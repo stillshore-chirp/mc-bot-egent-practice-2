@@ -936,6 +936,13 @@ def _nested_adapter_contract(
     root: Path, nested_agents: Path
 ) -> tuple[Path, dict[str, Any], Path, dict[str, Any], str]:
     scope = nested_agents.parent.relative_to(root).as_posix()
+    unsupported = sorted(set(scope) & set("*?[]{}!,\\"))
+    if unsupported:
+        raise _fail(
+            nested_agents,
+            "nested scope contains unsupported glob metacharacters: "
+            + ", ".join(repr(character) for character in unsupported),
+        )
     scope_key = quote(scope, safe="")
     claude_adapter = root / f".claude/rules/nested-agents-{scope_key}.md"
     cursor_adapter = root / f".cursor/rules/nested-agents-{scope_key}.mdc"
@@ -1343,6 +1350,37 @@ def run_self_test() -> None:
             )
         validate_nested_agents(root)
         validate_markdown_links(root)
+
+        for metacharacter in "*?[]{}!,\\":
+            metacharacter_nested = (
+                root / f"apps/scope{metacharacter}name/AGENTS.md"
+            )
+            try:
+                _nested_adapter_contract(root, metacharacter_nested)
+            except ValidationError as exc:
+                if "unsupported glob metacharacters" not in str(exc):
+                    raise ValidationError(
+                        "glob metacharacter self-test failed"
+                    ) from exc
+            else:
+                raise ValidationError(
+                    f"self-test accepted glob metacharacter {metacharacter!r}"
+                )
+
+        unsafe_nested = root / "apps/[bot]/AGENTS.md"
+        unsafe_nested.parent.mkdir(parents=True)
+        unsafe_nested.write_text("# Unsafe glob scope\n", encoding="utf-8")
+        (unsafe_nested.parent / "bot.py").write_text("pass\n", encoding="utf-8")
+        try:
+            validate_nested_agents(root)
+        except ValidationError as exc:
+            if "unsupported glob metacharacters" not in str(exc):
+                raise ValidationError("glob-safe nested scope self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted a glob-unsafe nested scope")
+        unsafe_nested.unlink()
+        (unsafe_nested.parent / "bot.py").unlink()
+        unsafe_nested.parent.rmdir()
 
         nested.unlink()
         try:
