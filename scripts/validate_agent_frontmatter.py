@@ -143,28 +143,27 @@ def validate_skill(
 
 def validate_claude_rule(data: dict[str, Any], path: Path) -> None:
     paths = data.get("paths")
-    if "paths" in data and (
+    if (
         not isinstance(paths, list)
         or not paths
         or any(not isinstance(item, str) or not item.strip() for item in paths)
     ):
-        raise _fail(path, "paths must be a non-empty list of strings when provided")
+        raise _fail(path, "paths must be a non-empty list of strings")
 
 
 def validate_cursor_rule(data: dict[str, Any], path: Path) -> None:
     _require_string(data, "description", path)
     globs = data.get("globs")
-    if "globs" in data:
-        valid_globs = isinstance(globs, str) and bool(globs.strip())
-        valid_globs = valid_globs or (
-            isinstance(globs, list)
-            and bool(globs)
-            and all(isinstance(item, str) and item.strip() for item in globs)
-        )
-        if not valid_globs:
-            raise _fail(path, "globs must be a non-empty string or list of strings")
-    if not isinstance(data.get("alwaysApply"), bool):
-        raise _fail(path, "alwaysApply must be a YAML boolean")
+    glob_values = [globs] if isinstance(globs, str) else globs
+    if not isinstance(glob_values, list) or not glob_values or any(
+        not isinstance(item, str) for item in glob_values
+    ):
+        raise _fail(path, "globs must be a non-empty string or list of strings")
+    patterns = [part.strip() for item in glob_values for part in item.split(",")]
+    if not patterns or any(not pattern for pattern in patterns):
+        raise _fail(path, "globs must not contain empty comma-separated patterns")
+    if data.get("alwaysApply") is not False:
+        raise _fail(path, "alwaysApply must be the YAML boolean false")
 
 
 def infer_kind(path: Path, root: Path) -> str:
@@ -185,16 +184,8 @@ def validate_path(path: Path, root: Path) -> None:
     relative = _relative(path, root).as_posix()
     kind = infer_kind(path, root)
     text = path.read_text(encoding="utf-8")
-    managed_claude_adapter = (
-        relative == ".claude/rules/agent-harness.md"
-        or relative.startswith(".claude/rules/nested-agents-")
-    )
     if kind == "claude-rule" and not text.startswith("---\n"):
-        if managed_claude_adapter:
-            raise _fail(path, "managed Claude adapter requires frontmatter")
-        if not text.strip():
-            raise _fail(path, "rule body must not be empty")
-        return
+        raise _fail(path, "Claude rule requires scoped frontmatter")
 
     data, _ = load_frontmatter(path)
     if kind == "skill":
@@ -1063,11 +1054,29 @@ def run_self_test() -> None:
             encoding="utf-8",
         )
         validate_path(cursor, root)
-        cursor.write_text(
-            "---\ndescription: test\nalwaysApply: true\n---\n\n# Test\n",
-            encoding="utf-8",
+        invalid_cursor_rules = (
+            "---\ndescription: test\nalwaysApply: false\n---\n\n# Test\n",
+            "---\ndescription: test\nglobs: test/**\n"
+            "alwaysApply: true\n---\n\n# Test\n",
+            "---\ndescription: test\nglobs: \",\"\n"
+            "alwaysApply: false\n---\n\n# Test\n",
+            "---\ndescription: test\nglobs: \",,\"\n"
+            "alwaysApply: false\n---\n\n# Test\n",
+            "---\ndescription: test\nglobs: \", test/**\"\n"
+            "alwaysApply: false\n---\n\n# Test\n",
+            "---\ndescription: test\nglobs: \"test/**,\"\n"
+            "alwaysApply: false\n---\n\n# Test\n",
         )
-        validate_path(cursor, root)
+        for content in invalid_cursor_rules:
+            cursor.write_text(content, encoding="utf-8")
+            try:
+                validate_path(cursor, root)
+            except ValidationError:
+                pass
+            else:
+                raise ValidationError(
+                    "self-test accepted an unscoped or always-on Cursor rule"
+                )
         cursor.write_text(
             "---\ndescription: test\nglobs: test\nalwaysApply: \"false\"\n---\n\n# Test\n",
             encoding="utf-8",
@@ -1082,36 +1091,35 @@ def run_self_test() -> None:
         claude = root / ".claude/rules/global.md"
         claude.parent.mkdir(parents=True)
         claude.write_text(
-            "---\ndescription: global project rule\n---\n\n# Global\n",
+            "---\npaths:\n  - src/**\n---\n\n# Scoped\n",
             encoding="utf-8",
         )
         validate_path(claude, root)
         nested_claude = root / ".claude/rules/product/global.md"
         nested_claude.parent.mkdir(parents=True)
-        nested_claude.write_text("# Global product rule\n", encoding="utf-8")
+        nested_claude.write_text(
+            "---\npaths:\n  - product/**\n---\n\n# Scoped product rule\n",
+            encoding="utf-8",
+        )
         validate_path(nested_claude, root)
         if nested_claude not in discover_agent_files(root):
             raise ValidationError("self-test missed a recursive Claude rule")
 
-        claude.write_text(
-            "---\npaths: null\n---\n\n# Invalid\n",
-            encoding="utf-8",
+        invalid_claude_rules = (
+            "# Missing frontmatter\n",
+            "---\ndescription: global rule\n---\n\n# Missing paths\n",
+            "---\npaths: null\n---\n\n# Null paths\n",
+            "---\npaths: []\n---\n\n# Empty paths\n",
+            "---\npaths:\n  - \" \"\n---\n\n# Blank path\n",
         )
-        try:
-            validate_path(claude, root)
-        except ValidationError:
-            pass
-        else:
-            raise ValidationError("self-test accepted paths: null")
-
-        managed_claude = root / ".claude/rules/agent-harness.md"
-        managed_claude.write_text("# Missing frontmatter\n", encoding="utf-8")
-        try:
-            validate_path(managed_claude, root)
-        except ValidationError:
-            pass
-        else:
-            raise ValidationError("self-test accepted a managed adapter without frontmatter")
+        for content in invalid_claude_rules:
+            claude.write_text(content, encoding="utf-8")
+            try:
+                validate_path(claude, root)
+            except ValidationError:
+                pass
+            else:
+                raise ValidationError("self-test accepted an unscoped Claude rule")
 
         cursor.write_text(
             "---\ndescription: test\nglobs: null\n"
