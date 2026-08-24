@@ -9,8 +9,6 @@ import subprocess
 import sys
 import unicodedata
 from collections import defaultdict
-from difflib import SequenceMatcher
-from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterable
@@ -140,28 +138,29 @@ def validate_skill(
 
 
 def validate_claude_rule(data: dict[str, Any], path: Path) -> None:
-    _require_exact_keys(data, {"paths"}, path)
     paths = data.get("paths")
-    if not isinstance(paths, list) or not paths:
-        raise _fail(path, "paths must be a non-empty list")
-    if any(not isinstance(item, str) or not item.strip() for item in paths):
-        raise _fail(path, "every paths item must be a non-empty string")
+    if "paths" in data and (
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(item, str) or not item.strip() for item in paths)
+    ):
+        raise _fail(path, "paths must be a non-empty list of strings when provided")
 
 
 def validate_cursor_rule(data: dict[str, Any], path: Path) -> None:
-    _require_exact_keys(data, {"description", "globs", "alwaysApply"}, path)
     _require_string(data, "description", path)
     globs = data.get("globs")
-    valid_globs = isinstance(globs, str) and bool(globs.strip())
-    valid_globs = valid_globs or (
-        isinstance(globs, list)
-        and bool(globs)
-        and all(isinstance(item, str) and item.strip() for item in globs)
-    )
-    if not valid_globs:
-        raise _fail(path, "globs must be a non-empty string or list of strings")
-    if data.get("alwaysApply") is not False:
-        raise _fail(path, "alwaysApply must be the YAML boolean false")
+    if "globs" in data:
+        valid_globs = isinstance(globs, str) and bool(globs.strip())
+        valid_globs = valid_globs or (
+            isinstance(globs, list)
+            and bool(globs)
+            and all(isinstance(item, str) and item.strip() for item in globs)
+        )
+        if not valid_globs:
+            raise _fail(path, "globs must be a non-empty string or list of strings")
+    if not isinstance(data.get("alwaysApply"), bool):
+        raise _fail(path, "alwaysApply must be a YAML boolean")
 
 
 def infer_kind(path: Path, root: Path) -> str:
@@ -179,9 +178,21 @@ def infer_kind(path: Path, root: Path) -> str:
 
 
 def validate_path(path: Path, root: Path) -> None:
-    data, _ = load_frontmatter(path)
     relative = _relative(path, root).as_posix()
     kind = infer_kind(path, root)
+    text = path.read_text(encoding="utf-8")
+    managed_claude_adapter = (
+        relative == ".claude/rules/agent-harness.md"
+        or relative.startswith(".claude/rules/nested-agents-")
+    )
+    if kind == "claude-rule" and not text.startswith("---\n"):
+        if managed_claude_adapter:
+            raise _fail(path, "managed Claude adapter requires frontmatter")
+        if not text.strip():
+            raise _fail(path, "rule body must not be empty")
+        return
+
+    data, _ = load_frontmatter(path)
     if kind == "skill":
         validate_skill(
             data,
@@ -200,8 +211,8 @@ def discover_agent_files(root: Path) -> list[Path]:
     patterns = (
         ".agents/skills/**/SKILL.md",
         ".claude/skills/**/SKILL.md",
-        ".claude/rules/*.md",
-        ".cursor/rules/*.mdc",
+        ".claude/rules/**/*.md",
+        ".cursor/rules/**/*.mdc",
     )
     return sorted({path for pattern in patterns for path in root.glob(pattern)})
 
@@ -583,33 +594,61 @@ def validate_workflow(root: Path) -> None:
         raise _fail(path, "syntax step must run bash -n and Python py_compile")
 
 
-def _authoring_files(root: Path) -> Iterable[Path]:
+def _bootstrap_source_files(root: Path) -> Iterable[Path]:
     text_suffixes = {".md", ".mdc", ".txt", ".yml", ".yaml"}
+    exact = {
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        *HARNESS_DOCUMENTS,
+        ".github/ISSUE_TEMPLATE/feature.md",
+        ".github/pull_request_template.md",
+        ".github/workflows/agent-harness.yml",
+    }
     for path in _repository_files(root):
         relative = path.relative_to(root).as_posix()
         if path.suffix not in text_suffixes:
             continue
-        if relative in {"README.md", "AGENTS.md", "CLAUDE.md"}:
-            yield path
-        elif relative.startswith(("docs/", ".agents/", ".claude/", ".cursor/")):
-            yield path
-        elif relative.startswith(
-            (".github/ISSUE_TEMPLATE/", ".github/workflows/")
-        ) or relative == ".github/pull_request_template.md":
+        if relative in exact or relative.startswith(
+            (".agents/", ".claude/", ".cursor/")
+        ):
             yield path
 
 
 def validate_source_specific_residue(root: Path) -> None:
     forbidden = (
-        "WordPack",
-        "wordpack-for-english",
-        "mc-bot-egent-practice-1",
+        ("WordPack", r"(?<![0-9A-Za-z_-])wordpack(?![0-9A-Za-z_-])"),
+        ("wordpack-for-english", r"wordpack-for-english"),
+        ("mc-bot-egent-practice-1", r"mc-bot-egent-practice-1"),
     )
-    for path in _authoring_files(root):
-        text = path.read_text(encoding="utf-8").casefold()
-        for term in forbidden:
-            if term.casefold() in text:
+    for path in _bootstrap_source_files(root):
+        text = _without_code_fences(path.read_text(encoding="utf-8")).casefold()
+        for term, pattern in forbidden:
+            if re.search(pattern, text, re.IGNORECASE):
                 raise _fail(path, f"source-specific term remains: {term}")
+
+
+def validate_conflicting_instructions(root: Path) -> None:
+    retired = (
+        "指定がなければDraft",
+        "通常はDraft",
+        "Draftのみ",
+        "下書きPR",
+        "ドラフトPRのみ",
+        "上記は参考情報",
+        "この文は無効",
+        "常にmerge",
+        "コードレビュー往復は最大",
+        "P0 または P1 を含まないレビュー結果が 3 回連続",
+        "codex/<purpose>",
+        "自己reviewで代替する",
+        "mergeまで通常配送",
+    )
+    for path in _bootstrap_source_files(root):
+        visible = _without_code_fences(path.read_text(encoding="utf-8"))
+        for phrase in retired:
+            if phrase in visible:
+                raise _fail(path, f"retired or conflicting instruction remains: {phrase}")
 
 
 def _body_without_frontmatter(path: Path) -> str:
@@ -661,21 +700,20 @@ def validate_long_duplicates(root: Path) -> None:
             if len(normalized) >= 160 and normalized in canonical_text:
                 raise _fail(path, "adapter duplicates a long canonical paragraph")
 
-    normalized_files = {
-        path: _normalize_paragraph(_body_without_frontmatter(path)) for path in canonical
-    }
-    for first, second in combinations(canonical, 2):
-        blocks = SequenceMatcher(
-            None,
-            normalized_files[first],
-            normalized_files[second],
-            autojunk=False,
-        ).get_matching_blocks()
-        longest = max((block.size for block in blocks), default=0)
-        if longest >= 120:
+    paragraph_owners: dict[str, set[Path]] = defaultdict(set)
+    for path in canonical:
+        for paragraph in re.split(r"\n\s*\n", _body_without_frontmatter(path)):
+            normalized = _normalize_paragraph(paragraph)
+            if len(normalized) >= 120:
+                paragraph_owners[normalized].add(path)
+    for paragraph, paths in paragraph_owners.items():
+        if len(paths) > 1:
             print(
-                "WARNING: canonical similarity requires human review: "
-                f"{_relative(first, root)}, {_relative(second, root)} ({longest} chars)",
+                "WARNING: repeated canonical paragraph requires human review: "
+                + ", ".join(
+                    str(_relative(path, root)) for path in sorted(paths)
+                )
+                + f" ({len(paragraph)} chars)",
                 file=sys.stderr,
             )
 
@@ -725,7 +763,12 @@ def validate_adapter_mapping(root: Path) -> None:
     }
     claude_rule = root / ".claude/rules/agent-harness.md"
     claude_data, claude_body = load_frontmatter(claude_rule)
-    if set(claude_data["paths"]) != required_scope:
+    claude_paths = claude_data.get("paths")
+    if (
+        set(claude_data) != {"paths"}
+        or not isinstance(claude_paths, list)
+        or set(claude_paths) != required_scope
+    ):
         raise _fail(claude_rule, "paths must exactly match the harness surface")
     expected_claude_body = (
         "# Agent harness adapter\n\n"
@@ -739,7 +782,10 @@ def validate_adapter_mapping(root: Path) -> None:
 
     cursor_rule = root / ".cursor/rules/agent-harness.mdc"
     cursor_data, cursor_body = load_frontmatter(cursor_rule)
-    cursor_scope = set(cursor_data["globs"].split(","))
+    cursor_globs = cursor_data.get("globs")
+    cursor_scope = (
+        set(cursor_globs.split(",")) if isinstance(cursor_globs, str) else set()
+    )
     cursor_expected = {
         "README.md",
         "AGENTS.md",
@@ -760,7 +806,16 @@ def validate_adapter_mapping(root: Path) -> None:
         ".github/pull_request_template.md",
         ".github/workflows/agent-harness.yml",
     }
-    if cursor_scope != cursor_expected:
+    expected_cursor_data = {
+        "description": "エージェントハーネス変更時に3tool共通の保守正本へ接続するrouter",
+        "globs": cursor_globs,
+        "alwaysApply": False,
+    }
+    if (
+        cursor_scope != cursor_expected
+        or set(cursor_data) != {"description", "globs", "alwaysApply"}
+        or cursor_data != expected_cursor_data
+    ):
         raise _fail(cursor_rule, "globs must exactly match the harness surface")
     expected_cursor_body = (
         "# Agent harness adapter\n\n"
@@ -884,6 +939,7 @@ def validate_repository(root: Path) -> None:
     validate_yaml_files(root)
     validate_workflow(root)
     validate_source_specific_residue(root)
+    validate_conflicting_instructions(root)
     validate_long_duplicates(root)
     validate_adapter_mapping(root)
     validate_nested_agents(root)
@@ -938,6 +994,11 @@ def run_self_test() -> None:
         )
         validate_path(cursor, root)
         cursor.write_text(
+            "---\ndescription: test\nalwaysApply: true\n---\n\n# Test\n",
+            encoding="utf-8",
+        )
+        validate_path(cursor, root)
+        cursor.write_text(
             "---\ndescription: test\nglobs: test\nalwaysApply: \"false\"\n---\n\n# Test\n",
             encoding="utf-8",
         )
@@ -947,6 +1008,52 @@ def run_self_test() -> None:
             pass
         else:
             raise ValidationError("self-test accepted string alwaysApply=false")
+
+        claude = root / ".claude/rules/global.md"
+        claude.parent.mkdir(parents=True)
+        claude.write_text(
+            "---\ndescription: global project rule\n---\n\n# Global\n",
+            encoding="utf-8",
+        )
+        validate_path(claude, root)
+        nested_claude = root / ".claude/rules/product/global.md"
+        nested_claude.parent.mkdir(parents=True)
+        nested_claude.write_text("# Global product rule\n", encoding="utf-8")
+        validate_path(nested_claude, root)
+        if nested_claude not in discover_agent_files(root):
+            raise ValidationError("self-test missed a recursive Claude rule")
+
+        claude.write_text(
+            "---\npaths: null\n---\n\n# Invalid\n",
+            encoding="utf-8",
+        )
+        try:
+            validate_path(claude, root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test accepted paths: null")
+
+        managed_claude = root / ".claude/rules/agent-harness.md"
+        managed_claude.write_text("# Missing frontmatter\n", encoding="utf-8")
+        try:
+            validate_path(managed_claude, root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test accepted a managed adapter without frontmatter")
+
+        cursor.write_text(
+            "---\ndescription: test\nglobs: null\n"
+            "alwaysApply: false\n---\n\n# Invalid\n",
+            encoding="utf-8",
+        )
+        try:
+            validate_path(cursor, root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test accepted globs: null")
 
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -1001,7 +1108,11 @@ def run_self_test() -> None:
             encoding="utf-8",
         )
         validate_source_specific_residue(root)
-        architecture.write_text("# WordPack residue\n", encoding="utf-8")
+        architecture.write_text("# Provenance\n\nAdapted from WordPack.\n", encoding="utf-8")
+        validate_source_specific_residue(root)
+
+        readme = root / "README.md"
+        readme.write_text("# WordPack residue\n", encoding="utf-8")
         try:
             validate_source_specific_residue(root)
         except ValidationError as exc:
@@ -1009,6 +1120,29 @@ def run_self_test() -> None:
                 raise ValidationError("source residue self-test failed") from exc
         else:
             raise ValidationError("self-test accepted an unambiguous source identifier")
+        readme.write_text(
+            "# Project\n\n履歴上のsource名は `WordPack` です。\n",
+            encoding="utf-8",
+        )
+        validate_source_specific_residue(root)
+
+        history = root / "docs/policy-history.md"
+        history.write_text("# History\n\n旧語は下書きPRでした。\n", encoding="utf-8")
+        validate_conflicting_instructions(root)
+        active_rule = root / ".agents/skills/example/SKILL.md"
+        active_rule.write_text("# Active\n\n下書きPRを使います。\n", encoding="utf-8")
+        try:
+            validate_conflicting_instructions(root)
+        except ValidationError as exc:
+            if "retired or conflicting instruction remains: 下書きPR" not in str(exc):
+                raise ValidationError("conflicting instruction self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted a conflicting active instruction")
+        active_rule.write_text(
+            "# Active\n\n履歴上の旧語は `下書きPR` です。\n",
+            encoding="utf-8",
+        )
+        validate_conflicting_instructions(root)
 
         nested = root / "apps/bot/AGENTS.md"
         nested.parent.mkdir(parents=True)

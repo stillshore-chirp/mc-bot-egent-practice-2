@@ -30,14 +30,6 @@ require_text() {
   grep -Fq -- "$text" "$file" || fail "$file must contain: $text"
 }
 
-reject_text() {
-  local text="$1"
-  shift
-  if grep -R -Fq --exclude='verify-agent-harness.sh' -- "$text" "$@"; then
-    fail "retired or conflicting instruction remains: $text"
-  fi
-}
-
 REQUIRED_FILES=(
   "README.md"
   ".gitignore"
@@ -147,30 +139,5 @@ require_text "docs/agent-harness.md" "GitHub配送Skill"
 require_text "docs/agent-harness.md" "証跡と完了ゲート"
 require_text "docs/ai-governance/13-maintenance-policy.md" "GitHub配送Skill"
 require_text "docs/ai-governance/13-maintenance-policy.md" "証跡と完了ゲート"
-
-AUTHORING_TARGETS=(
-  "README.md"
-  "AGENTS.md"
-  "docs"
-  ".agents"
-  ".claude"
-  ".cursor"
-  ".github/ISSUE_TEMPLATE"
-  ".github/pull_request_template.md"
-)
-
-reject_text "指定がなければDraft" "${AUTHORING_TARGETS[@]}"
-reject_text "通常はDraft" "${AUTHORING_TARGETS[@]}"
-reject_text "Draftのみ" "${AUTHORING_TARGETS[@]}"
-reject_text "下書きPR" "${AUTHORING_TARGETS[@]}"
-reject_text "ドラフトPRのみ" "${AUTHORING_TARGETS[@]}"
-reject_text "上記は参考情報" "${AUTHORING_TARGETS[@]}"
-reject_text "この文は無効" "${AUTHORING_TARGETS[@]}"
-reject_text "常にmerge" "${AUTHORING_TARGETS[@]}"
-reject_text "コードレビュー往復は最大" "${AUTHORING_TARGETS[@]}"
-reject_text "P0 または P1 を含まないレビュー結果が 3 回連続" "${AUTHORING_TARGETS[@]}"
-reject_text "codex/<purpose>" "${AUTHORING_TARGETS[@]}"
-reject_text "自己reviewで代替する" "${AUTHORING_TARGETS[@]}"
-reject_text "mergeまで通常配送" "${AUTHORING_TARGETS[@]}"
 
 echo "Agent harness verification: PASS"
