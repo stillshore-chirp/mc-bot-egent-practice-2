@@ -699,15 +699,36 @@ def validate_adapter_mapping(root: Path) -> None:
         raise _fail(cursor_rule, "body must contain only canonical routing text")
 
 
-def validate_no_nested_agents(root: Path) -> None:
+def validate_nested_agents(root: Path) -> None:
+    repository_files = list(_repository_files(root))
+    root_agents = root / "AGENTS.md"
+    root_bytes = len(root_agents.read_bytes())
     nested = [
-        path for path in _repository_files(root) if path.name == "AGENTS.md" and path.parent != root
+        path
+        for path in repository_files
+        if path.name == "AGENTS.md" and path.parent != root
     ]
-    if nested:
-        raise ValidationError(
-            "nested AGENTS.md is not allowed before a real product path exists: "
-            + ", ".join(str(_relative(path, root)) for path in nested)
-        )
+    for path in nested:
+        scoped_files = [
+            candidate
+            for candidate in repository_files
+            if candidate != path
+            and candidate.name != ".gitkeep"
+            and candidate.is_relative_to(path.parent)
+        ]
+        if not scoped_files:
+            raise _fail(path, "nested rule requires a real file in the same subtree")
+
+        raw = path.read_bytes()
+        lines = len(raw.decode("utf-8").splitlines())
+        if lines > 100 or len(raw) > 8192:
+            raise _fail(
+                path,
+                f"nested instruction budget exceeded: {lines}/100 lines, "
+                f"{len(raw)}/8192 bytes",
+            )
+        if root_bytes + len(raw) > 24576:
+            raise _fail(path, "root and nested AGENTS.md exceed 24576 combined bytes")
 
 
 def validate_repository(root: Path) -> None:
@@ -727,7 +748,7 @@ def validate_repository(root: Path) -> None:
     validate_source_specific_residue(root)
     validate_long_duplicates(root)
     validate_adapter_mapping(root)
-    validate_no_nested_agents(root)
+    validate_nested_agents(root)
 
 
 def run_self_test() -> None:
