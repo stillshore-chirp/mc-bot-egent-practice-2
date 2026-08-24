@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import html
 import re
 import subprocess
 import sys
@@ -17,9 +16,11 @@ from urllib.parse import quote, unquote
 
 try:
     import yaml
+    from markdown_it import MarkdownIt
+    from markdown_it.token import Token
 except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
     raise SystemExit(
-        "ERROR: PyYAML is required; run "
+        "ERROR: agent harness dependencies are required; run "
         "`python3 -m pip install -r requirements-agent-harness.txt`"
     ) from exc
 
@@ -37,6 +38,8 @@ HARNESS_DOCUMENTS = (
     "docs/ai-governance/13-maintenance-policy.md",
     "docs/ai-governance/14-issue-quality-gate.md",
 )
+
+MARKDOWN_PARSER = MarkdownIt("commonmark", {"html": True})
 
 
 class UniqueKeySafeLoader(yaml.SafeLoader):
@@ -335,54 +338,22 @@ def validate_text_hygiene(root: Path) -> None:
                 raise _fail(path, f"trailing whitespace on line {line_number}")
 
 
-def _without_fenced_code_blocks(text: str) -> str:
-    output: list[str] = []
-    fence: str | None = None
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        marker = "```" if stripped.startswith("```") else "~~~" if stripped.startswith("~~~") else None
-        if marker:
-            fence = None if fence == marker else marker if fence is None else fence
-            output.append("")
-            continue
-        output.append("" if fence else line)
-    return "\n".join(output)
-
-
-def _without_code_fences(text: str) -> str:
-    visible = _without_fenced_code_blocks(text)
-    return re.sub(r"`+[^`\n]*`+", "", visible)
-
-
 def _markdown_targets(text: str) -> Iterable[str]:
-    visible = _without_code_fences(text)
-    references = re.compile(r"^\s*\[[^\]]+\]:\s*<?([^\s>]+)>?", re.MULTILINE)
-    inline_start = re.compile(r"!?\[[^\]]*\]\(")
-    for match in inline_start.finditer(visible):
-        cursor = match.end()
-        while cursor < len(visible) and visible[cursor].isspace():
-            cursor += 1
-        if cursor < len(visible) and visible[cursor] == "<":
-            end = visible.find(">", cursor + 1)
-            if end != -1:
-                yield visible[cursor + 1 : end]
-            continue
-
-        start = cursor
-        depth = 1
-        while cursor < len(visible):
-            character = visible[cursor]
-            if character == "(":
-                depth += 1
-            elif character == ")":
-                depth -= 1
-                if depth == 0:
-                    raw = visible[start:cursor].strip()
-                    if raw:
-                        yield raw.split(maxsplit=1)[0]
-                    break
-            cursor += 1
-    yield from (match.group(1) for match in references.finditer(visible))
+    environment: dict[str, Any] = {}
+    tokens = MARKDOWN_PARSER.parse(text, environment)
+    for reference in environment.get("references", {}).values():
+        target = reference.get("href")
+        if isinstance(target, str) and target:
+            yield target
+    for token in tokens:
+        for child in token.children or []:
+            attribute = (
+                "href"
+                if child.type == "link_open"
+                else "src" if child.type == "image" else None
+            )
+            if attribute and (target := child.attrGet(attribute)):
+                yield target
 
 
 def _assert_exact_case(root: Path, relative: Path, source: Path) -> None:
@@ -394,85 +365,29 @@ def _assert_exact_case(root: Path, relative: Path, source: Path) -> None:
         current = current / part
 
 
-def _rendered_heading_text(markdown: str) -> str:
-    """Approximate the rendered inline text GitHub uses to derive an ATX anchor."""
-    output: list[str] = []
-    code_spans: list[str] = []
-    cursor = 0
-    while cursor < len(markdown):
-        if markdown[cursor] != "`":
-            output.append(markdown[cursor])
-            cursor += 1
-            continue
+def _inline_visible_text(tokens: Iterable[Token]) -> str:
+    visible: list[str] = []
+    for child in tokens:
+        if child.type in {"text", "text_special", "code_inline"}:
+            visible.append(child.content)
+        elif child.type in {"softbreak", "hardbreak"}:
+            visible.append(" ")
+        elif child.type == "image":
+            visible.append(_inline_visible_text(child.children or []))
+    return "".join(visible)
 
-        opening_end = cursor
-        while opening_end < len(markdown) and markdown[opening_end] == "`":
-            opening_end += 1
-        opening_length = opening_end - cursor
-        search = opening_end
-        closing_start: int | None = None
-        closing_end: int | None = None
-        while search < len(markdown):
-            candidate = markdown.find("`", search)
-            if candidate == -1:
-                break
-            candidate_end = candidate
-            while candidate_end < len(markdown) and markdown[candidate_end] == "`":
-                candidate_end += 1
-            if candidate_end - candidate == opening_length:
-                closing_start = candidate
-                closing_end = candidate_end
-                break
-            search = candidate_end
 
-        if closing_start is None or closing_end is None:
-            output.append(markdown[cursor:opening_end])
-            cursor = opening_end
-            continue
-
-        code = markdown[opening_end:closing_start].replace("\n", " ")
-        if code.startswith(" ") and code.endswith(" ") and code.strip(" "):
-            code = code[1:-1]
-        token = f"\x00{len(code_spans)}\x00"
-        code_spans.append(code)
-        output.append(token)
-        cursor = closing_end
-
-    prose = "".join(output)
-    prose = re.sub(r"!?\[([^\]]+)\]\([^)]*\)", r"\1", prose)
-    prose = re.sub(r"!?\[([^\]]+)\]\[[^\]]*\]", r"\1", prose)
-    prose = re.sub(r"<!--.*?-->", "", prose)
-    prose = re.sub(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>", "", prose)
-    emphasis_patterns = (
-        re.compile(
-            r"(?<!\\)(?P<marker>\*{1,3})(?=\S)"
-            r"(?P<body>.+?)(?<=\S)(?P=marker)"
-        ),
-        re.compile(
-            r"(?<![\w\\])(?P<marker>_{1,3})(?=\S)"
-            r"(?P<body>.+?)(?<=\S)(?P=marker)(?!\w)"
-        ),
-    )
-    previous = ""
-    while prose != previous:
-        previous = prose
-        for pattern in emphasis_patterns:
-            prose = pattern.sub(r"\g<body>", prose)
-        prose = re.sub(r"(?<!\\)~~(?=\S)(.+?)(?<=\S)~~", r"\1", prose)
-    prose = html.unescape(prose)
-    prose = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])", r"\1", prose)
-    for index, code in enumerate(code_spans):
-        prose = prose.replace(f"\x00{index}\x00", code)
-    return prose
+def _heading_text(token: Token) -> str:
+    return _inline_visible_text(token.children or [])
 
 
 def _markdown_anchors(text: str) -> set[str]:
     anchors: set[str] = set()
-    counts: dict[str, int] = defaultdict(int)
-    visible = _without_fenced_code_blocks(text)
-    for match in re.finditer(r"^#{1,6}\s+(.+?)\s*#*\s*$", visible, re.MULTILINE):
-        heading = _rendered_heading_text(match.group(1))
-        heading = heading.lower()
+    tokens = MARKDOWN_PARSER.parse(text)
+    for index, token in enumerate(tokens[:-1]):
+        if token.type != "heading_open" or tokens[index + 1].type != "inline":
+            continue
+        heading = _heading_text(tokens[index + 1]).lower()
         heading = "".join(
             character
             for character in heading
@@ -481,9 +396,12 @@ def _markdown_anchors(text: str) -> set[str]:
         base = heading.strip().replace(" ", "-")
         if not base:
             continue
-        count = counts[base]
-        counts[base] += 1
-        anchors.add(base if count == 0 else f"{base}-{count}")
+        candidate = base
+        suffix = 0
+        while candidate in anchors:
+            suffix += 1
+            candidate = f"{base}-{suffix}"
+        anchors.add(candidate)
     return anchors
 
 
@@ -492,7 +410,7 @@ def validate_markdown_links(root: Path) -> None:
     for path in sorted(paths):
         text = path.read_text(encoding="utf-8")
         for target in _markdown_targets(text):
-            if target.startswith(("http://", "https://", "mailto:")):
+            if target.casefold().startswith(("http://", "https://", "mailto:")):
                 continue
             path_part, _, fragment = target.partition("#")
             clean = unquote(path_part.split("?", 1)[0])
@@ -505,7 +423,7 @@ def validate_markdown_links(root: Path) -> None:
                 raise _fail(path, f"relative link target is missing: {target}")
             _assert_exact_case(root.resolve(), relative, path)
             if fragment and candidate.suffix in {".md", ".mdc"}:
-                anchor = unquote(fragment).casefold()
+                anchor = unquote(fragment).lower()
                 anchors = _markdown_anchors(candidate.read_text(encoding="utf-8"))
                 if anchor not in anchors:
                     raise _fail(path, f"Markdown anchor is missing: {target}")
@@ -1195,7 +1113,15 @@ def run_self_test() -> None:
             stderr=subprocess.DEVNULL,
         )
         (root / "README.md").write_text(
-            "[Inline-code heading](AGENTS.md#use-agentpurpose)\n",
+            "[Inline-code heading](AGENTS.md#use-agentpurpose)\n"
+            "[Unicode heading](AGENTS.md#straße)\n"
+            "[Collision heading](AGENTS.md#collision-1-1)\n"
+            "[Indented heading](AGENTS.md#indented-heading)\n"
+            "[Setext heading](AGENTS.md#setext-heading)\n"
+            "[Image heading](AGENTS.md#image-foo--bar-heading)\n"
+            "[Nested image heading](AGENTS.md#nested-foo-bar-baz-heading)\n"
+            "[External](HTTPS://example.com)\n"
+            "[Email](MailTo:test@example.com)\n",
             encoding="utf-8",
         )
         (root / "AGENTS.md").write_text(
@@ -1208,13 +1134,31 @@ def run_self_test() -> None:
             "## A <!-- hidden --> B\n\n"
             "## Straße\n\n"
             "## Two  Spaces\n\n"
-            "```md\n# Ignored heading\n```\n",
+            "## Collision\n\n"
+            "## Collision\n\n"
+            "## Collision-1\n\n"
+            "  ## Indented heading\n\n"
+            "Setext heading\n"
+            "--------------\n\n"
+            "## Image ![foo &amp; *bar*](.agents/skills/example/assets/image.png) heading\n\n"
+            "## Nested ![foo [bar](inner.md) baz](.agents/skills/example/assets/image.png) heading\n\n"
+            "````md\n"
+            "```md\n"
+            "# Ignored heading\n"
+            "[ignored](missing.md)\n"
+            "```\n"
+            "````\n\n"
+            "> ```md\n"
+            "> [ignored](missing-blockquote.md)\n"
+            "> ```\n\n"
+            "- example:\n\n"
+            "  ```md\n"
+            "  [ignored](missing-list.md)\n"
+            "  ```\n\n"
+            "End example.\n\n"
+            "    [ignored](missing-indented.md)\n",
             encoding="utf-8",
         )
-        if _rendered_heading_text(
-            "Keep ``foo_bar_baz <!-- visible --> ` tick``"
-        ) != "Keep foo_bar_baz <!-- visible --> ` tick":
-            raise ValidationError("protected code-span self-test failed")
         expected_anchors = {
             "root",
             "use-agentpurpose",
@@ -1225,6 +1169,13 @@ def run_self_test() -> None:
             "a--b",
             "straße",
             "two--spaces",
+            "collision",
+            "collision-1",
+            "collision-1-1",
+            "indented-heading",
+            "setext-heading",
+            "image-foo--bar-heading",
+            "nested-foo-bar-baz-heading",
         }
         actual_anchors = _markdown_anchors(
             (root / "AGENTS.md").read_text(encoding="utf-8")
