@@ -82,6 +82,13 @@ def _relative(path: Path, root: Path) -> Path:
         return path
 
 
+def _lexical_relative(path: Path, root: Path) -> Path:
+    try:
+        return path.absolute().relative_to(root.absolute())
+    except ValueError:
+        return path
+
+
 def load_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -167,7 +174,7 @@ def validate_cursor_rule(data: dict[str, Any], path: Path) -> None:
 
 
 def infer_kind(path: Path, root: Path) -> str:
-    relative = _relative(path, root).as_posix()
+    relative = _lexical_relative(path, root).as_posix()
     if relative.startswith(".claude/rules/"):
         return "claude-rule"
     if relative.startswith(".cursor/rules/"):
@@ -180,9 +187,29 @@ def infer_kind(path: Path, root: Path) -> str:
     raise _fail(path, "cannot infer agent frontmatter kind")
 
 
+def _is_managed_rule(relative: str, kind: str) -> bool:
+    path = Path(relative)
+    contracts = {
+        "claude-rule": (Path(".claude/rules"), "agent-harness.md", ".md"),
+        "cursor-rule": (Path(".cursor/rules"), "agent-harness.mdc", ".mdc"),
+    }
+    parent, harness_name, suffix = contracts[kind]
+    return path.parent == parent and (
+        path.name == harness_name
+        or (path.name.startswith("nested-agents-") and path.name.endswith(suffix))
+    )
+
+
 def validate_path(path: Path, root: Path) -> None:
-    relative = _relative(path, root).as_posix()
+    relative = _lexical_relative(path, root).as_posix()
     kind = infer_kind(path, root)
+    if kind in {"claude-rule", "cursor-rule"} and path.is_symlink():
+        raise _fail(path, "tool rule symlinks are not allowed")
+    if kind in {"claude-rule", "cursor-rule"} and not _is_managed_rule(
+        relative,
+        kind,
+    ):
+        raise _fail(path, "unknown tool rule is not a managed thin adapter")
     text = path.read_text(encoding="utf-8")
     if kind == "claude-rule" and not text.startswith("---\n"):
         raise _fail(path, "Claude rule requires scoped frontmatter")
@@ -1046,7 +1073,7 @@ def run_self_test() -> None:
             if passed != should_pass:
                 raise ValidationError(f"self-test failed for {relative}")
 
-        cursor = root / ".cursor/rules/test.mdc"
+        cursor = root / ".cursor/rules/agent-harness.mdc"
         cursor.parent.mkdir(parents=True)
         cursor.write_text(
             "---\ndescription: test\nglobs:\n  - test/**\n"
@@ -1088,7 +1115,7 @@ def run_self_test() -> None:
         else:
             raise ValidationError("self-test accepted string alwaysApply=false")
 
-        claude = root / ".claude/rules/global.md"
+        claude = root / ".claude/rules/agent-harness.md"
         claude.parent.mkdir(parents=True)
         claude.write_text(
             "---\npaths:\n  - src/**\n---\n\n# Scoped\n",
@@ -1101,9 +1128,46 @@ def run_self_test() -> None:
             "---\npaths:\n  - product/**\n---\n\n# Scoped product rule\n",
             encoding="utf-8",
         )
-        validate_path(nested_claude, root)
         if nested_claude not in discover_agent_files(root):
             raise ValidationError("self-test missed a recursive Claude rule")
+        try:
+            validate_path(nested_claude, root)
+        except ValidationError as exc:
+            if "unknown tool rule" not in str(exc):
+                raise ValidationError("unknown Claude rule self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted an unknown Claude rule")
+
+        unknown_cursor = root / ".cursor/rules/product/custom.mdc"
+        unknown_cursor.parent.mkdir(parents=True)
+        unknown_cursor.write_text(
+            "---\ndescription: custom\nglobs: src/**\n"
+            "alwaysApply: false\n---\n\n# Custom\n",
+            encoding="utf-8",
+        )
+        if unknown_cursor not in discover_agent_files(root):
+            raise ValidationError("self-test missed a recursive Cursor rule")
+        try:
+            validate_path(unknown_cursor, root)
+        except ValidationError as exc:
+            if "unknown tool rule" not in str(exc):
+                raise ValidationError("unknown Cursor rule self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted an unknown Cursor rule")
+
+        unknown_claude_alias = root / ".claude/rules/product/tool-only.md"
+        unknown_claude_alias.symlink_to("../agent-harness.md")
+        unknown_cursor_alias = root / ".cursor/rules/product/tool-only.mdc"
+        unknown_cursor_alias.parent.mkdir(parents=True, exist_ok=True)
+        unknown_cursor_alias.symlink_to("../agent-harness.mdc")
+        for alias in (unknown_claude_alias, unknown_cursor_alias):
+            try:
+                validate_path(alias, root)
+            except ValidationError as exc:
+                if "symlinks are not allowed" not in str(exc):
+                    raise ValidationError("rule symlink self-test failed") from exc
+            else:
+                raise ValidationError("self-test accepted a rule symlink alias")
 
         invalid_claude_rules = (
             "# Missing frontmatter\n",
@@ -1329,6 +1393,7 @@ def run_self_test() -> None:
                 f"---\n{frontmatter}\n---\n\n{body}\n",
                 encoding="utf-8",
             )
+            validate_path(path, root)
         validate_nested_agents(root)
         validate_markdown_links(root)
 
