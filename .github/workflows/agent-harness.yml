@@ -1,0 +1,80 @@
+name: Agent harness governance
+
+on:
+  push:
+    paths:
+      - 'README.md'
+      - '.gitignore'
+      - 'AGENTS.md'
+      - '**/AGENTS.md'
+      - 'CLAUDE.md'
+      - '.agents/**'
+      - '.claude/**'
+      - '.cursor/**'
+      - 'docs/**'
+      - 'scripts/verify-agent-harness.sh'
+      - 'scripts/validate_agent_frontmatter.py'
+      - 'requirements-agent-harness.txt'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.github/workflows/agent-harness.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - '.gitignore'
+      - 'AGENTS.md'
+      - '**/AGENTS.md'
+      - 'CLAUDE.md'
+      - '.agents/**'
+      - '.claude/**'
+      - '.cursor/**'
+      - 'docs/**'
+      - 'scripts/verify-agent-harness.sh'
+      - 'scripts/validate_agent_frontmatter.py'
+      - 'requirements-agent-harness.txt'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.github/workflows/agent-harness.yml'
+
+concurrency:
+  group: agent-harness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify agent harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-agent-harness.txt
+
+      - name: Validate script syntax
+        run: |
+          bash -n scripts/verify-agent-harness.sh
+          python -m py_compile scripts/validate_agent_frontmatter.py
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint verification script
+        run: shellcheck scripts/verify-agent-harness.sh
+
+      - name: Verify agent harness
+        run: bash scripts/verify-agent-harness.sh

@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Validate agent frontmatter and repository harness structure."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import unicodedata
+from collections import defaultdict
+from difflib import SequenceMatcher
+from itertools import combinations
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any, Iterable
+from urllib.parse import unquote
+
+try:
+    import yaml
+except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
+    raise SystemExit(
+        "ERROR: PyYAML is required; run "
+        "`python3 -m pip install -r requirements-agent-harness.txt`"
+    ) from exc
+
+
+class ValidationError(ValueError):
+    """Raised when an agent harness contract is invalid."""
+
+
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate mapping keys."""
+
+
+class UniqueKeyBaseLoader(yaml.BaseLoader):
+    """BaseLoader variant that preserves workflow keys such as `on`."""
+
+
+def _construct_unique_mapping(
+    loader: yaml.Loader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValidationError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+for loader_type in (UniqueKeySafeLoader, UniqueKeyBaseLoader):
+    loader_type.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _construct_unique_mapping,
+    )
+
+
+def _fail(path: Path, message: str) -> ValidationError:
+    return ValidationError(f"{path}: {message}")
+
+
+def _relative(path: Path, root: Path) -> Path:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return path
+
+
+def load_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise _fail(path, "frontmatter must start on the first line")
+
+    try:
+        end = next(
+            index for index in range(1, len(lines)) if lines[index].strip() == "---"
+        )
+    except StopIteration as exc:
+        raise _fail(path, "frontmatter closing delimiter is missing") from exc
+
+    raw = "\n".join(lines[1:end])
+    try:
+        data = yaml.load(raw, Loader=UniqueKeySafeLoader)
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise _fail(path, f"invalid YAML frontmatter: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise _fail(path, "frontmatter must be a YAML mapping")
+    if any(not isinstance(key, str) for key in data):
+        raise _fail(path, "frontmatter keys must be strings")
+
+    body = "\n".join(lines[end + 1 :]).strip()
+    if not body:
+        raise _fail(path, "body must not be empty")
+    return data, body
+
+
+def _require_string(data: dict[str, Any], key: str, path: Path) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise _fail(path, f"{key} must be a non-empty string")
+    return value
+
+
+def _require_exact_keys(data: dict[str, Any], keys: set[str], path: Path) -> None:
+    actual = set(data)
+    if actual != keys:
+        raise _fail(path, f"frontmatter keys must be {sorted(keys)}, got {sorted(actual)}")
+
+
+def validate_skill(data: dict[str, Any], path: Path) -> None:
+    _require_exact_keys(data, {"name", "description"}, path)
+    name = _require_string(data, "name", path)
+    _require_string(data, "description", path)
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None:
+        raise _fail(path, "name must be lowercase kebab-case")
+    if path.parent.name != name:
+        raise _fail(path, f"name must match parent directory {path.parent.name!r}")
+
+
+def validate_claude_rule(data: dict[str, Any], path: Path) -> None:
+    _require_exact_keys(data, {"paths"}, path)
+    paths = data.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise _fail(path, "paths must be a non-empty list")
+    if any(not isinstance(item, str) or not item.strip() for item in paths):
+        raise _fail(path, "every paths item must be a non-empty string")
+
+
+def validate_cursor_rule(data: dict[str, Any], path: Path) -> None:
+    _require_exact_keys(data, {"description", "globs", "alwaysApply"}, path)
+    _require_string(data, "description", path)
+    _require_string(data, "globs", path)
+    if data.get("alwaysApply") is not False:
+        raise _fail(path, "alwaysApply must be the YAML boolean false")
+
+
+def infer_kind(path: Path, root: Path) -> str:
+    relative = _relative(path, root).as_posix()
+    if relative.startswith(".claude/rules/"):
+        return "claude-rule"
+    if relative.startswith(".cursor/rules/"):
+        return "cursor-rule"
+    if path.name == "SKILL.md" and (
+        relative.startswith(".agents/skills/")
+        or relative.startswith(".claude/skills/")
+    ):
+        return "skill"
+    raise _fail(path, "cannot infer agent frontmatter kind")
+
+
+def validate_path(path: Path, root: Path) -> None:
+    data, _ = load_frontmatter(path)
+    validators = {
+        "skill": validate_skill,
+        "claude-rule": validate_claude_rule,
+        "cursor-rule": validate_cursor_rule,
+    }
+    validators[infer_kind(path, root)](data, path)
+
+
+def discover_agent_files(root: Path) -> list[Path]:
+    patterns = (
+        ".agents/skills/**/SKILL.md",
+        ".claude/skills/**/SKILL.md",
+        ".claude/rules/*.md",
+        ".cursor/rules/*.mdc",
+    )
+    return sorted({path for pattern in patterns for path in root.glob(pattern)})
+
+
+def validate_instruction_budgets(root: Path, agent_files: Iterable[Path]) -> None:
+    limits = {"root": (180, 16384), "skill": (180, 16384), "adapter": (30, 4096)}
+    targets: list[tuple[Path, str]] = [(root / "AGENTS.md", "root")]
+    for path in agent_files:
+        relative = path.relative_to(root).as_posix()
+        category = "skill" if relative.startswith(".agents/skills/") else "adapter"
+        targets.append((path, category))
+
+    for path, category in targets:
+        max_lines, max_bytes = limits[category]
+        raw = path.read_bytes()
+        lines = len(raw.decode("utf-8").splitlines())
+        if lines > max_lines or len(raw) > max_bytes:
+            raise _fail(
+                path,
+                f"instruction budget exceeded: {lines}/{max_lines} lines, "
+                f"{len(raw)}/{max_bytes} bytes",
+            )
+
+
+def validate_skill_layout(root: Path, agent_files: Iterable[Path]) -> None:
+    for path in agent_files:
+        relative = path.relative_to(root)
+        if path.name != "SKILL.md":
+            continue
+        if relative.parts[:2] in {(".agents", "skills"), (".claude", "skills")}:
+            if len(relative.parts) != 4:
+                raise _fail(path, "Skill must be exactly one directory below skills/")
+
+
+def _repository_files(root: Path) -> Iterable[Path]:
+    """Return tracked and non-ignored untracked files without scanning build output."""
+    try:
+        output = subprocess.check_output(
+            [
+                "git",
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            cwd=root,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise ValidationError("git ls-files failed while discovering repository files") from exc
+
+    for encoded in output.split(b"\0"):
+        if not encoded:
+            continue
+        try:
+            relative = Path(encoded.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValidationError("repository file names must be valid UTF-8") from exc
+        path = root / relative
+        if path.is_file():
+            yield path
+
+
+def _text_files(root: Path) -> Iterable[Path]:
+    suffixes = {".md", ".mdc", ".py", ".sh", ".yml", ".yaml", ".txt"}
+    for path in _repository_files(root):
+        if path.suffix in suffixes:
+            yield path
+
+
+def validate_text_hygiene(root: Path) -> None:
+    invisible_controls = {
+        "\ufeff",  # byte-order mark
+        "\u200b",  # zero-width space
+        "\u200c",  # zero-width non-joiner
+        "\u200d",  # zero-width joiner
+        "\u2060",  # word joiner
+        *map(chr, range(0x202A, 0x202F)),  # bidirectional formatting controls
+        *map(chr, range(0x2066, 0x206A)),  # bidirectional isolates
+    }
+    for path in _text_files(root):
+        try:
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _fail(path, f"must be valid UTF-8: {exc}") from exc
+        if raw and not raw.endswith(b"\n"):
+            raise _fail(path, "must end with a newline")
+        if found := sorted({character for character in text if character in invisible_controls}):
+            codepoints = ", ".join(f"U+{ord(character):04X}" for character in found)
+            raise _fail(path, f"contains invisible Unicode control: {codepoints}")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if line != line.rstrip(" \t"):
+                raise _fail(path, f"trailing whitespace on line {line_number}")
+
+
+def _without_code_fences(text: str) -> str:
+    output: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        marker = "```" if stripped.startswith("```") else "~~~" if stripped.startswith("~~~") else None
+        if marker:
+            fence = None if fence == marker else marker if fence is None else fence
+            output.append("")
+            continue
+        output.append("" if fence else line)
+    visible = "\n".join(output)
+    return re.sub(r"`+[^`\n]*`+", "", visible)
+
+
+def _markdown_targets(text: str) -> Iterable[str]:
+    visible = _without_code_fences(text)
+    references = re.compile(r"^\s*\[[^\]]+\]:\s*<?([^\s>]+)>?", re.MULTILINE)
+    inline_start = re.compile(r"!?\[[^\]]*\]\(")
+    for match in inline_start.finditer(visible):
+        cursor = match.end()
+        while cursor < len(visible) and visible[cursor].isspace():
+            cursor += 1
+        if cursor < len(visible) and visible[cursor] == "<":
+            end = visible.find(">", cursor + 1)
+            if end != -1:
+                yield visible[cursor + 1 : end]
+            continue
+
+        start = cursor
+        depth = 1
+        while cursor < len(visible):
+            character = visible[cursor]
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    raw = visible[start:cursor].strip()
+                    if raw:
+                        yield raw.split(maxsplit=1)[0]
+                    break
+            cursor += 1
+    yield from (match.group(1) for match in references.finditer(visible))
+
+
+def _assert_exact_case(root: Path, relative: Path, source: Path) -> None:
+    current = root
+    for part in relative.parts:
+        names = {entry.name for entry in current.iterdir()}
+        if part not in names:
+            raise _fail(source, f"link target has wrong case or is missing: {relative}")
+        current = current / part
+
+
+def _markdown_anchors(text: str) -> set[str]:
+    anchors: set[str] = set()
+    counts: dict[str, int] = defaultdict(int)
+    for match in re.finditer(r"^#{1,6}\s+(.+?)\s*#*\s*$", _without_code_fences(text), re.MULTILINE):
+        heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", match.group(1))
+        heading = re.sub(r"<[^>]+>", "", heading)
+        heading = unicodedata.normalize("NFKC", heading).casefold()
+        heading = "".join(
+            character
+            for character in heading
+            if character.isalnum() or character in {" ", "-", "_"}
+        )
+        base = re.sub(r"\s+", "-", heading.strip())
+        if not base:
+            continue
+        count = counts[base]
+        counts[base] += 1
+        anchors.add(base if count == 0 else f"{base}-{count}")
+    return anchors
+
+
+def validate_markdown_links(root: Path) -> None:
+    paths = [path for path in _repository_files(root) if path.suffix in {".md", ".mdc"}]
+    for path in sorted(paths):
+        text = path.read_text(encoding="utf-8")
+        for target in _markdown_targets(text):
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            path_part, _, fragment = target.partition("#")
+            clean = unquote(path_part.split("?", 1)[0])
+            candidate = path.resolve() if not clean else (path.parent / clean).resolve()
+            try:
+                relative = candidate.relative_to(root.resolve())
+            except ValueError as exc:
+                raise _fail(path, f"link escapes repository: {target}") from exc
+            if not candidate.exists():
+                raise _fail(path, f"relative link target is missing: {target}")
+            _assert_exact_case(root.resolve(), relative, path)
+            if fragment and candidate.suffix in {".md", ".mdc"}:
+                anchor = unquote(fragment).casefold()
+                anchors = _markdown_anchors(candidate.read_text(encoding="utf-8"))
+                if anchor not in anchors:
+                    raise _fail(path, f"Markdown anchor is missing: {target}")
+
+
+def validate_yaml_files(root: Path) -> None:
+    repository_files = list(_repository_files(root))
+    for path in sorted(
+        path for path in repository_files if path.suffix in {".yml", ".yaml"}
+    ):
+        try:
+            data = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyBaseLoader)
+        except (yaml.YAMLError, ValidationError) as exc:
+            raise _fail(path, f"invalid YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise _fail(path, "YAML document must be a mapping")
+
+    issue_root = root / ".github/ISSUE_TEMPLATE"
+    for path in sorted(
+        path
+        for path in repository_files
+        if path.parent == issue_root and path.suffix == ".md"
+    ):
+        data, body = load_frontmatter(path)
+        required = {"name", "about", "title", "labels", "assignees"}
+        if set(data) != required:
+            raise _fail(path, f"Issue template keys must be {sorted(required)}")
+        for key in required:
+            if not isinstance(data[key], str):
+                raise _fail(path, f"{key} must be a string")
+        required_headings = {
+            "## 背景と目的",
+            "## 根拠と未確認事項",
+            "## 現在と対応後",
+            "## 対応範囲",
+            "## 非対象",
+            "## 受け入れ条件",
+            "## 検証方法",
+            "## 公開安全性",
+            "## 未確認事項・残るリスク",
+        }
+        actual_headings = {
+            line.strip() for line in body.splitlines() if line.startswith("## ")
+        }
+        missing = required_headings - actual_headings
+        if missing:
+            raise _fail(path, f"Issue template headings missing: {sorted(missing)}")
+
+
+def validate_workflow(root: Path) -> None:
+    path = root / ".github/workflows/agent-harness.yml"
+    data = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyBaseLoader)
+    triggers = data.get("on", {})
+    if not isinstance(triggers, dict) or "push" not in triggers or "pull_request" not in triggers:
+        raise _fail(path, "workflow must define push and pull_request triggers")
+    if "pull_request_target" in triggers:
+        raise _fail(path, "pull_request_target is not allowed")
+    pull_request = triggers["pull_request"]
+    if not isinstance(pull_request, dict) or pull_request.get("branches") != ["main"]:
+        raise _fail(path, "pull_request must target main")
+
+    required_paths = {
+        "README.md",
+        ".gitignore",
+        "AGENTS.md",
+        "**/AGENTS.md",
+        "CLAUDE.md",
+        ".agents/**",
+        ".claude/**",
+        ".cursor/**",
+        "docs/**",
+        "scripts/verify-agent-harness.sh",
+        "scripts/validate_agent_frontmatter.py",
+        "requirements-agent-harness.txt",
+        ".github/ISSUE_TEMPLATE/**",
+        ".github/pull_request_template.md",
+        ".github/workflows/agent-harness.yml",
+    }
+    for event in ("push", "pull_request"):
+        event_data = triggers[event]
+        if not isinstance(event_data, dict):
+            raise _fail(path, f"{event} trigger must be a mapping")
+        actual_paths = set(event_data.get("paths", []))
+        missing = required_paths - actual_paths
+        if missing:
+            raise _fail(path, f"{event}.paths missing {sorted(missing)}")
+
+    permissions = data.get("permissions")
+    if permissions != {"contents": "read"}:
+        raise _fail(path, "workflow permissions must be contents: read only")
+
+    jobs = data.get("jobs", {})
+    verify = jobs.get("verify", {}) if isinstance(jobs, dict) else {}
+    if not isinstance(verify, dict) or any(
+        key in verify for key in ("if", "continue-on-error")
+    ):
+        raise _fail(path, "verify job must exist and must not be conditionally disabled")
+    if verify.get("runs-on") != "ubuntu-latest" or verify.get("timeout-minutes") != "5":
+        raise _fail(path, "verify job must use ubuntu-latest with a five-minute timeout")
+    steps = verify.get("steps", []) if isinstance(verify, dict) else []
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        raise _fail(path, "verify.steps must be a list of mappings")
+    if any(any(key in step for key in ("if", "continue-on-error")) for step in steps):
+        raise _fail(path, "verification steps must not be conditionally disabled")
+    by_name = {step.get("name"): step for step in steps}
+    if len(by_name) != len(steps) or None in by_name:
+        raise _fail(path, "every verification step must have a unique name")
+
+    checkout = by_name.get("Checkout repository", {})
+    checkout_with = checkout.get("with", {}) if isinstance(checkout, dict) else {}
+    if checkout.get("uses") != "actions/checkout@v4" or checkout_with != {
+        "persist-credentials": "false"
+    }:
+        raise _fail(path, "checkout must use actions/checkout@v4 without credentials")
+
+    setup = by_name.get("Set up Python", {})
+    setup_with = setup.get("with", {}) if isinstance(setup, dict) else {}
+    if setup.get("uses") != "actions/setup-python@v6" or setup_with != {
+        "python-version": "3.14"
+    }:
+        raise _fail(path, "Python setup must use actions/setup-python@v6 and Python 3.14")
+
+    expected_runs = {
+        "Install validation dependencies": (
+            "python -m pip install --disable-pip-version-check "
+            "-r requirements-agent-harness.txt"
+        ),
+        "Install shellcheck": (
+            "sudo apt-get update\n"
+            "sudo apt-get install -y shellcheck"
+        ),
+        "Lint verification script": "shellcheck scripts/verify-agent-harness.sh",
+        "Verify agent harness": "bash scripts/verify-agent-harness.sh",
+    }
+    for name, expected in expected_runs.items():
+        step = by_name.get(name, {})
+        if not isinstance(step, dict) or step.get("run", "").strip() != expected:
+            raise _fail(path, f"workflow step must run the canonical command: {name}")
+
+    syntax = by_name.get("Validate script syntax", {})
+    syntax_commands = syntax.get("run", "").splitlines() if isinstance(syntax, dict) else []
+    if syntax_commands != [
+        "bash -n scripts/verify-agent-harness.sh",
+        "python -m py_compile scripts/validate_agent_frontmatter.py",
+    ]:
+        raise _fail(path, "syntax step must run bash -n and Python py_compile")
+
+
+def _authoring_files(root: Path) -> Iterable[Path]:
+    for path in _repository_files(root):
+        relative = path.relative_to(root).as_posix()
+        if relative in {"README.md", "AGENTS.md", "CLAUDE.md"}:
+            yield path
+        elif relative.startswith(("docs/", ".agents/", ".claude/", ".cursor/")):
+            yield path
+        elif relative.startswith(
+            (".github/ISSUE_TEMPLATE/", ".github/workflows/")
+        ) or relative == ".github/pull_request_template.md":
+            yield path
+
+
+def validate_source_specific_residue(root: Path) -> None:
+    forbidden = (
+        "WordPack",
+        "wordpack-for-english",
+        "Lexicon",
+        "apps/frontend",
+        "apps/backend",
+        "docs/operations",
+        "ui-ux-review",
+        "Cloud Run",
+        "Firebase",
+        "Firestore",
+        "Google OAuth",
+        "mc-bot-egent-practice-1",
+    )
+    for path in _authoring_files(root):
+        text = path.read_text(encoding="utf-8").casefold()
+        for term in forbidden:
+            if term.casefold() in text:
+                raise _fail(path, f"source-specific term remains: {term}")
+
+
+def _body_without_frontmatter(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    if text.startswith("---\n"):
+        _, text = text.split("\n---\n", 1)
+    return text
+
+
+def _normalize_paragraph(value: str) -> str:
+    value = re.sub(r"\[[^\]]*\]\([^)]*\)", " ", value)
+    value = re.sub(r"[`#>*_|-]", " ", value)
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def validate_long_duplicates(root: Path) -> None:
+    canonical = [
+        root / "AGENTS.md",
+        *sorted((root / "docs").rglob("*.md")),
+        *sorted((root / ".agents/skills").glob("*/SKILL.md")),
+    ]
+    adapters = [
+        *sorted((root / ".claude").rglob("*.md")),
+        *sorted((root / ".cursor").rglob("*.mdc")),
+    ]
+
+    canonical_text = "\n".join(
+        _normalize_paragraph(_body_without_frontmatter(path)) for path in canonical
+    )
+    for path in adapters:
+        for paragraph in re.split(r"\n\s*\n", _body_without_frontmatter(path)):
+            normalized = _normalize_paragraph(paragraph)
+            if len(normalized) >= 160 and normalized in canonical_text:
+                raise _fail(path, "adapter duplicates a long canonical paragraph")
+
+    owners: dict[str, list[Path]] = defaultdict(list)
+    for path in canonical:
+        for paragraph in re.split(r"\n\s*\n", _body_without_frontmatter(path)):
+            normalized = _normalize_paragraph(paragraph)
+            if len(normalized) >= 240:
+                owners[normalized].append(path)
+    for paths in owners.values():
+        unique = sorted(set(paths))
+        if len(unique) > 1:
+            raise ValidationError(
+                "long canonical paragraph is duplicated in: "
+                + ", ".join(str(_relative(path, root)) for path in unique)
+            )
+
+    normalized_files = {
+        path: _normalize_paragraph(_body_without_frontmatter(path)) for path in canonical
+    }
+    for first, second in combinations(canonical, 2):
+        blocks = SequenceMatcher(
+            None,
+            normalized_files[first],
+            normalized_files[second],
+            autojunk=False,
+        ).get_matching_blocks()
+        longest = max((block.size for block in blocks), default=0)
+        if longest >= 120:
+            raise ValidationError(
+                "canonical files share an overlong text block: "
+                f"{_relative(first, root)}, {_relative(second, root)} ({longest} chars)"
+            )
+
+
+def validate_adapter_mapping(root: Path) -> None:
+    canonical_names = {
+        path.parent.name for path in (root / ".agents/skills").glob("*/SKILL.md")
+    }
+    adapter_names = {
+        path.parent.name for path in (root / ".claude/skills").glob("*/SKILL.md")
+    }
+    if canonical_names != adapter_names:
+        raise ValidationError(
+            "canonical and Claude Skill names must match: "
+            f"canonical={sorted(canonical_names)}, adapters={sorted(adapter_names)}"
+        )
+
+    for name in canonical_names:
+        path = root / f".claude/skills/{name}/SKILL.md"
+        _, body = load_frontmatter(path)
+        expected = f"../../../.agents/skills/{name}/SKILL.md"
+        expected_body = (
+            f"# {name} adapter\n\n"
+            f"[共有Skill]({expected})を唯一の手順正本として適用します。"
+        )
+        if body != expected_body:
+            raise _fail(path, "Skill adapter must contain only its canonical reference")
+
+    required_scope = {
+        "README.md",
+        ".gitignore",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".agents/**/*",
+        ".claude/**/*",
+        ".cursor/**/*",
+        "docs/agent-harness.md",
+        "docs/agent-principles.md",
+        "docs/documentation-structure.md",
+        "docs/ai-governance/**/*",
+        "docs/security-publication-checklist.md",
+        "scripts/verify-agent-harness.sh",
+        "scripts/validate_agent_frontmatter.py",
+        "requirements-agent-harness.txt",
+        ".github/ISSUE_TEMPLATE/**/*",
+        ".github/pull_request_template.md",
+        ".github/workflows/agent-harness.yml",
+    }
+    claude_rule = root / ".claude/rules/agent-harness.md"
+    claude_data, claude_body = load_frontmatter(claude_rule)
+    if set(claude_data["paths"]) != required_scope:
+        raise _fail(claude_rule, "paths must exactly match the harness surface")
+    expected_claude_body = (
+        "# Agent harness adapter\n\n"
+        "エージェントルールを変更する時は、"
+        "[`docs/agent-harness.md`](../../docs/agent-harness.md) と "
+        "[`13-maintenance-policy.md`](../../docs/ai-governance/13-maintenance-policy.md) "
+        "を正本として参照します。このadapterへ手順本文を複製しません。"
+    )
+    if claude_body != expected_claude_body:
+        raise _fail(claude_rule, "body must contain only canonical routing text")
+
+    cursor_rule = root / ".cursor/rules/agent-harness.mdc"
+    cursor_data, cursor_body = load_frontmatter(cursor_rule)
+    cursor_scope = set(cursor_data["globs"].split(","))
+    cursor_expected = {
+        "README.md",
+        ".gitignore",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".agents/**",
+        ".claude/**",
+        ".cursor/**",
+        "docs/**",
+        "scripts/verify-agent-harness.sh",
+        "scripts/validate_agent_frontmatter.py",
+        "requirements-agent-harness.txt",
+        ".github/ISSUE_TEMPLATE/**",
+        ".github/pull_request_template.md",
+        ".github/workflows/agent-harness.yml",
+    }
+    if cursor_scope != cursor_expected:
+        raise _fail(cursor_rule, "globs must exactly match the harness surface")
+    expected_cursor_body = (
+        "# Agent harness adapter\n\n"
+        "エージェントルールを変更する時は、"
+        "[harness設計](../../docs/agent-harness.md) と "
+        "[保守方針](../../docs/ai-governance/13-maintenance-policy.md) "
+        "を正本として参照します。このadapterへ手順本文を複製しません。"
+    )
+    if cursor_body != expected_cursor_body:
+        raise _fail(cursor_rule, "body must contain only canonical routing text")
+
+
+def validate_no_nested_agents(root: Path) -> None:
+    nested = [
+        path for path in _repository_files(root) if path.name == "AGENTS.md" and path.parent != root
+    ]
+    if nested:
+        raise ValidationError(
+            "nested AGENTS.md is not allowed before a real product path exists: "
+            + ", ".join(str(_relative(path, root)) for path in nested)
+        )
+
+
+def validate_repository(root: Path) -> None:
+    if (root / "CLAUDE.md").read_bytes() != b"@AGENTS.md\n":
+        raise _fail(root / "CLAUDE.md", "must contain exactly @AGENTS.md and one newline")
+    agent_files = discover_agent_files(root)
+    if not agent_files:
+        raise ValidationError("no agent Skill or rule files were discovered")
+    for path in agent_files:
+        validate_path(path, root)
+    validate_skill_layout(root, agent_files)
+    validate_instruction_budgets(root, agent_files)
+    validate_text_hygiene(root)
+    validate_markdown_links(root)
+    validate_yaml_files(root)
+    validate_workflow(root)
+    validate_source_specific_residue(root)
+    validate_long_duplicates(root)
+    validate_adapter_mapping(root)
+    validate_no_nested_agents(root)
+
+
+def run_self_test() -> None:
+    cases = {
+        ".agents/skills/valid-skill/SKILL.md": (
+            "---\nname: valid-skill\ndescription: valid\n---\n\n# Valid\n",
+            True,
+        ),
+        ".agents/skills/duplicate/SKILL.md": (
+            "---\nname: duplicate\nname: duplicate\ndescription: bad\n---\n\n# Bad\n",
+            False,
+        ),
+        ".agents/skills/wrong-name/SKILL.md": (
+            "---\nname: other\ndescription: bad\n---\n\n# Bad\n",
+            False,
+        ),
+        ".agents/skills/missing/SKILL.md": ("name: missing\n", False),
+    }
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        for relative, (content, should_pass) in cases.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            passed = True
+            try:
+                validate_path(path, root)
+            except (OSError, ValidationError):
+                passed = False
+            if passed != should_pass:
+                raise ValidationError(f"self-test failed for {relative}")
+
+        cursor = root / ".cursor/rules/test.mdc"
+        cursor.parent.mkdir(parents=True)
+        cursor.write_text(
+            "---\ndescription: test\nglobs: test\nalwaysApply: \"false\"\n---\n\n# Test\n",
+            encoding="utf-8",
+        )
+        try:
+            validate_path(cursor, root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test accepted string alwaysApply=false")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="*", type=Path)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--repository", type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.self_test:
+            run_self_test()
+        root = (args.repository or Path.cwd()).resolve()
+        for path in args.paths:
+            validate_path(path, root)
+        if args.repository is not None:
+            validate_repository(root)
+    except (OSError, ValidationError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
