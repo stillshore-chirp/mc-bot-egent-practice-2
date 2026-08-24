@@ -81,7 +81,7 @@ merge、Issue・PRのclose、release、deploy、force-push、公開済み履歴�
 | nested `AGENTS.md` | 100以下 | 8 KiB以下 |
 | rule / Skill adapter | 30以下 | 4 KiB以下 |
 | canonical Skill | 180以下 | 16 KiB以下 |
-| ルート + 一つのnested `AGENTS.md` | - | 24 KiB以下 |
+| ルート + 対象pathで有効な全nested `AGENTS.md` | - | 24 KiB以下 |
 
 上限を超える場合は、常時読込である必要、分割できない理由、3製品への影響をIssueとPRへ記録し、検証scriptの上限を黙って緩和しません。
 

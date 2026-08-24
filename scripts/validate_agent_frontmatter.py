@@ -879,6 +879,18 @@ def _nested_adapter_contract(
     return claude_adapter, claude_data, cursor_adapter, cursor_data, body
 
 
+def _active_nested_chain_bytes(
+    root_bytes: int,
+    path: Path,
+    nested_bytes: dict[Path, int],
+) -> int:
+    return root_bytes + sum(
+        size
+        for candidate, size in nested_bytes.items()
+        if path.is_relative_to(candidate.parent)
+    )
+
+
 def validate_nested_agents(root: Path) -> None:
     repository_files = list(_repository_files(root))
     root_agents = root / "AGENTS.md"
@@ -888,6 +900,7 @@ def validate_nested_agents(root: Path) -> None:
         for path in repository_files
         if path.name == "AGENTS.md" and path.parent != root
     ]
+    nested_bytes = {path: len(path.read_bytes()) for path in nested}
     expected_claude_adapters: set[Path] = set()
     expected_cursor_adapters: set[Path] = set()
     for path in nested:
@@ -943,8 +956,17 @@ def validate_nested_agents(root: Path) -> None:
                 f"nested instruction budget exceeded: {lines}/100 lines, "
                 f"{len(raw)}/8192 bytes",
             )
-        if root_bytes + len(raw) > 24576:
-            raise _fail(path, "root and nested AGENTS.md exceed 24576 combined bytes")
+        active_bytes = _active_nested_chain_bytes(
+            root_bytes,
+            path,
+            nested_bytes,
+        )
+        if active_bytes > 24576:
+            raise _fail(
+                path,
+                "root and active nested AGENTS.md chain exceed "
+                f"24576 combined bytes: {active_bytes}",
+            )
 
     actual_claude_adapters = set(root.glob(".claude/rules/nested-agents-*.md"))
     actual_cursor_adapters = set(root.glob(".cursor/rules/nested-agents-*.mdc"))
@@ -1341,6 +1363,67 @@ def run_self_test() -> None:
                 raise ValidationError("orphan adapter self-test failed") from exc
         else:
             raise ValidationError("self-test accepted an orphan path adapter")
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(
+            ["git", "init", "--quiet"],
+            cwd=root,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        (root / "AGENTS.md").write_text("# Root\n", encoding="utf-8")
+        budget_nested = [
+            root / "apps/AGENTS.md",
+            root / "apps/bot/AGENTS.md",
+            root / "apps/bot/deep/AGENTS.md",
+        ]
+        sibling = root / "other/AGENTS.md"
+        boundary_bytes = {
+            budget_nested[0]: 12000,
+            budget_nested[-1]: 12000,
+            sibling: 12000,
+        }
+        if (
+            _active_nested_chain_bytes(576, budget_nested[-1], boundary_bytes)
+            != 24576
+        ):
+            raise ValidationError("nested chain boundary self-test failed")
+        for nested_path in budget_nested:
+            nested_path.parent.mkdir(parents=True, exist_ok=True)
+            nested_path.write_text(
+                "# Scope\n" + "x" * 8181 + "\n",
+                encoding="utf-8",
+            )
+            claude_path, claude_data, cursor_path, cursor_data, body = (
+                _nested_adapter_contract(root, nested_path)
+            )
+            for adapter_path, data in (
+                (claude_path, claude_data),
+                (cursor_path, cursor_data),
+            ):
+                adapter_path.parent.mkdir(parents=True, exist_ok=True)
+                frontmatter = yaml.safe_dump(
+                    data,
+                    allow_unicode=True,
+                    sort_keys=False,
+                ).rstrip()
+                adapter_path.write_text(
+                    f"---\n{frontmatter}\n---\n\n{body}\n",
+                    encoding="utf-8",
+                )
+        (budget_nested[-1].parent / "bot.py").write_text(
+            "pass\n",
+            encoding="utf-8",
+        )
+        try:
+            validate_nested_agents(root)
+        except ValidationError as exc:
+            if "active nested AGENTS.md chain exceed" not in str(exc):
+                raise ValidationError("nested chain budget self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted an oversized nested rule chain")
 
 
 def parse_args() -> argparse.Namespace:
