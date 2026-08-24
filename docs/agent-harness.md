@@ -122,4 +122,4 @@ bash scripts/verify-agent-harness.sh
 
 CIはエージェントルールと共同作業文書の関連pathが変わった場合だけ同じ検証を実行します。製品コード用のCIは製品実装の設計後に追加します。
 
-検証対象は、gitが管理する非ignore fileのうち、共通核、nested rule、Skill、tool rule・adapter、明示した共同作業文書、template、harness workflow・scriptです。将来の製品コード、一般docs、parser・security fixture、binary assetの内容検査は製品CIへ分離します。移植元固有語と廃止指示の検査もactiveなbootstrap成果物へ限定し、無関係なprovenance文書やcode例を失敗条件にしません。
+検証対象は、gitが管理する非ignore fileのうち、共通核、nested rule、Skill、tool rule・adapter、明示した共同作業文書、template、harness workflow・scriptです。将来の製品コード、一般docs、parser・security fixture、binary assetの内容検査は製品CIへ分離します。移植元固有語と廃止指示の検査もactiveなbootstrap成果物へ限定し、無関係なprovenance文書を失敗条件にしません。active ruleではinline codeとcode fence内も競合検査の対象です。

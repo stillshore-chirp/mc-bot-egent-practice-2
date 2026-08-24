@@ -1,6 +1,7 @@
 ---
 paths:
   - "README.md"
+  - ".gitignore"
   - "AGENTS.md"
   - "CLAUDE.md"
   - ".agents/**/*"

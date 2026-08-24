@@ -279,6 +279,7 @@ def _repository_files(root: Path) -> Iterable[Path]:
 def _harness_files(root: Path) -> Iterable[Path]:
     exact = {
         "README.md",
+        ".gitignore",
         "AGENTS.md",
         "CLAUDE.md",
         *HARNESS_DOCUMENTS,
@@ -505,6 +506,7 @@ def validate_workflow(root: Path) -> None:
 
     required_paths = {
         "README.md",
+        ".gitignore",
         "AGENTS.md",
         "**/AGENTS.md",
         "CLAUDE.md",
@@ -611,7 +613,7 @@ def _bootstrap_source_files(root: Path) -> Iterable[Path]:
             continue
         if relative in exact or relative.startswith(
             (".agents/", ".claude/", ".cursor/")
-        ):
+        ) or (path.name == "AGENTS.md" and path.parent != root):
             yield path
 
 
@@ -622,7 +624,7 @@ def validate_source_specific_residue(root: Path) -> None:
         ("mc-bot-egent-practice-1", r"mc-bot-egent-practice-1"),
     )
     for path in _bootstrap_source_files(root):
-        text = _without_code_fences(path.read_text(encoding="utf-8")).casefold()
+        text = path.read_text(encoding="utf-8").casefold()
         for term, pattern in forbidden:
             if re.search(pattern, text, re.IGNORECASE):
                 raise _fail(path, f"source-specific term remains: {term}")
@@ -645,7 +647,7 @@ def validate_conflicting_instructions(root: Path) -> None:
         "mergeまで通常配送",
     )
     for path in _bootstrap_source_files(root):
-        visible = _without_code_fences(path.read_text(encoding="utf-8"))
+        visible = path.read_text(encoding="utf-8")
         for phrase in retired:
             if phrase in visible:
                 raise _fail(path, f"retired or conflicting instruction remains: {phrase}")
@@ -744,6 +746,7 @@ def validate_adapter_mapping(root: Path) -> None:
 
     required_scope = {
         "README.md",
+        ".gitignore",
         "AGENTS.md",
         "CLAUDE.md",
         ".agents/**/*",
@@ -788,6 +791,7 @@ def validate_adapter_mapping(root: Path) -> None:
     )
     cursor_expected = {
         "README.md",
+        ".gitignore",
         "AGENTS.md",
         "CLAUDE.md",
         ".agents/**",
@@ -1120,11 +1124,7 @@ def run_self_test() -> None:
                 raise ValidationError("source residue self-test failed") from exc
         else:
             raise ValidationError("self-test accepted an unambiguous source identifier")
-        readme.write_text(
-            "# Project\n\n履歴上のsource名は `WordPack` です。\n",
-            encoding="utf-8",
-        )
-        validate_source_specific_residue(root)
+        readme.write_text("# Project\n", encoding="utf-8")
 
         history = root / "docs/policy-history.md"
         history.write_text("# History\n\n旧語は下書きPRでした。\n", encoding="utf-8")
@@ -1142,12 +1142,27 @@ def run_self_test() -> None:
             "# Active\n\n履歴上の旧語は `下書きPR` です。\n",
             encoding="utf-8",
         )
-        validate_conflicting_instructions(root)
+        try:
+            validate_conflicting_instructions(root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test ignored a code-formatted active instruction")
+        active_rule.write_text("# Active\n\n通常は非Draft PRを使います。\n", encoding="utf-8")
 
         nested = root / "apps/bot/AGENTS.md"
         nested.parent.mkdir(parents=True)
         nested.write_text("# Bot scope\n", encoding="utf-8")
         (nested.parent / "bot.py").write_text("pass\n", encoding="utf-8")
+
+        nested.write_text("# Bot scope\n\n通常はDraft\n", encoding="utf-8")
+        try:
+            validate_conflicting_instructions(root)
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test ignored a conflicting nested AGENTS.md")
+        nested.write_text("# Bot scope\n", encoding="utf-8")
 
         try:
             validate_nested_agents(root)
