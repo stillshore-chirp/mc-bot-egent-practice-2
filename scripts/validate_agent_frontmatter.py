@@ -29,6 +29,17 @@ class ValidationError(ValueError):
     """Raised when an agent harness contract is invalid."""
 
 
+HARNESS_DOCUMENTS = (
+    "docs/agent-harness.md",
+    "docs/agent-principles.md",
+    "docs/documentation-structure.md",
+    "docs/security-publication-checklist.md",
+    "docs/ai-governance/03-evidence-and-completion-gates.md",
+    "docs/ai-governance/13-maintenance-policy.md",
+    "docs/ai-governance/14-issue-quality-gate.md",
+)
+
+
 class UniqueKeySafeLoader(yaml.SafeLoader):
     """SafeLoader variant that rejects duplicate mapping keys."""
 
@@ -112,8 +123,14 @@ def _require_exact_keys(data: dict[str, Any], keys: set[str], path: Path) -> Non
         raise _fail(path, f"frontmatter keys must be {sorted(keys)}, got {sorted(actual)}")
 
 
-def validate_skill(data: dict[str, Any], path: Path) -> None:
-    _require_exact_keys(data, {"name", "description"}, path)
+def validate_skill(
+    data: dict[str, Any], path: Path, *, thin_adapter: bool = False
+) -> None:
+    required = {"name", "description"}
+    if not required.issubset(data):
+        raise _fail(path, f"frontmatter must include {sorted(required)}")
+    if thin_adapter:
+        _require_exact_keys(data, required, path)
     name = _require_string(data, "name", path)
     _require_string(data, "description", path)
     if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None:
@@ -134,7 +151,15 @@ def validate_claude_rule(data: dict[str, Any], path: Path) -> None:
 def validate_cursor_rule(data: dict[str, Any], path: Path) -> None:
     _require_exact_keys(data, {"description", "globs", "alwaysApply"}, path)
     _require_string(data, "description", path)
-    _require_string(data, "globs", path)
+    globs = data.get("globs")
+    valid_globs = isinstance(globs, str) and bool(globs.strip())
+    valid_globs = valid_globs or (
+        isinstance(globs, list)
+        and bool(globs)
+        and all(isinstance(item, str) and item.strip() for item in globs)
+    )
+    if not valid_globs:
+        raise _fail(path, "globs must be a non-empty string or list of strings")
     if data.get("alwaysApply") is not False:
         raise _fail(path, "alwaysApply must be the YAML boolean false")
 
@@ -155,12 +180,20 @@ def infer_kind(path: Path, root: Path) -> str:
 
 def validate_path(path: Path, root: Path) -> None:
     data, _ = load_frontmatter(path)
+    relative = _relative(path, root).as_posix()
+    kind = infer_kind(path, root)
+    if kind == "skill":
+        validate_skill(
+            data,
+            path,
+            thin_adapter=relative.startswith(".claude/skills/"),
+        )
+        return
     validators = {
-        "skill": validate_skill,
         "claude-rule": validate_claude_rule,
         "cursor-rule": validate_cursor_rule,
     }
-    validators[infer_kind(path, root)](data, path)
+    validators[kind](data, path)
 
 
 def discover_agent_files(root: Path) -> list[Path]:
@@ -232,9 +265,33 @@ def _repository_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+def _harness_files(root: Path) -> Iterable[Path]:
+    exact = {
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        *HARNESS_DOCUMENTS,
+        "requirements-agent-harness.txt",
+        "scripts/validate_agent_frontmatter.py",
+        "scripts/verify-agent-harness.sh",
+        ".github/ISSUE_TEMPLATE/feature.md",
+        ".github/pull_request_template.md",
+        ".github/workflows/agent-harness.yml",
+    }
+    for path in _repository_files(root):
+        relative = path.relative_to(root).as_posix()
+        if (
+            relative in exact
+            or (path.name == "AGENTS.md" and path.parent != root)
+            or relative.startswith((".agents/", ".claude/", ".cursor/"))
+            or relative.startswith("docs/ai-governance/")
+        ):
+            yield path
+
+
 def _text_files(root: Path) -> Iterable[Path]:
     suffixes = {".md", ".mdc", ".py", ".sh", ".yml", ".yaml", ".txt"}
-    for path in _repository_files(root):
+    for path in _harness_files(root):
         if path.suffix in suffixes:
             yield path
 
@@ -342,7 +399,7 @@ def _markdown_anchors(text: str) -> set[str]:
 
 
 def validate_markdown_links(root: Path) -> None:
-    paths = [path for path in _repository_files(root) if path.suffix in {".md", ".mdc"}]
+    paths = [path for path in _harness_files(root) if path.suffix in {".md", ".mdc"}]
     for path in sorted(paths):
         text = path.read_text(encoding="utf-8")
         for target in _markdown_targets(text):
@@ -366,22 +423,25 @@ def validate_markdown_links(root: Path) -> None:
 
 
 def validate_yaml_files(root: Path) -> None:
-    repository_files = list(_repository_files(root))
+    repository_files = list(_harness_files(root))
     for path in sorted(
         path for path in repository_files if path.suffix in {".yml", ".yaml"}
     ):
         try:
-            data = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyBaseLoader)
+            list(
+                yaml.load_all(
+                    path.read_text(encoding="utf-8"),
+                    Loader=UniqueKeyBaseLoader,
+                )
+            )
         except (yaml.YAMLError, ValidationError) as exc:
             raise _fail(path, f"invalid YAML: {exc}") from exc
-        if not isinstance(data, dict):
-            raise _fail(path, "YAML document must be a mapping")
 
     issue_root = root / ".github/ISSUE_TEMPLATE"
     for path in sorted(
         path
         for path in repository_files
-        if path.parent == issue_root and path.suffix == ".md"
+        if path == issue_root / "feature.md"
     ):
         data, body = load_frontmatter(path)
         required = {"name", "about", "title", "labels", "assignees"}
@@ -411,7 +471,18 @@ def validate_yaml_files(root: Path) -> None:
 
 def validate_workflow(root: Path) -> None:
     path = root / ".github/workflows/agent-harness.yml"
-    data = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyBaseLoader)
+    try:
+        documents = list(
+            yaml.load_all(
+                path.read_text(encoding="utf-8"),
+                Loader=UniqueKeyBaseLoader,
+            )
+        )
+    except (yaml.YAMLError, ValidationError) as exc:
+        raise _fail(path, f"invalid workflow YAML: {exc}") from exc
+    if len(documents) != 1 or not isinstance(documents[0], dict):
+        raise _fail(path, "workflow must be a single YAML mapping")
+    data = documents[0]
     triggers = data.get("on", {})
     if not isinstance(triggers, dict) or "push" not in triggers or "pull_request" not in triggers:
         raise _fail(path, "workflow must define push and pull_request triggers")
@@ -423,18 +494,22 @@ def validate_workflow(root: Path) -> None:
 
     required_paths = {
         "README.md",
-        ".gitignore",
         "AGENTS.md",
         "**/AGENTS.md",
         "CLAUDE.md",
         ".agents/**",
         ".claude/**",
         ".cursor/**",
-        "docs/**",
+        *(
+            relative
+            for relative in HARNESS_DOCUMENTS
+            if not relative.startswith("docs/ai-governance/")
+        ),
+        "docs/ai-governance/**",
         "scripts/verify-agent-harness.sh",
         "scripts/validate_agent_frontmatter.py",
         "requirements-agent-harness.txt",
-        ".github/ISSUE_TEMPLATE/**",
+        ".github/ISSUE_TEMPLATE/feature.md",
         ".github/pull_request_template.md",
         ".github/workflows/agent-harness.yml",
     }
@@ -509,8 +584,11 @@ def validate_workflow(root: Path) -> None:
 
 
 def _authoring_files(root: Path) -> Iterable[Path]:
+    text_suffixes = {".md", ".mdc", ".txt", ".yml", ".yaml"}
     for path in _repository_files(root):
         relative = path.relative_to(root).as_posix()
+        if path.suffix not in text_suffixes:
+            continue
         if relative in {"README.md", "AGENTS.md", "CLAUDE.md"}:
             yield path
         elif relative.startswith(("docs/", ".agents/", ".claude/", ".cursor/")):
@@ -525,15 +603,6 @@ def validate_source_specific_residue(root: Path) -> None:
     forbidden = (
         "WordPack",
         "wordpack-for-english",
-        "Lexicon",
-        "apps/frontend",
-        "apps/backend",
-        "docs/operations",
-        "ui-ux-review",
-        "Cloud Run",
-        "Firebase",
-        "Firestore",
-        "Google OAuth",
         "mc-bot-egent-practice-1",
     )
     for path in _authoring_files(root):
@@ -558,9 +627,24 @@ def _normalize_paragraph(value: str) -> str:
 
 
 def validate_long_duplicates(root: Path) -> None:
+    repository_files = list(_repository_files(root))
+    canonical_documents = {
+        root / relative for relative in HARNESS_DOCUMENTS
+    } | {
+        path
+        for path in repository_files
+        if path.suffix == ".md"
+        and path.relative_to(root).as_posix().startswith("docs/ai-governance/")
+    }
     canonical = [
+        root / "README.md",
         root / "AGENTS.md",
-        *sorted((root / "docs").rglob("*.md")),
+        *sorted(
+            path
+            for path in repository_files
+            if path.name == "AGENTS.md" and path.parent != root
+        ),
+        *sorted(canonical_documents),
         *sorted((root / ".agents/skills").glob("*/SKILL.md")),
     ]
     adapters = [
@@ -622,7 +706,6 @@ def validate_adapter_mapping(root: Path) -> None:
 
     required_scope = {
         "README.md",
-        ".gitignore",
         "AGENTS.md",
         "CLAUDE.md",
         ".agents/**/*",
@@ -636,7 +719,7 @@ def validate_adapter_mapping(root: Path) -> None:
         "scripts/verify-agent-harness.sh",
         "scripts/validate_agent_frontmatter.py",
         "requirements-agent-harness.txt",
-        ".github/ISSUE_TEMPLATE/**/*",
+        ".github/ISSUE_TEMPLATE/feature.md",
         ".github/pull_request_template.md",
         ".github/workflows/agent-harness.yml",
     }
@@ -659,17 +742,21 @@ def validate_adapter_mapping(root: Path) -> None:
     cursor_scope = set(cursor_data["globs"].split(","))
     cursor_expected = {
         "README.md",
-        ".gitignore",
         "AGENTS.md",
         "CLAUDE.md",
         ".agents/**",
         ".claude/**",
         ".cursor/**",
-        "docs/**",
+        *(
+            relative
+            for relative in HARNESS_DOCUMENTS
+            if not relative.startswith("docs/ai-governance/")
+        ),
+        "docs/ai-governance/**",
         "scripts/verify-agent-harness.sh",
         "scripts/validate_agent_frontmatter.py",
         "requirements-agent-harness.txt",
-        ".github/ISSUE_TEMPLATE/**",
+        ".github/ISSUE_TEMPLATE/feature.md",
         ".github/pull_request_template.md",
         ".github/workflows/agent-harness.yml",
     }
@@ -691,8 +778,8 @@ def _nested_adapter_contract(
 ) -> tuple[Path, dict[str, Any], Path, dict[str, Any], str]:
     scope = nested_agents.parent.relative_to(root).as_posix()
     scope_key = quote(scope, safe="")
-    claude_adapter = root / f".claude/rules/scope-{scope_key}.md"
-    cursor_adapter = root / f".cursor/rules/scope-{scope_key}.mdc"
+    claude_adapter = root / f".claude/rules/nested-agents-{scope_key}.md"
+    cursor_adapter = root / f".cursor/rules/nested-agents-{scope_key}.mdc"
     claude_data = {"paths": [f"{scope}/**/*"]}
     cursor_data = {
         "description": f"{scope}のnested AGENTS.mdへ接続するpath adapter",
@@ -774,8 +861,8 @@ def validate_nested_agents(root: Path) -> None:
         if root_bytes + len(raw) > 24576:
             raise _fail(path, "root and nested AGENTS.md exceed 24576 combined bytes")
 
-    actual_claude_adapters = set(root.glob(".claude/rules/scope-*.md"))
-    actual_cursor_adapters = set(root.glob(".cursor/rules/scope-*.mdc"))
+    actual_claude_adapters = set(root.glob(".claude/rules/nested-agents-*.md"))
+    actual_cursor_adapters = set(root.glob(".cursor/rules/nested-agents-*.mdc"))
     for orphan in sorted(actual_claude_adapters - expected_claude_adapters):
         raise _fail(orphan, "path adapter has no corresponding nested AGENTS.md")
     for orphan in sorted(actual_cursor_adapters - expected_cursor_adapters):
@@ -808,6 +895,16 @@ def run_self_test() -> None:
             "---\nname: valid-skill\ndescription: valid\n---\n\n# Valid\n",
             True,
         ),
+        ".agents/skills/extended-skill/SKILL.md": (
+            "---\nname: extended-skill\ndescription: valid\nmetadata:\n"
+            "  owner: project\nlicense: MIT\n---\n\n# Valid\n",
+            True,
+        ),
+        ".claude/skills/adapter/SKILL.md": (
+            "---\nname: adapter\ndescription: bad\nmetadata:\n"
+            "  owner: project\n---\n\n# Bad\n",
+            False,
+        ),
         ".agents/skills/duplicate/SKILL.md": (
             "---\nname: duplicate\nname: duplicate\ndescription: bad\n---\n\n# Bad\n",
             False,
@@ -835,6 +932,12 @@ def run_self_test() -> None:
         cursor = root / ".cursor/rules/test.mdc"
         cursor.parent.mkdir(parents=True)
         cursor.write_text(
+            "---\ndescription: test\nglobs:\n  - test/**\n"
+            "alwaysApply: false\n---\n\n# Test\n",
+            encoding="utf-8",
+        )
+        validate_path(cursor, root)
+        cursor.write_text(
             "---\ndescription: test\nglobs: test\nalwaysApply: \"false\"\n---\n\n# Test\n",
             encoding="utf-8",
         )
@@ -855,6 +958,58 @@ def run_self_test() -> None:
             stderr=subprocess.DEVNULL,
         )
         (root / "AGENTS.md").write_text("# Root\n", encoding="utf-8")
+        fixtures = root / "fixtures"
+        fixtures.mkdir()
+        (fixtures / "sequence.yml").write_text(
+            "- first\n- second\n",
+            encoding="utf-8",
+        )
+        (fixtures / "multi.yaml").write_text(
+            "---\nkind: Example\n---\n- item\n",
+            encoding="utf-8",
+        )
+        (fixtures / "broken.md").write_bytes(b"[missing](missing.md)\xff")
+        skill_asset = root / ".agents/skills/example/assets/image.png"
+        skill_asset.parent.mkdir(parents=True)
+        skill_asset.write_bytes(b"\x89PNG\r\n\x1a\n\xff")
+        validate_text_hygiene(root)
+        validate_markdown_links(root)
+        validate_source_specific_residue(root)
+        validate_yaml_files(root)
+
+        duplicate_yaml = fixtures / "duplicate.yml"
+        duplicate_yaml.write_text("key: first\nkey: second\n", encoding="utf-8")
+        validate_yaml_files(root)
+
+        harness_yaml = root / ".github/workflows/agent-harness.yml"
+        harness_yaml.parent.mkdir(parents=True)
+        harness_yaml.write_text("key: first\nkey: second\n", encoding="utf-8")
+        try:
+            validate_yaml_files(root)
+        except ValidationError as exc:
+            if "duplicate YAML key" not in str(exc):
+                raise ValidationError("YAML duplicate-key self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted a duplicate YAML key")
+        harness_yaml.unlink()
+        duplicate_yaml.unlink()
+
+        architecture = root / "docs/architecture.md"
+        architecture.parent.mkdir()
+        architecture.write_text(
+            "# Architecture\n\nCloud Run、Firebase、Firestore、Google OAuthを候補として比較します。\n",
+            encoding="utf-8",
+        )
+        validate_source_specific_residue(root)
+        architecture.write_text("# WordPack residue\n", encoding="utf-8")
+        try:
+            validate_source_specific_residue(root)
+        except ValidationError as exc:
+            if "source-specific term remains: WordPack" not in str(exc):
+                raise ValidationError("source residue self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted an unambiguous source identifier")
+
         nested = root / "apps/bot/AGENTS.md"
         nested.parent.mkdir(parents=True)
         nested.write_text("# Bot scope\n", encoding="utf-8")

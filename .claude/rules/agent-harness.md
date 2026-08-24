@@ -1,7 +1,6 @@
 ---
 paths:
   - "README.md"
-  - ".gitignore"
   - "AGENTS.md"
   - "CLAUDE.md"
   - ".agents/**/*"
@@ -15,7 +14,7 @@ paths:
   - "scripts/verify-agent-harness.sh"
   - "scripts/validate_agent_frontmatter.py"
   - "requirements-agent-harness.txt"
-  - ".github/ISSUE_TEMPLATE/**/*"
+  - ".github/ISSUE_TEMPLATE/feature.md"
   - ".github/pull_request_template.md"
   - ".github/workflows/agent-harness.yml"
 ---
