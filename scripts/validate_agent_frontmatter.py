@@ -481,6 +481,30 @@ def validate_yaml_files(root: Path) -> None:
             raise _fail(path, f"Issue template headings missing: {sorted(missing)}")
 
 
+def _validate_workflow_path_patterns(
+    path: Path,
+    event: str,
+    event_data: Any,
+    required_paths: set[str],
+) -> None:
+    if not isinstance(event_data, dict):
+        raise _fail(path, f"{event} trigger must be a mapping")
+    expected_keys = {"paths"} if event == "push" else {"branches", "paths"}
+    if set(event_data) != expected_keys:
+        raise _fail(path, f"{event} keys must be exactly {sorted(expected_keys)}")
+    path_patterns = event_data.get("paths", [])
+    if not isinstance(path_patterns, list) or any(
+        not isinstance(pattern, str) or not pattern
+        for pattern in path_patterns
+    ):
+        raise _fail(path, f"{event}.paths must be a list of strings")
+    if any(pattern.startswith("!") for pattern in path_patterns):
+        raise _fail(path, f"{event}.paths must not contain negative patterns")
+    missing = required_paths - set(path_patterns)
+    if missing:
+        raise _fail(path, f"{event}.paths missing {sorted(missing)}")
+
+
 def validate_workflow(root: Path) -> None:
     path = root / ".github/workflows/agent-harness.yml"
     try:
@@ -527,13 +551,12 @@ def validate_workflow(root: Path) -> None:
         ".github/workflows/agent-harness.yml",
     }
     for event in ("push", "pull_request"):
-        event_data = triggers[event]
-        if not isinstance(event_data, dict):
-            raise _fail(path, f"{event} trigger must be a mapping")
-        actual_paths = set(event_data.get("paths", []))
-        missing = required_paths - actual_paths
-        if missing:
-            raise _fail(path, f"{event}.paths missing {sorted(missing)}")
+        _validate_workflow_path_patterns(
+            path,
+            event,
+            triggers[event],
+            required_paths,
+        )
 
     permissions = data.get("permissions")
     if permissions != {"contents": "read"}:
@@ -845,9 +868,10 @@ def _nested_adapter_contract(
         "globs": f"{scope}/**",
         "alwaysApply": False,
     }
+    link_target = quote(f"{scope}/AGENTS.md", safe="/")
     body = (
         "# Path scope adapter\n\n"
-        f"[`{scope}/AGENTS.md`](../../{scope}/AGENTS.md)を、"
+        f"[`{scope}/AGENTS.md`](../../{link_target})を、"
         "このpathで適用する唯一の追加ルール正本として参照します。"
     )
     return claude_adapter, claude_data, cursor_adapter, cursor_data, body
@@ -950,6 +974,24 @@ def validate_repository(root: Path) -> None:
 
 
 def run_self_test() -> None:
+    invalid_push_events = (
+        {"paths": ["AGENTS.md", "!AGENTS.md"]},
+        {"paths": ["AGENTS.md"], "paths-ignore": ["AGENTS.md"]},
+        {"paths": ["AGENTS.md"], "branches": ["main"]},
+    )
+    for event_data in invalid_push_events:
+        try:
+            _validate_workflow_path_patterns(
+                Path("workflow.yml"),
+                "push",
+                event_data,
+                {"AGENTS.md"},
+            )
+        except ValidationError:
+            pass
+        else:
+            raise ValidationError("self-test accepted a suppressible push trigger")
+
     cases = {
         ".agents/skills/valid-skill/SKILL.md": (
             "---\nname: valid-skill\ndescription: valid\n---\n\n# Valid\n",
@@ -1150,7 +1192,7 @@ def run_self_test() -> None:
             raise ValidationError("self-test ignored a code-formatted active instruction")
         active_rule.write_text("# Active\n\n通常は非Draft PRを使います。\n", encoding="utf-8")
 
-        nested = root / "apps/bot/AGENTS.md"
+        nested = root / "apps/my bot/AGENTS.md"
         nested.parent.mkdir(parents=True)
         nested.write_text("# Bot scope\n", encoding="utf-8")
         (nested.parent / "bot.py").write_text("pass\n", encoding="utf-8")
@@ -1187,6 +1229,7 @@ def run_self_test() -> None:
                 encoding="utf-8",
             )
         validate_nested_agents(root)
+        validate_markdown_links(root)
 
         nested.unlink()
         try:
