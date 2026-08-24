@@ -47,9 +47,11 @@ description: "リポジトリ変更を、主Issue、専用branch、論理的なc
 
 - latest headに紐づくpush CIとpull_request CIを確認する。失敗時はlogから原因を特定し、修正、commit、push、再確認する。
 - CI成功後、latest meaningful changeに対するGitHub上で確認可能な自動または人間のreview、review comment、review threadを確認する。
+- 指摘の根拠を確認して妥当性と優先度を確定する。P0が残る場合は完了不可。P1は原則として同じ変更内で修正し、分離する場合は理由と追跡先を示す。P2は完了を止めないが、対応しない理由または後続先を記録する。
 - actionableな指摘は一つのreview cycleでまとめて確認し、修正を責務単位のcommitへ分けてpushした後、latest headで関連CIと該当reviewを再確認する。
-- 対応済みthreadは、修正がlatest headへpushされ、関連検証が成功した後だけ、根拠を返信してGraphQL thread IDで解決する。
-- latest meaningful changeに対するclean reviewが1回得られ、actionableな未解決threadがなく、GitHubのmergeabilityがcleanならreviewを収束する。同一headでclean結果を増やすためだけの再reviewを行わない。
+- 修正したthreadは、修正がlatest headへpushされ、関連検証が成功した後だけ、根拠を返信してGraphQL thread IDで解決する。コード変更が不要な指摘は、妥当でない根拠、P1を分離する理由と追跡先、またはP2を対応しない理由か後続先を返信して解決し、headが変わらない限り再reviewを行わない。
+- latest meaningful changeに対するclean reviewが1回得られ、actionableな未解決threadがなく、GitHubのmergeabilityがcleanならreviewを収束する。clean reviewは指摘が一件もないreviewに限定せず、P1を分離する理由と追跡先、またはP2を対応しない理由か後続先まで記録した場合は、それだけを理由にheadを変更したり追加reviewを行ったりしない。
+- 同一headでclean結果を増やすためだけの再reviewを行わない。
 - reviewが提供されない場合、自己reviewを補助証跡として行い、GitHub上のreview確認の代替にはしない。
 
 ## 6. 権限境界と終了

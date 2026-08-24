@@ -41,7 +41,9 @@ PRをマージ可能な状態として報告するには、次をすべて満た
 - GitHubのmergeabilityがcleanで、conflictまたはblocking conditionがない。
 - PR本文に主Issue、変更、検証、未実行項目、公開安全性、残るriskを記録している。
 
-reviewが提供されない場合、自己reviewは補助証跡に限り、GitHub上のreviewを確認した状態の代替にしません。同じheadでclean reviewを複数回集める必要はありません。指摘対応でheadが変わった場合だけ、関連CIと該当reviewを再確認します。
+P0が残る場合は完了不可です。P1は原則として同じ変更内で修正し、分離する場合は理由と追跡先を示します。P2は完了を止めませんが、対応しない理由または後続先を記録します。clean reviewは指摘が一件もないreviewに限定せず、P1の分離判断またはP2の対応判断を記録し、actionableな未解決threadがない状態を含みます。
+
+reviewが提供されない場合、自己reviewは補助証跡に限り、GitHub上のreviewを確認した状態の代替にしません。同じheadでclean reviewを複数回集める必要はありません。修正でheadが変わった場合だけ、関連CIと該当reviewを再確認します。P1を分離する理由と追跡先、またはP2を対応しない理由か後続先を記録した場合はheadを変えず、そのreviewで終了できます。
 
 merge、Issue・PRのclose、release、deploy、force-push、公開済み履歴の書換え、破壊的操作は、対象を特定した別の明示指示がある場合だけ実行します。
 

@@ -41,6 +41,8 @@
 - push CI:
 - pull_request CI:
 - latest meaningful changeへのreview:
+- P0 / P1の対応状況、P1分離時の理由と追跡先:
+- P2の対応判断、非対応理由または後続先:
 - actionableな未解決review thread:
 - GitHub mergeability:
 
