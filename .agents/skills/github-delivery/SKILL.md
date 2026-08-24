@@ -47,9 +47,9 @@ description: "リポジトリ変更を、主Issue、専用branch、論理的なc
 
 - latest headに紐づくpush CIとpull_request CIを確認する。失敗時はlogから原因を特定し、修正、commit、push、再確認する。
 - CI成功後、latest meaningful changeに対するGitHub上で確認可能な自動または人間のreview、review comment、review threadを確認する。
-- actionableな指摘は責務単位で修正し、commit・push後のlatest headで関連CIと該当reviewを再確認する。
+- actionableな指摘は一つのreview cycleでまとめて確認し、修正を責務単位のcommitへ分けてpushした後、latest headで関連CIと該当reviewを再確認する。
 - 対応済みthreadは、修正がlatest headへpushされ、関連検証が成功した後だけ、根拠を返信してGraphQL thread IDで解決する。
-- clean reviewが得られ、actionableな未解決threadがなく、GitHubのmergeabilityがcleanならreviewを収束する。同一headでclean結果を増やすためだけの再reviewを行わない。
+- latest meaningful changeに対するclean reviewが1回得られ、actionableな未解決threadがなく、GitHubのmergeabilityがcleanならreviewを収束する。同一headでclean結果を増やすためだけの再reviewを行わない。
 - reviewが提供されない場合、自己reviewを補助証跡として行い、GitHub上のreview確認の代替にはしない。
 
 ## 6. 権限境界と終了
