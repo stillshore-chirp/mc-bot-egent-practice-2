@@ -62,4 +62,4 @@ server 再起動、world の変更、bot 操作、memory の修正、rollback、
 
 ## 実環境受け入れ
 
-実 Minecraft と実 OpenAI API の E2E 手順・事前条件・証跡境界は [testing.md](testing.md#実環境-e2e) を正本とします。資格情報または server 操作の許可がないときは、実 E2E を未実施として記録し、模擬環境の結果を置き換えません。
+実 Minecraft と実 OpenAI API の E2E 手順・事前条件・証跡境界は [testing.md](testing.md#実環境-e2e) を正本とします。直近の公開可能な結果は [2026-08-25 実施結果](testing.md#2026-08-25-実施結果) にあります。資格情報または server 操作の許可がないときは、実 E2E を未実施として記録し、模擬環境の結果を置き換えません。

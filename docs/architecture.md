@@ -65,11 +65,11 @@ Minecraft の高頻度観測を受け、次の優先順位で処理します。
 4. 進行中の主作業
 5. 自律的な待機
 
-停止は現在の移動、採掘、LLM 応答の完了を待ちません。空腹、落下、溺水、窒息、溶岩、炎、敵対 Mob、被ダメージ、経路詰まり、切断は決定論的に検出・処理します。経路探索の再試行は設定上限を超えず、上限到達時は失敗理由を残します。
+停止は現在の移動、採掘、LLM 応答の完了を待ちません。空腹、落下、溺水、窒息、溶岩、炎、敵対 Mob、被ダメージ、経路詰まり、切断は決定論的に検出・処理します。敵対Mobからの退避は、観測した全hostileに対する走行線分上の最近接距離を比較し、環境hazardの退避とは分離します。経路探索の再試行は設定上限を超えず、上限到達時は失敗理由を残します。
 
 ### Deliberation loop
 
-LLM を呼ぶ契機は、新しい利用者発話、tool内の作業完了、起動時の未完了約束・suspended作業、安全介入後、接続復旧後の再評価に限ります。Minecraft tick、移動の一歩、採掘の一打ごとに呼び出しません。runtime再評価では観測と記憶参照toolだけを許可し、新しい移動・採取・記憶更新はownerの新しい明示指示まで開始しません。
+LLM を呼ぶ契機は、新しい利用者発話、tool内の作業完了、起動時の未完了約束・suspended作業、安全介入後、接続復旧後の再評価に限ります。Minecraft tick、移動の一歩、採掘の一打ごとに呼び出しません。runtime再評価はsingle-flight gateで直列化し、より新しい状態変化へまとめ、停止・shutdown後の古い生成結果を破棄します。再評価では観測と記憶参照toolだけを許可し、新しい移動・採取・記憶更新はownerの新しい明示指示まで開始しません。
 
 1. 指定利用者かを判定し、会話参加と操作権限を分けます。
 2. 現在 snapshot、関連する人格・記憶・主作業を最小範囲で集めます。
@@ -82,9 +82,9 @@ LLM を呼ぶ契機は、新しい利用者発話、tool内の作業完了、起
 
 初期版で公開する tool は `observe_status`、`observe_surroundings`、`say`、`follow_player`、`stop_current_action`、`move_to`、`gather_resource`、`return_to_player`、`remember_player_fact`、`remember_location`、`recall_memory`、`set_commitment`、`complete_commitment` です。
 
-各 tool は単一 schema から TypeScript 型、runtime validation、OpenAI function schema、test fixture、統一 failure detail を得ます。登録だけで実処理を持たない tool は置きません。
+各 tool は単一 schema から TypeScript 型、runtime validation、OpenAI function schema、test fixture、統一 failure detail を得ます。登録だけで実処理を持たない tool は置きません。原木収集による約束の完了は、同じ利用者のactiveな型付きfulfillment、resource / count、inventory差分、帰還距離、同一correlationを照合した一度限りのreceiptを必要とし、停止・失敗・cancelled作業からは発行しません。
 
-各長時間 skill は、型付き input、precondition、実行、cancel、timeout、retry 条件と上限、前後 snapshot、success condition、failure classification、利用者向け summary を持ちます。追従はpathの`noPath`、timeout、stuck等を数え、設定上限で明示的に失敗します。`gather_resource` は原木探索・移動・採取・drop 回収・数量確認・依頼者の再観測位置への帰還を一つのskillで扱い、inventory差分と帰還距離のverificationで依頼を閉じます。
+各長時間 skill は、型付き input、precondition、実行、cancel、timeout、retry 条件と上限、前後 snapshot、success condition、failure classification、利用者向け summary を持ちます。追従はpathの`noPath`、timeout、stuck等を数え、設定上限で明示的に失敗します。`gather_resource` は原木探索・移動・採取・drop 回収・数量確認・依頼者の再観測位置への帰還を一つのskillで扱い、inventory差分と帰還距離のverificationで依頼を閉じます。採掘前に対象面へのline of sightと同一blockを再検証し、dropは破壊地点近傍の同一itemだけを追跡します。一過性の採掘経路失敗は上限内で再試行し、対象が変化した場合はresource探索へ戻ります。
 
 ## 設定・起動
 

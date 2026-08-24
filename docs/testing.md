@@ -25,6 +25,7 @@ Unit test は外部境界を fake に置換してよい範囲です。製品 bui
 - snapshot 比較、inventory 数量、success / failure 判定
 - persona context の生成
 - memory の保存、検索、訂正、撤回、重複、矛盾、commitment完了根拠
+- hostile退避の走行線分、runtime再評価の直列化、drop選別と採掘再試行
 
 ## Integration test
 
@@ -88,3 +89,18 @@ Issue・PR・commit には API key、server address、IP、Minecraft username / 
 runnerのJSONを保存する場合は、repository外またはgit ignore済みの`logs/`へ置きます。Issue / PRには原文を貼らず、上記項目を一般化した要約だけを載せます。
 
 実環境資格情報または許可がない場合は、`npm run test:e2e` を実行しません。未実施であることと残る risk を記録し、固定応答・模擬 Minecraft・模擬 LLM で E2E を代替しません。
+
+## 2026-08-25 実施結果
+
+許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使い、上記12項目を追跡可能な一連のrunで確認しました。最終対話式runnerは12件pass、0件fail、0件skipで終了code 0でした。
+
+| 対象                         | 公開可能な観測結果                                                                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| 接続・日本語会話・追従・停止 | 独立player接続、日本語応答、安全距離の追従、実行中followの`cancelled`遷移を確認                                          |
+| 生存行動                     | hungerとinventoryの実観測から安全な食料の消費を確認。hostile退避の実失敗を起点に走行線分評価を修正し、回帰testを追加     |
+| 記憶・再起動                 | 明示情報の構造化保存、application再生成と再接続後の復元を確認                                                            |
+| 原木収集・帰還・報告         | 一つの依頼で指定1個、inventory差分1個、最終所持1個、依頼者から約3blockへの帰還を観測                                     |
+| failure                      | resource / inventory、path、短時間上限によるtimeout、即時cancelを実runで発生させ、成功扱いせず日本語で報告することを確認 |
+| 切断                         | server切断後、設定した再接続上限で`connectionState=failed`と明示的なretry exhausted状態を確認                            |
+
+接続先、player名、座標、会話、記憶本文、相関ID、実log原文、runner JSON、SQLite実dataはrepositoryへ保存していません。確認範囲は単一のローカル環境であり、remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。既知のmoderate dependency advisoryはIssue #4で追跡します。

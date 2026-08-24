@@ -14,16 +14,16 @@
 
 ## SQLite の論理モデル
 
-| 状態                | 保存する内容                                               | 信頼性・更新の扱い                                         |
-| ------------------- | ---------------------------------------------------------- | ---------------------------------------------------------- |
-| `RelationshipState` | 利用者の基本情報、信頼・親密度、既知情報、共有体験への参照 | 利用者ごとに分離し、変更時刻を残す                         |
-| `LifeState`         | 現在の関心、長期目標、拠点、観測した所持品                 | companion全体の一つの現在状態として更新する                |
-| `PlayerFact`        | 利用者が明示的に教えた事実                                 | sourceを`player_stated`として記録し、訂正・削除を優先する  |
-| `Location`          | 名前、用途、座標・dimension、登録根拠                      | 実 server の座標や名称を Issue・PR へ転載しない            |
-| `Commitment`        | 約束、進捗、阻害要因、完了状態                             | owner確認または同一tool loopの検証済み行動を完了根拠にする |
-| `Episode`           | 行動、結果、重要度、共有体験                               | 会話全文ではなく要約と観測根拠を保存する                   |
-| `WorldMemory`       | 資源、危険地点、構造物、観測時刻                           | Minecraft 観測と LLM 推測を区別する                        |
-| `WorkResult`        | task、checkpoint、観測済みoutput、failure detail、相関ID   | 観測できない完了を成功として保存しない                     |
+| 状態                | 保存する内容                                               | 信頼性・更新の扱い                                            |
+| ------------------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `RelationshipState` | 利用者の基本情報、信頼・親密度、既知情報、共有体験への参照 | 利用者ごとに分離し、変更時刻を残す                            |
+| `LifeState`         | 現在の関心、長期目標、拠点、観測した所持品                 | companion全体の一つの現在状態として更新する                   |
+| `PlayerFact`        | 利用者が明示的に教えた事実                                 | sourceを`player_stated`として記録し、訂正・削除を優先する     |
+| `Location`          | 名前、用途、座標・dimension、登録根拠                      | 実 server の座標や名称を Issue・PR へ転載しない               |
+| `Commitment`        | 約束、型付き履行条件、進捗、阻害要因、完了状態             | owner確認または同一tool loopの検証済みreceiptを完了根拠にする |
+| `Episode`           | 行動、結果、重要度、共有体験                               | 会話全文ではなく要約と観測根拠を保存する                      |
+| `WorldMemory`       | 資源、危険地点、構造物、観測時刻                           | Minecraft 観測と LLM 推測を区別する                           |
+| `WorkResult`        | task、checkpoint、観測済みoutput、failure detail、相関ID   | 観測できない完了を成功として保存しない                        |
 
 事実とWorldMemoryはsource、active / superseded / retracted、作成・更新時刻を持ちます。Episodeもsourceと観測時刻を持ちます。LifeStateはsingletonの現在状態、Locationは同一利用者・同一名の更新、Commitmentはactive / completed / cancelledと完了根拠で履歴を表します。同じ事実の重複は正規化または統合し、矛盾は新しい根拠と更新時刻を伴うrecordとして解決します。訂正・撤回済みのFactとWorldMemoryはretrieval対象から除外します。
 
@@ -50,4 +50,4 @@ SQLite migrationはversion管理し、v1からLifeState / WorldMemoryを加え�
 
 ## 検証境界
 
-unit / integration test は保存、検索、訂正、削除、矛盾、migration、再起動復元を test database で検証します。実 Minecraft・実 LLM を通じて利用者情報を保存し、再起動後に復元する E2E は別途の実環境証跡が必要です。実環境 E2E が未実施の間、実際の記憶保持を確認済みとは記載しません。
+unit / integration test は保存、検索、訂正、削除、矛盾、migration、再起動復元を test database で検証します。2026-08-25の実環境E2Eでは、実Minecraft chatと実LLMを通じて利用者が明示した情報を構造化保存し、application再生成・Minecraft再接続後に同じSQLiteから復元して応答へ利用できることを確認しました。実内容、player情報、会話、追跡IDは公開証跡へ保存していません。

@@ -24,7 +24,9 @@ AI コンパニオンが、Minecraft で観測した状況と利用者との継�
 
 ## 現在の状態
 
-初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。ローカルの自動テストは実装契約を検証しますが、実 Minecraft サーバーと実 OpenAI API を使う E2E は、接続先・利用権限・資格情報が設定されるまで未確認です。未確認の実環境結果を、利用可能または成功として扱いません。
+初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。2026-08-25に、許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使い、[実環境E2Eの12項目](docs/testing.md#2026-08-25-実施結果)を追跡可能な一連のrunで確認しました。最終対話式runnerは12件pass、fail / skipなし、終了code 0でした。
+
+確認範囲は単一のローカル環境です。remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。依存経路の既知のmoderate advisoryはIssue #4で追跡し、high / criticalを品質gateにしています。
 
 初期完成版では次を一続きの体験として扱います。
 
@@ -105,7 +107,7 @@ npm run test:e2e
 ```
 
 この command は実環境用です。必須設定・利用権限・安全な test world が揃わない場合は接続や API 呼出しを行わず、明確な設定エラーとして終了させます。手順と受け入れ項目は [docs/testing.md](docs/testing.md#実環境-e2e) を参照してください。
-対話式runnerは`.env.local`の`LIVE_E2E_CONFIRMED=true`を追加の安全gateとし、12項目すべてに実worldの観測に基づく`pass`が入力された場合だけ成功終了します。項目ごとに接続、health / food / oxygen、task state、原木収集数、相関IDを秘密情報を除いたJSONとして出力し、記憶復元項目の前にはapplicationを実際に再生成・再接続します。
+対話式runnerは`.env.local`の`LIVE_E2E_CONFIRMED=true`を追加の安全gateとし、12項目すべてに実worldの観測に基づく`pass`が入力された場合だけ成功終了します。項目ごとに接続、health / food / oxygen、task state、原木収集数、ローカル追跡用の相関IDをJSONとして出力し、記憶復元項目の前にはapplicationを実際に再生成・再接続します。runnerの原文は実環境情報を含み得るため、repository、Issue、PRへ保存しません。
 
 ## 文書
 
