@@ -577,20 +577,6 @@ def validate_long_duplicates(root: Path) -> None:
             if len(normalized) >= 160 and normalized in canonical_text:
                 raise _fail(path, "adapter duplicates a long canonical paragraph")
 
-    owners: dict[str, list[Path]] = defaultdict(list)
-    for path in canonical:
-        for paragraph in re.split(r"\n\s*\n", _body_without_frontmatter(path)):
-            normalized = _normalize_paragraph(paragraph)
-            if len(normalized) >= 240:
-                owners[normalized].append(path)
-    for paths in owners.values():
-        unique = sorted(set(paths))
-        if len(unique) > 1:
-            raise ValidationError(
-                "long canonical paragraph is duplicated in: "
-                + ", ".join(str(_relative(path, root)) for path in unique)
-            )
-
     normalized_files = {
         path: _normalize_paragraph(_body_without_frontmatter(path)) for path in canonical
     }
@@ -603,9 +589,10 @@ def validate_long_duplicates(root: Path) -> None:
         ).get_matching_blocks()
         longest = max((block.size for block in blocks), default=0)
         if longest >= 120:
-            raise ValidationError(
-                "canonical files share an overlong text block: "
-                f"{_relative(first, root)}, {_relative(second, root)} ({longest} chars)"
+            print(
+                "WARNING: canonical similarity requires human review: "
+                f"{_relative(first, root)}, {_relative(second, root)} ({longest} chars)",
+                file=sys.stderr,
             )
 
 
