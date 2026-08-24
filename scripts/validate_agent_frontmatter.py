@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import subprocess
 import sys
@@ -334,7 +335,7 @@ def validate_text_hygiene(root: Path) -> None:
                 raise _fail(path, f"trailing whitespace on line {line_number}")
 
 
-def _without_code_fences(text: str) -> str:
+def _without_fenced_code_blocks(text: str) -> str:
     output: list[str] = []
     fence: str | None = None
     for line in text.splitlines():
@@ -345,7 +346,11 @@ def _without_code_fences(text: str) -> str:
             output.append("")
             continue
         output.append("" if fence else line)
-    visible = "\n".join(output)
+    return "\n".join(output)
+
+
+def _without_code_fences(text: str) -> str:
+    visible = _without_fenced_code_blocks(text)
     return re.sub(r"`+[^`\n]*`+", "", visible)
 
 
@@ -389,19 +394,91 @@ def _assert_exact_case(root: Path, relative: Path, source: Path) -> None:
         current = current / part
 
 
+def _rendered_heading_text(markdown: str) -> str:
+    """Approximate the rendered inline text GitHub uses to derive an ATX anchor."""
+    output: list[str] = []
+    code_spans: list[str] = []
+    cursor = 0
+    while cursor < len(markdown):
+        if markdown[cursor] != "`":
+            output.append(markdown[cursor])
+            cursor += 1
+            continue
+
+        opening_end = cursor
+        while opening_end < len(markdown) and markdown[opening_end] == "`":
+            opening_end += 1
+        opening_length = opening_end - cursor
+        search = opening_end
+        closing_start: int | None = None
+        closing_end: int | None = None
+        while search < len(markdown):
+            candidate = markdown.find("`", search)
+            if candidate == -1:
+                break
+            candidate_end = candidate
+            while candidate_end < len(markdown) and markdown[candidate_end] == "`":
+                candidate_end += 1
+            if candidate_end - candidate == opening_length:
+                closing_start = candidate
+                closing_end = candidate_end
+                break
+            search = candidate_end
+
+        if closing_start is None or closing_end is None:
+            output.append(markdown[cursor:opening_end])
+            cursor = opening_end
+            continue
+
+        code = markdown[opening_end:closing_start].replace("\n", " ")
+        if code.startswith(" ") and code.endswith(" ") and code.strip(" "):
+            code = code[1:-1]
+        token = f"\x00{len(code_spans)}\x00"
+        code_spans.append(code)
+        output.append(token)
+        cursor = closing_end
+
+    prose = "".join(output)
+    prose = re.sub(r"!?\[([^\]]+)\]\([^)]*\)", r"\1", prose)
+    prose = re.sub(r"!?\[([^\]]+)\]\[[^\]]*\]", r"\1", prose)
+    prose = re.sub(r"<!--.*?-->", "", prose)
+    prose = re.sub(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>", "", prose)
+    emphasis_patterns = (
+        re.compile(
+            r"(?<!\\)(?P<marker>\*{1,3})(?=\S)"
+            r"(?P<body>.+?)(?<=\S)(?P=marker)"
+        ),
+        re.compile(
+            r"(?<![\w\\])(?P<marker>_{1,3})(?=\S)"
+            r"(?P<body>.+?)(?<=\S)(?P=marker)(?!\w)"
+        ),
+    )
+    previous = ""
+    while prose != previous:
+        previous = prose
+        for pattern in emphasis_patterns:
+            prose = pattern.sub(r"\g<body>", prose)
+        prose = re.sub(r"(?<!\\)~~(?=\S)(.+?)(?<=\S)~~", r"\1", prose)
+    prose = html.unescape(prose)
+    prose = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])", r"\1", prose)
+    for index, code in enumerate(code_spans):
+        prose = prose.replace(f"\x00{index}\x00", code)
+    return prose
+
+
 def _markdown_anchors(text: str) -> set[str]:
     anchors: set[str] = set()
     counts: dict[str, int] = defaultdict(int)
-    for match in re.finditer(r"^#{1,6}\s+(.+?)\s*#*\s*$", _without_code_fences(text), re.MULTILINE):
-        heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", match.group(1))
-        heading = re.sub(r"<[^>]+>", "", heading)
-        heading = unicodedata.normalize("NFKC", heading).casefold()
+    visible = _without_fenced_code_blocks(text)
+    for match in re.finditer(r"^#{1,6}\s+(.+?)\s*#*\s*$", visible, re.MULTILINE):
+        heading = _rendered_heading_text(match.group(1))
+        heading = heading.lower()
         heading = "".join(
             character
             for character in heading
             if character.isalnum() or character in {" ", "-", "_"}
         )
-        base = re.sub(r"\s+", "-", heading.strip())
+        base = heading.strip().replace(" ", "-")
         if not base:
             continue
         count = counts[base]
@@ -1110,7 +1187,43 @@ def run_self_test() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        (root / "AGENTS.md").write_text("# Root\n", encoding="utf-8")
+        (root / "README.md").write_text(
+            "[Inline-code heading](AGENTS.md#use-agentpurpose)\n",
+            encoding="utf-8",
+        )
+        (root / "AGENTS.md").write_text(
+            "# Root\n\n"
+            "## Use `agent/<purpose>`\n\n"
+            "## Use ``foo [x](y) bar ` baz <qux>`` now\n\n"
+            "## A _Helpful_ Section\n\n"
+            "## A _Helpful_ Section\n\n"
+            "## foo_bar_baz\n\n"
+            "## A <!-- hidden --> B\n\n"
+            "## Straße\n\n"
+            "## Two  Spaces\n\n"
+            "```md\n# Ignored heading\n```\n",
+            encoding="utf-8",
+        )
+        if _rendered_heading_text(
+            "Keep ``foo_bar_baz <!-- visible --> ` tick``"
+        ) != "Keep foo_bar_baz <!-- visible --> ` tick":
+            raise ValidationError("protected code-span self-test failed")
+        expected_anchors = {
+            "root",
+            "use-agentpurpose",
+            "use-foo-xy-bar--baz-qux-now",
+            "a-helpful-section",
+            "a-helpful-section-1",
+            "foo_bar_baz",
+            "a--b",
+            "straße",
+            "two--spaces",
+        }
+        actual_anchors = _markdown_anchors(
+            (root / "AGENTS.md").read_text(encoding="utf-8")
+        )
+        if actual_anchors != expected_anchors:
+            raise ValidationError("Markdown anchor rendering self-test failed")
         fixtures = root / "fixtures"
         fixtures.mkdir()
         (fixtures / "sequence.yml").write_text(
