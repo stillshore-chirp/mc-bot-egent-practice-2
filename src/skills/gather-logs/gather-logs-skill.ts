@@ -120,19 +120,32 @@ export class GatherLogsSkill implements Skill<
             continue;
           }
 
+          let resourceChanged = false;
           for (const target of targets) {
             const latest = await this.minecraft.observe();
             if (countInventory(latest, itemName) - baseline >= input.count)
               break;
-            await this.collectTarget(
-              target,
-              itemName,
-              baseline,
-              (phase, checkpoint) => context.advance(phase, checkpoint),
-              signal,
-            );
+            try {
+              await this.collectTarget(
+                target,
+                itemName,
+                baseline,
+                (phase, checkpoint) => context.advance(phase, checkpoint),
+                signal,
+              );
+            } catch (error) {
+              if (
+                error instanceof AppError &&
+                error.detail.code === "RESOURCE_CHANGED"
+              ) {
+                resourceChanged = true;
+                break;
+              }
+              throw error;
+            }
           }
           targets = [];
+          if (resourceChanged) continue;
         }
 
         await this.returnToRequester(
@@ -186,7 +199,20 @@ export class GatherLogsSkill implements Skill<
       target: target.position,
       heldCount: countInventory(beforeDig, itemName),
     });
-    await this.minecraft.dig(target, signal);
+    await retry(
+      () => this.minecraft.dig(target, signal),
+      {
+        maxAttempts: this.limits.maxPathAttempts,
+        initialDelayMs: 100,
+        maxDelayMs: 500,
+        multiplier: 2,
+      },
+      (error) =>
+        error instanceof AppError &&
+        error.detail.retryable &&
+        error.detail.code !== "RESOURCE_CHANGED",
+      signal,
+    );
     const expectedInventoryCount = Math.max(
       baseline + 1,
       countInventory(beforeDig, itemName) + 1,

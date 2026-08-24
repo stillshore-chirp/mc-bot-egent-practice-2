@@ -61,8 +61,10 @@ export class ReflexCoordinator {
     }
     const incident = this.detector.detect(snapshot, movementExpected);
     if (incident === undefined) {
-      if (this.currentState.state === "stabilizing")
+      if (this.currentState.state !== "safe") {
         this.currentState = { state: "safe" };
+        this.retryNotBefore = 0;
+      }
       return this.currentState;
     }
 
@@ -86,7 +88,20 @@ export class ReflexCoordinator {
               this.stuckRecoveryAttempts,
               signal,
             );
-          } else await this.minecraft.escapeDanger(signal);
+          } else {
+            const hostileEscape =
+              incident.kind === "hostile" ||
+              (incident.kind === "damage" &&
+                snapshot.nearbyEntities.some(
+                  (entity) =>
+                    entity.hostile &&
+                    entity.distance <= this.thresholds.hostileDistance,
+                ));
+            await this.minecraft.escapeDanger(
+              hostileEscape ? "hostile" : "environment",
+              signal,
+            );
+          }
         },
         this.actionTimeoutMs,
         undefined,

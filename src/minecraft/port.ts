@@ -9,6 +9,8 @@ export interface ResourceTarget {
   readonly position: Position;
 }
 
+export type EscapeMode = "environment" | "hostile";
+
 export interface MinecraftPort {
   connect(signal?: AbortSignal): Promise<void>;
   disconnect(reason?: string): Promise<void>;
@@ -40,7 +42,7 @@ export interface MinecraftPort {
     signal: AbortSignal,
   ): Promise<void>;
   eatBestFood(signal: AbortSignal): Promise<string>;
-  escapeDanger(signal: AbortSignal): Promise<void>;
+  escapeDanger(mode: EscapeMode, signal: AbortSignal): Promise<void>;
   recoverFromStuck(maxAttempts: number, signal: AbortSignal): Promise<void>;
   stopCurrentAction(): Promise<void>;
 }

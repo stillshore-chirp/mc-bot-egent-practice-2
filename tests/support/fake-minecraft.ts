@@ -4,6 +4,7 @@ import type {
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
 import type {
+  EscapeMode,
   MinecraftPort,
   ResourceTarget,
 } from "../../src/minecraft/port.js";
@@ -188,7 +189,10 @@ export class FakeMinecraft implements MinecraftPort {
     return "bread";
   }
 
-  public async escapeDanger(signal: AbortSignal): Promise<void> {
+  public async escapeDanger(
+    mode: EscapeMode,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (signal.aborted) throw signal.reason;
     this.snapshot = {
       ...this.snapshot,
@@ -199,7 +203,7 @@ export class FakeMinecraft implements MinecraftPort {
       oxygen: 20,
       nearbyEntities: [],
     };
-    this.actions.push("escape");
+    this.actions.push(`escape:${mode}`);
   }
 
   public async recoverFromStuck(

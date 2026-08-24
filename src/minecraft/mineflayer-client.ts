@@ -15,7 +15,12 @@ import {
 } from "../domain/snapshot.js";
 import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay } from "../runtime/timeout.js";
-import type { MinecraftLogger, MinecraftPort, ResourceTarget } from "./port.js";
+import type {
+  EscapeMode,
+  MinecraftLogger,
+  MinecraftPort,
+  ResourceTarget,
+} from "./port.js";
 
 const hostileNames = new Set([
   "blaze",
@@ -78,6 +83,74 @@ const positionOf = (position: {
   y: position.y,
   z: position.z,
 });
+
+export function escapeTarget(
+  origin: Position,
+  threats: readonly Position[],
+  distance = 16,
+): Position | undefined {
+  if (threats.length === 0) return undefined;
+  const candidates = Array.from({ length: 16 }, (_, index) => {
+    const angle = (Math.PI * 2 * index) / 16;
+    const candidate = {
+      x: origin.x + Math.cos(angle) * distance,
+      y: origin.y,
+      z: origin.z + Math.sin(angle) * distance,
+    };
+    const clearances = threats.map((threat) =>
+      Math.hypot(candidate.x - threat.x, candidate.z - threat.z),
+    );
+    const segmentX = candidate.x - origin.x;
+    const segmentZ = candidate.z - origin.z;
+    const segmentLengthSquared = segmentX ** 2 + segmentZ ** 2;
+    const pathClearances = threats.map((threat) => {
+      const projection =
+        ((threat.x - origin.x) * segmentX + (threat.z - origin.z) * segmentZ) /
+        segmentLengthSquared;
+      const boundedProjection = Math.max(0, Math.min(1, projection));
+      const closestX = origin.x + segmentX * boundedProjection;
+      const closestZ = origin.z + segmentZ * boundedProjection;
+      return Math.hypot(closestX - threat.x, closestZ - threat.z);
+    });
+    return {
+      candidate,
+      minimumPathClearance: Math.min(...pathClearances),
+      totalPathClearance: pathClearances.reduce(
+        (total, value) => total + value,
+        0,
+      ),
+      minimumClearance: Math.min(...clearances),
+      totalClearance: clearances.reduce((total, value) => total + value, 0),
+    };
+  });
+  candidates.sort(
+    (left, right) =>
+      right.minimumPathClearance - left.minimumPathClearance ||
+      right.totalPathClearance - left.totalPathClearance ||
+      right.minimumClearance - left.minimumClearance ||
+      right.totalClearance - left.totalClearance,
+  );
+  return candidates[0]?.candidate;
+}
+
+export function nearestItemDropPosition(
+  origin: Position,
+  expectedItemName: string,
+  entities: readonly {
+    readonly itemName: string | undefined;
+    readonly position: Position;
+  }[],
+  maxDistance = 8,
+): Position | undefined {
+  return entities
+    .filter(({ itemName }) => itemName === expectedItemName)
+    .map(({ position }) => ({
+      position,
+      distance: distance(origin, position),
+    }))
+    .filter((candidate) => candidate.distance <= maxDistance)
+    .sort((left, right) => left.distance - right.distance)[0]?.position;
+}
 
 export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
@@ -481,7 +554,7 @@ export class MineflayerClient implements MinecraftPort {
   public async dig(target: ResourceTarget, signal: AbortSignal): Promise<void> {
     throwIfAborted(signal, "dig");
     const bot = this.requireBot();
-    const block = bot.blockAt(
+    let block = bot.blockAt(
       new Vec3(target.position.x, target.position.y, target.position.z),
     );
     if (block?.name !== target.name) {
@@ -489,6 +562,20 @@ export class MineflayerClient implements MinecraftPort {
         category: "resource",
         code: "RESOURCE_CHANGED",
         message: "The target block is no longer present",
+        retryable: true,
+        failedAt: "dig",
+      });
+    }
+    await this.runPathfinder(
+      new goals.GoalLookAtBlock(block.position, bot.world, { reach: 4.5 }),
+      signal,
+    );
+    block = bot.blockAt(block.position);
+    if (block?.name !== target.name) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target block changed before a visible face was reached",
         retryable: true,
         failedAt: "dig",
       });
@@ -507,7 +594,21 @@ export class MineflayerClient implements MinecraftPort {
     const abort = (): void => bot.stopDigging();
     signal.addEventListener("abort", abort, { once: true });
     try {
-      await bot.dig(block, true, "raycast");
+      try {
+        await bot.dig(block, true, "auto");
+      } catch (error) {
+        if (signal.aborted) throwIfAborted(signal, "dig");
+        throw new AppError(
+          {
+            category: "resource",
+            code: "DIG_FAILED",
+            message: error instanceof Error ? error.message : "Digging failed",
+            retryable: true,
+            failedAt: "dig",
+          },
+          { cause: error },
+        );
+      }
       throwIfAborted(signal, "dig");
       if (bot.blockAt(block.position)?.name === target.name) {
         throw new AppError({
@@ -536,25 +637,17 @@ export class MineflayerClient implements MinecraftPort {
       const count =
         current.inventory.find((item) => item.name === itemName)?.count ?? 0;
       if (count >= expectedInventoryCount) return;
-      const itemEntity = Object.values(this.requireBot().entities)
-        .filter((entity) => entity.name === "item" || entity.type === "object")
-        .sort(
-          (left, right) =>
-            left.position.distanceTo(
-              new Vec3(position.x, position.y, position.z),
-            ) -
-            right.position.distanceTo(
-              new Vec3(position.x, position.y, position.z),
-            ),
-        )[0];
-      if (itemEntity !== undefined) {
+      const itemPosition = nearestItemDropPosition(
+        position,
+        itemName,
+        Object.values(this.requireBot().entities).map((entity) => ({
+          itemName: droppedItemName(entity),
+          position: positionOf(entity.position),
+        })),
+      );
+      if (itemPosition !== undefined) {
         await this.runPathfinder(
-          new goals.GoalNear(
-            itemEntity.position.x,
-            itemEntity.position.y,
-            itemEntity.position.z,
-            1,
-          ),
+          new goals.GoalNear(itemPosition.x, itemPosition.y, itemPosition.z, 1),
           signal,
         );
       }
@@ -600,16 +693,40 @@ export class MineflayerClient implements MinecraftPort {
     return food.name;
   }
 
-  public async escapeDanger(signal: AbortSignal): Promise<void> {
+  public async escapeDanger(
+    mode: EscapeMode,
+    signal: AbortSignal,
+  ): Promise<void> {
     throwIfAborted(signal, "escape");
     const bot = this.requireBot();
     bot.pathfinder.setGoal(null);
     bot.clearControlStates();
+    const target =
+      mode === "hostile"
+        ? escapeTarget(
+            positionOf(bot.entity.position),
+            Object.values(bot.entities)
+              .filter(
+                (entity) =>
+                  hostileNames.has(
+                    entity.name ?? entity.displayName ?? entity.type,
+                  ) && bot.entity.position.distanceTo(entity.position) <= 8,
+              )
+              .map((entity) => positionOf(entity.position)),
+          )
+        : undefined;
+    if (target !== undefined) {
+      await bot.lookAt(new Vec3(target.x, target.y + 1.6, target.z), true);
+    }
+    throwIfAborted(signal, "escape");
     bot.setControlState("jump", true);
     bot.setControlState("sprint", true);
     bot.setControlState("forward", true);
     try {
-      await delay(1_000, signal);
+      await delay(
+        mode === "hostile" && target !== undefined ? 2_500 : 1_000,
+        signal,
+      );
     } finally {
       bot.clearControlStates();
     }
@@ -715,5 +832,15 @@ export class MineflayerClient implements MinecraftPort {
         signal.removeEventListener("abort", abortRejection);
       }
     }
+  }
+}
+
+function droppedItemName(entity: {
+  getDroppedItem(): { readonly name: string } | null;
+}): string | undefined {
+  try {
+    return entity.getDroppedItem()?.name;
+  } catch {
+    return undefined;
   }
 }
