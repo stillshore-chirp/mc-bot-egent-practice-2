@@ -33,12 +33,19 @@ export interface ChatContextFactory {
   }>;
 }
 
+export type RuntimeReassessmentEvent =
+  | "startup_reassessment"
+  | "safety_stabilized"
+  | "safety_failed"
+  | "connection_recovered";
+
 export class ChatCoordinator {
   readonly #ownerUsername: string;
   readonly #game: GameController;
   readonly #agent: OpenAIDeliberationAgent;
   readonly #contextFactory: ChatContextFactory;
   readonly #logger: Logger;
+  readonly #immediateStopListeners = new Set<() => void>();
   #activeController: AbortController | undefined;
   #conversationTail: Promise<void> = Promise.resolve();
   #generation = 0;
@@ -63,6 +70,7 @@ export class ChatCoordinator {
     const normalized = message.trim();
     if (STOP_COMMANDS.has(normalized)) {
       this.#generation += 1;
+      this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
       const report = await this.#game.stopCurrentAction("利用者の即時停止指示");
       await this.#game.say(report.summary);
@@ -81,12 +89,13 @@ export class ChatCoordinator {
     return true;
   }
 
+  public onImmediateStop(listener: () => void): () => void {
+    this.#immediateStopListeners.add(listener);
+    return () => this.#immediateStopListeners.delete(listener);
+  }
+
   public async handleRuntimeEvent(
-    event:
-      | "startup_reassessment"
-      | "safety_stabilized"
-      | "safety_failed"
-      | "connection_recovered",
+    event: RuntimeReassessmentEvent,
   ): Promise<void> {
     const messages = {
       startup_reassessment:
@@ -117,6 +126,22 @@ export class ChatCoordinator {
     this.#generation += 1;
     this.#activeController?.abort(new Error("APPLICATION_SHUTDOWN"));
     await this.#conversationTail;
+  }
+
+  #notifyImmediateStop(): void {
+    for (const listener of this.#immediateStopListeners) {
+      try {
+        listener();
+      } catch (error) {
+        this.#logger.warn(
+          {
+            code: "IMMEDIATE_STOP_LISTENER_FAILED",
+            errorType: error instanceof Error ? error.name : "UnknownError",
+          },
+          "immediate stop listener failed",
+        );
+      }
+    }
   }
 
   async #deliberate(

@@ -4,7 +4,10 @@ import { dirname } from "node:path";
 import type { Logger } from "pino";
 
 import { OpenAIDeliberationAgent } from "../agent/openai-agent.js";
-import { ChatCoordinator } from "../agent/chat-coordinator.js";
+import {
+  ChatCoordinator,
+  type RuntimeReassessmentEvent,
+} from "../agent/chat-coordinator.js";
 import type { AppConfig } from "../config/schema.js";
 import { AppError } from "../domain/errors.js";
 import { MemoryStore } from "../memory/store.js";
@@ -18,7 +21,10 @@ import {
 } from "../observability/correlation.js";
 import { loadPersona } from "../persona/persona.js";
 import { ReflexDetector } from "../reflexes/detectors.js";
-import { ReflexCoordinator } from "../reflexes/reflex-coordinator.js";
+import {
+  ReflexCoordinator,
+  type ReflexState,
+} from "../reflexes/reflex-coordinator.js";
 import { ActionArbiter } from "../runtime/action-arbiter.js";
 import { TaskRuntime } from "../runtime/task-service.js";
 import { FollowPlayerSkill } from "../skills/follow-player.js";
@@ -30,8 +36,10 @@ import type { GameStatus } from "../tools/contracts.js";
 import { CompanionContextFactory } from "./context-factory.js";
 import { CompanionGameController } from "./game-controller.js";
 import { MemoryTaskStore, ToolMemoryAdapter } from "./memory-adapters.js";
+import { RuntimeReassessmentGate } from "./runtime-reassessment-gate.js";
 
 const REFLEX_INTERVAL_MS = 250;
+const RUNTIME_REASSESSMENT_COOLDOWN_MS = 30_000;
 const MOVEMENT_PHASES = new Set([
   "move_to",
   "move_to_resource",
@@ -40,6 +48,68 @@ const MOVEMENT_PHASES = new Set([
   "return_to_player",
   "following",
 ]);
+
+const runtimeReassessmentPriority = (event: RuntimeReassessmentEvent): number =>
+  ({
+    safety_failed: 4,
+    connection_recovered: 3,
+    startup_reassessment: 2,
+    safety_stabilized: 1,
+  })[event];
+
+export function taskExpectsMovement(
+  task:
+    | {
+        readonly kind?: string;
+        readonly status: string;
+        readonly phase: string;
+        readonly input?: unknown;
+      }
+    | undefined,
+  ownerDistance?: number,
+  followDistance = 0,
+): boolean {
+  if (task?.status !== "running" || !MOVEMENT_PHASES.has(task.phase))
+    return false;
+  return task.phase !== "following"
+    ? true
+    : ownerDistance !== undefined &&
+        ownerDistance > activeFollowDistance(task, followDistance) + 0.75;
+}
+
+function activeFollowDistance(
+  task: { readonly kind?: string; readonly input?: unknown },
+  fallback: number,
+): number {
+  if (
+    task.kind !== "follow_player" ||
+    task.input === null ||
+    typeof task.input !== "object" ||
+    Array.isArray(task.input)
+  ) {
+    return fallback;
+  }
+  const range = (task.input as { readonly range?: unknown }).range;
+  return typeof range === "number" && Number.isFinite(range) && range >= 0
+    ? range
+    : fallback;
+}
+
+export function reflexReassessmentForTransition(
+  previous: ReflexState,
+  current: ReflexState,
+): RuntimeReassessmentEvent | undefined {
+  if (current.state === "failed") {
+    return previous.state === "failed" &&
+      previous.incident.kind === current.incident.kind &&
+      previous.failure.code === current.failure.code
+      ? undefined
+      : "safety_failed";
+  }
+  return previous.state !== "safe" && current.state === "safe"
+    ? "safety_stabilized"
+    : undefined;
+}
 
 export interface CompanionApplication {
   start(): Promise<void>;
@@ -87,17 +157,20 @@ class DefaultCompanionApplication implements CompanionApplication {
   readonly #tasks: TaskRuntime;
   readonly #reflexes: ReflexCoordinator;
   readonly #coordinator: ChatCoordinator;
+  readonly #runtimeReassessments: RuntimeReassessmentGate<RuntimeReassessmentEvent>;
   readonly #game: CompanionGameController;
   readonly #playerId: string;
+  readonly #ownerUsername: string;
+  readonly #followDistance: number;
   readonly #startupReassessmentRequired: boolean;
   readonly #logger: Logger;
   #unsubscribeChat: (() => void) | undefined;
+  #unsubscribeImmediateStop: (() => void) | undefined;
   #reflexTimer: NodeJS.Timeout | undefined;
-  #reflexTickInFlight = false;
+  #reflexTickPromise: Promise<void> | undefined;
   #observationUnavailable = false;
   #lastReflexFailure = "";
   #lastRememberedIncident = "";
-  #lastReflexReassessment = "";
   #reconnectFailureLogged = false;
   #started = false;
   #shutdownPromise: Promise<void> | undefined;
@@ -111,6 +184,8 @@ class DefaultCompanionApplication implements CompanionApplication {
     coordinator: ChatCoordinator;
     game: CompanionGameController;
     playerId: string;
+    ownerUsername: string;
+    followDistance: number;
     startupReassessmentRequired: boolean;
     logger: Logger;
   }) {
@@ -122,8 +197,29 @@ class DefaultCompanionApplication implements CompanionApplication {
     this.#coordinator = input.coordinator;
     this.#game = input.game;
     this.#playerId = input.playerId;
+    this.#ownerUsername = input.ownerUsername;
+    this.#followDistance = input.followDistance;
     this.#startupReassessmentRequired = input.startupReassessmentRequired;
     this.#logger = input.logger;
+    this.#runtimeReassessments = new RuntimeReassessmentGate({
+      run: (event) => this.#coordinator.handleRuntimeEvent(event),
+      priority: runtimeReassessmentPriority,
+      cooldownMs: RUNTIME_REASSESSMENT_COOLDOWN_MS,
+      onError: (error, event) => {
+        this.#logger.error(
+          {
+            category: "llm",
+            code: "RUNTIME_REASSESSMENT_FAILED",
+            event,
+            errorType: error instanceof Error ? error.name : "UnknownError",
+          },
+          "runtime reassessment failed",
+        );
+      },
+    });
+    this.#unsubscribeImmediateStop = this.#coordinator.onImmediateStop(() =>
+      this.#runtimeReassessments.cancelPending(),
+    );
   }
 
   public async start(): Promise<void> {
@@ -142,9 +238,7 @@ class DefaultCompanionApplication implements CompanionApplication {
         });
     });
     this.#reflexTimer = setInterval(() => {
-      void runWithCorrelation(createCorrelationId(), () =>
-        this.#runReflexTick(),
-      );
+      this.#scheduleReflexTick();
     }, REFLEX_INTERVAL_MS);
     this.#started = true;
     this.#logger.info(
@@ -212,7 +306,15 @@ class DefaultCompanionApplication implements CompanionApplication {
     }
     this.#unsubscribeChat?.();
     this.#unsubscribeChat = undefined;
-    await this.#coordinator.shutdown();
+    const runtimeReassessmentsStopped = this.#runtimeReassessments.stop();
+    const coordinatorStopped = this.#coordinator.shutdown();
+    await Promise.all([
+      this.#reflexTickPromise,
+      coordinatorStopped,
+      runtimeReassessmentsStopped,
+    ]);
+    this.#unsubscribeImmediateStop?.();
+    this.#unsubscribeImmediateStop = undefined;
     await this.#tasks.suspend(reason);
     await this.#connection.shutdown(reason);
     this.#memory.close();
@@ -220,9 +322,25 @@ class DefaultCompanionApplication implements CompanionApplication {
     this.#logger.info({}, "AI companion stopped");
   }
 
+  #scheduleReflexTick(): void {
+    if (
+      this.#reflexTickPromise !== undefined ||
+      this.#shutdownPromise !== undefined
+    ) {
+      return;
+    }
+    const tick = runWithCorrelation(createCorrelationId(), () =>
+      this.#runReflexTick(),
+    ).finally(() => {
+      if (this.#reflexTickPromise === tick) this.#reflexTickPromise = undefined;
+    });
+    this.#reflexTickPromise = tick;
+  }
+
   async #runReflexTick(): Promise<void> {
-    if (this.#reflexTickInFlight || this.#shutdownPromise !== undefined) return;
-    this.#reflexTickInFlight = true;
+    if (this.#shutdownPromise !== undefined) return;
+    const reassessmentGeneration =
+      this.#runtimeReassessments.captureGeneration();
     try {
       const snapshot = await this.#minecraft.observe();
       if (this.#connection.state === "connected") {
@@ -231,16 +349,25 @@ class DefaultCompanionApplication implements CompanionApplication {
       if (this.#observationUnavailable) {
         this.#logger.info({}, "Minecraft observation recovered");
         this.#observationUnavailable = false;
-        this.#requestRuntimeReassessment("connection_recovered");
+        this.#requestRuntimeReassessment(
+          "connection_recovered",
+          reassessmentGeneration,
+        );
       }
-      const phase = this.#tasks.current?.phase;
+      const previousReflexState = this.#reflexes.state;
+      const ownerDistance = snapshot.players.find(
+        ({ username }) => username === this.#ownerUsername,
+      )?.distance;
       const state = await this.#reflexes.tick(
         snapshot,
-        phase !== undefined && MOVEMENT_PHASES.has(phase),
+        taskExpectsMovement(
+          this.#tasks.current,
+          ownerDistance,
+          this.#followDistance,
+        ),
       );
       if (state.state === "safe") {
         this.#lastRememberedIncident = "";
-        this.#lastReflexReassessment = "";
       } else if (state.incident.kind !== "hunger") {
         const incidentKey = [
           state.incident.kind,
@@ -275,17 +402,12 @@ class DefaultCompanionApplication implements CompanionApplication {
           }
         }
       }
-      if (state.state === "stabilizing" || state.state === "failed") {
-        const reassessmentKey = `${state.state}:${state.incident.kind}`;
-        if (reassessmentKey !== this.#lastReflexReassessment) {
-          this.#lastReflexReassessment = reassessmentKey;
-          this.#requestRuntimeReassessment(
-            state.state === "stabilizing"
-              ? "safety_stabilized"
-              : "safety_failed",
-          );
-        }
-      }
+      const reassessment = reflexReassessmentForTransition(
+        previousReflexState,
+        state,
+      );
+      if (reassessment !== undefined)
+        this.#requestRuntimeReassessment(reassessment, reassessmentGeneration);
       if (state.state === "failed") {
         const key = `${state.incident.kind}:${state.failure.code}`;
         if (key !== this.#lastReflexFailure) {
@@ -333,25 +455,14 @@ class DefaultCompanionApplication implements CompanionApplication {
         );
         this.#reconnectFailureLogged = true;
       }
-    } finally {
-      this.#reflexTickInFlight = false;
     }
   }
 
   #requestRuntimeReassessment(
-    event: Parameters<ChatCoordinator["handleRuntimeEvent"]>[0],
+    event: RuntimeReassessmentEvent,
+    generation?: number,
   ): void {
-    void this.#coordinator.handleRuntimeEvent(event).catch((error: unknown) => {
-      this.#logger.error(
-        {
-          category: "llm",
-          code: "RUNTIME_REASSESSMENT_FAILED",
-          event,
-          errorType: error instanceof Error ? error.name : "UnknownError",
-        },
-        "runtime reassessment failed",
-      );
-    });
+    this.#runtimeReassessments.request(event, generation);
   }
 }
 
@@ -478,6 +589,8 @@ export function createApplication(config: AppConfig): CompanionApplication {
     coordinator,
     game,
     playerId: player.id,
+    ownerUsername: config.ownerUsername,
+    followDistance: config.limits.followDistance,
     startupReassessmentRequired,
     logger,
   });
