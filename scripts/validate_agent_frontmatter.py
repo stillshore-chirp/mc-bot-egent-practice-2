@@ -545,17 +545,17 @@ def validate_workflow(root: Path) -> None:
 
     checkout = by_name.get("Checkout repository", {})
     checkout_with = checkout.get("with", {}) if isinstance(checkout, dict) else {}
-    if checkout.get("uses") != "actions/checkout@v4" or checkout_with != {
+    if checkout.get("uses") != "actions/checkout@v7" or checkout_with != {
         "persist-credentials": "false"
     }:
-        raise _fail(path, "checkout must use actions/checkout@v4 without credentials")
+        raise _fail(path, "checkout must use actions/checkout@v7 without credentials")
 
     setup = by_name.get("Set up Python", {})
     setup_with = setup.get("with", {}) if isinstance(setup, dict) else {}
-    if setup.get("uses") != "actions/setup-python@v6" or setup_with != {
+    if setup.get("uses") != "actions/setup-python@v7" or setup_with != {
         "python-version": "3.14"
     }:
-        raise _fail(path, "Python setup must use actions/setup-python@v6 and Python 3.14")
+        raise _fail(path, "Python setup must use actions/setup-python@v7 and Python 3.14")
 
     expected_runs = {
         "Install validation dependencies": (
