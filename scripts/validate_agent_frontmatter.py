@@ -14,7 +14,7 @@ from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterable
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 try:
     import yaml
@@ -686,6 +686,27 @@ def validate_adapter_mapping(root: Path) -> None:
         raise _fail(cursor_rule, "body must contain only canonical routing text")
 
 
+def _nested_adapter_contract(
+    root: Path, nested_agents: Path
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any], str]:
+    scope = nested_agents.parent.relative_to(root).as_posix()
+    scope_key = quote(scope, safe="")
+    claude_adapter = root / f".claude/rules/scope-{scope_key}.md"
+    cursor_adapter = root / f".cursor/rules/scope-{scope_key}.mdc"
+    claude_data = {"paths": [f"{scope}/**/*"]}
+    cursor_data = {
+        "description": f"{scope}のnested AGENTS.mdへ接続するpath adapter",
+        "globs": f"{scope}/**",
+        "alwaysApply": False,
+    }
+    body = (
+        "# Path scope adapter\n\n"
+        f"[`{scope}/AGENTS.md`](../../{scope}/AGENTS.md)を、"
+        "このpathで適用する唯一の追加ルール正本として参照します。"
+    )
+    return claude_adapter, claude_data, cursor_adapter, cursor_data, body
+
+
 def validate_nested_agents(root: Path) -> None:
     repository_files = list(_repository_files(root))
     root_agents = root / "AGENTS.md"
@@ -695,7 +716,19 @@ def validate_nested_agents(root: Path) -> None:
         for path in repository_files
         if path.name == "AGENTS.md" and path.parent != root
     ]
+    expected_claude_adapters: set[Path] = set()
+    expected_cursor_adapters: set[Path] = set()
     for path in nested:
+        (
+            claude_adapter,
+            expected_claude_data,
+            cursor_adapter,
+            expected_cursor_data,
+            expected_body,
+        ) = _nested_adapter_contract(root, path)
+        expected_claude_adapters.add(claude_adapter)
+        expected_cursor_adapters.add(cursor_adapter)
+
         scoped_files = [
             candidate
             for candidate in repository_files
@@ -705,6 +738,30 @@ def validate_nested_agents(root: Path) -> None:
         ]
         if not scoped_files:
             raise _fail(path, "nested rule requires a real file in the same subtree")
+
+        if not claude_adapter.is_file():
+            raise _fail(
+                path,
+                f"Claude path adapter is missing: {_relative(claude_adapter, root)}",
+            )
+        claude_data, claude_body = load_frontmatter(claude_adapter)
+        if claude_data != expected_claude_data or claude_body != expected_body:
+            raise _fail(
+                claude_adapter,
+                "must exactly scope and route to the nested AGENTS.md",
+            )
+
+        if not cursor_adapter.is_file():
+            raise _fail(
+                path,
+                f"Cursor path adapter is missing: {_relative(cursor_adapter, root)}",
+            )
+        cursor_data, cursor_body = load_frontmatter(cursor_adapter)
+        if cursor_data != expected_cursor_data or cursor_body != expected_body:
+            raise _fail(
+                cursor_adapter,
+                "must exactly scope and route to the nested AGENTS.md",
+            )
 
         raw = path.read_bytes()
         lines = len(raw.decode("utf-8").splitlines())
@@ -716,6 +773,13 @@ def validate_nested_agents(root: Path) -> None:
             )
         if root_bytes + len(raw) > 24576:
             raise _fail(path, "root and nested AGENTS.md exceed 24576 combined bytes")
+
+    actual_claude_adapters = set(root.glob(".claude/rules/scope-*.md"))
+    actual_cursor_adapters = set(root.glob(".cursor/rules/scope-*.mdc"))
+    for orphan in sorted(actual_claude_adapters - expected_claude_adapters):
+        raise _fail(orphan, "path adapter has no corresponding nested AGENTS.md")
+    for orphan in sorted(actual_cursor_adapters - expected_cursor_adapters):
+        raise _fail(orphan, "path adapter has no corresponding nested AGENTS.md")
 
 
 def validate_repository(root: Path) -> None:
@@ -780,6 +844,54 @@ def run_self_test() -> None:
             pass
         else:
             raise ValidationError("self-test accepted string alwaysApply=false")
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(
+            ["git", "init", "--quiet"],
+            cwd=root,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        (root / "AGENTS.md").write_text("# Root\n", encoding="utf-8")
+        nested = root / "apps/bot/AGENTS.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("# Bot scope\n", encoding="utf-8")
+        (nested.parent / "bot.py").write_text("pass\n", encoding="utf-8")
+
+        try:
+            validate_nested_agents(root)
+        except ValidationError as exc:
+            if "Claude path adapter is missing" not in str(exc):
+                raise ValidationError("nested adapter self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted a nested rule without adapters")
+
+        claude_path, claude_data, cursor_path, cursor_data, body = (
+            _nested_adapter_contract(root, nested)
+        )
+        for path, data in ((claude_path, claude_data), (cursor_path, cursor_data)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frontmatter = yaml.safe_dump(
+                data,
+                allow_unicode=True,
+                sort_keys=False,
+            ).rstrip()
+            path.write_text(
+                f"---\n{frontmatter}\n---\n\n{body}\n",
+                encoding="utf-8",
+            )
+        validate_nested_agents(root)
+
+        nested.unlink()
+        try:
+            validate_nested_agents(root)
+        except ValidationError as exc:
+            if "path adapter has no corresponding nested AGENTS.md" not in str(exc):
+                raise ValidationError("orphan adapter self-test failed") from exc
+        else:
+            raise ValidationError("self-test accepted an orphan path adapter")
 
 
 def parse_args() -> argparse.Namespace:

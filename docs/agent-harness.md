@@ -47,6 +47,8 @@
 
 各toolのversion、実行形態、sandboxによる発見差は静的検証だけでは保証できません。発見できない場合はtool名、version、実行形態、再現pathをIssueへ記録します。
 
+nested `AGENTS.md` を追加する場合は、その親pathをURL percent-encodeしたscope keyを使い、`.claude/rules/scope-<scope-key>.md` と `.cursor/rules/scope-<scope-key>.mdc` を同じ変更で追加します。例えば `apps/bot/AGENTS.md` のscope keyは `apps%2Fbot` です。両adapterは対象pathだけへscopeし、nested `AGENTS.md` への参照だけを持ちます。検証scriptは、adapterの欠落、scope不一致、本文複製、対応するnested ruleがない孤立adapterを拒否します。
+
 ## 配置の判断
 
 新しい規則を追加する前に、次の順で判断します。
