@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { AppError } from "../domain/errors.js";
 import type { ErrorCategory, ToolContext, ToolResult } from "./contracts.js";
 import { getToolDefinition } from "./registry.js";
@@ -84,7 +86,31 @@ export class ToolExecutor {
     try {
       const result = await definition.execute(parsed.data, context);
       if (definition.action && result.success) {
-        context.executionEvidence.verifiedActionSuccess = true;
+        const commitmentId = verifiedFulfillmentCommitmentId(
+          name,
+          parsed.data,
+          result,
+          context,
+        );
+        if (commitmentId !== undefined) {
+          const receipt = {
+            receiptId: randomUUID(),
+            commitmentId,
+            correlationId: context.correlationId,
+            toolName: name,
+            evidence: result.evidence,
+            used: false,
+          };
+          context.executionEvidence.verifiedActionReceipts.push(receipt);
+          return {
+            ...result,
+            verificationReceipt: {
+              receiptId: receipt.receiptId,
+              commitmentId,
+              toolName: name,
+            },
+          };
+        }
       }
       return result;
     } catch (error) {
@@ -126,4 +152,62 @@ export class ToolExecutor {
       };
     }
   }
+}
+
+function verifiedFulfillmentCommitmentId(
+  toolName: string,
+  input: unknown,
+  result: Extract<ToolResult<unknown>, { success: true }>,
+  context: ToolContext,
+): string | undefined {
+  if (
+    toolName !== "gather_resource" ||
+    input === null ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
+    return undefined;
+  }
+  const action = input as {
+    readonly commitmentId?: unknown;
+    readonly resource?: unknown;
+    readonly count?: unknown;
+  };
+  if (typeof action.commitmentId !== "string") return undefined;
+  const commitment = context.memory.getCommitment({
+    playerId: context.playerId,
+    commitmentId: action.commitmentId,
+  });
+  if (
+    commitment?.status !== "active" ||
+    commitment.fulfillment?.toolName !== "gather_resource" ||
+    commitment.fulfillment.resource !== action.resource ||
+    commitment.fulfillment.count !== action.count ||
+    result.evidence.every(({ kind }) => kind !== "inventory_delta") ||
+    result.data === null ||
+    typeof result.data !== "object" ||
+    Array.isArray(result.data)
+  ) {
+    return undefined;
+  }
+  const confirmedState = (result.data as { readonly confirmedState?: unknown })
+    .confirmedState;
+  if (
+    confirmedState === null ||
+    typeof confirmedState !== "object" ||
+    Array.isArray(confirmedState)
+  ) {
+    return undefined;
+  }
+  const verified = confirmedState as Readonly<Record<string, unknown>>;
+  return verified.resource === action.resource &&
+    verified.requestedCount === action.count &&
+    typeof verified.collectedCount === "number" &&
+    verified.collectedCount >= commitment.fulfillment.count &&
+    typeof verified.heldCount === "number" &&
+    verified.heldCount >= commitment.fulfillment.count &&
+    typeof verified.playerDistance === "number" &&
+    verified.playerDistance <= context.limits.followDistance
+    ? action.commitmentId
+    : undefined;
 }

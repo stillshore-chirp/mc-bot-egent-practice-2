@@ -12,6 +12,7 @@ import {
   worldMemoryStatuses,
 } from "./types.js";
 import type {
+  CommitmentFulfillment,
   CommitmentRecord,
   CommitmentStatus,
   CompleteCommitmentInput,
@@ -525,7 +526,11 @@ export class MemoryStore {
       "commitment blockers",
       30,
     );
-    const stateJson = commitmentEnvelopeJson(progress, blockers);
+    const fulfillment =
+      input.fulfillment === undefined
+        ? undefined
+        : commitmentFulfillment(input.fulfillment, "commitment fulfillment");
+    const stateJson = commitmentEnvelopeJson(progress, blockers, fulfillment);
     const now = timestamp();
     return this.database.transaction(() => {
       const duplicate = this.database
@@ -549,6 +554,7 @@ export class MemoryStore {
         status: "active",
         progress,
         blockers,
+        ...(fulfillment === undefined ? {} : { fulfillment }),
         createdAt: now,
         updatedAt: now,
       };
@@ -584,11 +590,19 @@ export class MemoryStore {
       if (row.status === "completed") {
         return commitment(row);
       }
+      if (row.status !== "active") {
+        throw new MemoryStoreError(
+          "Only an active commitment can be completed.",
+        );
+      }
       const state = commitmentState(row);
       const outcomeJson = json(
         {
           progress: state.progress,
           blockers: [],
+          ...(state.fulfillment === undefined
+            ? {}
+            : { fulfillment: state.fulfillment }),
           result,
           verificationSource,
           verificationEvidence,
@@ -631,7 +645,12 @@ export class MemoryStore {
           "Only an active commitment can update progress.",
         );
       }
-      const stateJson = commitmentEnvelopeJson(progress, blockers);
+      const state = commitmentState(row);
+      const stateJson = commitmentEnvelopeJson(
+        progress,
+        blockers,
+        state.fulfillment,
+      );
       this.database
         .prepare<[string, string, string]>(
           "UPDATE commitments SET outcome_json = ?, updated_at = ? WHERE id = ?",
@@ -661,6 +680,15 @@ export class MemoryStore {
       )
       .all(playerId)
       .map(commitment);
+  }
+
+  public getCommitment(commitmentId: string): CommitmentRecord | undefined {
+    const row = this.database
+      .prepare<[string], CommitmentRow>(
+        "SELECT id, player_id, description, status, outcome_json, created_at, updated_at, completed_at FROM commitments WHERE id = ?",
+      )
+      .get(commitmentId);
+    return row === undefined ? undefined : commitment(row);
   }
 
   public recordEpisode(input: RecordEpisodeInput): EpisodeRecord {
@@ -992,13 +1020,18 @@ export class MemoryStore {
         createdAt,
         updatedAt: now,
       };
-      this.index(
-        LIFE_STATE_ID,
-        "life_state",
-        GLOBAL_MEMORY_OWNER,
-        lifeStateSearchText(saved),
-        now,
-      );
+      const searchText = lifeStateSearchText(saved);
+      if (searchText.length === 0) {
+        this.removeSearch(LIFE_STATE_ID, "life_state");
+      } else {
+        this.index(
+          LIFE_STATE_ID,
+          "life_state",
+          GLOBAL_MEMORY_OWNER,
+          searchText,
+          now,
+        );
+      }
       return saved;
     })();
   }
@@ -2241,6 +2274,9 @@ function commitment(row: CommitmentRow): CommitmentRecord {
     status: commitmentStatus(row.status),
     progress: state.progress,
     blockers: state.blockers,
+    ...(state.fulfillment === undefined
+      ? {}
+      : { fulfillment: state.fulfillment }),
     ...(state.outcome === undefined ? {} : { outcome: state.outcome }),
     ...(state.completionVerification === undefined
       ? {}
@@ -2254,13 +2290,22 @@ function commitment(row: CommitmentRow): CommitmentRecord {
 function commitmentEnvelopeJson(
   progress: readonly string[],
   blockers: readonly string[],
+  fulfillment?: CommitmentFulfillment,
 ): string {
-  return json({ progress, blockers }, "commitment state");
+  return json(
+    {
+      progress,
+      blockers,
+      ...(fulfillment === undefined ? {} : { fulfillment }),
+    },
+    "commitment state",
+  );
 }
 
 function commitmentState(row: CommitmentRow): {
   readonly progress: readonly string[];
   readonly blockers: readonly string[];
+  readonly fulfillment?: CommitmentFulfillment;
   readonly outcome?: JsonValue;
   readonly completionVerification?: {
     readonly source: "owner_confirmation" | "verified_tool_result";
@@ -2287,6 +2332,14 @@ function commitmentState(row: CommitmentRow): {
     return {
       progress,
       blockers,
+      ...(parsed.fulfillment === undefined
+        ? {}
+        : {
+            fulfillment: commitmentFulfillment(
+              parsed.fulfillment,
+              "persisted commitment fulfillment",
+            ),
+          }),
       ...(row.status === "completed" && parsed.result !== undefined
         ? { outcome: parsed.result }
         : {}),
@@ -2310,6 +2363,31 @@ function commitmentState(row: CommitmentRow): {
   return row.status === "completed"
     ? { progress: [], blockers: [], outcome: parsed }
     : { progress: [], blockers: [] };
+}
+
+function commitmentFulfillment(
+  value: unknown,
+  label: string,
+): CommitmentFulfillment {
+  if (!isJsonObject(value as JsonValue)) {
+    throw new MemoryStoreError(label + " must be an object.");
+  }
+  const object = value as JsonObject;
+  if (
+    object.toolName !== "gather_resource" ||
+    typeof object.resource !== "string" ||
+    typeof object.count !== "number" ||
+    !Number.isInteger(object.count) ||
+    object.count < 1 ||
+    object.count > 64
+  ) {
+    throw new MemoryStoreError(label + " is invalid.");
+  }
+  return {
+    toolName: "gather_resource",
+    resource: text(object.resource, label + " resource", 80),
+    count: object.count,
+  };
 }
 
 function commitmentStringList(

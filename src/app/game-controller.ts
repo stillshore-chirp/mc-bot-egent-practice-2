@@ -214,6 +214,14 @@ export class CompanionGameController implements GameController {
         }),
       (output) => ({
         outcome: "completed",
+        evidenceKind: "inventory_delta",
+        confirmedState: {
+          resource: output.itemName,
+          requestedCount: output.requestedCount,
+          collectedCount: output.collectedCount,
+          heldCount: output.heldCount,
+          playerDistance: output.playerDistance,
+        },
         summary: `${output.itemName}を新たに${String(output.collectedCount)}個収集し、所持数${String(output.heldCount)}個と依頼者への帰還を観測しました。`,
       }),
     );
@@ -251,7 +259,12 @@ export class CompanionGameController implements GameController {
       after: WorldSnapshot | null,
     ) => Pick<
       ActionReport,
-      "outcome" | "failureCategory" | "failureCode" | "summary"
+      | "outcome"
+      | "failureCategory"
+      | "failureCode"
+      | "confirmedState"
+      | "evidenceKind"
+      | "summary"
     >,
     capturedBefore?: WorldSnapshot,
   ): Promise<ActionReport> {

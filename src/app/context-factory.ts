@@ -110,7 +110,7 @@ export class CompanionContextFactory implements ChatContextFactory {
         playerId: this.playerId,
         signal,
         requestKind,
-        executionEvidence: { verifiedActionSuccess: false },
+        executionEvidence: { verifiedActionReceipts: [] },
         game: this.game,
         memory: this.toolMemory,
         limits: {

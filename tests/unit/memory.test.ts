@@ -25,6 +25,32 @@ afterEach(() => {
 });
 
 describe("MemoryStore", () => {
+  it("persists an empty initial life state without creating a stale search entry", () => {
+    const store = MemoryStore.open(databasePath());
+    const initial = store.saveLifeState({
+      currentInterests: [],
+      longTermGoals: [],
+      possessions: [],
+    });
+
+    expect(store.getLifeState()).toEqual(initial);
+    expect(store.searchLifeState("rail route")).toBeUndefined();
+
+    store.saveLifeState({
+      currentInterests: ["repair the rail route"],
+      longTermGoals: [],
+      possessions: [],
+    });
+    expect(store.searchLifeState("rail route")).toBeDefined();
+
+    store.saveLifeState({
+      currentInterests: [],
+      longTermGoals: [],
+      possessions: [],
+    });
+    expect(store.searchLifeState("rail route")).toBeUndefined();
+  });
+
   it("creates a migrated WAL database and a relationship with a player", () => {
     const path = databasePath();
     const store = MemoryStore.open(path);
@@ -163,6 +189,11 @@ describe("MemoryStore", () => {
       playerId: player.id,
       description: "Return after collecting eight oak logs",
       blockers: ["bridge is incomplete"],
+      fulfillment: {
+        toolName: "gather_resource",
+        resource: "oak_log",
+        count: 8,
+      },
     });
     const progressed = store.updateCommitmentProgress({
       commitmentId: commitment.id,
@@ -191,11 +222,21 @@ describe("MemoryStore", () => {
     expect(progressed).toMatchObject({
       progress: ["collected four logs"],
       blockers: ["bridge is incomplete"],
+      fulfillment: {
+        toolName: "gather_resource",
+        resource: "oak_log",
+        count: 8,
+      },
     });
     expect(complete.status).toBe("completed");
     expect(complete).toMatchObject({
       progress: ["collected four logs"],
       blockers: [],
+      fulfillment: {
+        toolName: "gather_resource",
+        resource: "oak_log",
+        count: 8,
+      },
       outcome: { delivered: 8, verifiedBy: "inventory_snapshot" },
       completionVerification: {
         source: "verified_tool_result",
@@ -216,6 +257,36 @@ describe("MemoryStore", () => {
     expect(
       Object.prototype.hasOwnProperty.call(store, "rememberTranscript"),
     ).toBe(false);
+  });
+
+  it("does not transition a cancelled commitment to completed", () => {
+    const path = databasePath();
+    const store = MemoryStore.open(path);
+    const player = store.getOrCreatePlayer("Explorer");
+    const commitment = store.setCommitment({
+      playerId: player.id,
+      description: "Collect one oak log",
+    });
+    store.close();
+
+    const database = new Database(path);
+    database
+      .prepare("UPDATE commitments SET status = 'cancelled' WHERE id = ?")
+      .run(commitment.id);
+    database.close();
+
+    const reopened = MemoryStore.open(path);
+    expect(() =>
+      reopened.completeCommitment({
+        playerId: player.id,
+        commitmentId: commitment.id,
+        outcome: "done",
+        verificationSource: "owner_confirmation",
+        verificationEvidence: "owner confirmed",
+      }),
+    ).toThrow(MemoryStoreError);
+    expect(reopened.getCommitment(commitment.id)?.status).toBe("cancelled");
+    reopened.close();
   });
 
   it("stores, corrects, and searches companion life state and world memory independently", () => {

@@ -66,6 +66,7 @@ function toolContext(): ToolContext {
     rememberLocation: () => ({}),
     recall: () => [],
     setCommitment: () => ({ id: "commitment" }),
+    getCommitment: () => undefined,
     completeCommitment: () => ({}),
   };
   return {
@@ -75,7 +76,7 @@ function toolContext(): ToolContext {
     playerId: "player",
     signal: new AbortController().signal,
     requestKind: "owner_message",
-    executionEvidence: { verifiedActionSuccess: false },
+    executionEvidence: { verifiedActionReceipts: [] },
     game,
     memory,
     limits: {
@@ -107,7 +108,12 @@ describe("OpenAI tool loop", () => {
           type: "function_call",
           call_id: "call-1",
           name: "move_to",
-          arguments: JSON.stringify({ x: 100, y: 64, z: 0, radius: 2 }),
+          arguments: JSON.stringify({
+            x: 100,
+            y: 64,
+            z: 0,
+            radius: 2,
+          }),
           status: "completed",
         },
       ]),
@@ -179,6 +185,93 @@ describe("OpenAI tool loop", () => {
       }),
     ).rejects.toMatchObject({
       detail: { code: "LLM_RESPONSE_NOT_COMPLETED" },
+    });
+  });
+
+  it("rejects an unrelated action as commitment completion evidence", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-recall",
+          name: "recall_memory",
+          arguments: JSON.stringify({
+            query: "約束",
+            kinds: ["commitment"],
+            limit: 5,
+          }),
+          status: "completed",
+        },
+      ]),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-move",
+          name: "move_to",
+          arguments: JSON.stringify({
+            x: 1,
+            y: 64,
+            z: 0,
+            radius: 2,
+          }),
+          status: "completed",
+        },
+      ]),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-complete",
+          name: "complete_commitment",
+          arguments: JSON.stringify({
+            commitmentId: "commitment",
+            outcome: "done",
+            basis: "verified_tool_result",
+            receiptId: "00000000-0000-4000-8000-000000000001",
+            evidenceSummary: null,
+          }),
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-final",
+            role: "assistant",
+            status: "completed",
+            content: [
+              { type: "output_text", text: "確認しました。", annotations: [] },
+            ],
+          },
+        ],
+        "確認しました。",
+      ),
+    ]);
+    let completionWrites = 0;
+    const context = toolContext();
+    context.memory.completeCommitment = () => {
+      completionWrites += 1;
+      return {};
+    };
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      client: fake as never,
+      logger: pino({ enabled: false }),
+      model: "test-model",
+    });
+
+    const reply = await agent.deliberate({
+      message: "約束を確認して移動して完了にして",
+      personaContext: "test persona",
+      memoryContext: "active commitment",
+      worldContext: JSON.stringify(status),
+      toolContext: context,
+    });
+
+    expect(completionWrites).toBe(0);
+    expect(reply.toolResults.at(-1)?.result).toMatchObject({
+      success: false,
+      error: { code: "COMMITMENT_VERIFIED_ACTION_MISSING" },
     });
   });
 });

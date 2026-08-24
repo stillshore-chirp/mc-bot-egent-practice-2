@@ -30,6 +30,11 @@ export class ToolMemoryAdapter implements MemoryPort {
     return this.store.setCommitment(input);
   }
 
+  public getCommitment(input: Parameters<MemoryPort["getCommitment"]>[0]) {
+    const commitment = this.store.getCommitment(input.commitmentId);
+    return commitment?.playerId === input.playerId ? commitment : undefined;
+  }
+
   public completeCommitment(
     input: Parameters<MemoryPort["completeCommitment"]>[0],
   ) {

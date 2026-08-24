@@ -37,6 +37,11 @@ export type ToolResult<T> =
       data: T;
       evidence: EvidenceReference[];
       userSummary: string;
+      verificationReceipt?: {
+        receiptId: string;
+        commitmentId: string;
+        toolName: string;
+      };
     }
   | { success: false; error: ToolFailure };
 
@@ -133,9 +138,27 @@ export interface MemoryPort {
     kinds: MemoryKind[];
     limit: number;
   }): unknown[];
-  setCommitment(input: { playerId: string; description: string }): {
+  setCommitment(input: {
+    playerId: string;
+    description: string;
+    fulfillment?: {
+      toolName: "gather_resource";
+      resource: string;
+      count: number;
+    };
+  }): {
     id: string;
   };
+  getCommitment(input: { playerId: string; commitmentId: string }):
+    | {
+        status: "active" | "completed" | "cancelled";
+        fulfillment?: {
+          toolName: "gather_resource";
+          resource: string;
+          count: number;
+        };
+      }
+    | undefined;
   completeCommitment(input: {
     playerId: string;
     commitmentId: string;
@@ -152,7 +175,16 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
-  executionEvidence: { verifiedActionSuccess: boolean };
+  executionEvidence: {
+    verifiedActionReceipts: {
+      receiptId: string;
+      commitmentId: string;
+      correlationId: string;
+      toolName: string;
+      evidence: EvidenceReference[];
+      used: boolean;
+    }[];
+  };
   game: GameController;
   memory: MemoryPort;
   limits: {

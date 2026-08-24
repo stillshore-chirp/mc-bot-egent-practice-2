@@ -23,7 +23,6 @@ const resourceNames = [
 ] as const;
 
 const memoryKinds = ["fact", "location", "commitment", "episode"] as const;
-
 function nowEvidence(
   kind: EvidenceReference["kind"],
   summary: string,
@@ -208,16 +207,17 @@ export const toolDefinitions = [
   defineTool({
     name: "gather_resource",
     description:
-      "指定した原木を探索・採取・回収し、所持品差分を確認して利用者へ戻る。",
+      "指定した原木を探索・採取・回収し、所持品差分を確認して利用者へ戻る。型付き収集約束の履行ならcommitmentId、通常はnullを指定する。",
     input: z
       .object({
         resource: z.enum(resourceNames),
         count: z.number().int().min(1).max(64),
+        commitmentId: z.string().trim().min(1).max(100).nullable(),
       })
       .strict(),
     fixtures: {
-      valid: [{ resource: "oak_log", count: 4 }],
-      invalid: [{ resource: "stone", count: 4 }],
+      valid: [{ resource: "oak_log", count: 4, commitmentId: null }],
+      invalid: [{ resource: "stone", count: 4, commitmentId: null }],
     },
     action: true,
     execute: async (input, context) => {
@@ -250,8 +250,15 @@ export const toolDefinitions = [
   defineTool({
     name: "return_to_player",
     description: "認可済み利用者の現在位置を再観測して安全な距離まで戻る。",
-    input: z.object({ safeDistance: z.number().min(2).max(16) }).strict(),
-    fixtures: { valid: [{ safeDistance: 3 }], invalid: [{ safeDistance: 0 }] },
+    input: z
+      .object({
+        safeDistance: z.number().min(2).max(16),
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ safeDistance: 3 }],
+      invalid: [{ safeDistance: 0 }],
+    },
     action: true,
     execute: async (input, context) => {
       if (input.safeDistance < context.limits.followDistance) {
@@ -377,19 +384,74 @@ export const toolDefinitions = [
   }),
   defineTool({
     name: "set_commitment",
-    description: "利用者との約束を未完了状態で保存する。",
+    description:
+      "利用者との約束を未完了状態で保存する。原木収集をMinecraft観測で自動完了する約束だけfulfillmentTool/resource/countを指定し、それ以外は3項目をnullにする。",
     input: z
-      .object({ description: z.string().trim().min(1).max(500) })
+      .object({
+        description: z.string().trim().min(1).max(500),
+        fulfillmentTool: z.literal("gather_resource").nullable(),
+        resource: z.enum(resourceNames).nullable(),
+        count: z.number().int().min(1).max(64).nullable(),
+      })
       .strict(),
     fixtures: {
-      valid: [{ description: "原木を集める" }],
-      invalid: [{ description: "" }],
+      valid: [
+        {
+          description: "オークの原木を4個集めて戻る",
+          fulfillmentTool: "gather_resource",
+          resource: "oak_log",
+          count: 4,
+        },
+        {
+          description: "あとで相談する",
+          fulfillmentTool: null,
+          resource: null,
+          count: null,
+        },
+      ],
+      invalid: [
+        {
+          description: "",
+          fulfillmentTool: null,
+          resource: null,
+          count: null,
+        },
+      ],
     },
     action: false,
     execute: async (input, context) => {
+      const fulfillment =
+        input.fulfillmentTool === "gather_resource" &&
+        input.resource !== null &&
+        input.count !== null
+          ? {
+              toolName: "gather_resource" as const,
+              resource: input.resource,
+              count: input.count,
+            }
+          : undefined;
+      const noFulfillment =
+        input.fulfillmentTool === null &&
+        input.resource === null &&
+        input.count === null;
+      if (fulfillment === undefined && !noFulfillment) {
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "COMMITMENT_FULFILLMENT_INVALID",
+            retryable: false,
+            failedAt: "set_commitment",
+            confirmedState: {},
+            nextActions: ["収集条件3項目をすべて指定するか、すべてnullにする"],
+            userSummary: "約束の完了条件が不完全なため、保存しませんでした。",
+          },
+        };
+      }
       const commitment = context.memory.setCommitment({
         playerId: context.playerId,
         description: input.description,
+        ...(fulfillment === undefined ? {} : { fulfillment }),
       });
       return {
         success: true,
@@ -401,13 +463,15 @@ export const toolDefinitions = [
   }),
   defineTool({
     name: "complete_commitment",
-    description: "観測結果または利用者の確認に基づき、既存の約束を完了にする。",
+    description:
+      "既存の約束を完了にする。tool結果が根拠なら同じ会話内で約束に束縛した成功行動のreceiptIdを使いevidenceSummaryはnull、利用者確認ならreceiptIdはnullにする。",
     input: z
       .object({
         commitmentId: z.string().trim().min(1).max(100),
         outcome: z.string().trim().min(1).max(500),
         basis: z.enum(["owner_confirmation", "verified_tool_result"]),
-        evidenceSummary: z.string().trim().min(1).max(500),
+        receiptId: z.uuid().nullable(),
+        evidenceSummary: z.string().trim().min(1).max(500).nullable(),
       })
       .strict(),
     fixtures: {
@@ -416,7 +480,15 @@ export const toolDefinitions = [
           commitmentId: "commitment-id",
           outcome: "観測済みの結果",
           basis: "owner_confirmation",
+          receiptId: null,
           evidenceSummary: "指定利用者が現在の発話で完了を確認した",
+        },
+        {
+          commitmentId: "commitment-id",
+          outcome: "観測済みの結果",
+          basis: "verified_tool_result",
+          receiptId: "00000000-0000-4000-8000-000000000001",
+          evidenceSummary: null,
         },
       ],
       invalid: [
@@ -424,6 +496,7 @@ export const toolDefinitions = [
           commitmentId: "",
           outcome: "結果",
           basis: "owner_confirmation",
+          receiptId: null,
           evidenceSummary: "確認済み",
         },
       ],
@@ -431,8 +504,35 @@ export const toolDefinitions = [
     action: false,
     execute: async (input, context) => {
       if (
+        input.basis === "owner_confirmation" &&
+        (input.receiptId !== null || input.evidenceSummary === null)
+      ) {
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "COMMITMENT_VERIFICATION_BASIS_MISMATCH",
+            retryable: false,
+            failedAt: "complete_commitment",
+            confirmedState: { basis: input.basis },
+            nextActions: [
+              "利用者確認ではreceiptIdをnullにし、確認内容を指定する",
+            ],
+            userSummary:
+              "利用者確認とtool証跡が混在しているため、約束を完了にしませんでした。",
+          },
+        };
+      }
+      const receipt = context.executionEvidence.verifiedActionReceipts.find(
+        (candidate) =>
+          !candidate.used &&
+          candidate.receiptId === input.receiptId &&
+          candidate.commitmentId === input.commitmentId &&
+          candidate.correlationId === context.correlationId,
+      );
+      if (
         input.basis === "verified_tool_result" &&
-        !context.executionEvidence.verifiedActionSuccess
+        (input.evidenceSummary !== null || receipt === undefined)
       ) {
         return {
           success: false,
@@ -441,10 +541,15 @@ export const toolDefinitions = [
             code: "COMMITMENT_VERIFIED_ACTION_MISSING",
             retryable: false,
             failedAt: "complete_commitment",
-            confirmedState: { verifiedActionSuccess: false },
-            nextActions: ["観測で成功した行動後に完了を記録する"],
+            confirmedState: {
+              verifiedActionEvidenceMatched: false,
+              receiptId: input.receiptId,
+            },
+            nextActions: [
+              "同じ会話処理内で約束に束縛した行動を成功させ、そのreceiptを使用する",
+            ],
             userSummary:
-              "確認済みのMinecraft行動結果がないため、約束を完了にしませんでした。",
+              "一致する一回限りのMinecraft行動証跡がないため、約束を完了にしませんでした。",
           },
         };
       }
@@ -453,8 +558,12 @@ export const toolDefinitions = [
         commitmentId: input.commitmentId,
         outcome: input.outcome,
         verificationSource: input.basis,
-        verificationEvidence: input.evidenceSummary,
+        verificationEvidence:
+          receipt === undefined
+            ? (input.evidenceSummary ?? "利用者確認")
+            : receiptEvidence(receipt),
       });
+      if (receipt !== undefined) receipt.used = true;
       return {
         success: true,
         data: commitment,
@@ -464,6 +573,23 @@ export const toolDefinitions = [
     },
   }),
 ] as const;
+
+function receiptEvidence(receipt: {
+  receiptId: string;
+  correlationId: string;
+  toolName: string;
+  evidence: readonly EvidenceReference[];
+}): string {
+  const summaries = receipt.evidence.map(({ summary }) => summary).join(" / ");
+  return [
+    `receipt=${receipt.receiptId}`,
+    `correlation=${receipt.correlationId}`,
+    `tool=${receipt.toolName}`,
+    `evidence=${summaries}`,
+  ]
+    .join("; ")
+    .slice(0, 500);
+}
 
 export type RegisteredToolName = (typeof toolDefinitions)[number]["name"];
 

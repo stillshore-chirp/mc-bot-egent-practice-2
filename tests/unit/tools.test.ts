@@ -38,7 +38,7 @@ function context(requesterUsername = "owner"): ToolContext {
     stopCurrentAction: async () => ({
       before: status,
       after: status,
-      outcome: "cancelled",
+      outcome: "completed",
       summary: "停止しました。",
     }),
     moveTo: async () => ({
@@ -47,10 +47,18 @@ function context(requesterUsername = "owner"): ToolContext {
       outcome: "completed",
       summary: "到達しました。",
     }),
-    gatherResource: async () => ({
+    gatherResource: async (resource, count) => ({
       before: status,
       after: status,
       outcome: "completed",
+      evidenceKind: "inventory_delta",
+      confirmedState: {
+        resource,
+        requestedCount: count,
+        collectedCount: count,
+        heldCount: count,
+        playerDistance: 3,
+      },
       summary: "原木を収集して戻りました。",
     }),
     returnToOwner: async () => ({
@@ -66,6 +74,17 @@ function context(requesterUsername = "owner"): ToolContext {
     rememberLocation: () => ({ id: "location" }),
     recall: () => [],
     setCommitment: () => ({ id: "commitment" }),
+    getCommitment: ({ commitmentId }) =>
+      commitmentId === "commitment"
+        ? {
+            status: "active",
+            fulfillment: {
+              toolName: "gather_resource",
+              resource: "oak_log",
+              count: 1,
+            },
+          }
+        : undefined,
     completeCommitment: () => ({ id: "commitment", status: "completed" }),
   };
   return {
@@ -75,7 +94,7 @@ function context(requesterUsername = "owner"): ToolContext {
     playerId: "player",
     signal: new AbortController().signal,
     requestKind: "owner_message",
-    executionEvidence: { verifiedActionSuccess: false },
+    executionEvidence: { verifiedActionReceipts: [] },
     game,
     memory,
     limits: {
@@ -148,7 +167,7 @@ describe("ToolExecutor", () => {
   it("enforces configured action limits", async () => {
     const result = await new ToolExecutor().execute(
       "gather_resource",
-      JSON.stringify({ resource: "oak_log", count: 17 }),
+      JSON.stringify({ resource: "oak_log", count: 17, commitmentId: null }),
       context(),
     );
     expect(result.success).toBe(false);
@@ -178,7 +197,8 @@ describe("ToolExecutor", () => {
         commitmentId: "commitment",
         outcome: "done",
         basis: "verified_tool_result",
-        evidenceSummary: "action result",
+        receiptId: null,
+        evidenceSummary: null,
       }),
       toolContext,
     );
@@ -186,5 +206,140 @@ describe("ToolExecutor", () => {
       success: false,
       error: { code: "COMMITMENT_VERIFIED_ACTION_MISSING" },
     });
+  });
+
+  it("rejects a partially specified commitment fulfillment", async () => {
+    const result = await new ToolExecutor().execute(
+      "set_commitment",
+      JSON.stringify({
+        description: "collect logs",
+        fulfillmentTool: "gather_resource",
+        resource: "oak_log",
+        count: null,
+      }),
+      context(),
+    );
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "COMMITMENT_FULFILLMENT_INVALID" },
+    });
+  });
+
+  it("completes a commitment only with its bound one-time action receipt", async () => {
+    const toolContext = context();
+    const action = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({
+        resource: "oak_log",
+        count: 1,
+        commitmentId: "commitment",
+      }),
+      toolContext,
+    );
+    expect(action.success).toBe(true);
+    if (!action.success || action.verificationReceipt === undefined)
+      throw new Error("expected a verification receipt");
+
+    const mismatched = await new ToolExecutor().execute(
+      "complete_commitment",
+      JSON.stringify({
+        commitmentId: "other-commitment",
+        outcome: "done",
+        basis: "verified_tool_result",
+        receiptId: action.verificationReceipt.receiptId,
+        evidenceSummary: null,
+      }),
+      toolContext,
+    );
+    expect(mismatched).toMatchObject({
+      success: false,
+      error: { code: "COMMITMENT_VERIFIED_ACTION_MISSING" },
+    });
+
+    toolContext.correlationId = "different-correlation";
+    const correlationMismatched = await new ToolExecutor().execute(
+      "complete_commitment",
+      JSON.stringify({
+        commitmentId: "commitment",
+        outcome: "done",
+        basis: "verified_tool_result",
+        receiptId: action.verificationReceipt.receiptId,
+        evidenceSummary: null,
+      }),
+      toolContext,
+    );
+    expect(correlationMismatched).toMatchObject({
+      success: false,
+      error: { code: "COMMITMENT_VERIFIED_ACTION_MISSING" },
+    });
+    toolContext.correlationId = "test-correlation";
+
+    const matched = await new ToolExecutor().execute(
+      "complete_commitment",
+      JSON.stringify({
+        commitmentId: "commitment",
+        outcome: "done",
+        basis: "verified_tool_result",
+        receiptId: action.verificationReceipt.receiptId,
+        evidenceSummary: null,
+      }),
+      toolContext,
+    );
+    expect(matched.success).toBe(true);
+
+    const reused = await new ToolExecutor().execute(
+      "complete_commitment",
+      JSON.stringify({
+        commitmentId: "commitment",
+        outcome: "done again",
+        basis: "verified_tool_result",
+        receiptId: action.verificationReceipt.receiptId,
+        evidenceSummary: null,
+      }),
+      toolContext,
+    );
+    expect(reused).toMatchObject({
+      success: false,
+      error: { code: "COMMITMENT_VERIFIED_ACTION_MISSING" },
+    });
+  });
+
+  it("does not issue a receipt for an unbound action or stop", async () => {
+    const toolContext = context();
+    const unbound = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({
+        resource: "oak_log",
+        count: 1,
+        commitmentId: null,
+      }),
+      toolContext,
+    );
+    const stopped = await new ToolExecutor().execute(
+      "stop_current_action",
+      JSON.stringify({ reason: "stop" }),
+      toolContext,
+    );
+
+    expect(unbound.success && unbound.verificationReceipt).toBeUndefined();
+    expect(stopped.success).toBe(true);
+    expect(toolContext.executionEvidence.verifiedActionReceipts).toEqual([]);
+  });
+
+  it("does not issue a receipt when gather input differs from typed fulfillment", async () => {
+    const toolContext = context();
+    const unrelated = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({
+        resource: "birch_log",
+        count: 1,
+        commitmentId: "commitment",
+      }),
+      toolContext,
+    );
+
+    expect(unrelated.success).toBe(true);
+    expect(unrelated.success && unrelated.verificationReceipt).toBeUndefined();
+    expect(toolContext.executionEvidence.verifiedActionReceipts).toEqual([]);
   });
 });

@@ -105,6 +105,7 @@ export interface CommitmentRecord {
   readonly status: CommitmentStatus;
   readonly progress: readonly string[];
   readonly blockers: readonly string[];
+  readonly fulfillment?: CommitmentFulfillment;
   readonly outcome?: JsonValue;
   readonly completionVerification?: {
     readonly source: "owner_confirmation" | "verified_tool_result";
@@ -113,6 +114,12 @@ export interface CommitmentRecord {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly completedAt?: string;
+}
+
+export interface CommitmentFulfillment extends JsonObject {
+  readonly toolName: "gather_resource";
+  readonly resource: string;
+  readonly count: number;
 }
 
 export interface EpisodeRecord {
@@ -227,6 +234,7 @@ export interface SetCommitmentInput {
   readonly description: string;
   readonly progress?: readonly string[];
   readonly blockers?: readonly string[];
+  readonly fulfillment?: CommitmentFulfillment;
 }
 
 export interface UpdateCommitmentProgressInput {
