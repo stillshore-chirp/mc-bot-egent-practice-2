@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": { "@trace": ["src/trace/contracts.ts"] },
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "exactOptionalPropertyTypes": false,
+    "types": ["node"]
+  },
+  "include": [
+    "dashboard/**/*.ts",
+    "dashboard/**/*.tsx",
+    "tests/browser/**/*.ts",
+    "tests/unit/dashboard-*.test.ts",
+    "src/trace/contracts.ts",
+    "vite.config.ts",
+    "playwright.config.ts"
+  ],
+  "exclude": ["node_modules", "dist", "dashboard/dist"]
+}
