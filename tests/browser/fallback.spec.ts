@@ -66,9 +66,32 @@ test("2D fallback remains contained at narrow width and 200 percent text", async
   await expect(
     page.getByRole("group", { name: "処理トレースの2Dグラフ" }),
   ).toBeVisible();
+  const layout = await page.evaluate(() => {
+    const viewportWidth = window.innerWidth;
+    const documentWidth = document.documentElement.scrollWidth;
+    const overflowingElements = [...document.querySelectorAll("body *")]
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const className = element.getAttribute("class") ?? "";
+        return {
+          element: `${element.tagName.toLowerCase()}.${className.slice(0, 80)}`,
+          left: Math.round(rect.left),
+          right: Math.round(rect.right),
+          width: Math.round(rect.width),
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          minWidth: style.minWidth,
+          overflowX: style.overflowX,
+          whiteSpace: style.whiteSpace,
+        };
+      })
+      .filter(({ left, right }) => left < -1 || right > documentWidth + 1)
+      .slice(0, 12);
+    return { documentWidth, viewportWidth, overflowingElements };
+  });
   expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth > window.innerWidth + 1,
-    ),
-  ).toBe(false);
+    layout.documentWidth,
+    `document overflow diagnostics: ${JSON.stringify(layout)}`,
+  ).toBeLessThanOrEqual(layout.viewportWidth + 1);
 });

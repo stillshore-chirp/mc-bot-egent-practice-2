@@ -79,3 +79,14 @@ jobs:
 
       - name: Run dashboard browser E2E
         run: npm run test:browser
+
+      - name: Upload dashboard browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: dashboard-browser-failure-${{ github.run_attempt }}
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
