@@ -67,6 +67,7 @@ export interface DashboardData {
   readonly livePaused: boolean;
   readonly liveBufferedCount: number;
   readonly liveBufferOverflow: boolean;
+  readonly hydrationIssue?: string;
   readonly error?: string;
   readonly loading: boolean;
   readonly refresh: () => Promise<void>;
@@ -75,6 +76,13 @@ export interface DashboardData {
   readonly setLivePaused: (paused: boolean) => void;
   readonly setReplayIndex: (index: number) => void;
   readonly dispatch: Dispatch<Parameters<typeof traceReducer>[1]>;
+}
+
+interface ActiveTraceHydration {
+  readonly generation: number;
+  readonly traceId: string;
+  events: CognitiveTraceEvent[];
+  overflowed: boolean;
 }
 
 export function useDashboardData(): DashboardData {
@@ -92,6 +100,7 @@ export function useDashboardData(): DashboardData {
   const [livePaused, setLivePausedState] = useState(false);
   const [liveBufferedCount, setLiveBufferedCount] = useState(0);
   const [liveBufferOverflow, setLiveBufferOverflow] = useState(false);
+  const [hydrationIssue, setHydrationIssue] = useState<string>();
   const [healthState, setHealthState] =
     useState<DashboardData["healthState"]>("unknown");
   const [botHealth, setBotHealth] = useState<DashboardBotHealth>({});
@@ -109,15 +118,17 @@ export function useDashboardData(): DashboardData {
   const stream = useRef<TraceStreamClient | undefined>(undefined);
   const runsRef = useRef(runs);
   const selectedTraceIdRef = useRef(selectedTraceId);
-  // Detail/event hydration is asynchronous. Keep the intended selection so
-  // live events are not dropped while the first snapshot is still loading.
-  const pendingTraceSelectionRef = useRef<string | undefined>(undefined);
+  const hydrationGenerationRef = useRef(0);
+  const activeHydrationRef = useRef<ActiveTraceHydration | undefined>(
+    undefined,
+  );
   const modeRef = useRef(mode);
   // A late detail response must not overwrite a mode the operator selected.
   const modeChangeVersionRef = useRef(0);
   const livePausedRef = useRef(false);
   const liveBufferRef = useRef<CognitiveTraceEvent[]>([]);
   const liveBufferOverflowRef = useRef(false);
+  const hydrationIssueRef = useRef<string | undefined>(undefined);
   const pendingTraceRefresh = useRef(new Set<string>());
   runsRef.current = runs;
   selectedTraceIdRef.current = selectedTraceId;
@@ -129,6 +140,15 @@ export function useDashboardData(): DashboardData {
     if (clearOverflow) {
       liveBufferOverflowRef.current = false;
       setLiveBufferOverflow(false);
+    }
+  }, []);
+
+  const recordHydrationIssue = useCallback((message?: string): void => {
+    hydrationIssueRef.current = message;
+    setHydrationIssue(message);
+    if (message !== undefined) {
+      setStreamState("degraded");
+      setStreamMessage(message);
     }
   }, []);
 
@@ -148,35 +168,123 @@ export function useDashboardData(): DashboardData {
     setLiveBufferedCount(liveBufferRef.current.length);
   }, []);
 
+  const beginTraceHydration = useCallback((traceId: string): number => {
+    const generation = hydrationGenerationRef.current + 1;
+    hydrationGenerationRef.current = generation;
+    activeHydrationRef.current = {
+      generation,
+      traceId,
+      events: [],
+      overflowed: false,
+    };
+    return generation;
+  }, []);
+
+  const isCurrentHydration = useCallback(
+    (traceId: string, generation: number): boolean => {
+      const active = activeHydrationRef.current;
+      return active?.traceId === traceId && active.generation === generation;
+    },
+    [],
+  );
+
+  const enqueueHydrationEvent = useCallback(
+    (event: CognitiveTraceEvent): boolean => {
+      const active = activeHydrationRef.current;
+      if (active?.traceId !== event.traceId) return false;
+      if (active.events.some(({ eventId }) => eventId === event.eventId)) {
+        return true;
+      }
+      if (active.events.length >= LIVE_EVENT_BUFFER_LIMIT) {
+        if (!active.overflowed) {
+          active.overflowed = true;
+          setStreamState("degraded");
+          setStreamMessage(
+            `Trace読込中のeventが上限(${LIVE_EVENT_BUFFER_LIMIT}件)を超えました。保存済みeventsとの連続性を確認してください。`,
+          );
+        }
+        return true;
+      }
+      active.events = [...active.events, event];
+      return true;
+    },
+    [],
+  );
+
   const loadTrace = useCallback(
     async (
       traceId: string,
+      generation: number,
       requestedMode?: DashboardMode,
-    ): Promise<readonly CognitiveTraceEvent[]> => {
+    ): Promise<readonly CognitiveTraceEvent[] | undefined> => {
       const modeVersion = modeChangeVersionRef.current;
       const [nextDetail, nextEvents] = await Promise.all([
         getTrace(traceId),
         getTraceEvents(traceId),
       ]);
+      const hydration = activeHydrationRef.current;
+      if (
+        hydration?.traceId !== traceId ||
+        hydration.generation !== generation
+      ) {
+        return undefined;
+      }
+      const merged = mergeHydratedEvents(nextEvents, hydration.events);
+      const nextHydrationIssue = hydration.overflowed
+        ? `Trace hydration overflow: ${LIVE_EVENT_BUFFER_LIMIT}件を保持しました。保存済みeventsを再取得してください。`
+        : merged.sequenceConflicts > 0
+          ? `Trace hydration integrity: ${String(merged.sequenceConflicts)}件のsequence競合を除外しました。保存済みeventsを確認してください。`
+          : undefined;
+      recordHydrationIssue(nextHydrationIssue);
+      const mergedEvents = merged.events;
+      selectedTraceIdRef.current = traceId;
       setSelectedTraceId(traceId);
       setDetail(nextDetail);
-      setEvents(nextEvents);
+      setEvents(mergedEvents);
       setReplayCursor(undefined);
       dispatch({ type: "reset", detail: nextDetail });
-      dispatch({ type: "apply-many", events: nextEvents });
-      if (
-        requestedMode !== undefined ||
-        modeChangeVersionRef.current === modeVersion
-      ) {
+      dispatch({ type: "apply-many", events: mergedEvents });
+      if (modeChangeVersionRef.current === modeVersion) {
         const nextMode =
           requestedMode ??
           (nextDetail.run.source === "recorded" ? "replay" : "live");
         modeRef.current = nextMode;
         setMode(nextMode);
       }
-      return nextEvents;
+      return mergedEvents;
     },
-    [],
+    [recordHydrationIssue],
+  );
+
+  const reconcileRuns = useCallback(
+    (nextRuns: readonly CognitiveTraceRun[]): void => {
+      runsRef.current = nextRuns;
+      setRuns(nextRuns);
+      const activeHydration = activeHydrationRef.current;
+      if (
+        activeHydration !== undefined &&
+        !nextRuns.some(({ traceId }) => traceId === activeHydration.traceId)
+      ) {
+        hydrationGenerationRef.current += 1;
+        activeHydrationRef.current = undefined;
+        setLoading(false);
+      }
+      const currentSelectedTraceId = selectedTraceIdRef.current;
+      if (
+        currentSelectedTraceId !== undefined &&
+        !nextRuns.some(({ traceId }) => traceId === currentSelectedTraceId)
+      ) {
+        selectedTraceIdRef.current = undefined;
+        setSelectedTraceId(undefined);
+        setDetail(undefined);
+        setEvents([]);
+        dispatch({ type: "reset" });
+        livePausedRef.current = false;
+        setLivePausedState(false);
+        clearLiveBuffer();
+      }
+    },
+    [clearLiveBuffer],
   );
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -187,22 +295,10 @@ export function useDashboardData(): DashboardData {
         listTraces(controller.signal),
         getHealth(controller.signal),
       ]);
-      setRuns(nextRuns);
+      reconcileRuns(nextRuns);
       const parsedHealth = parseHealth(health);
       setHealthState(parsedHealth.observabilityState);
       setBotHealth(parsedHealth.bot);
-      if (
-        selectedTraceId !== undefined &&
-        !nextRuns.some(({ traceId }) => traceId === selectedTraceId)
-      ) {
-        setSelectedTraceId(undefined);
-        setDetail(undefined);
-        setEvents([]);
-        dispatch({ type: "reset" });
-        livePausedRef.current = false;
-        setLivePausedState(false);
-        clearLiveBuffer();
-      }
     } catch {
       setHealthState("offline");
       setBotHealth({});
@@ -210,33 +306,35 @@ export function useDashboardData(): DashboardData {
         "ダッシュボードAPIへ接続できません。ボットの観測状態を確認してください。",
       );
     } finally {
-      setLoading(false);
+      if (activeHydrationRef.current === undefined) setLoading(false);
     }
     controller.abort();
-  }, [clearLiveBuffer, selectedTraceId]);
+  }, [reconcileRuns]);
 
   const selectTrace = useCallback(
     async (traceId: string): Promise<void> => {
-      pendingTraceSelectionRef.current = traceId;
+      const generation = beginTraceHydration(traceId);
       livePausedRef.current = false;
       setLivePausedState(false);
       clearLiveBuffer();
       setLoading(true);
       setError(undefined);
       try {
-        await loadTrace(traceId);
+        await loadTrace(traceId, generation);
       } catch {
-        setError(
-          "トレースを読み込めませんでした。保存済みデータを確認してください。",
-        );
-      } finally {
-        if (pendingTraceSelectionRef.current === traceId) {
-          pendingTraceSelectionRef.current = undefined;
+        if (isCurrentHydration(traceId, generation)) {
+          setError(
+            "トレースを読み込めませんでした。保存済みデータを確認してください。",
+          );
         }
-        setLoading(false);
+      } finally {
+        if (isCurrentHydration(traceId, generation)) {
+          activeHydrationRef.current = undefined;
+          setLoading(false);
+        }
       }
     },
-    [clearLiveBuffer, loadTrace],
+    [beginTraceHydration, clearLiveBuffer, isCurrentHydration, loadTrace],
   );
 
   const resumeLive = useCallback(async (): Promise<void> => {
@@ -253,14 +351,20 @@ export function useDashboardData(): DashboardData {
       livePausedRef.current = true;
       setLivePausedState(true);
       setLoading(true);
+      const generation = beginTraceHydration(traceId);
       try {
-        const persistedEvents = await loadTrace(traceId, "live");
-        const persistedIds = new Set(
-          persistedEvents.map(({ eventId }) => eventId),
+        const persistedEvents = await loadTrace(traceId, generation, "live");
+        if (persistedEvents === undefined) return;
+        const merged = mergeHydratedEvents(
+          persistedEvents,
+          liveBufferRef.current,
         );
-        const afterReload = [...liveBufferRef.current]
-          .filter(({ eventId }) => !persistedIds.has(eventId))
-          .sort((left, right) => left.sequence - right.sequence);
+        const afterReload = merged.additions;
+        if (merged.sequenceConflicts > 0) {
+          recordHydrationIssue(
+            `Trace hydration integrity: ${String(merged.sequenceConflicts)}件のsequence競合を除外しました。保存済みeventsを確認してください。`,
+          );
+        }
         if (afterReload.length > 0) {
           setEvents((current) => {
             const existing = new Set(current.map(({ eventId }) => eventId));
@@ -283,19 +387,24 @@ export function useDashboardData(): DashboardData {
           "Live更新を再開しました。保存済みeventsから表示を再構築しました。",
         );
       } catch {
-        const afterFailure = liveBufferRef.current;
-        liveBufferRef.current = [...pending, ...afterFailure].slice(
-          0,
-          LIVE_EVENT_BUFFER_LIMIT,
-        );
-        setLiveBufferedCount(liveBufferRef.current.length);
-        livePausedRef.current = true;
-        setLivePausedState(true);
-        setError(
-          "Live更新を再開できませんでした。保存済みeventsを再取得してください。",
-        );
+        if (isCurrentHydration(traceId, generation)) {
+          const afterFailure = liveBufferRef.current;
+          liveBufferRef.current = [...pending, ...afterFailure].slice(
+            0,
+            LIVE_EVENT_BUFFER_LIMIT,
+          );
+          setLiveBufferedCount(liveBufferRef.current.length);
+          livePausedRef.current = true;
+          setLivePausedState(true);
+          setError(
+            "Live更新を再開できませんでした。保存済みeventsを再取得してください。",
+          );
+        }
       } finally {
-        setLoading(false);
+        if (isCurrentHydration(traceId, generation)) {
+          activeHydrationRef.current = undefined;
+          setLoading(false);
+        }
       }
       return;
     }
@@ -321,7 +430,13 @@ export function useDashboardData(): DashboardData {
       });
     }
     clearLiveBuffer();
-  }, [clearLiveBuffer, loadTrace]);
+  }, [
+    beginTraceHydration,
+    clearLiveBuffer,
+    isCurrentHydration,
+    loadTrace,
+    recordHydrationIssue,
+  ]);
 
   const setLivePaused = useCallback(
     (paused: boolean): void => {
@@ -351,7 +466,12 @@ export function useDashboardData(): DashboardData {
   }, [refresh]);
 
   useEffect(() => {
-    if (selectedTraceId !== undefined || runs[0] === undefined) return;
+    if (
+      selectedTraceId !== undefined ||
+      activeHydrationRef.current !== undefined ||
+      runs[0] === undefined
+    )
+      return;
     void selectTrace(runs[0].traceId);
   }, [runs, selectedTraceId, selectTrace]);
 
@@ -385,11 +505,15 @@ export function useDashboardData(): DashboardData {
     stream.current = client;
     client.connect({
       onEvent: (event) => {
+        const hydrating = activeHydrationRef.current?.traceId === event.traceId;
         const selected =
-          event.traceId === selectedTraceIdRef.current ||
-          event.traceId === pendingTraceSelectionRef.current;
+          event.traceId === selectedTraceIdRef.current || hydrating;
         const pausedSelectedLive =
           selected && modeRef.current === "live" && livePausedRef.current;
+        const bufferedByHydration =
+          hydrating && !pausedSelectedLive
+            ? enqueueHydrationEvent(event)
+            : false;
         const knownTrace = runsRef.current.some(
           ({ traceId }) => traceId === event.traceId,
         );
@@ -398,10 +522,10 @@ export function useDashboardData(): DashboardData {
             pendingTraceRefresh.current.add(event.traceId);
             void listTraces()
               .then((nextRuns) => {
-                runsRef.current = nextRuns;
-                setRuns(nextRuns);
+                reconcileRuns(nextRuns);
                 if (
                   selectedTraceIdRef.current === undefined &&
+                  activeHydrationRef.current === undefined &&
                   nextRuns.some(({ traceId }) => traceId === event.traceId)
                 ) {
                   void selectTrace(event.traceId);
@@ -421,6 +545,7 @@ export function useDashboardData(): DashboardData {
             return nextRuns;
           });
         }
+        if (bufferedByHydration) return;
         if (selected) {
           if (modeRef.current === "live" && livePausedRef.current) {
             // While paused the bounded buffer is the only in-memory hold for
@@ -438,12 +563,17 @@ export function useDashboardData(): DashboardData {
         }
       },
       onState: (nextState, message) => {
-        setStreamState(
-          nextState === "connected" && liveBufferOverflowRef.current
-            ? "degraded"
-            : nextState,
+        const persistentHydrationIssue = hydrationIssueRef.current;
+        const remainsDegraded =
+          nextState === "connected" &&
+          (liveBufferOverflowRef.current ||
+            persistentHydrationIssue !== undefined);
+        setStreamState(remainsDegraded ? "degraded" : nextState);
+        setStreamMessage(
+          remainsDegraded && persistentHydrationIssue !== undefined
+            ? persistentHydrationIssue
+            : message,
         );
-        setStreamMessage(message);
       },
       onIntegrity: (integrity) => {
         setStreamIntegrity(integrity);
@@ -464,7 +594,7 @@ export function useDashboardData(): DashboardData {
       client.disconnect();
       stream.current = undefined;
     };
-  }, [enqueueLiveEvent, selectTrace]);
+  }, [enqueueHydrationEvent, enqueueLiveEvent, reconcileRuns, selectTrace]);
 
   const state = useMemo(
     () =>
@@ -499,6 +629,7 @@ export function useDashboardData(): DashboardData {
     livePaused,
     liveBufferedCount,
     liveBufferOverflow,
+    hydrationIssue,
     setLivePaused,
     setReplayIndex,
     dispatch,
@@ -598,4 +729,41 @@ function updateRunList(
             : {}),
         },
   );
+}
+
+function mergeHydratedEvents(
+  persisted: readonly CognitiveTraceEvent[],
+  live: readonly CognitiveTraceEvent[],
+): {
+  readonly events: readonly CognitiveTraceEvent[];
+  readonly additions: readonly CognitiveTraceEvent[];
+  readonly sequenceConflicts: number;
+} {
+  const eventIds = new Set(persisted.map(({ eventId }) => eventId));
+  const sequences = new Map(
+    persisted.map(({ sequence, eventId }) => [sequence, eventId] as const),
+  );
+  const additions: CognitiveTraceEvent[] = [];
+  let sequenceConflicts = 0;
+
+  for (const event of live) {
+    if (eventIds.has(event.eventId)) continue;
+    const existingEventId = sequences.get(event.sequence);
+    if (existingEventId !== undefined && existingEventId !== event.eventId) {
+      sequenceConflicts += 1;
+      continue;
+    }
+    eventIds.add(event.eventId);
+    sequences.set(event.sequence, event.eventId);
+    additions.push(event);
+  }
+
+  additions.sort((left, right) => left.sequence - right.sequence);
+  return {
+    events: [...persisted, ...additions].sort(
+      (left, right) => left.sequence - right.sequence,
+    ),
+    additions,
+    sequenceConflicts,
+  };
 }

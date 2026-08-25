@@ -213,6 +213,7 @@ export function App() {
           onSeek={data.setReplayIndex}
         />
         {data.liveBufferOverflow ||
+        data.hydrationIssue !== undefined ||
         data.state.gaps.length > 0 ||
         data.state.duplicateEvents > 0 ||
         data.streamIntegrity.gaps.length > 0 ||
@@ -223,6 +224,9 @@ export function App() {
             {data.liveBufferOverflow
               ? `Live buffer overflow: ${data.liveBufferedCount}件を保持。再開時に保存済みeventsから再構築します。`
               : null}
+            {data.hydrationIssue === undefined
+              ? null
+              : ` ${data.hydrationIssue}`}
             {data.state.gaps.length > 0
               ? ` sequence gap ${data.state.gaps.map(({ from, to }) => `${from}–${to}`).join(", ")}`
               : null}
