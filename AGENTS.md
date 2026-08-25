@@ -27,6 +27,8 @@
 - ソースコード変更依頼は、主Issueの確定、専用branch、論理的なcommit、push、非ドラフトPR、latest headのCI、GitHub上のreview対応、未解決thread確認、mergeability確認までの通常配送を行う権限を含みます。
 - 通常配送の順序は [`.agents/skills/github-delivery/SKILL.md`](.agents/skills/github-delivery/SKILL.md)、完了条件は [`docs/ai-governance/03-evidence-and-completion-gates.md`](docs/ai-governance/03-evidence-and-completion-gates.md) を正本とします。
 - commitは独立してreview・revertできる一つの論理的責務または受け入れ条件の単位にします。関連するtest、文書、生成物は同じcommitへ含めます。
+- 複数工程は着手前にcommitの責務と順序を決め、各責務の実装・関連test・文書・検証が完了した時点で、次の独立責務へ進む前にcommitします。複数の独立責務を未commitのまま蓄積し、最後に全差分を後付けで分解しません。
+- 共有作業ツリーのサブエージェント差分は、担当した責務の完了ごとにメインがfile範囲と内容をreviewしてcommitへ回収します。作業時間、行数、担当者だけを理由にcommitを分割・一括化しません。
 - stage対象はpathを明示し、commit前にstaged file名、staged diff、`git diff --check`、secret・実データ・無関係差分の不在を確認します。
 - `Closes #N` は対象Issueを完全に解決し、merge時のcloseを意図する場合だけ使います。部分対応や関連付けは `Refs #N` を使います。
 - merge、Issue・PRのclose、release、deploy、force-push、公開済み履歴の書換え、破壊的操作は通常配送に含めません。対象を特定した別の明示指示がある場合だけ実行します。
