@@ -15,7 +15,7 @@ export const environmentSchema = z.object({
   MINECRAFT_VERSION: z.string().trim().default("1.21.11"),
   OWNER_USERNAME: z.string().trim().min(1),
   OPENAI_API_KEY: z.string().trim().min(1),
-  OPENAI_MODEL: z.string().trim().default("gpt-5.6-sol"),
+  OPENAI_MODEL: z.string().trim().default("gpt-5.6-luna"),
   DATABASE_PATH: z.string().trim().default("data/companion.sqlite"),
   PERSONA_PATH: z.string().trim().default("config/persona.example.json"),
   LOG_LEVEL: z
