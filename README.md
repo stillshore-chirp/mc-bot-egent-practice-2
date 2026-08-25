@@ -24,9 +24,9 @@ AI コンパニオンが、Minecraft で観測した状況と利用者との継�
 
 ## 現在の状態
 
-初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。2026-08-25に、許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使い、[実環境E2Eの12項目](docs/testing.md#2026-08-25-実施結果)を追跡可能な一連のrunで確認しました。最終対話式runnerは12件pass、fail / skipなし、終了code 0でした。
+初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。2026-08-25には、許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使った[実環境E2Eの12項目](docs/testing.md#2026-08-25-実施結果)を、初期コンパニオン実装の先行HEADで確認しました。最終対話式runnerは12件pass、fail / skipなし、終了code 0でした。
 
-確認範囲は単一のローカル環境です。remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。依存経路の既知のmoderate advisoryはIssue #4で追跡し、high / criticalを品質gateにしています。
+確認範囲は単一のローカル環境です。remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。依存経路の既知のmoderate advisoryはIssue #4で追跡し、high / criticalを品質gateにしています。ダッシュボードとトレース計測を含む現行HEADでの実Minecraft・実OpenAIのlatest-head E2Eは未実行です。先行HEADの12件passは、今回の完了証跡として扱いません。
 
 初期完成版では次を一続きの体験として扱います。
 
@@ -39,7 +39,13 @@ AI コンパニオンが、Minecraft で観測した状況と利用者との継�
 
 ## 非目標
 
-旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、Paper plugin、Web dashboard、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
+旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、Paper plugin、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
+
+## 観測ダッシュボード
+
+AIコンパニオンの依頼から応答までに発生した、型付きトレースを読み取り専用で確認できます。Three.jsの3D DAG、処理ノード一覧、結果・検証・エラーの詳細、SSEによるLive表示、保存済みtraceのReplay、Presenter Modeを提供します。ダッシュボードからbot、Minecraft、memory、taskを操作する機能はありません。
+
+ローカルでは `npm run build` の後に `npm run dev` を実行し、既定の [http://127.0.0.1:4310](http://127.0.0.1:4310) を開きます。loopback外へbindする場合は32文字以上のtokenとHTTPS / network制御を使い、browserはBasic challengeから同一originのAPI / SSEへ認証を引き継ぎます。詳細は [観測ダッシュボード索引](docs/dashboard.md) と、そこから参照する実装別文書にまとめています。ダッシュボードの停止、保存失敗、描画失敗はbot本体のtask failureへ変換せず、画面に観測性劣化として表示します。
 
 ## 必要環境
 
@@ -97,16 +103,18 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
+npm run test:browser
 npm run audit:high
 ```
 
-GitHub Actions は Node.js 22 と 24 の両方で上記の品質確認を実行します。live E2E は API key や Minecraft 接続情報を CI に渡さないため自動実行しません。
+GitHub Actions はNode.js 22 / 24でserver・dashboardのformat、lint、typecheck、test、build、auditを実行し、Node.js 24の独立jobでPlaywright Chromium browser E2Eも実行します。browser E2Eは架空の最小fixtureだけを使い、API key、Minecraft接続情報、実worldへ接続しません。live E2EはAPI keyやMinecraft接続情報をCIに渡さないため自動実行しません。
 
 ```bash
 npm run test:e2e
+npm run test:e2e:dashboard
 ```
 
-この command は実環境用です。必須設定・利用権限・安全な test world が揃わない場合は接続や API 呼出しを行わず、明確な設定エラーとして終了させます。手順と受け入れ項目は [docs/testing.md](docs/testing.md#実環境-e2e) を参照してください。
+これらの command は実環境用です。`test:e2e` は初期コンパニオン12項目、`test:e2e:dashboard` は今回のdashboard固有10シナリオを扱います。必須設定・利用権限・安全な test world が揃わない場合は接続や API 呼出しを行わず、明確な設定エラーとして終了させます。手順と受け入れ項目は [docs/testing.md](docs/testing.md#実環境-e2e) と [dashboardのテスト](docs/dashboard/testing.md#実環境-e2e) を参照してください。
 対話式runnerは`.env.local`の`LIVE_E2E_CONFIRMED=true`を追加の安全gateとし、12項目すべてに実worldの観測に基づく`pass`が入力された場合だけ成功終了します。項目ごとに接続、health / food / oxygen、task state、原木収集数、ローカル追跡用の相関IDをJSONとして出力し、記憶復元項目の前にはapplicationを実際に再生成・再接続します。runnerの原文は実環境情報を含み得るため、repository、Issue、PRへ保存しません。
 
 ## 文書
@@ -115,4 +123,5 @@ npm run test:e2e
 - [人格と記憶](docs/memory.md)
 - [テストと実環境 E2E](docs/testing.md)
 - [運用](docs/operations.md)
+- [観測ダッシュボード索引](docs/dashboard.md)
 - [エージェント作業契約](AGENTS.md)

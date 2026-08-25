@@ -3,6 +3,8 @@ import type { ResponseInputItem } from "openai/resources/responses/responses";
 import type { Logger } from "pino";
 
 import { AppError } from "../domain/errors.js";
+import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
+import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
 import { toOpenAIFunctionTool } from "../tools/definition.js";
 import { ToolExecutor } from "../tools/executor.js";
@@ -64,11 +66,64 @@ function deterministicActionSummary(
     .join(" ");
 }
 
+async function safeWithTraceSpan<T>(
+  traceService: TraceService | undefined,
+  stage: CognitiveStage,
+  name: string,
+  options: WithSpanOptions<T>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (traceService === undefined) return operation();
+
+  let operationPromise: Promise<T> | undefined;
+  const invoke = (): Promise<T> => {
+    operationPromise = Promise.resolve().then(operation);
+    return operationPromise;
+  };
+
+  try {
+    return await traceService.withSpan(stage, name, options, invoke);
+  } catch {
+    if (operationPromise !== undefined) {
+      return operationPromise;
+    }
+    return operation();
+  }
+}
+
+function responseMetrics(response: unknown, durationMs: number): TraceMetrics {
+  if (response === null || typeof response !== "object") {
+    return { durationMs };
+  }
+  const usage = (response as { readonly usage?: unknown }).usage;
+  if (usage === null || typeof usage !== "object") {
+    return { durationMs };
+  }
+  const inputTokens = (usage as { readonly input_tokens?: unknown })
+    .input_tokens;
+  const outputTokens = (usage as { readonly output_tokens?: unknown })
+    .output_tokens;
+  return {
+    durationMs,
+    ...(typeof inputTokens === "number" &&
+    Number.isInteger(inputTokens) &&
+    inputTokens >= 0
+      ? { inputTokens }
+      : {}),
+    ...(typeof outputTokens === "number" &&
+    Number.isInteger(outputTokens) &&
+    outputTokens >= 0
+      ? { outputTokens }
+      : {}),
+  };
+}
+
 export class OpenAIDeliberationAgent {
   readonly #client: OpenAI;
   readonly #model: string;
   readonly #executor: ToolExecutor;
   readonly #logger: Logger;
+  readonly #traceService: TraceService | undefined;
 
   public constructor(input: {
     apiKey: string;
@@ -76,11 +131,13 @@ export class OpenAIDeliberationAgent {
     executor?: ToolExecutor;
     logger: Logger;
     client?: OpenAI;
+    traceService?: TraceService;
   }) {
     this.#client = input.client ?? new OpenAI({ apiKey: input.apiKey });
     this.#model = input.model;
-    this.#executor = input.executor ?? new ToolExecutor();
+    this.#executor = input.executor ?? new ToolExecutor(input.traceService);
     this.#logger = input.logger;
+    this.#traceService = input.traceService;
   }
 
   public async deliberate(
@@ -93,18 +150,33 @@ export class OpenAIDeliberationAgent {
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const startedAt = performance.now();
-      const response = await this.#client.responses.create(
+      const response = await safeWithTraceSpan(
+        this.#traceService,
+        "deliberation",
+        "LLM判断を実行",
         {
-          model: this.#model,
-          instructions: instructions(request),
-          input: inputItems,
-          tools: toolDefinitions.map(toOpenAIFunctionTool),
-          tool_choice: "auto",
-          parallel_tool_calls: false,
-          store: false,
-          include: ["reasoning.encrypted_content"],
+          summary: "LLM判断を実行",
+          attributes: {
+            round,
+          },
+          summarizeResult: (result) =>
+            result.status === "completed" ? "LLM応答を受信" : "LLM応答が未完了",
+          metrics: (result, durationMs) => responseMetrics(result, durationMs),
         },
-        { signal: request.toolContext.signal },
+        () =>
+          this.#client.responses.create(
+            {
+              model: this.#model,
+              instructions: instructions(request),
+              input: inputItems,
+              tools: toolDefinitions.map(toOpenAIFunctionTool),
+              tool_choice: "auto",
+              parallel_tool_calls: false,
+              store: false,
+              include: ["reasoning.encrypted_content"],
+            },
+            { signal: request.toolContext.signal },
+          ),
       );
 
       this.#logger.info(

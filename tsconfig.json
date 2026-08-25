@@ -22,5 +22,11 @@
     "tests/**/*.ts",
     "eslint.config.js",
     "vitest.config.ts"
+  ],
+  "exclude": [
+    "dashboard",
+    "tests/browser",
+    "tests/unit/dashboard-*.test.ts",
+    "dashboard/dist"
   ]
 }

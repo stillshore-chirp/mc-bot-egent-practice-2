@@ -9,6 +9,10 @@ import {
   type RuntimeReassessmentEvent,
 } from "../agent/chat-coordinator.js";
 import type { AppConfig } from "../config/schema.js";
+import {
+  DashboardHttpServer,
+  type DashboardBotHealth,
+} from "../dashboard/http-server.js";
 import { AppError } from "../domain/errors.js";
 import { MemoryStore } from "../memory/store.js";
 import type { JsonObject, JsonValue } from "../memory/types.js";
@@ -33,6 +37,8 @@ import { MoveToSkill } from "../skills/move-to.js";
 import { ReturnToPlayerSkill } from "../skills/return-to-player.js";
 import { ToolExecutor } from "../tools/executor.js";
 import type { GameStatus } from "../tools/contracts.js";
+import { TraceService, type TraceSession } from "../trace/service.js";
+import { TraceStore } from "../trace/store.js";
 import { CompanionContextFactory } from "./context-factory.js";
 import { CompanionGameController } from "./game-controller.js";
 import { MemoryTaskStore, ToolMemoryAdapter } from "./memory-adapters.js";
@@ -164,6 +170,8 @@ class DefaultCompanionApplication implements CompanionApplication {
   readonly #followDistance: number;
   readonly #startupReassessmentRequired: boolean;
   readonly #logger: Logger;
+  readonly #traceService: TraceService | undefined;
+  readonly #dashboard: DashboardHttpServer | undefined;
   #unsubscribeChat: (() => void) | undefined;
   #unsubscribeImmediateStop: (() => void) | undefined;
   #reflexTimer: NodeJS.Timeout | undefined;
@@ -188,6 +196,8 @@ class DefaultCompanionApplication implements CompanionApplication {
     followDistance: number;
     startupReassessmentRequired: boolean;
     logger: Logger;
+    traceService?: TraceService | undefined;
+    dashboard: AppConfig["dashboard"];
   }) {
     this.#minecraft = input.minecraft;
     this.#connection = input.connection;
@@ -201,6 +211,8 @@ class DefaultCompanionApplication implements CompanionApplication {
     this.#followDistance = input.followDistance;
     this.#startupReassessmentRequired = input.startupReassessmentRequired;
     this.#logger = input.logger;
+    this.#traceService = input.traceService;
+    this.#dashboard = this.#createDashboard(input.dashboard);
     this.#runtimeReassessments = new RuntimeReassessmentGate({
       run: (event) => this.#coordinator.handleRuntimeEvent(event),
       priority: runtimeReassessmentPriority,
@@ -224,7 +236,8 @@ class DefaultCompanionApplication implements CompanionApplication {
 
   public async start(): Promise<void> {
     if (this.#started) return;
-    await this.#connection.connect();
+    await this.#startDashboard();
+    await this.#connectMinecraft();
     this.#unsubscribeChat = this.#minecraft.onChat((username, message) => {
       void this.#coordinator
         .handleChat(username, message)
@@ -317,7 +330,20 @@ class DefaultCompanionApplication implements CompanionApplication {
     this.#unsubscribeImmediateStop = undefined;
     await this.#tasks.suspend(reason);
     await this.#connection.shutdown(reason);
+    await this.#stopDashboard();
     this.#memory.close();
+    try {
+      this.#traceService?.store.close();
+    } catch (error) {
+      this.#logger.warn(
+        {
+          category: "observability",
+          code: "TRACE_STORE_CLOSE_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "trace store close failed",
+      );
+    }
     this.#started = false;
     this.#logger.info({}, "AI companion stopped");
   }
@@ -366,6 +392,7 @@ class DefaultCompanionApplication implements CompanionApplication {
           this.#followDistance,
         ),
       );
+      await this.#recordReflexTransition(previousReflexState, state);
       if (state.state === "safe") {
         this.#lastRememberedIncident = "";
       } else if (state.incident.kind !== "hunger") {
@@ -464,6 +491,200 @@ class DefaultCompanionApplication implements CompanionApplication {
   ): void {
     this.#runtimeReassessments.request(event, generation);
   }
+
+  #createDashboard(
+    config: AppConfig["dashboard"],
+  ): DashboardHttpServer | undefined {
+    if (this.#traceService === undefined) return undefined;
+    try {
+      return new DashboardHttpServer(
+        this.#traceService,
+        {
+          ...config,
+          getBotHealth: () => this.#collectDashboardHealth(),
+        },
+        this.#logger,
+      );
+    } catch (error) {
+      this.#logger.error(
+        {
+          category: "observability",
+          code: "DASHBOARD_CONFIGURATION_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "trace dashboard unavailable",
+      );
+      return undefined;
+    }
+  }
+
+  async #startDashboard(): Promise<void> {
+    try {
+      await this.#dashboard?.start();
+    } catch (error) {
+      this.#logger.error(
+        {
+          category: "observability",
+          code: "DASHBOARD_START_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "trace dashboard unavailable",
+      );
+    }
+  }
+
+  async #connectMinecraft(): Promise<void> {
+    const traceService = this.#traceService;
+    if (traceService === undefined) {
+      await this.#connection.connect();
+      return;
+    }
+    const operation: { promise?: Promise<void> } = {};
+    const connect = (): Promise<void> => {
+      operation.promise = this.#connection.connect();
+      return operation.promise;
+    };
+    let session: TraceSession | undefined;
+    try {
+      session = await traceService.startTrace("Minecraft接続状態を更新", {
+        attributes: { requestKind: "system_startup" },
+      });
+      await traceService.withTrace(session, () =>
+        traceService.withSpan(
+          "system",
+          "Minecraftへ接続",
+          {
+            summary: "設定済みMinecraft serverへ接続",
+            summarizeResult: () => "Minecraft接続を確立",
+          },
+          connect,
+        ),
+      );
+      await session.complete("succeeded", { summary: "Minecraft接続を確立" });
+    } catch (error) {
+      if (operation.promise !== undefined) {
+        try {
+          await operation.promise;
+        } catch {
+          try {
+            await session?.complete("failed", {
+              summary: "Minecraft接続を確立できず",
+            });
+          } catch {
+            // The original connection failure remains authoritative.
+          }
+          throw error;
+        }
+        return;
+      }
+      await connect();
+    }
+  }
+
+  async #stopDashboard(): Promise<void> {
+    try {
+      await this.#dashboard?.stop();
+    } catch (error) {
+      this.#logger.warn(
+        {
+          category: "observability",
+          code: "DASHBOARD_STOP_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "trace dashboard stop failed",
+      );
+    }
+  }
+
+  async #collectDashboardHealth(): Promise<DashboardBotHealth> {
+    const evidence = await this.collectLiveEvidence();
+    return {
+      botState:
+        evidence.game === null
+          ? "unknown"
+          : evidence.game.connected && evidence.game.spawned
+            ? "active"
+            : "unavailable",
+      connectionState: evidence.connectionState,
+      aiState: this.#traceService?.health.active === true ? "active" : "idle",
+      memoryState: "available",
+      reflexState: evidence.reflexState,
+      ...(evidence.game === null
+        ? { positionState: "unavailable" as const }
+        : {
+            health: evidence.game.health,
+            food: evidence.game.food,
+            positionState: evidence.game.spawned
+              ? ("available_redacted" as const)
+              : ("unavailable" as const),
+          }),
+      ...(evidence.task === null
+        ? {}
+        : {
+            taskStatus: evidence.task.status,
+            taskPhase: evidence.task.phase,
+          }),
+    };
+  }
+
+  async #recordReflexTransition(
+    previous: ReflexState,
+    current: ReflexState,
+  ): Promise<void> {
+    const traceService = this.#traceService;
+    if (
+      traceService === undefined ||
+      reflexTraceKey(previous) === reflexTraceKey(current)
+    ) {
+      return;
+    }
+    const record = () =>
+      traceService.withSpan(
+        "reflex",
+        "安全介入状態を更新",
+        {
+          summary: "Minecraft観測に基づく安全状態の変化",
+          resultKind: "skill_result",
+          attributes: {
+            previousState: previous.state,
+            currentState: current.state,
+            ...(current.state === "safe"
+              ? {}
+              : { incidentKind: current.incident.kind }),
+          },
+          summarizeResult: () => "安全状態の変化を記録",
+        },
+        async () => current.state,
+      );
+    try {
+      if (traceService.health.active) {
+        await traceService.withActiveTrace(record);
+        return;
+      }
+      const session = await traceService.startTrace("安全状態の変化", {
+        attributes: { requestKind: "runtime_reflex" },
+      });
+      await traceService.withTrace(session, record);
+      await session.complete(
+        current.state === "failed" ? "failed" : "succeeded",
+        {
+          summary:
+            current.state === "failed"
+              ? "安全介入を完了できず"
+              : "安全状態を更新",
+        },
+      );
+    } catch (error) {
+      this.#logger.warn(
+        {
+          category: "observability",
+          code: "REFLEX_TRACE_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "reflex trace unavailable",
+      );
+    }
+  }
 }
 
 export function createApplication(config: AppConfig): CompanionApplication {
@@ -471,6 +692,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
   const persona = loadPersona(config.personaPath);
   prepareDatabaseDirectory(config.databasePath);
   const memory = MemoryStore.open(config.databasePath);
+  const traceService = createTraceService(config.databasePath, logger);
   const player = memory.getOrCreatePlayer(config.ownerUsername);
   const startupReassessmentRequired =
     memory.listActiveCommitments(player.id).length > 0 ||
@@ -509,10 +731,13 @@ export function createApplication(config: AppConfig): CompanionApplication {
     },
     Math.min(config.limits.taskTimeoutMs, 60_000),
     config.reconnect.enabled,
+    traceService,
   );
   const arbiter = new ActionArbiter();
-  const tasks = new TaskRuntime(new MemoryTaskStore(memory, player.id), () =>
-    minecraft.stopCurrentAction(),
+  const tasks = new TaskRuntime(
+    new MemoryTaskStore(memory, player.id),
+    () => minecraft.stopCurrentAction(),
+    traceService,
   );
   const followPlayer = new FollowPlayerSkill(minecraft, tasks, arbiter);
   const moveTo = new MoveToSkill(minecraft, tasks, arbiter);
@@ -558,11 +783,13 @@ export function createApplication(config: AppConfig): CompanionApplication {
     config.limits.skillRetryLimit + 1,
   );
   const toolMemory = new ToolMemoryAdapter(memory);
+  const executor = new ToolExecutor(traceService);
   const agent = new OpenAIDeliberationAgent({
     apiKey: config.openai.apiKey,
     model: config.openai.model,
-    executor: new ToolExecutor(),
+    executor,
     logger,
+    ...(traceService === undefined ? {} : { traceService }),
   });
   const contextFactory = new CompanionContextFactory(
     config,
@@ -572,6 +799,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     persona,
     game,
     tasks,
+    traceService,
   );
   const coordinator = new ChatCoordinator({
     ownerUsername: config.ownerUsername,
@@ -579,6 +807,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     agent,
     contextFactory,
     logger,
+    ...(traceService === undefined ? {} : { traceService }),
   });
   return new DefaultCompanionApplication({
     minecraft,
@@ -593,7 +822,36 @@ export function createApplication(config: AppConfig): CompanionApplication {
     followDistance: config.limits.followDistance,
     startupReassessmentRequired,
     logger,
+    ...(traceService === undefined ? {} : { traceService }),
+    dashboard: config.dashboard,
   });
+}
+
+function createTraceService(
+  databasePath: string,
+  logger: Logger,
+): TraceService | undefined {
+  try {
+    return new TraceService(TraceStore.open(databasePath), logger);
+  } catch (error) {
+    logger.error(
+      {
+        category: "observability",
+        code: "TRACE_STORE_OPEN_FAILED",
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      },
+      "trace observability unavailable",
+    );
+    return undefined;
+  }
+}
+
+function reflexTraceKey(state: ReflexState): string {
+  return state.state === "safe"
+    ? "safe"
+    : `${state.state}:${state.incident.kind}${
+        state.state === "failed" ? `:${state.failure.code}` : ""
+      }`;
 }
 
 function prepareDatabaseDirectory(databasePath: string): void {

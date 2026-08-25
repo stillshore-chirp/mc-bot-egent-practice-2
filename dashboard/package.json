@@ -1,0 +1,11 @@
+{
+  "name": "@mc-bot/dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm --prefix .. run dev:dashboard",
+    "build": "npm --prefix .. run build:dashboard",
+    "test:browser": "npm --prefix .. run test:browser",
+    "test:visual": "npm --prefix .. run test:visual"
+  }
+}

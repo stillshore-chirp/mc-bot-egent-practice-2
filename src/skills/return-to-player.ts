@@ -6,7 +6,6 @@ import {
   type ActionArbiter,
 } from "../runtime/action-arbiter.js";
 import type { TaskRuntime } from "../runtime/task-service.js";
-import { retry } from "../runtime/retry.js";
 import type { Skill } from "./contract.js";
 
 export interface ReturnToPlayerInput {
@@ -40,7 +39,8 @@ export class ReturnToPlayerSkill implements Skill<
         actionPriorities.task,
       );
       try {
-        await retry(
+        await context.retry(
+          "return_to_player",
           async (attempt) => {
             const snapshot = await this.minecraft.observe();
             const player = snapshot.players.find(

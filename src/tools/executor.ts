@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import { AppError } from "../domain/errors.js";
+import type { CognitiveStage } from "../trace/contracts.js";
+import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ErrorCategory, ToolContext, ToolResult } from "./contracts.js";
 import { getToolDefinition } from "./registry.js";
 
@@ -9,6 +11,39 @@ const runtimeReassessmentTools = new Set([
   "observe_surroundings",
   "recall_memory",
 ]);
+
+const memoryReadTools = new Set(["recall_memory"]);
+const memoryWriteTools = new Set([
+  "remember_player_fact",
+  "remember_location",
+  "set_commitment",
+  "complete_commitment",
+]);
+
+async function safeWithTraceSpan<T>(
+  traceService: TraceService | undefined,
+  stage: CognitiveStage,
+  name: string,
+  options: WithSpanOptions<T>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (traceService === undefined) return operation();
+
+  let operationPromise: Promise<T> | undefined;
+  const invoke = (): Promise<T> => {
+    operationPromise = Promise.resolve().then(operation);
+    return operationPromise;
+  };
+
+  try {
+    return await traceService.withSpan(stage, name, options, invoke);
+  } catch {
+    if (operationPromise !== undefined) {
+      return operationPromise;
+    }
+    return operation();
+  }
+}
 
 function failure(
   code: string,
@@ -31,7 +66,35 @@ function failure(
 }
 
 export class ToolExecutor {
+  readonly #traceService: TraceService | undefined;
+
+  public constructor(traceService?: TraceService) {
+    this.#traceService = traceService;
+  }
+
   public async execute(
+    name: string,
+    serializedArguments: string,
+    context: ToolContext,
+  ): Promise<ToolResult<unknown>> {
+    const definition = getToolDefinition(name);
+    const traceName =
+      definition === undefined ? "未登録tool" : `tool:${definition.name}`;
+    return safeWithTraceSpan(
+      this.#traceService,
+      "tool",
+      traceName,
+      {
+        summary: "toolを検証・実行",
+        resultKind: "tool_result",
+        summarizeResult: (result) =>
+          result.success ? "tool実行を完了" : "tool実行を拒否または失敗",
+      },
+      () => this.#executeCore(name, serializedArguments, context),
+    );
+  }
+
+  async #executeCore(
     name: string,
     serializedArguments: string,
     context: ToolContext,
@@ -84,7 +147,84 @@ export class ToolExecutor {
     }
 
     try {
-      const result = await definition.execute(parsed.data, context);
+      const stage = memoryReadTools.has(name)
+        ? "memory_read"
+        : memoryWriteTools.has(name)
+          ? "memory_write"
+          : definition.action
+            ? "minecraft_action"
+            : undefined;
+      const executeAction = async (): Promise<ToolResult<unknown>> => {
+        const actionResult = await definition.execute(parsed.data, context);
+        if (
+          actionResult.success ||
+          (Object.prototype.hasOwnProperty.call(
+            actionResult.error.confirmedState,
+            "after",
+          ) &&
+            actionResult.error.category !== "cancelled")
+        ) {
+          await safeWithTraceSpan(
+            this.#traceService,
+            "verification",
+            "Minecraft状態を検証",
+            {
+              summary: "実行結果の検証",
+              resultKind: "verification_result",
+              summarizeResult: (value) =>
+                value.success ? "完了条件を確認" : "完了条件を確認できず",
+            },
+            async () => actionResult,
+          );
+        }
+        if (
+          !actionResult.success &&
+          actionResult.error.category === "cancelled"
+        ) {
+          await safeWithTraceSpan(
+            this.#traceService,
+            "cancellation",
+            "操作を中断",
+            { summary: "キャンセル結果を処理" },
+            async () => undefined,
+          );
+        }
+        return actionResult;
+      };
+      const result =
+        stage === undefined
+          ? await definition.execute(parsed.data, context)
+          : await safeWithTraceSpan(
+              this.#traceService,
+              stage,
+              stage === "memory_read"
+                ? "構造化記憶を参照"
+                : stage === "memory_write"
+                  ? "構造化記憶を更新"
+                  : "Minecraft操作を実行",
+              {
+                summary:
+                  stage === "memory_read"
+                    ? "構造化記憶を参照"
+                    : stage === "memory_write"
+                      ? "構造化記憶を更新"
+                      : "Minecraft操作を実行",
+                ...(stage === "memory_write"
+                  ? {
+                      resultKind: "memory_update_result" as const,
+                    }
+                  : stage === "minecraft_action"
+                    ? {
+                        resultKind: "minecraft_state_delta" as const,
+                      }
+                    : {}),
+                summarizeResult: (value) =>
+                  value.success ? "処理結果を受信" : "処理結果を確認できず",
+              },
+              stage === "minecraft_action"
+                ? executeAction
+                : () => definition.execute(parsed.data, context),
+            );
       if (definition.action && result.success) {
         const commitmentId = verifiedFulfillmentCommitmentId(
           name,
