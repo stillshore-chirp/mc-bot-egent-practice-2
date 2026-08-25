@@ -209,6 +209,7 @@ test("live pause reports bounded-buffer overflow as degraded observability", asy
   }));
   await routeDashboardApi(page, {
     streamDelayMs: 2_000,
+    traceDelayMs: 4_000,
     streamBody: burst
       .map((event) => `event: trace\ndata: ${JSON.stringify(event)}\n\n`)
       .join(""),

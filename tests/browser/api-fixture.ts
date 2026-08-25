@@ -5,6 +5,7 @@ import { bundle, detail, events, run, traces } from "./fixtures/trace";
 export interface DashboardApiFixtureOptions {
   readonly streamBody?: string;
   readonly streamDelayMs?: number;
+  readonly traceDelayMs?: number;
 }
 
 export async function routeDashboardApi(
@@ -28,10 +29,14 @@ export async function routeDashboardApi(
       },
     }),
   );
-  await page.route("**/api/traces/*", (route) => json(route, detail));
-  await page.route("**/api/traces/*/events", (route) =>
-    json(route, { events }),
-  );
+  await page.route("**/api/traces/*", async (route) => {
+    await wait(options.traceDelayMs);
+    await json(route, detail);
+  });
+  await page.route("**/api/traces/*/events", async (route) => {
+    await wait(options.traceDelayMs);
+    await json(route, { events });
+  });
   await page.route("**/api/traces/*/demo-safe", (route) => json(route, bundle));
   await page.route("**/api/traces/*/export", (route) => json(route, bundle));
   await page.route("**/api/traces/import", (route) =>
@@ -57,4 +62,9 @@ async function json(route: Route, body: unknown): Promise<void> {
     contentType: "application/json",
     body: JSON.stringify(body),
   });
+}
+
+async function wait(delayMs: number | undefined): Promise<void> {
+  if (delayMs === undefined) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }

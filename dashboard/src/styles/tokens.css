@@ -500,6 +500,7 @@ select {
 .graph-fallback {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 430px;
   margin: 0 1rem 1rem;
   overflow: hidden;
@@ -530,6 +531,7 @@ select {
 }
 .graph-2d-wrap {
   width: 100%;
+  min-width: 0;
   height: calc(100% - 2.25rem);
   overflow: auto;
 }

@@ -109,7 +109,12 @@ export function useDashboardData(): DashboardData {
   const stream = useRef<TraceStreamClient | undefined>(undefined);
   const runsRef = useRef(runs);
   const selectedTraceIdRef = useRef(selectedTraceId);
+  // Detail/event hydration is asynchronous. Keep the intended selection so
+  // live events are not dropped while the first snapshot is still loading.
+  const pendingTraceSelectionRef = useRef<string | undefined>(undefined);
   const modeRef = useRef(mode);
+  // A late detail response must not overwrite a mode the operator selected.
+  const modeChangeVersionRef = useRef(0);
   const livePausedRef = useRef(false);
   const liveBufferRef = useRef<CognitiveTraceEvent[]>([]);
   const liveBufferOverflowRef = useRef(false);
@@ -148,6 +153,7 @@ export function useDashboardData(): DashboardData {
       traceId: string,
       requestedMode?: DashboardMode,
     ): Promise<readonly CognitiveTraceEvent[]> => {
+      const modeVersion = modeChangeVersionRef.current;
       const [nextDetail, nextEvents] = await Promise.all([
         getTrace(traceId),
         getTraceEvents(traceId),
@@ -158,10 +164,16 @@ export function useDashboardData(): DashboardData {
       setReplayCursor(undefined);
       dispatch({ type: "reset", detail: nextDetail });
       dispatch({ type: "apply-many", events: nextEvents });
-      setMode(
-        requestedMode ??
-          (nextDetail.run.source === "recorded" ? "replay" : "live"),
-      );
+      if (
+        requestedMode !== undefined ||
+        modeChangeVersionRef.current === modeVersion
+      ) {
+        const nextMode =
+          requestedMode ??
+          (nextDetail.run.source === "recorded" ? "replay" : "live");
+        modeRef.current = nextMode;
+        setMode(nextMode);
+      }
       return nextEvents;
     },
     [],
@@ -205,6 +217,7 @@ export function useDashboardData(): DashboardData {
 
   const selectTrace = useCallback(
     async (traceId: string): Promise<void> => {
+      pendingTraceSelectionRef.current = traceId;
       livePausedRef.current = false;
       setLivePausedState(false);
       clearLiveBuffer();
@@ -217,6 +230,9 @@ export function useDashboardData(): DashboardData {
           "トレースを読み込めませんでした。保存済みデータを確認してください。",
         );
       } finally {
+        if (pendingTraceSelectionRef.current === traceId) {
+          pendingTraceSelectionRef.current = undefined;
+        }
         setLoading(false);
       }
     },
@@ -322,6 +338,8 @@ export function useDashboardData(): DashboardData {
 
   const changeMode = useCallback(
     (nextMode: DashboardMode): void => {
+      modeChangeVersionRef.current += 1;
+      modeRef.current = nextMode;
       if (nextMode === "live" && livePausedRef.current) void resumeLive();
       setMode(nextMode);
     },
@@ -367,7 +385,9 @@ export function useDashboardData(): DashboardData {
     stream.current = client;
     client.connect({
       onEvent: (event) => {
-        const selected = event.traceId === selectedTraceIdRef.current;
+        const selected =
+          event.traceId === selectedTraceIdRef.current ||
+          event.traceId === pendingTraceSelectionRef.current;
         const pausedSelectedLive =
           selected && modeRef.current === "live" && livePausedRef.current;
         const knownTrace = runsRef.current.some(
