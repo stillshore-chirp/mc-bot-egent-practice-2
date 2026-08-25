@@ -1,0 +1,21 @@
+dist/
+coverage/
+node_modules/
+package-lock.json
+
+# Existing governance artifacts use their own canonical formatting.
+.agents/
+.claude/
+.cursor/
+.github/ISSUE_TEMPLATE/
+.github/pull_request_template.md
+.github/workflows/agent-harness.yml
+AGENTS.md
+CLAUDE.md
+docs/agent-harness.md
+docs/agent-principles.md
+docs/ai-governance/
+docs/documentation-structure.md
+docs/security-publication-checklist.md
+requirements-agent-harness.txt
+scripts/
