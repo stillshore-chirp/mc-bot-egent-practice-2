@@ -29,8 +29,11 @@ description: "リポジトリ変更を、主Issue、専用branch、論理的なc
 ## 3. 実装とcommit
 
 - 真のblockerがない限り、調査、実装、検証、配送を同じtaskで継続する。
+- 実装前に、受け入れ条件と依存関係から予定commitの責務、関連test・文書、実装順序を決める。責務の境界が実装中に変わった場合は、次の編集前に計画を更新する。
 - 目的を満たす最小十分な差分を作り、非対象を先行実装しない。
 - commitは独立してreview・revertできる一つの論理的責務または受け入れ条件の単位にする。関連test、文書、schema、生成物は同じcommitへ含める。
+- 一つの責務の実装・関連test・文書・検証が完了したら、次の独立責務を編集する前にstage確認とcommitを完了する。複数責務を共有作業ツリーへ蓄積し、最後に全差分を再読して後付け分解しない。
+- サブエージェントの完了報告を受けたら、メインが担当fileと差分をreviewし、その責務だけを上記の時点でcommitへ回収する。他担当の未完了差分はstageしない。
 - `git add .` と `git add -A` を使わず、stageするpathを明示する。
 - commit前にstaged file名、staged diff、`git diff --check`、secret・実データ・無関係差分の不在を確認する。
 - commit messageは変更の責務を短く表す。
