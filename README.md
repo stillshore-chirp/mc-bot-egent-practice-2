@@ -82,7 +82,7 @@ oak_logを4個集めて、ここへ戻ってきて。
 | 区分      | 必須設定                                                 | 既定設定                                                                         |
 | --------- | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Minecraft | `MINECRAFT_HOST`、`MINECRAFT_USERNAME`、`OWNER_USERNAME` | port `25565`、auth `microsoft`、version `1.21.11`                                |
-| OpenAI    | `OPENAI_API_KEY`                                         | model `gpt-5.6-luna`                                                              |
+| OpenAI    | `OPENAI_API_KEY`                                         | model `gpt-5.6-luna`                                                             |
 | 永続化    | なし                                                     | `DATABASE_PATH=data/companion.sqlite`                                            |
 | 安全上限  | なし                                                     | 移動距離、採取数、timeout、retry、追従距離、空腹しきい値は `.env.example` を参照 |
 | live E2E  | なし                                                     | `LIVE_E2E_CONFIRMED=false`。許可済みtest worldでだけ`true`にする                 |
