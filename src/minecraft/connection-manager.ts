@@ -1,5 +1,7 @@
 import { AppError } from "../domain/errors.js";
 import { retry, type RetryPolicy } from "../runtime/retry.js";
+import { createTraceRetryObserver } from "../trace/retry-observer.js";
+import type { TraceService } from "../trace/service.js";
 import { withTimeout } from "../runtime/timeout.js";
 import type { MinecraftPort } from "./port.js";
 
@@ -21,6 +23,7 @@ export class ConnectionManager {
     private readonly retryPolicy: RetryPolicy,
     private readonly connectTimeoutMs: number,
     private readonly reconnectEnabled = true,
+    private readonly traceService?: TraceService,
   ) {}
 
   public async connect(signal?: AbortSignal): Promise<void> {
@@ -67,6 +70,7 @@ export class ConnectionManager {
       this.retryPolicy,
       (error) => error instanceof AppError && error.detail.retryable,
       signal,
+      createTraceRetryObserver(this.traceService, "minecraft_connection"),
     );
   }
 

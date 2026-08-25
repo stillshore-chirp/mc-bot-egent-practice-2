@@ -50,5 +50,16 @@ export function loadConfig(
       maxAttempts: env.RECONNECT_MAX_ATTEMPTS,
       delayMs: env.RECONNECT_DELAY_MS,
     },
+    dashboard: {
+      enabled: env.DASHBOARD_ENABLED,
+      host: env.DASHBOARD_HOST,
+      port: env.DASHBOARD_PORT,
+      ...(env.DASHBOARD_AUTH_TOKEN === undefined
+        ? {}
+        : { authToken: env.DASHBOARD_AUTH_TOKEN }),
+      staticDirectory: env.DASHBOARD_STATIC_DIR,
+      maxAgeDays: env.TRACE_RETENTION_DAYS,
+      maxTraces: env.TRACE_MAX_RUNS,
+    },
   };
 }

@@ -6,8 +6,7 @@ import {
   actionPriorities,
   type ActionArbiter,
 } from "../../runtime/action-arbiter.js";
-import { retry } from "../../runtime/retry.js";
-import type { TaskRuntime } from "../../runtime/task-service.js";
+import type { TaskContext, TaskRuntime } from "../../runtime/task-service.js";
 import {
   verifyGatherCompletion,
   type GatherVerification,
@@ -131,6 +130,14 @@ export class GatherLogsSkill implements Skill<
                 itemName,
                 baseline,
                 (phase, checkpoint) => context.advance(phase, checkpoint),
+                (operationName, operation, policy, shouldRetry, retrySignal) =>
+                  context.retry(
+                    operationName,
+                    operation,
+                    policy,
+                    shouldRetry,
+                    retrySignal,
+                  ),
                 signal,
               );
             } catch (error) {
@@ -152,6 +159,14 @@ export class GatherLogsSkill implements Skill<
           input.requester,
           this.limits.returnRange,
           (phase, checkpoint) => context.advance(phase, checkpoint),
+          (operationName, operation, policy, shouldRetry, retrySignal) =>
+            context.retry(
+              operationName,
+              operation,
+              policy,
+              shouldRetry,
+              retrySignal,
+            ),
           signal,
         );
         await context.advance("final_verify");
@@ -179,10 +194,12 @@ export class GatherLogsSkill implements Skill<
       phase: string,
       checkpoint?: Readonly<Record<string, unknown>>,
     ) => Promise<void>,
+    retryOperation: TaskContext["retry"],
     signal: AbortSignal,
   ): Promise<void> {
     await advance("move_to_resource", { target: target.position });
-    await retry(
+    await retryOperation(
+      "move_to_resource",
       async () =>
         this.minecraft.moveTo(target.position, this.limits.moveRange, signal),
       {
@@ -199,7 +216,8 @@ export class GatherLogsSkill implements Skill<
       target: target.position,
       heldCount: countInventory(beforeDig, itemName),
     });
-    await retry(
+    await retryOperation(
+      "dig_resource",
       () => this.minecraft.dig(target, signal),
       {
         maxAttempts: this.limits.maxPathAttempts,
@@ -249,9 +267,11 @@ export class GatherLogsSkill implements Skill<
       phase: string,
       checkpoint?: Readonly<Record<string, unknown>>,
     ) => Promise<void>,
+    retryOperation: TaskContext["retry"],
     signal: AbortSignal,
   ): Promise<void> {
-    await retry(
+    await retryOperation(
+      "return_to_requester",
       async (attempt) => {
         const snapshot = await this.minecraft.observe();
         const player = this.requireRequester(snapshot, username);
