@@ -84,9 +84,13 @@ test("2D fallback remains contained at narrow width and 200 percent text", async
           minWidth: style.minWidth,
           overflowX: style.overflowX,
           whiteSpace: style.whiteSpace,
+          insideHorizontalScroller: element.closest(".graph-2d-wrap") !== null,
         };
       })
-      .filter(({ left, right }) => left < -1 || right > documentWidth + 1)
+      .filter(
+        ({ insideHorizontalScroller, left, right }) =>
+          !insideHorizontalScroller && (left < -1 || right > viewportWidth + 1),
+      )
       .slice(0, 12);
     return { documentWidth, viewportWidth, overflowingElements };
   });

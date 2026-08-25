@@ -987,8 +987,15 @@ dd {
     width: 100%;
     min-width: 0;
   }
+  .status-cluster {
+    align-items: stretch;
+  }
   .status-chip {
+    width: 100%;
     max-width: 100%;
+    min-width: 0;
+    justify-content: flex-start;
+    overflow-wrap: anywhere;
     white-space: normal;
   }
   .filter-row,
