@@ -69,6 +69,7 @@ PRODUCT_PATTERNS = (
     "README.md",
     ".env.example",
     ".gitignore",
+    ".prettierignore",
     "config/**",
     "docs/architecture.md",
     "docs/dashboard.md",
