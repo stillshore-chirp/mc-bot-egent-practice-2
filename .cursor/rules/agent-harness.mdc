@@ -1,9 +1,7 @@
 ---
-description: "エージェントハーネス変更時に3tool共通の保守正本へ接続するrouter"
-globs: "README.md,.gitignore,AGENTS.md,CLAUDE.md,.agents/**,.claude/**,.cursor/**,docs/agent-harness.md,docs/agent-principles.md,docs/documentation-structure.md,docs/security-publication-checklist.md,docs/ai-governance/**,scripts/verify-agent-harness.sh,scripts/validate_agent_frontmatter.py,requirements-agent-harness.txt,.github/ISSUE_TEMPLATE/feature.md,.github/pull_request_template.md,.github/workflows/agent-harness.yml"
+description: "エージェントハーネス変更時に3製品共通の保守正本へ接続するrouter"
+globs: "AGENTS.md,CLAUDE.md,.agents/**,.claude/**,.cursor/**,docs/agent-harness.md,docs/agent-principles.md,docs/documentation-structure.md,docs/security-publication-checklist.md,docs/ai-governance/**,.github/ISSUE_TEMPLATE/**,.github/pull_request_template.md,requirements-agent-harness.txt,scripts/validate_governance.py,scripts/verify_task_skills.py"
 alwaysApply: false
 ---
 
-# Agent harness adapter
-
-エージェントルールを変更する時は、[harness設計](../../docs/agent-harness.md) と [保守方針](../../docs/ai-governance/13-maintenance-policy.md) を正本として参照します。このadapterへ手順本文を複製しません。
+エージェントハーネス変更時は[docs/agent-harness.md](../../docs/agent-harness.md)と[13-maintenance-policy.md](../../docs/ai-governance/13-maintenance-policy.md)を正本として参照します。

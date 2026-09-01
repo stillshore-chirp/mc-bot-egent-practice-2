@@ -1,64 +1,46 @@
 # 証跡と完了ゲート
 
-この文書は、リポジトリ変更を完了扱いするために必要な証跡と観測条件を定義します。
+この文書は、repository governance、Minecraft runtime、GitHub共同作業面の変更を完了扱いするためのevidenceと判定条件を定義します。static validatorはruntime成功や外部サービス状態を代替しません。
 
-## 1. 証跡の原則
+## 1. 共通evidence
 
-- 受け入れ条件ごとに、file差分、test、静的検査、CI、review、実環境観測などの対応する根拠を示します。
-- 実行した検証と結果、実行していない検証と理由、残る不確実性を分けます。
-- codeから導いた仮説と、Minecraft、外部service、GitHubで実際に観測した事実を混ぜません。
-- secret、認証情報、個人情報、実環境log原文、追跡可能な実識別子を証跡に使いません。
+受け入れ条件ごとに、差分、test、静的検査、CI、review、実環境観測などの根拠を対応付けます。HEAD / base、変更path、関連設定、生成物、実行条件をinput closureとして記録し、stable evidenceとvolatile delivery stateを分けます。
 
-## 2. 対象面
+配送checkpointはimplementation → focused_verification → code_freeze → measurement → publication_freeze → external_gate → review_fix → acceptedです。高コストgateはclosureと公開境界をfreezeした後に選びます。
 
-現段階の変更対象は主にREADME、repository rule、Issue・PR template、workflowなどのGitHub共同作業面です。次を確認します。
+gate ledgerにはgate、snapshot phase・HEAD・base、input closure（path / config / artifact / conditions）、result、artifact referenceを置きます。closureと交差したpath・設定・生成物・条件だけがgateを失効させ、invalidation reasonとreacquire scopeを残します。同じclosure・条件の成功evidenceは再利用します。
 
-- 変更した文言、項目、順序、必須性、設定
-- Markdown、YAML、frontmatterの構造
-- link、command、参照先file
-- 公開安全性
-- previewまたはGitHub上の実表示確認が必要か
+task budget（context、owned paths、runtime、deadline、output cap）とreview budget（対象HEAD、cycle、severity、再取得条件）は、laneとgateの開始前に固定します。予算はhard safetyやacceptance contradictionを延期する理由にせず、P2-only findingや公開文言の調整は限定されたreview scopeで扱います。
 
-GitHubが所有し、このリポジトリが変更しないlayout、keyboard、focus、loading、permission stateへ、製品UIの証跡を要求しません。将来、リポジトリが製品UIを実装する場合は、対象画面、主要状態、操作、accessibility、前後差分に必要な検証を、その設計と同時に定義します。
+## 2. Governance面
 
-## 3. 共通完了ゲート
+rule、Skill、adapter、docs、Issue / PR template、validatorの変更では、次を確認します。
 
-- 依頼の成果と主Issueの受け入れ条件を満たしている。
-- 変更対象と非対象が一致し、無関係な差分や製品codeを混入していない。
-- 対象に対応するlocal verificationが最新差分で成功している。
-- 文書参照、frontmatter、instruction budget、adapter、公開安全性を確認している。
-- 実施していない確認を成功扱いしていない。
-- 未実行検証、その理由、残るriskまたはblockerを示している。
+- frontmatter、Skill identity、routerのscope、rendered Markdown link
+- instruction budget、UTF-8、broken link、task-state/v1 shape
+- rootとadapterの責務分離、旧正本・孤立adapterの不在
+- public safety、差分の無関係path混入の不在
+- focused Python governance testsとstatic validatorの結果
 
-## 4. Pull Request完了ゲート
+この面ではアプリ画面のscreenshot、dev server、Minecraft接続を受け入れ条件へ追加しません。
 
-PRをマージ可能な状態として報告するには、次をすべて満たします。
+## 3. Minecraft / production面
 
-- 専用branchから非ドラフトPRが作成または更新されている。
-- latest headについて、対象branchで定義されたpush CIとpull_request CIが成功している。
-- latest meaningful changeに対するGitHub上で確認可能な自動または人間のreviewがcleanである。
-- actionableな未解決review threadがない。
-- GitHubのmergeabilityがcleanで、conflictまたはblocking conditionがない。
-- PR本文に主Issue、変更、検証、未実行項目、公開安全性、残るriskを記録している。
+実環境調査では、対象環境、時間範囲、観測方法、read-only/write、ownerを記録します。観測事実は安全に要約し、server address、player、memory内容、log原文、追跡IDを公開しません。runtimeを使う場合はPID、process group、port、readiness、cleanupのevidenceを残します。
 
-P0が残る場合は完了不可です。P1は原則として同じ変更内で修正し、分離する場合は理由と追跡先を示します。P2は完了を止めませんが、対応しない理由または後続先を記録します。clean reviewは指摘が一件もないreviewに限定せず、P1の分離判断またはP2の対応判断を記録し、actionableな未解決threadがない状態を含みます。
+code上の仮説だけでproduction状態を断定しません。bot actionはゲーム内の結果で確認し、確認できない場合はunverifiedまたはblockedとして残します。
 
-reviewが提供されない場合、自己reviewは補助証跡に限り、GitHub上のreviewを確認した状態の代替にしません。同じheadでclean reviewを複数回集める必要はありません。修正でheadが変わった場合だけ、関連CIと該当reviewを再確認します。P1を分離する理由と追跡先、またはP2を対応しない理由か後続先を記録した場合はheadを変えず、そのreviewで終了できます。
+## 4. PR monitor
 
-merge、Issue・PRのclose、release、deploy、force-push、公開済み履歴の書換え、破壊的操作は、対象を特定した別の明示指示がある場合だけ実行します。
+各runの軽量keyはstate、headRefOid、updatedAt、reviewDecision、mergeStateStatusの完全一致で比較します。MERGED / CLOSEDはterminal-firstで、そのrunの詳細照会を抑制しscheduled taskを削除します。OPENでkeyが無変化なら詳細照会をせずevent/backoffで待機し、logical checkpointまたはdeadlineで継続要否を再評価します。timeoutはfailure扱いにしません。
 
-## 5. 推奨検証
+## 5. 完了条件
 
-変更範囲に応じて、次から最小十分な組合せを選びます。
+- acceptance、対象path、非対象、公開境界が一致している。
+- P0、security、secret、data integrity、受入証跡の矛盾が残っていない。
+- 対応pathに必要なfocused verificationがlatest local差分で成功している。
+- static validator、frontmatter、link、budget、task-stateの結果を示している。
+- 実行したこと、未実行理由、残るriskを分離している。
+- PRをmerge可能と報告する場合、latest HEADのCI、review、未解決thread、mergeabilityを同一snapshotで確認している。
 
-- syntax、lint、format、typecheck
-- unit、integration、contract、E2E test
-- Markdown相対link、YAML、frontmatter、UTF-8、trailing whitespace
-- secret、実データ、無関係差分、禁止された製品固有情報
-- 実環境のread-only観測
-
-利用できない検証は、存在しない成果物として補わず、理由と影響を報告します。
-
-## 6. 完了報告
-
-変更内容と判断理由、受け入れ条件の根拠、local verification、Issue、branch、commit、PR、latest head、CI、review、未解決thread、mergeability、未実行検証、残るriskまたはblockerを、今回に関係する範囲で記録します。
+merge、Issue / PR close、release、deploy、force-pushは対象と権限の別明示なしに実行しません。

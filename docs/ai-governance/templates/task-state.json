@@ -1,0 +1,66 @@
+{
+  "schema": "task-state/v1",
+  "status": "running",
+  "goal": "Synthetic delivery checkpoint state.",
+  "acceptance": [
+    "Stable snapshot and input closure are recorded.",
+    "Measurement scope excludes publication annotation."
+  ],
+  "snapshot": {
+    "base": "base-ref",
+    "head": "head-ref",
+    "phase": "code_freeze"
+  },
+  "lane": {
+    "id": "delivery-procedure-lane",
+    "owner": "synthetic-owner",
+    "owned_paths": [
+      "docs/example.md"
+    ]
+  },
+  "completed_evidence": [
+    {
+      "gate": "synthetic-gate",
+      "summary": "Bounded synthetic verification summary.",
+      "result": "pass",
+      "artifact_reference": "artifact-reference/evidence-1"
+    }
+  ],
+  "input_closure": {
+    "paths": [
+      "docs/example.md"
+    ],
+    "config": [
+      "config/example.toml"
+    ],
+    "artifacts": [
+      "artifact-reference/evidence-1"
+    ],
+    "conditions": [
+      "Code snapshot is frozen.",
+      "Publication annotation is outside the measurement scope."
+    ]
+  },
+  "measurement": {
+    "gate": "measurement",
+    "input_paths": [
+      "docs/example.md"
+    ]
+  },
+  "publication": {
+    "gate": "publication",
+    "annotation_paths": [
+      "docs/publication-report.md"
+    ]
+  },
+  "invalidated_gates": [],
+  "remaining_work": [
+    "Record publication freeze and external gate state in the next bounded step."
+  ],
+  "risks_blockers": {
+    "risks": [
+      "Volatile delivery state is recorded separately from stable evidence."
+    ],
+    "blockers": []
+  }
+}
