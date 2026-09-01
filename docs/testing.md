@@ -13,7 +13,18 @@ npm run build
 npm run audit:high
 ```
 
-GitHub Actions の `Product quality` workflow は Node.js 22 と 24 のそれぞれで同じ command を実行します。`audit:high`はhigh / critical advisoryを品質gateにし、既知のmoderate認証依存はIssue #4で追跡します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
+GitHub Actions は通常PRで一つの `CI` workflowだけを起動します。最初に `scripts/classify_verification_inputs.py` が `base...head` の変更pathを分類し、必要なjobだけを実行します。最後の `Quality gate (selected checks)` は、選択されたjobの成功と未選択jobのskipを照合します。未知path、diff失敗、選択状態の不整合はfail-closedです。
+
+| 変更範囲 | 選択する検証 |
+|---|---|
+| server、runtime、unit/integration test、製品docs/config | Node.js 22 / 24のtest・build、Node.js 24のformat・lint・typecheck・audit |
+| dashboard、trace、browser spec/config | 製品検証 + Node.js 24のPlaywright browser test |
+| agent rule、Skill、adapter、governance docs/template | 中央governance validator、Skill検証、focused契約test |
+| workflow、classifier、workflow契約test | 全job + workflow契約test |
+
+workflowはpath filterで起動自体を消しません。削除・renameの両側を分類するため、PRでは `git diff --name-only --no-renames -z base...head` を使います。同一のHEAD・base・入力閉包・実行条件で成功した証跡は再利用し、交差する入力が変わったgateだけを再実行します。
+
+`audit:high`はhigh / critical advisoryを品質gateにし、既知のmoderate認証依存はIssue #4で追跡します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
 
 ## Unit test
 
