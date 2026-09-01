@@ -1,125 +1,72 @@
 # エージェントハーネス設計・保守ガイド
 
-この文書は、mc-bot-egent-practice-2をCodex・Claude Code・Cursorのいずれで扱っても、同じ品質基準へ到達するための構成を定義します。
+この文書は、Codex、Claude Code、Cursorで共有する、正本の読者・配置、委任、evidence、task-stateの最小契約です。説明文であり、機械検証や製品runtimeの代替ではありません。
 
-## 目的
+## 正本、読者、責務
 
-常時読み込む長文、複数の正本、taskと無関係な手順は、重要な指示への注意を薄めます。このリポジトリでは責務を次の層へ分けます。
-
-| 層 | 役割 | 配置 |
+| 正本 | 読者 | 責務 |
 |---|---|---|
-| 共通核 | 全作業に必要な進行、安全境界、配送契約 | `AGENTS.md` |
-| path固有ルール | 実在する領域だけの追加契約 | 将来必要になった時点のnested `AGENTS.md` |
-| task Skill | GitHub配送、実環境調査、公開安全性の実行順序 | `.agents/skills/` |
-| 詳細正本 | 配置判断、原則、証跡、保守、公開判定 | `docs/` |
-| tool adapter | 各toolの発見機構から正本への接続 | `CLAUDE.md`, `.claude/`, `.cursor/` |
-| 機械検証 | 形式、参照、budget、重複、必須契約 | `scripts/verify-agent-harness.sh`, CI |
+| AGENTS.md、最寄りのAGENTS.md | 3製品 | hard gate、権限境界、最小実行 |
+| .agents/skills/<name>/SKILL.md | 3製品 | task固有の発動条件、手順、handoff |
+| docs/ai-governance/ | agent、reviewer | Issue、evidence、完了の判定基準 |
+| この文書 | agent、reviewer、保守者 | 委任、snapshot、closure、task-state、runtime境界 |
+| scripts/validate_governance.py | CI、保守者 | 形式、存在、参照、identity、budgetのstatic検査 |
 
-現時点で製品コードのpathは未確定です。将来のディレクトリを仮定したnested ruleや空adapterは作りません。
+CLAUDE.md、.claude/rules/、.claude/skills/、.cursor/rules/は正本へ到達するrouterです。adapterへ本文を複製せず、routerの不調をhard gateの緩和に使いません。
 
-## 正本とadapter
+## 読み分けと変更影響
 
-- 共有する常時読込契約はルート `AGENTS.md`。
-- task手順は `.agents/skills/<name>/SKILL.md`。
-- 判断基準と保守方針は `docs/`。
-- `.claude/rules/`、`.claude/skills/`、`.cursor/rules/` は、対象範囲と読むべき正本だけを示す薄いadapter。
-- adapterへ正本のchecklistや手順本文をコピーしません。
+全体の安全境界はroot、実在するpath固有契約は最寄りのAGENTS.md、task手順はSkillへ置きます。設計heuristicは[agent-principles](agent-principles.md)、保守判断は[maintenance policy](ai-governance/13-maintenance-policy.md)を読みます。logic、共有処理、API、型、data契約を変える時は、参照追跡と関連testで影響範囲を確認します。
 
-## 3製品の接続
+## 配送checkpoint
 
-### Codex
+配送は次の順で進め、各段階でHEAD、base、owner、入力閉包、終了条件を固定します。
 
-- ルートから作業場所までの `AGENTS.md` を利用します。
-- task固有手順は `.agents/skills/` を読みます。
-- 複数領域を変更する場合は、各対象に最も近い `AGENTS.md` を明示的に確認します。
+1. implementation: scope、acceptance、非対象、owner、変更pathを確定。
+2. focused_verification: pathに対応する最小十分なtest・構造確認を実行。
+3. code_freeze: source、test、設定、生成物とgateのinput closureを固定。
+4. measurement: 固定snapshotとscopeで実行数、wall-clock、照会数、output bytesを記録。
+5. publication_freeze: Issue、PR、report、artifactの公開内容と安全性を固定。
+6. external_gate: 必要なCI、review、thread、mergeabilityを確認。
+7. review_fix: actionableな修正後、closureと交差するgateだけを再取得。
+8. accepted: latest HEAD / base、acceptance、CI、review、thread、mergeabilityを同一snapshotで照合。
 
-### Claude Code
+高コストgateはcode_freeze、測定scope、公開境界、再取得条件の確定後に選びます。
 
-- `CLAUDE.md` は `@AGENTS.md` だけをimportし、共通核を一重に共有します。
-- `.claude/rules/*.md` はfrontmatterの `paths` で必要な時だけ詳細正本へ案内します。
-- `.claude/skills/<name>/SKILL.md` は対応する共有Skillだけを案内します。
+## snapshot、evidence、input closure
 
-### Cursor
+stable evidenceはHEAD / base、変更path、関連config、生成artifact、実行条件、結果、artifact referenceに束縛します。CI、review、thread、mergeability、待機中statusはvolatile delivery stateとして分離します。
 
-- 共通核はルート `AGENTS.md` から読みます。
-- `.cursor/rules/*.mdc` は `globs` と `alwaysApply: false` で、対象変更だけを詳細正本へ案内します。
-- task手順はAgent Skills互換の `.agents/skills/` を正本として使います。
+gate ledgerは gate、snapshot phase・HEAD・base、input paths、関連config、artifact、conditions、result、artifact referenceを持ち、失効時はinvalidation reasonとreacquire scopeを追記します。base、owned path、設定、生成物、条件がclosureと交差したgateだけを失効させ、同じclosureと条件の成功evidenceは再利用します。timeoutは失敗でもevidence失効でもなく、laneをrunningのままeventまたはbackoffで再待機します。
 
-各toolのversion、実行形態、sandboxによる発見差は静的検証だけでは保証できません。発見できない場合はtool名、version、実行形態、再現pathをIssueへ記録します。
+測定artifactへ後からreport annotationを加える場合は、annotationを測定scope外へ分離するかpublication gateへ移します。推定token量をobserved telemetryと表現しません。
 
-nested `AGENTS.md` を追加する場合は、その親pathをURL percent-encodeしたscope keyを使い、`.claude/rules/nested-agents-<scope-key>.md` と `.cursor/rules/nested-agents-<scope-key>.mdc` を同じ変更で追加します。例えば `apps/bot/AGENTS.md` のscope keyは `apps%2Fbot` です。`nested-agents-` prefixはこの接続専用として予約します。両adapterは対象pathだけへscopeし、nested `AGENTS.md` への参照だけを持ちます。ClaudeとCursorのglob解釈を一致させるため、scopeのディレクトリ名に `*`, `?`, `[`, `]`, `{`, `}`, `!`, `,`, `\` は使いません。検証scriptは、globとして安全でないscope、adapterの欠落、scope不一致、本文複製、対応するnested ruleがない孤立adapterを拒否します。
+## bounded laneとevidence package
 
-## 配置の判断
+委任時にrisk lane、owner、target HEAD / base、target paths、acceptance、depends_on、snapshot phase、write ownership、runtime resource、port、cleanup、output cap、completion、verification、reuse evidence、invalidation conditionを固定します。最小contextは目的、受け入れ条件、非対象、HEAD / base、対象path、依存、停止条件だけにします。
 
-新しい規則を追加する前に、次の順で判断します。
+completed laneは、status、scope / revision、conclusion、changed paths、verification、unperformed checks、remaining risks、stop reason、snapshot / diff、artifact referenceを含むcompact evidence packageを返します。raw logや長いfile全文は含めません。
 
-1. 全taskで毎回必要なら `AGENTS.md` に短く置く。
-2. 実在する特定pathだけに必要なら最寄りのnested `AGENTS.md` と薄いadapterを置く。
-3. 特定taskだけに必要なら `.agents/skills/` と必要なClaude adapterを置く。
-4. 機械判定できるならscript、test、lint、CIへ置く。
-5. 既存の詳細正本へ統合できる場合は新規文書を増やさない。
+task budgetは、primaryとlaneごとの最小context、owned paths、実行時間またはdeadline、runtime資源、output capを開始時に固定します。review budgetは、対象HEAD、review cycle数、確認するseverityとclosure、再取得条件を固定し、同じHEADでclean結果を増やすための再reviewを行いません。P0/P1またはsecurity・acceptance contradictionは予算外でもblockingとして扱います。
 
-## Hard gateとheuristic
+checkpointを逃した時だけ同じownerへ一度partial resultを求め、進展がなければscope shrink、縮小後も進展がなければreassignします。partial / unverifiedは未確認範囲と再開条件を保持します。primaryが分離可能な作業を直接行う場合は、specific reason、subagent不能のevidence、scope shrink history、reassignment history、primary-only question、target paths、output capを記録します。
 
-Hard gateは、違反時に停止または未完了扱いにする客観的な条件です。secret・個人情報の非公開、権限境界、観測していない状態の非断定、latest headのCI・review・thread・mergeabilityが該当します。
+## task-stateとruntime境界
 
-Heuristicは設計判断を助ける目安です。DRY、KISS、SRP、OCP、YAGNI、行数、重複回数、test配分が該当します。例外が成立する判断を、数値だけでPass / Failへ変換しません。
+cross-sessionのfield sourceは[task-state/v1 template](ai-governance/templates/task-state.json)だけです。resume時は現在のsnapshotとclosureを照合し、条件一致のcompleted evidenceをartifact referenceで再利用します。completeはacceptanceと必要gateを満たし、remaining work、invalidated gate、blockerがない場合だけです。blockedは権限・外部状態など真の停止理由がある場合だけです。
 
-## GitHub配送の権限
+Minecraft runtimeを使うlaneはowner、PID、process group、port、readiness、cleanupを起動前に固定し、成功・停止・失敗・割込みの全経路でprocess groupとport解放を確認します。runtimeを使わない場合はその旨を記録します。validatorのstatic PASSはtool発見、Hook注入、runtime routing、権限、実環境成功を保証しません。
 
-ソースコード変更依頼には、主Issueの確定、専用branch、commit、push、非ドラフトPR、CI確認、GitHub上のreview対応、対応済みthread解決、mergeability確認までの通常配送が含まれます。実行順序は [GitHub配送Skill](../.agents/skills/github-delivery/SKILL.md)、観測可能な完了条件は [証跡と完了ゲート](ai-governance/03-evidence-and-completion-gates.md) を正本とします。
+## instruction budget
 
-merge、Issue・PRのclose、release、deploy、force-push、公開済み履歴の書換え、破壊的操作には、対象を特定した別の明示指示が必要です。
+root AGENTS.mdは180行・16KiB、nested AGENTS.mdは100行・8KiB、adapterは30行・4KiB、canonical Skillは180行・16KiB、rootと有効なnested ruleの合計は24KiBを上限とします。source-sizeはestimateで、実際のtoken telemetryではありません。形式、参照、frontmatter、Skill identity、task-state、budgetは[validate_governance.py](../scripts/validate_governance.py)で検査します。
 
-## Instruction budget
+## PR monitor契約
 
-次をhard upper boundとします。短いほど常に良いという意味ではなく、超過時に構造を見直す上限です。
+各runの冒頭に、state、headRefOid、updatedAt、reviewDecision、mergeStateStatusだけからなる軽量keyを取得します。MERGEDまたはCLOSEDならstateを最優先し、そのrunでscheduled taskを削除して監視を終了し、review・thread・CI・mergeabilityの詳細を取得しません。UNKNOWNや空のsecondary fieldはterminal stateを覆しません。
 
-| 対象 | 行数 | UTF-8 bytes |
-|---|---:|---:|
-| ルート `AGENTS.md` | 180以下 | 16 KiB以下 |
-| nested `AGENTS.md` | 100以下 | 8 KiB以下 |
-| rule / Skill adapter | 30以下 | 4 KiB以下 |
-| canonical Skill | 180以下 | 16 KiB以下 |
-| ルート + 対象pathで有効な全nested `AGENTS.md` | - | 24 KiB以下 |
+OPENで外部待ちが必要な時、keyが変わらない間は詳細照会をせず、eventまたはbackoffで待機します。logical checkpointまたはdeadlineで継続要否を再評価し、不要と判断した時だけ停止理由と未確認範囲を通知します。timeout回数を完了条件にしません。
 
-上限を超える場合は、常時読込である必要、分割できない理由、3製品への影響をIssueとPRへ記録し、検証scriptの上限を黙って緩和しません。
+## 保守境界
 
-## 禁止する構造
-
-- tool別ファイルへ同じ長文を複製する。
-- `AGENTS.md`、Skill、詳細docsで同じchecklistをそれぞれ正本化する。
-- 一つのGitHub clientや特定review名を、同等手段がある全toolの共通条件にする。
-- 変更のない同一headへ、clean結果を増やすためだけのreviewを反復する。
-- read-only回答へIssue・branch・PR欄の定型出力を要求する。
-- 将来だけを理由にpath rule、空文書、placeholderを作る。
-- 形式で検査できる条件を自然言語だけで維持する。
-
-## Review契約の配置
-
-reviewの実行順序は [GitHub配送Skill](../.agents/skills/github-delivery/SKILL.md)、Pass / Failの観測条件は [証跡と完了ゲート](ai-governance/03-evidence-and-completion-gates.md) を正本とします。この文書では手順や完了条件を再定義しません。
-
-## 変更時の確認
-
-1. 変更をcommon、path、task、docs、machineのどこへ置くか決めた。
-2. Codex、Claude Code、Cursorから必要な正本へ到達できる。
-3. adapterへルール本文を複製していない。
-4. Hard gateとheuristicを区別した。
-5. instruction budgetを満たした。
-6. 旧正本、競合指示、循環参照、壊れたlinkを残していない。
-7. GitHub配送Skillと完了ゲートの参照が保たれ、機械検証が両者の契約を確認している。
-
-## 検証
-
-依存を導入した環境で次を実行します。
-
-```bash
-python3 -m pip install -r requirements-agent-harness.txt
-bash -n scripts/verify-agent-harness.sh
-python3 -m py_compile scripts/validate_agent_frontmatter.py
-bash scripts/verify-agent-harness.sh
-```
-
-CIはエージェントルールと共同作業文書の関連pathが変わった場合だけ同じ検証を実行します。製品コード用のCIは製品実装の設計後に追加します。
-
-検証対象は、gitが管理する非ignore fileのうち、共通核、nested rule、Skill、tool rule・adapter、明示した共同作業文書、template、harness workflow・scriptです。将来の製品コード、一般docs、parser・security fixture、binary assetの内容検査は製品CIへ分離します。移植元固有語と廃止指示の検査もactiveなbootstrap成果物へ限定し、無関係なprovenance文書を失敗条件にしません。active ruleではinline codeとcode fence内も競合検査の対象です。
+この契約は静的なrepository governanceです。Codex desktop scheduler、各toolの実際の発見、GitHub権限、Minecraft server、LLM provider、実データ、production logの状態は、対応する実行またはread-only観測なしに成功と断定しません。

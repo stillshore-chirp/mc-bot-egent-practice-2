@@ -1,7 +1,5 @@
 ---
 paths:
-  - "README.md"
-  - ".gitignore"
   - "AGENTS.md"
   - "CLAUDE.md"
   - ".agents/**/*"
@@ -10,16 +8,13 @@ paths:
   - "docs/agent-harness.md"
   - "docs/agent-principles.md"
   - "docs/documentation-structure.md"
-  - "docs/ai-governance/**/*"
   - "docs/security-publication-checklist.md"
-  - "scripts/verify-agent-harness.sh"
-  - "scripts/validate_agent_frontmatter.py"
-  - "requirements-agent-harness.txt"
-  - ".github/ISSUE_TEMPLATE/feature.md"
+  - "docs/ai-governance/**/*"
+  - ".github/ISSUE_TEMPLATE/**/*"
   - ".github/pull_request_template.md"
-  - ".github/workflows/agent-harness.yml"
+  - "requirements-agent-harness.txt"
+  - "scripts/validate_governance.py"
+  - "scripts/verify_task_skills.py"
 ---
 
-# Agent harness adapter
-
-エージェントルールを変更する時は、[`docs/agent-harness.md`](../../docs/agent-harness.md) と [`13-maintenance-policy.md`](../../docs/ai-governance/13-maintenance-policy.md) を正本として参照します。このadapterへ手順本文を複製しません。
+エージェントハーネス変更時は[docs/agent-harness.md](../../docs/agent-harness.md)と[13-maintenance-policy.md](../../docs/ai-governance/13-maintenance-policy.md)を読み、3製品の到達性、budget、正本とadapterの分離を確認します。形式・参照・task-stateはscripts/validate_governance.pyで検証します。
