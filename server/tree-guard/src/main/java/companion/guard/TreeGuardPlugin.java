@@ -104,8 +104,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void didBreak(BlockBreakEvent e) {
-        if (bot(e.getPlayer())) ledger.harvested(point(e.getBlock()));
-        else ledger.changedNear(point(e.getBlock()));
+        ledger.broken(point(e.getBlock()), e.getBlock().getType().name().toLowerCase(Locale.ROOT), bot(e.getPlayer()));
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void piston(BlockPistonExtendEvent e) { for (Block b:e.getBlocks()) ledger.changedNear(point(b)); }

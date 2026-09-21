@@ -45,6 +45,10 @@ public final class GrowthLedger {
         }
     }
     public Set<Point> tree(Point point) { return trees.getOrDefault(point, Set.of(point)); }
+    public void broken(Point point, String material, boolean configuredBot) {
+        if (configuredBot && isGatherable(material.toUpperCase(Locale.ROOT)) && known(point, material)) harvested(point);
+        else changedNear(point);
+    }
     public void harvested(Point point) {
         logs.remove(point);Set<Point> tree=trees.remove(point);
         if(tree!=null && tree.stream().noneMatch(p -> trees.get(p)==tree)) evidence.remove(tree);
