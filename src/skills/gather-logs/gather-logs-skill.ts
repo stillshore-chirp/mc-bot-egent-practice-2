@@ -280,7 +280,12 @@ export class GatherLogsSkill implements Skill<
           observedDistance: player.distance,
         });
         if (player.distance > range)
-          await this.minecraft.moveTo(player.position, range, signal);
+          // ブロック単位の到着判定による端数を見込み、実座標の許容範囲内を目指す。
+          await this.minecraft.moveTo(
+            player.position,
+            Math.max(0, range - 1),
+            signal,
+          );
         const verified = (await this.minecraft.observe()).players.find(
           (candidate) => candidate.username === username,
         );
