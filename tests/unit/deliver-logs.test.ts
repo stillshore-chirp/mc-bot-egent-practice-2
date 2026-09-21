@@ -100,6 +100,32 @@ describe("gather, return and storage task", () => {
     expect(second.output?.deposited).toBe(1);
     expect(minecraft.chestCounts.get("oak_log")).toBe(2);
   });
+  it("reaches inside the measured boundary despite block-based pathfinder rounding", async () => {
+    class RoundedArrival extends FakeMinecraft {
+      override async moveTo(
+        position: DeliveryInput["home"]["position"],
+        range: number,
+        signal: AbortSignal,
+      ) {
+        await super.moveTo(
+          { ...position, x: position.x + range + 0.6 },
+          range,
+          signal,
+        );
+      }
+    }
+    const { skill } = setup(
+      new RoundedArrival(
+        createSnapshot({ inventory: [{ name: "oak_log", count: 2 }] }),
+      ),
+    );
+    const result = await skill.run(
+      { ...input, gather: false },
+      () => undefined,
+    );
+    expect(result.status).toBe("completed");
+    expect(result.output?.homeDistance).toBeCloseTo(1.6);
+  });
   it("rejects a replaced chest before gathering or moving", async () => {
     const { minecraft, skill, arbiter } = setup();
     minecraft.storageIdentities.clear();

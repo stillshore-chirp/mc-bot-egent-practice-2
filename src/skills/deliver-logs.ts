@@ -115,7 +115,13 @@ export class DeliverLogsSkill {
                 retryable: false,
               });
             await context.advance(phase);
-            await this.minecraft.moveTo(position, range, signal);
+            // 経路探索はブロック単位で停止するため、1ブロック内側を目指す。
+            // 到達確認はBotの実座標で行い、許容範囲を広げない。
+            await this.minecraft.moveTo(
+              position,
+              Math.max(0, range - 1),
+              signal,
+            );
             const after = await checkWorld();
             if (distance(after.position, position) > range)
               throw new AppError({
