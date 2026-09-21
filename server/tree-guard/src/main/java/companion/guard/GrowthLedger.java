@@ -4,6 +4,9 @@ import java.util.*;
 
 /** Main-thread only. Evidence deliberately expires on restart and chunk unload. */
 public final class GrowthLedger {
+    public static boolean isGatherable(String name) {
+        return Set.of("OAK_LOG","SPRUCE_LOG","BIRCH_LOG","JUNGLE_LOG","ACACIA_LOG","DARK_OAK_LOG","MANGROVE_LOG","CHERRY_LOG","PALE_OAK_LOG","CRIMSON_STEM","WARPED_STEM").contains(name);
+    }
     public record Point(UUID world, int x, int y, int z) {
         public boolean near(Point other) {
             return world.equals(other.world) && Math.abs((long)x-other.x)<=1

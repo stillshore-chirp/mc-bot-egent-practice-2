@@ -6,6 +6,15 @@ class GrowthLedgerTest {
     final UUID world=UUID.randomUUID();
     final GrowthLedger.Point root=new GrowthLedger.Point(world,0,64,0);
     final GrowthLedger.Point top=new GrowthLedger.Point(world,0,65,0);
+    @Test void netherStemsAreRecognizedWithoutAllowingPlacedOrStrippedWood() {
+        assertTrue(GrowthLedger.isGatherable("CRIMSON_STEM"));
+        assertTrue(GrowthLedger.isGatherable("WARPED_STEM"));
+        assertFalse(GrowthLedger.isGatherable("STRIPPED_OAK_LOG"));
+        GrowthLedger ledger=new GrowthLedger();
+        assertEquals("unknown",ledger.decision(root,"crimson_stem",false,true));
+        ledger.grew(Map.of(root,"crimson_stem"));
+        assertEquals("allowed",ledger.decision(root,"crimson_stem",false,true));
+    }
     @Test void unknownHistoryAndDifferentWorldAreDenied() {
         GrowthLedger ledger=new GrowthLedger();
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));
