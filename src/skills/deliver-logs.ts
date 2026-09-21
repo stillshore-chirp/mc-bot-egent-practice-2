@@ -110,6 +110,46 @@ export class DeliverLogsSkill {
             await context.advance(phase);
             // 経路探索はブロック単位で停止するため、1ブロック内側を目指す。
             // 到達確認はBotの実座標で行い、許容範囲を広げない。
+            let current = before;
+            // 遠方の未読込地形まで一度に探索せず、読込範囲内の区間を進む。
+            for (
+              let step = 0;
+              distance(current.position, position) > 32;
+              step += 1
+            ) {
+              const remaining = distance(current.position, position);
+              if (
+                remaining > this.maxDistance ||
+                step > Math.ceil(this.maxDistance / 16)
+              )
+                throw new AppError({
+                  category: "validation",
+                  code: "DELIVERY_DISTANCE_EXCEEDED",
+                  message: "帰還経路が距離上限を超えたため移動を停止します。",
+                  retryable: false,
+                });
+              const fraction = 32 / remaining;
+              const waypoint = {
+                x:
+                  current.position.x +
+                  (position.x - current.position.x) * fraction,
+                y:
+                  current.position.y +
+                  (position.y - current.position.y) * fraction,
+                z:
+                  current.position.z +
+                  (position.z - current.position.z) * fraction,
+              };
+              await this.minecraft.moveTo(waypoint, 1, signal);
+              current = await checkWorld();
+              if (distance(current.position, position) >= remaining - 1)
+                throw new AppError({
+                  category: "path",
+                  code: "DELIVERY_RETURN_NOT_VERIFIED",
+                  message: "帰還先へ近づいたことを確認できません。",
+                  retryable: false,
+                });
+            }
             await this.minecraft.moveTo(
               position,
               Math.max(0, range - 1),

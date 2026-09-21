@@ -273,4 +273,35 @@ describe("gather, return and storage task", () => {
         );
     },
   );
+  it("walks a long return in loaded-distance segments", async () => {
+    class LimitedView extends FakeMinecraft {
+      override async moveTo(
+        position: Position,
+        range: number,
+        signal: AbortSignal,
+      ) {
+        if (distance(this.snapshot.position, position) > 33)
+          throw new Error("target outside loaded view");
+        await super.moveTo(position, range, signal);
+      }
+    }
+    const { minecraft, skill } = setup(
+      new LimitedView(
+        createSnapshot({
+          position: { x: 210, y: 64, z: 0 },
+          inventory: [{ name: "oak_log", count: 2 }],
+        }),
+      ),
+      256,
+    );
+    const result = await skill.run(
+      { ...input, gather: false },
+      () => undefined,
+    );
+    expect(result.status).toBe("completed");
+    expect(
+      minecraft.actions.filter((a) => a.startsWith("move:")).length,
+    ).toBeGreaterThan(2);
+    expect(minecraft.chestCounts.get("oak_log")).toBe(2);
+  });
 });
