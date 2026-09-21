@@ -60,18 +60,18 @@ export class GatherLogsSkill implements Skill<
       );
       const signal = AbortSignal.any([context.signal, lease.signal]);
       const itemName = input.resource;
-      const before = await this.minecraft.observe();
-      const startedAt = before.observedAt;
-      this.requireRequester(before, input.requester);
-      const baseline = countInventory(before, itemName);
-      let frontierIndex = 0;
-      const frontier = createSearchFrontier(
-        before.position,
-        this.limits.searchStep,
-        this.limits.maxSearchDistance,
-      );
-
       try {
+        const before = await this.minecraft.observe();
+        const startedAt = before.observedAt;
+        this.requireRequester(before, input.requester);
+        const baseline = countInventory(before, itemName);
+        let frontierIndex = 0;
+        const frontier = createSearchFrontier(
+          before.position,
+          this.limits.searchStep,
+          this.limits.maxSearchDistance,
+        );
+
         await context.advance("precheck", {
           itemName,
           baseline,
@@ -92,6 +92,7 @@ export class GatherLogsSkill implements Skill<
             [itemName],
             this.limits.localSearchDistance,
             Math.min(input.count - acquired, 8),
+            signal,
           );
           if (targets.length === 0) {
             const searchPoint = frontier[frontierIndex];
@@ -100,7 +101,7 @@ export class GatherLogsSkill implements Skill<
                 category: "resource",
                 code: "RESOURCE_NOT_FOUND",
                 message:
-                  "No requested logs were observed within the configured search area",
+                  "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
                 retryable: false,
                 failedAt: "locate_resource",
                 confirmedState: {
@@ -280,7 +281,12 @@ export class GatherLogsSkill implements Skill<
           observedDistance: player.distance,
         });
         if (player.distance > range)
-          await this.minecraft.moveTo(player.position, range, signal);
+          // ブロック単位の到着判定による端数を見込み、実座標の許容範囲内を目指す。
+          await this.minecraft.moveTo(
+            player.position,
+            Math.max(0, range - 1),
+            signal,
+          );
         const verified = (await this.minecraft.observe()).players.find(
           (candidate) => candidate.username === username,
         );

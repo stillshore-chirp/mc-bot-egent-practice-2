@@ -33,6 +33,7 @@ export interface MinecraftPort {
     names: readonly string[],
     maxDistance: number,
     count: number,
+    signal: AbortSignal,
   ): Promise<readonly ResourceTarget[]>;
   dig(target: ResourceTarget, signal: AbortSignal): Promise<void>;
   collectDropsNear(

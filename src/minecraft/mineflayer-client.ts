@@ -22,6 +22,12 @@ import type {
   ResourceTarget,
 } from "./port.js";
 
+import {
+  queryTreeProtection,
+  requireTreePermission,
+  treeProtectionChannel,
+} from "./tree-protection.js";
+
 const hostileNames = new Set([
   "blaze",
   "cave_spider",
@@ -192,6 +198,10 @@ export class MineflayerClient implements MinecraftPort {
       const onSpawn = (): void => {
         cleanup();
         this.spawned = true;
+        bot._client.write("custom_payload", {
+          channel: "minecraft:register",
+          data: Buffer.from(treeProtectionChannel),
+        });
         const movements = new Movements(bot);
         movements.canDig = false;
         movements.allow1by1towers = false;
@@ -524,7 +534,9 @@ export class MineflayerClient implements MinecraftPort {
     names: readonly string[],
     maxDistance: number,
     count: number,
+    signal: AbortSignal,
   ): Promise<readonly ResourceTarget[]> {
+    throwIfAborted(signal, "find_resources");
     const bot = this.requireBot();
     const ids = names
       .map((name) => bot.registry.blocksByName[name]?.id)
@@ -538,17 +550,35 @@ export class MineflayerClient implements MinecraftPort {
         retryable: false,
       });
     }
-    return bot
-      .findBlocks({ matching: ids, maxDistance, count })
-      .map((position) => bot.blockAt(position))
-      .filter(
-        (block): block is NonNullable<typeof block> =>
-          block !== null && names.includes(block.name),
-      )
-      .map((block) => ({
-        name: block.name,
-        position: positionOf(block.position),
-      }));
+    const seen = new Set<string>();
+    const allowed: ResourceTarget[] = [];
+    while (allowed.length < count) {
+      throwIfAborted(signal, "find_resources");
+      const positions = bot.findBlocks({
+        matching: ids,
+        maxDistance,
+        count: 64,
+        useExtraInfo: (block) => !seen.has(block.position.toString()),
+      });
+      if (positions.length === 0) break;
+      for (const position of positions) {
+        seen.add(position.toString());
+        throwIfAborted(signal, "find_resources");
+        const block = bot.blockAt(position);
+        if (block === null || !names.includes(block.name)) continue;
+        const candidate = {
+          name: block.name,
+          position: positionOf(block.position),
+        };
+        if (
+          (await queryTreeProtection(bot._client, candidate, signal)) ===
+          "allowed"
+        )
+          allowed.push(candidate);
+        if (allowed.length >= count) break;
+      }
+    }
+    return allowed;
   }
 
   public async dig(target: ResourceTarget, signal: AbortSignal): Promise<void> {
@@ -591,6 +621,22 @@ export class MineflayerClient implements MinecraftPort {
     }
     const bestTool = bot.pathfinder.bestHarvestTool(block);
     if (bestTool !== null) await bot.equip(bestTool, "hand");
+    requireTreePermission(
+      await queryTreeProtection(bot._client, target, signal),
+    );
+    throwIfAborted(signal, "dig");
+    if (
+      this.requireBot() !== bot ||
+      bot.blockAt(block.position)?.stateId !== block.stateId
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target changed during protection verification",
+        retryable: false,
+        failedAt: "dig",
+      });
+    }
     const abort = (): void => bot.stopDigging();
     signal.addEventListener("abort", abort, { once: true });
     try {

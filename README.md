@@ -39,7 +39,7 @@ AI コンパニオンが、Minecraft で観測した状況と利用者との継�
 
 ## 非目標
 
-旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、Paper plugin、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
+旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、汎用Paper plugin基盤、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
 
 ## 観測ダッシュボード
 
@@ -82,6 +82,8 @@ oak_logを4個集めて、ここへ戻ってきて。
 ```
 
 `停止`、`停止して`、`止まって`、`止めて`、`ストップ`、`やめて`、`中止`、`中断`はLLM待ちを経ず、ownerの完全一致chatとして即時処理します。
+
+原木収集には [建築保護の専用補助](docs/building-protection.md#専用補助のビルドと設定) が必須です。Java 21 と Maven でビルドした JAR を Paper サーバーの `plugins` へ配置し、生成設定の `bot-names` に対象 Bot を登録して起動してください。Bot は探索時と採掘直前に補助へ照会し、応答がない場合や履歴が不明な場合は採取を拒否します。補助の稼働中に苗木から成長した木を対象にします。既存の稼働環境への JAR 配置・設定反映・再起動は別の適用作業です。
 
 ## 設定
 

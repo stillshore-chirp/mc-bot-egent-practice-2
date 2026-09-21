@@ -1,0 +1,4 @@
+# 実アカウント名はサーバー側だけに設定する。空の場合は全照会を拒否する。
+bot-names: []
+# 保護領域。worldはworld名、min/maxは包含端点。実座標をgitへ入れない。
+protected-regions: []

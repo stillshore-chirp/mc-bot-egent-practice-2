@@ -1,7 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
-node_modules/
+node_modules
 dist/
 coverage/
 test-results/
@@ -14,3 +14,5 @@ logs/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+server/tree-guard/target/

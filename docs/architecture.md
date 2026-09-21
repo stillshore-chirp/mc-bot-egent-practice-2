@@ -97,3 +97,7 @@ LLM を呼ぶ契機は、新しい利用者発話、tool内の作業完了、起
 失敗は connection、observation、path、resource、inventory、authorization / permission、timeout、cancelled、LLM、persistence、safety、validation、internal に分類します。AsyncLocalStorageで保持する各主作業の相関 IDを構造化ログとtask recordへ渡し、利用者依頼、tool、skill、Minecraft操作、verificationを安全に追跡します。
 
 graceful shutdown 時には、進行中taskをsuspendedへ遷移してcheckpointとmemoryを保存します。再起動時、完了を観測できないtaskは成功へ遷移させず、未完了の約束とともにread-onlyのdeliberationで再評価します。自動再開はせず、ownerの新しい指示を待ちます。切断時は設定回数・間隔で再接続し、上限後はconnection managerを`failed`へ遷移して安全な構造化ログとlive evidenceへ残します。復旧できた場合は、接続後の実snapshotを再評価してMinecraft chatへ報告します。
+
+## 原木の建築保護の拡張境界
+
+[建築保護の設計契約](building-protection.md)では、単一TypeScriptアプリの探索・採取を保持し、採取可否の根拠と破壊時の再確認だけをPaper側の専用補助へ分離する。未実装・未検証の段階で保証済みと扱わない。
