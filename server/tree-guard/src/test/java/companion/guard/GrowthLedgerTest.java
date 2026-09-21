@@ -15,6 +15,16 @@ class GrowthLedgerTest {
         ledger.grew(Map.of(root,"crimson_stem"));
         assertEquals("allowed",ledger.decision(root,"crimson_stem",false,true));
     }
+    @Test void onlyGrowthRecordedMangroveRootsSupportTheTree() {
+        GrowthLedger ledger=new GrowthLedger();
+        assertFalse(ledger.known(root,"mangrove_roots"));
+        ledger.grew(Map.of(root,"mangrove_roots",top,"mangrove_log"));
+        assertTrue(ledger.known(root,"mangrove_roots"));
+        assertFalse(GrowthLedger.isGatherable("MANGROVE_ROOTS"));
+        ledger.changedNear(root);
+        assertFalse(ledger.known(root,"mangrove_roots"));
+        assertEquals("unknown",ledger.decision(top,"mangrove_log",false,true));
+    }
     @Test void unknownHistoryAndDifferentWorldAreDenied() {
         GrowthLedger ledger=new GrowthLedger();
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));
