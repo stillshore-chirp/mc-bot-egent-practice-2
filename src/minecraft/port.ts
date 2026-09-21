@@ -21,6 +21,11 @@ export interface MinecraftPort {
     radius: number,
     includeEntities: boolean,
   ): Promise<SurroundingsObservation>;
+  storageIdentity(
+    position: Position | null,
+    register: boolean,
+    signal: AbortSignal,
+  ): Promise<{ worldId: string; identity: string | null }>;
   say(message: string): Promise<void>;
   moveTo(position: Position, range: number, signal: AbortSignal): Promise<void>;
   followPlayer(

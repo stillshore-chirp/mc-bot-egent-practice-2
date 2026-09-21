@@ -1,3 +1,4 @@
+import { DeliveryController } from "./delivery-controller.js";
 import type { Logger } from "pino";
 
 import {
@@ -45,6 +46,7 @@ interface CompanionGameControllerInput {
 const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
 
 export class CompanionGameController implements GameController {
+  public readonly delivery: DeliveryController;
   readonly #minecraft: MinecraftPort;
   readonly #tasks: TaskRuntime;
   readonly #arbiter: ActionArbiter;
@@ -59,6 +61,12 @@ export class CompanionGameController implements GameController {
   readonly #memory: MemoryStore;
 
   public constructor(input: CompanionGameControllerInput) {
+    this.delivery = new DeliveryController(
+      input.minecraft,
+      input.memory,
+      input.ownerUsername,
+      input.arbiter,
+    );
     this.#minecraft = input.minecraft;
     this.#tasks = input.tasks;
     this.#arbiter = input.arbiter;

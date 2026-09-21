@@ -28,6 +28,8 @@ import {
   treeProtectionChannel,
 } from "./tree-protection.js";
 
+import { queryStorageIdentity, storageChannel } from "./storage-identity.js";
+
 const hostileNames = new Set([
   "blaze",
   "cave_spider",
@@ -200,7 +202,7 @@ export class MineflayerClient implements MinecraftPort {
         this.spawned = true;
         bot._client.write("custom_payload", {
           channel: "minecraft:register",
-          data: Buffer.from(treeProtectionChannel),
+          data: Buffer.from(`${treeProtectionChannel}\0${storageChannel}`),
         });
         const movements = new Movements(bot);
         movements.canDig = false;
@@ -528,6 +530,27 @@ export class MineflayerClient implements MinecraftPort {
     } finally {
       await this.stopCurrentAction();
     }
+  }
+
+  public async storageIdentity(
+    position: Position | null,
+    register: boolean,
+    signal: AbortSignal,
+  ) {
+    const bot = this.requireBot();
+    if (
+      position !== null &&
+      register &&
+      distance(positionOf(bot.entity.position), position) > 5
+    ) {
+      throw new AppError({
+        category: "validation",
+        code: "CHEST_REGISTRATION_OUT_OF_REACH",
+        message: "指定チェストへ近づいてから登録してください。",
+        retryable: false,
+      });
+    }
+    return queryStorageIdentity(bot._client, position, register, signal);
   }
 
   public async findResources(

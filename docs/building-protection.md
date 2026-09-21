@@ -33,3 +33,5 @@ Paperの [StructureGrowEvent](https://jd.papermc.io/paper/1.21.11/org/bukkit/eve
 Java 21とMavenで `mvn -f server/tree-guard/pom.xml verify` を実行する。生成されたJARは、許可を得たPaperサーバーのpluginsへ配置する。生成設定の `bot-names` に対象Botだけを登録し、必要な保護領域は `protected-regions` のworld・min・maxへ指定する。初期値の空リストでは照会を許可しない。値やJAR、実worldをgitへ保存しない。
 
 履歴はchunkのunloadでも全失効する。履歴上限を超えた場合も全失効し、上限を根拠のない許可で回避しない。採取許可に必要な周辺観測は、同じ成長で生まれた木全体とその1ブロック周辺を対象とする。土壌の支持層、空気、葉、草、蔓、履歴内の原木を許容し、他のブロックや保護領域との接触は除外する。自然の石や他の木との接触も拒否し得る保守的な条件である。
+
+Issue #13 の[登録先確認](delivery-storage.md)では、同じ補助へチェスト個体の確認を追加する。収納操作と物品移動はBot側に残し、補助は明示登録時の識別metadata以外のworld変更を行わない。

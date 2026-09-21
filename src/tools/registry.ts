@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { deliveryRegistrationTools } from "./delivery-tools.js";
 
 import {
   actionReportResult,
@@ -37,6 +38,7 @@ function defineTool<Name extends string, Input extends z.ZodType, Output>(
 }
 
 export const toolDefinitions = [
+  ...deliveryRegistrationTools,
   defineTool({
     name: "observe_status",
     description:

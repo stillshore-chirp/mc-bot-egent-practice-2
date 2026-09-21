@@ -76,7 +76,7 @@ describe("MemoryStore", () => {
       state: {},
     });
     expect(journalMode).toBe("wal");
-    expect(migration).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(migration).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
   });
 
   it("forward migrates an existing v1 database without losing its structured records", () => {
@@ -107,7 +107,11 @@ describe("MemoryStore", () => {
       .all();
     inspected.close();
 
-    expect(migrations).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(migrations).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+    ]);
     expect(
       migrated.recall({
         playerId: player.id,

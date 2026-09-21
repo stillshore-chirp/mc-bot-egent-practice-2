@@ -52,6 +52,22 @@ export class FakeMinecraft implements MinecraftPort {
     this.snapshot = snapshot;
   }
 
+  public storageIdentities = new Map<string, string>();
+  public async storageIdentity(
+    position: Position | null,
+    _register: boolean,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    return {
+      worldId: "00000000-0000-4000-8000-000000000001",
+      identity:
+        position === null
+          ? null
+          : (this.storageIdentities.get(JSON.stringify(position)) ?? null),
+    };
+  }
+
   public async connect(): Promise<void> {
     this.actions.push("connect");
   }

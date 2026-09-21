@@ -46,6 +46,8 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
+        getServer().getMessenger().registerIncomingPluginChannel(this,StorageIdentity.CHANNEL,new StorageIdentity(this,this::bot));
+        getServer().getMessenger().registerOutgoingPluginChannel(this,StorageIdentity.CHANNEL);
     }
     @Override public void onDisable() { ledger.clear(); }
     private boolean bot(Player p) { return botNames.contains(p.getName().toLowerCase(Locale.ROOT)); }
