@@ -41,6 +41,50 @@ describe("gather logs skill", () => {
     expect(minecraft.actions.at(-1)).toBe("move:0,64,0");
   });
 
+  it("returns within the measured distance despite block coordinate rounding", async () => {
+    class RoundedArrival extends FakeMinecraft {
+      override async moveTo(
+        position: ResourceTarget["position"],
+        range: number,
+        signal: AbortSignal,
+      ) {
+        await super.moveTo(
+          { ...position, x: position.x + range + 0.6 },
+          range,
+          signal,
+        );
+      }
+    }
+    const minecraft = new RoundedArrival();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 8, y: 64, z: 0 },
+    });
+    const skill = new GatherLogsSkill(
+      minecraft,
+      new TaskRuntime(new InMemoryTaskStore(), () =>
+        minecraft.stopCurrentAction(),
+      ),
+      new ActionArbiter(),
+      {
+        maxCount: 64,
+        localSearchDistance: 32,
+        maxSearchDistance: 64,
+        searchStep: 16,
+        moveRange: 3,
+        returnRange: 3,
+        maxPathAttempts: 1,
+      },
+    );
+    const result = await skill.run({
+      resource: "oak_log",
+      count: 1,
+      requester: "owner",
+    });
+    expect(result.status).toBe("completed");
+    expect(result.output?.playerDistance).toBeCloseTo(2.6);
+  });
+
   it("fails instead of reporting success when no resource exists in the bounded search", async () => {
     const minecraft = new FakeMinecraft();
     const runtime = new TaskRuntime(new InMemoryTaskStore(), () =>

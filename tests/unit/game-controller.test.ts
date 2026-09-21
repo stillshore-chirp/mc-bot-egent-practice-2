@@ -108,6 +108,32 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("reports acquired and held counts when gathering is stopped after pickup", async () => {
+    const signal = new AbortController();
+    class StopAfterPickup extends FakeMinecraft {
+      override async collectDropsNear(
+        ...args: Parameters<FakeMinecraft["collectDropsNear"]>
+      ) {
+        await super.collectDropsNear(...args);
+        signal.abort(new Error("fixture stop"));
+      }
+    }
+    const minecraft = new StopAfterPickup();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 5, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    const report = await game.gatherResource("oak_log", 2, signal.signal);
+    expect(report.outcome).toBe("cancelled");
+    expect(report.confirmedState).toMatchObject({
+      collectedCount: 1,
+      heldCount: 1,
+    });
+    expect(report.summary).toContain("今回の取得は1個");
+    close();
+  });
+
   it("splits long Unicode responses within the Minecraft chat limit", async () => {
     const minecraft = new FakeMinecraft();
     const { game, close } = createController(minecraft);
