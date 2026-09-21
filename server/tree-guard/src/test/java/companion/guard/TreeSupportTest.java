@@ -18,6 +18,13 @@ class TreeSupportTest {
             assertFalse(TreeSupport.naturalSupport("OAK_LOG",soil,1),soil);
         }
     }
+    @Test void unrecordedMuddyRootsAreOnlyAllowedAsTrunkSubstrates() {
+        for(String root:new String[]{"MANGROVE_ROOTS","MUDDY_MANGROVE_ROOTS"})
+            for(int dy:new int[]{-1,0,1})
+                assertFalse(TreeSupport.naturalSupport(root,"MUDDY_MANGROVE_ROOTS",dy));
+        assertTrue(TreeSupport.naturalSupport("MANGROVE_LOG","MUDDY_MANGROVE_ROOTS",-1));
+        assertFalse(TreeSupport.naturalSupport("MOSS_CARPET","MUDDY_MANGROVE_ROOTS",-1));
+    }
     @Test void trunkSupportsRemainRestrictedToTheLayerBelow() {
         assertTrue(TreeSupport.naturalSupport("MANGROVE_LOG","WATER",0));
         assertFalse(TreeSupport.naturalSupport("OAK_LOG","WATER",0));
