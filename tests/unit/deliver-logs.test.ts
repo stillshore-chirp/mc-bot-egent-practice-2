@@ -304,4 +304,42 @@ describe("gather, return and storage task", () => {
     ).toBeGreaterThan(2);
     expect(minecraft.chestCounts.get("oak_log")).toBe(2);
   });
+  it("rejects a same-dimension world switch during movement preflight before issuing movement", async () => {
+    class WorldSwitch extends FakeMinecraft {
+      observations = 0;
+      currentWorld = worldId;
+      override async observe() {
+        this.observations += 1;
+        if (this.observations === 3) {
+          this.currentWorld = "00000000-0000-4000-8000-000000000002";
+          this.snapshot = {
+            ...this.snapshot,
+            position: { x: 20, y: 64, z: 0 },
+          };
+        }
+        return super.observe();
+      }
+      override async storageIdentity(
+        position: Position | null,
+        register: boolean,
+        signal: AbortSignal,
+      ) {
+        return {
+          ...(await super.storageIdentity(position, register, signal)),
+          worldId: this.currentWorld,
+        };
+      }
+    }
+    const { minecraft, skill } = setup(
+      new WorldSwitch(
+        createSnapshot({ inventory: [{ name: "oak_log", count: 2 }] }),
+      ),
+    );
+    const result = await skill.run(
+      { ...input, gather: false },
+      () => undefined,
+    );
+    expect(result.failure?.code).toBe("DELIVERY_WORLD_CHANGED");
+    expect(minecraft.actions.some((a) => a.startsWith("move:"))).toBe(false);
+  });
 });

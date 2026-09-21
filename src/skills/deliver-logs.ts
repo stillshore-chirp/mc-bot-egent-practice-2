@@ -49,12 +49,19 @@ export class DeliverLogsSkill {
         try {
           const checkWorld = async () => {
             throwIfAborted(signal, "delivery_precheck");
+            const state = await this.minecraft.observe();
             const proof = await this.minecraft.storageIdentity(
               null,
               false,
               signal,
             );
-            const state = await this.minecraft.observe();
+            if (proof.position === undefined)
+              throw new AppError({
+                category: "observation",
+                code: "DELIVERY_WORLD_UNVERIFIED",
+                message: "worldと位置の対応をサーバーで確認できません。",
+                retryable: false,
+              });
             if (
               proof.worldId !== input.home.worldId ||
               proof.worldId !== input.chest.worldId ||
@@ -67,7 +74,7 @@ export class DeliverLogsSkill {
                 message: "登録したworldにいないため移動・収納しません。",
                 retryable: false,
               });
-            return state;
+            return { ...state, position: proof.position };
           };
           const checkChest = async (allowUnavailable = false) => {
             const proof = await this.minecraft.storageIdentity(
