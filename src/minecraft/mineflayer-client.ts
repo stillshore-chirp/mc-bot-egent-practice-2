@@ -534,7 +534,9 @@ export class MineflayerClient implements MinecraftPort {
     names: readonly string[],
     maxDistance: number,
     count: number,
+    signal: AbortSignal,
   ): Promise<readonly ResourceTarget[]> {
+    throwIfAborted(signal, "find_resources");
     const bot = this.requireBot();
     const ids = names
       .map((name) => bot.registry.blocksByName[name]?.id)
@@ -548,22 +550,33 @@ export class MineflayerClient implements MinecraftPort {
         retryable: false,
       });
     }
-    const candidates = bot
-      .findBlocks({ matching: ids, maxDistance, count: Math.max(count, 64) })
-      .map((position) => bot.blockAt(position))
-      .filter(
-        (block): block is NonNullable<typeof block> =>
-          block !== null && names.includes(block.name),
-      )
-      .map((block) => ({
-        name: block.name,
-        position: positionOf(block.position),
-      }));
+    const seen = new Set<string>();
     const allowed: ResourceTarget[] = [];
-    for (const candidate of candidates) {
-      if ((await queryTreeProtection(bot._client, candidate)) === "allowed")
-        allowed.push(candidate);
-      if (allowed.length >= count) break;
+    while (allowed.length < count) {
+      throwIfAborted(signal, "find_resources");
+      const positions = bot.findBlocks({
+        matching: ids,
+        maxDistance,
+        count: 64,
+        useExtraInfo: (block) => !seen.has(block.position.toString()),
+      });
+      if (positions.length === 0) break;
+      for (const position of positions) {
+        seen.add(position.toString());
+        throwIfAborted(signal, "find_resources");
+        const block = bot.blockAt(position);
+        if (block === null || !names.includes(block.name)) continue;
+        const candidate = {
+          name: block.name,
+          position: positionOf(block.position),
+        };
+        if (
+          (await queryTreeProtection(bot._client, candidate, signal)) ===
+          "allowed"
+        )
+          allowed.push(candidate);
+        if (allowed.length >= count) break;
+      }
     }
     return allowed;
   }

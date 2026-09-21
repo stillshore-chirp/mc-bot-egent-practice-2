@@ -151,3 +151,68 @@ describe("Mineflayer mining boundary", () => {
     expect(bot.dig).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("protected resource candidate paging", () => {
+  it("finds an allowed tree after more than 64 denied logs and stops requests on abort", async () => {
+    const { MineflayerClient } =
+      await import("../../src/minecraft/mineflayer-client.js");
+    const { Vec3 } = await import("vec3");
+    const blocks = Array.from({ length: 70 }, (_, x) => ({
+      name: "oak_log",
+      position: new Vec3(x, 64, 0),
+    }));
+    const events = new EventEmitter();
+    const abort = new AbortController();
+    let requests = 0;
+    const write = vi.fn((_name: string, packet: { data: Buffer }) => {
+      const [id, x] = packet.data.toString().split("|");
+      requests++;
+      queueMicrotask(() =>
+        events.emit("custom_payload", {
+          channel: treeProtectionChannel,
+          data: Buffer.from(
+            `${id}|${Number(x) === 69 ? "allowed" : "protected"}`,
+          ),
+        }),
+      );
+    });
+    const findBlocks = vi.fn(
+      (options: {
+        count: number;
+        useExtraInfo: (block: (typeof blocks)[number]) => boolean;
+      }) =>
+        blocks
+          .filter(options.useExtraInfo)
+          .slice(0, options.count)
+          .map((b) => b.position),
+    );
+    const adapter = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    Object.assign(adapter, {
+      spawned: true,
+      botInstance: {
+        registry: { blocksByName: { oak_log: { id: 1 } } },
+        _client: Object.assign(events, { write }),
+        findBlocks,
+        blockAt: (position: { x: number }) => blocks[position.x],
+      },
+    });
+    expect(
+      await adapter.findResources(["oak_log"], 80, 1, abort.signal),
+    ).toEqual([{ name: "oak_log", position: { x: 69, y: 64, z: 0 } }]);
+    expect(findBlocks).toHaveBeenCalledTimes(2);
+    expect(requests).toBe(70);
+    abort.abort();
+    await expect(
+      adapter.findResources(["oak_log"], 80, 1, abort.signal),
+    ).rejects.toThrow();
+    expect(requests).toBe(70);
+  });
+});
