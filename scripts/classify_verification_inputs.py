@@ -75,6 +75,7 @@ PRODUCT_PATTERNS = (
     "docs/dashboard.md",
     "docs/dashboard/**",
     "docs/memory.md",
+    "docs/minecraft-26-1.md",
     "docs/operations.md",
     "docs/testing.md",
     "package.json",
