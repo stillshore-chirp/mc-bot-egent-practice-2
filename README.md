@@ -53,6 +53,8 @@ AIコンパニオンの依頼から応答までに発生した、型付きトレ
 - npm と、ローカルへ書込み可能な SQLite の保存先。
 - 実 E2E 時のみ、Mineflayer が直接対応する Minecraft Java Edition サーバー、許可された bot 接続情報、指定利用者、実 OpenAI API の利用資格とネットワーク到達性。
 
+Mac 版 Minecraft 26.1 クライアントを使う場合は、[26.1 接続・日本語会話の検証手順](docs/minecraft-26-1.md)を参照してください。`MINECRAFT_VERSION` は Bot 側が接続するサーバー版であり、クライアント版を指定する欄ではありません。
+
 Minecraft の接続先、player 名、API key、token、world seed、私的座標、会話、実記憶データを repository、Issue、PR、log 要約へ保存しません。
 
 ## 最短のローカル起動手順
@@ -122,6 +124,7 @@ npm run test:e2e:dashboard
 - [アーキテクチャ](docs/architecture.md)
 - [人格と記憶](docs/memory.md)
 - [テストと実環境 E2E](docs/testing.md)
+- [Minecraft 26.1 接続・日本語会話の検証](docs/minecraft-26-1.md)
 - [運用](docs/operations.md)
 - [観測ダッシュボード索引](docs/dashboard.md)
 - [エージェント作業契約](AGENTS.md)

@@ -11,7 +11,7 @@
 2026-08-25時点の一次情報とpackage metadataを確認し、次を固定しています。
 
 - Node.jsは24 LTSを推奨し、依存packageが対応する22 / 24をCI matrixにする。[Node.js Releases](https://nodejs.org/en/about/previous-releases)
-- Mineflayer 4.37.1はMinecraft 1.21.11対応をreleaseで明記しているため、既定versionを1.21.11にする。未releaseのMinecraft対応や互換proxyを前提にしない。[PrismarineJS/mineflayer 4.37.1](https://github.com/PrismarineJS/mineflayer/releases/tag/4.37.1)
+- 本リポジトリで固定するMineflayer 4.37.1はMinecraft 1.21.11対応をreleaseで明記しているため、既定のBot接続先を1.21.11にする。[PrismarineJS/mineflayer 4.37.1](https://github.com/PrismarineJS/mineflayer/releases/tag/4.37.1) 26.1クライアントを使う検証では、[サーバー側の互換構成](minecraft-26-1.md)を別に指定する。Botの`MINECRAFT_VERSION`をクライアント版に合わせて変更しない。
 - LLMは公式`openai` TypeScript SDKのResponses APIとstrict function callingを使い、既定modelは公式model catalogに掲載された`gpt-5.6-luna`とする。[OpenAI Responses API](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create)、[gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
 - 永続化は埋め込み型SQLiteとFTS5を使う。初期版でnetwork database、vector database、provider抽象化を追加しない。
 

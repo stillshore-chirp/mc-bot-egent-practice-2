@@ -51,6 +51,8 @@ Integration test は実装された依存境界の契約を確認します。Min
 
 ## 実環境 E2E
 
+Minecraft 26.1系のMacクライアントと本Botを同一サーバーへ接続する検証は、[専用手順](minecraft-26-1.md)を使います。この手順は接続・日本語会話・即時停止・切断の受け入れに絞り、以下の12項目runnerの全件成功とは区別します。
+
 `npm run test:e2e` は実 Minecraft Java Edition server と実 OpenAI API を対象にします。次の preflight が一つでも欠ける場合、Minecraft 接続や API 呼出しを開始せず、設定エラーとして失敗させます。
 
 このcommandは対話式です。安全なtest world、botの接続、block破壊、危険・空腹の再現、process再起動、切断試験まで許可されたrunでだけ、`.env.local`の`LIVE_E2E_CONFIRMED`を`true`にします。既定値`false`では製品runtime moduleの読込み、外部接続、API呼出しより前に停止し、非対話CIでも実行しません。各項目はoperatorが実worldの画面と観測状態を確認して`pass`、`fail`、`skip`を記録し、全項目`pass`の場合だけ終了code 0になります。
