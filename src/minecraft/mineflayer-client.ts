@@ -286,7 +286,8 @@ export class MineflayerClient implements MinecraftPort {
       .filter(
         (player) =>
           player.username !== bot.username &&
-          (player as { readonly entity?: unknown }).entity !== undefined,
+          (player as { readonly entity?: unknown }).entity !== undefined &&
+          (player as { readonly entity?: unknown }).entity !== null,
       )
       .map((player) => ({
         username: player.username,
