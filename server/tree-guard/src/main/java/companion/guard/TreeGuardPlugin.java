@@ -52,6 +52,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     private GrowthLedger.Point point(Block b) { return new GrowthLedger.Point(b.getWorld().getUID(), b.getX(),b.getY(),b.getZ()); }
     private static boolean log(Material material) { return GrowthLedger.isGatherable(material.name()); }
     private static boolean root(Material material) { return material==Material.MANGROVE_ROOTS || material==Material.MUDDY_MANGROVE_ROOTS; }
+    private static boolean growthDecoration(Material material) { return material==Material.MOSS_CARPET || material==Material.MANGROVE_PROPAGULE; }
     private String name(Block b) { return b.getType().name().toLowerCase(Locale.ROOT); }
     private boolean protectedArea(Block b) { return protectedRegions.stream().anyMatch(r -> r.contains(b)); }
     private boolean safeSurroundings(Block b) {
@@ -63,10 +64,8 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             if (protectedArea(neighbor)) return false;
             Material type=neighbor.getType();
             if (type.isAir() || Tag.LEAVES.isTagged(type) || type==Material.VINE || type==Material.SHORT_GRASS || type==Material.TALL_GRASS || type==Material.NETHER_WART_BLOCK || type==Material.WARPED_WART_BLOCK || type==Material.SHROOMLIGHT || type.name().startsWith("WEEPING_VINES") || type.name().startsWith("TWISTING_VINES")) continue;
-            if ((log(type) || root(type)) && ledger.known(point(neighbor),name(neighbor))) continue;
-            if (b.getType()==Material.MANGROVE_LOG && type==Material.WATER) continue;
-            // Soil in the layer under the log supports the tree; side-level building blocks fail closed.
-            if (dy==-1 && (type==Material.DIRT || type==Material.GRASS_BLOCK || type==Material.PODZOL || type==Material.ROOTED_DIRT || type==Material.MUD || type==Material.CRIMSON_NYLIUM || type==Material.WARPED_NYLIUM)) continue;
+            if ((log(type) || root(type) || growthDecoration(type)) && ledger.known(point(neighbor),name(neighbor))) continue;
+            if (TreeSupport.naturalSupport(b.getType().name(),type.name(),dy)) continue;
             return false;
         }
         return true;
@@ -76,15 +75,19 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         for (GrowthLedger.Point p : ledger.tree(point(b))) {
             if (!b.getWorld().isChunkLoaded(p.x()>>4,p.z()>>4)) { safe=false; break; }
             Block member=b.getWorld().getBlockAt(p.x(),p.y(),p.z());
-            if (protectedArea(member) || (log(member.getType()) && !safeSurroundings(member))) { safe=false; break; }
+            if (protectedArea(member) || ((log(member.getType()) || root(member.getType()) || growthDecoration(member.getType())) && !safeSurroundings(member))) { safe=false; break; }
         }
         return ledger.decision(point(b),name(b),protectedArea(b),safe);
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void grow(StructureGrowEvent e) {
         Map<GrowthLedger.Point,String> grown = new HashMap<>();
-        for (BlockState state:e.getBlocks()) if (log(state.getType()) || root(state.getType())) {
+        for (BlockState state:e.getBlocks()) if (log(state.getType()) || root(state.getType()) || growthDecoration(state.getType())) {
             Block previous=state.getBlock();
+            if(growthDecoration(state.getType())) {
+                if(previous.getType().isAir())grown.put(point(previous),state.getType().name().toLowerCase(Locale.ROOT));
+                continue;
+            }
             if(root(state.getType())) {
                 Material old=previous.getType();
                 if(!old.isAir() && old!=Material.WATER && old!=Material.DIRT && old!=Material.MUD && old!=Material.GRASS_BLOCK && old!=Material.ROOTED_DIRT)continue;
