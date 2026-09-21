@@ -1,5 +1,5 @@
 import pino from "pino";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OpenAIDeliberationAgent } from "../../src/agent/openai-agent.js";
 import type { AppConfig } from "../../src/config/schema.js";
@@ -20,6 +20,8 @@ import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
 import { ScriptedOpenAI } from "../support/fake-openai.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
+
+afterEach(() => vi.useRealTimers());
 
 const status = {
   connected: true,
@@ -309,6 +311,10 @@ describe("runtime trace instrumentation", () => {
   });
 
   it("places a deterministic skill and its verification under the active Minecraft action", async () => {
+    // 座標の伏せ字検査が、実行時間や日時の偶然一致で失敗しないよう固定する。
+    // JSON全体を検査する範囲は変えず、timeout用のtimerは実時間のままにする。
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
     const { service, store } = trace();
     const minecraft = new FakeMinecraft();
     const runtime = new TaskRuntime(
