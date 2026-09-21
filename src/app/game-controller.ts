@@ -204,7 +204,7 @@ export class CompanionGameController implements GameController {
         retryable: false,
       });
     }
-    return this.#executeTask(
+    const report = await this.#executeTask(
       signal,
       () =>
         this.#gatherLogs.run({
@@ -225,6 +225,32 @@ export class CompanionGameController implements GameController {
         summary: `${output.itemName}を新たに${String(output.collectedCount)}個収集し、所持数${String(output.heldCount)}個と依頼者への帰還を観測しました。`,
       }),
     );
+    if (
+      report.outcome !== "completed" &&
+      (report.failureCode?.startsWith("TREE_") ||
+        report.failureCode === "RESOURCE_NOT_FOUND")
+    ) {
+      const held =
+        report.after === null
+          ? undefined
+          : (report.after.inventory[resource] ?? 0);
+      const before =
+        report.before === null
+          ? undefined
+          : (report.before.inventory[resource] ?? 0);
+      const acquired =
+        held === undefined || before === undefined
+          ? undefined
+          : Math.max(0, held - before);
+      return {
+        ...report,
+        nextActions: [
+          "建築保護の補助が有効か確認し、その稼働中に建築から離れた苗木を育ててください。",
+        ],
+        summary: `安全に採取できる原木を確認できず、収集を停止しました。${acquired === undefined ? "取得数は未確認です。" : `今回の取得は${String(acquired)}個、現在の所持数は${String(held)}個です。`}履歴不足・建築保護・照会失敗の対象は採取しません。`,
+      };
+    }
+    return report;
   }
 
   public async returnToOwner(

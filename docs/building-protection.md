@@ -27,3 +27,9 @@ Issue #12 の設計契約。原木の種類と形だけでは、人が設置し�
 ## 一次資料
 
 Paperの [StructureGrowEvent](https://jd.papermc.io/paper/1.21.11/org/bukkit/event/world/StructureGrowEvent.html) は苗木等の成長と生成ブロックを提供する。[plugin messaging](https://docs.papermc.io/paper/dev/plugin-messaging/) は既存ゲーム接続でサーバーとclientの補助通信を行う仕組みである。採取許可の条件と失効方式は本プロジェクトの設計であり、Paper自体の保証とは区別する。
+
+## 専用補助のビルドと設定
+
+Java 21とMavenで `mvn -f server/tree-guard/pom.xml verify` を実行する。生成されたJARは、許可を得たPaperサーバーのpluginsへ配置する。生成設定の `bot-names` に対象Botだけを登録し、必要な保護領域は `protected-regions` のworld・min・maxへ指定する。初期値の空リストでは照会を許可しない。値やJAR、実worldをgitへ保存しない。
+
+履歴はchunkのunloadでも全失効する。履歴上限を超えた場合も全失効し、上限を根拠のない許可で回避しない。採取許可に必要な周辺観測は、同じ成長で生まれた木全体とその1ブロック周辺を対象とする。土壌の支持層、空気、葉、草、蔓、履歴内の原木を許容し、他のブロックや保護領域との接触は除外する。自然の石や他の木との接触も拒否し得る保守的な条件である。

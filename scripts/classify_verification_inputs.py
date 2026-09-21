@@ -63,6 +63,8 @@ BROWSER_PATTERNS = (
 
 PRODUCT_PATTERNS = (
     "src/**",
+    "server/tree-guard/**",
+    "docs/building-protection.md",
     "tests/unit/**",
     "tests/integration/**",
     "tests/e2e/**",

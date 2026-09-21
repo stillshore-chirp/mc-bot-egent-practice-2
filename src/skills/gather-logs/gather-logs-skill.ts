@@ -60,18 +60,18 @@ export class GatherLogsSkill implements Skill<
       );
       const signal = AbortSignal.any([context.signal, lease.signal]);
       const itemName = input.resource;
-      const before = await this.minecraft.observe();
-      const startedAt = before.observedAt;
-      this.requireRequester(before, input.requester);
-      const baseline = countInventory(before, itemName);
-      let frontierIndex = 0;
-      const frontier = createSearchFrontier(
-        before.position,
-        this.limits.searchStep,
-        this.limits.maxSearchDistance,
-      );
-
       try {
+        const before = await this.minecraft.observe();
+        const startedAt = before.observedAt;
+        this.requireRequester(before, input.requester);
+        const baseline = countInventory(before, itemName);
+        let frontierIndex = 0;
+        const frontier = createSearchFrontier(
+          before.position,
+          this.limits.searchStep,
+          this.limits.maxSearchDistance,
+        );
+
         await context.advance("precheck", {
           itemName,
           baseline,
@@ -100,7 +100,7 @@ export class GatherLogsSkill implements Skill<
                 category: "resource",
                 code: "RESOURCE_NOT_FOUND",
                 message:
-                  "No requested logs were observed within the configured search area",
+                  "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
                 retryable: false,
                 failedAt: "locate_resource",
                 confirmedState: {

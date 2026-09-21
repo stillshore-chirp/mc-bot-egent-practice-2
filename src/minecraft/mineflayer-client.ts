@@ -22,6 +22,12 @@ import type {
   ResourceTarget,
 } from "./port.js";
 
+import {
+  queryTreeProtection,
+  requireTreePermission,
+  treeProtectionChannel,
+} from "./tree-protection.js";
+
 const hostileNames = new Set([
   "blaze",
   "cave_spider",
@@ -192,6 +198,10 @@ export class MineflayerClient implements MinecraftPort {
       const onSpawn = (): void => {
         cleanup();
         this.spawned = true;
+        bot._client.write("custom_payload", {
+          channel: "minecraft:register",
+          data: Buffer.from(treeProtectionChannel),
+        });
         const movements = new Movements(bot);
         movements.canDig = false;
         movements.allow1by1towers = false;
@@ -538,8 +548,8 @@ export class MineflayerClient implements MinecraftPort {
         retryable: false,
       });
     }
-    return bot
-      .findBlocks({ matching: ids, maxDistance, count })
+    const candidates = bot
+      .findBlocks({ matching: ids, maxDistance, count: Math.max(count, 64) })
       .map((position) => bot.blockAt(position))
       .filter(
         (block): block is NonNullable<typeof block> =>
@@ -549,6 +559,13 @@ export class MineflayerClient implements MinecraftPort {
         name: block.name,
         position: positionOf(block.position),
       }));
+    const allowed: ResourceTarget[] = [];
+    for (const candidate of candidates) {
+      if ((await queryTreeProtection(bot._client, candidate)) === "allowed")
+        allowed.push(candidate);
+      if (allowed.length >= count) break;
+    }
+    return allowed;
   }
 
   public async dig(target: ResourceTarget, signal: AbortSignal): Promise<void> {
@@ -591,6 +608,22 @@ export class MineflayerClient implements MinecraftPort {
     }
     const bestTool = bot.pathfinder.bestHarvestTool(block);
     if (bestTool !== null) await bot.equip(bestTool, "hand");
+    requireTreePermission(
+      await queryTreeProtection(bot._client, target, signal),
+    );
+    throwIfAborted(signal, "dig");
+    if (
+      this.requireBot() !== bot ||
+      bot.blockAt(block.position)?.stateId !== block.stateId
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target changed during protection verification",
+        retryable: false,
+        failedAt: "dig",
+      });
+    }
     const abort = (): void => bot.stopDigging();
     signal.addEventListener("abort", abort, { once: true });
     try {

@@ -99,3 +99,11 @@ def test_node_22_compatibility_lane_avoids_duplicate_static_checks() -> None:
 
     assert guarded
     assert set(guarded.values()) == {"matrix.node-version == '24.x'"}
+
+
+def test_tree_guard_uses_java_21_and_maven_verification() -> None:
+    steps = load_workflow()["jobs"]["product"]["steps"]
+    helper = next(step for step in steps if step["name"] == "Build and test tree protection helper")
+    assert helper["if"] == "matrix.node-version == '24.x'"
+    assert 'JAVA_HOME="$JAVA_HOME_21_X64"' in helper["run"]
+    assert "server/tree-guard/pom.xml verify" in helper["run"]

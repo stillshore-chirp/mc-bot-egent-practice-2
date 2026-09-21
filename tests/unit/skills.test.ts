@@ -171,3 +171,38 @@ describe("gather logs skill", () => {
     expect(minecraft.digAttempts).toBe(2);
   });
 });
+
+describe("gather protection cleanup", () => {
+  it("releases the action lease when the requester disappears during precheck", async () => {
+    const minecraft = new FakeMinecraft(createSnapshot({ players: [] }));
+    const arbiter = new ActionArbiter();
+    const skill = new GatherLogsSkill(
+      minecraft,
+      new TaskRuntime(new InMemoryTaskStore(), () =>
+        minecraft.stopCurrentAction(),
+      ),
+      arbiter,
+      {
+        maxCount: 64,
+        localSearchDistance: 16,
+        maxSearchDistance: 16,
+        searchStep: 16,
+        moveRange: 3,
+        returnRange: 3,
+        maxPathAttempts: 1,
+      },
+    );
+    const result = await skill.run({
+      resource: "oak_log",
+      count: 1,
+      requester: "owner",
+    });
+    expect(result.status).toBe("failed");
+    const lease = arbiter.acquire("subsequent-request", 50);
+    expect(lease.signal.aborted).toBe(false);
+    lease.release();
+    expect(minecraft.actions.some((action) => action.startsWith("dig:"))).toBe(
+      false,
+    );
+  });
+});
