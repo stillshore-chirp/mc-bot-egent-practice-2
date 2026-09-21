@@ -1,3 +1,4 @@
+import type { ChestTarget } from "../memory/delivery-targets.js";
 import type {
   Position,
   SurroundingsObservation,
@@ -11,6 +12,27 @@ export interface ResourceTarget {
 
 export type EscapeMode = "environment" | "hostile";
 
+export interface StorageObservation {
+  readonly chestCount: number;
+  readonly playerCount: number;
+  readonly revision: number;
+  readonly epoch: string;
+  readonly uncontested: boolean;
+}
+export interface StorageIdentity {
+  readonly worldId: string;
+  readonly identity: string | null;
+  readonly observation?: StorageObservation | null;
+}
+export interface DepositResult {
+  readonly requested: number;
+  readonly deposited: number | null;
+  readonly remaining: number | null;
+  readonly heldCount: number | null;
+  readonly verified: boolean;
+  readonly reason:
+    "completed" | "full" | "cancelled" | "changed" | "unverified" | "failed";
+}
 export interface MinecraftPort {
   connect(signal?: AbortSignal): Promise<void>;
   disconnect(reason?: string): Promise<void>;
@@ -25,7 +47,14 @@ export interface MinecraftPort {
     position: Position | null,
     register: boolean,
     signal: AbortSignal,
-  ): Promise<{ worldId: string; identity: string | null }>;
+    resource?: string,
+  ): Promise<StorageIdentity>;
+  depositLogs(
+    target: ChestTarget,
+    resource: string,
+    count: number,
+    signal: AbortSignal,
+  ): Promise<DepositResult>;
   say(message: string): Promise<void>;
   moveTo(position: Position, range: number, signal: AbortSignal): Promise<void>;
   followPlayer(

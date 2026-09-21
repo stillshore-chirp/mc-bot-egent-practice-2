@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { AppError } from "../domain/errors.js";
 import type { DeliveryTarget } from "../memory/delivery-targets.js";
+import { actionReportResult } from "./contracts.js";
+import { gatherableLogs } from "../skills/gather-logs/resource-catalog.js";
 import type { ToolContext } from "./contracts.js";
 import type { ToolDefinition } from "./definition.js";
 function define<Name extends string, Input extends z.ZodType, Output>(
@@ -34,6 +36,72 @@ const position = z
   })
   .strict();
 export const deliveryRegistrationTools = [
+  define({
+    name: "gather_and_store",
+    description:
+      "建築保護の条件を満たす原木を指定数集め、登録拠点へ帰還して指定チェストに収納する。拠点とチェストの事前登録が必須。利用者が収集と収納を明示依頼したときに使う。",
+    input: z
+      .object({
+        resource: z.enum(gatherableLogs),
+        count: z.number().int().min(1).max(64),
+      })
+      .strict(),
+    action: true,
+    fixtures: {
+      valid: [{ resource: "oak_log", count: 2 }],
+      invalid: [{ resource: "diamond", count: 1 }],
+    },
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount)
+        throw new AppError({
+          category: "validation",
+          code: "INVALID_GATHER_COUNT",
+          message: "設定された数量上限を超えています。",
+          retryable: false,
+        });
+      return actionReportResult(
+        await delivery(context).deliver(
+          input.resource,
+          input.count,
+          true,
+          context.signal,
+        ),
+      );
+    },
+  }),
+  define({
+    name: "store_logs",
+    description:
+      "既に所持する指定種類・指定数の原木を登録拠点へ持ち帰り、指定チェストに収納する。途中収納後の再依頼では現在所持数から残りを指定する。過去の収納数を加算しない。",
+    input: z
+      .object({
+        resource: z.enum(gatherableLogs),
+        count: z.number().int().min(1).max(64),
+      })
+      .strict(),
+    action: true,
+    fixtures: {
+      valid: [{ resource: "oak_log", count: 1 }],
+      invalid: [{ resource: "oak_log", count: 0 }],
+    },
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount)
+        throw new AppError({
+          category: "validation",
+          code: "INVALID_GATHER_COUNT",
+          message: "設定された数量上限を超えています。",
+          retryable: false,
+        });
+      return actionReportResult(
+        await delivery(context).deliver(
+          input.resource,
+          input.count,
+          false,
+          context.signal,
+        ),
+      );
+    },
+  }),
   define({
     name: "register_delivery_target",
     description:

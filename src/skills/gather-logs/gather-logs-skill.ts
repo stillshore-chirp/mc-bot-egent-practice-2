@@ -61,100 +61,12 @@ export class GatherLogsSkill implements Skill<
       const signal = AbortSignal.any([context.signal, lease.signal]);
       const itemName = input.resource;
       try {
-        const before = await this.minecraft.observe();
-        const startedAt = before.observedAt;
-        this.requireRequester(before, input.requester);
-        const baseline = countInventory(before, itemName);
-        let frontierIndex = 0;
-        const frontier = createSearchFrontier(
-          before.position,
-          this.limits.searchStep,
-          this.limits.maxSearchDistance,
+        const { before, startedAt } = await this.collect(
+          input,
+          context,
+          signal,
+          true,
         );
-
-        await context.advance("precheck", {
-          itemName,
-          baseline,
-          requestedCount: input.count,
-        });
-        while (
-          countInventory(await this.minecraft.observe(), itemName) - baseline <
-          input.count
-        ) {
-          const current = await this.minecraft.observe();
-          const acquired = countInventory(current, itemName) - baseline;
-          await context.advance("locate_resource", {
-            acquired,
-            requestedCount: input.count,
-            frontierIndex,
-          });
-          let targets = await this.minecraft.findResources(
-            [itemName],
-            this.limits.localSearchDistance,
-            Math.min(input.count - acquired, 8),
-          );
-          if (targets.length === 0) {
-            const searchPoint = frontier[frontierIndex];
-            if (searchPoint === undefined) {
-              throw new AppError({
-                category: "resource",
-                code: "RESOURCE_NOT_FOUND",
-                message:
-                  "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
-                retryable: false,
-                failedAt: "locate_resource",
-                confirmedState: {
-                  acquired,
-                  maxSearchDistance: this.limits.maxSearchDistance,
-                },
-              });
-            }
-            frontierIndex += 1;
-            await context.advance("explore", { frontierIndex, searchPoint });
-            await this.minecraft.moveTo(
-              searchPoint,
-              this.limits.moveRange,
-              signal,
-            );
-            continue;
-          }
-
-          let resourceChanged = false;
-          for (const target of targets) {
-            const latest = await this.minecraft.observe();
-            if (countInventory(latest, itemName) - baseline >= input.count)
-              break;
-            try {
-              await this.collectTarget(
-                target,
-                itemName,
-                baseline,
-                (phase, checkpoint) => context.advance(phase, checkpoint),
-                (operationName, operation, policy, shouldRetry, retrySignal) =>
-                  context.retry(
-                    operationName,
-                    operation,
-                    policy,
-                    shouldRetry,
-                    retrySignal,
-                  ),
-                signal,
-              );
-            } catch (error) {
-              if (
-                error instanceof AppError &&
-                error.detail.code === "RESOURCE_CHANGED"
-              ) {
-                resourceChanged = true;
-                break;
-              }
-              throw error;
-            }
-          }
-          targets = [];
-          if (resourceChanged) continue;
-        }
-
         await this.returnToRequester(
           input.requester,
           this.limits.returnRange,
@@ -184,6 +96,106 @@ export class GatherLogsSkill implements Skill<
         lease.release();
       }
     });
+  }
+
+  /** Called only inside a task that already owns the action lease. */
+  public async collect(
+    input: GatherLogsInput,
+    context: TaskContext,
+    signal: AbortSignal,
+    requireRequester = false,
+  ) {
+    this.validateInput(input);
+    const itemName = input.resource;
+    const before = await this.minecraft.observe();
+    const startedAt = before.observedAt;
+    if (requireRequester) this.requireRequester(before, input.requester);
+    const baseline = countInventory(before, itemName);
+    let frontierIndex = 0;
+    const frontier = createSearchFrontier(
+      before.position,
+      this.limits.searchStep,
+      this.limits.maxSearchDistance,
+    );
+
+    await context.advance("precheck", {
+      itemName,
+      baseline,
+      requestedCount: input.count,
+    });
+    while (
+      countInventory(await this.minecraft.observe(), itemName) - baseline <
+      input.count
+    ) {
+      const current = await this.minecraft.observe();
+      const acquired = countInventory(current, itemName) - baseline;
+      await context.advance("locate_resource", {
+        acquired,
+        requestedCount: input.count,
+        frontierIndex,
+      });
+      const targets = await this.minecraft.findResources(
+        [itemName],
+        this.limits.localSearchDistance,
+        Math.min(input.count - acquired, 8),
+      );
+      if (targets.length === 0) {
+        const searchPoint = frontier[frontierIndex];
+        if (searchPoint === undefined) {
+          throw new AppError({
+            category: "resource",
+            code: "RESOURCE_NOT_FOUND",
+            message:
+              "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
+            retryable: false,
+            failedAt: "locate_resource",
+            confirmedState: {
+              acquired,
+              maxSearchDistance: this.limits.maxSearchDistance,
+            },
+          });
+        }
+        frontierIndex += 1;
+        await context.advance("explore", { frontierIndex, searchPoint });
+        await this.minecraft.moveTo(searchPoint, this.limits.moveRange, signal);
+        continue;
+      }
+
+      let resourceChanged = false;
+      for (const target of targets) {
+        const latest = await this.minecraft.observe();
+        if (countInventory(latest, itemName) - baseline >= input.count) break;
+        try {
+          await this.collectTarget(
+            target,
+            itemName,
+            baseline,
+            (phase, checkpoint) => context.advance(phase, checkpoint),
+            (operationName, operation, policy, shouldRetry, retrySignal) =>
+              context.retry(
+                operationName,
+                operation,
+                policy,
+                shouldRetry,
+                retrySignal,
+              ),
+            signal,
+          );
+        } catch (error) {
+          if (
+            error instanceof AppError &&
+            error.detail.code === "RESOURCE_CHANGED"
+          ) {
+            resourceChanged = true;
+            break;
+          }
+          throw error;
+        }
+      }
+      if (resourceChanged) continue;
+    }
+
+    return { before, startedAt, baseline };
   }
 
   private async collectTarget(

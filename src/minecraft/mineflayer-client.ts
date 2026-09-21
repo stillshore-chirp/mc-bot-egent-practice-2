@@ -30,6 +30,9 @@ import {
 
 import { queryStorageIdentity, storageChannel } from "./storage-identity.js";
 
+import { depositIntoChest } from "./chest-deposit.js";
+import type { ChestTarget } from "../memory/delivery-targets.js";
+
 const hostileNames = new Set([
   "blaze",
   "cave_spider",
@@ -536,6 +539,7 @@ export class MineflayerClient implements MinecraftPort {
     position: Position | null,
     register: boolean,
     signal: AbortSignal,
+    resource?: string,
   ) {
     const bot = this.requireBot();
     if (
@@ -550,7 +554,36 @@ export class MineflayerClient implements MinecraftPort {
         retryable: false,
       });
     }
-    return queryStorageIdentity(bot._client, position, register, signal);
+    return queryStorageIdentity(
+      bot._client,
+      position,
+      register,
+      signal,
+      resource,
+    );
+  }
+
+  public async depositLogs(
+    target: ChestTarget,
+    resource: string,
+    count: number,
+    signal: AbortSignal,
+  ) {
+    const bot = this.requireBot();
+    return depositIntoChest(
+      bot,
+      target,
+      resource,
+      count,
+      signal,
+      (inspectionSignal) =>
+        this.storageIdentity(
+          target.position,
+          false,
+          inspectionSignal,
+          resource,
+        ),
+    );
   }
 
   public async findResources(
@@ -823,6 +856,7 @@ export class MineflayerClient implements MinecraftPort {
     bot.pathfinder.setGoal(null);
     bot.stopDigging();
     bot.clearControlStates();
+    if (bot.currentWindow) bot.closeWindow(bot.currentWindow);
   }
 
   private requireBot(): Bot {

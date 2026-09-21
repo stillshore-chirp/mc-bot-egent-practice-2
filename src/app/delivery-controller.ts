@@ -1,3 +1,4 @@
+import type { ActionReport } from "../tools/contracts.js";
 import { AppError } from "../domain/errors.js";
 import type { Position } from "../domain/snapshot.js";
 import type { DeliveryTargetKind } from "../memory/delivery-targets.js";
@@ -15,7 +16,28 @@ export class DeliveryController {
     private readonly memory: MemoryStore,
     private readonly owner: string,
     private readonly arbiter: ActionArbiter,
+    private readonly executeDelivery?: (
+      resource: string,
+      count: number,
+      gather: boolean,
+      signal: AbortSignal,
+    ) => Promise<ActionReport>,
   ) {}
+  async deliver(
+    resource: string,
+    count: number,
+    gather: boolean,
+    signal: AbortSignal,
+  ) {
+    if (!this.executeDelivery)
+      throw new AppError({
+        category: "validation",
+        code: "DELIVERY_UNAVAILABLE",
+        message: "収納実行機能を利用できません。",
+        retryable: false,
+      });
+    return this.executeDelivery(resource, count, gather, signal);
+  }
   private playerId() {
     return this.memory.getOrCreatePlayer(this.owner).id;
   }

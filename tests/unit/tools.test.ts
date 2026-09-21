@@ -109,6 +109,8 @@ function context(requesterUsername = "owner"): ToolContext {
 describe("tool schema registry", () => {
   it("has the complete tool set with strict JSON schemas and fixtures", () => {
     expect(toolDefinitions.map(({ name }) => name)).toEqual([
+      "gather_and_store",
+      "store_logs",
       "register_delivery_target",
       "get_delivery_targets",
       "forget_delivery_target",

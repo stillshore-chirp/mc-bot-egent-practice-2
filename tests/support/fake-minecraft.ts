@@ -1,3 +1,5 @@
+import type { ChestTarget } from "../../src/memory/delivery-targets.js";
+import type { DepositResult } from "../../src/minecraft/port.js";
 import type {
   Position,
   SurroundingsObservation,
@@ -65,6 +67,49 @@ export class FakeMinecraft implements MinecraftPort {
         position === null
           ? null
           : (this.storageIdentities.get(JSON.stringify(position)) ?? null),
+    };
+  }
+
+  public chestCounts = new Map<string, number>();
+  public chestCapacity = 64;
+  public async depositLogs(
+    target: ChestTarget,
+    resource: string,
+    count: number,
+    signal: AbortSignal,
+  ): Promise<DepositResult> {
+    signal.throwIfAborted();
+    if (
+      this.storageIdentities.get(JSON.stringify(target.position)) !==
+      target.identity
+    )
+      throw new Error("Chest changed");
+    const held =
+      this.snapshot.inventory.find((item) => item.name === resource)?.count ??
+      0;
+    const stored = this.chestCounts.get(resource) ?? 0;
+    const deposited = Math.min(
+      count,
+      held,
+      Math.max(0, this.chestCapacity - stored),
+    );
+    this.chestCounts.set(resource, stored + deposited);
+    this.snapshot = {
+      ...this.snapshot,
+      inventory: this.snapshot.inventory.map((item) =>
+        item.name === resource
+          ? { ...item, count: item.count - deposited }
+          : item,
+      ),
+    };
+    this.actions.push(`deposit:${resource}:${deposited}`);
+    return {
+      requested: count,
+      deposited,
+      remaining: count - deposited,
+      heldCount: held - deposited,
+      verified: true,
+      reason: deposited === count ? "completed" : "full",
     };
   }
 
