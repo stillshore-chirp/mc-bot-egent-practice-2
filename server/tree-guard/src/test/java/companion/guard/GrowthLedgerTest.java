@@ -33,6 +33,14 @@ class GrowthLedgerTest {
         ledger.changedNear(new GrowthLedger.Point(world,1,64,0));
         assertEquals("unknown",ledger.decision(top,"oak_log",false,true));
     }
+    @Test void invalidationUsesOriginalFootprintAfterPartialHarvestAndLeavesOtherTrees() {
+        GrowthLedger ledger=new GrowthLedger();
+        GrowthLedger.Point high=new GrowthLedger.Point(world,0,68,0),other=new GrowthLedger.Point(world,20,64,0);
+        ledger.grew(Map.of(root,"oak_log",high,"oak_log"));ledger.grew(Map.of(other,"birch_log"));
+        ledger.harvested(root);ledger.changedNear(root);
+        assertEquals("unknown",ledger.decision(high,"oak_log",false,true));
+        assertEquals("allowed",ledger.decision(other,"birch_log",false,true));
+    }
     @Test void HarvestAllowsRemainingTreeButCannotRecountRemovedLog() {
         GrowthLedger ledger=new GrowthLedger();ledger.grew(Map.of(root,"oak_log",top,"oak_log"));ledger.harvested(root);
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));
