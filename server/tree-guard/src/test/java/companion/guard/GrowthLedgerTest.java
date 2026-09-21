@@ -25,6 +25,18 @@ class GrowthLedgerTest {
         assertFalse(ledger.known(root,"mangrove_roots"));
         assertEquals("unknown",ledger.decision(top,"mangrove_log",false,true));
     }
+    @Test void observedRootCoverSharesTheTreeInvalidationBoundary() {
+        GrowthLedger ledger=new GrowthLedger();
+        GrowthLedger.Point cover=new GrowthLedger.Point(world,2,65,0);
+        assertFalse(ledger.known(cover,"moss_carpet"));
+        GrowthLedger.Point propagule=new GrowthLedger.Point(world,0,67,0);
+        ledger.grew(Map.of(root,"mangrove_roots",top,"mangrove_log",cover,"moss_carpet",propagule,"mangrove_propagule"));
+        assertTrue(ledger.known(propagule,"mangrove_propagule"));
+        assertTrue(ledger.known(cover,"moss_carpet"));
+        assertFalse(GrowthLedger.isGatherable("MOSS_CARPET"));
+        ledger.changedNear(new GrowthLedger.Point(world,3,65,0));
+        assertEquals("unknown",ledger.decision(top,"mangrove_log",false,true));
+    }
     @Test void unknownHistoryAndDifferentWorldAreDenied() {
         GrowthLedger ledger=new GrowthLedger();
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));
