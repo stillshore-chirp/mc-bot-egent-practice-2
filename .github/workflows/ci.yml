@@ -88,6 +88,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Build and test tree protection helper
+        if: matrix.node-version == '24.x'
+        run: JAVA_HOME="$JAVA_HOME_21_X64" mvn --batch-mode --no-transfer-progress -f server/tree-guard/pom.xml verify
+
       - name: Audit high and critical vulnerabilities
         if: matrix.node-version == '24.x'
         run: npm run audit:high

@@ -1,0 +1,5 @@
+name: CompanionTreeGuard
+version: 0.1.0
+main: companion.guard.TreeGuardPlugin
+api-version: "1.21.11"
+description: 成長履歴のない原木をCompanionに採取させない専用補助

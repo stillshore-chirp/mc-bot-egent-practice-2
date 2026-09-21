@@ -100,3 +100,14 @@ def test_retired_harness_paths_remain_classifiable_when_deleted() -> None:
 
     assert result["classification_ok"] is True
     assert result["governance"] is True
+
+
+def test_tree_protection_sources_and_contract_select_product() -> None:
+    for path in (
+        "server/tree-guard/pom.xml",
+        "server/tree-guard/src/main/java/companion/guard/TreeGuardPlugin.java",
+        "docs/building-protection.md",
+    ):
+        result = MODULE.classify_paths([path])
+        assert result["classification_ok"] is True
+        assert result["product"] is True
