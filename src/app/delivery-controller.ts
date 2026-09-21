@@ -78,10 +78,19 @@ export class DeliveryController {
           message: "登録中にworldが変わりました。",
           retryable: false,
         });
+      const targetPosition = position ?? proof.position;
+      if (targetPosition === undefined)
+        throw new AppError({
+          category: "observation",
+          code: "HOME_POSITION_UNAVAILABLE",
+          message:
+            "同じworld観測の拠点座標を確認できません。補助を更新してください。",
+          retryable: false,
+        });
       const common = {
         dimension: observed.dimension,
         worldId: proof.worldId,
-        position: position ?? observed.position,
+        position: targetPosition,
       };
       if (kind === "home")
         return this.memory.saveDeliveryTarget(this.playerId(), {

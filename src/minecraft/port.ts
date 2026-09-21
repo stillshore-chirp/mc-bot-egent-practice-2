@@ -20,6 +20,7 @@ export interface StorageObservation {
   readonly uncontested: boolean;
 }
 export interface StorageIdentity {
+  readonly position?: Position | undefined;
   readonly worldId: string;
   readonly identity: string | null;
   readonly observation?: StorageObservation | null;

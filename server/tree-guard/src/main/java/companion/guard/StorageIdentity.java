@@ -109,7 +109,9 @@ public final class StorageIdentity implements PluginMessageListener, Listener {
                 if(Math.abs((long)x)>30_000_000 || Math.abs((long)z)>30_000_000 || y<world.getMinHeight() || y>=world.getMaxHeight())return;
                 if(world.isChunkLoaded(x>>4,z>>4) && player.getLocation().distanceSquared(new Location(world,x,y,z))<=(register?25:128*128)) { target=world.getBlockAt(x,y,z);identity=identity(target,register); }
             } else if(!operation.equals("world"))return;
-            JsonObject result=new JsonObject();result.addProperty("id",id);result.addProperty("worldId",player.getWorld().getUID().toString());
+            Location observed=player.getLocation();
+            JsonObject result=new JsonObject();result.addProperty("id",id);result.addProperty("worldId",observed.getWorld().getUID().toString());
+            JsonObject observedPosition=new JsonObject();observedPosition.addProperty("x",observed.getX());observedPosition.addProperty("y",observed.getY());observedPosition.addProperty("z",observed.getZ());result.add("position",observedPosition);
             result.add("identity",identity==null?JsonNull.INSTANCE:new JsonPrimitive(identity));
             JsonElement observation=JsonNull.INSTANCE;
             if(identity!=null && target!=null && request.has("resource") && !request.get("resource").isJsonNull()) {

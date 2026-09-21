@@ -10,6 +10,14 @@ const responseSchema = z
   .object({
     id: z.uuid(),
     worldId: z.uuid(),
+    position: z
+      .object({
+        x: z.number().min(-30_000_000).max(30_000_000),
+        y: z.number().min(-2048).max(2048),
+        z: z.number().min(-30_000_000).max(30_000_000),
+      })
+      .strict()
+      .optional(),
     identity: z.string().max(500).nullable(),
     observation: z
       .object({

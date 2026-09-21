@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DeliveryController } from "../../src/app/delivery-controller.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
@@ -124,5 +124,31 @@ describe("explicit delivery target registration", () => {
     await expect(delivery.register("home", null, signal)).rejects.toThrow();
     expect(delivery.list()).toHaveLength(1);
     lease.release();
+  });
+  it("binds home coordinates to the server world snapshot after a same-dimension teleport", async () => {
+    const { delivery, minecraft, signal } = setup();
+    const newWorld = "00000000-0000-4000-8000-000000000002";
+    const newPosition = { x: 80, y: 70, z: 40 };
+    vi.spyOn(minecraft, "storageIdentity").mockImplementation(async () => {
+      minecraft.snapshot = { ...minecraft.snapshot, position: newPosition };
+      return { worldId: newWorld, position: newPosition, identity: null };
+    });
+    const target = await delivery.register("home", null, signal);
+    expect(target).toMatchObject({
+      worldId: newWorld,
+      position: newPosition,
+      dimension: "overworld",
+    });
+  });
+  it("refuses a home proof without paired server coordinates", async () => {
+    const { delivery, minecraft, signal } = setup();
+    vi.spyOn(minecraft, "storageIdentity").mockResolvedValue({
+      worldId: "00000000-0000-4000-8000-000000000001",
+      identity: null,
+    });
+    await expect(delivery.register("home", null, signal)).rejects.toMatchObject(
+      { detail: { code: "HOME_POSITION_UNAVAILABLE" } },
+    );
+    expect(delivery.list()).toEqual([]);
   });
 });

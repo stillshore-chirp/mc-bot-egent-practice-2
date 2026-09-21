@@ -1,5 +1,8 @@
 import type { ChestTarget } from "../../src/memory/delivery-targets.js";
-import type { DepositResult } from "../../src/minecraft/port.js";
+import type {
+  DepositResult,
+  StorageIdentity,
+} from "../../src/minecraft/port.js";
 import type {
   Position,
   SurroundingsObservation,
@@ -59,9 +62,10 @@ export class FakeMinecraft implements MinecraftPort {
     position: Position | null,
     _register: boolean,
     signal: AbortSignal,
-  ) {
+  ): Promise<StorageIdentity> {
     signal.throwIfAborted();
     return {
+      position: { ...this.snapshot.position },
       worldId: "00000000-0000-4000-8000-000000000001",
       identity:
         position === null
