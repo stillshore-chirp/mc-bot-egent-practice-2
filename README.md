@@ -39,7 +39,7 @@ AI コンパニオンが、Minecraft で観測した状況と利用者との継�
 
 ## 非目標
 
-旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、Paper plugin、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
+旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、汎用Paper plugin基盤、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
 
 ## 観測ダッシュボード
 
@@ -82,6 +82,8 @@ oak_logを4個集めて、ここへ戻ってきて。
 ```
 
 `停止`、`停止して`、`止まって`、`止めて`、`ストップ`、`やめて`、`中止`、`中断`はLLM待ちを経ず、ownerの完全一致chatとして即時処理します。
+
+原木の建築保護は [専用補助の設計契約](docs/building-protection.md) に従って拡張中です。現行の稼働版にはまだ適用されていません。
 
 ## 設定
 
