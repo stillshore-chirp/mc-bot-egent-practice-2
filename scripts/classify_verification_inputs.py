@@ -67,6 +67,7 @@ PRODUCT_PATTERNS = (
     "docs/building-protection.md",
     "docs/delivery-storage.md",
     "tests/unit/**",
+    "tests/support/**",
     "tests/integration/**",
     "tests/e2e/**",
     "README.md",

@@ -111,3 +111,12 @@ def test_tree_protection_sources_and_contract_select_product() -> None:
         result = MODULE.classify_paths([path])
         assert result["classification_ok"] is True
         assert result["product"] is True
+
+
+def test_shared_minecraft_fixture_selects_product_gate() -> None:
+    result = MODULE.classify_paths(["tests/support/fake-minecraft.ts"])
+
+    assert result["classification_ok"] is True
+    assert result["product"] is True
+    assert result["unknown_paths"] == []
+    assert result["browser"] is False
