@@ -69,7 +69,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             Material type=neighbor.getType();
             if (type.isAir() || Tag.LEAVES.isTagged(type) || type==Material.VINE || type==Material.SHORT_GRASS || type==Material.TALL_GRASS || type==Material.NETHER_WART_BLOCK || type==Material.WARPED_WART_BLOCK || type==Material.SHROOMLIGHT || type.name().startsWith("WEEPING_VINES") || type.name().startsWith("TWISTING_VINES")) continue;
             if ((log(type) || root(type) || growthDecoration(type)) && ledger.known(point(neighbor),name(neighbor))) continue;
-            if (TreeSupport.naturalSupport(b.getType().name(),type.name(),dy)) continue;
+            if (TreeSupport.naturalSupport(b.getType().name(),type.name(),dx,dy,dz)) continue;
             return false;
         }
         return true;
