@@ -69,12 +69,18 @@ export class DeliverLogsSkill {
               });
             return state;
           };
-          const checkChest = async () => {
+          const checkChest = async (allowUnavailable = false) => {
             const proof = await this.minecraft.storageIdentity(
               input.chest.position,
               false,
               signal,
             );
+            if (
+              allowUnavailable &&
+              proof.worldId === input.chest.worldId &&
+              proof.identity === null
+            )
+              return false;
             if (
               proof.worldId !== input.chest.worldId ||
               proof.identity !== input.chest.identity
@@ -85,22 +91,9 @@ export class DeliverLogsSkill {
                 message: "登録チェストが消失・変更されたため作業を停止します。",
                 retryable: false,
               });
+            return true;
           };
           await context.advance("delivery_precheck");
-          await checkWorld();
-          await checkChest();
-          if (input.gather) await this.gather.collect(input, context, signal);
-          const inventory = await this.minecraft.observe();
-          if (countInventory(inventory, input.resource) < input.count)
-            throw new AppError({
-              category: "inventory",
-              code: "DEPOSIT_ITEMS_MISSING",
-              message: "指定数の原木を所持していません。",
-              retryable: false,
-              confirmedState: {
-                heldCount: countInventory(inventory, input.resource),
-              },
-            });
           const move = async (
             position: DeliveryTarget["position"],
             range: number,
@@ -132,12 +125,48 @@ export class DeliverLogsSkill {
               });
             return distance(after.position, position);
           };
+          const initial = await checkWorld();
+          if (
+            distance(initial.position, input.home.position) >
+              this.maxDistance ||
+            distance(input.home.position, input.chest.position) + 2 >
+              this.maxDistance
+          )
+            throw new AppError({
+              category: "validation",
+              code: "DELIVERY_DISTANCE_EXCEEDED",
+              message:
+                "登録先への帰還・収納経路が移動距離の設定上限を超えています。",
+              retryable: false,
+            });
+          if (input.gather) {
+            // 遠方・未読込は消失と断定せず、登録地点へ近づいてから採取前に確認する。
+            if (!(await checkChest(true))) {
+              await move(input.home.position, 2, "inspect_via_home");
+              await move(input.chest.position, 3, "inspect_registered_chest");
+              await checkChest();
+            }
+            await this.gather.collect(input, context, signal, false, {
+              center: input.home.position,
+              radius: this.maxDistance,
+            });
+          }
+          const inventory = await this.minecraft.observe();
+          if (countInventory(inventory, input.resource) < input.count)
+            throw new AppError({
+              category: "inventory",
+              code: "DEPOSIT_ITEMS_MISSING",
+              message: "指定数の原木を所持していません。",
+              retryable: false,
+              confirmedState: {
+                heldCount: countInventory(inventory, input.resource),
+              },
+            });
           const homeDistance = await move(
             input.home.position,
             2,
             "return_to_home",
           );
-          await checkChest();
           await move(input.chest.position, 3, "move_to_registered_chest");
           await checkChest();
           await context.advance("deposit_logs");

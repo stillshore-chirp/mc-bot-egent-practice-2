@@ -1,5 +1,10 @@
 import { AppError } from "../../domain/errors.js";
-import { countInventory, type WorldSnapshot } from "../../domain/snapshot.js";
+import {
+  countInventory,
+  distance,
+  type Position,
+  type WorldSnapshot,
+} from "../../domain/snapshot.js";
 import type { TaskRecord } from "../../domain/task.js";
 import type { MinecraftPort, ResourceTarget } from "../../minecraft/port.js";
 import {
@@ -104,6 +109,7 @@ export class GatherLogsSkill implements Skill<
     context: TaskContext,
     signal: AbortSignal,
     requireRequester = false,
+    returnBoundary?: { center: Position; radius: number },
   ) {
     this.validateInput(input);
     const itemName = input.resource;
@@ -112,11 +118,17 @@ export class GatherLogsSkill implements Skill<
     if (requireRequester) this.requireRequester(before, input.requester);
     const baseline = countInventory(before, itemName);
     let frontierIndex = 0;
+    // 回収対象は原木から8ブロック以内。到達半径と座標丸めも内側に確保する。
+    const reserve = Math.max(10, this.limits.moveRange + 0.75);
+    const withinReturnRange = (position: Position) =>
+      returnBoundary === undefined ||
+      distance(position, returnBoundary.center) + reserve <=
+        returnBoundary.radius;
     const frontier = createSearchFrontier(
       before.position,
       this.limits.searchStep,
       this.limits.maxSearchDistance,
-    );
+    ).filter(withinReturnRange);
 
     await context.advance("precheck", {
       itemName,
@@ -134,12 +146,14 @@ export class GatherLogsSkill implements Skill<
         requestedCount: input.count,
         frontierIndex,
       });
-      const targets = await this.minecraft.findResources(
-        [itemName],
-        this.limits.localSearchDistance,
-        Math.min(input.count - acquired, 8),
-        signal,
-      );
+      const targets = (
+        await this.minecraft.findResources(
+          [itemName],
+          this.limits.localSearchDistance,
+          Math.min(input.count - acquired, 8),
+          signal,
+        )
+      ).filter((target) => withinReturnRange(target.position));
       if (targets.length === 0) {
         const searchPoint = frontier[frontierIndex];
         if (searchPoint === undefined) {
@@ -181,6 +195,7 @@ export class GatherLogsSkill implements Skill<
                 retrySignal,
               ),
             signal,
+            returnBoundary,
           );
         } catch (error) {
           if (
@@ -209,6 +224,7 @@ export class GatherLogsSkill implements Skill<
     ) => Promise<void>,
     retryOperation: TaskContext["retry"],
     signal: AbortSignal,
+    returnBoundary?: { center: Position; radius: number },
   ): Promise<void> {
     await advance("move_to_resource", { target: target.position });
     await retryOperation(
@@ -225,6 +241,17 @@ export class GatherLogsSkill implements Skill<
       signal,
     );
     const beforeDig = await this.minecraft.observe();
+    if (
+      returnBoundary &&
+      distance(beforeDig.position, returnBoundary.center) >
+        returnBoundary.radius
+    )
+      throw new AppError({
+        category: "validation",
+        code: "DELIVERY_DISTANCE_EXCEEDED",
+        message: "帰還可能な範囲外にいるため採掘しません。",
+        retryable: false,
+      });
     await advance("dig", {
       target: target.position,
       heldCount: countInventory(beforeDig, itemName),
