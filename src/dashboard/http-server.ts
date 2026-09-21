@@ -6,6 +6,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { extname, resolve, sep } from "node:path";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 
 import type { Logger } from "pino";
 
@@ -179,7 +180,7 @@ export class DashboardHttpServer {
       return;
     }
     if (request.method === "GET" && path === "/api/stream") {
-      this.#stream(request, response);
+      await this.#stream(request, response);
       return;
     }
     if (request.method === "POST" && path === "/api/traces/import") {
@@ -249,7 +250,10 @@ export class DashboardHttpServer {
     this.#json(response, 404, { code: "DASHBOARD_ROUTE_NOT_FOUND" });
   }
 
-  #stream(request: IncomingMessage, response: ServerResponse): void {
+  async #stream(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
     response.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
@@ -262,47 +266,83 @@ export class DashboardHttpServer {
     let lastSent = parseLastEventId(
       Array.isArray(lastEventHeader) ? lastEventHeader[0] : lastEventHeader,
     );
-    const send = (event: CognitiveTraceEvent): void => {
-      if (event.streamId === undefined || event.streamId <= lastSent) return;
-      if (
-        response.writableEnded ||
-        response.writableLength > SSE_MAX_BUFFER_BYTES
-      ) {
-        response.end();
-        return;
-      }
-      response.write(`id: ${String(event.streamId)}\n`);
-      response.write("event: trace\n");
-      response.write(`data: ${JSON.stringify(event)}\n\n`);
-      lastSent = event.streamId;
-    };
-    let catchingUp = true;
-    const pending: CognitiveTraceEvent[] = [];
-    const unsubscribe = this.#service.subscribe((event) => {
-      if (catchingUp) pending.push(event);
-      else send(event);
-    });
-    let backfill = this.#service.store.listStreamEventsAfter(lastSent);
-    for (const event of backfill) send(event);
-    while (backfill.length === SSE_BACKFILL_PAGE) {
-      backfill = this.#service.store.listStreamEventsAfter(lastSent);
-      for (const event of backfill) send(event);
-    }
-    pending.sort((left, right) => (left.streamId ?? 0) - (right.streamId ?? 0));
-    for (const event of pending) send(event);
-    catchingUp = false;
-    response.write(": connected\n\n");
-    const keepalive = setInterval(() => {
-      if (!response.writableEnded) response.write(": keepalive\n\n");
-    }, SSE_KEEPALIVE_MS);
+    let closed = false;
+    const isClosed = (): boolean => closed;
+    let unsubscribe = (): void => undefined;
+    let keepalive: ReturnType<typeof setInterval> | undefined;
     const close = (): void => {
+      if (closed) return;
+      closed = true;
       clearInterval(keepalive);
       unsubscribe();
       this.#streams.delete(response);
-      response.end();
+      request.off("close", close);
+      response.off("close", close);
+      if (!response.writableEnded) response.end();
     };
+    // 履歴の送信中に終了しても必ず解放できるよう、先にcloseを登録する。
     request.once("close", close);
     response.once("close", close);
+    const send = (event: CognitiveTraceEvent): boolean => {
+      if (
+        closed ||
+        response.destroyed ||
+        response.writableEnded ||
+        response.writableLength > SSE_MAX_BUFFER_BYTES
+      ) {
+        close();
+        return false;
+      }
+      if (event.streamId === undefined || event.streamId <= lastSent)
+        return true;
+      response.write(
+        `id: ${String(event.streamId)}\nevent: trace\ndata: ${JSON.stringify(event)}\n\n`,
+      );
+      lastSent = event.streamId;
+      return true;
+    };
+    let catchingUp = true;
+    const pending: CognitiveTraceEvent[] = [];
+    unsubscribe = this.#service.subscribe((event) => {
+      if (closed) return;
+      if (catchingUp) {
+        if (pending.length >= SSE_BACKFILL_PAGE) close();
+        else pending.push(event);
+      } else send(event);
+    });
+    try {
+      while (!isClosed()) {
+        const before = lastSent;
+        const backfill = this.#service.store.listStreamEventsAfter(lastSent);
+        for (const event of backfill) if (!send(event)) return;
+        if (backfill.length < SSE_BACKFILL_PAGE) break;
+        if (lastSent <= before) {
+          close();
+          return;
+        }
+        // ゲーム接続、HTTP、切断通知を履歴のページ間でも処理できるようにする。
+        await yieldToEventLoop();
+      }
+      if (isClosed()) return;
+      pending.sort(
+        (left, right) => (left.streamId ?? 0) - (right.streamId ?? 0),
+      );
+      for (const event of pending) if (!send(event)) return;
+      catchingUp = false;
+      response.write(": connected\n\n");
+      keepalive = setInterval(() => {
+        if (
+          response.writableEnded ||
+          response.destroyed ||
+          response.writableLength > SSE_MAX_BUFFER_BYTES
+        )
+          close();
+        else response.write(": keepalive\n\n");
+      }, SSE_KEEPALIVE_MS);
+    } catch (error) {
+      close();
+      throw error;
+    }
   }
 
   #serveStatic(

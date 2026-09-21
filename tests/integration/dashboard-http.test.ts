@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DashboardHttpServer } from "../../src/dashboard/http-server.js";
 import { TraceService } from "../../src/trace/service.js";
@@ -12,6 +13,7 @@ import { TraceStore } from "../../src/trace/store.js";
 const cleanup: (() => void)[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const dispose of cleanup.splice(0).reverse()) dispose();
 });
 
@@ -200,5 +202,112 @@ describe("DashboardHttpServer", () => {
       done = next.done;
     }
     expect(done).toBe(true);
+  });
+  it("stops backfill and releases its subscription when the send buffer is full", async () => {
+    const store = TraceStore.open(":memory:");
+    cleanup.push(() => store.close());
+    const service = new TraceService(store, pino({ level: "silent" }));
+    const session = await service.startTrace("大量履歴のfixture");
+    const event = store.listEvents(session.traceId)[0];
+    if (!event) throw new Error("fixture event missing");
+    const page = Array.from({ length: 2_000 }, (_, i) => ({
+      ...event,
+      streamId: i + 1,
+    }));
+    const read = vi
+      .spyOn(store, "listStreamEventsAfter")
+      .mockImplementation(() => {
+        // 旧実装でもテストを無限ループさせず、同じページの再取得を失敗として捉える。
+        if (read.mock.calls.length > 1) throw new Error("SSE_PAGE_REPEATED");
+        return page;
+      });
+    const unsubscribe = vi.fn();
+    vi.spyOn(service, "subscribe").mockReturnValue(unsubscribe);
+    vi.spyOn(ServerResponse.prototype, "writableLength", "get").mockReturnValue(
+      1024 * 1024 + 1,
+    );
+    const server = new DashboardHttpServer(
+      service,
+      {
+        enabled: true,
+        host: "127.0.0.1",
+        port: 0,
+        staticDirectory: ".",
+        maxAgeDays: 30,
+        maxTraces: 500,
+      },
+      pino({ level: "silent" }),
+    );
+    await server.start();
+    cleanup.push(() => void server.stop());
+    const response = await fetch(`${server.address}/api/stream`);
+    await response.text();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect((await fetch(`${server.address}/api/dashboard/health`)).status).toBe(
+      200,
+    );
+    await server.stop();
+  });
+
+  it("yields between backfill pages so other work can run and disconnect can complete", async () => {
+    const store = TraceStore.open(":memory:");
+    cleanup.push(() => store.close());
+    const service = new TraceService(store, pino({ level: "silent" }));
+    const session = await service.startTrace("大量履歴のfixture");
+    const event = store.listEvents(session.traceId)[0];
+    if (!event) throw new Error("fixture event missing");
+    let yielded = false,
+      observedYield = false;
+    vi.spyOn(store, "listStreamEventsAfter").mockImplementation((cursor) => {
+      if (cursor === 0) {
+        setImmediate(() => {
+          yielded = true;
+        });
+        return Array.from({ length: 2_000 }, (_, i) => ({
+          ...event,
+          streamId: i + 1,
+        }));
+      }
+      observedYield = yielded;
+      return [];
+    });
+    vi.spyOn(ServerResponse.prototype, "writableLength", "get").mockReturnValue(
+      0,
+    );
+    const server = new DashboardHttpServer(
+      service,
+      {
+        enabled: true,
+        host: "127.0.0.1",
+        port: 0,
+        staticDirectory: ".",
+        maxAgeDays: 30,
+        maxTraces: 500,
+      },
+      pino({ level: "silent" }),
+    );
+    await server.start();
+    cleanup.push(() => void server.stop());
+    const controller = new AbortController();
+    const response = await fetch(`${server.address}/api/stream`, {
+      signal: controller.signal,
+    });
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("stream body missing");
+    let text = "";
+    const decoder = new TextDecoder();
+    while (!text.includes(": connected")) {
+      const value = await reader.read();
+      if (value.done) break;
+      text += decoder.decode(value.value);
+    }
+    expect(observedYield).toBe(true);
+    expect(text).toContain("id: 2000");
+    expect((await fetch(`${server.address}/api/dashboard/health`)).status).toBe(
+      200,
+    );
+    controller.abort();
+    await server.stop();
   });
 });
