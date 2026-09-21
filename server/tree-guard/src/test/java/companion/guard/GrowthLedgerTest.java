@@ -51,6 +51,17 @@ class GrowthLedgerTest {
         assertEquals("unknown",ledger.decision(high,"oak_log",false,true));
         assertEquals("allowed",ledger.decision(other,"birch_log",false,true));
     }
+    @Test void botNonLogBreakInvalidatesNearbyTreeWhileRecordedHarvestPreservesRemainder() {
+        GrowthLedger ledger=new GrowthLedger();
+        ledger.grew(Map.of(root,"oak_log",top,"oak_log"));
+        ledger.broken(root,"oak_log",true);
+        assertEquals("allowed",ledger.decision(top,"oak_log",false,true));
+        ledger.broken(new GrowthLedger.Point(world,1,65,0),"stone",true);
+        assertEquals("unknown",ledger.decision(top,"oak_log",false,true));
+        ledger.grew(Map.of(root,"oak_log",top,"oak_log"));
+        ledger.broken(root,"oak_log",false);
+        assertEquals("unknown",ledger.decision(top,"oak_log",false,true));
+    }
     @Test void HarvestAllowsRemainingTreeButCannotRecountRemovedLog() {
         GrowthLedger ledger=new GrowthLedger();ledger.grew(Map.of(root,"oak_log",top,"oak_log"));ledger.harvested(root);
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));
