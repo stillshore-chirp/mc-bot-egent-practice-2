@@ -62,6 +62,19 @@ class GrowthLedgerTest {
         ledger.broken(root,"oak_log",false);
         assertEquals("unknown",ledger.decision(top,"oak_log",false,true));
     }
+    @Test void batchChangesInvalidateAffectedFootprintsAndPreserveUnrelatedTrees() {
+        GrowthLedger ledger=new GrowthLedger();
+        GrowthLedger.Point far=new GrowthLedger.Point(world,20,64,0);
+        ledger.grew(Map.of(root,"oak_log",top,"oak_log"));ledger.grew(Map.of(far,"birch_log"));
+        List<GrowthLedger.Point> changes=new ArrayList<>();
+        for(int x=100;x<1100;x++)changes.add(new GrowthLedger.Point(world,x,64,0));
+        changes.add(new GrowthLedger.Point(world,1,64,0));
+        ledger.changedNear(changes);
+        assertEquals("unknown",ledger.decision(top,"oak_log",false,true));
+        assertEquals("allowed",ledger.decision(far,"birch_log",false,true));
+        ledger.changedNear(Collections.nCopies(10_001,root));
+        assertEquals("unknown",ledger.decision(far,"birch_log",false,true));
+    }
     @Test void HarvestAllowsRemainingTreeButCannotRecountRemovedLog() {
         GrowthLedger ledger=new GrowthLedger();ledger.grew(Map.of(root,"oak_log",top,"oak_log"));ledger.harvested(root);
         assertEquals("unknown",ledger.decision(root,"oak_log",false,true));

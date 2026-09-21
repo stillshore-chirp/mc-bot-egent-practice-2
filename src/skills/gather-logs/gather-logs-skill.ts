@@ -138,6 +138,7 @@ export class GatherLogsSkill implements Skill<
         [itemName],
         this.limits.localSearchDistance,
         Math.min(input.count - acquired, 8),
+        signal,
       );
       if (targets.length === 0) {
         const searchPoint = frontier[frontierIndex];

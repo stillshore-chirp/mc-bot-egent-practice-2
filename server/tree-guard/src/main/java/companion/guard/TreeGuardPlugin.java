@@ -104,24 +104,24 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     public void place(BlockPlaceEvent e) { ledger.changedNear(point(e.getBlock())); }
     @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
     public void protectBreak(BlockBreakEvent e) {
-        if (bot(e.getPlayer()) && log(e.getBlock().getType()) && !decision(e.getBlock()).equals("allowed")) e.setCancelled(true);
+        if (bot(e.getPlayer()) && (!log(e.getBlock().getType()) || !decision(e.getBlock()).equals("allowed"))) e.setCancelled(true);
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void didBreak(BlockBreakEvent e) {
         ledger.broken(point(e.getBlock()), e.getBlock().getType().name().toLowerCase(Locale.ROOT), bot(e.getPlayer()));
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void piston(BlockPistonExtendEvent e) { for (Block b:e.getBlocks()) ledger.changedNear(point(b)); }
+    public void piston(BlockPistonExtendEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void retract(BlockPistonRetractEvent e) { for (Block b:e.getBlocks()) ledger.changedNear(point(b)); }
+    public void retract(BlockPistonRetractEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void burn(BlockBurnEvent e) { ledger.changedNear(point(e.getBlock())); }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void entityChange(EntityChangeBlockEvent e) { ledger.changedNear(point(e.getBlock())); }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void explode(EntityExplodeEvent e) { for(Block b:e.blockList()) ledger.changedNear(point(b)); }
+    public void explode(EntityExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void blockExplode(BlockExplodeEvent e) { for(Block b:e.blockList()) ledger.changedNear(point(b)); }
+    public void blockExplode(BlockExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
     @EventHandler(priority=EventPriority.MONITOR)
     public void unload(ChunkUnloadEvent e) { ledger.clear(); }
     @Override public void onPluginMessageReceived(String channel, Player player, byte[] bytes) {

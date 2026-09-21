@@ -35,11 +35,26 @@ public final class GrowthLedger {
     }
     public boolean known(Point point, String name) { return name.equals(logs.get(point)); }
     public void changedNear(Point point) {
-        // Each growth footprint is visited once, with at most 10,000 retained points.
+        invalidate(p -> p.near(point));
+    }
+    public void changedNear(Collection<Point> points) {
+        // Bound the event index as well as the retained evidence; oversized events fail closed.
+        if(points.size()>10_000) { clear();return; }
+        if(points.size()==1) { changedNear(points.iterator().next());return; }
+        Set<Point> changed=new HashSet<>(points);
+        if(changed.isEmpty())return;
+        invalidate(p -> {
+            for(int dx=-1;dx<=1;dx++)for(int dy=-1;dy<=1;dy++)for(int dz=-1;dz<=1;dz++)
+                if(changed.contains(new Point(p.world(),p.x()+dx,p.y()+dy,p.z()+dz)))return true;
+            return false;
+        });
+    }
+    private void invalidate(java.util.function.Predicate<Point> affected) {
+        // Each growth footprint is visited once per event, including multi-block explosions.
         var iterator=evidence.iterator();
         while(iterator.hasNext()) {
             Set<Point> tree=iterator.next();
-            if(tree.stream().noneMatch(p -> p.near(point))) continue;
+            if(tree.stream().noneMatch(affected)) continue;
             for(Point key:tree) if(trees.get(key)==tree) { logs.remove(key);trees.remove(key); }
             iterator.remove();
         }
