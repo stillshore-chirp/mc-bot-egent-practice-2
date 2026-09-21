@@ -52,7 +52,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     @Override public void onDisable() { ledger.clear(); }
     private boolean bot(Player p) { return botNames.contains(p.getName().toLowerCase(Locale.ROOT)); }
     private GrowthLedger.Point point(Block b) { return new GrowthLedger.Point(b.getWorld().getUID(), b.getX(),b.getY(),b.getZ()); }
-    private static boolean log(Material material) { return material.name().endsWith("_LOG") && !material.name().startsWith("STRIPPED_"); }
+    private static boolean log(Material material) { return GrowthLedger.isGatherable(material.name()); }
     private String name(Block b) { return b.getType().name().toLowerCase(Locale.ROOT); }
     private boolean protectedArea(Block b) { return protectedRegions.stream().anyMatch(r -> r.contains(b)); }
     private boolean safeSurroundings(Block b) {
@@ -63,10 +63,10 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             Block neighbor=b.getWorld().getBlockAt(x,y,z);
             if (protectedArea(neighbor)) return false;
             Material type=neighbor.getType();
-            if (type.isAir() || Tag.LEAVES.isTagged(type) || type==Material.VINE || type==Material.SHORT_GRASS || type==Material.TALL_GRASS) continue;
+            if (type.isAir() || Tag.LEAVES.isTagged(type) || type==Material.VINE || type==Material.SHORT_GRASS || type==Material.TALL_GRASS || type==Material.NETHER_WART_BLOCK || type==Material.WARPED_WART_BLOCK || type==Material.SHROOMLIGHT || type.name().startsWith("WEEPING_VINES") || type.name().startsWith("TWISTING_VINES")) continue;
             if (log(type) && ledger.known(point(neighbor),name(neighbor))) continue;
             // Soil in the layer under the log supports the tree; side-level building blocks fail closed.
-            if (dy==-1 && (type==Material.DIRT || type==Material.GRASS_BLOCK || type==Material.PODZOL || type==Material.ROOTED_DIRT || type==Material.MUD)) continue;
+            if (dy==-1 && (type==Material.DIRT || type==Material.GRASS_BLOCK || type==Material.PODZOL || type==Material.ROOTED_DIRT || type==Material.MUD || type==Material.CRIMSON_NYLIUM || type==Material.WARPED_NYLIUM)) continue;
             return false;
         }
         return true;
@@ -86,7 +86,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         for (BlockState state:e.getBlocks()) if (log(state.getType())) {
             Block previous=state.getBlock();
             // An existing solid block is never retroactively authorized by growth.
-            if (!previous.getType().isAir() && !Tag.SAPLINGS.isTagged(previous.getType()) && !Tag.LEAVES.isTagged(previous.getType())) continue;
+            if (!previous.getType().isAir() && !Tag.SAPLINGS.isTagged(previous.getType()) && !Tag.LEAVES.isTagged(previous.getType()) && previous.getType()!=Material.CRIMSON_FUNGUS && previous.getType()!=Material.WARPED_FUNGUS) continue;
             grown.put(point(previous),state.getType().name().toLowerCase(Locale.ROOT));
         }
         ledger.grew(grown);
