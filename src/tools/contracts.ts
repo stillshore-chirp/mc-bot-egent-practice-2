@@ -1,4 +1,9 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
+import type {
+  BehaviorMemoryRecord,
+  ForgetBehaviorMemoryInput,
+  RememberBehaviorMemoryInput,
+} from "../memory/types.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -188,6 +193,25 @@ export interface MemoryPort {
   }): unknown;
 }
 
+export interface BehaviorMemoryPort {
+  remember(input: RememberBehaviorMemoryInput): BehaviorMemoryRecord;
+  correct(input: {
+    readonly playerId: string;
+    readonly memoryId?: string;
+    readonly category: RememberBehaviorMemoryInput["category"];
+    readonly slot: string;
+    readonly value: string;
+    readonly summary: string;
+    readonly idempotencyKey?: string;
+  }): BehaviorMemoryRecord;
+  list(
+    playerId: string,
+    input?: { readonly limit?: number; readonly query?: string },
+  ): BehaviorMemoryRecord[];
+  isApplicable(record: BehaviorMemoryRecord): boolean;
+  forget(input: ForgetBehaviorMemoryInput): BehaviorMemoryRecord[];
+}
+
 export interface ToolContext {
   correlationId: string;
   requesterUsername: string;
@@ -207,6 +231,8 @@ export interface ToolContext {
   };
   game: GameController;
   memory: MemoryPort;
+  /** Optional on older integrations; behavior tools fail closed when absent. */
+  behaviorMemory?: BehaviorMemoryPort;
   limits: {
     maxMoveDistance: number;
     maxGatherCount: number;
