@@ -230,7 +230,11 @@ export class RuntimeReassessmentGate<Event extends string> {
             ...this.#stats,
             completed: this.#stats.completed + 1,
           };
-          this.#lastCompletedStateKey = request.stateKey;
+          this.#lastCompletedStateKey =
+            this.#pending === undefined ||
+            this.#pending.stateKey === request.stateKey
+              ? request.stateKey
+              : undefined;
           this.#decide(request, "completed");
           return;
         }

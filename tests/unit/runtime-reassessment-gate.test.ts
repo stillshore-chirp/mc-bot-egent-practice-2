@@ -133,6 +133,39 @@ describe("RuntimeReassessmentGate", () => {
     await gate.stop();
   });
 
+  it("does not restore an old completed key when newer work is pending", async () => {
+    const releases: (() => void)[] = [];
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: (event: string) => {
+        seen.push(event);
+        return new Promise<"completed">((resolve) => {
+          releases.push(() => resolve("completed"));
+        });
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    gate.request({ event: "safety_stabilized", stateKey: "danger:cleared" });
+    releases.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    expect(seen).toEqual(["safety_failed", "safety_stabilized"]);
+    releases.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual([
+      "safety_failed",
+      "safety_stabilized",
+      "safety_failed",
+    ]);
+    releases.shift()?.();
+    await gate.stop();
+  });
+
   it("accepts a fresh transition after an earlier tick was cancelled", async () => {
     const seen: string[] = [];
     const gate = new RuntimeReassessmentGate({
