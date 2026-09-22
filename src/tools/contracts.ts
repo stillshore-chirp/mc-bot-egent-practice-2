@@ -223,6 +223,8 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
+  /** False while a stopped owner goal is being discussed without resuming it. */
+  allowActionTools?: boolean;
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;
   executionEvidence: {

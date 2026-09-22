@@ -65,6 +65,14 @@ function explicitlyResumesGoal(message: string): boolean {
   );
 }
 
+/**
+ * Permission questions and negative instructions keep the stop boundary in
+ * place. They are not authorization to execute the mentioned action.
+ */
+export function isNonAuthorizingGoalMessage(message: string): boolean {
+  return negatesGoalAction(compactText(message));
+}
+
 function requestsConcise(message: string): boolean {
   return (
     /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(message) ||

@@ -241,6 +241,7 @@ export class ChatCoordinator {
   readonly #readOnlyStatusQuestions = new Set<Promise<void>>();
   #activeController: AbortController | undefined;
   #activeRequestKind: ToolContext["requestKind"] | undefined;
+  #stopTail: Promise<void> = Promise.resolve();
   #conversationTail: Promise<RuntimeReassessmentRunOutcome | undefined> =
     Promise.resolve(undefined);
   #generation = 0;
@@ -275,51 +276,57 @@ export class ChatCoordinator {
       const interruptedRequestId =
         recorder.pendingOwnerRequestId?.(username) ??
         recorder.latestOwnerRequestId?.(username);
-      const session = await safeStartTrace(
-        this.#traceService,
-        "停止指示を受信",
-        "owner_message",
-      );
-      const stop = async (): Promise<void> => {
-        const report = await safeWithTraceSpan(
-          this.#traceService,
-          "cancellation",
-          "Minecraft作業を停止",
-          {
-            summary: "停止指示を処理",
-            summarizeResult: () => "停止処理を実行",
-          },
-          () => this.#game.stopCurrentAction("利用者の即時停止指示"),
-        );
-        if (interruptedRequestId === undefined) {
-          recorder.recordCancelledRequest?.(username, "owner_message");
-        } else {
-          recorder.recordCancelledRequest?.(
-            username,
+      const stopRun = this.#stopTail
+        .catch(() => undefined)
+        .then(async () => {
+          const session = await safeStartTrace(
+            this.#traceService,
+            "停止指示を受信",
             "owner_message",
-            interruptedRequestId,
           );
-        }
-        await safeWithTraceSpan(
-          this.#traceService,
-          "response",
-          "停止結果を応答",
-          {
-            summary: "停止結果を送信",
-            resultKind: "final_response",
-            summarizeResult: () => "停止結果を送信",
-          },
-          () => this.#game.say(report.summary),
-        );
-      };
-      try {
-        if (session === undefined) await stop();
-        else await safeWithTrace(this.#traceService, session, stop);
-        await safeCompleteTrace(session, "succeeded", "停止結果を送信");
-      } catch (error) {
-        await safeCompleteTrace(session, "failed", "停止処理に失敗");
-        throw error;
-      }
+          const stop = async (): Promise<void> => {
+            const report = await safeWithTraceSpan(
+              this.#traceService,
+              "cancellation",
+              "Minecraft作業を停止",
+              {
+                summary: "停止指示を処理",
+                summarizeResult: () => "停止処理を実行",
+              },
+              () => this.#game.stopCurrentAction("利用者の即時停止指示"),
+            );
+            if (interruptedRequestId === undefined) {
+              recorder.recordCancelledRequest?.(username, "owner_message");
+            } else {
+              recorder.recordCancelledRequest?.(
+                username,
+                "owner_message",
+                interruptedRequestId,
+              );
+            }
+            await safeWithTraceSpan(
+              this.#traceService,
+              "response",
+              "停止結果を応答",
+              {
+                summary: "停止結果を送信",
+                resultKind: "final_response",
+                summarizeResult: () => "停止結果を送信",
+              },
+              () => this.#game.say(report.summary),
+            );
+          };
+          try {
+            if (session === undefined) await stop();
+            else await safeWithTrace(this.#traceService, session, stop);
+            await safeCompleteTrace(session, "succeeded", "停止結果を送信");
+          } catch (error) {
+            await safeCompleteTrace(session, "failed", "停止処理に失敗");
+            throw error;
+          }
+        });
+      this.#stopTail = stopRun;
+      await stopRun;
       return true;
     }
 
@@ -331,22 +338,42 @@ export class ChatCoordinator {
     }
 
     if (isReadOnlyStatusQuestion(normalized)) {
-      const statusQuestion = this.#answerReadOnlyStatusQuestion(
-        username,
-        normalized,
-      );
-      this.#readOnlyStatusQuestions.add(statusQuestion);
-      try {
-        await statusQuestion;
-      } finally {
-        this.#readOnlyStatusQuestions.delete(statusQuestion);
+      let prefetchedStatus: GameStatus | undefined;
+      if (normalized === "なぜ") {
+        try {
+          prefetchedStatus = await this.#game.observeStatus();
+        } catch {
+          // Without a confirmed live task, let the normal conversation path
+          // use the prior explanation instead of inventing a current reason.
+        }
+        const activeTask =
+          prefetchedStatus?.activeTaskSummary?.trim() ??
+          prefetchedStatus?.activeTaskState?.trim();
+        if (activeTask === undefined || activeTask.length === 0) {
+          prefetchedStatus = undefined;
+        }
       }
-      return true;
+      if (normalized !== "なぜ" || prefetchedStatus !== undefined) {
+        const statusQuestion = this.#answerReadOnlyStatusQuestion(
+          username,
+          normalized,
+          prefetchedStatus,
+        );
+        this.#readOnlyStatusQuestions.add(statusQuestion);
+        try {
+          await statusQuestion;
+        } finally {
+          this.#readOnlyStatusQuestions.delete(statusQuestion);
+        }
+        return true;
+      }
     }
 
     const generation = this.#generation;
+    const stopBoundary = this.#stopTail;
     this.#conversationTail = this.#conversationTail
       .catch(() => undefined)
+      .then(() => stopBoundary.catch(() => undefined))
       .then(() =>
         generation === this.#generation
           ? this.#deliberate(username, normalized, "owner_message")
@@ -405,6 +432,7 @@ export class ChatCoordinator {
     this.#activeController?.abort(new Error("APPLICATION_SHUTDOWN"));
     await Promise.allSettled([
       this.#conversationTail,
+      this.#stopTail,
       ...this.#readOnlyStatusQuestions,
     ]);
   }
@@ -444,6 +472,7 @@ export class ChatCoordinator {
   async #answerReadOnlyStatusQuestion(
     username: string,
     message: string,
+    prefetchedStatus?: GameStatus,
   ): Promise<void> {
     const recorder = this.#agent as unknown as DeliveredReplyRecorder;
     const session = await safeStartTrace(
@@ -453,22 +482,24 @@ export class ChatCoordinator {
       { responseMode: "read_only_status" },
     );
     const process = async (): Promise<void> => {
-      let status: GameStatus | undefined;
-      try {
-        status = await safeWithTraceSpan(
-          this.#traceService,
-          "perception",
-          "Minecraft状態を観測",
-          {
-            summary: "現在のMinecraft状態を観測",
-            resultKind: "minecraft_state_delta",
-            summarizeResult: () => "現在状態を観測",
-          },
-          () => this.#game.observeStatus(),
-        );
-      } catch {
-        // A status question still receives an honest, bounded answer when
-        // observation is temporarily unavailable.
+      let status: GameStatus | undefined = prefetchedStatus;
+      if (status === undefined) {
+        try {
+          status = await safeWithTraceSpan(
+            this.#traceService,
+            "perception",
+            "Minecraft状態を観測",
+            {
+              summary: "現在のMinecraft状態を観測",
+              resultKind: "minecraft_state_delta",
+              summarizeResult: () => "現在状態を観測",
+            },
+            () => this.#game.observeStatus(),
+          );
+        } catch {
+          // A status question still receives an honest, bounded answer when
+          // observation is temporarily unavailable.
+        }
       }
       const reply =
         status === undefined

@@ -11,6 +11,7 @@ import type { WorldSnapshot } from "../domain/snapshot.js";
 import type { TaskRecord } from "../domain/task.js";
 import type { MinecraftPort } from "../minecraft/port.js";
 import type { MemoryStore } from "../memory/store.js";
+import type { TaskRunRecord } from "../memory/types.js";
 import type { ActionArbiter } from "../runtime/action-arbiter.js";
 import type { TaskRuntime } from "../runtime/task-service.js";
 import type { FollowPlayerSkill } from "../skills/follow-player.js";
@@ -39,6 +40,7 @@ interface CompanionGameControllerInput {
   readonly gatherLogs: GatherLogsSkill;
   readonly returnToPlayer: ReturnToPlayerSkill;
   readonly ownerUsername: string;
+  readonly playerId?: string;
   readonly taskTimeoutMs: number;
   readonly retryLimit: number;
   readonly maxMoveDistance?: number;
@@ -47,6 +49,14 @@ interface CompanionGameControllerInput {
 }
 
 const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
+
+interface TaskStateForSummary {
+  readonly kind: string;
+  readonly status: TaskRecord["status"];
+  readonly phase: string;
+  readonly updatedAt: string;
+  readonly checkpoint?: Readonly<Record<string, unknown>>;
+}
 
 export class CompanionGameController implements GameController {
   public readonly delivery: DeliveryController;
@@ -59,6 +69,7 @@ export class CompanionGameController implements GameController {
   readonly #gatherLogs: GatherLogsSkill;
   readonly #returnToPlayer: ReturnToPlayerSkill;
   readonly #ownerUsername: string;
+  readonly #playerId: string | undefined;
   readonly #taskTimeoutMs: number;
   readonly #retryLimit: number;
   readonly #logger: Logger;
@@ -88,6 +99,7 @@ export class CompanionGameController implements GameController {
     this.#gatherLogs = input.gatherLogs;
     this.#returnToPlayer = input.returnToPlayer;
     this.#ownerUsername = input.ownerUsername;
+    this.#playerId = input.playerId;
     this.#taskTimeoutMs = input.taskTimeoutMs;
     this.#retryLimit = input.retryLimit;
     this.#logger = input.logger;
@@ -518,7 +530,7 @@ export class CompanionGameController implements GameController {
     for (const item of snapshot.inventory) {
       inventory[item.name] = (inventory[item.name] ?? 0) + item.count;
     }
-    const task = this.#tasks.current;
+    const task = this.#latestTaskForStatus();
     return {
       observedAt: snapshot.observedAt,
       subject: snapshot.subject,
@@ -539,6 +551,23 @@ export class CompanionGameController implements GameController {
       activeTaskSummary: activeTaskSummary(task),
       latestTaskState: latestTaskState(task),
     };
+  }
+
+  #latestTaskForStatus(): TaskStateForSummary | undefined {
+    const active = this.#tasks.current;
+    let persisted: TaskStateForSummary | undefined;
+    if (this.#playerId !== undefined) {
+      try {
+        const latest = this.#memory.listRecentTaskRuns(this.#playerId, 1)[0];
+        if (latest !== undefined) persisted = persistedTaskState(latest);
+      } catch {
+        // A status question remains useful when the durable task read is
+        // temporarily unavailable; the live task state is still authoritative.
+      }
+    }
+    if (active === undefined) return persisted;
+    if (persisted === undefined) return active;
+    return active.updatedAt >= persisted.updatedAt ? active : persisted;
   }
 
   #syncLifeState(snapshot: WorldSnapshot): void {
@@ -613,7 +642,9 @@ interface SuspendedTaskRecovery {
   readonly nextActions: readonly string[];
 }
 
-function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
+function suspendedTaskRecovery(
+  task: TaskStateForSummary,
+): SuspendedTaskRecovery {
   const reason = task.checkpoint?.suspendReason;
   const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
   if (reason === "reflex:stuck") {
@@ -673,7 +704,7 @@ function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
   };
 }
 
-function activeTaskState(task: TaskRecord | undefined): string | null {
+function activeTaskState(task: TaskStateForSummary | undefined): string | null {
   if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
   if (task.status === "suspended") {
     const recovery = suspendedTaskRecovery(task);
@@ -682,7 +713,9 @@ function activeTaskState(task: TaskRecord | undefined): string | null {
   return `${task.kind}:${task.phase}:${task.status}`;
 }
 
-function activeTaskSummary(task: TaskRecord | undefined): string | null {
+function activeTaskSummary(
+  task: TaskStateForSummary | undefined,
+): string | null {
   if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
   if (task.status === "suspended") {
     const recovery = suspendedTaskRecovery(task);
@@ -702,7 +735,7 @@ function activeTaskSummary(task: TaskRecord | undefined): string | null {
   }
 }
 
-function latestTaskState(task: TaskRecord | undefined): string | null {
+function latestTaskState(task: TaskStateForSummary | undefined): string | null {
   if (task === undefined) return null;
   if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
   if (task.status === "failed") {
@@ -712,6 +745,19 @@ function latestTaskState(task: TaskRecord | undefined): string | null {
   if (task.status === "suspended") return suspendedTaskRecovery(task).summary;
   if (task.status === "queued") return "Minecraft作業の開始を待っています。";
   return activeTaskSummary(task);
+}
+
+function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {
+  const suspendReason = task.checkpoint?.data.suspendReason;
+  return {
+    kind: task.kind,
+    status: task.status,
+    phase: task.phase,
+    updatedAt: task.updatedAt,
+    ...(typeof suspendReason === "string"
+      ? { checkpoint: { suspendReason } }
+      : {}),
+  };
 }
 
 function formatCoordinates(position: {

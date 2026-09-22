@@ -15,9 +15,12 @@ import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
-function createController(minecraft: FakeMinecraft) {
+function createController(minecraft: FakeMinecraft, withPlayer = false) {
   const directory = mkdtempSync(join(tmpdir(), "mc-game-controller-"));
   const memory = MemoryStore.open(join(directory, "memory.sqlite"));
+  const playerId = withPlayer
+    ? memory.getOrCreatePlayer("owner").id
+    : undefined;
   const tasks = new TaskRuntime(new InMemoryTaskStore(), () =>
     minecraft.stopCurrentAction(),
   );
@@ -41,11 +44,13 @@ function createController(minecraft: FakeMinecraft) {
       }),
       returnToPlayer: new ReturnToPlayerSkill(minecraft, tasks, arbiter),
       ownerUsername: "owner",
+      ...(playerId === undefined ? {} : { playerId }),
       taskTimeoutMs: 2_000,
       retryLimit: 1,
       logger: pino({ level: "silent" }),
       memory,
     }),
+    memory,
     close: () => {
       memory.close();
       rmSync(directory, { recursive: true, force: true });
@@ -208,6 +213,25 @@ describe("CompanionGameController", () => {
     expect(report.outcome).toBe("completed");
     expect(report.summary).toContain("新たに2個");
     expect(report.after?.inventory).toMatchObject({ oak_log: 2 });
+    close();
+  });
+
+  it("uses the newest persisted task when the runtime has no live task", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, memory, close } = createController(minecraft, true);
+    const playerId = memory.getOrCreatePlayer("owner").id;
+    memory.createTaskRun({
+      playerId,
+      kind: "follow_player",
+      phase: "following",
+      status: "completed",
+      input: {},
+    });
+
+    const status = await game.observeStatus();
+
+    expect(status.activeTaskState).toBeNull();
+    expect(status.latestTaskState).toBe("直前のMinecraft作業は完了しました。");
     close();
   });
 

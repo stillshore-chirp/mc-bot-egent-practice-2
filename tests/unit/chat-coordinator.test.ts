@@ -722,6 +722,101 @@ describe("immediate stop command", () => {
     await action;
   });
 
+  it("does not shortcut a bare why without a confirmed live task", async () => {
+    const deliberate = vi.fn(async () => ({
+      text: "直前の説明を続けます。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          ...minimalToolContext.game,
+          observedAt: "2026-09-22T00:00:00.000Z",
+          subject: "bot",
+          source: "minecraft",
+          requesterVitals: "unobserved",
+          connected: true,
+          spawned: true,
+          health: 20,
+          food: 20,
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+          position: null,
+          inventory: {},
+          activeTaskState: null,
+        })),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "直前の停止理由",
+          worldContext: "確認済み状態",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "なぜ");
+
+    expect(deliberate).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "なぜ" }),
+    );
+  });
+
+  it("waits for an in-flight stop before starting a new owner action", async () => {
+    let releaseStop!: () => void;
+    let notifyStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => {
+      notifyStopStarted = resolve;
+    });
+    const deliberate = vi.fn(async () => ({
+      text: "新しい作業を始めます。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(
+          () =>
+            new Promise<{ outcome: "cancelled"; summary: string }>(
+              (resolve) => {
+                notifyStopStarted();
+                releaseStop = () =>
+                  resolve({ outcome: "cancelled", summary: "停止しました。" });
+              },
+            ),
+        ),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "確認済み状態",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const stopping = coordinator.handleChat("owner", "停止");
+    await stopStarted;
+    const followup = coordinator.handleChat("owner", "来て");
+    await Promise.resolve();
+    expect(deliberate).not.toHaveBeenCalled();
+
+    releaseStop();
+    await stopping;
+    await followup;
+    expect(deliberate).toHaveBeenCalledTimes(1);
+  });
+
   it("reports the latest completed task without reviving an older failure", async () => {
     const say = vi.fn(async () => undefined);
     const recordDeliveredOwnerExchange = vi.fn();

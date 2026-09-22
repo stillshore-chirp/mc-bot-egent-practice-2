@@ -128,6 +128,13 @@ export class ToolExecutor {
         "状態再評価では観測と記憶参照以外の操作を実行しません。",
       );
     }
+    if (context.allowActionTools === false && definition.action) {
+      return failure(
+        "STOPPED_GOAL_ACTION_NOT_ALLOWED",
+        "authorization",
+        "停止済みの作業は、明示的に再開するまで動かしません。",
+      );
+    }
 
     let rawArguments: unknown;
     try {
