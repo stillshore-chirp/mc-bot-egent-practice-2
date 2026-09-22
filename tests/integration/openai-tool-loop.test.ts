@@ -101,6 +101,101 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("carries the previous subject and explanation preferences into the next turn", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "目の前の木を対象にします。短く伝えます。"),
+      response([], "同じ木を対象に収集を始めます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const first = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    await agent.deliberate({
+      ...first,
+      message: "目の前の木でいい。専門用語を使わず短く説明して。",
+    });
+    await agent.deliberate({
+      ...first,
+      message: "それでいい。進めて。",
+    });
+
+    expect(fake.requests).toHaveLength(2);
+    expect(fake.requests[0]?.instructions).toContain(
+      "利用者の説明方法の希望: 短く要点だけ話す。",
+    );
+    expect(fake.requests[0]?.instructions).toContain(
+      "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
+    );
+    expect(fake.requests[0]?.instructions).toContain("提供していない操作");
+    expect(fake.requests[0]?.instructions).toContain("実行した工程");
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain(
+      "目の前の木でいい。専門用語を使わず短く説明して。",
+    );
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain(
+      "目の前の木を対象にします。短く伝えます。",
+    );
+    expect(fake.requests[1]?.instructions).toContain("同じ対象として扱って");
+    expect(fake.requests[1]?.instructions).toContain(
+      "利用者の説明方法の希望: 短く要点だけ話す。",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
+    );
+  });
+
+  it("does not add an automatic reassessment prompt to the user conversation", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "依頼を受けました。"),
+      response([], "現在の状態を確認しました。"),
+      response([], "続きます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    await agent.deliberate({
+      message: "安全状態を再確認して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: { ...context, requestKind: "runtime_reassessment" },
+    });
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    const thirdInput = JSON.stringify(fake.requests[2]?.input);
+    expect(thirdInput).toContain("木を集めて");
+    expect(thirdInput).toContain("依頼を受けました。");
+    expect(thirdInput).toContain("続けて");
+    expect(thirdInput).not.toContain("安全状態を再確認して");
+    expect(thirdInput).not.toContain("現在の状態を確認しました。");
+  });
+
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {
     const fake = new ScriptedOpenAI([
       response([

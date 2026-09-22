@@ -3,6 +3,7 @@ import type OpenAI from "openai";
 export interface RecordedOpenAIRequest {
   parallel_tool_calls?: boolean | null;
   store?: boolean | null;
+  instructions?: string;
   input?: unknown;
 }
 
