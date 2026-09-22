@@ -111,6 +111,26 @@ describe("TaskRuntime", () => {
     expect(stopped).toBe(1);
   });
 
+  it("preserves a timeout code when cancellation comes from a deadline", async () => {
+    const store = new InMemoryTaskStore();
+    const runtime = new TaskRuntime(store, async () => undefined);
+    const running = runtime.run("long", {}, async ({ signal }) => {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      throw signal.reason;
+    });
+    await Promise.resolve();
+
+    await runtime.cancel("deadline", "TASK_TIMEOUT");
+    const result = await running;
+
+    expect(result).toMatchObject({
+      status: "cancelled",
+      failure: { category: "cancelled", code: "TASK_TIMEOUT" },
+    });
+  });
+
   it("refuses a second main task", async () => {
     const runtime = new TaskRuntime(
       new InMemoryTaskStore(),

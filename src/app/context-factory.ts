@@ -127,20 +127,26 @@ export class CompanionContextFactory implements ChatContextFactory {
             `[world_memory:${memory.source}] ${memory.kind} ${memory.name}: ${memory.description} (${memory.dimension} ${String(memory.x)}, ${String(memory.y)}, ${String(memory.z)}; ${memory.updatedAt})`,
           );
         }
-        const recentTasks = await safeWithTraceSpan(
-          this.traceService,
-          "memory_read",
-          "task履歴を参照",
-          { summary: "task履歴を参照" },
-          async () =>
-            this.memoryStore.listRecentTaskRuns(
-              this.playerId,
-              Math.min(2, this.config.limits.memoryContextLimit),
-            ),
-        );
+        const recentTasks = (
+          await safeWithTraceSpan(
+            this.traceService,
+            "memory_read",
+            "task履歴を参照",
+            { summary: "task履歴を参照" },
+            async () =>
+              this.memoryStore.listRecentTaskRuns(
+                this.playerId,
+                // The newest task is the authoritative result for a current
+                // question. Older failures are retained in storage but are not
+                // placed beside it where the model could mistake them for the
+                // current state.
+                Math.min(1, this.config.limits.memoryContextLimit),
+              ),
+          )
+        ).slice(0, 1);
         for (const task of recentTasks) {
           contextLines.push(
-            `[task] ${task.kind} ${task.status}/${task.phase}${task.failure === undefined ? "" : ` failure=${task.failure.code}`} (${task.updatedAt})`,
+            `[latest_task] 最新の作業結果: ${task.kind} ${task.status}/${task.phase}${task.failure === undefined ? "" : ` failure=${task.failure.code}`} (${task.updatedAt})`,
           );
         }
         const remaining = Math.max(

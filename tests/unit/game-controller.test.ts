@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { CompanionGameController } from "../../src/app/game-controller.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
-import { TaskRuntime } from "../../src/runtime/task-service.js";
+import { TaskRuntime, type TaskStore } from "../../src/runtime/task-service.js";
 import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
 import { MoveToSkill } from "../../src/skills/move-to.js";
@@ -17,12 +17,17 @@ import { ToolExecutor } from "../../src/tools/executor.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
-function createController(minecraft: FakeMinecraft) {
+function createController(
+  minecraft: FakeMinecraft,
+  withPlayer = false,
+  taskStore: TaskStore = new InMemoryTaskStore(),
+) {
   const directory = mkdtempSync(join(tmpdir(), "mc-game-controller-"));
   const memory = MemoryStore.open(join(directory, "memory.sqlite"));
-  const tasks = new TaskRuntime(new InMemoryTaskStore(), () =>
-    minecraft.stopCurrentAction(),
-  );
+  const playerId = withPlayer
+    ? memory.getOrCreatePlayer("owner").id
+    : undefined;
+  const tasks = new TaskRuntime(taskStore, () => minecraft.stopCurrentAction());
   const arbiter = new ActionArbiter();
   return {
     tasks,
@@ -43,11 +48,13 @@ function createController(minecraft: FakeMinecraft) {
       }),
       returnToPlayer: new ReturnToPlayerSkill(minecraft, tasks, arbiter),
       ownerUsername: "owner",
+      ...(playerId === undefined ? {} : { playerId }),
       taskTimeoutMs: 2_000,
       retryLimit: 1,
       logger: pino({ level: "silent" }),
       memory,
     }),
+    memory,
     close: () => {
       memory.close();
       rmSync(directory, { recursive: true, force: true });
@@ -132,6 +139,7 @@ describe("CompanionGameController", () => {
     const report = await follow;
 
     expect(status.activeTaskState).toContain("移動が進まなかった");
+    expect(status.activeTaskSummary).toContain("移動が進まなかった");
     expect(report).toMatchObject({
       outcome: "failed",
       failureCategory: "safety",
@@ -409,6 +417,151 @@ describe("CompanionGameController", () => {
       }
     },
   );
+
+  it("uses the newest persisted task when the runtime has no live task", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, memory, close } = createController(minecraft, true);
+    const playerId = memory.getOrCreatePlayer("owner").id;
+    memory.createTaskRun({
+      playerId,
+      kind: "follow_player",
+      phase: "following",
+      status: "completed",
+      input: {},
+    });
+
+    const status = await game.observeStatus();
+
+    expect(status.activeTaskState).toBeNull();
+    expect(status.latestTaskState).toBe("直前のMinecraft作業は完了しました。");
+    close();
+  });
+
+  it.each(["queued", "running", "suspended"] as const)(
+    "does not present a persisted %s task as active after restart",
+    async (status) => {
+      const minecraft = new FakeMinecraft();
+      const { game, memory, close } = createController(minecraft, true);
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status,
+        input: {},
+      });
+
+      const observed = await game.observeStatus();
+
+      expect(observed.activeTaskState).toBeNull();
+      expect(observed.activeTaskSummary).toBeNull();
+      expect(observed.latestTaskState).toContain(
+        "現在その作業が続いていることは確認できません",
+      );
+      close();
+    },
+  );
+
+  it("reports a live queued task as waiting until its first save completes", async () => {
+    let releaseSave!: () => void;
+    let notifySaveStarted!: () => void;
+    const saveStarted = new Promise<void>((resolve) => {
+      notifySaveStarted = resolve;
+    });
+    const saveHeld = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    let firstSave = true;
+    const taskStore: TaskStore = {
+      save: async () => {
+        if (firstSave) {
+          firstSave = false;
+          notifySaveStarted();
+          await saveHeld;
+        }
+      },
+    };
+    const { game, tasks, close } = createController(
+      new FakeMinecraft(),
+      false,
+      taskStore,
+    );
+    const task = tasks.run("follow_player", {}, async () => undefined);
+    await saveStarted;
+
+    const status = await game.observeStatus();
+    expect(status.activeTaskSummary).toBe(
+      "Minecraft作業の開始を待っています。",
+    );
+    expect(status.latestTaskState).toBe("Minecraft作業の開始を待っています。");
+
+    releaseSave();
+    await task;
+    close();
+  });
+
+  it("keeps a safe persisted failure reason for direct status questions", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, memory, close } = createController(minecraft, true);
+    const playerId = memory.getOrCreatePlayer("owner").id;
+    const task = memory.createTaskRun({
+      playerId,
+      kind: "move_to",
+      phase: "moving",
+      status: "running",
+      input: {},
+    });
+    memory.updateTaskRun({
+      taskRunId: task.id,
+      status: "failed",
+      phase: "moving",
+      failure: {
+        category: "path",
+        code: "PATH_BLOCKED",
+        message: "raw internal failure detail",
+        retryable: true,
+      },
+    });
+
+    const status = await game.observeStatus();
+
+    expect(status.latestTaskState).toContain("経路を確認できませんでした。");
+    expect(status.latestTaskState).not.toContain("PATH_BLOCKED");
+    expect(status.latestTaskState).not.toContain("raw internal failure detail");
+    close();
+  });
+
+  it("keeps a persisted timeout distinct from an owner stop", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, memory, close } = createController(minecraft, true);
+    const playerId = memory.getOrCreatePlayer("owner").id;
+    const task = memory.createTaskRun({
+      playerId,
+      kind: "follow_player",
+      phase: "following",
+      status: "running",
+      input: {},
+    });
+    memory.updateTaskRun({
+      taskRunId: task.id,
+      status: "cancelled",
+      phase: "following",
+      failure: {
+        category: "cancelled",
+        code: "TASK_TIMEOUT",
+        message: "設定された作業時間を超過",
+        retryable: false,
+      },
+    });
+
+    const status = await game.observeStatus();
+
+    expect(status.latestTaskState).toContain(
+      "設定時間内に完了しませんでした。",
+    );
+    expect(status.latestTaskState).not.toContain("停止指示で中断しました");
+    close();
+  });
 
   it("reports acquired and held counts when gathering is stopped after pickup", async () => {
     const signal = new AbortController();

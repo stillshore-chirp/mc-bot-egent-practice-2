@@ -116,6 +116,53 @@ describe("explicit delivery target registration", () => {
       ),
     ).toMatchObject({ success: true });
   });
+  it("keeps a scoped delivery-target write on the named target kind", async () => {
+    const { delivery, signal } = setup();
+    const executor = new ToolExecutor();
+    const scoped = {
+      requesterUsername: "owner",
+      authorizedOwnerUsername: "owner",
+      requestKind: "owner_message",
+      signal,
+      game: { delivery },
+      executionEvidence: { verifiedActionReceipts: [] },
+      allowedActionToolNames: [
+        "register_delivery_target",
+        "forget_delivery_target",
+      ],
+      allowedDeliveryTargetKinds: ["home"],
+    } as unknown as ToolContext;
+
+    expect(
+      await executor.execute(
+        "register_delivery_target",
+        JSON.stringify({ kind: "chest", position: null }),
+        scoped,
+      ),
+    ).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_TARGET_NOT_ALLOWED" },
+    });
+    expect(
+      await executor.execute(
+        "register_delivery_target",
+        JSON.stringify({ kind: "home", position: null }),
+        scoped,
+      ),
+    ).toMatchObject({ success: true });
+    expect(delivery.list().map((target) => target.kind)).toEqual(["home"]);
+    expect(
+      await executor.execute(
+        "forget_delivery_target",
+        JSON.stringify({ kind: "chest" }),
+        scoped,
+      ),
+    ).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_TARGET_NOT_ALLOWED" },
+    });
+    expect(delivery.list().map((target) => target.kind)).toEqual(["home"]);
+  });
   it("does not modify a target while a task holds the action lock", async () => {
     const { delivery, arbiter, signal } = setup();
     await delivery.register("home", null, signal);

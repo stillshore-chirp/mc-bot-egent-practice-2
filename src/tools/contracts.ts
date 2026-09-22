@@ -98,6 +98,10 @@ export interface GameStatus {
   position: Position | null;
   inventory: Readonly<Record<string, number>>;
   activeTaskState: string | null;
+  /** Plain-language summary of the currently running task, when any. */
+  readonly activeTaskSummary?: string | null;
+  /** Latest task outcome, including terminal work, in plain user-facing text. */
+  readonly latestTaskState?: string | null;
 }
 
 export interface Surroundings {
@@ -298,6 +302,14 @@ export interface ToolContext {
   };
   /** Internal marker set only while the deterministic plan executor runs a step. */
   safeActionStepExecution?: boolean;
+  /** False while a stopped owner goal is discussed; also blocks memory writes. */
+  allowActionTools?: boolean;
+  /** Trusted per-request action and memory-write scope. */
+  allowedActionToolNames?: readonly string[];
+  /** Requested delivery-target kinds for registration or forgetting. */
+  allowedDeliveryTargetKinds?: readonly ("home" | "chest")[];
+  /** Called only after the public say tool has delivered a message. */
+  recordDeliveredAssistantMessage?: (message: string) => void;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;
