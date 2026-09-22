@@ -505,6 +505,38 @@ export const toolDefinitions = [
             planned.question,
           );
         }
+        const intermediateCountBefore = intermediateProgress.reduce(
+          (total, previous) => total + previous.completedCount,
+          0,
+        );
+        const intermediateRequestedCount = planned.candidate.requestedCount;
+        if (
+          (planned.candidate.intermediateItems?.length ?? 0) > 0 &&
+          (intermediateRequestedCount === undefined ||
+            !Number.isInteger(intermediateRequestedCount) ||
+            intermediateRequestedCount < 1 ||
+            intermediateCountBefore + intermediateRequestedCount > actionCount)
+        ) {
+          return safeActionFailure(
+            "safety",
+            "SAFE_ACTION_INTERMEDIATE_LIMIT",
+            false,
+            planned.candidate.id,
+            {
+              candidateId: planned.candidate.id,
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+              intermediateCount: intermediateCountBefore,
+              intermediateLimit: actionCount,
+            },
+            [
+              "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
+            ],
+            "中間素材の上限に達したため、追加の資源操作を開始せず停止しました。",
+          );
+        }
         completedCandidateIds.push(planned.candidate.id);
         planReasons.push(planned.reason);
         const successfulResults: Extract<

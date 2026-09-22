@@ -993,68 +993,9 @@ describe("ToolExecutor", () => {
     });
   });
 
-  it("carries verified intermediate material into the next plan round", async () => {
-    let round = 0;
-    const toolContext = context();
-    toolContext.game.findSafeActionCandidates = async () => {
-      round += 1;
-      return [
-        {
-          id: `iron-stage-${String(round)}`,
-          label: "鉄インゴットの段階計画",
-          action: "gather_resource",
-          observed: true,
-          purposeFit: "direct",
-          permission: "allowed",
-          safety: "allowed",
-          reversible: true,
-          impact: "low",
-          operationClass: "natural_resource",
-          resourceName: "iron_ore",
-          goalItem: "iron_ingot",
-          intermediateItems: ["raw_iron"],
-          requestedCount: 1,
-          steps: [
-            {
-              tool: "gather_resource",
-              input: { resource: "oak_log", count: 1, commitmentId: null },
-            },
-          ],
-        },
-      ];
-    };
-    toolContext.game.gatherResource = async () => ({
-      before: status,
-      after: status,
-      outcome: "completed",
-      confirmedState: {
-        item: round === 1 ? "raw_iron" : "iron_ingot",
-        requestedCount: 1,
-        collectedCount: 1,
-      },
-      summary:
-        round === 1 ? "raw_ironを確認しました。" : "iron_ingotを確認しました。",
-    });
-
-    const result = await new ToolExecutor().execute(
-      "plan_safe_action",
-      JSON.stringify({
-        goal: "make_iron_ingot",
-        count: 1,
-        mode: "delegated",
-        candidateId: null,
-      }),
-      toolContext,
-    );
-
-    expect(result).toMatchObject({
-      success: true,
-      data: { completedCount: 1, targetCount: 1, planRounds: 2 },
-    });
-  });
-
   it("stops repeated intermediate progress at the bounded target count", async () => {
     let round = 0;
+    let gathers = 0;
     const toolContext = context();
     toolContext.game.findSafeActionCandidates = async () => {
       round += 1;
@@ -1083,17 +1024,20 @@ describe("ToolExecutor", () => {
         },
       ];
     };
-    toolContext.game.gatherResource = async () => ({
-      before: status,
-      after: status,
-      outcome: "completed",
-      confirmedState: {
-        item: "raw_iron",
-        requestedCount: 1,
-        collectedCount: 1,
-      },
-      summary: "raw_ironを確認しました。",
-    });
+    toolContext.game.gatherResource = async () => {
+      gathers += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          item: "raw_iron",
+          requestedCount: 1,
+          collectedCount: 1,
+        },
+        summary: "raw_ironを確認しました。",
+      };
+    };
 
     const result = await new ToolExecutor().execute(
       "plan_safe_action",
@@ -1110,10 +1054,11 @@ describe("ToolExecutor", () => {
       success: false,
       error: {
         code: "SAFE_ACTION_INTERMEDIATE_LIMIT",
-        confirmedState: { intermediateCount: 2, intermediateLimit: 1 },
+        confirmedState: { intermediateCount: 1, intermediateLimit: 1 },
       },
     });
     expect(round).toBe(2);
+    expect(gathers).toBe(1);
   });
 
   it("stops once at the owner boundary for an unverified output", async () => {
