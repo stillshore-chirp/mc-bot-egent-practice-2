@@ -51,6 +51,10 @@ interface DeliveredReplyRecorder {
     requestKind: ToolContext["requestKind"],
     text: string,
   ) => void;
+  recordCancelledRequest?: (
+    requesterUsername: string,
+    requestKind: ToolContext["requestKind"],
+  ) => void;
 }
 
 async function safeWithTraceSpan<T>(
@@ -184,6 +188,8 @@ export class ChatCoordinator {
           },
           () => this.#game.stopCurrentAction("利用者の即時停止指示"),
         );
+        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+        recorder.recordCancelledRequest?.(username, "owner_message");
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -201,6 +207,8 @@ export class ChatCoordinator {
         else await safeWithTrace(this.#traceService, session, stop);
         await safeCompleteTrace(session, "succeeded", "停止結果を送信");
       } catch (error) {
+        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+        recorder.recordCancelledRequest?.(username, "owner_message");
         await safeCompleteTrace(session, "failed", "停止処理に失敗");
         throw error;
       }

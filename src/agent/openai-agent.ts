@@ -296,6 +296,16 @@ export class OpenAIDeliberationAgent {
     }
   }
 
+  public recordCancelledRequest(
+    requesterUsername: string,
+    requestKind: ToolContext["requestKind"],
+  ): void {
+    if (requestKind === "owner_message") {
+      this.#pendingOwnerTurns.delete(requesterUsername);
+      this.#conversation.recordCancellation(requesterUsername);
+    }
+  }
+
   #recordAssistantDelivery(requesterUsername: string, text: string): void {
     const pending = this.#pendingOwnerTurns.get(requesterUsername);
     if (pending === undefined) return;

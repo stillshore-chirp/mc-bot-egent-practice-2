@@ -280,6 +280,52 @@ describe("OpenAI tool loop", () => {
     );
   });
 
+  it("keeps a cancellation boundary after a delivered progress message", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-progress",
+          name: "say",
+          arguments: JSON.stringify({ message: "木を探しています。" }),
+          status: "completed",
+        },
+      ]),
+      response([], "採取を続けます。"),
+      response([], "停止済みなので再開の指示を待ちます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({
+      message: "もっと短く",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests[2]?.instructions).toContain(
+      "直前の作業は停止済みです",
+    );
+    expect(JSON.stringify(fake.requests[2]?.input)).toContain(
+      "明示的に再開するまで自動で続けません。",
+    );
+  });
+
   it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {
     const fake = new ScriptedOpenAI([
       response([], "鉄を20個ですね。確認しました。"),

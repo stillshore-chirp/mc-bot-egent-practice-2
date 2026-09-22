@@ -74,4 +74,29 @@ describe("conversation context", () => {
       ),
     ).toEqual({ concise: false, avoidJargon: true });
   });
+
+  it("keeps a cancellation boundary until the user explicitly resumes", () => {
+    const store = new ConversationContextStore();
+    store.recordUser("owner", "木を集めて。");
+    store.recordAssistant("owner", "木を探します。");
+    store.recordCancellation("owner");
+
+    const snapshot = store.snapshot("owner");
+    expect(snapshot.cancelledGoal).toBe(true);
+    expect(renderConversationContext(snapshot)).toContain(
+      "直前の作業は停止済みです",
+    );
+    expect(renderConversationContext(snapshot)).toContain(
+      "明示された場合だけ再開",
+    );
+  });
+
+  it("allows jargon again when the user permits avoiding it", () => {
+    expect(
+      updateConversationPreferences(
+        { concise: false, avoidJargon: true },
+        "専門用語を避けなくていい。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: false });
+  });
 });

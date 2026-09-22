@@ -13,6 +13,7 @@ export interface ConversationPreferences {
 export interface ConversationSnapshot {
   readonly turns: readonly ConversationTurn[];
   readonly preferences: ConversationPreferences;
+  readonly cancelledGoal: boolean;
 }
 
 const MAX_TURNS = 8;
@@ -44,6 +45,12 @@ function requestsJargon(message: string): boolean {
   );
 }
 
+function permitsJargon(message: string): boolean {
+  return /(避けなくていい|避けなくてもいい|使っていい|使ってもいい)/u.test(
+    message,
+  );
+}
+
 function requestsConcise(message: string): boolean {
   return (
     /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(message) ||
@@ -71,15 +78,17 @@ export function updateConversationPreferences(
     concise: requestsDetailed(normalized)
       ? false
       : requestsConcise(normalized) || previous.concise,
-    avoidJargon: requestsJargon(normalized)
-      ? false
-      : mentionsAvoidJargon(normalized) || previous.avoidJargon,
+    avoidJargon:
+      permitsJargon(normalized) || requestsJargon(normalized)
+        ? false
+        : mentionsAvoidJargon(normalized) || previous.avoidJargon,
   };
 }
 
 interface ConversationState {
   turns: ConversationTurn[];
   preferences: ConversationPreferences;
+  cancelledGoal: boolean;
 }
 
 /**
@@ -92,11 +101,16 @@ export class ConversationContextStore {
   public snapshot(key: string): ConversationSnapshot {
     const state = this.#sessions.get(key);
     if (state === undefined) {
-      return { turns: [], preferences: DEFAULT_PREFERENCES };
+      return {
+        turns: [],
+        preferences: DEFAULT_PREFERENCES,
+        cancelledGoal: false,
+      };
     }
     return {
       turns: [...state.turns],
       preferences: state.preferences,
+      cancelledGoal: state.cancelledGoal,
     };
   }
 
@@ -121,12 +135,23 @@ export class ConversationContextStore {
     this.#append(this.#state(key), { role: "assistant", text: message });
   }
 
+  public recordCancellation(key: string): void {
+    const state = this.#state(key);
+    if (state.cancelledGoal) return;
+    state.cancelledGoal = true;
+    this.#append(state, {
+      role: "assistant",
+      text: "直前の作業は停止しました。明示的に再開するまで自動で続けません。",
+    });
+  }
+
   #state(key: string): ConversationState {
     const existing = this.#sessions.get(key);
     if (existing !== undefined) return existing;
     const created: ConversationState = {
       turns: [],
       preferences: DEFAULT_PREFERENCES,
+      cancelledGoal: false,
     };
     this.#sessions.set(key, created);
     return created;
@@ -161,6 +186,11 @@ export function renderConversationContext(
   if (snapshot.preferences.avoidJargon) {
     lines.push(
       "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
+    );
+  }
+  if (snapshot.cancelledGoal) {
+    lines.push(
+      "直前の作業は停止済みです。「短く」「詳しく」など説明方法だけの指示では再開せず、「続けて」「再開して」または新しい対象と動作が明示された場合だけ再開してください。",
     );
   }
   return lines.join("\n");
