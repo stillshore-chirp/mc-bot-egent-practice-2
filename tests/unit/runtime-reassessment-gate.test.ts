@@ -133,6 +133,31 @@ describe("RuntimeReassessmentGate", () => {
     await gate.stop();
   });
 
+  it("accepts a fresh transition after an earlier tick was cancelled", async () => {
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+        return "completed" as const;
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+    });
+    const staleGeneration = gate.captureGeneration();
+
+    gate.cancelPending("owner_message");
+    gate.request(
+      { event: "safety_failed", stateKey: "danger:new" },
+      staleGeneration,
+    );
+    gate.request({ event: "safety_failed", stateKey: "danger:new" });
+    await gate.stop();
+
+    expect(seen).toEqual(["safety_failed"]);
+    expect(gate.stats).toMatchObject({ completed: 1, suppressed: 1 });
+  });
+
   it("drops stale pending work when the active state recurs", async () => {
     let release!: () => void;
     const seen: string[] = [];

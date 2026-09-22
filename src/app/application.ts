@@ -443,8 +443,6 @@ class DefaultCompanionApplication implements CompanionApplication {
 
   async #runReflexTick(): Promise<void> {
     if (this.#shutdownPromise !== undefined) return;
-    const reassessmentGeneration =
-      this.#runtimeReassessments.captureGeneration();
     try {
       const snapshot = await this.#minecraft.observe();
       if (this.#connection.state === "connected") {
@@ -455,7 +453,6 @@ class DefaultCompanionApplication implements CompanionApplication {
         this.#observationUnavailable = false;
         this.#requestRuntimeReassessment(
           "connection_recovered",
-          reassessmentGeneration,
           runtimeReassessmentState(
             "connection_recovered",
             { state: "safe" },
@@ -520,7 +517,6 @@ class DefaultCompanionApplication implements CompanionApplication {
       if (reassessment !== undefined) {
         this.#requestRuntimeReassessment(
           reassessment,
-          reassessmentGeneration,
           runtimeReassessmentState(reassessment, previousReflexState, state),
         );
       }
@@ -577,7 +573,6 @@ class DefaultCompanionApplication implements CompanionApplication {
 
   #requestRuntimeReassessment(
     event: RuntimeReassessmentEvent,
-    generation?: number,
     context: { readonly stateKey: string; readonly causeKey?: string } = {
       stateKey: event,
     },
@@ -586,7 +581,7 @@ class DefaultCompanionApplication implements CompanionApplication {
       event,
       ...context,
     };
-    this.#runtimeReassessments.request(request, generation);
+    this.#runtimeReassessments.request(request);
   }
 
   #createDashboard(
