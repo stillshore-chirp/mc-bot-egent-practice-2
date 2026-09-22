@@ -45,13 +45,13 @@ export type RuntimeReassessmentEvent =
   | "safety_failed"
   | "connection_recovered";
 
-type DeliveredReplyRecorder = {
+interface DeliveredReplyRecorder {
   recordDeliveredReply?: (
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
     text: string,
   ) => void;
-};
+}
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
