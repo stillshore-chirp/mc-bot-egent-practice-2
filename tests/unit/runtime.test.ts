@@ -191,6 +191,36 @@ describe("TaskRuntime", () => {
       ),
     ).toBe(true);
   });
+
+  it("does not retain an interrupted record after the suspended run has ended", async () => {
+    const runtime = new TaskRuntime(
+      new InMemoryTaskStore(),
+      async () => undefined,
+    );
+    let started!: () => void;
+    const taskStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const first = runtime.run("follow_player", {}, async ({ signal }) => {
+      started();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      throw signal.reason;
+    });
+    await taskStarted;
+    await runtime.suspend("reflex:stuck");
+    await first;
+
+    await runtime.run("move_to", {}, async () => ({ restarted: true }));
+
+    const interruptedRecords = (
+      runtime as unknown as {
+        interruptedRecords: Map<string, TaskRecord>;
+      }
+    ).interruptedRecords;
+    expect(interruptedRecords.size).toBe(0);
+  });
 });
 
 describe("retry", () => {

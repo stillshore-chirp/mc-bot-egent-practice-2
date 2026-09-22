@@ -30,6 +30,7 @@ export class TaskRuntime {
   private active: TaskRecord | undefined;
   private controller: AbortController | undefined;
   private readonly interruptedRecords = new Map<string, TaskRecord>();
+  private readonly pendingExecutions = new Set<string>();
   private suspendedReplacement: Promise<void> | undefined;
   private activeTraceSpan: ActiveTraceSpan | undefined;
   private activePhaseTraceSpan: ActiveTraceSpan | undefined;
@@ -131,6 +132,7 @@ export class TaskRuntime {
       return this.active as TaskRecord<Input, Output>;
     }
     await this.startPhaseTraceSpan(record.phase);
+    this.pendingExecutions.add(record.id);
 
     const context: TaskContext = {
       taskId: record.id,
@@ -192,6 +194,7 @@ export class TaskRuntime {
         }),
       }) as TaskRecord<Input, Output>;
     } finally {
+      this.pendingExecutions.delete(record.id);
       if (this.controller === controller) this.controller = undefined;
     }
     if (!this.isCurrentTask(record.id)) {
@@ -393,7 +396,11 @@ export class TaskRuntime {
         failedAt: active.phase,
       },
     });
-    this.interruptedRecords.set(active.id, replaced);
+    if (this.pendingExecutions.has(active.id)) {
+      this.interruptedRecords.set(active.id, replaced);
+    } else {
+      this.interruptedRecords.delete(active.id);
+    }
     this.active = replaced;
     this.controller?.abort(new Error(reason));
     // suspend() has already stopped Minecraft controls before this task can
