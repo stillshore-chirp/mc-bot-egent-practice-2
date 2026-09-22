@@ -3,7 +3,7 @@ import type { MemoryStore } from "../memory/store.js";
 import type { JsonObject, JsonValue } from "../memory/types.js";
 import { currentCorrelationId } from "../observability/correlation.js";
 import type { TaskStore } from "../runtime/task-service.js";
-import type { MemoryPort } from "../tools/contracts.js";
+import type { BehaviorMemoryPort, MemoryPort } from "../tools/contracts.js";
 
 const PRIVATE_TASK_KEYS = new Set(["username", "requester", "playerName"]);
 
@@ -39,6 +39,29 @@ export class ToolMemoryAdapter implements MemoryPort {
     input: Parameters<MemoryPort["completeCommitment"]>[0],
   ) {
     return this.store.completeCommitment(input);
+  }
+}
+
+export class ToolBehaviorMemoryAdapter implements BehaviorMemoryPort {
+  public constructor(private readonly store: MemoryStore) {}
+
+  public remember(input: Parameters<BehaviorMemoryPort["remember"]>[0]) {
+    return this.store.rememberBehaviorMemory(input);
+  }
+
+  public correct(input: Parameters<BehaviorMemoryPort["correct"]>[0]) {
+    return this.store.correctBehaviorMemory(input);
+  }
+
+  public list(
+    playerId: string,
+    input?: Parameters<BehaviorMemoryPort["list"]>[1],
+  ) {
+    return this.store.listBehaviorMemories(playerId, input);
+  }
+
+  public forget(input: Parameters<BehaviorMemoryPort["forget"]>[0]) {
+    return this.store.forgetBehaviorMemories(input);
   }
 }
 

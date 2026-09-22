@@ -55,6 +55,90 @@ export const worldMemoryStatuses = [
 ] as const;
 export type WorldMemoryStatus = (typeof worldMemoryStatuses)[number];
 
+/**
+ * Durable behavior memory is deliberately separate from player facts.  The
+ * slots describe how the companion should communicate or plan; they never
+ * grant permission and cannot change safety or authentication rules.
+ */
+export const behaviorMemoryCategories = [
+  "communication",
+  "autonomy",
+  "workflow",
+  "planning",
+  "feedback",
+  "general",
+] as const;
+export type BehaviorMemoryCategory = (typeof behaviorMemoryCategories)[number];
+
+export const behaviorMemorySources = [
+  "owner_explicit",
+  "owner_correction",
+  "owner_feedback",
+] as const;
+export type BehaviorMemorySource = (typeof behaviorMemorySources)[number];
+
+export const behaviorMemoryConfidences = [
+  "explicit",
+  "corrected",
+  "repeated_feedback",
+  "corroborated",
+] as const;
+export type BehaviorMemoryConfidence =
+  (typeof behaviorMemoryConfidences)[number];
+
+export const behaviorMemoryScopes = ["owner_global"] as const;
+export type BehaviorMemoryScope = (typeof behaviorMemoryScopes)[number];
+
+export const behaviorMemoryStatuses = [
+  "active",
+  "superseded",
+  "retracted",
+] as const;
+export type BehaviorMemoryStatus = (typeof behaviorMemoryStatuses)[number];
+
+export interface BehaviorMemoryRecord {
+  readonly id: string;
+  readonly playerId: string;
+  readonly category: BehaviorMemoryCategory;
+  /** A stable slot for known preferences or a bounded hash for open-ended ones. */
+  readonly slot: string;
+  /** A canonical value or a short, sanitized owner-stated summary. */
+  readonly value: string;
+  readonly summary: string;
+  readonly source: BehaviorMemorySource;
+  readonly confidence: BehaviorMemoryConfidence;
+  readonly scope: BehaviorMemoryScope;
+  /** Number of independent owner feedback signals supporting this record. */
+  readonly supportCount: number;
+  readonly status: BehaviorMemoryStatus;
+  readonly supersededById?: string;
+  readonly retractionReason?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface RememberBehaviorMemoryInput {
+  readonly playerId: string;
+  readonly category: BehaviorMemoryCategory;
+  readonly slot: string;
+  readonly value: string;
+  readonly summary: string;
+  readonly source: BehaviorMemorySource;
+  readonly confidence: BehaviorMemoryConfidence;
+  readonly scope?: BehaviorMemoryScope;
+  readonly supportCount?: number;
+  /** Used when a natural-language correction targets a listed record. */
+  readonly supersedesId?: string;
+}
+
+export interface ForgetBehaviorMemoryInput {
+  readonly playerId: string;
+  readonly memoryId?: string;
+  readonly category?: BehaviorMemoryCategory;
+  readonly slot?: string;
+  readonly reason?: string;
+}
+
 export interface PlayerRecord {
   readonly id: string;
   readonly externalName: string;
