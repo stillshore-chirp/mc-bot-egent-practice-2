@@ -20,6 +20,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     private static final String CHANNEL = "companion:tree_guard";
     private static final String ACTION_CHANNEL = "companion:action_guard";
     private static final int ACTION_LEDGER_SCHEMA_VERSION = 1;
+    private static final long ACTION_PERMIT_TTL_MILLIS = 10_000L;
     private final GrowthLedger ledger = new GrowthLedger();
     private final ActionLedger actionLedger = new ActionLedger();
     private Set<String> botNames = Set.of();
@@ -224,7 +225,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             String requestedName = request.get("name").getAsString().toLowerCase(Locale.ROOT);
             JsonObject position = request.getAsJsonObject("position");
             int x = position.get("x").getAsInt(), y = position.get("y").getAsInt(), z = position.get("z").getAsInt();
-            if (!id.matches("[a-f0-9-]{36}") || !Set.of("mine", "place").contains(operation)
+            if (!id.matches("[a-f0-9-]{36}") || !Set.of("mine", "place", "inspect").contains(operation)
                 || !requestedName.matches("[a-z0-9_]{1,64}")) return;
             World world = player.getWorld();
             if (Math.abs((long)x) > 30_000_000 || Math.abs((long)z) > 30_000_000
@@ -236,14 +237,19 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                 decision = requestedName.equals(name(block)) && log(block.getType())
                     ? decision(block) : requestedName.equals(name(block)) ? genericMineDecision(block) : "changed";
                 if (decision.equals("allowed")) {
-                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + 3_000);
+                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + ACTION_PERMIT_TTL_MILLIS);
                 }
-            } else {
+            } else if (operation.equals("place")) {
                 decision = block.getType().isAir() && !protectedArea(block) && !actionLedger.isSaturated()
                     ? "allowed" : "protected";
                 if (decision.equals("allowed")) {
-                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + 3_000);
+                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + ACTION_PERMIT_TTL_MILLIS);
                 }
+            } else {
+                // Read-only authoritative state check. It never grants a
+                // permit and is used after a client mutation to distinguish
+                // server-confirmed state from Mineflayer's optimistic cache.
+                decision = requestedName.equals(name(block)) ? "allowed" : "changed";
             }
             sendActionResult(player, id, decision);
         } catch (RuntimeException invalid) {

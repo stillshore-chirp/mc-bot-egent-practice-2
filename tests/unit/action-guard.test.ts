@@ -37,6 +37,23 @@ describe("generic action guard protocol", () => {
     expect(client.writes).toHaveLength(1);
   });
 
+  it("supports a read-only authoritative state check", async () => {
+    const client = new FakeClient();
+    await expect(
+      queryActionGuard(client as never, {
+        operation: "inspect",
+        name: "air",
+        position: { x: 1, y: 63, z: 0 },
+      }),
+    ).resolves.toBe("allowed");
+    const write = client.writes[0];
+    expect(write).toBeDefined();
+    expect(JSON.parse(write?.data.toString("utf8") ?? "{}")).toMatchObject({
+      operation: "inspect",
+      name: "air",
+    });
+  });
+
   it("fails closed for a protected decision", () => {
     try {
       requireActionPermission("protected");

@@ -6,7 +6,7 @@ import type { Position } from "../domain/snapshot.js";
 
 export const actionGuardChannel = "companion:action_guard";
 
-export type ActionGuardOperation = "mine" | "place";
+export type ActionGuardOperation = "mine" | "place" | "inspect";
 
 export type ActionGuardDecision =
   "allowed" | "unknown" | "protected" | "changed";

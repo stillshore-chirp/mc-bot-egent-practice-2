@@ -1114,6 +1114,27 @@ export class MineflayerClient implements MinecraftPort {
         );
       }
       throwIfAborted(signal, "mine_block");
+      // Mineflayer updates its local world optimistically when the dig timer
+      // completes. Re-read the authoritative server block before reporting
+      // success so a cancelled/expired permit cannot look like a completed
+      // mutation.
+      await delay(150, signal);
+      const serverState = await queryActionGuard(
+        bot._client,
+        { operation: "inspect", name: "air", position: target.position },
+        signal,
+      );
+      if (serverState !== "allowed") {
+        throw new AppError({
+          category: "resource",
+          code: "MINE_SERVER_STATE_UNVERIFIED",
+          message:
+            "The authoritative server did not confirm the target was removed",
+          retryable: true,
+          failedAt: "mine_block",
+          confirmedState: { decision: serverState },
+        });
+      }
       if (bot.blockAt(block.position)?.name === target.name) {
         throw new AppError({
           category: "resource",
@@ -1303,6 +1324,21 @@ export class MineflayerClient implements MinecraftPort {
     await bot.equip(item.id, "hand");
     await bot.placeBlock(referenceBlock, reference.face);
     throwIfAborted(signal, "place_block");
+    const serverState = await queryActionGuard(
+      bot._client,
+      { operation: "inspect", name: target.name, position: target.position },
+      signal,
+    );
+    if (serverState !== "allowed") {
+      throw new AppError({
+        category: "resource",
+        code: "PLACE_SERVER_STATE_UNVERIFIED",
+        message: "The authoritative server did not confirm the placed block",
+        retryable: true,
+        failedAt: "place_block",
+        confirmedState: { decision: serverState },
+      });
+    }
     if (bot.blockAt(targetPosition)?.name !== target.name) {
       throw new AppError({
         category: "inventory",
@@ -1396,7 +1432,7 @@ export class MineflayerClient implements MinecraftPort {
           before.inventory.find((entry) => entry.name === target.output)
             ?.count ?? 0;
         if (count - baseline >= target.count) return count - baseline;
-        if (furnace.outputItem?.() !== undefined) {
+        if (furnace.outputItem?.() != null) {
           await furnace.takeOutput();
         }
       }
