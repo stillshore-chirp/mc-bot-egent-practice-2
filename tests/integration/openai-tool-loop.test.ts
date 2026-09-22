@@ -248,6 +248,70 @@ describe("OpenAI tool loop", () => {
     expect(received).toEqual({ distance: 3, duration: 60 });
   });
 
+  it("keeps the previous follow available to an explicit short continuation after safety suspension", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "追従は安全上の理由で一時停止しました。"),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-resume-follow",
+          name: "follow_player",
+          arguments: JSON.stringify({
+            safeDistance: null,
+            maxDurationSeconds: null,
+          }),
+          status: "completed",
+        },
+      ]),
+      response([], "追従を再開しました。"),
+    ]);
+    const context = toolContext();
+    const followOwner = vi.fn(async () => ({
+      before: status,
+      after: status,
+      outcome: "completed" as const,
+      summary: "追従しました。",
+    }));
+    context.game.followOwner = followOwner;
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const suspendedWorld = JSON.stringify({
+      ...status,
+      activeTaskSummary:
+        "移動中にBotの位置が変わらず、追従を一時停止しました。",
+    });
+
+    const first = await agent.deliberate({
+      message: "来て",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: suspendedWorld,
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    const continuation = await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: suspendedWorld,
+      toolContext: context,
+    });
+
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "follow_player",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "安全上の一時停止後に利用者が『続けて』と指示した場合",
+    );
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain("来て");
+    expect(followOwner).toHaveBeenCalledWith(3, 60, expect.any(AbortSignal));
+    expect(continuation.text).toContain("追従しました");
+  });
+
   it("executes a bounded multi-step goal plan inside one delegated tool call", async () => {
     const fake = new ScriptedOpenAI([
       response([
