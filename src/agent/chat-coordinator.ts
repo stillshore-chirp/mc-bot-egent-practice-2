@@ -207,8 +207,6 @@ export class ChatCoordinator {
         else await safeWithTrace(this.#traceService, session, stop);
         await safeCompleteTrace(session, "succeeded", "停止結果を送信");
       } catch (error) {
-        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
-        recorder.recordCancelledRequest?.(username, "owner_message");
         await safeCompleteTrace(session, "failed", "停止処理に失敗");
         throw error;
       }

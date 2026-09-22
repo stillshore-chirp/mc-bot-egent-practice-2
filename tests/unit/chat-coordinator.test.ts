@@ -199,6 +199,32 @@ describe("immediate stop command", () => {
     );
   });
 
+  it("does not mark cancellation when stopping the action fails", async () => {
+    const recordCancelledRequest = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => {
+          throw new Error("STOP_FAILED");
+        }),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        recordCancelledRequest,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    await expect(coordinator.handleChat("owner", "停止")).rejects.toThrow(
+      "STOP_FAILED",
+    );
+    expect(recordCancelledRequest).not.toHaveBeenCalled();
+  });
+
   it("records a cancellation and response when the owner issues stop", async () => {
     const store = TraceStore.open(":memory:");
     const traceService = new TraceService(store, {
