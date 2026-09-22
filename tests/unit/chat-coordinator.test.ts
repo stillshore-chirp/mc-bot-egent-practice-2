@@ -78,6 +78,8 @@ describe("immediate stop command", () => {
     "止まれ説明して",
     "追従をやめてくれ",
     "採取をやめなさい",
+    "危険だから採取を停止",
+    "今から10分間採取を止めて",
   ])("accepts a targeted affirmative safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -117,13 +119,27 @@ describe("immediate stop command", () => {
     "止まれ？",
     "今すぐやめろと言っただけ",
     "「止まれ」と表示して",
+    "危険なら採取を停止",
+    "危険なら、採取を停止",
+    "危険になったら採取を止めて",
+    "危険な時は採取を停止",
+    "あと10分で採取を停止",
+    "あと10分で、採取を停止",
+    "10分後に止まれ",
+    "明日採取をやめて",
   ])(
-    "does not stop for a question, negation, quote, or explanation %s",
+    "does not stop for a question, negation, quote, condition, or future timing %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
   );
 
   it("does not treat an ordinary sentence as a stop command", () => {
     expect(isImmediateStopCommand("停止方法を教えて")).toBe(false);
+  });
+
+  it("still accepts a later explicit stop after a conditional clause", () => {
+    expect(
+      isImmediateStopCommand("危険なら、採取を停止、でも今すぐ止まれ"),
+    ).toBe(true);
   });
 
   it.each(["止まれ", "今すぐやめろ"])(

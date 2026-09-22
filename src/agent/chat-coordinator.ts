@@ -28,13 +28,34 @@ const TARGETED_STOP_COMMAND_PATTERN = new RegExp(
   `${stopTeForms}${stopTeSuffix}$|${stopImperatives}$|(?:停止|中止|中断|ストップ)$`,
   "u",
 );
+const DEFERRED_STOP_CONDITION_PATTERN =
+  /(?:もし|仮に|なら|たら|場合(?:は|に|$)|とき(?:は|に|$)|時(?:は|に|$)|(?:して|終わって|戻って)から)/u;
+const DEFERRED_STOP_TIME_PATTERN =
+  /(?:あとで|後で|後ほど|明日|次回|次に|(?:あと|後|今から|これから)\s*[0-9０-９一二三四五六七八九十]+\s*(?:秒|分|時間|日)(?:後|で|に|経ったら)|[0-9０-９一二三四五六七八九十]+\s*(?:秒|分|時間|日)(?:後|経ったら))/u;
 const STOP_FAILURE_MESSAGE =
   "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
 
 function splitStopClauses(message: string): string[] {
   const punctuationClauses =
     message.match(/[^、，,。！？!?]+(?:[、，,。！？!?]|$)/gu) ?? [];
-  return punctuationClauses
+  const grouped: string[] = [];
+  let deferredPrefix = "";
+  for (const clause of punctuationClauses) {
+    const combined = deferredPrefix + clause;
+    const normalized = normalizedStopClause(combined);
+    if (
+      /[、，,]$/u.test(clause) &&
+      hasDeferredStopPrefix(normalized) &&
+      !TARGETED_STOP_COMMAND_PATTERN.test(normalized)
+    ) {
+      deferredPrefix = combined;
+      continue;
+    }
+    grouped.push(combined);
+    deferredPrefix = "";
+  }
+  if (deferredPrefix.length > 0) grouped.push(deferredPrefix);
+  return grouped
     .flatMap((clause) => clause.split(/(?=代わりに|その代わり)/u))
     .flatMap(splitInlineStopClause)
     .map((clause) => clause.trim())
@@ -71,11 +92,20 @@ function normalizedStopClause(clause: string): string {
   return clause.replace(/[、，,。！!]$/u, "").trim();
 }
 
+function hasDeferredStopPrefix(prefix: string): boolean {
+  return (
+    DEFERRED_STOP_CONDITION_PATTERN.test(prefix) ||
+    DEFERRED_STOP_TIME_PATTERN.test(prefix)
+  );
+}
+
 function isStopClause(clause: string): boolean {
   if (/[?？]/u.test(clause)) return false;
   const normalized = normalizedStopClause(clause);
   if (/[「」『』“”"'`]/u.test(normalized)) return false;
-  return TARGETED_STOP_COMMAND_PATTERN.test(normalized);
+  const command = TARGETED_STOP_COMMAND_PATTERN.exec(normalized);
+  if (command === null) return false;
+  return !hasDeferredStopPrefix(normalized.slice(0, command.index));
 }
 
 function isSafeReadOnlyFollowUp(message: string): boolean {
