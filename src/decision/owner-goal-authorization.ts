@@ -77,6 +77,18 @@ const resourceGoals: readonly ResourceGoal[] = [
     targetItem: "raw_iron",
   },
   {
+    label: "銅インゴット",
+    aliases: ["銅インゴット", "copper ingot", "copper_ingot"],
+    allowedResources: ["copper_ore", "deepslate_copper_ore"],
+    targetItem: "copper_ingot",
+  },
+  {
+    label: "金インゴット",
+    aliases: ["金インゴット", "gold ingot", "gold_ingot"],
+    allowedResources: ["gold_ore", "deepslate_gold_ore"],
+    targetItem: "gold_ingot",
+  },
+  {
     label: "石炭",
     aliases: ["石炭鉱石", "石炭", "coal ore", "coal_ore", "coal"],
     allowedResources: ["coal_ore", "deepslate_coal_ore"],

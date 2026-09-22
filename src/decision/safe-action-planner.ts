@@ -5,6 +5,10 @@ import {
   type SafeChoiceCandidate,
   type SafeChoiceDecision,
 } from "./safe-choice.js";
+import {
+  knownBlockDrops,
+  knownSmeltInputs,
+} from "../minecraft/general-actions.js";
 
 export interface SafeActionStep {
   readonly tool: string;
@@ -20,6 +24,8 @@ export interface SafeActionObservationRequest {
   readonly goal: string;
   readonly count: number;
   readonly maxCandidates: number;
+  /** Supplied only by the authenticated owner request boundary. */
+  readonly authorization?: SafeChoiceAuthorization;
 }
 
 export interface SafeActionPlanRequest {
@@ -122,14 +128,7 @@ function isAuthorizedBound(
   remainingCount: number | undefined,
 ): boolean {
   if (authorization?.kind !== "owner_bounded_resource") return true;
-  if (candidate.operationClass !== "natural_resource") return false;
   if (authorization.goal.trim().length === 0) return false;
-  if (
-    candidate.resourceName === undefined ||
-    !authorization.allowedResources.includes(candidate.resourceName)
-  )
-    return false;
-  if (!stepsMatchResource(candidate, candidate.resourceName)) return false;
   if (
     authorization.targetItem !== "*" &&
     candidate.goalItem !== authorization.targetItem
@@ -157,10 +156,44 @@ function isAuthorizedBound(
       requestedCount > remainingCount)
   )
     return false;
+  if (
+    requestedCount <= 0 ||
+    requestedCount > authorization.targetCount ||
+    requestedCount > authorization.maxCount
+  )
+    return false;
+  if (candidate.action === "smelt_item") {
+    if (authorization.targetItem === "*") return false;
+    const requiredInput = knownSmeltInputs[authorization.targetItem];
+    const step = candidate.steps[0];
+    return (
+      requiredInput !== undefined &&
+      candidate.operationClass === "world_change" &&
+      candidate.scopeId === "inventory" &&
+      candidate.impact === "low" &&
+      !candidate.reversible &&
+      candidate.steps.length === 1 &&
+      step?.tool === "smelt_item" &&
+      step.input.input === requiredInput &&
+      step.input.output === authorization.targetItem &&
+      step.input.count === requestedCount &&
+      authorization.allowedResources.some(
+        (resource) => knownBlockDrops[resource] === requiredInput,
+      )
+    );
+  }
+  const resourceName = candidate.resourceName;
+  if (resourceName === undefined) return false;
+  const observedDrop = knownBlockDrops[resourceName];
+  if (observedDrop === undefined) return false;
   return (
-    requestedCount > 0 &&
-    requestedCount <= authorization.targetCount &&
-    requestedCount <= authorization.maxCount
+    candidate.operationClass === "natural_resource" &&
+    authorization.allowedResources.includes(resourceName) &&
+    (observedDrop === candidate.goalItem ||
+      (authorization.targetItem !== "*" &&
+        observedDrop === knownSmeltInputs[authorization.targetItem] &&
+        candidate.intermediateItems?.includes(observedDrop) === true)) &&
+    stepsMatchResource(candidate, resourceName)
   );
 }
 
@@ -168,13 +201,13 @@ function stepsMatchResource(
   candidate: SafeActionCandidate,
   resourceName: string,
 ): boolean {
-  const declaredResources = candidate.steps.flatMap((step) => {
-    const input = step.input;
-    return ["resource", "resourceName", "block", "blockName"].flatMap((key) =>
-      typeof input[key] === "string" ? [input[key]] : [],
-    );
-  });
-  return declaredResources.every((value) => value === resourceName);
+  if (candidate.steps.length !== 1) return false;
+  const step = candidate.steps[0];
+  if (step?.tool !== "gather_resource" && step?.tool !== "mine_block")
+    return false;
+  const declared =
+    step.tool === "gather_resource" ? step.input.resource : step.input.name;
+  return declared === resourceName;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -12,6 +12,8 @@ import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
 import { MoveToSkill } from "../../src/skills/move-to.js";
 import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
+import type { ToolContext } from "../../src/tools/contracts.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
@@ -287,6 +289,87 @@ describe("CompanionGameController", () => {
     ]);
     close();
   });
+
+  it.each([
+    ["鉄", "iron_ore", "iron_ingot", "raw_iron"],
+    ["銅", "copper_ore", "copper_ingot", "raw_copper"],
+  ])(
+    "executes one bounded %s goal across mining and smelting from provider observations",
+    async (_label, ore, ingot, raw) => {
+      const minecraft = new FakeMinecraft();
+      minecraft.availableFurnace = true;
+      minecraft.resources.push(
+        { name: ore, position: { x: 2, y: 63, z: 0 } },
+        { name: ore, position: { x: 3, y: 63, z: 0 } },
+      );
+      const { game, close } = createController(minecraft);
+      const authorization = {
+        kind: "owner_bounded_resource" as const,
+        goal: `${ingot}を1個作って`,
+        allowedResources: [ore],
+        targetItem: ingot,
+        targetCount: 1,
+        maxCount: 8,
+      };
+      const context: ToolContext = {
+        correlationId: "multi-stage-goal",
+        requesterUsername: "owner",
+        authorizedOwnerUsername: "owner",
+        playerId: "owner",
+        signal: new AbortController().signal,
+        requestKind: "owner_message",
+        safeActionAuthorization: authorization,
+        safeActionAuthorizationUsage: {
+          remainingCount: 1,
+          consumed: false,
+        },
+        executionEvidence: { verifiedActionReceipts: [] },
+        game,
+        memory: {
+          rememberPlayerFact: () => ({}),
+          rememberLocation: () => ({}),
+          recall: () => [],
+          setCommitment: () => ({ id: "unused" }),
+          getCommitment: () => undefined,
+          completeCommitment: () => ({}),
+        },
+        limits: {
+          maxMoveDistance: 128,
+          maxGatherCount: 16,
+          maxSafeActionDurationMs: 5_000,
+          followDistance: 3,
+          memoryContextLimit: 10,
+        },
+      };
+      try {
+        const result = await new ToolExecutor().execute(
+          "plan_safe_action",
+          JSON.stringify({
+            goal: `${ingot}を作る`,
+            count: 1,
+            mode: "delegated",
+            candidateId: null,
+          }),
+          context,
+        );
+        expect(result).toMatchObject({
+          success: true,
+          data: {
+            completedCount: 1,
+            completedSteps: [{ tool: "mine_block" }, { tool: "smelt_item" }],
+          },
+        });
+        expect(
+          minecraft.actions.filter((action) => action === `dig:${ore}`),
+        ).toHaveLength(1);
+        expect(minecraft.actions).toContain(`collect:${raw}`);
+        expect(minecraft.actions).toContain(`smelt:${raw}:${ingot}:1`);
+        expect((await game.observeStatus()).inventory[ingot]).toBe(1);
+      } finally {
+        close();
+      }
+    },
+  );
 
   it("reports acquired and held counts when gathering is stopped after pickup", async () => {
     const signal = new AbortController();

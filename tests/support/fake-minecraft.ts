@@ -27,6 +27,7 @@ import type {
 import {
   goalMetadataForBlock,
   knownBlockDrops,
+  knownSmeltInputs,
 } from "../../src/minecraft/general-actions.js";
 
 const now = (): string => new Date().toISOString();
@@ -75,6 +76,7 @@ export class FakeMinecraft implements MinecraftPort {
     string,
     "allowed" | "unknown" | "denied"
   >();
+  public availableFurnace = false;
   public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
   public placedBlocks = new Map<string, string>();
   private pendingDrop: ResourceTarget | undefined;
@@ -328,6 +330,43 @@ export class FakeMinecraft implements MinecraftPort {
         distance: 1,
         order: candidates.length,
       });
+    }
+    if (this.availableFurnace) {
+      for (const output of input.requestedItems) {
+        const inputName = knownSmeltInputs[output];
+        if (
+          inputName === undefined ||
+          !this.snapshot.inventory.some(
+            (entry) => entry.name === inputName && entry.count > 0,
+          )
+        )
+          continue;
+        const furnace = { x: 1, y: 64, z: 0 };
+        candidates.push({
+          id: `smelt_item:${output}`,
+          label: `${inputName}を${output}へ精錬`,
+          action: "smelt_item",
+          args: { input: inputName, output, count: 1, furnace },
+          steps: [
+            {
+              tool: "smelt_item",
+              input: { input: inputName, output, count: 1, furnace },
+            },
+          ],
+          observed: true,
+          purposeFit: "direct",
+          permission: "allowed",
+          safety: "allowed",
+          reversible: false,
+          impact: "low",
+          operationClass: "world_change",
+          scopeId: "inventory",
+          requestedCount: 1,
+          goalItem: output,
+          distance: 1,
+          order: candidates.length,
+        });
+      }
     }
     return candidates;
   }

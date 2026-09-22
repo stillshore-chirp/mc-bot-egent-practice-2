@@ -221,20 +221,27 @@ describe("owner goal authorization", () => {
     }
   });
 
-  it("keeps an ingot goal distinct from its ore or raw-material progress", () => {
-    const result = deriveOwnerGoalAuthorization({
-      ...ownerInput,
-      message: "鉄インゴット20個を作って",
-    });
+  it.each([
+    ["鉄インゴット20個を作って", "iron_ingot", 20],
+    ["銅インゴット3個を作って", "copper_ingot", 3],
+    ["金インゴット2個を作って", "gold_ingot", 2],
+  ])(
+    "keeps %s distinct from ore or raw-material progress",
+    (message, targetItem, targetCount) => {
+      const result = deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message,
+      });
 
-    expect(result).toMatchObject({
-      outcome: "authorized",
-      authorization: {
-        targetItem: "iron_ingot",
-        targetCount: 20,
-      },
-    });
-  });
+      expect(result).toMatchObject({
+        outcome: "authorized",
+        authorization: {
+          targetItem,
+          targetCount,
+        },
+      });
+    },
+  );
 
   it("binds the next standalone quantity reply to a pending owner goal", () => {
     const first = deriveOwnerGoalAuthorization({

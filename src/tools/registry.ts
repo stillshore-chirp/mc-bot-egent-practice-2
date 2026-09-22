@@ -402,6 +402,9 @@ export const toolDefinitions = [
               goal: input.goal,
               count: remainingCount,
               maxCandidates: 8,
+              ...(context.safeActionAuthorization === undefined
+                ? {}
+                : { authorization: context.safeActionAuthorization }),
             },
             planSignal,
           );

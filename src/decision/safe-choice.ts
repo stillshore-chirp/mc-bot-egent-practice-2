@@ -1,3 +1,8 @@
+import {
+  knownBlockDrops,
+  knownSmeltInputs,
+} from "../minecraft/general-actions.js";
+
 export type ChoiceMode = "explicit" | "delegated" | "unspecified";
 
 export type ChoicePurposeFit = "direct" | "compatible" | "unknown";
@@ -173,6 +178,31 @@ function isEligible(
   const trustedAuthorization = authorization ?? {
     kind: "delegated_low_impact",
   };
+  if (
+    trustedAuthorization.kind === "owner_bounded_resource" &&
+    trustedAuthorization.targetItem !== "*" &&
+    candidate.action === "smelt_item" &&
+    candidate.operationClass === "world_change" &&
+    candidate.scopeId === "inventory" &&
+    candidate.impact === "low" &&
+    candidate.goalItem === trustedAuthorization.targetItem &&
+    trustedAuthorization.goal.trim().length > 0 &&
+    Number.isInteger(trustedAuthorization.targetCount) &&
+    trustedAuthorization.targetCount > 0 &&
+    Number.isInteger(trustedAuthorization.maxCount) &&
+    trustedAuthorization.targetCount <= trustedAuthorization.maxCount &&
+    Number.isInteger(candidate.requestedCount) &&
+    (candidate.requestedCount ?? 0) > 0 &&
+    (candidate.requestedCount ?? 0) <= trustedAuthorization.targetCount
+  ) {
+    const requiredInput = knownSmeltInputs[trustedAuthorization.targetItem];
+    return (
+      requiredInput !== undefined &&
+      trustedAuthorization.allowedResources.some(
+        (resource) => knownBlockDrops[resource] === requiredInput,
+      )
+    );
+  }
   if (
     trustedAuthorization.kind === "owner_bounded_resource" &&
     trustedAuthorization.goal.trim().length > 0 &&

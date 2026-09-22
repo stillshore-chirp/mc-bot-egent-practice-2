@@ -120,11 +120,14 @@ describe("safe action planner", () => {
           operationClass: "natural_resource",
           resourceName: "iron_ore",
           goalItem: "raw_iron",
-          requestedCount: 3,
+          requestedCount: 1,
           reversible: false,
           impact: "medium",
           steps: [
-            { tool: "mine_block", input: { resource: "iron_ore", count: 3 } },
+            {
+              tool: "mine_block",
+              input: { name: "iron_ore", position: { x: 1, y: 64, z: 1 } },
+            },
           ],
         }),
       ],
@@ -133,7 +136,7 @@ describe("safe action planner", () => {
 
     expect(result).toMatchObject({
       outcome: "planned",
-      candidate: { id: "mine-iron", requestedCount: 3 },
+      candidate: { id: "mine-iron", requestedCount: 1 },
       steps: [{ tool: "mine_block" }],
     });
   });
@@ -229,7 +232,14 @@ describe("safe action planner", () => {
           reversible: false,
           impact: "medium",
           steps: [
-            { tool: "mine_block", input: { resource: "oak_log", count: 1 } },
+            {
+              tool: "mine_block",
+              input: {
+                resource: "iron_ore",
+                name: "oak_log",
+                position: { x: 1, y: 64, z: 1 },
+              },
+            },
           ],
         }),
       ],
@@ -241,6 +251,43 @@ describe("safe action planner", () => {
       code: "CHOICE_NOT_CONFIRMED",
     });
   });
+
+  it.each([
+    ["wrong input", "raw_gold", "iron_ingot", "inventory"],
+    ["wrong output", "raw_iron", "gold_ingot", "inventory"],
+    ["wrong scope", "raw_iron", "iron_ingot", "chest"],
+  ])(
+    "rejects owner-bounded smelting with %s",
+    (_case, input, output, scopeId) => {
+      const result = planSafeAction({
+        mode: "delegated",
+        authorization: {
+          kind: "owner_bounded_resource",
+          goal: "鉄インゴットを1個作る",
+          allowedResources: ["iron_ore"],
+          targetItem: "iron_ingot",
+          targetCount: 1,
+          maxCount: 8,
+        },
+        candidates: [
+          candidate({
+            id: "smelt-iron",
+            action: "smelt_item",
+            operationClass: "world_change",
+            scopeId,
+            goalItem: "iron_ingot",
+            requestedCount: 1,
+            reversible: false,
+            impact: "low",
+            steps: [{ tool: "smelt_item", input: { input, output, count: 1 } }],
+          }),
+        ],
+        maxSteps: 4,
+      });
+
+      expect(result.outcome).toBe("clarify");
+    },
+  );
 
   it("keeps server-protected natural resources denied", () => {
     const result = planSafeAction({
