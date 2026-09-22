@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ConversationContextStore,
+  isExplicitGoalResumeMessage,
   renderConversationContext,
   updateConversationPreferences,
 } from "../../src/agent/conversation-context.js";
@@ -141,6 +142,17 @@ describe("conversation context", () => {
     store.recordUser("owner", "採取は再開しないで、拠点に戻って。");
 
     expect(store.snapshot("owner").cancelledGoal).toBe(false);
+  });
+
+  it("requires an explicit action before lifting a stop boundary", () => {
+    expect(isExplicitGoalResumeMessage("もっと短く。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("集めていい？")).toBe(false);
+    expect(
+      isExplicitGoalResumeMessage("採取は再開しないで、拠点に戻って。"),
+    ).toBe(true);
+    expect(
+      isExplicitGoalResumeMessage("採取は再開しないで代わりに拠点へ戻って。"),
+    ).toBe(true);
   });
 
   it("honors requests to stop being concise", () => {

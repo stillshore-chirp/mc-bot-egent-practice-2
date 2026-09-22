@@ -15,7 +15,7 @@ import { getToolDefinition, toolDefinitions } from "../tools/registry.js";
 import { buildCapabilityContext } from "./capability-context.js";
 import {
   ConversationContextStore,
-  isNonAuthorizingGoalMessage,
+  isExplicitGoalResumeMessage,
   renderConversationContext,
 } from "./conversation-context.js";
 
@@ -85,7 +85,7 @@ function instructions(
     conversationContext,
     ...(request.toolContext.allowActionTools === false
       ? [
-          "停止済みの作業についての許可質問や禁止の確認では、行動toolを呼ばず、現在の停止境界と再開方法だけを短く説明してください。",
+          "停止済みの作業については、明示的な再開または別の対象と動作が示されるまで行動toolを呼ばず、現在の停止境界と再開方法だけを短く説明してください。",
         ]
       : []),
     "型付き原木収集の約束を履行する場合だけ、gather_resourceのcommitmentIdへその約束IDを指定し、成功結果で返るreceiptIdだけをcomplete_commitmentへ渡してください。他の行動や通常の収集ではreceiptIdや証跡を作り出してはいけません。",
@@ -214,7 +214,7 @@ export class OpenAIDeliberationAgent {
     const keepStoppedGoal =
       shouldRecordConversation &&
       conversationSnapshot.cancelledGoal &&
-      isNonAuthorizingGoalMessage(request.message);
+      !isExplicitGoalResumeMessage(request.message);
     const toolContext: ToolContext = shouldRecordConversation
       ? {
           ...request.toolContext,

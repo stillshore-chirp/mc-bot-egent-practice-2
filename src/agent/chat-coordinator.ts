@@ -29,6 +29,14 @@ const STOP_COMMANDS = new Set([
   "中断",
 ]);
 
+function isCapabilityWhyQuestion(message: string): boolean {
+  return (
+    /^(?:なぜ|どうして).*(?:建築|設置|破壊|サーバー|管理|未提供|できない|できません)/u.test(
+      message,
+    ) && !/(?:失敗|止ま|中断|完了|作業)/u.test(message)
+  );
+}
+
 /**
  * Short, read-only status questions are answered independently of a long
  * running owner action. This keeps a harmless question from waiting behind a
@@ -54,7 +62,9 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
     /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作って|始め|続け|再開|使って|置いて|取り|停止|止ま|止め|ストップ|やめ|中止|中断)/u.test(
       normalized,
     );
+  const isCapabilityWhy = isCapabilityWhyQuestion(normalized);
   const isReasonForStoppedWork =
+    !isCapabilityWhy &&
     /^(?:なぜ|どうして).*(?:止ま|失敗|できな)/u.test(normalized);
   if (includesAction && !isReasonForStoppedWork) return false;
   return (

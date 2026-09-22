@@ -61,7 +61,7 @@ const AFFIRMATIVE_GOAL_ACTION_PATTERN =
 
 function goalActionClauses(message: string): string[] {
   return message
-    .split(/[、，,。！？!?]/u)
+    .split(/[、，,。！？!?]|(?=代わりに|その代わり)/u)
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -73,10 +73,10 @@ function isNonAuthorizingActionClause(clause: string): boolean {
 }
 
 function isAffirmativeActionClause(clause: string): boolean {
-  return (
-    !isNonAuthorizingActionClause(clause) &&
-    AFFIRMATIVE_GOAL_ACTION_PATTERN.test(clause)
-  );
+  const affirmativeIndex = clause.search(AFFIRMATIVE_GOAL_ACTION_PATTERN);
+  if (affirmativeIndex < 0) return false;
+  const nonAuthorizingIndex = clause.search(NON_AUTHORIZING_PATTERN);
+  return nonAuthorizingIndex < 0 || affirmativeIndex > nonAuthorizingIndex;
 }
 
 function negatesGoalAction(message: string): boolean {
@@ -99,6 +99,10 @@ function explicitlyResumesGoal(message: string): boolean {
  */
 export function isNonAuthorizingGoalMessage(message: string): boolean {
   return negatesGoalAction(compactText(message));
+}
+
+export function isExplicitGoalResumeMessage(message: string): boolean {
+  return explicitlyResumesGoal(compactText(message));
 }
 
 function negatesConcise(message: string): boolean {
