@@ -492,6 +492,7 @@ describe("immediate stop command", () => {
 
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
+    const clearPendingOwnerGoal = vi.fn();
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: {
@@ -502,7 +503,9 @@ describe("immediate stop command", () => {
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
       agent: {} as OpenAIDeliberationAgent,
-      contextFactory: {} as ChatContextFactory,
+      contextFactory: {
+        clearPendingOwnerGoal,
+      } as unknown as ChatContextFactory,
       logger: {
         warn: vi.fn(),
       } as unknown as Logger,
@@ -511,6 +514,7 @@ describe("immediate stop command", () => {
 
     const handled = coordinator.handleChat("owner", "停止");
     expect(calls).toEqual(["pending-cancelled"]);
+    expect(clearPendingOwnerGoal).toHaveBeenCalledOnce();
     expect(await handled).toBe(true);
   });
 

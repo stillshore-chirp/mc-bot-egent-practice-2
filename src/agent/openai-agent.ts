@@ -3,6 +3,7 @@ import type { ResponseInputItem } from "openai/resources/responses/responses";
 import type { Logger } from "pino";
 
 import { AppError } from "../domain/errors.js";
+import { knownSmeltInputs } from "../minecraft/general-actions.js";
 import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
@@ -37,12 +38,20 @@ const stoppedGoalReadOnlyToolNames = new Set([
 const actionToolFamilies: Readonly<
   Record<string, readonly GoalActionFamily[]>
 > = {
+  // The planner is only a wrapper. Its mutating steps are scoped separately
+  // by the same request and rechecked by ToolExecutor before each action.
+  plan_safe_action: [],
   gather_and_store: ["gather", "inventory"],
   store_logs: ["inventory"],
   register_delivery_target: ["memory"],
   follow_player: ["follow"],
   move_to: ["move"],
   gather_resource: ["gather"],
+  mine_block: ["gather"],
+  collect_item: ["gather"],
+  craft_item: ["craft"],
+  place_block: ["place"],
+  smelt_item: ["smelt"],
   return_to_player: ["return"],
   forget_delivery_target: ["memory"],
   remember_player_fact: ["memory"],
@@ -193,6 +202,11 @@ function instructions(
     "requesterVitalsがunobservedのとき、利用者の体力・空腹・酸素・水中状態をBotの値から推測せず、『利用者の状態は観測できていません』と答えてください。",
     "oxygenStateがnot_applicableのときは地上なので酸素ゲージを危険の根拠にせず、生の数値だけを説明しないでください。unknownのときも酸素値を低酸素として断定せず、危険が疑われる場合は成功と報告せず再観測・停止など次の安全な処理と未確認範囲を短く説明してください。",
     "操作が必要なら必ず公開されたtoolを使い、自然文だけで実行済みにしてはいけません。",
+    "利用者が目的だけを伝えた場合は、個々のtool引数を聞き返す前にplan_safe_actionで観測・計画・実行をまとめ、安全な計画結果の各段階を検証してください。plan_safe_actionが未対応の目的を返した場合は、実行可能な範囲と不足する操作を一度だけ具体的に説明してください。",
+    "利用者が『ついてきて』と依頼した場合、follow_playerの距離と時間は設定済みの安全な既定値（最大60秒）を使い、追加質問をせず開始してください。無期限の追従は開始しないでください。",
+    "plan_safe_actionのmodeやcandidateIdは認可ではありません。低影響で可逆な候補を優先し、中影響の自然資源操作は信頼できる所有者側の数量上限付き認可がある場合だけ選び、建築・設置などの世界変更は明示された範囲認可がない限り開始しないでください。",
+    "所有者側の目的と数量上限が認可コンテキストにある場合はtool引数で変更せず、候補が返す最終inventory itemと中間素材を区別してください。ドロップやレシピの出力を観測で確認できない目的は、一度だけ具体的に確認して停止してください。",
+    "数量だけを尋ねた直後は、所有者の次の発話にある単独の数量回答が認可境界で結び付くまで、対象の作業toolを開始しないでください。数量回答に見えない陳述や別の依頼は認可として扱わず、停止指示と安全介入は常に優先してください。",
     "tool引数を推測で補わず、schemaに必要な情報がなければ日本語で確認してください。",
     "toolのfailureでは、確認済み状態、再試行有無、次に可能な行動を日本語で説明してください。",
     "直前の依頼対象が今回の指示語で明らかに継続されている場合は、同じ対象として扱ってください。候補が複数あるなど本当に曖昧な場合だけ、一つの明確な質問をしてください。",
@@ -370,6 +384,15 @@ export class OpenAIDeliberationAgent {
       (conversationSnapshot.cancelledGoal || explicitProhibited.length > 0)
         ? new Set(resumedFamilies)
         : undefined;
+    const resourceAuthorization = request.toolContext.safeActionAuthorization;
+    if (
+      authorizedFamilies?.has("gather") &&
+      resourceAuthorization?.kind === "owner_bounded_resource" &&
+      knownSmeltInputs[resourceAuthorization.targetItem] !== undefined &&
+      !prohibitedFamilies.has("smelt")
+    ) {
+      authorizedFamilies.add("smelt");
+    }
     const requestedMemoryTools = explicitlyRequestedMemoryTools(
       request.message,
     );

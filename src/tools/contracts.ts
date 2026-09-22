@@ -1,5 +1,11 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
 import type {
+  SafeActionCandidate,
+  SafeActionObservationRequest,
+  SafeActionStep,
+} from "../decision/safe-action-planner.js";
+import type { SafeChoiceAuthorization } from "../decision/safe-choice.js";
+import type {
   CollectItemInput,
   CraftItemInput,
   GeneralActionCandidate,
@@ -46,12 +52,20 @@ export interface ToolFailure {
   userSummary: string;
 }
 
+export interface ActionProgress {
+  readonly completedCount: number;
+  readonly requestedCount: number;
+  /** Canonical inventory item represented by the verified progress delta. */
+  readonly item?: string;
+}
+
 export type ToolResult<T> =
   | {
       success: true;
       data: T;
       evidence: EvidenceReference[];
       userSummary: string;
+      progress?: ActionProgress;
       verificationReceipt?: {
         receiptId: string;
         commitmentId: string;
@@ -103,6 +117,11 @@ export interface Surroundings {
   hazards: readonly string[];
 }
 
+export interface SafeResourceCandidate {
+  readonly resource: string;
+  readonly distance: number;
+}
+
 export interface ActionReport {
   before: GameStatus | null;
   after: GameStatus | null;
@@ -127,6 +146,24 @@ export interface GameController {
     radius: number,
     includeEntities: boolean,
   ): Promise<Surroundings>;
+  /**
+   * Returns candidates that passed the server-side protection boundary.
+   * Adapters without this observation must make callers stop safely.
+   */
+  findSafeResourceCandidates?(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+  ): Promise<readonly SafeResourceCandidate[]>;
+  /**
+   * Observes provider-backed candidates for a high-level goal. The goal is
+   * descriptive only; returned candidates still need the safe planner and
+   * each step needs normal tool validation before execution.
+   */
+  findSafeActionCandidates?(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<readonly SafeActionCandidate[]>;
   observeActionCandidates(
     input: GeneralActionObservationInput,
     signal: AbortSignal,
@@ -247,6 +284,24 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
+  /**
+   * A trusted request-boundary decision. Tool/model arguments must never
+   * manufacture this value. Omitted means delegated low-impact only.
+   */
+  safeActionAuthorization?: SafeChoiceAuthorization;
+  /** One concrete owner-goal clarification produced at the request boundary. */
+  safeActionClarification?: string;
+  /**
+   * Mutable, request-scoped accounting for the owner authorization. It is
+   * created only by the authenticated request boundary and prevents another
+   * model tool call from replaying the same bounded goal.
+   */
+  safeActionAuthorizationUsage?: {
+    remainingCount: number;
+    consumed: boolean;
+  };
+  /** Internal marker set only while the deterministic plan executor runs a step. */
+  safeActionStepExecution?: boolean;
   /** False while a stopped owner goal is discussed; also blocks memory writes. */
   allowActionTools?: boolean;
   /** Trusted per-request action and memory-write scope. */
@@ -265,6 +320,10 @@ export interface ToolContext {
       used: boolean;
     }[];
   };
+  executeSafeActionStep?: (
+    step: SafeActionStep,
+    context: ToolContext,
+  ) => Promise<ToolResult<unknown>>;
   game: GameController;
   memory: MemoryPort;
   /** Optional on older integrations; behavior tools fail closed when absent. */
@@ -272,6 +331,8 @@ export interface ToolContext {
   limits: {
     maxMoveDistance: number;
     maxGatherCount: number;
+    /** Optional generic-plan wall-clock cap; the planner applies its own hard cap. */
+    maxSafeActionDurationMs?: number;
     followDistance: number;
     memoryContextLimit: number;
   };
@@ -282,6 +343,7 @@ export function actionReportResult(
 ): ToolResult<ActionReport> {
   const observedAt = new Date().toISOString();
   if (report.outcome === "completed") {
+    const progress = actionProgress(report.confirmedState);
     return {
       success: true,
       data: report,
@@ -293,6 +355,7 @@ export function actionReportResult(
         },
       ],
       userSummary: report.summary,
+      ...(progress === undefined ? {} : { progress }),
     };
   }
   return {
@@ -312,4 +375,53 @@ export function actionReportResult(
       userSummary: report.summary,
     },
   };
+}
+
+function actionProgress(
+  confirmedState: Readonly<Record<string, unknown>> | undefined,
+): ActionProgress | undefined {
+  if (confirmedState === undefined) return undefined;
+  const requestedCount = firstInteger(confirmedState, [
+    "requestedCount",
+    "targetCount",
+  ]);
+  const completedCount = firstInteger(confirmedState, [
+    "collectedCount",
+    "minedCount",
+    "craftedCount",
+    "placedCount",
+    "smeltedCount",
+  ]);
+  if (
+    requestedCount === undefined ||
+    completedCount === undefined ||
+    requestedCount < 1 ||
+    completedCount < 0
+  ) {
+    return undefined;
+  }
+  const item =
+    typeof confirmedState.item === "string"
+      ? confirmedState.item
+      : typeof confirmedState.resource === "string"
+        ? confirmedState.resource
+        : undefined;
+  return {
+    completedCount,
+    requestedCount,
+    ...(item === undefined ? {} : { item }),
+  };
+}
+
+function firstInteger(
+  value: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): number | undefined {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isInteger(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
 }

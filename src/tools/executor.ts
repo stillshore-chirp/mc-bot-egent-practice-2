@@ -71,6 +71,14 @@ export class ToolExecutor {
     serializedArguments: string,
     context: ToolContext,
   ): Promise<ToolResult<unknown>> {
+    const executionContext: ToolContext = {
+      ...context,
+      executeSafeActionStep: (step, stepContext) =>
+        this.execute(step.tool, JSON.stringify(step.input), {
+          ...stepContext,
+          safeActionStepExecution: true,
+        }),
+    };
     const definition = getToolDefinition(name);
     const traceName =
       definition === undefined ? "未登録tool" : `tool:${definition.name}`;
@@ -84,7 +92,7 @@ export class ToolExecutor {
         summarizeResult: (result) =>
           result.success ? "tool実行を完了" : "tool実行を拒否または失敗",
       },
-      () => this.#executeCore(name, serializedArguments, context),
+      () => this.#executeCore(name, serializedArguments, executionContext),
     );
   }
 
@@ -118,6 +126,24 @@ export class ToolExecutor {
         "authorization",
         "状態再評価では観測と記憶参照以外の操作を実行しません。",
       );
+    }
+    if (
+      context.safeActionClarification !== undefined &&
+      definition.action &&
+      name !== "stop_current_action"
+    ) {
+      return {
+        success: false,
+        error: {
+          category: "authorization",
+          code: "OWNER_GOAL_CLARIFICATION_REQUIRED",
+          retryable: false,
+          failedAt: "owner_goal_boundary",
+          confirmedState: { ownerGoal: "clarification_required" },
+          nextActions: [context.safeActionClarification],
+          userSummary: context.safeActionClarification,
+        },
+      };
     }
     const ownerScopedMutation =
       definition.action || ownerScopedMutationToolNames.has(name);
@@ -174,6 +200,19 @@ export class ToolExecutor {
       );
     }
 
+    if (
+      definition.authorization !== undefined &&
+      !context.safeActionStepExecution &&
+      !isStaticGatherLimitFailure(name, parsed.data, context) &&
+      !isDirectActionAuthorized(definition.authorization, parsed.data, context)
+    ) {
+      return failure(
+        "SAFE_ACTION_AUTHORIZATION_INVALID",
+        "authorization",
+        "この操作の対象と数量を所有者の認可範囲で確認できないため、開始しませんでした。",
+      );
+    }
+
     try {
       const stage = memoryReadTools.has(name)
         ? "memory_read"
@@ -184,6 +223,40 @@ export class ToolExecutor {
             : undefined;
       const executeAction = async (): Promise<ToolResult<unknown>> => {
         const actionResult = await definition.execute(parsed.data, context);
+        if (
+          name === "gather_resource" &&
+          !context.safeActionStepExecution &&
+          context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
+          actionResult.success
+        ) {
+          const resource = firstStringField(parsed.data, ["resource"]);
+          const requestedCount = firstPositiveIntegerField(parsed.data, [
+            "count",
+          ]);
+          const progress = actionResult.progress;
+          const remainingCount =
+            context.safeActionAuthorizationUsage?.remainingCount;
+          if (
+            progress === undefined ||
+            progress.item !== resource ||
+            progress.requestedCount !== requestedCount ||
+            progress.completedCount < 1 ||
+            progress.completedCount > progress.requestedCount ||
+            remainingCount === undefined ||
+            progress.completedCount > remainingCount
+          ) {
+            if (context.safeActionAuthorizationUsage !== undefined) {
+              context.safeActionAuthorizationUsage.consumed = true;
+            }
+            return failure(
+              progress === undefined
+                ? "SAFE_ACTION_PROGRESS_UNCONFIRMED"
+                : "SAFE_ACTION_PROGRESS_INVALID",
+              "observation",
+              "採取後の種類または数量が依頼の範囲と一致しないため、完了として扱わず停止しました。",
+            );
+          }
+        }
         if (
           actionResult.success ||
           (Object.prototype.hasOwnProperty.call(
@@ -217,6 +290,7 @@ export class ToolExecutor {
             async () => undefined,
           );
         }
+        consumeSafeActionAuthorization(name, actionResult, context);
         return actionResult;
       };
       const result =
@@ -253,6 +327,9 @@ export class ToolExecutor {
                 ? executeAction
                 : () => definition.execute(parsed.data, context),
             );
+      if (name === "plan_safe_action" && stage === undefined) {
+        consumeSafeActionAuthorization(name, result, context);
+      }
       if (definition.action && result.success) {
         const commitmentId = verifiedFulfillmentCommitmentId(
           name,
@@ -320,6 +397,170 @@ export class ToolExecutor {
       };
     }
   }
+}
+
+function consumeSafeActionAuthorization(
+  toolName: string,
+  result: ToolResult<unknown>,
+  context: ToolContext,
+): void {
+  if (
+    (toolName !== "plan_safe_action" && toolName !== "gather_resource") ||
+    (toolName === "gather_resource" && context.safeActionStepExecution) ||
+    context.safeActionAuthorization?.kind !== "owner_bounded_resource" ||
+    context.safeActionAuthorizationUsage === undefined
+  ) {
+    return;
+  }
+  const completedCount =
+    result.success && result.progress !== undefined
+      ? result.progress.completedCount
+      : result.success && isRecord(result.data)
+        ? integerField(result.data.completedCount)
+        : !result.success
+          ? (integerField(result.error.confirmedState.completedCount) ??
+            integerField(result.error.confirmedState.collectedCount))
+          : undefined;
+  if (completedCount === undefined || completedCount < 0) return;
+  const remaining = context.safeActionAuthorizationUsage.remainingCount;
+  context.safeActionAuthorizationUsage.remainingCount = Math.max(
+    0,
+    remaining - completedCount,
+  );
+  if (completedCount > remaining) {
+    context.safeActionAuthorizationUsage.consumed = true;
+  }
+}
+
+function isDirectActionAuthorized(
+  kind: "owner_bounded_resource" | "owner_scoped_change",
+  input: unknown,
+  context: ToolContext,
+): boolean {
+  const resource =
+    kind === "owner_bounded_resource"
+      ? firstStringField(input, [
+          "resource",
+          "resourceName",
+          "block",
+          "blockName",
+          "item",
+          "itemName",
+          "targetItem",
+        ])
+      : undefined;
+  const count =
+    kind === "owner_bounded_resource"
+      ? firstPositiveIntegerField(input, [
+          "count",
+          "requestedCount",
+          "targetCount",
+          "quantity",
+        ])
+      : undefined;
+  const authorization = context.safeActionAuthorization;
+  const usage = context.safeActionAuthorizationUsage;
+  if (usage === undefined || usage.consumed || authorization === undefined) {
+    return false;
+  }
+  if (kind === "owner_bounded_resource") {
+    if (authorization.kind !== "owner_bounded_resource") return false;
+    if (authorization.selectionRequired === true) return false;
+    const withinGrant =
+      resource !== undefined &&
+      authorization.allowedResources.includes(resource) &&
+      count !== undefined &&
+      count <= usage.remainingCount &&
+      count <= authorization.targetCount &&
+      count <= authorization.maxCount;
+    if (!withinGrant) return false;
+    return (
+      isRecord(input) &&
+      (typeof input.commitmentId !== "string" ||
+        isBoundCommitmentGather(input, resource, count, context))
+    );
+  }
+  if (authorization.kind !== "owner_scoped_change") return false;
+  return (
+    firstStringField(input, ["scopeId", "areaId"]) === authorization.scopeId
+  );
+}
+
+function isStaticGatherLimitFailure(
+  toolName: string,
+  input: unknown,
+  context: ToolContext,
+): boolean {
+  return (
+    toolName === "gather_resource" &&
+    isRecord(input) &&
+    typeof input.count === "number" &&
+    input.count > context.limits.maxGatherCount
+  );
+}
+
+function isBoundCommitmentGather(
+  input: unknown,
+  resource: string | undefined,
+  count: number | undefined,
+  context: ToolContext,
+): boolean {
+  if (!isRecord(input) || typeof input.commitmentId !== "string") return false;
+  if (resource === undefined || count === undefined) return false;
+  if (
+    context.executionEvidence.verifiedActionReceipts.some(
+      (receipt) => receipt.commitmentId === input.commitmentId && !receipt.used,
+    )
+  ) {
+    return false;
+  }
+  const commitment = context.memory.getCommitment({
+    playerId: context.playerId,
+    commitmentId: input.commitmentId,
+  });
+  return (
+    commitment?.status === "active" &&
+    commitment.fulfillment?.toolName === "gather_resource" &&
+    commitment.fulfillment.resource === resource &&
+    commitment.fulfillment.count === count
+  );
+}
+
+function firstStringField(
+  input: unknown,
+  keys: readonly string[],
+): string | undefined {
+  if (!isRecord(input)) return undefined;
+  for (const key of keys) {
+    if (typeof input[key] === "string" && input[key].length > 0) {
+      return input[key];
+    }
+  }
+  return undefined;
+}
+
+function firstPositiveIntegerField(
+  input: unknown,
+  keys: readonly string[],
+): number | undefined {
+  if (!isRecord(input)) return undefined;
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function integerField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value)
+    ? value
+    : undefined;
 }
 
 function verifiedFulfillmentCommitmentId(

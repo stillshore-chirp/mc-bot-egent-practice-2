@@ -11,6 +11,10 @@ import type {
   ToolContext,
 } from "../tools/contracts.js";
 import type { ChatContextFactory } from "../agent/chat-coordinator.js";
+import {
+  deriveOwnerGoalAuthorization,
+  type PendingOwnerGoal,
+} from "../decision/owner-goal-authorization.js";
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
@@ -38,6 +42,8 @@ async function safeWithTraceSpan<T>(
 }
 
 export class CompanionContextFactory implements ChatContextFactory {
+  #pendingOwnerGoal: PendingOwnerGoal | undefined;
+
   public constructor(
     private readonly config: AppConfig,
     private readonly playerId: string,
@@ -48,6 +54,10 @@ export class CompanionContextFactory implements ChatContextFactory {
     private readonly tasks: TaskRuntime,
     private readonly traceService?: TraceService,
   ) {}
+
+  public clearPendingOwnerGoal(): void {
+    this.#pendingOwnerGoal = undefined;
+  }
 
   public async create(
     requesterUsername: string,
@@ -186,6 +196,38 @@ export class CompanionContextFactory implements ChatContextFactory {
           { summary: "Minecraft状態を観測" },
           () => this.game.observeStatus(),
         );
+        const ownerGoal = deriveOwnerGoalAuthorization({
+          message,
+          requesterUsername,
+          authorizedOwnerUsername: this.config.ownerUsername,
+          requestKind,
+          maxCount: this.config.limits.maxGatherCount,
+          ...(this.#pendingOwnerGoal === undefined
+            ? {}
+            : { pendingGoal: this.#pendingOwnerGoal }),
+        });
+        if (
+          requestKind !== "runtime_reassessment" &&
+          requesterUsername === this.config.ownerUsername
+        ) {
+          this.#pendingOwnerGoal =
+            ownerGoal.outcome === "clarify" &&
+            ownerGoal.pendingGoal !== undefined
+              ? ownerGoal.pendingGoal
+              : undefined;
+        }
+        const ownerGoalFields =
+          ownerGoal.outcome === "authorized"
+            ? {
+                safeActionAuthorization: ownerGoal.authorization,
+                safeActionAuthorizationUsage: {
+                  remainingCount: ownerGoal.authorization.targetCount,
+                  consumed: false,
+                },
+              }
+            : ownerGoal.outcome === "clarify"
+              ? { safeActionClarification: ownerGoal.question }
+              : {};
         return {
           personaContext: buildPersonaContext(this.persona, {
             playerName: requesterUsername,
@@ -214,12 +256,17 @@ export class CompanionContextFactory implements ChatContextFactory {
             playerId: this.playerId,
             signal,
             requestKind,
+            ...ownerGoalFields,
             executionEvidence: { verifiedActionReceipts: [] },
             game: this.game,
             memory: this.toolMemory,
             limits: {
               maxMoveDistance: this.config.limits.maxMoveDistance,
               maxGatherCount: this.config.limits.maxGatherCount,
+              maxSafeActionDurationMs: Math.min(
+                this.config.limits.taskTimeoutMs,
+                60_000,
+              ),
               followDistance: this.config.limits.followDistance,
               memoryContextLimit: this.config.limits.memoryContextLimit,
             },

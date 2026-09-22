@@ -231,6 +231,7 @@ function renderReadOnlyStatus(status: GameStatus): string {
 }
 
 export interface ChatContextFactory {
+  clearPendingOwnerGoal?(): void;
   create(
     requesterUsername: string,
     message: string,
@@ -406,6 +407,7 @@ export class ChatCoordinator {
       this.#runtimeGeneration += 1;
       const ownerMessageGeneration = this.#runtimeGeneration;
       this.#generation += 1;
+      this.#contextFactory.clearPendingOwnerGoal?.();
       const stopGeneration = this.#generation;
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
@@ -600,6 +602,7 @@ export class ChatCoordinator {
 
   public async shutdown(): Promise<void> {
     this.#generation += 1;
+    this.#contextFactory.clearPendingOwnerGoal?.();
     this.#activeController?.abort(new Error("APPLICATION_SHUTDOWN"));
     await Promise.allSettled([
       this.#conversationTail,

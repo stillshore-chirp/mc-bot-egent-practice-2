@@ -12,6 +12,8 @@ import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
 import { MoveToSkill } from "../../src/skills/move-to.js";
 import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
+import type { ToolContext } from "../../src/tools/contracts.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
@@ -218,6 +220,208 @@ describe("CompanionGameController", () => {
     expect(report.after?.inventory).toMatchObject({ oak_log: 2 });
     close();
   });
+
+  it("returns only server protection-checked resource candidates in distance order", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push(
+      { name: "oak_log", position: { x: 6, y: 64, z: 0 } },
+      { name: "birch_log", position: { x: 3, y: 64, z: 0 } },
+    );
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeResourceCandidates(
+      16,
+      8,
+      new AbortController().signal,
+    );
+
+    expect(candidates).toEqual([
+      { resource: "birch_log", distance: 3 },
+      { resource: "oak_log", distance: 6 },
+    ]);
+    close();
+  });
+
+  it("turns an observed resource into a reusable safe action plan candidate", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "birch_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeActionCandidates(
+      { goal: "collect_resource", count: 2, maxCandidates: 4 },
+      new AbortController().signal,
+    );
+
+    expect(candidates).toMatchObject([
+      {
+        id: "gather_resource:birch_log",
+        reversible: false,
+        impact: "medium",
+        action: "gather_resource",
+        operationClass: "natural_resource",
+        requestedCount: 2,
+        resourceName: "birch_log",
+        goalItem: "birch_log",
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "birch_log", count: 2, commitmentId: null },
+          },
+        ],
+      },
+    ]);
+    close();
+  });
+
+  it("normalizes a descriptive log collection goal", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeActionCandidates(
+      { goal: "オークの原木を集める", count: 2, maxCandidates: 4 },
+      new AbortController().signal,
+    );
+
+    expect(candidates).toMatchObject([
+      {
+        resourceName: "oak_log",
+        goalItem: "oak_log",
+        requestedCount: 2,
+      },
+    ]);
+    close();
+  });
+
+  it("finds the authorized log species behind other nearby logs", async () => {
+    const minecraft = new FakeMinecraft();
+    for (let index = 0; index < 8; index += 1) {
+      minecraft.resources.push({
+        name: "oak_log",
+        position: { x: 1 + index, y: 64, z: 0 },
+      });
+    }
+    minecraft.resources.push({
+      name: "spruce_log",
+      position: { x: 10, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const candidates = await game.findSafeActionCandidates(
+        {
+          goal: "トウヒの原木を1本集める",
+          count: 1,
+          maxCandidates: 8,
+          authorization: {
+            kind: "owner_bounded_resource",
+            goal: "トウヒの原木を1本集めて",
+            allowedResources: ["spruce_log"],
+            targetItem: "spruce_log",
+            targetCount: 1,
+            maxCount: 16,
+          },
+        },
+        new AbortController().signal,
+      );
+      expect(candidates.map((candidate) => candidate.resourceName)).toEqual([
+        "spruce_log",
+      ]);
+    } finally {
+      close();
+    }
+  });
+
+  it.each([
+    ["鉄", "iron_ore", "iron_ingot", "raw_iron"],
+    ["銅", "copper_ore", "copper_ingot", "raw_copper"],
+  ])(
+    "executes one bounded %s goal across mining and smelting from provider observations",
+    async (_label, ore, ingot, raw) => {
+      const minecraft = new FakeMinecraft();
+      minecraft.availableFurnace = true;
+      minecraft.resources.push(
+        { name: ore, position: { x: 2, y: 63, z: 0 } },
+        { name: ore, position: { x: 3, y: 63, z: 0 } },
+      );
+      const { game, close } = createController(minecraft);
+      const authorization = {
+        kind: "owner_bounded_resource" as const,
+        goal: `${ingot}を1個作って`,
+        allowedResources: [ore],
+        targetItem: ingot,
+        targetCount: 1,
+        maxCount: 8,
+      };
+      const context: ToolContext = {
+        correlationId: "multi-stage-goal",
+        requesterUsername: "owner",
+        authorizedOwnerUsername: "owner",
+        playerId: "owner",
+        signal: new AbortController().signal,
+        requestKind: "owner_message",
+        safeActionAuthorization: authorization,
+        allowedActionToolNames: [
+          "plan_safe_action",
+          "mine_block",
+          "smelt_item",
+        ],
+        safeActionAuthorizationUsage: {
+          remainingCount: 1,
+          consumed: false,
+        },
+        executionEvidence: { verifiedActionReceipts: [] },
+        game,
+        memory: {
+          rememberPlayerFact: () => ({}),
+          rememberLocation: () => ({}),
+          recall: () => [],
+          setCommitment: () => ({ id: "unused" }),
+          getCommitment: () => undefined,
+          completeCommitment: () => ({}),
+        },
+        limits: {
+          maxMoveDistance: 128,
+          maxGatherCount: 16,
+          maxSafeActionDurationMs: 5_000,
+          followDistance: 3,
+          memoryContextLimit: 10,
+        },
+      };
+      try {
+        const result = await new ToolExecutor().execute(
+          "plan_safe_action",
+          JSON.stringify({
+            goal: `${ingot}を作る`,
+            count: 1,
+            mode: "delegated",
+            candidateId: null,
+          }),
+          context,
+        );
+        expect(result).toMatchObject({
+          success: true,
+          data: {
+            completedCount: 1,
+            completedSteps: [{ tool: "mine_block" }, { tool: "smelt_item" }],
+          },
+        });
+        expect(
+          minecraft.actions.filter((action) => action === `dig:${ore}`),
+        ).toHaveLength(1);
+        expect(minecraft.actions).toContain(`collect:${raw}`);
+        expect(minecraft.actions).toContain(`smelt:${raw}:${ingot}:1`);
+        expect((await game.observeStatus()).inventory[ingot]).toBe(1);
+      } finally {
+        close();
+      }
+    },
+  );
 
   it("uses the newest persisted task when the runtime has no live task", async () => {
     const minecraft = new FakeMinecraft();

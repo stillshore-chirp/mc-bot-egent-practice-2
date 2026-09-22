@@ -17,6 +17,12 @@ export interface ToolDefinition<
   input: Input;
   fixtures: ToolFixtures;
   action: boolean;
+  /**
+   * Actions with a world or inventory side effect must pass the trusted
+   * request authorization when called directly by the model. A deterministic
+   * safe-action plan may call them through the executor step boundary.
+   */
+  authorization?: "owner_bounded_resource" | "owner_scoped_change";
   execute(
     input: z.output<Input>,
     context: ToolContext,
