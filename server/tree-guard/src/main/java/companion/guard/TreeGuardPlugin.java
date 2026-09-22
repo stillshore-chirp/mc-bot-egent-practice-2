@@ -19,6 +19,7 @@ import org.bukkit.plugin.messaging.PluginMessageListener;
 public final class TreeGuardPlugin extends JavaPlugin implements Listener, PluginMessageListener {
     private static final String CHANNEL = "companion:tree_guard";
     private static final String ACTION_CHANNEL = "companion:action_guard";
+    private static final int ACTION_LEDGER_SCHEMA_VERSION = 1;
     private final GrowthLedger ledger = new GrowthLedger();
     private final ActionLedger actionLedger = new ActionLedger();
     private Set<String> botNames = Set.of();
@@ -78,7 +79,11 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         if (file == null || !file.isFile()) return;
         try {
             YamlConfiguration config = YamlConfiguration.loadConfiguration(file);
-            for (Map<?, ?> value : config.getMapList("placements")) {
+            if (!validActionLedgerSchema(config)) throw new IllegalArgumentException();
+            Object rawPlacements = config.get("placements");
+            if (!(rawPlacements instanceof List<?> placementList)) throw new IllegalArgumentException();
+            for (Object rawValue : placementList) {
+                if (!(rawValue instanceof Map<?, ?> value)) throw new IllegalArgumentException();
                 Object world = value.get("world");
                 Object x = value.get("x"), y = value.get("y"), z = value.get("z");
                 Object name = value.get("name");
@@ -90,11 +95,22 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                     UUID.fromString(worldName), Integer.parseInt(x.toString()),
                     Integer.parseInt(y.toString()), Integer.parseInt(z.toString())), blockName);
             }
-            if (config.getBoolean("saturated", false)) actionLedger.markSaturated();
+            if (Boolean.TRUE.equals(config.get("saturated"))) actionLedger.markSaturated();
         } catch (RuntimeException invalid) {
             actionLedger.markSaturated();
+            saveActionLedger();
             getLogger().warning("汎用操作の配置履歴を読み込めないため、採掘を保守的に停止します。");
         }
+    }
+
+    static boolean validActionLedgerSchema(YamlConfiguration config) {
+        Object version = config.get("schema-version");
+        Object placements = config.get("placements");
+        Object saturated = config.get("saturated");
+        return version instanceof Number number
+            && number.intValue() == ACTION_LEDGER_SCHEMA_VERSION
+            && placements instanceof List<?>
+            && saturated instanceof Boolean;
     }
 
     private void saveActionLedger() {
@@ -116,6 +132,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                 value.put("name", entry.getValue());
                 placements.add(value);
             }
+            config.set("schema-version", ACTION_LEDGER_SCHEMA_VERSION);
             config.set("placements", placements);
             config.set("saturated", actionLedger.isSaturated());
             config.save(file);
@@ -125,6 +142,12 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         }
     }
     private boolean bot(Player p) { return botNames.contains(p.getName().toLowerCase(Locale.ROOT)); }
+    private void saturateActionLedger() {
+        actionLedger.markSaturated();
+        // Persist at the event boundary so a crash cannot reopen a stale
+        // unsaturated ledger on the next server start.
+        saveActionLedger();
+    }
     private GrowthLedger.Point point(Block b) { return new GrowthLedger.Point(b.getWorld().getUID(), b.getX(),b.getY(),b.getZ()); }
     private static boolean log(Material material) { return GrowthLedger.isGatherable(material.name()); }
     private static boolean root(Material material) { return material==Material.MANGROVE_ROOTS || material==Material.MUDDY_MANGROVE_ROOTS; }
@@ -251,6 +274,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     public void place(BlockPlaceEvent e) {
         ledger.changedNear(point(e.getBlock()));
         actionLedger.recordPlacement(actionPoint(e.getBlock()), name(e.getBlock()));
+        saveActionLedger();
     }
     @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
     public void protectBreak(BlockBreakEvent e) {
@@ -259,6 +283,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             if (!decision(e.getBlock()).equals("allowed")) e.setCancelled(true);
             return;
         }
+        if (actionLedger.isSaturated()) { e.setCancelled(true); return; }
         ActionLedger.Permit permit = new ActionLedger.Permit(
             e.getPlayer().getUniqueId(), "mine", actionPoint(e.getBlock()), name(e.getBlock()));
         if (!actionLedger.consume(permit, System.currentTimeMillis())) e.setCancelled(true);
@@ -279,7 +304,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         if (blocks.stream().map(this::actionPoint).anyMatch(actionLedger::hasPlacement)) {
             // The new coordinates depend on piston mechanics. Stop generic
             // mining until an operator re-establishes a safe provenance set.
-            actionLedger.markSaturated();
+            saturateActionLedger();
         }
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
@@ -300,13 +325,13 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void entityChange(EntityChangeBlockEvent e) {
         ledger.changedNear(point(e.getBlock()));
-        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))) actionLedger.markSaturated();
+        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))) saturateActionLedger();
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void flow(BlockFromToEvent e) {
         ledger.changedNear(List.of(point(e.getBlock()), point(e.getToBlock())));
         if (actionLedger.hasPlacement(actionPoint(e.getBlock()))
-            || actionLedger.hasPlacement(actionPoint(e.getToBlock()))) actionLedger.markSaturated();
+            || actionLedger.hasPlacement(actionPoint(e.getToBlock()))) saturateActionLedger();
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void explode(EntityExplodeEvent e) {

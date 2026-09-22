@@ -68,9 +68,12 @@ class ActionLedgerTest {
     @Test void uncertainMovedPlacementStopsNaturalMiningUntilOperatorRecovery() {
         ActionLedger ledger = new ActionLedger();
         ActionLedger.Point point = new ActionLedger.Point(WORLD, 9, 64, 10);
+        ActionLedger.Permit permit = new ActionLedger.Permit(ACTOR, "mine", point, "stone");
         assertTrue(ledger.recordPlacement(point, "stone"));
+        ledger.grant(permit, Long.MAX_VALUE);
         ledger.markSaturated();
         assertTrue(ledger.isSaturated());
+        assertFalse(ledger.consume(permit, 0));
         assertFalse(ledger.allowsNaturalMining(point, true));
     }
 }

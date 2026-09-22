@@ -43,6 +43,9 @@ public final class ActionLedger {
 
     public void markSaturated() {
         saturated = true;
+        // A provenance-changing event invalidates every outstanding grant.
+        // A permit must never outlive the fail-closed transition.
+        permits.clear();
     }
 
     public Map<Point, String> placementSnapshot() {
