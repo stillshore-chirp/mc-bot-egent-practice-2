@@ -4,6 +4,11 @@ import type {
   SafeActionObservationRequest,
 } from "../decision/safe-action-planner.js";
 import type { DepositResult } from "../minecraft/port.js";
+import {
+  closestHostileDistance,
+  decideHostileResponse,
+  type HostileGoal,
+} from "../decision/hostile-response.js";
 import { DeliveryController } from "./delivery-controller.js";
 import type { Logger } from "pino";
 
@@ -409,6 +414,171 @@ export class CompanionGameController implements GameController {
         };
       },
     );
+  }
+
+  public async respondToHostiles(
+    goal: HostileGoal,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const initial = await this.#minecraft.observe();
+    if (decideHostileResponse(initial).mode === "none") {
+      const status = this.#statusFromSnapshot(initial);
+      return {
+        before: status,
+        after: status,
+        outcome: "failed",
+        failureCategory: "observation",
+        failureCode: "HOSTILE_TARGET_NOT_OBSERVED",
+        summary:
+          "現在の観測範囲に敵対的な相手はいません。攻撃や退避は始めませんでした。",
+      };
+    }
+
+    const report = await this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "respond_to_hostiles",
+          {
+            goal,
+            observedHostiles: initial.nearbyEntities.filter((e) => e.hostile)
+              .length,
+          },
+          signal,
+          async (actionSignal) => {
+            const current = await this.#minecraft.observe();
+            const choice =
+              goal === "evade"
+                ? closestHostileDistance(current) === null
+                  ? ({ mode: "none" } as const)
+                  : ({
+                      mode: "retreat",
+                      reason: "退避を指示されたため",
+                    } as const)
+                : decideHostileResponse(current);
+            if (choice.mode === "none") return { mode: "none" as const };
+            let attackedEntityId: number | undefined;
+            let reason = choice.mode === "retreat" ? choice.reason : "";
+            if (choice.mode === "attack") {
+              attackedEntityId = choice.entityId;
+              try {
+                if (
+                  await this.#minecraft.attackHostile(
+                    choice.entityId,
+                    actionSignal,
+                  )
+                ) {
+                  return { mode: "attack" as const, entityId: choice.entityId };
+                }
+                reason = "攻撃しましたが撃破を確認できないため";
+              } catch (error) {
+                if (actionSignal.aborted) throw error;
+                if (
+                  !(error instanceof AppError) ||
+                  error.detail.category !== "safety"
+                ) {
+                  throw error;
+                }
+                reason = "攻撃条件が変わったため";
+              }
+            }
+            const distanceBefore = closestHostileDistance(current);
+            try {
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            } catch (error) {
+              if (
+                actionSignal.aborted ||
+                !(error instanceof AppError) ||
+                error.detail.category !== "path"
+              ) {
+                throw error;
+              }
+              await this.#minecraft.recoverFromStuck(2, actionSignal);
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            }
+            const first = await this.#minecraft.observe();
+            if (
+              distance(current.position, first.position) < 1.5 &&
+              closestHostileDistance(first) !== null
+            ) {
+              await this.#minecraft.recoverFromStuck(2, actionSignal);
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            }
+            return {
+              mode: "retreat" as const,
+              reason,
+              distanceBefore,
+              ...(attackedEntityId === undefined ? {} : { attackedEntityId }),
+            };
+          },
+        ),
+      (result, after) => {
+        if (result.mode === "none") {
+          return {
+            outcome: "failed",
+            failureCategory: "observation",
+            failureCode: "HOSTILE_TARGET_CHANGED",
+            summary:
+              "対象が観測範囲からいなくなったため、攻撃や退避は始めませんでした。",
+          };
+        }
+        if (result.mode === "attack") {
+          return after !== null &&
+            !after.nearbyEntities.some(
+              (entity) => entity.id === result.entityId,
+            )
+            ? {
+                outcome: "completed",
+                evidenceKind: "minecraft_snapshot",
+                summary:
+                  "敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。",
+              }
+            : {
+                outcome: "failed",
+                failureCategory: "observation",
+                failureCode: "HOSTILE_DEATH_NOT_VERIFIED",
+                summary:
+                  "攻撃後に相手の死亡を確認できませんでした。撃破済みとは扱いません。",
+              };
+        }
+        const moved =
+          after === null ? 0 : distance(initial.position, after.position);
+        const distanceAfter =
+          after === null ? null : closestHostileDistance(after);
+        const safer =
+          moved >= 1.5 &&
+          (distanceAfter === null ||
+            (result.distanceBefore !== null &&
+              distanceAfter >= result.distanceBefore + 1));
+        return safer
+          ? {
+              outcome: goal === "evade" ? "completed" : "failed",
+              ...(goal === "evade"
+                ? {}
+                : {
+                    failureCategory: "safety" as const,
+                    failureCode: "HOSTILE_ELIMINATION_NOT_CONFIRMED",
+                  }),
+              evidenceKind: "minecraft_snapshot",
+              summary: `${result.reason}攻撃は続けず、実際に${moved.toFixed(1)}ブロック移動して距離を取りました。敵の撃破は未確認です。`,
+            }
+          : {
+              outcome: "failed",
+              failureCategory: "safety",
+              failureCode: "HOSTILE_RETREAT_NOT_VERIFIED",
+              summary:
+                "退避を試みましたが、敵との距離が広がったことを確認できませんでした。撃破や安全確保は未確認です。",
+            };
+      },
+      initial,
+    );
+    return report.failureCategory === "path"
+      ? {
+          ...report,
+          summary:
+            "安全な退避経路を見つけられず、敵との距離を広げられたか確認できません。撃破や安全確保は未確認です。",
+        }
+      : report;
   }
 
   public async stopCurrentAction(reason: string): Promise<ActionReport> {

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { CompanionGameController } from "../../src/app/game-controller.js";
+import { AppError } from "../../src/domain/errors.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime, type TaskStore } from "../../src/runtime/task-service.js";
@@ -63,6 +64,135 @@ function createController(
 }
 
 describe("CompanionGameController", () => {
+  const hostile = (id: number, distance: number) => ({
+    id,
+    name: "zombie",
+    kind: "mob",
+    position: { x: distance, y: 64, z: 0 },
+    distance,
+    hostile: true,
+  });
+
+  it("retreats when the observed threat is distant and the Bot is unarmed", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ nearbyEntities: [hostile(1, 21), hostile(2, 23)] }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(minecraft.actions).toContain("retreat:hostile");
+      expect(
+        minecraft.actions.some((action) => action.startsWith("attack:")),
+      ).toBe(false);
+      expect(report.outcome).toBe("failed");
+      expect(report.failureCode).toBe("HOSTILE_ELIMINATION_NOT_CONFIRMED");
+      expect(report.summary).toContain("移動して距離を取りました");
+      expect(report.summary).toContain("撃破は未確認");
+    } finally {
+      close();
+    }
+  });
+
+  it("attacks one adjacent hostile with a weapon and verifies death", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        nearbyEntities: [hostile(7, 2)],
+        inventory: [{ name: "iron_sword", count: 1 }],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(minecraft.actions).toContain("attack:7");
+      expect(minecraft.actions).not.toContain("retreat:hostile");
+      expect(report.outcome).toBe("completed");
+      expect(report.summary).toContain("死亡を確認");
+    } finally {
+      close();
+    }
+  });
+
+  it("retreats after an inconclusive attack and never claims a kill", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        nearbyEntities: [hostile(7, 2)],
+        inventory: [{ name: "iron_sword", count: 1 }],
+      }),
+    );
+    minecraft.attackSucceeds = false;
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(minecraft.actions).toEqual(
+        expect.arrayContaining(["attack:7", "retreat:hostile"]),
+      );
+      expect(report.summary).toContain("撃破は未確認");
+    } finally {
+      close();
+    }
+  });
+
+  it("takes no action without an observed hostile target", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(report.failureCode).toBe("HOSTILE_TARGET_NOT_OBSERVED");
+      expect(minecraft.actions).toEqual([]);
+    } finally {
+      close();
+    }
+  });
+
+  it("tries stuck recovery and another safe route after pathfinding fails", async () => {
+    class ObstructedMinecraft extends FakeMinecraft {
+      private firstRoute = true;
+
+      public override async retreatFromHostiles(
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (this.firstRoute) {
+          this.firstRoute = false;
+          throw new AppError({
+            category: "path",
+            code: "PATHFINDER_FAILED",
+            message: "route blocked",
+            retryable: true,
+          });
+        }
+        await super.retreatFromHostiles(signal);
+      }
+    }
+    const minecraft = new ObstructedMinecraft(
+      createSnapshot({ nearbyEntities: [hostile(1, 21), hostile(2, 23)] }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "evade",
+        new AbortController().signal,
+      );
+      expect(minecraft.actions).toEqual(
+        expect.arrayContaining(["recover:stuck", "retreat:hostile"]),
+      );
+      expect(report.outcome).toBe("completed");
+    } finally {
+      close();
+    }
+  });
+
   it("attributes vitals to the Bot and keeps requester vitals unobserved", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({ oxygen: 5, inWater: true }),

@@ -85,6 +85,12 @@ function createFactory(calls: string[]): CompanionContextFactory {
     recall: () => [],
   } as unknown as MemoryStore;
   const game: GameController = {
+    respondToHostiles: async () => ({
+      before: null,
+      after: null,
+      outcome: "failed",
+      summary: "対象なし",
+    }),
     observeStatus: async () => status,
     observeSurroundings: async () => ({
       observedAt: "2026-09-22T00:00:00.000Z",

@@ -96,6 +96,9 @@ export interface MinecraftPort {
     signal: AbortSignal,
   ): Promise<void>;
   eatBestFood(signal: AbortSignal): Promise<string>;
+  /** Returns true only after the server reports the target entity's death. */
+  attackHostile(entityId: number, signal: AbortSignal): Promise<boolean>;
+  retreatFromHostiles(signal: AbortSignal): Promise<void>;
   escapeDanger(mode: EscapeMode, signal: AbortSignal): Promise<void>;
   recoverFromStuck(maxAttempts: number, signal: AbortSignal): Promise<void>;
   stopCurrentAction(): Promise<void>;

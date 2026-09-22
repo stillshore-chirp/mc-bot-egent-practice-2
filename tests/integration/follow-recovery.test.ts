@@ -143,6 +143,7 @@ describe("follow recovery conversation", () => {
     const replies: string[] = [];
     const coordinatorGame: GameController = {
       delivery: game.delivery,
+      respondToHostiles: (goal, signal) => game.respondToHostiles(goal, signal),
       observeStatus: () => game.observeStatus(),
       observeSurroundings: (radius, includeEntities) =>
         game.observeSurroundings(radius, includeEntities),

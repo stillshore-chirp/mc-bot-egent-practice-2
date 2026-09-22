@@ -1747,6 +1747,102 @@ export class MineflayerClient implements MinecraftPort {
     return food.name;
   }
 
+  public async attackHostile(
+    entityId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    throwIfAborted(signal, "hostile_attack");
+    const bot = this.requireBot();
+    const weapon = bot.inventory
+      .items()
+      .find((item) =>
+        /^(?:wooden|stone|iron|golden|diamond|netherite)_(?:sword|axe)$/u.test(
+          item.name,
+        ),
+      );
+    if (weapon === undefined) {
+      throw new AppError({
+        category: "safety",
+        code: "HOSTILE_ATTACK_WEAPON_MISSING",
+        message: "No safe melee weapon is available",
+        retryable: false,
+        failedAt: "hostile_attack",
+      });
+    }
+    await bot.equip(weapon, "hand");
+
+    const deaths = new Set<number>();
+    const onDeath = (entity: { readonly id: number }): void => {
+      deaths.add(entity.id);
+    };
+    bot.on("entityDead", onDeath);
+    try {
+      for (let hit = 0; hit < 6 && !deaths.has(entityId); hit += 1) {
+        throwIfAborted(signal, "hostile_attack");
+        const entity = bot.entities[entityId];
+        const name = entity?.name ?? entity?.displayName ?? entity?.type;
+        const physics = bot.entity as unknown as {
+          isInWater?: boolean;
+          isInLava?: boolean;
+          onFire?: boolean;
+        };
+        if (
+          entity === undefined ||
+          !["zombie", "husk", "zombie_villager"].includes(name ?? "") ||
+          bot.entity.position.distanceTo(entity.position) > 3 ||
+          bot.health < 16 ||
+          bot.food < 8 ||
+          physics.isInWater === true ||
+          physics.isInLava === true ||
+          physics.onFire === true ||
+          Object.values(bot.entities).some(
+            (other) =>
+              other.id !== entityId &&
+              other.id !== bot.entity.id &&
+              bot.entity.position.distanceTo(other.position) <= 4,
+          )
+        ) {
+          return false;
+        }
+        await bot.lookAt(entity.position.offset(0, 1, 0), true);
+        if (bot.entityAtCursor(3.5)?.id !== entityId) return false;
+        throwIfAborted(signal, "hostile_attack");
+        bot.attack(entity);
+        await delay(800, signal);
+      }
+      return deaths.has(entityId);
+    } finally {
+      bot.off("entityDead", onDeath);
+    }
+  }
+
+  public async retreatFromHostiles(signal: AbortSignal): Promise<void> {
+    throwIfAborted(signal, "hostile_retreat");
+    const bot = this.requireBot();
+    const origin = positionOf(bot.entity.position);
+    const threats = Object.values(bot.entities)
+      .filter(
+        (entity) =>
+          hostileNames.has(entity.name ?? entity.displayName ?? entity.type) &&
+          bot.entity.position.distanceTo(entity.position) <= 32,
+      )
+      .map((entity) => positionOf(entity.position));
+    const target = escapeTarget(origin, threats, 8);
+    if (target === undefined) {
+      throw new AppError({
+        category: "observation",
+        code: "HOSTILE_RETREAT_TARGET_MISSING",
+        message: "No hostile target remains observable",
+        retryable: false,
+        failedAt: "hostile_retreat",
+      });
+    }
+    await this.runPathfinder(
+      new goals.GoalNear(target.x, target.y, target.z, 2),
+      signal,
+    );
+  }
+
   public async escapeDanger(
     mode: EscapeMode,
     signal: AbortSignal,
@@ -1764,7 +1860,7 @@ export class MineflayerClient implements MinecraftPort {
                 (entity) =>
                   hostileNames.has(
                     entity.name ?? entity.displayName ?? entity.type,
-                  ) && bot.entity.position.distanceTo(entity.position) <= 8,
+                  ) && bot.entity.position.distanceTo(entity.position) <= 32,
               )
               .map((entity) => positionOf(entity.position)),
           )

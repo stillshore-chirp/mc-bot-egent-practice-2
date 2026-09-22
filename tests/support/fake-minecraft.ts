@@ -77,6 +77,7 @@ export class FakeMinecraft implements MinecraftPort {
     "allowed" | "unknown" | "denied"
   >();
   public availableFurnace = false;
+  public attackSucceeds = true;
   public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
   public placedBlocks = new Map<string, string>();
   private pendingDrop: ResourceTarget | undefined;
@@ -509,6 +510,37 @@ export class FakeMinecraft implements MinecraftPort {
     return "bread";
   }
 
+  public async attackHostile(
+    entityId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    signal.throwIfAborted();
+    const target = this.snapshot.nearbyEntities.find(
+      (entity) => entity.id === entityId && entity.hostile,
+    );
+    if (target === undefined) throw new Error("HOSTILE_TARGET_CHANGED");
+    this.actions.push(`attack:${entityId}`);
+    if (this.attackSucceeds) {
+      this.snapshot = {
+        ...this.snapshot,
+        nearbyEntities: this.snapshot.nearbyEntities.filter(
+          (entity) => entity.id !== entityId,
+        ),
+      };
+    }
+    return this.attackSucceeds;
+  }
+
+  public async retreatFromHostiles(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    this.snapshot = {
+      ...this.snapshot,
+      position: { ...this.snapshot.position, x: this.snapshot.position.x - 4 },
+      nearbyEntities: [],
+    };
+    this.actions.push("retreat:hostile");
+  }
+
   public async escapeDanger(
     mode: EscapeMode,
     signal: AbortSignal,
@@ -522,6 +554,10 @@ export class FakeMinecraft implements MinecraftPort {
       suffocating: false,
       oxygen: 20,
       oxygenState: oxygenObservationState(20, false),
+      position:
+        mode === "hostile"
+          ? { ...this.snapshot.position, x: this.snapshot.position.x - 4 }
+          : this.snapshot.position,
       nearbyEntities: [],
     };
     this.actions.push(`escape:${mode}`);

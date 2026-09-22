@@ -199,6 +199,17 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
   );
 }
 
+export function isHostileResponseCommand(message: string): boolean {
+  const normalized = message.trim();
+  if (/[?？「」『』“”]/u.test(normalized)) return false;
+  if (/(?:倒|攻撃|戦|撃滅|退治).{0,8}(?:ない|ません|不要)/u.test(normalized)) {
+    return false;
+  }
+  return /(?:撃滅|討伐|退治|やっつけ(?:て|ろ)|倒(?:せ|して|しろ|しなさい)|攻撃(?:して|しろ|せよ)|(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)|^(?:逃げて|退避して|距離を取って))/u.test(
+    normalized,
+  );
+}
+
 function renderReadOnlyStatus(status: GameStatus): string {
   if (!status.connected) {
     return "Minecraftへの接続を確認できません。再接続後に現在の状態を確認してください。";
@@ -535,6 +546,13 @@ export class ChatCoordinator {
       }
     }
 
+    const hostileResponse = isHostileResponseCommand(normalized);
+    if (hostileResponse) {
+      this.#contextFactory.clearPendingOwnerGoal?.();
+      this.#activeController?.abort(
+        new Error("OWNER_HOSTILE_RESPONSE_PRIORITIZED"),
+      );
+    }
     const generation = this.#generation;
     const stopBoundary = this.#stopTail;
     this.#conversationTail = this.#conversationTail
@@ -548,9 +566,14 @@ export class ChatCoordinator {
           );
           return undefined;
         }
-        return generation === this.#generation
-          ? this.#deliberate(username, normalized, "owner_message")
-          : undefined;
+        if (generation !== this.#generation) return undefined;
+        if (hostileResponse) {
+          await this.#game.stopCurrentAction(
+            "所有者の敵対対象への新しい対処依頼",
+          );
+          return this.#respondToHostiles(username, normalized);
+        }
+        return this.#deliberate(username, normalized, "owner_message");
       });
     await this.#conversationTail;
     return true;
@@ -729,6 +752,73 @@ export class ChatCoordinator {
       );
       await safeCompleteTrace(session, "failed", "状態質問への応答に失敗");
       throw error;
+    }
+  }
+
+  async #respondToHostiles(
+    username: string,
+    message: string,
+  ): Promise<RuntimeReassessmentRunOutcome> {
+    const controller = new AbortController();
+    this.#activeController = controller;
+    this.#activeRequestKind = "owner_message";
+    const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+    recorder.beginOwnerRequest?.(username, message);
+    const session = await safeStartTrace(
+      this.#traceService,
+      "敵対対象への対処依頼を受信",
+      "owner_message",
+    );
+    try {
+      const report = await safeWithTraceSpan(
+        this.#traceService,
+        "minecraft_action",
+        "敵対対象への対処",
+        { summary: "観測に応じた攻撃または退避" },
+        () =>
+          this.#game.respondToHostiles(
+            /^(?:逃げて|退避して|距離を取って)/u.test(message)
+              ? "evade"
+              : "eliminate",
+            controller.signal,
+          ),
+      );
+      if (controller.signal.aborted) {
+        await safeCompleteTrace(session, "cancelled", "停止を優先");
+        return "cancelled";
+      }
+      await this.#game.say(report.summary);
+      recorder.recordDeliveredOwnerExchange?.(
+        username,
+        message,
+        report.summary,
+      );
+      await safeCompleteTrace(
+        session,
+        report.outcome === "completed" ? "succeeded" : "failed",
+        "ゲーム内で観測した対処結果を送信",
+      );
+      return report.outcome === "completed" ? "completed" : "failed";
+    } catch (error) {
+      if (controller.signal.aborted) {
+        await safeCompleteTrace(session, "cancelled", "停止を優先");
+        return "cancelled";
+      }
+      this.#logger.error(
+        { errorType: error instanceof Error ? error.name : "UnknownError" },
+        "hostile response failed",
+      );
+      const summary =
+        "敵への対処中に操作を完了できませんでした。現在位置と周囲の危険を再確認してください。";
+      await this.#game.say(summary);
+      recorder.recordDeliveredOwnerExchange?.(username, message, summary);
+      await safeCompleteTrace(session, "failed", "敵への対処に失敗");
+      return "failed";
+    } finally {
+      if (this.#activeController === controller) {
+        this.#activeController = undefined;
+        this.#activeRequestKind = undefined;
+      }
     }
   }
 

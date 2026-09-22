@@ -1,4 +1,5 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
+import type { HostileGoal } from "../decision/hostile-response.js";
 import type {
   SafeActionCandidate,
   SafeActionObservationRequest,
@@ -172,6 +173,10 @@ export interface GameController {
   followOwner(
     safeDistance: number,
     maxDurationSeconds: number,
+    signal: AbortSignal,
+  ): Promise<ActionReport>;
+  respondToHostiles(
+    goal: HostileGoal,
     signal: AbortSignal,
   ): Promise<ActionReport>;
   stopCurrentAction(reason: string): Promise<ActionReport>;
