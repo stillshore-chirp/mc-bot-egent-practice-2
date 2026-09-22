@@ -4,6 +4,15 @@ import type {
   SurroundingsObservation,
   WorldSnapshot,
 } from "../domain/snapshot.js";
+import type {
+  CollectItemInput,
+  CraftItemInput,
+  GeneralActionCandidate,
+  GeneralActionObservationInput,
+  MineBlockInput,
+  PlaceBlockInput,
+  SmeltItemInput,
+} from "./general-actions.js";
 
 export interface ResourceTarget {
   readonly name: string;
@@ -71,6 +80,15 @@ export interface MinecraftPort {
     signal: AbortSignal,
   ): Promise<readonly ResourceTarget[]>;
   dig(target: ResourceTarget, signal: AbortSignal): Promise<void>;
+  observeActionCandidates(
+    input: GeneralActionObservationInput,
+    signal: AbortSignal,
+  ): Promise<readonly GeneralActionCandidate[]>;
+  mineBlock(target: MineBlockInput, signal: AbortSignal): Promise<void>;
+  collectItem(target: CollectItemInput, signal: AbortSignal): Promise<void>;
+  craftItem(target: CraftItemInput, signal: AbortSignal): Promise<number>;
+  placeBlock(target: PlaceBlockInput, signal: AbortSignal): Promise<void>;
+  smeltItem(target: SmeltItemInput, signal: AbortSignal): Promise<number>;
   collectDropsNear(
     position: Position,
     itemName: string,
