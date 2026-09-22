@@ -1213,7 +1213,7 @@ export class CompanionGameController implements GameController {
       };
     }
     if (record.status === "suspended") {
-      const recovery = suspendedTaskRecovery(record);
+      const recovery = suspendedTaskRecovery(record, afterSnapshot);
       return {
         before,
         after,
@@ -1280,9 +1280,9 @@ export class CompanionGameController implements GameController {
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
       armor: snapshot.armor,
-      activeTaskState: activeTaskState(task),
-      activeTaskSummary: activeTaskSummary(task),
-      latestTaskState: latestTaskState(task),
+      activeTaskState: activeTaskState(task, snapshot),
+      activeTaskSummary: activeTaskSummary(task, snapshot),
+      latestTaskState: latestTaskState(task, snapshot),
     };
   }
 
@@ -1397,82 +1397,85 @@ interface SuspendedTaskRecovery {
 
 function suspendedTaskRecovery(
   task: TaskStateForSummary,
+  snapshot?: WorldSnapshot | null,
 ): SuspendedTaskRecovery {
   const reason = task.checkpoint?.suspendReason;
   const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
+  const currentDanger = observedCurrentDanger(snapshot);
   if (reason === "reflex:stuck") {
-    const nextInstruction =
-      task.kind === "follow_player"
-        ? "もう一度「こっちおいで」と指示する"
-        : "もう一度作業を指示する";
     return {
-      summary: `移動が進まなかったため、${actionLabel}を安全に一時停止しました。周囲の障害物を避けてから、${nextInstruction}。`,
-      nextActions: ["周囲の障害物を避ける", nextInstruction],
+      summary: `移動中にBotの位置が変わらず、${actionLabel}を一時停止しました。${currentDanger ?? "通れない地形の詳細はまだ確認できていません。"} 通れる道を確保できたら「続けて」で再開できます。`,
+      nextActions: [
+        "通れる道と周囲の安全を確認する",
+        "状況が変わったら「続けて」で再開する",
+      ],
     };
   }
   if (reason === "reflex:hazard") {
     return {
-      summary:
-        "危険を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。周囲の安全を確かめてから、もう一度指示してください。",
+      summary: `直前にBotの周囲で危険を確認し、作業を一時停止しました。${currentDanger ?? "今回の観測だけでは危険が続いているか確認できません。"} 安全が確認できたら「続けて」で再開できます。`,
       nextActions: [
-        "周囲が安全か再確認する",
-        "安全を確かめてからもう一度指示する",
+        "Botの周囲の安全を再確認する",
+        "安全になったら「続けて」で再開する",
       ],
     };
   }
   if (reason === "reflex:hostile") {
     return {
-      summary:
-        "危険な相手を確認したため、安全のため作業を一時停止しました。現在も相手が近くにいるかは再確認が必要です。相手から離れて安全を確かめてから、もう一度指示してください。",
+      summary: `直前にBotの近くで敵を確認し、作業を一時停止しました。${currentDanger ?? "今回の観測では近くの敵を確認していません。"} 敵から距離を取れたら「続けて」で再開できます。`,
       nextActions: [
-        "危険な相手から離れる",
-        "周囲の安全を再確認してからもう一度指示する",
+        "敵から距離を取り周囲の安全を確認する",
+        "安全になったら「続けて」で再開する",
       ],
     };
   }
   if (reason === "reflex:damage") {
     return {
-      summary:
-        "被害を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。周囲の安全と被害の原因を確かめてから、もう一度指示してください。",
+      summary: `直前にBotの体力が減ったため、作業を一時停止しました。${currentDanger ?? "今回の観測だけでは被害の原因を特定できません。"} 原因を確かめ、安全になったら「続けて」で再開できます。`,
       nextActions: [
-        "周囲の安全と被害の原因を再確認する",
-        "安全を確かめてからもう一度指示する",
+        "Botの周囲と被害の原因を確認する",
+        "安全になったら「続けて」で再開する",
       ],
     };
   }
   if (reason === "reflex:hunger") {
     return {
       summary:
-        "空腹を確認したため、安全のため作業を一時停止しました。現在の空腹状態と食料を再確認し、必要なら食料を確保してから、もう一度指示してください。",
+        "Botの空腹を確認したため、作業を一時停止しました。食料を確保して安全を確認できたら「続けて」で再開できます。",
       nextActions: [
-        "現在の空腹状態と食料を再確認する",
-        "必要なら食料を確保してからもう一度指示する",
+        "Botの食料と空腹状態を確認する",
+        "食料を確保した後に「続けて」で再開する",
       ],
     };
   }
   return {
     summary:
-      "安全確認のため作業を一時停止しました。現在の状態を確認してから、もう一度指示してください。",
-    nextActions: ["現在の安全状態を確認する", "確認後にもう一度指示する"],
+      "作業を一時停止しました。停止の詳しい原因はまだ確認できていません。Botの状態を確かめてから「続けて」で再開できます。",
+    nextActions: ["Botの状態を確認する", "安全なら「続けて」で再開する"],
   };
 }
 
-function activeTaskState(task: TaskStateForSummary | undefined): string | null {
-  if (
-    task === undefined ||
-    task.persistedWithoutRuntime === true ||
-    terminalTaskStatuses.has(task.status)
-  )
-    return null;
-  if (task.status === "suspended") {
-    const recovery = suspendedTaskRecovery(task);
-    return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+function observedCurrentDanger(snapshot?: WorldSnapshot | null): string | null {
+  if (snapshot === undefined || snapshot === null) return null;
+  if (snapshot.inLava || snapshot.onFire || snapshot.suffocating) {
+    return "今もBotの周囲に環境上の危険を観測しています。";
   }
-  return `${task.kind}:${task.phase}:${task.status}`;
+  if (snapshot.inWater && snapshot.oxygenState !== "normal") {
+    return "Botは水中にいて、呼吸の安全を確認できません。";
+  }
+  if (
+    snapshot.nearbyEntities.some(
+      (entity) => entity.hostile && entity.distance <= 8,
+    )
+  ) {
+    return "今もBotの近くに敵を観測しています。";
+  }
+  return null;
 }
 
-function activeTaskSummary(
+function activeTaskState(
   task: TaskStateForSummary | undefined,
+  snapshot: WorldSnapshot,
 ): string | null {
   if (
     task === undefined ||
@@ -1481,8 +1484,23 @@ function activeTaskSummary(
   )
     return null;
   if (task.status === "suspended") {
-    const recovery = suspendedTaskRecovery(task);
-    return `${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+    return suspendedTaskRecovery(task, snapshot).summary;
+  }
+  return `${task.kind}:${task.phase}:${task.status}`;
+}
+
+function activeTaskSummary(
+  task: TaskStateForSummary | undefined,
+  snapshot: WorldSnapshot,
+): string | null {
+  if (
+    task === undefined ||
+    task.persistedWithoutRuntime === true ||
+    terminalTaskStatuses.has(task.status)
+  )
+    return null;
+  if (task.status === "suspended") {
+    return suspendedTaskRecovery(task, snapshot).summary;
   }
   if (task.status === "queued") {
     return "Minecraft作業の開始を待っています。";
@@ -1501,7 +1519,10 @@ function activeTaskSummary(
   }
 }
 
-function latestTaskState(task: TaskStateForSummary | undefined): string | null {
+function latestTaskState(
+  task: TaskStateForSummary | undefined,
+  snapshot: WorldSnapshot,
+): string | null {
   if (task === undefined) return null;
   if (task.persistedWithoutRuntime === true) {
     return "前回のMinecraft作業は途中と記録されていますが、現在その作業が続いていることは確認できません。状態を確認してから、必要ならもう一度指示してください。";
@@ -1519,9 +1540,10 @@ function latestTaskState(task: TaskStateForSummary | undefined): string | null {
       ? "直前のMinecraft作業は停止しました。"
       : "直前のMinecraft作業は停止しました。" + reason;
   }
-  if (task.status === "suspended") return suspendedTaskRecovery(task).summary;
+  if (task.status === "suspended")
+    return suspendedTaskRecovery(task, snapshot).summary;
   if (task.status === "queued") return "Minecraft作業の開始を待っています。";
-  return activeTaskSummary(task);
+  return activeTaskSummary(task, snapshot);
 }
 
 function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {

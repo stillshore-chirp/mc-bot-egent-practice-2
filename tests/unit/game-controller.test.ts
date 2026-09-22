@@ -350,19 +350,23 @@ describe("CompanionGameController", () => {
     const status = await game.observeStatus();
     const report = await follow;
 
-    expect(status.activeTaskState).toContain("移動が進まなかった");
-    expect(status.activeTaskSummary).toContain("移動が進まなかった");
+    expect(status.activeTaskState).toContain("Botの位置が変わらず");
+    expect(status.activeTaskSummary).toContain("Botの位置が変わらず");
+    expect(status.activeTaskSummary).not.toContain("次の操作:");
     expect(report).toMatchObject({
       outcome: "failed",
       failureCategory: "safety",
       failureCode: "TASK_SUSPENDED_FOR_SAFETY",
       failureRetryable: true,
     });
-    expect(report.summary).toContain("周囲の障害物");
-    expect(report.summary).toContain("もう一度「こっちおいで」");
+    expect(report.summary).toContain(
+      "通れない地形の詳細はまだ確認できていません",
+    );
+    expect(report.summary).toContain("「続けて」");
+    expect(report.summary).not.toContain("もう一度「こっちおいで」");
     expect(report.nextActions).toEqual([
-      "周囲の障害物を避ける",
-      "もう一度「こっちおいで」と指示する",
+      "通れる道と周囲の安全を確認する",
+      "状況が変わったら「続けて」で再開する",
     ]);
     expect(report.summary).not.toContain("reflex:stuck");
     close();
@@ -371,27 +375,27 @@ describe("CompanionGameController", () => {
   it.each([
     {
       reason: "reflex:hazard",
-      observed: "危険を確認したため",
-      currentCheck: "現在も危険があるかは再確認が必要",
-      nextAction: "周囲が安全か再確認する",
+      observed: "直前にBotの周囲で危険を確認",
+      currentCheck: "危険が続いているか確認できません",
+      nextAction: "Botの周囲の安全を再確認する",
     },
     {
       reason: "reflex:hostile",
-      observed: "危険な相手を確認したため",
-      currentCheck: "現在も相手が近くにいるかは再確認が必要",
-      nextAction: "周囲の安全を再確認してからもう一度指示する",
+      observed: "直前にBotの近くで敵を確認",
+      currentCheck: "今回の観測では近くの敵を確認していません",
+      nextAction: "敵から距離を取り周囲の安全を確認する",
     },
     {
       reason: "reflex:damage",
-      observed: "被害を確認したため",
-      currentCheck: "現在も危険があるかは再確認が必要",
-      nextAction: "周囲の安全と被害の原因を再確認する",
+      observed: "直前にBotの体力が減ったため",
+      currentCheck: "被害の原因を特定できません",
+      nextAction: "Botの周囲と被害の原因を確認する",
     },
     {
       reason: "reflex:hunger",
-      observed: "空腹を確認したため",
-      currentCheck: "現在の空腹状態と食料を再確認し",
-      nextAction: "現在の空腹状態と食料を再確認する",
+      observed: "Botの空腹を確認したため",
+      currentCheck: "食料を確保して安全を確認",
+      nextAction: "Botの食料と空腹状態を確認する",
     },
   ])(
     "separates a remembered $reason observation from the current state",
@@ -412,6 +416,26 @@ describe("CompanionGameController", () => {
       close();
     },
   );
+
+  it("reports a currently observed threat separately from the reason a task stopped", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+
+    await tasks.suspend("reflex:damage");
+    minecraft.snapshot = createSnapshot({ nearbyEntities: [hostile(1, 4)] });
+    const status = await game.observeStatus();
+    const report = await follow;
+
+    expect(status.activeTaskSummary).toContain("直前にBotの体力が減った");
+    expect(status.activeTaskSummary).toContain("今もBotの近くに敵を観測");
+    expect(report.summary).toContain("今もBotの近くに敵を観測");
+    expect(report.summary).not.toContain(
+      "今回の観測だけでは被害の原因を特定できません",
+    );
+    close();
+  });
 
   it("reports the observed new inventory count after gathering and returning", async () => {
     const minecraft = new FakeMinecraft();
