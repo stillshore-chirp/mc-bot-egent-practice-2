@@ -11,7 +11,11 @@ import {
   runtimeReassessmentToolNames,
   ToolExecutor,
 } from "../tools/executor.js";
-import { getToolDefinition, toolDefinitions } from "../tools/registry.js";
+import {
+  getToolDefinition,
+  ownerScopedMutationToolNames,
+  toolDefinitions,
+} from "../tools/registry.js";
 import { buildCapabilityContext } from "./capability-context.js";
 import {
   ConversationContextStore,
@@ -40,6 +44,11 @@ const actionToolFamilies: Readonly<
   move_to: ["move"],
   gather_resource: ["gather"],
   return_to_player: ["return"],
+  forget_delivery_target: ["memory"],
+  remember_player_fact: ["memory"],
+  remember_location: ["memory"],
+  set_commitment: ["memory"],
+  complete_commitment: ["memory"],
 };
 
 function scopedActionToolNames(
@@ -49,7 +58,7 @@ function scopedActionToolNames(
   if (authorized === undefined && prohibited.size === 0) return undefined;
   return toolDefinitions
     .filter(({ name, action }) => {
-      if (!action) return false;
+      if (!action && !ownerScopedMutationToolNames.has(name)) return false;
       if (name === "stop_current_action") return true;
       const families = actionToolFamilies[name];
       return (
@@ -332,7 +341,8 @@ export class OpenAIDeliberationAgent {
             ? toolDefinitions
             : toolDefinitions.filter(
                 ({ name, action }) =>
-                  !action || effectiveActionToolNames.includes(name),
+                  (!action && !ownerScopedMutationToolNames.has(name)) ||
+                  effectiveActionToolNames.includes(name),
               );
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {

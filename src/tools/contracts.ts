@@ -223,9 +223,9 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
-  /** False while a stopped owner goal is being discussed without resuming it. */
+  /** False while a stopped owner goal is discussed; also blocks memory writes. */
   allowActionTools?: boolean;
-  /** Trusted per-request action scope; model tool arguments cannot expand it. */
+  /** Trusted per-request action and memory-write scope. */
   allowedActionToolNames?: readonly string[];
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;

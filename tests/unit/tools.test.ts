@@ -209,6 +209,28 @@ describe("ToolExecutor", () => {
     });
   });
 
+  it("blocks persistent memory writes while a stopped goal remains read-only", async () => {
+    const stopped = context();
+    stopped.allowActionTools = false;
+    for (const [name, argumentsJson] of [
+      [
+        "remember_player_fact",
+        JSON.stringify({ subject: "利用者", predicate: "希望", value: "桜" }),
+      ],
+      ["forget_delivery_target", JSON.stringify({ kind: "chest" })],
+    ] as const) {
+      const result = await new ToolExecutor().execute(
+        name,
+        argumentsJson,
+        stopped,
+      );
+      expect(result).toMatchObject({
+        success: false,
+        error: { code: "STOPPED_GOAL_ACTION_NOT_ALLOWED" },
+      });
+    }
+  });
+
   it("requires a verified action before completing a commitment on tool evidence", async () => {
     const toolContext = context();
     const result = await new ToolExecutor().execute(

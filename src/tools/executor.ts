@@ -4,7 +4,7 @@ import { AppError } from "../domain/errors.js";
 import type { CognitiveStage } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ErrorCategory, ToolContext, ToolResult } from "./contracts.js";
-import { getToolDefinition } from "./registry.js";
+import { getToolDefinition, ownerScopedMutationToolNames } from "./registry.js";
 
 export const runtimeReassessmentToolNames = new Set([
   "observe_status",
@@ -14,15 +14,6 @@ export const runtimeReassessmentToolNames = new Set([
 ]);
 
 const memoryReadTools = new Set(["recall_memory", "get_delivery_targets"]);
-const memoryWriteTools = new Set([
-  "remember_player_fact",
-  "remember_location",
-  "register_delivery_target",
-  "forget_delivery_target",
-  "set_commitment",
-  "complete_commitment",
-]);
-
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,
@@ -128,7 +119,9 @@ export class ToolExecutor {
         "状態再評価では観測と記憶参照以外の操作を実行しません。",
       );
     }
-    if (context.allowActionTools === false && definition.action) {
+    const ownerScopedMutation =
+      definition.action || ownerScopedMutationToolNames.has(name);
+    if (context.allowActionTools === false && ownerScopedMutation) {
       return failure(
         "STOPPED_GOAL_ACTION_NOT_ALLOWED",
         "authorization",
@@ -136,7 +129,7 @@ export class ToolExecutor {
       );
     }
     if (
-      definition.action &&
+      ownerScopedMutation &&
       context.allowedActionToolNames !== undefined &&
       !context.allowedActionToolNames.includes(name)
     ) {
@@ -170,7 +163,7 @@ export class ToolExecutor {
     try {
       const stage = memoryReadTools.has(name)
         ? "memory_read"
-        : memoryWriteTools.has(name)
+        : ownerScopedMutationToolNames.has(name)
           ? "memory_write"
           : definition.action
             ? "minecraft_action"

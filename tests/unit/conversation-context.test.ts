@@ -195,6 +195,12 @@ describe("conversation context", () => {
     const message = "採取は再開しないで、拠点に戻って。";
     expect(explicitlyAuthorizedActionFamilies(message)).toEqual(["return"]);
     expect(explicitlyProhibitedActionFamilies(message)).toEqual(["gather"]);
+    expect(explicitlyProhibitedActionFamilies("拠点を忘れないで。")).toEqual([
+      "memory",
+    ]);
+    expect(explicitlyAuthorizedActionFamilies("拠点を忘れて。")).toEqual([
+      "memory",
+    ]);
     expect(
       explicitlyAuthorizedActionFamilies("追従しないで採取して。"),
     ).toEqual(["gather"]);

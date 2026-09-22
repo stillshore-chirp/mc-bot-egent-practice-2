@@ -510,6 +510,55 @@ describe("OpenAI tool loop", () => {
     });
   });
 
+  it("keeps memory writes outside a replacement movement request", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "採取を始めます。"),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-memory-write",
+          name: "remember_player_fact",
+          arguments: JSON.stringify({
+            subject: "利用者",
+            predicate: "希望",
+            value: "帰還",
+          }),
+          status: "completed",
+        },
+      ]),
+      response([], "記憶の更新は行いません。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    const replacement = await agent.deliberate({
+      ...request,
+      message: "記憶しないで、拠点に戻って",
+    });
+
+    const advertised = fake.requests[1]?.tools?.map((tool) => tool.name);
+    expect(advertised).toContain("return_to_player");
+    expect(advertised).not.toContain("remember_player_fact");
+    expect(advertised).not.toContain("forget_delivery_target");
+    expect(replacement.toolResults[0]?.result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+  });
+
   it("keeps an explicitly requested delivery registration available after a stop", async () => {
     const fake = new ScriptedOpenAI([
       response([], "木を探します。"),
