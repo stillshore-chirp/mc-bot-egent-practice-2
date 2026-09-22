@@ -1,5 +1,8 @@
 import { Vec3 } from "vec3";
-import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
+import {
+  MineflayerClient,
+  oxygenFromEntityMetadata,
+} from "../../src/minecraft/mineflayer-client.js";
 import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/minecraft/connection-manager.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
@@ -82,6 +85,166 @@ describe("Minecraft boundary", () => {
 });
 
 describe("Mineflayer player observation", () => {
+  it("attributes air supply to the Bot entity instead of nearby entity metadata", () => {
+    const metadataKeys: string[] = [];
+    metadataKeys[4] = "air_supply";
+    const botFull = {
+      entityId: 1,
+      metadata: [{ key: 4, value: 300 }],
+    };
+    const nearbyLow = {
+      entityId: 2,
+      metadata: [{ key: 4, value: 75 }],
+    };
+    const botLow = {
+      entityId: 1,
+      metadata: [{ key: 4, value: 75 }],
+    };
+    const nearbyFull = {
+      entityId: 2,
+      metadata: [{ key: 4, value: 300 }],
+    };
+
+    expect(oxygenFromEntityMetadata(botFull, 1, metadataKeys)).toBe(20);
+    expect(
+      oxygenFromEntityMetadata(nearbyLow, 1, metadataKeys),
+    ).toBeUndefined();
+    expect(oxygenFromEntityMetadata(botLow, 1, metadataKeys)).toBe(5);
+    expect(
+      oxygenFromEntityMetadata(nearbyFull, 1, metadataKeys),
+    ).toBeUndefined();
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 1, metadata: [{ key: 4, value: 399 }] },
+        1,
+        metadataKeys,
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    [1, 1],
+    [7, 1],
+    [8, 1],
+    [75, 5],
+    [76, 6],
+    [82, 6],
+  ])("maps raw air supply %i to oxygen unit %i", (raw, expected) => {
+    const metadataKeys: string[] = [];
+    metadataKeys[4] = "air_supply";
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 1, metadata: [{ key: 4, value: raw }] },
+        1,
+        metadataKeys,
+      ),
+    ).toBe(expected);
+  });
+
+  it("returns Bot oxygen, water state, and derived hazard from one observation", async () => {
+    const client = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    Object.assign(client, {
+      spawned: true,
+      authoritativeOxygen: 5,
+      botInstance: {
+        username: "fixture_bot",
+        entity: {
+          id: 1,
+          position: new Vec3(0, 64, 0),
+          velocity: new Vec3(0, 0, 0),
+          isInWater: true,
+        },
+        inventory: { items: () => [] },
+        players: {},
+        entities: {},
+        findBlocks: () => [],
+        blockAt: () => null,
+        game: { dimension: "overworld" },
+        health: 20,
+        food: 20,
+        oxygenLevel: 5,
+      },
+    });
+
+    const snapshot = await client.observe();
+    const surroundings = await client.observeSurroundings(8, false);
+
+    expect(snapshot).toMatchObject({
+      subject: "bot",
+      source: "minecraft",
+      oxygen: 5,
+      oxygenState: "low",
+      inWater: true,
+    });
+    expect(surroundings).toMatchObject({
+      subject: "bot",
+      source: "minecraft",
+      oxygen: 5,
+      oxygenState: "low",
+      inWater: true,
+      hazards: ["low_oxygen"],
+    });
+    expect(surroundings.observedAt).toEqual(expect.any(String));
+  });
+
+  it("marks out-of-range oxygen as unknown instead of reporting a false numeric value", async () => {
+    const client = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    const bot = {
+      username: "fixture_bot",
+      entity: {
+        id: 1,
+        position: new Vec3(0, 64, 0),
+        velocity: new Vec3(0, 0, 0),
+        isInWater: false,
+      },
+      inventory: { items: () => [] },
+      players: {},
+      entities: {},
+      findBlocks: () => [],
+      blockAt: () => null,
+      game: { dimension: "overworld" },
+      health: 20,
+      food: 20,
+      oxygenLevel: 399,
+    };
+    Object.assign(client, { spawned: true, botInstance: bot });
+
+    const snapshot = await client.observe();
+    const surroundings = await client.observeSurroundings(8, false);
+
+    expect(snapshot).toMatchObject({
+      oxygen: null,
+      oxygenState: "unknown",
+      inWater: false,
+    });
+    expect(surroundings.hazards).toEqual([]);
+
+    bot.entity.isInWater = true;
+    const underwaterSurroundings = await client.observeSurroundings(8, false);
+    expect(underwaterSurroundings).toMatchObject({
+      oxygen: null,
+      oxygenState: "unknown",
+      inWater: true,
+      hazards: ["oxygen_unconfirmed"],
+    });
+  });
+
   it("ignores distant unloaded players while preserving visible observations", async () => {
     const client = new MineflayerClient(
       {

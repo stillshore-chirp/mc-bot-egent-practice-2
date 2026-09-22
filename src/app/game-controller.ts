@@ -107,6 +107,13 @@ export class CompanionGameController implements GameController {
       includeEntities,
     );
     return {
+      observedAt: observed.observedAt,
+      subject: observed.subject,
+      source: observed.source,
+      requesterVitals: "unobserved",
+      oxygen: observed.oxygen,
+      oxygenState: observed.oxygenState,
+      inWater: observed.inWater,
       blocks: observed.blocks.map(({ name, distance }) => ({ name, distance })),
       entities: observed.entities.map(({ kind, distance }) => ({
         kind,
@@ -513,11 +520,19 @@ export class CompanionGameController implements GameController {
     }
     const task = this.#tasks.current;
     return {
+      observedAt: snapshot.observedAt,
+      subject: snapshot.subject,
+      source: snapshot.source,
+      requesterVitals: "unobserved",
       connected: snapshot.connected,
       spawned: snapshot.spawned,
       health: snapshot.health,
       food: snapshot.food,
       oxygen: snapshot.oxygen,
+      oxygenState: snapshot.oxygenState,
+      inWater: snapshot.inWater,
+      inLava: snapshot.inLava,
+      suffocating: snapshot.suffocating,
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
       activeTaskState: activeTaskState(task),

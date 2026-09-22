@@ -9,7 +9,21 @@ import type { ReflexState } from "../../src/reflexes/reflex-coordinator.js";
 
 const failed = (code = "REFLEX_FAILED"): ReflexState => ({
   state: "failed",
-  incident: { kind: "stuck", reason: "movement stopped", priority: 100 },
+  incident: {
+    kind: "stuck",
+    reason: "movement stopped",
+    priority: 100,
+    observation: {
+      subject: "bot",
+      source: "minecraft",
+      observedAt: "2026-09-22T00:00:00.000Z",
+      dimension: "overworld",
+      position: { x: 0, y: 64, z: 0 },
+      oxygen: 20,
+      oxygenState: "not_applicable",
+      inWater: false,
+    },
+  },
   failure: {
     category: "safety",
     code,
@@ -62,6 +76,16 @@ describe("application reflex policy", () => {
         kind: "stuck",
         reason: "movement stopped",
         priority: 100,
+        observation: {
+          subject: "bot",
+          source: "minecraft",
+          observedAt: "2026-08-25T00:00:00.000Z",
+          dimension: "overworld",
+          position: { x: 0, y: 64, z: 0 },
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+        },
       },
     };
 
@@ -90,6 +114,16 @@ describe("application reflex policy", () => {
         kind: "stuck",
         reason: "movement stopped",
         priority: 100,
+        observation: {
+          subject: "bot",
+          source: "minecraft",
+          observedAt: "2026-08-25T00:00:00.000Z",
+          dimension: "overworld",
+          position: { x: 0, y: 64, z: 0 },
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+        },
       },
     };
 

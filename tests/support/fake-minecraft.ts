@@ -8,6 +8,7 @@ import type {
   SurroundingsObservation,
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
+import { oxygenObservationState } from "../../src/domain/snapshot.js";
 import type {
   EscapeMode,
   MinecraftPort,
@@ -19,8 +20,10 @@ const now = (): string => new Date().toISOString();
 export function createSnapshot(
   overrides: Partial<WorldSnapshot> = {},
 ): WorldSnapshot {
-  return {
+  const snapshot: WorldSnapshot = {
     observedAt: now(),
+    subject: "bot",
+    source: "minecraft",
     connected: true,
     spawned: true,
     dimension: "overworld",
@@ -29,6 +32,7 @@ export function createSnapshot(
     health: 20,
     food: 20,
     oxygen: 20,
+    oxygenState: "not_applicable",
     onFire: false,
     inWater: false,
     inLava: false,
@@ -39,6 +43,12 @@ export function createSnapshot(
     ],
     nearbyEntities: [],
     ...overrides,
+  };
+  return {
+    ...snapshot,
+    oxygenState:
+      overrides.oxygenState ??
+      oxygenObservationState(snapshot.oxygen, snapshot.inWater),
   };
 }
 
@@ -155,11 +165,20 @@ export class FakeMinecraft implements MinecraftPort {
   ): Promise<SurroundingsObservation> {
     return {
       observedAt: now(),
+      subject: this.snapshot.subject,
+      source: this.snapshot.source,
+      oxygen: this.snapshot.oxygen,
+      oxygenState: this.snapshot.oxygenState,
+      inWater: this.snapshot.inWater,
       blocks: this.resources.map((resource) => ({ ...resource, distance: 1 })),
       entities: includeEntities ? this.snapshot.nearbyEntities : [],
       hazards: [
         ...(this.snapshot.inLava ? ["lava"] : []),
         ...(this.snapshot.onFire ? ["fire"] : []),
+        ...(this.snapshot.oxygenState === "low" ? ["low_oxygen"] : []),
+        ...(this.snapshot.inWater && this.snapshot.oxygenState === "unknown"
+          ? ["oxygen_unconfirmed"]
+          : []),
       ],
     };
   }
@@ -266,6 +285,7 @@ export class FakeMinecraft implements MinecraftPort {
       onFire: false,
       suffocating: false,
       oxygen: 20,
+      oxygenState: oxygenObservationState(20, false),
       nearbyEntities: [],
     };
     this.actions.push(`escape:${mode}`);

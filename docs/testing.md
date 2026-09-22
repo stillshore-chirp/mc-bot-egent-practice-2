@@ -47,6 +47,7 @@ Integration test は実装された依存境界の契約を確認します。Min
 - SQLite migration、transaction、再起動復元
 - OpenAI Responses API の function-call output に対する validation
 - Minecraft 観測イベントから reflexes への伝達
+- Bot自身の酸素・水中状態・観測時刻と危険判定の一致、利用者体調の未観測契約
 - 長時間 skill の cancellation と再開判断
 
 ## 実環境 E2E
