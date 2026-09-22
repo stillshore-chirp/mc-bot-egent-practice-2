@@ -58,6 +58,7 @@ interface TaskStateForSummary {
   readonly failureCategory?: string;
   readonly failureCode?: string;
   readonly checkpoint?: Readonly<Record<string, unknown>>;
+  readonly persistedWithoutRuntime?: boolean;
 }
 
 export class CompanionGameController implements GameController {
@@ -589,11 +590,11 @@ export class CompanionGameController implements GameController {
         // temporarily unavailable; the live task state is still authoritative.
       }
     }
-    if (activeSummary === undefined) return persisted;
-    if (persisted === undefined) return activeSummary;
-    return activeSummary.updatedAt >= persisted.updatedAt
-      ? activeSummary
-      : persisted;
+    if (activeSummary !== undefined) return activeSummary;
+    if (persisted === undefined) return undefined;
+    return terminalTaskStatuses.has(persisted.status)
+      ? persisted
+      : { ...persisted, persistedWithoutRuntime: true };
   }
 
   #syncLifeState(snapshot: WorldSnapshot): void {
@@ -731,7 +732,12 @@ function suspendedTaskRecovery(
 }
 
 function activeTaskState(task: TaskStateForSummary | undefined): string | null {
-  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+  if (
+    task === undefined ||
+    task.persistedWithoutRuntime === true ||
+    terminalTaskStatuses.has(task.status)
+  )
+    return null;
   if (task.status === "suspended") {
     const recovery = suspendedTaskRecovery(task);
     return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
@@ -742,7 +748,12 @@ function activeTaskState(task: TaskStateForSummary | undefined): string | null {
 function activeTaskSummary(
   task: TaskStateForSummary | undefined,
 ): string | null {
-  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+  if (
+    task === undefined ||
+    task.persistedWithoutRuntime === true ||
+    terminalTaskStatuses.has(task.status)
+  )
+    return null;
   if (task.status === "suspended") {
     const recovery = suspendedTaskRecovery(task);
     return `${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
@@ -763,6 +774,9 @@ function activeTaskSummary(
 
 function latestTaskState(task: TaskStateForSummary | undefined): string | null {
   if (task === undefined) return null;
+  if (task.persistedWithoutRuntime === true) {
+    return "前回のMinecraft作業は途中と記録されていますが、現在その作業が続いていることは確認できません。状態を確認してから、必要ならもう一度指示してください。";
+  }
   if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
   if (task.status === "failed") {
     const reason = taskFailureReason(task.failureCategory, task.failureCode);

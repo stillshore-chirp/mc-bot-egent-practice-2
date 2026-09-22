@@ -32,6 +32,7 @@ interface PendingOwnerTurn {
   readonly requestId: number;
   readonly message: string;
   userRecorded: boolean;
+  readonly readOnlyExchanges: { message: string; reply: string }[];
 }
 
 export interface DeliberationRequest {
@@ -365,6 +366,11 @@ export class OpenAIDeliberationAgent {
     message: string,
     reply: string,
   ): void {
+    const pending = this.#pendingOwnerTurns.get(requesterUsername);
+    if (pending !== undefined) {
+      pending.readOnlyExchanges.push({ message, reply });
+      return;
+    }
     this.#conversation.recordUser(requesterUsername, message);
     this.#conversation.recordAssistant(requesterUsername, reply);
   }
@@ -412,6 +418,7 @@ export class OpenAIDeliberationAgent {
         conversationRequestId !== undefined &&
         pending?.requestId === conversationRequestId
       ) {
+        this.#flushReadOnlyExchanges(requesterUsername, pending);
         this.#pendingOwnerTurns.delete(requesterUsername);
       }
       this.#conversation.recordCancellation(requesterUsername);
@@ -441,10 +448,15 @@ export class OpenAIDeliberationAgent {
     ) {
       return conversationRequestId;
     }
+    if (pending?.requestId === requestId) return requestId;
+    if (pending !== undefined) {
+      this.#flushReadOnlyExchanges(requesterUsername, pending);
+    }
     this.#pendingOwnerTurns.set(requesterUsername, {
       requestId,
       message,
       userRecorded: false,
+      readOnlyExchanges: [],
     });
     return requestId;
   }
@@ -466,6 +478,18 @@ export class OpenAIDeliberationAgent {
       this.#conversation.recordUser(requesterUsername, pending.message);
       pending.userRecorded = true;
     }
+    this.#flushReadOnlyExchanges(requesterUsername, pending);
     this.#conversation.recordAssistant(requesterUsername, text);
+  }
+
+  #flushReadOnlyExchanges(
+    requesterUsername: string,
+    pending: PendingOwnerTurn,
+  ): void {
+    for (const exchange of pending.readOnlyExchanges) {
+      this.#conversation.recordUser(requesterUsername, exchange.message);
+      this.#conversation.recordAssistant(requesterUsername, exchange.reply);
+    }
+    pending.readOnlyExchanges.length = 0;
   }
 }

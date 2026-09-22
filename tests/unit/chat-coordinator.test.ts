@@ -57,6 +57,9 @@ describe("immediate stop command", () => {
     "採取を中止",
     "そこで止まってください",
     "採取をやめてほしい",
+    "採取をやめてほしいです",
+    "採取を止めて拠点へ戻って",
+    "採取を止めて説明して",
   ])("accepts a targeted affirmative safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -72,6 +75,10 @@ describe("immediate stop command", () => {
     "「採取を止めて」と言った？",
     "追従を停止しないで",
     "『追従を停止』と表示して",
+    "採取を止めてほしくないけど拠点へ戻って",
+    "「採取を止めて」拠点へ戻って",
+    "なぜ採取を止めてしまった？",
+    "採取を止めて拠点へ戻っていい？",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
@@ -107,7 +114,11 @@ describe("immediate stop command", () => {
     expect(stopCurrentAction).toHaveBeenCalledWith("利用者の即時停止指示");
   });
 
-  it.each(["採取を止めて、拠点へ戻って", "採取を止めて代わりに拠点へ戻って"])(
+  it.each([
+    "採取を止めて、拠点へ戻って",
+    "採取を止めて代わりに拠点へ戻って",
+    "採取を止めて拠点へ戻って",
+  ])(
     "starts an explicit replacement only after a targeted stop succeeds: %s",
     async (message) => {
       const events: string[] = [];

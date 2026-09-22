@@ -30,7 +30,7 @@ const STOP_COMMANDS = new Set([
   "中断",
 ]);
 const TARGETED_STOP_COMMAND_PATTERN =
-  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい)?$|(?:停止|中止|中断)$/u;
+  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?$|(?:停止|中止|中断)$/u;
 const STOP_FAILURE_MESSAGE =
   "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
 
@@ -39,8 +39,31 @@ function splitStopClauses(message: string): string[] {
     message.match(/[^、，,。！？!?]+(?:[、，,。！？!?]|$)/gu) ?? [];
   return punctuationClauses
     .flatMap((clause) => clause.split(/(?=代わりに|その代わり)/u))
+    .flatMap(splitInlineStopClause)
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
+}
+
+function splitInlineStopClause(clause: string): string[] {
+  if (/[?？]/u.test(clause)) return [clause];
+  const normalized = normalizedStopClause(clause);
+  const commands =
+    /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?/gu;
+  for (const match of normalized.matchAll(commands)) {
+    const end = match.index + match[0].length;
+    const stop = normalized.slice(0, end).trim();
+    const rest = normalized.slice(end).trim();
+    if (
+      rest.length > 0 &&
+      isStopClause(stop) &&
+      !/^(?:[?？]|ほしくない|ほしくありません|いい|よい|良い|かどうか|と|って|は)/u.test(
+        rest,
+      )
+    ) {
+      return [stop, rest];
+    }
+  }
+  return [clause];
 }
 
 function normalizedStopClause(clause: string): string {
@@ -50,6 +73,7 @@ function normalizedStopClause(clause: string): string {
 function isStopClause(clause: string): boolean {
   if (/[?？]/u.test(clause)) return false;
   const normalized = normalizedStopClause(clause);
+  if (/[「」『』“”"'`]/u.test(normalized)) return false;
   if (STOP_COMMANDS.has(normalized)) return true;
   return TARGETED_STOP_COMMAND_PATTERN.test(normalized);
 }

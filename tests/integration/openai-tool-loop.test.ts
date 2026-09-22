@@ -363,6 +363,9 @@ describe("OpenAI tool loop", () => {
     "専門用語を使って説明して",
     "例を使って説明して",
     "例を作って説明して",
+    "要約を作って",
+    "手順を作って説明して",
+    "説明を続けて",
   ])(
     "does not expose or execute action tools after a stop for %s",
     async (message) => {
@@ -461,6 +464,88 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[0]?.instructions).not.toContain(
       "直前の作業は停止済みです",
     );
+  });
+
+  it("keeps a concurrent status exchange between the earlier action request and its reply", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "木を集めました。"),
+      response([], "確認しました。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const requestId = agent.beginOwnerRequest("owner", "木を集めて");
+    agent.recordDeliveredOwnerExchange(
+      "owner",
+      "今何してる",
+      "木を探しています。",
+    );
+    await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+      conversationRequestId: requestId,
+    });
+    agent.recordDeliveredReply(
+      "owner",
+      "owner_message",
+      "木を集めました。",
+      requestId,
+    );
+    await agent.deliberate({
+      message: "それはどうなった",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const history = JSON.stringify(fake.requests[1]?.input);
+    expect(history.indexOf("木を集めて")).toBeLessThan(
+      history.indexOf("今何してる"),
+    );
+    expect(history.indexOf("今何してる")).toBeLessThan(
+      history.indexOf("木を探しています。"),
+    );
+    expect(history.indexOf("木を探しています。")).toBeLessThan(
+      history.indexOf("木を集めました。"),
+    );
+  });
+
+  it("retains a delivered status exchange when the earlier action is cancelled", async () => {
+    const fake = new ScriptedOpenAI([response([], "確認しました。")]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const requestId = agent.beginOwnerRequest("owner", "木を集めて");
+    agent.recordDeliveredOwnerExchange(
+      "owner",
+      "今何してる",
+      "木を探しています。",
+    );
+    agent.recordCancelledRequest("owner", "owner_message", requestId);
+    await agent.deliberate({
+      message: "なぜ止まった",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const history = JSON.stringify(fake.requests[0]?.input);
+    expect(history).not.toContain("木を集めて");
+    expect(history).toContain("今何してる");
+    expect(history).toContain("木を探しています。");
   });
 
   it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {

@@ -235,6 +235,31 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it.each(["queued", "running", "suspended"] as const)(
+    "does not present a persisted %s task as active after restart",
+    async (status) => {
+      const minecraft = new FakeMinecraft();
+      const { game, memory, close } = createController(minecraft, true);
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status,
+        input: {},
+      });
+
+      const observed = await game.observeStatus();
+
+      expect(observed.activeTaskState).toBeNull();
+      expect(observed.activeTaskSummary).toBeNull();
+      expect(observed.latestTaskState).toContain(
+        "現在その作業が続いていることは確認できません",
+      );
+      close();
+    },
+  );
+
   it("keeps a safe persisted failure reason for direct status questions", async () => {
     const minecraft = new FakeMinecraft();
     const { game, memory, close } = createController(minecraft, true);
