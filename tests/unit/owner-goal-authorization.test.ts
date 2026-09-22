@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveOwnerGoalAuthorization } from "../../src/decision/owner-goal-authorization.js";
+import {
+  deriveOwnerGoalAuthorization,
+  ownerGoalPendingTtlMs,
+} from "../../src/decision/owner-goal-authorization.js";
 
 const ownerInput = {
   requesterUsername: "owner",
@@ -109,6 +112,87 @@ describe("owner goal authorization", () => {
         targetCount: 20,
       },
     });
+  });
+
+  it("binds the next standalone quantity reply to a pending owner goal", () => {
+    const first = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "鉄を掘って",
+      nowMs: 1_000,
+    });
+
+    expect(first).toMatchObject({
+      outcome: "clarify",
+      pendingGoal: {
+        targetItem: "raw_iron",
+        remainingTurns: 1,
+      },
+    });
+    if (first.outcome !== "clarify" || first.pendingGoal === undefined)
+      throw new Error("expected pending owner goal");
+
+    const followup = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "20個で",
+      pendingGoal: first.pendingGoal,
+      nowMs: 1_001,
+    });
+    expect(followup).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: ["iron_ore", "deepslate_iron_ore"],
+        targetItem: "raw_iron",
+        targetCount: 20,
+      },
+    });
+  });
+
+  it.each([
+    ["statement", "20個持ってるよ"],
+    ["different task", "拠点に戻って"],
+  ])("does not authorize a pending goal from a %s reply", (_label, message) => {
+    const first = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "鉄を掘って",
+      nowMs: 1_000,
+    });
+    if (first.outcome !== "clarify" || first.pendingGoal === undefined)
+      throw new Error("expected pending owner goal");
+
+    const result = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message,
+      pendingGoal: first.pendingGoal,
+      nowMs: 1_001,
+    });
+    expect(result).not.toMatchObject({ outcome: "authorized" });
+  });
+
+  it("does not use an expired or foreign pending goal", () => {
+    const first = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "鉄を掘って",
+      nowMs: 1_000,
+    });
+    if (first.outcome !== "clarify" || first.pendingGoal === undefined)
+      throw new Error("expected pending owner goal");
+
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "20個",
+        pendingGoal: first.pendingGoal,
+        nowMs: 1_000 + ownerGoalPendingTtlMs + 1,
+      }),
+    ).not.toMatchObject({ outcome: "authorized" });
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "20個",
+        pendingGoal: { ...first.pendingGoal, ownerUsername: "other" },
+        nowMs: 1_001,
+      }),
+    ).not.toMatchObject({ outcome: "authorized" });
   });
 
   it.each([

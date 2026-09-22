@@ -206,6 +206,42 @@ describe("safe action planner", () => {
     });
   });
 
+  it("rejects a candidate whose executable input names another resource", () => {
+    const result = planSafeAction({
+      mode: "explicit",
+      requestedId: "mine-iron",
+      authorization: {
+        kind: "owner_bounded_resource",
+        goal: "ironを集める",
+        allowedResources: ["iron_ore"],
+        targetItem: "raw_iron",
+        targetCount: 1,
+        maxCount: 8,
+      },
+      candidates: [
+        candidate({
+          id: "mine-iron",
+          action: "mine_resource",
+          operationClass: "natural_resource",
+          resourceName: "iron_ore",
+          goalItem: "raw_iron",
+          requestedCount: 1,
+          reversible: false,
+          impact: "medium",
+          steps: [
+            { tool: "mine_block", input: { resource: "oak_log", count: 1 } },
+          ],
+        }),
+      ],
+      maxSteps: 4,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "clarify",
+      code: "CHOICE_NOT_CONFIRMED",
+    });
+  });
+
   it("keeps server-protected natural resources denied", () => {
     const result = planSafeAction({
       mode: "delegated",

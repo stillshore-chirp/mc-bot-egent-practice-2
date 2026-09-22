@@ -127,4 +127,107 @@ describe("CompanionContextFactory owner action boundary", () => {
     );
     expect(thirdParty.toolContext.safeActionAuthorization).toBeUndefined();
   });
+
+  it("keeps one pending resource goal for the next owner quantity reply", async () => {
+    const contextFactory = factory();
+    const first = await contextFactory.create(
+      "owner",
+      "鉄を掘って",
+      new AbortController().signal,
+      "correlation-pending-1",
+      "owner_message",
+    );
+    expect(first.toolContext.safeActionAuthorization).toBeUndefined();
+    expect(first.toolContext.safeActionClarification).toContain("数量");
+
+    const second = await contextFactory.create(
+      "owner",
+      "20個",
+      new AbortController().signal,
+      "correlation-pending-2",
+      "owner_message",
+    );
+    expect(second.toolContext.safeActionAuthorization).toMatchObject({
+      targetItem: "raw_iron",
+      targetCount: 20,
+    });
+    expect(second.toolContext.safeActionClarification).toBeUndefined();
+  });
+
+  it("preserves pending owner goals across runtime reassessment but clears on stop", async () => {
+    const contextFactory = factory();
+    await contextFactory.create(
+      "owner",
+      "鉄を掘って",
+      new AbortController().signal,
+      "correlation-clear-1",
+      "owner_message",
+    );
+    await contextFactory.create(
+      "owner",
+      "現在の状態を確認して",
+      new AbortController().signal,
+      "correlation-clear-2",
+      "runtime_reassessment",
+    );
+    const afterRuntime = await contextFactory.create(
+      "owner",
+      "20個",
+      new AbortController().signal,
+      "correlation-clear-3",
+      "owner_message",
+    );
+    expect(afterRuntime.toolContext.safeActionAuthorization).toMatchObject({
+      targetItem: "raw_iron",
+      targetCount: 20,
+    });
+
+    await contextFactory.create(
+      "owner",
+      "鉄を掘って",
+      new AbortController().signal,
+      "correlation-clear-4",
+      "owner_message",
+    );
+    contextFactory.clearPendingOwnerGoal();
+    const afterStop = await contextFactory.create(
+      "owner",
+      "20個",
+      new AbortController().signal,
+      "correlation-clear-5",
+      "owner_message",
+    );
+    expect(afterStop.toolContext.safeActionAuthorization).toBeUndefined();
+  });
+
+  it("does not let a third-party message consume the owner pending goal", async () => {
+    const contextFactory = factory();
+    await contextFactory.create(
+      "owner",
+      "鉄を掘って",
+      new AbortController().signal,
+      "correlation-third-party-1",
+      "owner_message",
+    );
+    const thirdParty = await contextFactory.create(
+      "other",
+      "20個",
+      new AbortController().signal,
+      "correlation-third-party-2",
+      "owner_message",
+    );
+    expect(thirdParty.toolContext.safeActionAuthorization).toBeUndefined();
+
+    const owner = await contextFactory.create(
+      "owner",
+      "20個",
+      new AbortController().signal,
+      "correlation-third-party-3",
+      "owner_message",
+    );
+    expect(owner.toolContext.safeActionAuthorization).toMatchObject({
+      targetItem: "raw_iron",
+      targetCount: 20,
+    });
+  });
 });

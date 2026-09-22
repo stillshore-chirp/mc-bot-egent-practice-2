@@ -133,6 +133,24 @@ export class ToolExecutor {
         "状態再評価では観測と記憶参照以外の操作を実行しません。",
       );
     }
+    if (
+      context.safeActionClarification !== undefined &&
+      definition.action &&
+      name !== "stop_current_action"
+    ) {
+      return {
+        success: false,
+        error: {
+          category: "authorization",
+          code: "OWNER_GOAL_CLARIFICATION_REQUIRED",
+          retryable: false,
+          failedAt: "owner_goal_boundary",
+          confirmedState: { ownerGoal: "clarification_required" },
+          nextActions: [context.safeActionClarification],
+          userSummary: context.safeActionClarification,
+        },
+      };
+    }
 
     let rawArguments: unknown;
     try {

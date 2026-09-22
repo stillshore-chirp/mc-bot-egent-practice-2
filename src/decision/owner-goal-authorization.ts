@@ -6,6 +6,19 @@ export interface OwnerGoalAuthorizationInput {
   readonly authorizedOwnerUsername: string;
   readonly requestKind: "owner_message" | "runtime_reassessment";
   readonly maxCount: number;
+  readonly pendingGoal?: PendingOwnerGoal;
+  readonly nowMs?: number;
+}
+
+export interface PendingOwnerGoal {
+  readonly ownerUsername: string;
+  readonly goal: string;
+  readonly label: string;
+  readonly allowedResources: readonly string[];
+  readonly targetItem: string;
+  readonly createdAtMs: number;
+  readonly expiresAtMs: number;
+  readonly remainingTurns: number;
 }
 
 export type OwnerGoalAuthorizationDecision =
@@ -16,8 +29,14 @@ export type OwnerGoalAuthorizationDecision =
         { kind: "owner_bounded_resource" }
       >;
     }
-  | { readonly outcome: "clarify"; readonly question: string }
+  | {
+      readonly outcome: "clarify";
+      readonly question: string;
+      readonly pendingGoal?: PendingOwnerGoal;
+    }
   | { readonly outcome: "none" };
+
+export const ownerGoalPendingTtlMs = 5 * 60_000;
 
 interface ResourceGoal {
   readonly label: string;
@@ -91,8 +110,9 @@ const canonicalResourceOutputs: Readonly<Record<string, string>> = {
 
 /**
  * Derives a bounded resource authorization from the authenticated owner's
- * current message. The result is intentionally ephemeral and never read from
- * memory or from a model-selected tool argument.
+ * current message and, for one short-lived follow-up, a typed pending goal.
+ * The result is intentionally ephemeral and never read from memory or from a
+ * model-selected tool argument.
  */
 export function deriveOwnerGoalAuthorization(
   input: OwnerGoalAuthorizationInput,
@@ -105,6 +125,7 @@ export function deriveOwnerGoalAuthorization(
   }
 
   const message = normalize(input.message);
+  const nowMs = input.nowMs ?? Date.now();
   const namedResource = resourceGoals.find(({ aliases }) =>
     aliases.some((alias) => containsAlias(message, alias)),
   );
@@ -117,7 +138,26 @@ export function deriveOwnerGoalAuthorization(
   const hasResourceIntent =
     resource !== undefined ||
     unresolvedCanonicalResource !== undefined ||
-    resourceIntentPattern.test(message);
+    resourceIntentPattern.test(message) ||
+    count !== undefined;
+
+  const pendingGoal = input.pendingGoal;
+  const pendingGoalValid =
+    pendingGoal !== undefined &&
+    isPendingGoalValid(pendingGoal, input.authorizedOwnerUsername, nowMs);
+  if (
+    pendingGoalValid &&
+    resource === undefined &&
+    isStandaloneQuantityReply(message)
+  ) {
+    if (count === undefined) {
+      return {
+        outcome: "clarify",
+        question: `数量を数字で指定してください（上限${String(input.maxCount)}個）。`,
+      };
+    }
+    return authorizePendingGoal(pendingGoal, count, input.maxCount);
+  }
 
   if (resource === undefined && count === undefined && !hasResourceIntent) {
     return { outcome: "none" };
@@ -139,6 +179,11 @@ export function deriveOwnerGoalAuthorization(
     return {
       outcome: "clarify",
       question: `目的は${resource.label}の収集として理解しました。数量を指定してください（上限${String(input.maxCount)}個）。`,
+      pendingGoal: createPendingGoal(
+        resource,
+        input.authorizedOwnerUsername,
+        nowMs,
+      ),
     };
   }
   if (!Number.isInteger(input.maxCount) || input.maxCount < 1) {
@@ -166,6 +211,75 @@ export function deriveOwnerGoalAuthorization(
       maxCount: input.maxCount,
     },
   };
+}
+
+function authorizePendingGoal(
+  pendingGoal: PendingOwnerGoal,
+  count: number,
+  maxCount: number,
+): OwnerGoalAuthorizationDecision {
+  if (!Number.isInteger(maxCount) || maxCount < 1) {
+    return {
+      outcome: "clarify",
+      question:
+        "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
+    };
+  }
+  if (count > maxCount) {
+    return {
+      outcome: "clarify",
+      question: `指定数が上限を超えています。${pendingGoal.label}は${String(maxCount)}個以下で指定してください。`,
+    };
+  }
+  return {
+    outcome: "authorized",
+    authorization: {
+      kind: "owner_bounded_resource",
+      goal: pendingGoal.goal,
+      allowedResources: pendingGoal.allowedResources,
+      targetItem: pendingGoal.targetItem,
+      targetCount: count,
+      maxCount,
+    },
+  };
+}
+
+function createPendingGoal(
+  resource: ResourceGoal,
+  ownerUsername: string,
+  nowMs: number,
+): PendingOwnerGoal {
+  return {
+    ownerUsername,
+    goal: resource.label,
+    label: resource.label,
+    allowedResources: resource.allowedResources,
+    targetItem: resource.targetItem,
+    createdAtMs: nowMs,
+    expiresAtMs: nowMs + ownerGoalPendingTtlMs,
+    remainingTurns: 1,
+  };
+}
+
+function isPendingGoalValid(
+  pendingGoal: PendingOwnerGoal,
+  authorizedOwnerUsername: string,
+  nowMs: number,
+): boolean {
+  return (
+    pendingGoal.ownerUsername === authorizedOwnerUsername &&
+    pendingGoal.remainingTurns === 1 &&
+    Number.isInteger(pendingGoal.createdAtMs) &&
+    Number.isInteger(pendingGoal.expiresAtMs) &&
+    pendingGoal.expiresAtMs >= pendingGoal.createdAtMs &&
+    nowMs <= pendingGoal.expiresAtMs
+  );
+}
+
+function isStandaloneQuantityReply(message: string): boolean {
+  return /^(?:あと\s*)?[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
+    message,
+  );
 }
 
 function normalize(value: string): string {

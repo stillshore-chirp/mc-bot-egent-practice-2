@@ -11,7 +11,10 @@ import type {
   ToolContext,
 } from "../tools/contracts.js";
 import type { ChatContextFactory } from "../agent/chat-coordinator.js";
-import { deriveOwnerGoalAuthorization } from "../decision/owner-goal-authorization.js";
+import {
+  deriveOwnerGoalAuthorization,
+  type PendingOwnerGoal,
+} from "../decision/owner-goal-authorization.js";
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
@@ -39,6 +42,8 @@ async function safeWithTraceSpan<T>(
 }
 
 export class CompanionContextFactory implements ChatContextFactory {
+  #pendingOwnerGoal: PendingOwnerGoal | undefined;
+
   public constructor(
     private readonly config: AppConfig,
     private readonly playerId: string,
@@ -49,6 +54,10 @@ export class CompanionContextFactory implements ChatContextFactory {
     private readonly tasks: TaskRuntime,
     private readonly traceService?: TraceService,
   ) {}
+
+  public clearPendingOwnerGoal(): void {
+    this.#pendingOwnerGoal = undefined;
+  }
 
   public async create(
     requesterUsername: string,
@@ -187,7 +196,20 @@ export class CompanionContextFactory implements ChatContextFactory {
           authorizedOwnerUsername: this.config.ownerUsername,
           requestKind,
           maxCount: this.config.limits.maxGatherCount,
+          ...(this.#pendingOwnerGoal === undefined
+            ? {}
+            : { pendingGoal: this.#pendingOwnerGoal }),
         });
+        if (
+          requestKind !== "runtime_reassessment" &&
+          requesterUsername === this.config.ownerUsername
+        ) {
+          this.#pendingOwnerGoal =
+            ownerGoal.outcome === "clarify" &&
+            ownerGoal.pendingGoal !== undefined
+              ? ownerGoal.pendingGoal
+              : undefined;
+        }
         const ownerGoalFields =
           ownerGoal.outcome === "authorized"
             ? { safeActionAuthorization: ownerGoal.authorization }

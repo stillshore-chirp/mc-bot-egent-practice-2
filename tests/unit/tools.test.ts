@@ -590,6 +590,40 @@ describe("ToolExecutor", () => {
     expect(observations).toBe(0);
   });
 
+  it("does not start another action while the owner quantity is pending", async () => {
+    const toolContext = context();
+    toolContext.safeActionClarification =
+      "鉄の数量を指定してください（上限64個）。";
+
+    const result = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        code: "OWNER_GOAL_CLARIFICATION_REQUIRED",
+        category: "authorization",
+      },
+    });
+  });
+
+  it("allows an explicit stop while a goal clarification is pending", async () => {
+    const toolContext = context();
+    toolContext.safeActionClarification =
+      "鉄の数量を指定してください（上限64個）。";
+
+    const result = await new ToolExecutor().execute(
+      "stop_current_action",
+      JSON.stringify({ reason: "利用者の停止指示" }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({ success: true });
+  });
+
   it("rejects an unauthorized requester before executing", async () => {
     const result = await new ToolExecutor().execute(
       "observe_status",

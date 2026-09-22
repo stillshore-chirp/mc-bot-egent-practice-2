@@ -129,6 +129,7 @@ function isAuthorizedBound(
     !authorization.allowedResources.includes(candidate.resourceName)
   )
     return false;
+  if (!stepsMatchResource(candidate, candidate.resourceName)) return false;
   if (candidate.goalItem !== authorization.targetItem) return false;
   if (
     !Number.isInteger(authorization.targetCount) ||
@@ -151,6 +152,19 @@ function isAuthorizedBound(
     requestedCount <= authorization.targetCount &&
     requestedCount <= authorization.maxCount
   );
+}
+
+function stepsMatchResource(
+  candidate: SafeActionCandidate,
+  resourceName: string,
+): boolean {
+  const declaredResources = candidate.steps.flatMap((step) => {
+    const input = step.input;
+    return ["resource", "resourceName", "block", "blockName"].flatMap((key) =>
+      typeof input[key] === "string" ? [input[key]] : [],
+    );
+  });
+  return declaredResources.every((value) => value === resourceName);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

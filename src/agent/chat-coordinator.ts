@@ -25,6 +25,7 @@ const STOP_COMMANDS = new Set([
 ]);
 
 export interface ChatContextFactory {
+  clearPendingOwnerGoal?(): void;
   create(
     requesterUsername: string,
     message: string,
@@ -158,6 +159,7 @@ export class ChatCoordinator {
     const normalized = message.trim();
     if (STOP_COMMANDS.has(normalized)) {
       this.#generation += 1;
+      this.#contextFactory.clearPendingOwnerGoal?.();
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
       const session = await safeStartTrace(
@@ -246,6 +248,7 @@ export class ChatCoordinator {
 
   public async shutdown(): Promise<void> {
     this.#generation += 1;
+    this.#contextFactory.clearPendingOwnerGoal?.();
     this.#activeController?.abort(new Error("APPLICATION_SHUTDOWN"));
     await this.#conversationTail;
   }
