@@ -1,4 +1,10 @@
-import { distance, type WorldSnapshot } from "../domain/snapshot.js";
+import {
+  distance,
+  type ObservationAttribution,
+  type OxygenObservationState,
+  type Position,
+  type WorldSnapshot,
+} from "../domain/snapshot.js";
 
 export const reflexKinds = [
   "hazard",
@@ -13,6 +19,15 @@ export interface ReflexIncident {
   readonly kind: ReflexKind;
   readonly reason: string;
   readonly priority: number;
+  readonly observation: ReflexObservation;
+}
+
+export interface ReflexObservation extends ObservationAttribution {
+  readonly dimension: string;
+  readonly position: Position;
+  readonly oxygen: number | null;
+  readonly oxygenState: OxygenObservationState;
+  readonly inWater: boolean;
 }
 
 export interface ReflexThresholds {
@@ -38,21 +53,43 @@ export class ReflexDetector {
     const previous = this.previous;
     this.previous = current;
 
+    const observation = reflexObservation(current);
+    const oxygenHazard =
+      current.inWater &&
+      (current.oxygenState === "low" ||
+        current.oxygenState === "unknown" ||
+        (current.oxygen !== null &&
+          current.oxygen <= this.thresholds.lowOxygen));
+
     if (
       current.inLava ||
       current.onFire ||
       current.suffocating ||
-      current.oxygen <= this.thresholds.lowOxygen ||
+      oxygenHazard ||
       current.velocityY <= this.thresholds.fallingVelocity
     ) {
       return {
         kind: "hazard",
-        reason: "Immediate environmental hazard observed",
+        reason:
+          current.inWater &&
+          (current.oxygenState === "low" ||
+            (current.oxygen !== null &&
+              current.oxygen <= this.thresholds.lowOxygen))
+            ? "Bot oxygen is low while underwater"
+            : current.oxygenState === "unknown" && current.inWater
+              ? "Bot oxygen cannot be confirmed while underwater"
+              : "Immediate environmental hazard observed",
         priority: 500,
+        observation,
       };
     }
     if (previous?.health !== undefined && current.health < previous.health) {
-      return { kind: "damage", reason: "Health decreased", priority: 400 };
+      return {
+        kind: "damage",
+        reason: "Health decreased",
+        priority: 400,
+        observation,
+      };
     }
     if (
       current.nearbyEntities.some(
@@ -64,6 +101,7 @@ export class ReflexDetector {
         kind: "hostile",
         reason: "Hostile entity is within safety distance",
         priority: 300,
+        observation,
       };
     }
     if (current.food <= this.thresholds.lowFood) {
@@ -71,6 +109,7 @@ export class ReflexDetector {
         kind: "hunger",
         reason: "Food level is below the configured threshold",
         priority: 200,
+        observation,
       };
     }
 
@@ -96,6 +135,7 @@ export class ReflexDetector {
           kind: "stuck",
           reason: "Movement was requested but position did not change",
           priority: 100,
+          observation,
         }
       : undefined;
   }
@@ -112,7 +152,11 @@ export function isStableAfterIncident(
         !snapshot.inLava &&
         !snapshot.onFire &&
         !snapshot.suffocating &&
-        snapshot.oxygen > thresholds.lowOxygen
+        (!snapshot.inWater ||
+          (snapshot.oxygenState !== "low" &&
+            snapshot.oxygenState !== "unknown" &&
+            snapshot.oxygen !== null &&
+            snapshot.oxygen > thresholds.lowOxygen))
       );
     case "damage":
     case "hostile":
@@ -125,4 +169,17 @@ export function isStableAfterIncident(
     case "stuck":
       return true;
   }
+}
+
+export function reflexObservation(snapshot: WorldSnapshot): ReflexObservation {
+  return {
+    subject: snapshot.subject,
+    source: snapshot.source,
+    observedAt: snapshot.observedAt,
+    dimension: snapshot.dimension,
+    position: snapshot.position,
+    oxygen: snapshot.oxygen,
+    oxygenState: snapshot.oxygenState,
+    inWater: snapshot.inWater,
+  };
 }

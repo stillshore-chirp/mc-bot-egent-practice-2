@@ -78,6 +78,7 @@ PRODUCT_PATTERNS = (
     "docs/architecture.md",
     "docs/dashboard.md",
     "docs/dashboard/**",
+    "docs/behavior-memory-e2e.md",
     "docs/memory.md",
     "docs/minecraft-26-1.md",
     "docs/operations.md",
