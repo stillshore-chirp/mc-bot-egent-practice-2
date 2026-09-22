@@ -158,6 +158,8 @@ export function oxygenFromEntityMetadata(
   ) {
     return null;
   }
+  // The safety threshold is expressed in 15-tick oxygen units. Ceil keeps
+  // raw values above the five-unit cutoff from being reported as low.
   const oxygen = Math.ceil(airSupply.value / 15);
   return Number.isFinite(oxygen) && oxygen >= 0 && oxygen <= 20 ? oxygen : null;
 }

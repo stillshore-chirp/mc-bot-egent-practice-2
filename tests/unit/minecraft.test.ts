@@ -115,18 +115,30 @@ describe("Mineflayer player observation", () => {
     ).toBeUndefined();
     expect(
       oxygenFromEntityMetadata(
-        { entityId: 1, metadata: [{ key: 4, value: 76 }] },
-        1,
-        metadataKeys,
-      ),
-    ).toBe(6);
-    expect(
-      oxygenFromEntityMetadata(
         { entityId: 1, metadata: [{ key: 4, value: 399 }] },
         1,
         metadataKeys,
       ),
     ).toBeNull();
+  });
+
+  it.each([
+    [1, 1],
+    [7, 1],
+    [8, 1],
+    [75, 5],
+    [76, 6],
+    [82, 6],
+  ])("maps raw air supply %i to oxygen unit %i", (raw, expected) => {
+    const metadataKeys: string[] = [];
+    metadataKeys[4] = "air_supply";
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 1, metadata: [{ key: 4, value: raw }] },
+        1,
+        metadataKeys,
+      ),
+    ).toBe(expected);
   });
 
   it("returns Bot oxygen, water state, and derived hazard from one observation", async () => {
