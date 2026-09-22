@@ -196,6 +196,41 @@ describe("OpenAI tool loop", () => {
     expect(thirdInput).not.toContain("現在の状態を確認しました。");
   });
 
+  it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "鉄を20個ですね。確認しました。"),
+      response([], "鉄の収集操作は提供していません。原木なら収集できます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "鉄が必要で、数量は20個です。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    await agent.deliberate({
+      message: "集めて。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    const secondInput = JSON.stringify(fake.requests[1]?.input);
+    expect(secondInput).toContain("鉄");
+    expect(secondInput).toContain("20個");
+    expect(fake.requests[1]?.instructions).toContain("提供していない操作");
+    expect(fake.requests[1]?.instructions).toContain("実行済みと扱わず");
+  });
+
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {
     const fake = new ScriptedOpenAI([
       response([
