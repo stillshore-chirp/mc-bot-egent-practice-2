@@ -7,7 +7,10 @@ import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
 import { toOpenAIFunctionTool } from "../tools/definition.js";
-import { ToolExecutor } from "../tools/executor.js";
+import {
+  runtimeReassessmentToolNames,
+  ToolExecutor,
+} from "../tools/executor.js";
 import { getToolDefinition, toolDefinitions } from "../tools/registry.js";
 
 const MAX_TOOL_ROUNDS = 8;
@@ -62,7 +65,9 @@ function instructions(request: DeliberationRequest): string {
 
 function deterministicActionSummary(
   results: { name: string; result: ToolResult<unknown> }[],
+  requestKind: ToolContext["requestKind"],
 ): string | undefined {
+  if (requestKind === "runtime_reassessment") return undefined;
   const actions = results.filter(
     ({ name }) => getToolDefinition(name)?.action === true,
   );
@@ -155,6 +160,12 @@ export class OpenAIDeliberationAgent {
       { role: "user", content: request.message },
     ];
     const toolResults: { name: string; result: ToolResult<unknown> }[] = [];
+    const availableTools =
+      request.toolContext.requestKind === "runtime_reassessment"
+        ? toolDefinitions.filter(({ name }) =>
+            runtimeReassessmentToolNames.has(name),
+          )
+        : toolDefinitions;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const startedAt = performance.now();
@@ -177,7 +188,7 @@ export class OpenAIDeliberationAgent {
               model: this.#model,
               instructions: instructions(request),
               input: inputItems,
-              tools: toolDefinitions.map(toOpenAIFunctionTool),
+              tools: availableTools.map(toOpenAIFunctionTool),
               tool_choice: "auto",
               parallel_tool_calls: false,
               store: false,
@@ -216,7 +227,10 @@ export class OpenAIDeliberationAgent {
         (item) => item.type === "function_call",
       );
       if (calls.length === 0) {
-        const actionSummary = deterministicActionSummary(toolResults);
+        const actionSummary = deterministicActionSummary(
+          toolResults,
+          request.toolContext.requestKind,
+        );
         const text = actionSummary ?? response.output_text.trim();
         if (text.length === 0) {
           throw new Error("LLM_RESPONSE_EMPTY");

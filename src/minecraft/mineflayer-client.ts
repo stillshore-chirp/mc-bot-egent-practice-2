@@ -22,6 +22,29 @@ import type {
   MinecraftPort,
   ResourceTarget,
 } from "./port.js";
+import {
+  actionGuardChannel,
+  queryActionGuard,
+  requireActionPermission,
+} from "./action-guard.js";
+import type {
+  CollectItemInput,
+  CraftItemInput,
+  FurnaceSlotState,
+  GeneralActionCandidate,
+  GeneralActionObservationInput,
+  MineBlockInput,
+  PlaceBlockInput,
+  SmeltItemInput,
+} from "./general-actions.js";
+import {
+  craftRunsForOutput,
+  furnaceBatchReadiness,
+  goalMetadataForBlock,
+  goalMetadataForOutput,
+  knownBlockDrops,
+  selectBalancedActionCandidates,
+} from "./general-actions.js";
 
 import {
   queryTreeProtection,
@@ -33,6 +56,7 @@ import { queryStorageIdentity, storageChannel } from "./storage-identity.js";
 
 import { depositIntoChest } from "./chest-deposit.js";
 import type { ChestTarget } from "../memory/delivery-targets.js";
+import { gatherableLogs } from "../skills/gather-logs/resource-catalog.js";
 
 const hostileNames = new Set([
   "blaze",
@@ -232,6 +256,37 @@ export function nearestItemDropPosition(
     .sort((left, right) => left.distance - right.distance)[0]?.position;
 }
 
+function generalPermissionSafety(
+  permission: GeneralActionCandidate["permission"],
+  hazards: readonly string[],
+): GeneralActionCandidate["safety"] {
+  if (permission !== "allowed")
+    return permission === "unknown" ? "unknown" : "blocked";
+  return hazards.length === 0 ? "allowed" : "blocked";
+}
+
+function normalizePermission(
+  decision: "allowed" | "unknown" | "protected" | "changed",
+): GeneralActionCandidate["permission"] {
+  return decision === "allowed"
+    ? "allowed"
+    : decision === "unknown"
+      ? "unknown"
+      : "denied";
+}
+
+function generalCandidateId(
+  action: string,
+  name: string,
+  position: { x: number; y: number; z: number },
+): string {
+  return `${action}:${name}:${position.x}:${position.y}:${position.z}`;
+}
+
+function isAirName(name: string | undefined): boolean {
+  return name === undefined || ["air", "cave_air", "void_air"].includes(name);
+}
+
 export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
   private spawned = false;
@@ -293,7 +348,9 @@ export class MineflayerClient implements MinecraftPort {
         this.spawned = true;
         bot._client.write("custom_payload", {
           channel: "minecraft:register",
-          data: Buffer.from(`${treeProtectionChannel}\0${storageChannel}`),
+          data: Buffer.from(
+            `${treeProtectionChannel}\0${storageChannel}\0${actionGuardChannel}`,
+          ),
         });
         const movements = new Movements(bot);
         movements.canDig = false;
@@ -747,6 +804,254 @@ export class MineflayerClient implements MinecraftPort {
     return allowed;
   }
 
+  public async observeActionCandidates(
+    input: GeneralActionObservationInput,
+    signal: AbortSignal,
+  ): Promise<readonly GeneralActionCandidate[]> {
+    throwIfAborted(signal, "observe_actions");
+    const bot = this.requireBot();
+    const surrounding = await this.observeSurroundings(input.radius, true);
+    const requested = new Set(input.requestedItems);
+    const candidates: GeneralActionCandidate[] = [];
+    const add = (candidate: Omit<GeneralActionCandidate, "order">): void => {
+      candidates.push({ ...candidate, order: candidates.length });
+    };
+
+    for (const block of surrounding.blocks) {
+      if (knownBlockDrops[block.name] === undefined) continue;
+      const target: ResourceTarget = {
+        name: block.name,
+        position: block.position,
+      };
+      const goalMetadata = goalMetadataForBlock(block.name, requested);
+      let permission: GeneralActionCandidate["permission"];
+      try {
+        permission = normalizePermission(
+          gatherableLogs.includes(block.name as (typeof gatherableLogs)[number])
+            ? await queryTreeProtection(bot._client, target, signal)
+            : await queryActionGuard(
+                bot._client,
+                {
+                  operation: "mine",
+                  name: block.name,
+                  position: block.position,
+                },
+                signal,
+              ),
+        );
+      } catch {
+        permission = "unknown";
+      }
+      add({
+        id: generalCandidateId("mine_block", block.name, block.position),
+        label: `${block.name}を採掘`,
+        action: "mine_block",
+        args: { name: block.name, position: block.position },
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: block.name, position: block.position },
+          },
+        ],
+        observed: true,
+        purposeFit:
+          requested.has(block.name) || goalMetadata.goalItem !== undefined
+            ? "direct"
+            : "unknown",
+        permission,
+        safety: generalPermissionSafety(permission, surrounding.hazards),
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: block.name,
+        ...goalMetadata,
+        distance: block.distance,
+      });
+    }
+
+    const inventory = new Map<string, number>();
+    for (const item of bot.inventory.items()) {
+      inventory.set(item.name, (inventory.get(item.name) ?? 0) + item.count);
+    }
+    const craftingTable = findCraftingTable(bot, input.radius);
+    for (const itemName of requested) {
+      const item = bot.registry.itemsByName[itemName];
+      const recipesFor = (
+        bot as unknown as {
+          recipesFor?: (...args: unknown[]) => readonly unknown[];
+        }
+      ).recipesFor;
+      if (item === undefined || recipesFor === undefined) continue;
+      let recipe: unknown;
+      try {
+        recipe = recipesFor.call(bot, item.id, null, 1, craftingTable)[0];
+      } catch {
+        recipe = undefined;
+      }
+      if (recipe === undefined) continue;
+      const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(itemName, requested);
+      add({
+        id: `craft_item:${itemName}`,
+        label: `${itemName}を所持品からクラフト`,
+        action: "craft_item",
+        args: { name: itemName, count: 1 },
+        steps: [{ tool: "craft_item", input: { name: itemName, count: 1 } }],
+        observed: true,
+        purposeFit: "direct",
+        permission,
+        safety: generalPermissionSafety(permission, surrounding.hazards),
+        reversible: false,
+        impact: "low",
+        operationClass: "world_change",
+        requestedCount: 1,
+        scopeId: "inventory",
+        ...goalMetadata,
+        distance: 0,
+      });
+    }
+
+    const origin = bot.entity.position.floored();
+    const placePosition = [
+      origin.offset(1, 0, 0),
+      origin.offset(-1, 0, 0),
+      origin.offset(0, 0, 1),
+      origin.offset(0, 0, -1),
+    ].find((position) => {
+      const block = bot.blockAt(position);
+      const support = bot.blockAt(position.offset(0, -1, 0));
+      return (
+        block !== null &&
+        isAirName(block.name) &&
+        support !== null &&
+        !isAirName(support.name)
+      );
+    });
+    if (placePosition !== undefined) {
+      for (const [itemName, held] of inventory) {
+        if (held <= 0 || bot.registry.blocksByName[itemName] === undefined)
+          continue;
+        const position = positionOf(placePosition);
+        let permission: GeneralActionCandidate["permission"];
+        try {
+          permission = normalizePermission(
+            await queryActionGuard(
+              bot._client,
+              { operation: "place", name: itemName, position },
+              signal,
+            ),
+          );
+        } catch {
+          permission = "unknown";
+        }
+        const goalMetadata = goalMetadataForOutput(itemName, requested);
+        add({
+          id: generalCandidateId("place_block", itemName, position),
+          label: `${itemName}を観測位置へ設置`,
+          action: "place_block",
+          args: { name: itemName, position },
+          steps: [
+            {
+              tool: "place_block",
+              input: { name: itemName, position },
+            },
+          ],
+          observed: true,
+          purposeFit:
+            goalMetadata.goalItem !== undefined ? "direct" : "unknown",
+          permission,
+          safety: generalPermissionSafety(permission, surrounding.hazards),
+          reversible: false,
+          impact: "medium",
+          operationClass: "world_change",
+          requestedCount: 1,
+          scopeId: "observed-placement",
+          ...goalMetadata,
+          distance: bot.entity.position.distanceTo(placePosition),
+        });
+      }
+    }
+
+    for (const entity of surrounding.entities) {
+      const itemName = droppedItemName(
+        entity as unknown as Parameters<typeof droppedItemName>[0],
+      );
+      if (itemName === undefined) continue;
+      const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(itemName, requested);
+      add({
+        id: generalCandidateId("collect_item", itemName, entity.position),
+        label: `${itemName}を回収`,
+        action: "collect_item",
+        args: { name: itemName, position: entity.position, count: 1 },
+        steps: [
+          {
+            tool: "collect_item",
+            input: { name: itemName, position: entity.position, count: 1 },
+          },
+        ],
+        observed: true,
+        purposeFit: goalMetadata.goalItem !== undefined ? "direct" : "unknown",
+        permission,
+        safety: generalPermissionSafety(permission, surrounding.hazards),
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: itemName,
+        ...goalMetadata,
+        distance: entity.distance,
+      });
+    }
+
+    const furnace = bot.findBlock({
+      matching: ["furnace", "blast_furnace", "smoker"]
+        .map((name) => bot.registry.blocksByName[name]?.id)
+        .filter((id): id is number => id !== undefined),
+      maxDistance: input.radius,
+      count: 1,
+    });
+    const smeltingRecipes: Record<string, string> = {
+      iron_ingot: "raw_iron",
+      gold_ingot: "raw_gold",
+      copper_ingot: "raw_copper",
+    };
+    for (const output of requested) {
+      if (furnace === null) break;
+      const inputName = smeltingRecipes[output];
+      if (inputName === undefined || (inventory.get(inputName) ?? 0) < 1)
+        continue;
+      const position = positionOf(furnace.position);
+      const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(output, requested);
+      add({
+        id: generalCandidateId("smelt_item", output, position),
+        label: `${inputName}を${output}へ精錬`,
+        action: "smelt_item",
+        args: { input: inputName, output, count: 1, furnace: position },
+        steps: [
+          {
+            tool: "smelt_item",
+            input: { input: inputName, output, count: 1, furnace: position },
+          },
+        ],
+        observed: true,
+        purposeFit: "direct",
+        permission,
+        safety: generalPermissionSafety(permission, surrounding.hazards),
+        reversible: false,
+        impact: "low",
+        operationClass: "world_change",
+        requestedCount: 1,
+        scopeId: "inventory",
+        ...goalMetadata,
+        distance: bot.entity.position.distanceTo(furnace.position),
+      });
+    }
+    return selectBalancedActionCandidates(candidates, input.maxCandidates);
+  }
+
   public async dig(target: ResourceTarget, signal: AbortSignal): Promise<void> {
     throwIfAborted(signal, "dig");
     const bot = this.requireBot();
@@ -834,6 +1139,543 @@ export class MineflayerClient implements MinecraftPort {
     } finally {
       signal.removeEventListener("abort", abort);
     }
+  }
+
+  public async mineBlock(
+    target: MineBlockInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal, "mine_block");
+    const bot = this.requireBot();
+    let block = bot.blockAt(
+      new Vec3(target.position.x, target.position.y, target.position.z),
+    );
+    if (block?.name !== target.name) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target block is no longer present",
+        retryable: true,
+        failedAt: "mine_block",
+      });
+    }
+    await this.runPathfinder(
+      new goals.GoalLookAtBlock(block.position, bot.world, { reach: 4.5 }),
+      signal,
+    );
+    block = bot.blockAt(block.position);
+    if (block?.name !== target.name) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target block changed before a visible face was reached",
+        retryable: true,
+        failedAt: "mine_block",
+      });
+    }
+    if (!bot.canDigBlock(block)) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_NOT_DIGGABLE",
+        message: "The observed block cannot be dug from the current position",
+        retryable: true,
+        failedAt: "mine_block",
+      });
+    }
+    const bestTool = bot.pathfinder.bestHarvestTool(block);
+    if (bestTool !== null) await bot.equip(bestTool, "hand");
+    requireActionPermission(
+      await queryActionGuard(
+        bot._client,
+        { operation: "mine", name: target.name, position: target.position },
+        signal,
+      ),
+    );
+    throwIfAborted(signal, "mine_block");
+    if (
+      this.requireBot() !== bot ||
+      bot.blockAt(block.position)?.stateId !== block.stateId
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "RESOURCE_CHANGED",
+        message: "The target changed during permission verification",
+        retryable: false,
+        failedAt: "mine_block",
+      });
+    }
+    const abort = (): void => bot.stopDigging();
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      try {
+        await bot.dig(block, true, "auto");
+      } catch (error) {
+        if (signal.aborted) throwIfAborted(signal, "mine_block");
+        throw new AppError(
+          {
+            category: "resource",
+            code: "DIG_FAILED",
+            message: error instanceof Error ? error.message : "Digging failed",
+            retryable: true,
+            failedAt: "mine_block",
+          },
+          { cause: error },
+        );
+      }
+      throwIfAborted(signal, "mine_block");
+      // Mineflayer updates its local world optimistically when the dig timer
+      // completes. Re-read the authoritative server block before reporting
+      // success so a cancelled/expired permit cannot look like a completed
+      // mutation.
+      await delay(150, signal);
+      const serverState = await queryActionGuard(
+        bot._client,
+        { operation: "inspect", name: "air", position: target.position },
+        signal,
+      );
+      if (serverState !== "allowed") {
+        throw new AppError({
+          category: "resource",
+          code: "MINE_SERVER_STATE_UNVERIFIED",
+          message:
+            "The authoritative server did not confirm the target was removed",
+          retryable: true,
+          failedAt: "mine_block",
+          confirmedState: { decision: serverState },
+        });
+      }
+      if (bot.blockAt(block.position)?.name === target.name) {
+        throw new AppError({
+          category: "resource",
+          code: "DIG_VERIFICATION_FAILED",
+          message: "The target block still exists after digging",
+          retryable: true,
+          failedAt: "mine_block",
+        });
+      }
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
+  public async collectItem(
+    target: CollectItemInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal, "collect_item");
+    const before = await this.observe();
+    const baseline =
+      before.inventory.find((item) => item.name === target.name)?.count ?? 0;
+    await this.runPathfinder(
+      new goals.GoalNear(
+        target.position.x,
+        target.position.y,
+        target.position.z,
+        1,
+      ),
+      signal,
+    );
+    await this.collectDropsNear(
+      target.position,
+      target.name,
+      baseline + target.count,
+      signal,
+    );
+  }
+
+  public async craftItem(
+    target: CraftItemInput,
+    signal: AbortSignal,
+  ): Promise<number> {
+    throwIfAborted(signal, "craft_item");
+    const bot = this.requireBot();
+    const item = bot.registry.itemsByName[target.name];
+    const recipesFor = (
+      bot as unknown as {
+        recipesFor?: (...args: unknown[]) => readonly {
+          readonly result?: { readonly count?: number };
+        }[];
+      }
+    ).recipesFor;
+    const craft = (
+      bot as unknown as {
+        craft?: (
+          recipe: unknown,
+          count: number,
+          table?: unknown,
+        ) => Promise<void>;
+      }
+    ).craft;
+    if (item === undefined || recipesFor === undefined || craft === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "CRAFT_RECIPE_UNAVAILABLE",
+        message: "The requested item has no observed craft recipe",
+        retryable: false,
+        failedAt: "craft_item",
+      });
+    }
+    const craftingTable = findCraftingTable(bot, 8);
+    const recipe = recipesFor.call(bot, item.id, null, 1, craftingTable)[0];
+    if (recipe === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "CRAFT_RECIPE_UNAVAILABLE",
+        message: "The requested item has no observed craft recipe",
+        retryable: false,
+        failedAt: "craft_item",
+      });
+    }
+    const runCount = craftRunsForOutput(target.count, recipe.result?.count);
+    if (runCount === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "CRAFT_OUTPUT_UNKNOWN",
+        message: "The observed recipe does not expose a safe output count",
+        retryable: false,
+        failedAt: "craft_item",
+      });
+    }
+    const before = await this.observe();
+    await craft.call(bot, recipe, runCount, craftingTable);
+    throwIfAborted(signal, "craft_item");
+    const after = await this.observe();
+    const beforeCount =
+      before.inventory.find((entry) => entry.name === target.name)?.count ?? 0;
+    const afterCount =
+      after.inventory.find((entry) => entry.name === target.name)?.count ?? 0;
+    const delta = Math.max(0, afterCount - beforeCount);
+    if (delta < target.count) {
+      throw new AppError({
+        category: "inventory",
+        code: "CRAFT_OUTPUT_NOT_VERIFIED",
+        message: "Crafting finished without the requested inventory delta",
+        retryable: true,
+        failedAt: "craft_item",
+        confirmedState: { requested: target.count, produced: delta },
+      });
+    }
+    return delta;
+  }
+
+  public async placeBlock(
+    target: PlaceBlockInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal, "place_block");
+    const bot = this.requireBot();
+    const item = bot.registry.itemsByName[target.name];
+    if (
+      item === undefined ||
+      bot.registry.blocksByName[target.name] === undefined
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "PLACE_BLOCK_UNAVAILABLE",
+        message:
+          "The requested placeable block is not observed in the registry",
+        retryable: false,
+        failedAt: "place_block",
+      });
+    }
+    const targetPosition = new Vec3(
+      target.position.x,
+      target.position.y,
+      target.position.z,
+    );
+    const existing = bot.blockAt(targetPosition);
+    if (existing === null || !isAirName(existing.name)) {
+      throw new AppError({
+        category: "validation",
+        code: "PLACE_TARGET_OCCUPIED",
+        message: "The observed placement position is not empty",
+        retryable: false,
+        failedAt: "place_block",
+      });
+    }
+    const reference = [
+      {
+        block: bot.blockAt(targetPosition.offset(-1, 0, 0)),
+        face: new Vec3(1, 0, 0),
+      },
+      {
+        block: bot.blockAt(targetPosition.offset(1, 0, 0)),
+        face: new Vec3(-1, 0, 0),
+      },
+      {
+        block: bot.blockAt(targetPosition.offset(0, -1, 0)),
+        face: new Vec3(0, 1, 0),
+      },
+      {
+        block: bot.blockAt(targetPosition.offset(0, 1, 0)),
+        face: new Vec3(0, -1, 0),
+      },
+      {
+        block: bot.blockAt(targetPosition.offset(0, 0, -1)),
+        face: new Vec3(0, 0, 1),
+      },
+      {
+        block: bot.blockAt(targetPosition.offset(0, 0, 1)),
+        face: new Vec3(0, 0, -1),
+      },
+    ].find(({ block }) => block !== null && !isAirName(block.name));
+    const referenceBlock = reference?.block;
+    if (
+      reference === undefined ||
+      referenceBlock === null ||
+      referenceBlock === undefined
+    ) {
+      throw new AppError({
+        category: "path",
+        code: "PLACE_SUPPORT_NOT_FOUND",
+        message: "No observed solid block can support the placement",
+        retryable: false,
+        failedAt: "place_block",
+      });
+    }
+    requireActionPermission(
+      await queryActionGuard(
+        bot._client,
+        { operation: "place", name: target.name, position: target.position },
+        signal,
+      ),
+    );
+    await bot.equip(item.id, "hand");
+    await bot.placeBlock(referenceBlock, reference.face);
+    throwIfAborted(signal, "place_block");
+    const serverState = await queryActionGuard(
+      bot._client,
+      { operation: "inspect", name: target.name, position: target.position },
+      signal,
+    );
+    if (serverState !== "allowed") {
+      throw new AppError({
+        category: "resource",
+        code: "PLACE_SERVER_STATE_UNVERIFIED",
+        message: "The authoritative server did not confirm the placed block",
+        retryable: true,
+        failedAt: "place_block",
+        confirmedState: { decision: serverState },
+      });
+    }
+    if (bot.blockAt(targetPosition)?.name !== target.name) {
+      throw new AppError({
+        category: "inventory",
+        code: "PLACE_VERIFICATION_FAILED",
+        message: "The placed block was not observed at the requested position",
+        retryable: true,
+        failedAt: "place_block",
+      });
+    }
+  }
+
+  public async smeltItem(
+    target: SmeltItemInput,
+    signal: AbortSignal,
+  ): Promise<number> {
+    throwIfAborted(signal, "smelt_item");
+    const bot = this.requireBot();
+    const furnacePosition =
+      target.furnace ??
+      positionOf(
+        bot.findBlock({
+          matching: ["furnace", "blast_furnace", "smoker"]
+            .map((name) => bot.registry.blocksByName[name]?.id)
+            .filter((id): id is number => id !== undefined),
+          maxDistance: 8,
+          count: 1,
+        })?.position ?? bot.entity.position,
+      );
+    const furnaceBlock = bot.blockAt(
+      new Vec3(furnacePosition.x, furnacePosition.y, furnacePosition.z),
+    );
+    if (
+      furnaceBlock === null ||
+      !["furnace", "blast_furnace", "smoker"].includes(furnaceBlock.name)
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "FURNACE_NOT_FOUND",
+        message: "No observed furnace is available for smelting",
+        retryable: false,
+        failedAt: "smelt_item",
+      });
+    }
+    const typedBot = bot as unknown as {
+      openFurnace?: (block: unknown) => Promise<{
+        putInput(
+          itemId: number,
+          metadata: unknown,
+          count: number,
+        ): Promise<void>;
+        putFuel(
+          itemId: number,
+          metadata: unknown,
+          count: number,
+        ): Promise<void>;
+        takeOutput(): Promise<void>;
+        close(): void;
+        inputItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
+        fuelItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
+        outputItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
+      }>;
+    };
+    const inputItem = bot.registry.itemsByName[target.input];
+    const fuelItem =
+      bot.registry.itemsByName.coal ?? bot.registry.itemsByName.charcoal;
+    if (
+      typedBot.openFurnace === undefined ||
+      inputItem === undefined ||
+      fuelItem === undefined
+    ) {
+      throw new AppError({
+        category: "resource",
+        code: "SMELT_UNAVAILABLE",
+        message: "The furnace or safe fuel contract is unavailable",
+        retryable: false,
+        failedAt: "smelt_item",
+      });
+    }
+    const before = await this.observe();
+    const furnace = await typedBot.openFurnace(furnaceBlock);
+    try {
+      const initialSlots = furnaceBatchReadiness({
+        input: readFurnaceSlot(furnace.inputItem?.bind(furnace)),
+        fuel: readFurnaceSlot(furnace.fuelItem?.bind(furnace)),
+        output: readFurnaceSlot(furnace.outputItem?.bind(furnace)),
+      });
+      if (!initialSlots.allowed) {
+        throw new AppError({
+          category: "safety",
+          code:
+            initialSlots.reason === "occupied"
+              ? "SMELT_FURNACE_NOT_EMPTY"
+              : "SMELT_FURNACE_STATE_UNKNOWN",
+          message:
+            initialSlots.reason === "occupied"
+              ? "The observed furnace contains an unrelated batch"
+              : "The furnace slots could not be verified before smelting",
+          retryable: initialSlots.reason === "unknown",
+          failedAt: "smelt_item",
+          confirmedState: {
+            slot: initialSlots.slot,
+            item: initialSlots.itemName ?? null,
+          },
+        });
+      }
+      await furnace.putInput(inputItem.id, null, target.count);
+      await furnace.putFuel(fuelItem.id, null, target.count);
+      const boundInput = readFurnaceSlot(furnace.inputItem?.bind(furnace));
+      const boundFuel = readFurnaceSlot(furnace.fuelItem?.bind(furnace));
+      if (
+        !boundInput.known ||
+        boundInput.itemName !== target.input ||
+        !boundFuel.known ||
+        boundFuel.itemName !== fuelItem.name
+      ) {
+        throw new AppError({
+          category: "safety",
+          code: "SMELT_BATCH_NOT_BOUND",
+          message: "The furnace did not confirm the bot-owned input batch",
+          retryable: true,
+          failedAt: "smelt_item",
+          confirmedState: {
+            input: boundInput.itemName ?? null,
+            fuel: boundFuel.itemName ?? null,
+          },
+        });
+      }
+      const boundInputCount = boundInput.count ?? target.count;
+      const deadline = Date.now() + this.options.collectTimeoutMs;
+      while (Date.now() < deadline) {
+        throwIfAborted(signal, "smelt_item");
+        await delay(250, signal);
+        const current = await this.observe();
+        const count =
+          current.inventory.find((entry) => entry.name === target.output)
+            ?.count ?? 0;
+        const baseline =
+          before.inventory.find((entry) => entry.name === target.output)
+            ?.count ?? 0;
+        if (count - baseline >= target.count) return count - baseline;
+        const outputSlot = readFurnaceSlot(furnace.outputItem?.bind(furnace));
+        if (!outputSlot.known) {
+          throw new AppError({
+            category: "safety",
+            code: "SMELT_FURNACE_STATE_UNKNOWN",
+            message: "The furnace output slot could not be verified",
+            retryable: true,
+            failedAt: "smelt_item",
+          });
+        }
+        if (outputSlot.itemName !== undefined && (outputSlot.count ?? 1) > 0) {
+          if (outputSlot.itemName !== target.output) {
+            throw new AppError({
+              category: "safety",
+              code: "SMELT_OUTPUT_UNEXPECTED",
+              message: "The furnace produced an output outside this batch",
+              retryable: false,
+              failedAt: "smelt_item",
+              confirmedState: { output: outputSlot.itemName },
+            });
+          }
+          const currentInput = readFurnaceSlot(
+            furnace.inputItem?.bind(furnace),
+          );
+          if (
+            !currentInput.known ||
+            (currentInput.itemName === target.input &&
+              (currentInput.count ?? 0) >= boundInputCount)
+          ) {
+            throw new AppError({
+              category: "safety",
+              code: "SMELT_OUTPUT_NOT_BOUND",
+              message:
+                "The furnace output was not linked to consumed batch input",
+              retryable: true,
+              failedAt: "smelt_item",
+            });
+          }
+          await furnace.takeOutput();
+        }
+      }
+    } finally {
+      try {
+        furnace.close();
+      } catch {
+        // Mineflayer's runtime close() is synchronous; closing is best effort
+        // after the authoritative inventory observation.
+      }
+    }
+    const after = await this.observe();
+    const baseline =
+      before.inventory.find((entry) => entry.name === target.output)?.count ??
+      0;
+    const produced = Math.max(
+      0,
+      (after.inventory.find((entry) => entry.name === target.output)?.count ??
+        0) - baseline,
+    );
+    if (produced < target.count) {
+      throw new AppError({
+        category: "inventory",
+        code: "SMELT_OUTPUT_NOT_VERIFIED",
+        message: "Smelting finished without the requested inventory delta",
+        retryable: true,
+        failedAt: "smelt_item",
+        confirmedState: { requested: target.count, produced },
+      });
+    }
+    return produced;
   }
 
   public async collectDropsNear(
@@ -1045,6 +1887,34 @@ export class MineflayerClient implements MinecraftPort {
         signal.removeEventListener("abort", abortRejection);
       }
     }
+  }
+}
+
+function findCraftingTable(bot: Bot, maxDistance: number): unknown {
+  const tableId = bot.registry.blocksByName.crafting_table?.id;
+  if (tableId === undefined) return null;
+  return bot.findBlock({ matching: tableId, maxDistance, count: 1 });
+}
+
+function readFurnaceSlot(
+  reader:
+    | (() => { readonly name: string; readonly count: number } | null)
+    | undefined,
+): FurnaceSlotState {
+  if (reader === undefined) return { known: false };
+  try {
+    const item = reader();
+    if (item === null) return { known: true };
+    if (
+      typeof item.name !== "string" ||
+      !Number.isFinite(item.count) ||
+      item.count < 0
+    ) {
+      return { known: false };
+    }
+    return { known: true, itemName: item.name, count: item.count };
+  } catch {
+    return { known: false };
   }
 }
 

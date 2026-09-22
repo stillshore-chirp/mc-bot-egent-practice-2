@@ -6,7 +6,7 @@ import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ErrorCategory, ToolContext, ToolResult } from "./contracts.js";
 import { getToolDefinition } from "./registry.js";
 
-const runtimeReassessmentTools = new Set([
+export const runtimeReassessmentToolNames = new Set([
   "observe_status",
   "observe_surroundings",
   "recall_memory",
@@ -128,7 +128,7 @@ export class ToolExecutor {
     }
     if (
       context.requestKind === "runtime_reassessment" &&
-      !runtimeReassessmentTools.has(name)
+      !runtimeReassessmentToolNames.has(name)
     ) {
       return failure(
         "RUNTIME_REASSESSMENT_TOOL_NOT_ALLOWED",

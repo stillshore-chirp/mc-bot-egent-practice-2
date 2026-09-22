@@ -6,6 +6,15 @@ import type {
 } from "../decision/safe-action-planner.js";
 import type { SafeChoiceAuthorization } from "../decision/safe-choice.js";
 import type {
+  CollectItemInput,
+  CraftItemInput,
+  GeneralActionCandidate,
+  GeneralActionObservationInput,
+  MineBlockInput,
+  PlaceBlockInput,
+  SmeltItemInput,
+} from "../minecraft/general-actions.js";
+import type {
   BehaviorMemoryRecord,
   ForgetBehaviorMemoryInput,
   RememberBehaviorMemoryInput,
@@ -151,6 +160,10 @@ export interface GameController {
     request: SafeActionObservationRequest,
     signal: AbortSignal,
   ): Promise<readonly SafeActionCandidate[]>;
+  observeActionCandidates(
+    input: GeneralActionObservationInput,
+    signal: AbortSignal,
+  ): Promise<readonly GeneralActionCandidate[]>;
   say(message: string): Promise<void>;
   followOwner(
     safeDistance: number,
@@ -168,6 +181,17 @@ export interface GameController {
     count: number,
     signal: AbortSignal,
   ): Promise<ActionReport>;
+  mineBlock(input: MineBlockInput, signal: AbortSignal): Promise<ActionReport>;
+  collectItem(
+    input: CollectItemInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport>;
+  craftItem(input: CraftItemInput, signal: AbortSignal): Promise<ActionReport>;
+  placeBlock(
+    input: PlaceBlockInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport>;
+  smeltItem(input: SmeltItemInput, signal: AbortSignal): Promise<ActionReport>;
   returnToOwner(
     safeDistance: number,
     signal: AbortSignal,

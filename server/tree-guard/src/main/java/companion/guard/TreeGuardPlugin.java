@@ -1,9 +1,13 @@
 package companion.guard;
 
+import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import com.google.gson.*;
 import org.bukkit.*;
 import org.bukkit.block.*;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.*;
 import org.bukkit.event.block.*;
@@ -14,9 +18,15 @@ import org.bukkit.plugin.messaging.PluginMessageListener;
 
 public final class TreeGuardPlugin extends JavaPlugin implements Listener, PluginMessageListener {
     private static final String CHANNEL = "companion:tree_guard";
+    private static final String ACTION_CHANNEL = "companion:action_guard";
+    private static final int ACTION_LEDGER_SCHEMA_VERSION = 1;
+    private static final long ACTION_PERMIT_TTL_MILLIS = 10_000L;
     private final GrowthLedger ledger = new GrowthLedger();
+    private final ActionLedger actionLedger = new ActionLedger();
     private Set<String> botNames = Set.of();
     private List<Region> protectedRegions = List.of();
+    private List<Region> naturalResourceRegions = List.of();
+    private File actionLedgerFile;
     private record Region(String world, int x1, int y1, int z1, int x2, int y2, int z2) {
         boolean contains(Block b) {
             return world.equals(b.getWorld().getName()) && b.getX()>=x1 && b.getX()<=x2
@@ -28,8 +38,23 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         Set<String> names = new HashSet<>();
         for (String name : getConfig().getStringList("bot-names")) names.add(name.toLowerCase(Locale.ROOT));
         botNames = Set.copyOf(names);
+        protectedRegions = readRegions("protected-regions");
+        naturalResourceRegions = readRegions("natural-resource-regions");
+        actionLedgerFile = new File(getDataFolder(), "action-ledger.yml");
+        loadActionLedger();
+        getServer().getPluginManager().registerEvents(this, this);
+        getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
+        getServer().getMessenger().registerIncomingPluginChannel(this, ACTION_CHANNEL, this);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, ACTION_CHANNEL);
+        StorageIdentity storage=new StorageIdentity(this,this::bot);
+        getServer().getMessenger().registerIncomingPluginChannel(this,StorageIdentity.CHANNEL,storage);
+        getServer().getPluginManager().registerEvents(storage,this);
+        getServer().getMessenger().registerOutgoingPluginChannel(this,StorageIdentity.CHANNEL);
+    }
+    private List<Region> readRegions(String key) {
         List<Region> regions = new ArrayList<>();
-        for (Map<?,?> value : getConfig().getMapList("protected-regions")) {
+        for (Map<?,?> value : getConfig().getMapList(key)) {
             try {
                 String world = (String)value.get("world");
                 List<?> min = (List<?>)value.get("min"), max = (List<?>)value.get("max");
@@ -42,17 +67,88 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                 regions.add(new Region(world,lo[0],lo[1],lo[2],hi[0],hi[1],hi[2]));
             } catch (RuntimeException invalid) { throw new IllegalArgumentException("Invalid protected region configuration"); }
         }
-        protectedRegions = List.copyOf(regions);
-        getServer().getPluginManager().registerEvents(this, this);
-        getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
-        getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
-        StorageIdentity storage=new StorageIdentity(this,this::bot);
-        getServer().getMessenger().registerIncomingPluginChannel(this,StorageIdentity.CHANNEL,storage);
-        getServer().getPluginManager().registerEvents(storage,this);
-        getServer().getMessenger().registerOutgoingPluginChannel(this,StorageIdentity.CHANNEL);
+        return List.copyOf(regions);
     }
-    @Override public void onDisable() { ledger.clear(); }
+    @Override public void onDisable() {
+        saveActionLedger();
+        ledger.clear();
+        actionLedger.clear();
+    }
+
+    private void loadActionLedger() {
+        File file = actionLedgerFile;
+        if (file == null || !file.isFile()) return;
+        try {
+            YamlConfiguration config = YamlConfiguration.loadConfiguration(file);
+            if (!validActionLedgerSchema(config)) throw new IllegalArgumentException();
+            Object rawPlacements = config.get("placements");
+            if (!(rawPlacements instanceof List<?> placementList)) throw new IllegalArgumentException();
+            for (Object rawValue : placementList) {
+                if (!(rawValue instanceof Map<?, ?> value)) throw new IllegalArgumentException();
+                Object world = value.get("world");
+                Object x = value.get("x"), y = value.get("y"), z = value.get("z");
+                Object name = value.get("name");
+                if (!(world instanceof String worldName) || !(name instanceof String blockName)
+                    || x == null || y == null || z == null || blockName.isBlank()) {
+                    throw new IllegalArgumentException();
+                }
+                actionLedger.restorePlacement(new ActionLedger.Point(
+                    UUID.fromString(worldName), Integer.parseInt(x.toString()),
+                    Integer.parseInt(y.toString()), Integer.parseInt(z.toString())), blockName);
+            }
+            if (Boolean.TRUE.equals(config.get("saturated"))) actionLedger.markSaturated();
+        } catch (RuntimeException invalid) {
+            actionLedger.markSaturated();
+            saveActionLedger();
+            getLogger().warning("汎用操作の配置履歴を読み込めないため、採掘を保守的に停止します。");
+        }
+    }
+
+    static boolean validActionLedgerSchema(YamlConfiguration config) {
+        Object version = config.get("schema-version");
+        Object placements = config.get("placements");
+        Object saturated = config.get("saturated");
+        return version instanceof Number number
+            && number.intValue() == ACTION_LEDGER_SCHEMA_VERSION
+            && placements instanceof List<?>
+            && saturated instanceof Boolean;
+    }
+
+    private void saveActionLedger() {
+        File file = actionLedgerFile;
+        if (file == null) return;
+        try {
+            if (!getDataFolder().exists() && !getDataFolder().mkdirs()) {
+                throw new IOException("data directory unavailable");
+            }
+            YamlConfiguration config = new YamlConfiguration();
+            List<Map<String, Object>> placements = new ArrayList<>();
+            for (Map.Entry<ActionLedger.Point, String> entry : actionLedger.placementSnapshot().entrySet()) {
+                ActionLedger.Point point = entry.getKey();
+                Map<String, Object> value = new LinkedHashMap<>();
+                value.put("world", point.world().toString());
+                value.put("x", point.x());
+                value.put("y", point.y());
+                value.put("z", point.z());
+                value.put("name", entry.getValue());
+                placements.add(value);
+            }
+            config.set("schema-version", ACTION_LEDGER_SCHEMA_VERSION);
+            config.set("placements", placements);
+            config.set("saturated", actionLedger.isSaturated());
+            config.save(file);
+        } catch (IOException | RuntimeException failure) {
+            actionLedger.markSaturated();
+            getLogger().warning("汎用操作の配置履歴を保存できないため、採掘を保守的に停止します。");
+        }
+    }
     private boolean bot(Player p) { return botNames.contains(p.getName().toLowerCase(Locale.ROOT)); }
+    private void saturateActionLedger() {
+        actionLedger.markSaturated();
+        // Persist at the event boundary so a crash cannot reopen a stale
+        // unsaturated ledger on the next server start.
+        saveActionLedger();
+    }
     private GrowthLedger.Point point(Block b) { return new GrowthLedger.Point(b.getWorld().getUID(), b.getX(),b.getY(),b.getZ()); }
     private static boolean log(Material material) { return GrowthLedger.isGatherable(material.name()); }
     private static boolean root(Material material) { return material==Material.MANGROVE_ROOTS || material==Material.MUDDY_MANGROVE_ROOTS; }
@@ -83,6 +179,83 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         }
         return ledger.decision(point(b),name(b),protectedArea(b),safe);
     }
+
+    private ActionLedger.Point actionPoint(Block b) {
+        return new ActionLedger.Point(b.getWorld().getUID(), b.getX(), b.getY(), b.getZ());
+    }
+
+    private static boolean naturalResource(Material material) {
+        String name = material.name();
+        if (name.endsWith("_ORE") || name.equals("ANCIENT_DEBRIS")) return true;
+        return Set.of(
+            "STONE", "DEEPSLATE", "TUFF", "CALCITE", "DIORITE", "ANDESITE", "GRANITE",
+            "NETHERRACK", "BASALT", "BLACKSTONE", "END_STONE", "DIRT", "COARSE_DIRT",
+            "ROOTED_DIRT", "GRASS_BLOCK", "SAND", "RED_SAND", "GRAVEL", "CLAY", "SOUL_SAND",
+            "SOUL_SOIL", "MUD", "MANGROVE_MUD", "ICE", "PACKED_ICE", "SNOW_BLOCK"
+        ).contains(name);
+    }
+
+    private String genericMineDecision(Block block) {
+        if (protectedArea(block)) return "protected";
+        boolean configuredRegion = naturalResourceRegions.stream().anyMatch(r -> r.contains(block));
+        if (!actionLedger.allowsNaturalMining(actionPoint(block), configuredRegion)) {
+            return actionLedger.isPlaced(actionPoint(block)) ? "protected" : "unknown";
+        }
+        return naturalResource(block.getType()) ? "allowed" : "unknown";
+    }
+
+    private boolean inReach(Player player, Block block, double maxDistance) {
+        return player.getWorld().equals(block.getWorld())
+            && player.getLocation().distanceSquared(block.getLocation()) <= maxDistance * maxDistance;
+    }
+
+    private void sendActionResult(Player player, String id, String decision) {
+        JsonObject result = new JsonObject();
+        result.addProperty("id", id);
+        result.addProperty("decision", decision);
+        player.sendPluginMessage(this, ACTION_CHANNEL, result.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void handleActionMessage(Player player, byte[] bytes) {
+        if (!bot(player) || bytes.length > 1024) return;
+        try {
+            JsonObject request = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
+            String id = request.get("id").getAsString();
+            String operation = request.get("operation").getAsString();
+            String requestedName = request.get("name").getAsString().toLowerCase(Locale.ROOT);
+            JsonObject position = request.getAsJsonObject("position");
+            int x = position.get("x").getAsInt(), y = position.get("y").getAsInt(), z = position.get("z").getAsInt();
+            if (!id.matches("[a-f0-9-]{36}") || !Set.of("mine", "place", "inspect").contains(operation)
+                || !requestedName.matches("[a-z0-9_]{1,64}")) return;
+            World world = player.getWorld();
+            if (Math.abs((long)x) > 30_000_000 || Math.abs((long)z) > 30_000_000
+                || y < world.getMinHeight() || y >= world.getMaxHeight()) return;
+            Block block = world.getBlockAt(x, y, z);
+            if (!inReach(player, block, 6)) { sendActionResult(player, id, "unknown"); return; }
+            String decision;
+            if (operation.equals("mine")) {
+                decision = requestedName.equals(name(block)) && log(block.getType())
+                    ? decision(block) : requestedName.equals(name(block)) ? genericMineDecision(block) : "changed";
+                if (decision.equals("allowed")) {
+                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + ACTION_PERMIT_TTL_MILLIS);
+                }
+            } else if (operation.equals("place")) {
+                decision = block.getType().isAir() && !protectedArea(block) && !actionLedger.isSaturated()
+                    ? "allowed" : "protected";
+                if (decision.equals("allowed")) {
+                    actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + ACTION_PERMIT_TTL_MILLIS);
+                }
+            } else {
+                // Read-only authoritative state check. It never grants a
+                // permit and is used after a client mutation to distinguish
+                // server-confirmed state from Mineflayer's optimistic cache.
+                decision = requestedName.equals(name(block)) ? "allowed" : "changed";
+            }
+            sendActionResult(player, id, decision);
+        } catch (RuntimeException invalid) {
+            // Invalid action requests are fail-closed and receive no permit.
+        }
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void grow(StructureGrowEvent e) {
         Map<GrowthLedger.Point,String> grown = new HashMap<>();
@@ -104,30 +277,86 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         ledger.grew(grown);
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void place(BlockPlaceEvent e) { ledger.changedNear(point(e.getBlock())); }
+    public void place(BlockPlaceEvent e) {
+        ledger.changedNear(point(e.getBlock()));
+        actionLedger.recordPlacement(actionPoint(e.getBlock()), name(e.getBlock()));
+        saveActionLedger();
+    }
     @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
     public void protectBreak(BlockBreakEvent e) {
-        if (bot(e.getPlayer()) && (!log(e.getBlock().getType()) || !decision(e.getBlock()).equals("allowed"))) e.setCancelled(true);
+        if (!bot(e.getPlayer())) return;
+        if (log(e.getBlock().getType())) {
+            if (!decision(e.getBlock()).equals("allowed")) e.setCancelled(true);
+            return;
+        }
+        if (actionLedger.isSaturated()) { e.setCancelled(true); return; }
+        ActionLedger.Permit permit = new ActionLedger.Permit(
+            e.getPlayer().getUniqueId(), "mine", actionPoint(e.getBlock()), name(e.getBlock()));
+        if (!actionLedger.consume(permit, System.currentTimeMillis())) e.setCancelled(true);
+    }
+    @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
+    public void protectPlace(BlockPlaceEvent e) {
+        if (!bot(e.getPlayer())) return;
+        ActionLedger.Permit permit = new ActionLedger.Permit(
+            e.getPlayer().getUniqueId(), "place", actionPoint(e.getBlock()), name(e.getBlock()));
+        if (!actionLedger.consume(permit, System.currentTimeMillis())) e.setCancelled(true);
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
     public void didBreak(BlockBreakEvent e) {
         ledger.broken(point(e.getBlock()), e.getBlock().getType().name().toLowerCase(Locale.ROOT), bot(e.getPlayer()));
+        actionLedger.remove(actionPoint(e.getBlock()));
+    }
+    private void invalidateMovedPlacements(Collection<Block> blocks) {
+        if (blocks.stream().map(this::actionPoint).anyMatch(actionLedger::hasPlacement)) {
+            // The new coordinates depend on piston mechanics. Stop generic
+            // mining until an operator re-establishes a safe provenance set.
+            saturateActionLedger();
+        }
     }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void piston(BlockPistonExtendEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
+    public void piston(BlockPistonExtendEvent e) {
+        ledger.changedNear(e.getBlocks().stream().map(this::point).toList());
+        invalidateMovedPlacements(e.getBlocks());
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void retract(BlockPistonRetractEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
+    public void retract(BlockPistonRetractEvent e) {
+        ledger.changedNear(e.getBlocks().stream().map(this::point).toList());
+        invalidateMovedPlacements(e.getBlocks());
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void burn(BlockBurnEvent e) { ledger.changedNear(point(e.getBlock())); }
+    public void burn(BlockBurnEvent e) {
+        ledger.changedNear(point(e.getBlock()));
+        actionLedger.remove(actionPoint(e.getBlock()));
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void entityChange(EntityChangeBlockEvent e) { ledger.changedNear(point(e.getBlock())); }
+    public void entityChange(EntityChangeBlockEvent e) {
+        ledger.changedNear(point(e.getBlock()));
+        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))) saturateActionLedger();
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void explode(EntityExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
+    public void flow(BlockFromToEvent e) {
+        ledger.changedNear(List.of(point(e.getBlock()), point(e.getToBlock())));
+        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))
+            || actionLedger.hasPlacement(actionPoint(e.getToBlock()))) saturateActionLedger();
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void blockExplode(BlockExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
+    public void explode(EntityExplodeEvent e) {
+        ledger.changedNear(e.blockList().stream().map(this::point).toList());
+        e.blockList().forEach(block -> actionLedger.remove(actionPoint(block)));
+    }
+    @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+    public void blockExplode(BlockExplodeEvent e) {
+        ledger.changedNear(e.blockList().stream().map(this::point).toList());
+        e.blockList().forEach(block -> actionLedger.remove(actionPoint(block)));
+    }
     @EventHandler(priority=EventPriority.MONITOR)
-    public void unload(ChunkUnloadEvent e) { ledger.clear(); }
+    public void unload(ChunkUnloadEvent e) {
+        // Growth history is local to a loaded chunk. Placement provenance is
+        // persisted separately and must survive unload to protect structures.
+        ledger.clear();
+    }
     @Override public void onPluginMessageReceived(String channel, Player player, byte[] bytes) {
+        if (ACTION_CHANNEL.equals(channel)) { handleActionMessage(player, bytes); return; }
         if (!CHANNEL.equals(channel) || !bot(player) || bytes.length>256) return;
         String[] parts=new String(bytes,StandardCharsets.UTF_8).split("\\|",-1);
         if (parts.length!=5 || !parts[0].matches("[a-f0-9-]{36}") || !parts[4].matches("[a-z_]{1,40}")) return;
