@@ -88,6 +88,33 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("explains why a stuck follow stopped and how to give the next instruction", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+
+    await tasks.suspend("reflex:stuck");
+    const status = await game.observeStatus();
+    const report = await follow;
+
+    expect(status.activeTaskState).toContain("移動が進まなかった");
+    expect(report).toMatchObject({
+      outcome: "failed",
+      failureCategory: "safety",
+      failureCode: "TASK_SUSPENDED_FOR_SAFETY",
+      failureRetryable: true,
+    });
+    expect(report.summary).toContain("周囲の障害物");
+    expect(report.summary).toContain("もう一度「こっちおいで」");
+    expect(report.nextActions).toEqual([
+      "周囲の障害物を避ける",
+      "もう一度「こっちおいで」と指示する",
+    ]);
+    expect(report.summary).not.toContain("reflex:stuck");
+    close();
+  });
+
   it("reports the observed new inventory count after gathering and returning", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push(

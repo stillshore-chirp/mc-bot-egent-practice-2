@@ -113,6 +113,70 @@ describe("TaskRuntime", () => {
     await runtime.cancel("test cleanup");
     await first;
   });
+
+  it("replaces a suspended task for a new instruction without stale overwrite", async () => {
+    const store = new InMemoryTaskStore();
+    let stopCount = 0;
+    let taskStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      taskStarted = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const runtime = new TaskRuntime(store, async () => {
+      stopCount += 1;
+    });
+    const first = runtime.run("follow_player", {}, async ({ signal }) => {
+      taskStarted();
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await firstCanFinish;
+      throw signal.reason;
+    });
+    await started;
+    await runtime.suspend("reflex:stuck");
+
+    let replacementStarted!: () => void;
+    const replacementReady = new Promise<void>((resolve) => {
+      replacementStarted = resolve;
+    });
+    const replacement = runtime.run(
+      "follow_player",
+      { retry: true },
+      async () => {
+        replacementStarted();
+        return { restarted: true };
+      },
+    );
+    await replacementReady;
+    releaseFirst();
+
+    const [firstResult, replacementResult] = await Promise.all([
+      first,
+      replacement,
+    ]);
+    expect(firstResult).toMatchObject({
+      status: "cancelled",
+      failure: { code: "TASK_REPLACED_AFTER_SUSPENSION" },
+    });
+    expect(replacementResult).toMatchObject({
+      status: "completed",
+      output: { restarted: true },
+    });
+    expect(runtime.current).toMatchObject({
+      kind: "follow_player",
+      status: "completed",
+    });
+    expect(stopCount).toBe(1);
+    expect(
+      store.records.some(
+        (record) => record.failure?.code === "TASK_REPLACED_AFTER_SUSPENSION",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("retry", () => {

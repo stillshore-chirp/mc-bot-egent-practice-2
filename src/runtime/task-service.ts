@@ -29,6 +29,8 @@ export interface TaskContext {
 export class TaskRuntime {
   private active: TaskRecord | undefined;
   private controller: AbortController | undefined;
+  private readonly interruptedRecords = new Map<string, TaskRecord>();
+  private suspendedReplacement: Promise<void> | undefined;
   private activeTraceSpan: ActiveTraceSpan | undefined;
   private activePhaseTraceSpan: ActiveTraceSpan | undefined;
   private activePhaseStartedAt: number | undefined;
@@ -57,9 +59,14 @@ export class TaskRuntime {
   ): Promise<TaskRecord<Input, Output>> {
     const traceSpan = await this.startTraceSpan(kind);
     const startedAt = performance.now();
+    if (this.active?.status === "suspended") {
+      await this.replaceSuspendedTask(
+        "新しい利用者指示を受けたため、安全待機中の作業を置き換えました",
+      );
+    }
     if (
       this.active !== undefined &&
-      ["queued", "running", "suspended"].includes(this.active.status)
+      ["queued", "running"].includes(this.active.status)
     ) {
       const error = new AppError({
         category: "validation",
@@ -74,7 +81,13 @@ export class TaskRuntime {
     this.activeTraceSpan = traceSpan;
     try {
       const result = await this.runTask(kind, input, execute);
-      await this.finishTraceSpan(traceSpan, result.status, startedAt, result);
+      await this.finishTraceSpan(
+        traceSpan,
+        result.status,
+        startedAt,
+        result,
+        this.activeTraceSpan === traceSpan,
+      );
       return result;
     } catch (error) {
       await this.finishTraceSpan(traceSpan, "failed", startedAt, error);
@@ -180,6 +193,13 @@ export class TaskRuntime {
       }) as TaskRecord<Input, Output>;
     } finally {
       if (this.controller === controller) this.controller = undefined;
+    }
+    if (!this.isCurrentTask(record.id)) {
+      const interrupted = this.interruptedTask(record.id);
+      if (interrupted !== undefined) {
+        return interrupted as TaskRecord<Input, Output>;
+      }
+      return record;
     }
     this.active = record;
     await this.store.save(record);
@@ -342,6 +362,46 @@ export class TaskRuntime {
     await this.store.save(this.active);
   }
 
+  private async replaceSuspendedTask(reason: string): Promise<void> {
+    const pending = this.suspendedReplacement;
+    if (pending !== undefined) {
+      await pending;
+      return;
+    }
+    const replacement = this.replaceSuspendedTaskNow(reason);
+    this.suspendedReplacement = replacement;
+    try {
+      await replacement;
+    } finally {
+      if (this.suspendedReplacement === replacement) {
+        this.suspendedReplacement = undefined;
+      }
+    }
+  }
+
+  private async replaceSuspendedTaskNow(reason: string): Promise<void> {
+    const active = this.active;
+    if (active?.status !== "suspended") return;
+    const replaced = transitionTask(active, {
+      type: "cancel",
+      phase: active.phase,
+      failure: {
+        category: "cancelled",
+        code: "TASK_REPLACED_AFTER_SUSPENSION",
+        message: reason,
+        retryable: true,
+        failedAt: active.phase,
+      },
+    });
+    this.interruptedRecords.set(active.id, replaced);
+    this.active = replaced;
+    this.controller?.abort(new Error(reason));
+    // suspend() has already stopped Minecraft controls before this task can
+    // reach the suspended state. Avoid issuing a second stop while replacing
+    // the persisted task with the owner's new explicit instruction.
+    await this.store.save(replaced);
+  }
+
   public async cancel(reason: string): Promise<void> {
     if (
       this.active === undefined ||
@@ -366,11 +426,20 @@ export class TaskRuntime {
   }
 
   private interruptedTask(taskId: string): TaskRecord | undefined {
+    const interrupted = this.interruptedRecords.get(taskId);
+    if (interrupted !== undefined) {
+      this.interruptedRecords.delete(taskId);
+      return interrupted;
+    }
     const active: TaskRecord | undefined = this.active;
     return active?.id === taskId &&
       (active.status === "suspended" || active.status === "cancelled")
       ? active
       : undefined;
+  }
+
+  private isCurrentTask(taskId: string): boolean {
+    return this.active?.id === taskId;
   }
 }
 

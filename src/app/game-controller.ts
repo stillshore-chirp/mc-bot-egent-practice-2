@@ -462,6 +462,7 @@ export class CompanionGameController implements GameController {
       };
     }
     if (record.status === "suspended") {
+      const recovery = suspendedTaskRecovery(record);
       return {
         before,
         after,
@@ -470,9 +471,8 @@ export class CompanionGameController implements GameController {
         failureCode: "TASK_SUSPENDED_FOR_SAFETY",
         failureRetryable: true,
         failedAt: record.phase,
-        nextActions: ["安全状態を再観測して再開可否を判断する"],
-        summary:
-          "安全処理が介入したため作業を中断し、再評価待ちとして保存しました。",
+        nextActions: recovery.nextActions,
+        summary: recovery.summary,
       };
     }
     return {
@@ -520,10 +520,7 @@ export class CompanionGameController implements GameController {
       oxygen: snapshot.oxygen,
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
-      activeTaskState:
-        task === undefined || terminalTaskStatuses.has(task.status)
-          ? null
-          : `${task.kind}:${task.phase}:${task.status}`,
+      activeTaskState: activeTaskState(task),
     };
   }
 
@@ -592,6 +589,63 @@ function failureNextActions(
     case undefined:
       return ["状態と依頼内容を確認してから再試行する"];
   }
+}
+
+interface SuspendedTaskRecovery {
+  readonly summary: string;
+  readonly nextActions: readonly string[];
+}
+
+function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
+  const reason = task.checkpoint?.suspendReason;
+  if (reason === "reflex:stuck") {
+    return {
+      summary:
+        "移動が進まなかったため、追従を安全に一時停止しました。周囲の障害物を避けてから、もう一度「こっちおいで」と指示してください。",
+      nextActions: [
+        "周囲の障害物を避ける",
+        "もう一度「こっちおいで」と指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:hazard") {
+    return {
+      summary:
+        "現在の周囲に危険を観測したため、安全のため作業を一時停止しました。安全な場所へ移動してから、もう一度指示してください。",
+      nextActions: ["周囲の危険を取り除く", "安全な場所からもう一度指示する"],
+    };
+  }
+  if (reason === "reflex:hostile" || reason === "reflex:damage") {
+    return {
+      summary:
+        "近くの危険を確認したため、安全のため作業を一時停止しました。相手から離れて安全を確かめてから、もう一度指示してください。",
+      nextActions: [
+        "危険な相手から離れる",
+        "安全を確かめてからもう一度指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:hunger") {
+    return {
+      summary:
+        "空腹を確認したため、安全のため作業を一時停止しました。食料を確保してから、もう一度指示してください。",
+      nextActions: ["食料を確保する", "食料を確保してからもう一度指示する"],
+    };
+  }
+  return {
+    summary:
+      "安全確認のため作業を一時停止しました。現在の状態を確認してから、もう一度指示してください。",
+    nextActions: ["現在の安全状態を確認する", "確認後にもう一度指示する"],
+  };
+}
+
+function activeTaskState(task: TaskRecord | undefined): string | null {
+  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+  if (task.status === "suspended") {
+    const recovery = suspendedTaskRecovery(task);
+    return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+  }
+  return `${task.kind}:${task.phase}:${task.status}`;
 }
 
 function formatCoordinates(position: {
