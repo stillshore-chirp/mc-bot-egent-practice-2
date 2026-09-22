@@ -1,5 +1,8 @@
 import { Vec3 } from "vec3";
-import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
+import {
+  MineflayerClient,
+  oxygenFromEntityMetadata,
+} from "../../src/minecraft/mineflayer-client.js";
 import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/minecraft/connection-manager.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
@@ -82,6 +85,43 @@ describe("Minecraft boundary", () => {
 });
 
 describe("Mineflayer player observation", () => {
+  it("attributes air supply to the Bot entity instead of nearby entity metadata", () => {
+    const metadataKeys: string[] = [];
+    metadataKeys[4] = "air_supply";
+    const botFull = {
+      entityId: 1,
+      metadata: [{ key: 4, value: 300 }],
+    };
+    const nearbyLow = {
+      entityId: 2,
+      metadata: [{ key: 4, value: 75 }],
+    };
+    const botLow = {
+      entityId: 1,
+      metadata: [{ key: 4, value: 75 }],
+    };
+    const nearbyFull = {
+      entityId: 2,
+      metadata: [{ key: 4, value: 300 }],
+    };
+
+    expect(oxygenFromEntityMetadata(botFull, 1, metadataKeys)).toBe(20);
+    expect(
+      oxygenFromEntityMetadata(nearbyLow, 1, metadataKeys),
+    ).toBeUndefined();
+    expect(oxygenFromEntityMetadata(botLow, 1, metadataKeys)).toBe(5);
+    expect(
+      oxygenFromEntityMetadata(nearbyFull, 1, metadataKeys),
+    ).toBeUndefined();
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 1, metadata: [{ key: 4, value: 399 }] },
+        1,
+        metadataKeys,
+      ),
+    ).toBeNull();
+  });
+
   it("returns Bot oxygen, water state, and derived hazard from one observation", async () => {
     const client = new MineflayerClient(
       {
@@ -94,6 +134,7 @@ describe("Mineflayer player observation", () => {
     );
     Object.assign(client, {
       spawned: true,
+      authoritativeOxygen: 5,
       botInstance: {
         username: "fixture_bot",
         entity: {

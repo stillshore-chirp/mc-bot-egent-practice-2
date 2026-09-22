@@ -96,6 +96,72 @@ const positionOf = (position: {
   z: position.z,
 });
 
+export interface EntityMetadataEntry {
+  readonly key: number;
+  readonly value: unknown;
+}
+
+export interface EntityMetadataPacket {
+  readonly entityId: number;
+  readonly metadata: readonly EntityMetadataEntry[];
+}
+
+function parseEntityMetadataPacket(
+  packet: unknown,
+): EntityMetadataPacket | undefined {
+  if (typeof packet !== "object" || packet === null) return undefined;
+  const candidate = packet as {
+    readonly entityId?: unknown;
+    readonly metadata?: unknown;
+  };
+  const entityId = candidate.entityId;
+  if (
+    typeof entityId !== "number" ||
+    !Number.isInteger(entityId) ||
+    !Array.isArray(candidate.metadata)
+  )
+    return undefined;
+  const metadata = candidate.metadata.filter(
+    (entry): entry is EntityMetadataEntry => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const metadataEntry = entry as { readonly key?: unknown };
+      return (
+        typeof metadataEntry.key === "number" &&
+        Number.isInteger(metadataEntry.key)
+      );
+    },
+  );
+  return { entityId, metadata };
+}
+
+/**
+ * Mineflayer's named-metadata path can receive air supply for another entity
+ * and overwrite bot.oxygenLevel. Only accept an air-supply field from the
+ * bot's own entity packet; an invalid own value is explicitly unknown.
+ */
+export function oxygenFromEntityMetadata(
+  packet: EntityMetadataPacket,
+  botEntityId: number,
+  metadataKeys: readonly string[] | undefined,
+  legacyMetadata = false,
+): number | null | undefined {
+  if (packet.entityId !== botEntityId) return undefined;
+  const airSupply = packet.metadata.find(
+    (entry) =>
+      metadataKeys?.[entry.key] === "air_supply" ||
+      (legacyMetadata && entry.key === 1),
+  );
+  if (airSupply === undefined) return undefined;
+  if (
+    typeof airSupply.value !== "number" ||
+    !Number.isFinite(airSupply.value)
+  ) {
+    return null;
+  }
+  const oxygen = Math.round(airSupply.value / 15);
+  return Number.isFinite(oxygen) && oxygen >= 0 && oxygen <= 20 ? oxygen : null;
+}
+
 export function escapeTarget(
   origin: Position,
   threats: readonly Position[],
@@ -168,6 +234,7 @@ export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
   private spawned = false;
   private intentionalDisconnect = false;
+  private authoritativeOxygen: number | null | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
   >();
@@ -184,6 +251,24 @@ export class MineflayerClient implements MinecraftPort {
     const bot = mineflayer.createBot(this.options.bot);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
+    this.authoritativeOxygen = undefined;
+    const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
+    bot._client.on("entity_metadata", (packet) => {
+      const botEntity = bot.entity;
+      const metadataPacket = parseEntityMetadataPacket(packet as unknown);
+      if (metadataPacket === undefined) return;
+      const metadataKeys =
+        usesNamedMetadata && botEntity.name !== undefined
+          ? bot.registry.entitiesByName[botEntity.name]?.metadataKeys
+          : undefined;
+      const oxygen = oxygenFromEntityMetadata(
+        metadataPacket,
+        botEntity.id,
+        metadataKeys,
+        !usesNamedMetadata,
+      );
+      if (oxygen !== undefined) this.authoritativeOxygen = oxygen;
+    });
     bot.on("chat", (username, message) => {
       for (const listener of this.chatListeners) listener(username, message);
     });
@@ -321,14 +406,7 @@ export class MineflayerClient implements MinecraftPort {
     };
     const inWater =
       physicsState.isInWater ?? blockNames.some((name) => name === "water");
-    const rawOxygen = bot.oxygenLevel;
-    const oxygen =
-      typeof rawOxygen === "number" &&
-      Number.isFinite(rawOxygen) &&
-      rawOxygen >= 0 &&
-      rawOxygen <= 20
-        ? rawOxygen
-        : null;
+    const oxygen = this.authoritativeOxygen ?? null;
     return {
       observedAt,
       subject: "bot",
