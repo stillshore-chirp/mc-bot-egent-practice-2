@@ -265,6 +265,21 @@ describe("owner goal authorization", () => {
     },
   );
 
+  it.each([
+    "鉄を1個集めていい？",
+    "鉄を1個集めてもいいか教えて",
+    "鉄を1個掘っていいよ",
+    "鉄を1個集めてはいけない",
+    "鉄を1個集めてほしくない",
+  ])("does not authorize permission or prohibition wording: %s", (message) => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message,
+      }),
+    ).not.toMatchObject({ outcome: "authorized" });
+  });
+
   it("does not block an unrelated action when a message only mentions a resource", () => {
     expect(
       deriveOwnerGoalAuthorization({

@@ -195,7 +195,9 @@ const resourceGoals: readonly ResourceGoal[] = [
 const affirmativeCollectionIntentPattern =
   /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
 const negatedCollectionIntentPattern =
-  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
+  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
+const collectionPermissionQuestionPattern =
+  /(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:も)?(?:いい|よい|良い|大丈夫|問題ない|はいけない)/iu;
 const operationWords = new Set([
   "collect_resource",
   "gather_resource",
@@ -257,6 +259,8 @@ export function deriveOwnerGoalAuthorization(
   const hasCollectionIntent = affirmativeCollectionIntentPattern.test(message);
   const hasNegatedCollectionIntent =
     negatedCollectionIntentPattern.test(message);
+  const asksCollectionPermission =
+    collectionPermissionQuestionPattern.test(message);
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -289,11 +293,11 @@ export function deriveOwnerGoalAuthorization(
     };
   }
 
-  if (hasNegatedCollectionIntent) {
+  if (hasNegatedCollectionIntent || asksCollectionPermission) {
     return {
       outcome: "clarify",
       question:
-        "収集しない依頼として扱い、採取・採掘・作成・精錬は開始しません。実行する依頼なら操作を明示してください。",
+        "実行を求める指示と確認・禁止を区別できないため、採取・採掘・作成・精錬は開始しません。実行する場合は目的と数量を指示してください。",
     };
   }
 
