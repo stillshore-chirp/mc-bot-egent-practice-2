@@ -395,6 +395,59 @@ describe("ToolExecutor", () => {
     expect(gatherCalls).toBe(1);
   });
 
+  it("rejects progress that changes the provider-requested quantity", async () => {
+    const toolContext = context();
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "one-block-with-inflated-progress",
+        label: "数量が一致しない採取",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "oak_log",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      confirmedState: {
+        resource: "oak_log",
+        requestedCount: 64,
+        collectedCount: 64,
+      },
+      summary: "採取結果を確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_PROGRESS_INVALID" },
+    });
+  });
+
   it("does not treat intermediate material as the requested final inventory item", async () => {
     const toolContext = context();
     toolContext.game.findSafeActionCandidates = async () => [

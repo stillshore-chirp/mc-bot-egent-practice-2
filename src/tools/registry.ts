@@ -455,10 +455,14 @@ export const toolDefinitions = [
         }
 
         const progress = latestActionProgress(successfulResults);
+        const expectedCount = planned.candidate.requestedCount;
         if (
           progress !== undefined &&
           (progress.completedCount < 1 ||
-            progress.completedCount > progress.requestedCount)
+            progress.completedCount > progress.requestedCount ||
+            progress.requestedCount > remainingCount ||
+            (expectedCount !== undefined &&
+              progress.requestedCount !== expectedCount))
         ) {
           return safeActionFailure(
             "observation",
@@ -507,7 +511,6 @@ export const toolDefinitions = [
           intermediateProgress.push(progress);
           continue;
         }
-        const expectedCount = planned.candidate.requestedCount;
         const requiresProgress =
           planned.candidate.goalItem !== undefined ||
           (remainingCount > 1 &&
