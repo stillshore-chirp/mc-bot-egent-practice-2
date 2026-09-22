@@ -138,8 +138,7 @@ export function deriveOwnerGoalAuthorization(
   const hasResourceIntent =
     resource !== undefined ||
     unresolvedCanonicalResource !== undefined ||
-    resourceIntentPattern.test(message) ||
-    count !== undefined;
+    resourceIntentPattern.test(message);
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -159,7 +158,20 @@ export function deriveOwnerGoalAuthorization(
     return authorizePendingGoal(pendingGoal, count, input.maxCount);
   }
 
-  if (resource === undefined && count === undefined && !hasResourceIntent) {
+  if (
+    pendingGoalValid &&
+    resource === undefined &&
+    count !== undefined &&
+    hasCollectionQuantityUnit(message)
+  ) {
+    return {
+      outcome: "clarify",
+      question:
+        "前の資源収集の数量回答は、数量だけで指定してください（例: 20個で）。",
+    };
+  }
+
+  if (!hasResourceIntent) {
     return { outcome: "none" };
   }
   if (resource === undefined) {
@@ -280,6 +292,10 @@ function isStandaloneQuantityReply(message: string): boolean {
   return /^(?:あと\s*)?[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
     message,
   );
+}
+
+function hasCollectionQuantityUnit(message: string): boolean {
+  return /[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)/iu.test(message);
 }
 
 function normalize(value: string): string {

@@ -228,6 +228,18 @@ describe("owner goal authorization", () => {
     ).toEqual({ outcome: "none" });
   });
 
+  it.each(["座標10 64 20へ移動して", "10秒ついてきて"])(
+    "does not turn an unrelated numeric owner request into a resource clarification: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({
+          ...ownerInput,
+          message,
+        }),
+      ).toEqual({ outcome: "none" });
+    },
+  );
+
   it("does not retain a previous owner goal when the message changes", () => {
     const iron = deriveOwnerGoalAuthorization({
       ...ownerInput,

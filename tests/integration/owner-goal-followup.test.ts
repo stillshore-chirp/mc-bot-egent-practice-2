@@ -211,6 +211,6 @@ describe("owner goal quantity follow-up boundary", () => {
     );
 
     expect(held.toolContext.safeActionAuthorization).toBeUndefined();
-    expect(held.toolContext.safeActionClarification).toContain("資源");
+    expect(held.toolContext.safeActionClarification).toContain("数量");
   });
 });

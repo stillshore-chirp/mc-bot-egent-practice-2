@@ -230,4 +230,20 @@ describe("CompanionContextFactory owner action boundary", () => {
       targetCount: 20,
     });
   });
+
+  it.each(["座標10 64 20へ移動して", "10秒ついてきて"])(
+    "does not block an unrelated numeric action with a resource clarification: %s",
+    async (message) => {
+      const result = await factory().create(
+        "owner",
+        message,
+        new AbortController().signal,
+        "correlation-unrelated-number",
+        "owner_message",
+      );
+
+      expect(result.toolContext.safeActionAuthorization).toBeUndefined();
+      expect(result.toolContext.safeActionClarification).toBeUndefined();
+    },
+  );
 });

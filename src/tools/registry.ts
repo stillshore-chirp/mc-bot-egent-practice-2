@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { deliveryRegistrationTools } from "./delivery-tools.js";
 
-import { planSafeAction } from "../decision/safe-action-planner.js";
+import {
+  planSafeAction,
+  type SafeActionCandidate,
+} from "../decision/safe-action-planner.js";
 import { chooseSafeCandidate } from "../decision/safe-choice.js";
 
 import {
@@ -199,7 +202,14 @@ export const toolDefinitions = [
           ? Math.min(Math.max(1, configuredDuration), maxSafeActionDurationMs)
           : maxSafeActionDurationMs;
       const deadline = startedAt + durationMs;
-      const timedOut = (): boolean => Date.now() >= deadline;
+      const deadlineSignal = AbortSignal.timeout(durationMs);
+      const planSignal = AbortSignal.any([context.signal, deadlineSignal]);
+      const planContext: ToolContext = {
+        ...context,
+        signal: planSignal,
+      };
+      const timedOut = (): boolean =>
+        deadlineSignal.aborted || Date.now() >= deadline;
       if (context.safeActionClarification !== undefined) {
         return safeActionFailure(
           "authorization",
@@ -325,14 +335,85 @@ export const toolDefinitions = [
           );
         }
 
-        const observed = await context.game.findSafeActionCandidates(
-          {
-            goal: input.goal,
-            count: remainingCount,
-            maxCandidates: 8,
-          },
-          context.signal,
-        );
+        let observed: readonly SafeActionCandidate[];
+        try {
+          observed = await context.game.findSafeActionCandidates(
+            {
+              goal: input.goal,
+              count: remainingCount,
+              maxCandidates: 8,
+            },
+            planSignal,
+          );
+        } catch (error) {
+          if (isSignalAborted(context.signal)) {
+            return safeActionFailure(
+              "cancelled",
+              "SAFE_ACTION_PLAN_CANCELLED",
+              false,
+              "observe_safe_action_candidates",
+              {
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps: completedSteps.length,
+              },
+              ["必要なら安全状態を確認して新しい目的として再依頼する"],
+              `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,
+            );
+          }
+          if (timedOut()) {
+            return safeActionFailure(
+              "timeout",
+              "SAFE_ACTION_PLAN_TIMEOUT",
+              true,
+              "observe_safe_action_candidates",
+              {
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps: completedSteps.length,
+                elapsedMs: Date.now() - startedAt,
+              },
+              ["現在状態と数量を再観測してから新しい目的として再依頼する"],
+              `安全計画を${String(completedCount)}個分まで実行し、制限時間を超えたため停止しました。`,
+            );
+          }
+          throw error;
+        }
+        if (isSignalAborted(context.signal)) {
+          return safeActionFailure(
+            "cancelled",
+            "SAFE_ACTION_PLAN_CANCELLED",
+            false,
+            "observe_safe_action_candidates",
+            {
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+            },
+            ["必要なら安全状態を確認して新しい目的として再依頼する"],
+            `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,
+          );
+        }
+        if (timedOut()) {
+          return safeActionFailure(
+            "timeout",
+            "SAFE_ACTION_PLAN_TIMEOUT",
+            true,
+            "observe_safe_action_candidates",
+            {
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+              elapsedMs: Date.now() - startedAt,
+            },
+            ["現在状態と数量を再観測してから新しい目的として再依頼する"],
+            `安全計画を${String(completedCount)}個分まで実行し、制限時間を超えたため停止しました。`,
+          );
+        }
         const planned = planSafeAction({
           mode: input.mode,
           requestedId: input.candidateId ?? undefined,
@@ -423,7 +504,56 @@ export const toolDefinitions = [
               `安全計画の${String(index + 1)}段階目の前に現在状態を再観測できず、停止しました。`,
             );
           }
-          const result = await executeStep(step, context);
+          const result = await executeStep(step, planContext);
+          if (isSignalAborted(context.signal)) {
+            return safeActionFailure(
+              "cancelled",
+              "SAFE_ACTION_PLAN_CANCELLED",
+              false,
+              step.tool,
+              {
+                ...(result.success ? {} : result.error.confirmedState),
+                candidateId: planned.candidate.id,
+                failedStep: index + 1,
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps:
+                  completedSteps.length + (result.success ? 1 : 0),
+                ...(result.success ? {} : { stepCode: result.error.code }),
+              },
+              ["必要なら安全状態を確認して新しい目的として再依頼する"],
+              `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,
+            );
+          }
+          if (timedOut()) {
+            return safeActionFailure(
+              "timeout",
+              "SAFE_ACTION_PLAN_TIMEOUT",
+              true,
+              step.tool,
+              {
+                ...(result.success ? {} : result.error.confirmedState),
+                candidateId: planned.candidate.id,
+                failedStep: index + 1,
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps:
+                  completedSteps.length + (result.success ? 1 : 0),
+                ...(result.success
+                  ? {
+                      partialProgress: result.progress ?? null,
+                      partialStepSummary: result.userSummary,
+                    }
+                  : { stepCode: result.error.code }),
+              },
+              ["現在状態と数量を再観測してから新しい目的として再依頼する"],
+              result.success
+                ? `安全計画の${String(index + 1)}段階目まで確認しましたが、制限時間を超えたため後続操作を停止しました。`
+                : `安全計画の${String(index + 1)}段階目で制限時間を超えたため停止しました。${result.error.userSummary}`,
+            );
+          }
           if (!result.success) {
             return safeActionFailure(
               result.error.category,

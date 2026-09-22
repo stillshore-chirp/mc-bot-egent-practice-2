@@ -283,6 +283,154 @@ describe("ToolExecutor", () => {
     expect(mined).toHaveLength(3);
   });
 
+  it("aborts an in-flight step at the plan deadline and skips later steps", async () => {
+    const toolContext = context();
+    toolContext.limits.maxSafeActionDurationMs = 25;
+    const laterSteps: string[] = [];
+    let receivedSignal: AbortSignal | undefined;
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "deadline-plan",
+        label: "期限付きの採取",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "oak_log",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+          { tool: "say", input: { message: "後続" } },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async (_resource, _count, signal) => {
+      receivedSignal = signal;
+      return new Promise((resolve) => {
+        signal.addEventListener(
+          "abort",
+          () =>
+            resolve({
+              before: status,
+              after: status,
+              outcome: "cancelled",
+              failureCategory: "cancelled",
+              failureCode: "ACTION_CANCELLED",
+              failureRetryable: false,
+              failedAt: "gather_resource",
+              summary: "採取を中断しました。",
+            }),
+          { once: true },
+        );
+      });
+    };
+    toolContext.game.say = async (message) => {
+      laterSteps.push(message);
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        category: "timeout",
+        code: "SAFE_ACTION_PLAN_TIMEOUT",
+        confirmedState: { completedCount: 0, completedSteps: 0 },
+      },
+    });
+    expect(laterSteps).toEqual([]);
+  });
+
+  it("does not report a late successful step as a completed plan", async () => {
+    const toolContext = context();
+    toolContext.limits.maxSafeActionDurationMs = 10;
+    const laterSteps: string[] = [];
+    let receivedSignal: AbortSignal | undefined;
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "late-plan",
+        label: "期限後に返る採取",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "oak_log",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+          { tool: "say", input: { message: "後続" } },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async (_resource, _count, signal) => {
+      receivedSignal = signal;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource: "oak_log",
+          requestedCount: 1,
+          collectedCount: 1,
+        },
+        summary: "期限後に採取結果が返りました。",
+      };
+    };
+    toolContext.game.say = async (message) => {
+      laterSteps.push(message);
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        category: "timeout",
+        code: "SAFE_ACTION_PLAN_TIMEOUT",
+        confirmedState: {
+          completedCount: 0,
+          partialProgress: { completedCount: 1, requestedCount: 1 },
+        },
+      },
+    });
+    expect(laterSteps).toEqual([]);
+  });
+
   it("stops a plan at the first failed step and does not run later steps", async () => {
     const calls: string[] = [];
     const toolContext = context();
