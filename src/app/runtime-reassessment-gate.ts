@@ -152,8 +152,7 @@ export class RuntimeReassessmentGate<Event extends string> {
       return;
     }
     if (this.#pending === undefined) {
-      this.#pending = request;
-      this.#decide(request, "accepted");
+      this.#accept(request);
       this.#schedule();
       return;
     }
@@ -162,8 +161,7 @@ export class RuntimeReassessmentGate<Event extends string> {
       this.#pending = undefined;
       this.#clearTimer();
       this.#suppress(superseded, "superseded");
-      this.#pending = request;
-      this.#decide(request, "accepted");
+      this.#accept(request);
       this.#schedule();
       return;
     }
@@ -287,6 +285,14 @@ export class RuntimeReassessmentGate<Event extends string> {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
+  }
+
+  #accept(request: NormalizedRequest<Event>): void {
+    if (request.stateKey !== this.#lastCompletedStateKey) {
+      this.#lastCompletedStateKey = undefined;
+    }
+    this.#pending = request;
+    this.#decide(request, "accepted");
   }
 
   #decide(

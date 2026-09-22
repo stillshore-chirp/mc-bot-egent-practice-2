@@ -486,4 +486,62 @@ describe("immediate stop command", () => {
     expect(say).toHaveBeenCalledTimes(1);
     expect(say).toHaveBeenCalledWith("応答:今どうなっていますか");
   });
+
+  it("returns cancelled when an owner message invalidates queued runtime work", async () => {
+    let releaseOwner!: () => void;
+    let notifyOwnerStarted!: () => void;
+    const ownerStarted = new Promise<void>((resolve) => {
+      notifyOwnerStarted = resolve;
+    });
+    const deliberate = vi.fn(
+      async (request: {
+        readonly message: string;
+        readonly toolContext: ToolContext;
+      }) => {
+        if (request.message === "長い依頼") {
+          notifyOwnerStarted();
+          await new Promise<void>((resolve) => {
+            releaseOwner = resolve;
+          });
+        }
+        return { text: `応答:${request.message}`, toolResults: [] };
+      },
+    );
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say: vi.fn(async () => undefined) } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(
+          async (
+            _username: string,
+            _message: string,
+            signal: AbortSignal,
+            _correlationId: string,
+            requestKind: ToolContext["requestKind"],
+          ) => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "固定観測要約",
+            toolContext: { ...minimalToolContext, signal, requestKind },
+          }),
+        ),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const ownerRequest = coordinator.handleChat("owner", "長い依頼");
+    await ownerStarted;
+    const runtimeRequest = coordinator.handleRuntimeEvent("safety_failed", {
+      stateKey: "safety:failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+    const followup = coordinator.handleChat("owner", "別の質問");
+    releaseOwner();
+
+    await ownerRequest;
+    expect(await runtimeRequest).toBe("cancelled");
+    await followup;
+    expect(deliberate).toHaveBeenCalledTimes(2);
+  });
 });

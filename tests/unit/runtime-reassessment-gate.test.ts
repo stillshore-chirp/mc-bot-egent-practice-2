@@ -99,6 +99,40 @@ describe("RuntimeReassessmentGate", () => {
     expect(gate.stats.completed).toBe(0);
   });
 
+  it("retries a completed state after a newer state was accepted", async () => {
+    const releases: (() => void)[] = [];
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: (event: string) => {
+        seen.push(event);
+        return new Promise<"completed">((resolve) => {
+          releases.push(() => resolve("completed"));
+        });
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    releases.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    gate.request({ event: "safety_stabilized", stateKey: "danger:cleared" });
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    expect(seen).toEqual(["safety_failed", "safety_stabilized"]);
+
+    releases.shift()?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual([
+      "safety_failed",
+      "safety_stabilized",
+      "safety_failed",
+    ]);
+    releases.shift()?.();
+    await gate.stop();
+  });
+
   it("drops stale pending work when the active state recurs", async () => {
     let release!: () => void;
     const seen: string[] = [];

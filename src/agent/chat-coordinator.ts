@@ -270,7 +270,7 @@ export class ChatCoordinator {
               "runtime_reassessment",
               { event, ...context },
             )
-          : undefined,
+          : "cancelled",
       );
     return this.#conversationTail;
   }
