@@ -10,11 +10,19 @@ import type { GameController, MemoryPort } from "../../src/tools/contracts.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 
 const status = {
+  observedAt: "2026-09-22T00:00:00.000Z",
+  subject: "bot" as const,
+  source: "minecraft" as const,
+  requesterVitals: "unobserved" as const,
   connected: true,
   spawned: true,
   health: 20,
   food: 20,
   oxygen: 20,
+  oxygenState: "normal" as const,
+  inWater: false,
+  inLava: false,
+  suffocating: false,
   position: { x: 0, y: 64, z: 0, dimension: "overworld" },
   inventory: {},
   activeTaskState: null,
@@ -76,9 +84,16 @@ function createFactory(calls: string[]): CompanionContextFactory {
     listRecentTaskRuns: () => [],
     recall: () => [],
   } as unknown as MemoryStore;
-  const game = {
+  const game: GameController = {
     observeStatus: async () => status,
     observeSurroundings: async () => ({
+      observedAt: "2026-09-22T00:00:00.000Z",
+      subject: "bot" as const,
+      source: "minecraft" as const,
+      requesterVitals: "unobserved" as const,
+      oxygen: 20,
+      oxygenState: "normal" as const,
+      inWater: false,
       blocks: [],
       entities: [],
       hazards: [],
@@ -118,7 +133,7 @@ function createFactory(calls: string[]): CompanionContextFactory {
       summary: "戻りました。",
     }),
     currentPosition: async () => status.position,
-  } as unknown as GameController;
+  };
   const memory: MemoryPort = {
     rememberPlayerFact: () => ({}),
     rememberLocation: () => ({}),
