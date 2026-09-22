@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ReflexDetector,
+  reflexObservation,
   type ReflexThresholds,
 } from "../../src/reflexes/detectors.js";
 import { ReflexCoordinator } from "../../src/reflexes/reflex-coordinator.js";
-import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
+import {
+  actionPriorities,
+  ActionArbiter,
+} from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
@@ -233,5 +237,55 @@ describe("reflex loop", () => {
     const state = await coordinator.tick(await minecraft.observe(), true);
     expect(state.state).toBe("stabilizing");
     expect(minecraft.actions).toContain("recover:stuck");
+  });
+
+  it("reserves the reflex lease before suspending the task", async () => {
+    let startSuspending!: () => void;
+    const suspensionStarted = new Promise<void>((resolve) => {
+      startSuspending = resolve;
+    });
+    let releaseSuspension!: () => void;
+    const suspension = new Promise<void>((resolve) => {
+      releaseSuspension = resolve;
+    });
+    const minecraft = new FakeMinecraft();
+    const initialSnapshot = await minecraft.observe();
+    const tasks = {
+      suspend: async () => {
+        startSuspending();
+        await suspension;
+      },
+    } as unknown as TaskRuntime;
+    const detector = {
+      detect: () => ({
+        kind: "stuck" as const,
+        reason: "Movement was requested but position did not change",
+        priority: 100,
+        observation: reflexObservation(initialSnapshot),
+      }),
+    } as unknown as ReflexDetector;
+    const arbiter = new ActionArbiter();
+    const coordinator = new ReflexCoordinator(
+      detector,
+      thresholds,
+      minecraft,
+      tasks,
+      arbiter,
+      1_000,
+    );
+
+    const tick = coordinator.tick(initialSnapshot, true);
+    await suspensionStarted;
+
+    let error: unknown;
+    try {
+      arbiter.acquire("task:replacement", actionPriorities.task);
+    } catch (candidate) {
+      error = candidate;
+    }
+    expect(error).toMatchObject({ detail: { code: "ACTION_LEASE_BUSY" } });
+
+    releaseSuspension();
+    expect((await tick).state).toBe("stabilizing");
   });
 });

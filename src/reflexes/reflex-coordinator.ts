@@ -91,7 +91,6 @@ export class ReflexCoordinator {
       incident,
       startedAt: incident.observation.observedAt,
     };
-    await this.tasks.suspend(`reflex:${incident.kind}`);
     let lease: ActionLease | undefined;
     let after: ReflexObservation | undefined;
     try {
@@ -100,6 +99,7 @@ export class ReflexCoordinator {
         actionPriorities.reflex,
       );
       lease = acquiredLease;
+      await this.tasks.suspend(`reflex:${incident.kind}`);
       await withTimeout(
         async (timeoutSignal) => {
           const signal = AbortSignal.any([acquiredLease.signal, timeoutSignal]);
