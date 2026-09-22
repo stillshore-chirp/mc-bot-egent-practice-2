@@ -199,6 +199,41 @@ describe("immediate stop command", () => {
     );
   });
 
+  it("seeds the owner request before context construction can fail", async () => {
+    const beginOwnerRequest = vi.fn(() => 17);
+    const recordDeliveredReply = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        beginOwnerRequest,
+        deliberate: vi.fn(),
+        recordDeliveredReply,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => {
+          throw new Error("CONTEXT_FAILED");
+        }),
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "依頼");
+
+    expect(beginOwnerRequest).toHaveBeenCalledWith("owner", "依頼");
+    expect(recordDeliveredReply).toHaveBeenCalledWith(
+      "owner",
+      "owner_message",
+      "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。",
+      17,
+    );
+  });
+
   it("does not mark cancellation when stopping the action fails", async () => {
     const recordCancelledRequest = vi.fn();
     const coordinator = new ChatCoordinator({

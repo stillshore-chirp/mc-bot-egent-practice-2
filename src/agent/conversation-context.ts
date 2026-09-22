@@ -52,8 +52,15 @@ function permitsJargon(message: string): boolean {
   );
 }
 
+function negatesGoalAction(message: string): boolean {
+  return /(?:続け|続行|再開|集め|採取|移動|追従|来て|戻|探|収納|登録|始め|もう一度|もう一回)[^。！？!?]{0,12}(?:し|や|行)?(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない)/u.test(
+    message,
+  );
+}
+
 function explicitlyResumesGoal(message: string): boolean {
-  return /(続けて|続行|再開|やり直|もう一度|集め|採取|移動|追従|来て|戻|探|確認|収納|登録|始め)/u.test(
+  if (negatesGoalAction(message)) return false;
+  return /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|来て|戻って|探して|収納して|登録して|始めて)/u.test(
     message,
   );
 }

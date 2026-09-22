@@ -353,6 +353,40 @@ describe("OpenAI tool loop", () => {
     );
   });
 
+  it("does not let an older cancellation remove a newer pending owner turn", async () => {
+    const fake = new ScriptedOpenAI([response([], "次の返答です。")]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const oldRequestId = agent.beginOwnerRequest("owner", "古い依頼");
+    const newRequestId = agent.beginOwnerRequest("owner", "新しい依頼");
+    expect(newRequestId).not.toBe(oldRequestId);
+
+    agent.recordCancelledRequest("owner", "owner_message", oldRequestId);
+    agent.recordDeliveredReply(
+      "owner",
+      "owner_message",
+      "新しい返答です。",
+      newRequestId,
+    );
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const input = JSON.stringify(fake.requests[0]?.input);
+    expect(input).toContain("新しい依頼");
+    expect(input).toContain("新しい返答です。");
+    expect(input).not.toContain("古い依頼");
+  });
+
   it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {
     const fake = new ScriptedOpenAI([
       response([], "鉄を20個ですね。確認しました。"),

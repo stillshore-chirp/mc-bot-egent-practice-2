@@ -113,4 +113,18 @@ describe("conversation context", () => {
 
     expect(store.snapshot("owner").cancelledGoal).toBe(false);
   });
+
+  it("keeps the cancellation boundary for negated or status-only messages", () => {
+    for (const message of [
+      "採取は再開しないで。",
+      "移動しなくていい。",
+      "停止できたか確認して。",
+    ]) {
+      const store = new ConversationContextStore();
+      store.recordCancellation("owner");
+      store.recordUser("owner", message);
+
+      expect(store.snapshot("owner").cancelledGoal).toBe(true);
+    }
+  });
 });

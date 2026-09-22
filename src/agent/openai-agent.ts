@@ -18,6 +18,7 @@ import {
 const MAX_TOOL_ROUNDS = 8;
 
 interface PendingOwnerTurn {
+  readonly requestId: number;
   readonly message: string;
   userRecorded: boolean;
 }
@@ -28,11 +29,15 @@ export interface DeliberationRequest {
   memoryContext: string;
   worldContext: string;
   toolContext: ToolContext;
+  /** Internal correlation for delivery/cancellation of one owner request. */
+  conversationRequestId?: number;
 }
 
 export interface DeliberationReply {
   text: string;
   toolResults: { name: string; result: ToolResult<unknown> }[];
+  /** Internal correlation for delivery/cancellation of one owner request. */
+  conversationRequestId?: number;
 }
 
 function safeSerialize(value: unknown): string {
@@ -153,6 +158,7 @@ export class OpenAIDeliberationAgent {
   readonly #traceService: TraceService | undefined;
   readonly #conversation = new ConversationContextStore();
   readonly #pendingOwnerTurns = new Map<string, PendingOwnerTurn>();
+  #nextConversationRequestId = 0;
 
   public constructor(input: {
     apiKey: string;
@@ -179,17 +185,22 @@ export class OpenAIDeliberationAgent {
     const instructionSnapshot = shouldRecordConversation
       ? this.#conversation.previewUser(conversationKey, request.message)
       : conversationSnapshot;
-    if (shouldRecordConversation) {
-      this.#pendingOwnerTurns.set(conversationKey, {
-        message: request.message,
-        userRecorded: false,
-      });
-    }
+    const conversationRequestId = shouldRecordConversation
+      ? this.#stageOwnerRequest(
+          conversationKey,
+          request.message,
+          request.conversationRequestId,
+        )
+      : undefined;
     const toolContext: ToolContext = shouldRecordConversation
       ? {
           ...request.toolContext,
           recordDeliveredAssistantMessage: (text) =>
-            this.#recordAssistantDelivery(conversationKey, text),
+            this.#recordAssistantDelivery(
+              conversationKey,
+              text,
+              conversationRequestId,
+            ),
         }
       : request.toolContext;
     const inputItems: ResponseInputItem[] = [
@@ -269,7 +280,13 @@ export class OpenAIDeliberationAgent {
         if (text.length === 0) {
           throw new Error("LLM_RESPONSE_EMPTY");
         }
-        return { text, toolResults };
+        return {
+          text,
+          toolResults,
+          ...(conversationRequestId === undefined
+            ? {}
+            : { conversationRequestId }),
+        };
       }
 
       for (const call of calls) {
@@ -291,30 +308,90 @@ export class OpenAIDeliberationAgent {
   }
 
   /** Record an assistant turn only after the caller has delivered it. */
+  public beginOwnerRequest(requesterUsername: string, message: string): number {
+    return this.#stageOwnerRequest(requesterUsername, message);
+  }
+
+  public pendingOwnerRequestId(requesterUsername: string): number | undefined {
+    return this.#pendingOwnerTurns.get(requesterUsername)?.requestId;
+  }
+
   public recordDeliveredReply(
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
     text: string,
+    conversationRequestId?: number,
   ): void {
     if (requestKind === "owner_message") {
-      this.#recordAssistantDelivery(requesterUsername, text);
-      this.#pendingOwnerTurns.delete(requesterUsername);
+      this.#recordAssistantDelivery(
+        requesterUsername,
+        text,
+        conversationRequestId,
+      );
+      const pending = this.#pendingOwnerTurns.get(requesterUsername);
+      if (
+        pending !== undefined &&
+        (conversationRequestId === undefined ||
+          pending.requestId === conversationRequestId)
+      ) {
+        this.#pendingOwnerTurns.delete(requesterUsername);
+      }
     }
   }
 
   public recordCancelledRequest(
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
+    conversationRequestId?: number,
   ): void {
     if (requestKind === "owner_message") {
-      this.#pendingOwnerTurns.delete(requesterUsername);
+      const pending = this.#pendingOwnerTurns.get(requesterUsername);
+      if (
+        conversationRequestId !== undefined &&
+        pending?.requestId === conversationRequestId
+      ) {
+        this.#pendingOwnerTurns.delete(requesterUsername);
+      }
       this.#conversation.recordCancellation(requesterUsername);
     }
   }
 
-  #recordAssistantDelivery(requesterUsername: string, text: string): void {
+  #stageOwnerRequest(
+    requesterUsername: string,
+    message: string,
+    conversationRequestId?: number,
+  ): number {
+    const requestId =
+      conversationRequestId ?? ++this.#nextConversationRequestId;
+    const pending = this.#pendingOwnerTurns.get(requesterUsername);
+    if (
+      conversationRequestId !== undefined &&
+      pending !== undefined &&
+      pending.requestId !== conversationRequestId
+    ) {
+      return conversationRequestId;
+    }
+    this.#pendingOwnerTurns.set(requesterUsername, {
+      requestId,
+      message,
+      userRecorded: false,
+    });
+    return requestId;
+  }
+
+  #recordAssistantDelivery(
+    requesterUsername: string,
+    text: string,
+    conversationRequestId?: number,
+  ): void {
     const pending = this.#pendingOwnerTurns.get(requesterUsername);
     if (pending === undefined) return;
+    if (
+      conversationRequestId !== undefined &&
+      pending.requestId !== conversationRequestId
+    ) {
+      return;
+    }
     if (!pending.userRecorded) {
       this.#conversation.recordUser(requesterUsername, pending.message);
       pending.userRecorded = true;

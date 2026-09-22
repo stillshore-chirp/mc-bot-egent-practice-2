@@ -46,14 +46,21 @@ export type RuntimeReassessmentEvent =
   | "connection_recovered";
 
 interface DeliveredReplyRecorder {
+  beginOwnerRequest?: (
+    requesterUsername: string,
+    message: string,
+  ) => number | undefined;
+  pendingOwnerRequestId?: (requesterUsername: string) => number | undefined;
   recordDeliveredReply?: (
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
     text: string,
+    conversationRequestId?: number,
   ) => void;
   recordCancelledRequest?: (
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
+    conversationRequestId?: number,
   ) => void;
 }
 
@@ -172,6 +179,8 @@ export class ChatCoordinator {
       this.#generation += 1;
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
+      const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+      const interruptedRequestId = recorder.pendingOwnerRequestId?.(username);
       const session = await safeStartTrace(
         this.#traceService,
         "停止指示を受信",
@@ -188,8 +197,15 @@ export class ChatCoordinator {
           },
           () => this.#game.stopCurrentAction("利用者の即時停止指示"),
         );
-        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
-        recorder.recordCancelledRequest?.(username, "owner_message");
+        if (interruptedRequestId === undefined) {
+          recorder.recordCancelledRequest?.(username, "owner_message");
+        } else {
+          recorder.recordCancelledRequest?.(
+            username,
+            "owner_message",
+            interruptedRequestId,
+          );
+        }
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -287,6 +303,11 @@ export class ChatCoordinator {
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeController = controller;
+    const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+    const conversationRequestId =
+      requestKind === "owner_message"
+        ? recorder.beginOwnerRequest?.(username, message)
+        : undefined;
     const session = await safeStartTrace(
       this.#traceService,
       requestKind === "runtime_reassessment"
@@ -308,7 +329,13 @@ export class ChatCoordinator {
           correlationId,
           requestKind,
         );
-        const reply = await this.#agent.deliberate({ message, ...context });
+        const reply = await this.#agent.deliberate({
+          message,
+          ...context,
+          ...(conversationRequestId === undefined
+            ? {}
+            : { conversationRequestId }),
+        });
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -320,8 +347,18 @@ export class ChatCoordinator {
           },
           () => this.#game.say(reply.text),
         );
-        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
-        recorder.recordDeliveredReply?.(username, requestKind, reply.text);
+        const deliveredRequestId =
+          reply.conversationRequestId ?? conversationRequestId;
+        if (deliveredRequestId === undefined) {
+          recorder.recordDeliveredReply?.(username, requestKind, reply.text);
+        } else {
+          recorder.recordDeliveredReply?.(
+            username,
+            requestKind,
+            reply.text,
+            deliveredRequestId,
+          );
+        }
       });
     };
     try {
@@ -378,8 +415,16 @@ export class ChatCoordinator {
             () => this.#game.say(errorText),
           ),
         );
-        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
-        recorder.recordDeliveredReply?.(username, requestKind, errorText);
+        if (conversationRequestId === undefined) {
+          recorder.recordDeliveredReply?.(username, requestKind, errorText);
+        } else {
+          recorder.recordDeliveredReply?.(
+            username,
+            requestKind,
+            errorText,
+            conversationRequestId,
+          );
+        }
       } finally {
         await safeCompleteTrace(session, "failed", "処理に失敗");
       }
