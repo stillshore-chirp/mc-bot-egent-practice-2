@@ -195,7 +195,7 @@ const resourceGoals: readonly ResourceGoal[] = [
 const affirmativeCollectionIntentPattern =
   /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
 const negatedCollectionIntentPattern =
-  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
+  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:採ら|取ら)(?:ない|ず)|(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const collectionPermissionQuestionPattern =
   /(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:も)?(?:いい|よい|良い|大丈夫|問題ない|はいけない)/iu;
 const operationWords = new Set([
@@ -243,24 +243,40 @@ export function deriveOwnerGoalAuthorization(
 
   const message = normalize(input.message);
   const nowMs = input.nowMs ?? Date.now();
-  const namedResource = resourceGoals
-    .flatMap((goal) => goal.aliases.map((alias) => ({ alias, goal })))
-    .filter(({ alias }) => containsAlias(message, alias))
-    .sort(
-      (left, right) =>
-        normalize(right.alias).length - normalize(left.alias).length,
-    )[0]?.goal;
-  const resource = namedResource ?? canonicalResourceGoal(message);
+  const clauses = message
+    .split(/[、，,。；;]+/u)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+  const affirmativeClauses = clauses.filter(
+    (clause) =>
+      affirmativeCollectionIntentPattern.test(clause) &&
+      !negatedCollectionIntentPattern.test(clause) &&
+      !collectionPermissionQuestionPattern.test(clause) &&
+      !/[?？]/u.test(clause),
+  );
+  if (affirmativeClauses.length > 1) {
+    return {
+      outcome: "clarify",
+      question:
+        "複数の資源作業を一度に認可できません。まず一つの資源と数量を指定してください。",
+    };
+  }
+  const goalClause = affirmativeClauses[0] ?? message;
+  const namedMatch = findNamedResource(goalClause);
+  const namedResource = namedMatch?.goal;
+  const resource = namedResource ?? canonicalResourceGoal(goalClause);
   const unresolvedCanonicalResource =
     namedResource === undefined && resource === undefined
-      ? canonicalResourceId(message)
+      ? canonicalResourceId(goalClause)
       : undefined;
-  const count = parseCount(message);
-  const hasCollectionIntent = affirmativeCollectionIntentPattern.test(message);
+  const count = parseCount(goalClause);
+  const hasCollectionIntent =
+    affirmativeCollectionIntentPattern.test(goalClause);
   const hasNegatedCollectionIntent =
-    negatedCollectionIntentPattern.test(message);
+    negatedCollectionIntentPattern.test(goalClause);
   const asksCollectionPermission =
-    collectionPermissionQuestionPattern.test(message);
+    collectionPermissionQuestionPattern.test(goalClause) ||
+    (hasCollectionIntent && /[?？]/u.test(goalClause));
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -304,6 +320,29 @@ export function deriveOwnerGoalAuthorization(
   if (!hasCollectionIntent) {
     return { outcome: "none" };
   }
+  if (
+    hasMultipleResourceMentions(goalClause, namedMatch) ||
+    countMentions(goalClause) > 1 ||
+    (affirmativeClauses.length === 1 &&
+      clauses.some((clause) => {
+        if (!negatedCollectionIntentPattern.test(clause)) return false;
+        const prohibited =
+          findNamedResource(clause)?.goal ?? canonicalResourceGoal(clause);
+        return (
+          prohibited === undefined ||
+          resource === undefined ||
+          prohibited.allowedResources.some((id) =>
+            resource.allowedResources.includes(id),
+          )
+        );
+      }))
+  ) {
+    return {
+      outcome: "clarify",
+      question:
+        "資源や数量、禁止条件が重なっています。一つの資源と数量、実行してよい作業を指定してください。",
+    };
+  }
   if (resource === undefined) {
     if (unresolvedCanonicalResource !== undefined) {
       return {
@@ -346,7 +385,7 @@ export function deriveOwnerGoalAuthorization(
     outcome: "authorized",
     authorization: {
       kind: "owner_bounded_resource",
-      goal: message,
+      goal: goalClause,
       allowedResources: resource.allowedResources,
       targetItem: resource.targetItem,
       targetCount: count,
@@ -451,6 +490,46 @@ function containsAlias(message: string, alias: string): boolean {
     );
   }
   return message.includes(normalizedAlias);
+}
+
+function findNamedResource(
+  message: string,
+): { readonly alias: string; readonly goal: ResourceGoal } | undefined {
+  return resourceGoals
+    .flatMap((goal) => goal.aliases.map((alias) => ({ alias, goal })))
+    .filter(({ alias }) => containsAlias(message, alias))
+    .sort(
+      (left, right) =>
+        normalize(right.alias).length - normalize(left.alias).length,
+    )[0];
+}
+
+function hasMultipleResourceMentions(
+  message: string,
+  namedMatch: ReturnType<typeof findNamedResource>,
+): boolean {
+  const primary = normalize(
+    namedMatch?.alias ?? canonicalResourceId(message) ?? "",
+  );
+  if (primary.length === 0) return false;
+  const index = message.indexOf(primary);
+  if (index < 0) return false;
+  const remainder =
+    message.slice(0, index) +
+    " ".repeat(primary.length) +
+    message.slice(index + primary.length);
+  return (
+    findNamedResource(remainder) !== undefined ||
+    canonicalResourceId(remainder) !== undefined
+  );
+}
+
+function countMentions(message: string): number {
+  return [
+    ...message.matchAll(
+      /[0-9]{1,3}\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
+    ),
+  ].length;
 }
 
 function parseCount(message: string): number | undefined {

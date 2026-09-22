@@ -100,6 +100,7 @@ describe("owner goal authorization", () => {
   it.each([
     "オークの原木を1本集めないで",
     "オークの原木を1本集めるな",
+    "鉄は採らないで",
     "do not collect oak_log 2 items",
   ])("does not authorize a negated collection request: %s", (message) => {
     const result = deriveOwnerGoalAuthorization({
@@ -112,6 +113,42 @@ describe("owner goal authorization", () => {
       expect(result.question).toContain("開始しません");
     }
   });
+
+  it("takes the resource and quantity only from the affirmative clause", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "鉄は10個採らないで、石炭を3個集めて",
+      }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: { targetItem: "coal", targetCount: 3 },
+    });
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "石炭を3個集めて、鉄は10個採らないで",
+      }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: { targetItem: "coal", targetCount: 3 },
+    });
+  });
+
+  it.each([
+    "鉄を10個集めて、石炭を3個集めて",
+    "鉄を10個と石炭を3個集めて",
+    "鉄を10個集めて、鉄を2個集めないで",
+    "鉄を10個集めて石炭を3個集めないで",
+    "鉄を1個集めて？",
+  ])(
+    "does not infer one authorization from conflicting clauses: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+      ).toMatchObject({ outcome: "clarify" });
+    },
+  );
 
   it("does not authorize a named resource statement", () => {
     expect(
