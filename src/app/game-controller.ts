@@ -1368,13 +1368,21 @@ export class CompanionGameController implements GameController {
 
   #requiresSafetyResumeGate(): boolean {
     const current = this.#tasks.current;
-    if (current !== undefined) return current.status === "suspended";
+    if (current !== undefined) {
+      return (
+        current.status === "suspended" ||
+        (current.status === "cancelled" &&
+          typeof current.checkpoint?.suspendReason === "string")
+      );
+    }
     if (this.#playerId === undefined) return false;
     try {
       const latest = this.#memory.listRecentTaskRuns(this.#playerId, 1)[0];
       return (
         latest !== undefined &&
-        ["queued", "running", "suspended"].includes(latest.status)
+        (["queued", "running", "suspended"].includes(latest.status) ||
+          (latest.status === "cancelled" &&
+            typeof latest.checkpoint?.data.suspendReason === "string"))
       );
     } catch {
       // Without a durable task read, a restart cannot rule out a suspension.

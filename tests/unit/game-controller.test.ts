@@ -507,6 +507,39 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("keeps the safety gate after stopping a suspended task until danger clears", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    try {
+      const follow = game.followOwner(3, 60, new AbortController().signal);
+      await waitUntil(() => minecraft.actions.includes("follow:owner"));
+      await tasks.suspend("reflex:hazard");
+      await follow;
+      await game.stopCurrentAction("owner requested stop");
+      expect(tasks.current?.status).toBe("cancelled");
+
+      minecraft.snapshot = createSnapshot({ onFire: true });
+      const blocked = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+      expect(blocked.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+      expect(minecraft.actions).not.toContain("move:5,64,0");
+
+      minecraft.snapshot = createSnapshot();
+      const resumed = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+      expect(resumed.outcome).toBe("completed");
+      expect(minecraft.actions).toContain("move:5,64,0");
+    } finally {
+      close();
+    }
+  });
+
   it("reports a currently observed threat separately from the reason a task stopped", async () => {
     const minecraft = new FakeMinecraft();
     const { game, tasks, close } = createController(minecraft);
@@ -857,6 +890,41 @@ describe("CompanionGameController", () => {
       close();
     },
   );
+
+  it("checks a persisted cancelled suspension before moving after restart", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ inWater: true, oxygen: 2, oxygenState: "low" }),
+    );
+    const { game, memory, tasks, close } = createController(minecraft, true);
+    try {
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      const previous = memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status: "suspended",
+        input: { range: 3 },
+      });
+      memory.updateTaskRun({
+        taskRunId: previous.id,
+        status: "cancelled",
+        phase: "following",
+        checkpoint: { suspendReason: "reflex:hazard" },
+      });
+
+      const retry = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+
+      expect(tasks.current).toBeUndefined();
+      expect(minecraft.actions).not.toContain("move:5,64,0");
+      expect(retry.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    } finally {
+      close();
+    }
+  });
 
   it.each(["queued", "running", "suspended"] as const)(
     "does not present a persisted %s task as active after restart",
