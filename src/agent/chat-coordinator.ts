@@ -201,29 +201,31 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
 }
 
 export function hostileResponseIntent(message: string): HostileGoal | null {
-  const normalized = message.trim();
+  const normalized = message.trim().replace(/[。！!]+$/gu, "");
   if (/[?？「」『』“”]/u.test(normalized)) return null;
 
   const negatedEvade =
-    /(?:逃げ(?:ないで|るな|なくていい)|退避(?:しないで|するな|は不要|不要)|距離を取(?:らないで|るな)|離れ(?:ないで|るな))/gu;
+    /(?:逃げ(?:ないで|るな|なくていい|てはいけない)|退避(?:しないで|するな|は不要|不要|してはいけない)|距離を取(?:らないで|るな|ってはいけない)|離れ(?:ないで|るな|てはいけない))/gu;
   const negatedAttack =
     /(?:倒|攻撃|戦|撃滅|討伐|退治|やっつけ)[^、，,。]{0,8}(?:ないで|なくていい|不要|するな|すな|はいけない|必要はない|ほしくない|やめて)/gu;
   const hasNegatedEvade = negatedEvade.test(normalized);
   const hasNegatedAttack = negatedAttack.test(normalized);
   const affirmativeEvade = normalized.replace(negatedEvade, "");
   const affirmativeAttack = normalized.replace(negatedAttack, "");
+  const evadeCommand =
+    /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u;
   if (
-    /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))/u.test(
-      affirmativeEvade,
-    )
+    affirmativeEvade
+      .split(/[、，,。]/u)
+      .some((clause) => evadeCommand.test(clause.trim()))
   ) {
     return "evade";
   }
 
   const clauses = affirmativeAttack.split(/[、，,。]/u);
   const distress = clauses.some((clause) =>
-    /(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)/u.test(
-      clause,
+    /(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+      clause.trim(),
     ),
   );
   if (hasNegatedAttack) return distress ? "evade" : null;
@@ -237,13 +239,15 @@ export function hostileResponseIntent(message: string): HostileGoal | null {
         clause,
       );
     const explicitCombat =
-      /(?:撃滅(?:して|せよ|しろ)?|討伐(?:して|しろ)?|退治(?:して|しろ)?|やっつけ(?:て|ろ))/u.test(
-        clause,
+      /(?:撃滅(?:して|せよ|しろ|しなさい)|討伐(?:して|しろ|せよ)|退治(?:して|しろ|せよ)|やっつけ(?:て|ろ))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        clause.trim(),
       );
     const genericCombat =
-      /(?:倒(?:して|せ|しろ|しなさい)|攻撃(?:して|しろ|せよ))/u.test(clause);
+      /(?:倒(?:して|せ|しろ|しなさい)|攻撃(?:して|しろ|せよ))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        clause.trim(),
+      );
     return (
-      (explicitCombat && (!nonHostileTarget || hostileTarget)) ||
+      (explicitCombat && hostileTarget && !nonHostileTarget) ||
       (genericCombat && !nonHostileTarget && (hostileTarget || hasNegatedEvade))
     );
   });
