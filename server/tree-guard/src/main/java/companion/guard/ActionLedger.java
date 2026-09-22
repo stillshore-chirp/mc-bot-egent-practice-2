@@ -33,6 +33,10 @@ public final class ActionLedger {
         return saturated || placed.containsKey(point);
     }
 
+    public boolean hasPlacement(Point point) {
+        return placed.containsKey(point);
+    }
+
     public boolean isSaturated() {
         return saturated;
     }

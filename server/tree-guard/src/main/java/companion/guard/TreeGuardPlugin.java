@@ -275,18 +275,49 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         ledger.broken(point(e.getBlock()), e.getBlock().getType().name().toLowerCase(Locale.ROOT), bot(e.getPlayer()));
         actionLedger.remove(actionPoint(e.getBlock()));
     }
+    private void invalidateMovedPlacements(Collection<Block> blocks) {
+        if (blocks.stream().map(this::actionPoint).anyMatch(actionLedger::hasPlacement)) {
+            // The new coordinates depend on piston mechanics. Stop generic
+            // mining until an operator re-establishes a safe provenance set.
+            actionLedger.markSaturated();
+        }
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void piston(BlockPistonExtendEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
+    public void piston(BlockPistonExtendEvent e) {
+        ledger.changedNear(e.getBlocks().stream().map(this::point).toList());
+        invalidateMovedPlacements(e.getBlocks());
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void retract(BlockPistonRetractEvent e) { ledger.changedNear(e.getBlocks().stream().map(this::point).toList()); }
+    public void retract(BlockPistonRetractEvent e) {
+        ledger.changedNear(e.getBlocks().stream().map(this::point).toList());
+        invalidateMovedPlacements(e.getBlocks());
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void burn(BlockBurnEvent e) { ledger.changedNear(point(e.getBlock())); }
+    public void burn(BlockBurnEvent e) {
+        ledger.changedNear(point(e.getBlock()));
+        actionLedger.remove(actionPoint(e.getBlock()));
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void entityChange(EntityChangeBlockEvent e) { ledger.changedNear(point(e.getBlock())); }
+    public void entityChange(EntityChangeBlockEvent e) {
+        ledger.changedNear(point(e.getBlock()));
+        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))) actionLedger.markSaturated();
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void explode(EntityExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
+    public void flow(BlockFromToEvent e) {
+        ledger.changedNear(List.of(point(e.getBlock()), point(e.getToBlock())));
+        if (actionLedger.hasPlacement(actionPoint(e.getBlock()))
+            || actionLedger.hasPlacement(actionPoint(e.getToBlock()))) actionLedger.markSaturated();
+    }
     @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
-    public void blockExplode(BlockExplodeEvent e) { ledger.changedNear(e.blockList().stream().map(this::point).toList()); }
+    public void explode(EntityExplodeEvent e) {
+        ledger.changedNear(e.blockList().stream().map(this::point).toList());
+        e.blockList().forEach(block -> actionLedger.remove(actionPoint(block)));
+    }
+    @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+    public void blockExplode(BlockExplodeEvent e) {
+        ledger.changedNear(e.blockList().stream().map(this::point).toList());
+        e.blockList().forEach(block -> actionLedger.remove(actionPoint(block)));
+    }
     @EventHandler(priority=EventPriority.MONITOR)
     public void unload(ChunkUnloadEvent e) {
         // Growth history is local to a loaded chunk. Placement provenance is

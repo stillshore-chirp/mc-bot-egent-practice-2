@@ -64,4 +64,13 @@ class ActionLedgerTest {
         // placement provenance that protects an existing player structure.
         assertTrue(ledger.isPlaced(point));
     }
+
+    @Test void uncertainMovedPlacementStopsNaturalMiningUntilOperatorRecovery() {
+        ActionLedger ledger = new ActionLedger();
+        ActionLedger.Point point = new ActionLedger.Point(WORLD, 9, 64, 10);
+        assertTrue(ledger.recordPlacement(point, "stone"));
+        ledger.markSaturated();
+        assertTrue(ledger.isSaturated());
+        assertFalse(ledger.allowsNaturalMining(point, true));
+    }
 }
