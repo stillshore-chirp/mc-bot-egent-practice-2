@@ -1,3 +1,6 @@
+import { DeliverLogsSkill } from "../skills/deliver-logs.js";
+import type { DepositResult } from "../minecraft/port.js";
+import { DeliveryController } from "./delivery-controller.js";
 import type { Logger } from "pino";
 
 import {
@@ -38,6 +41,7 @@ interface CompanionGameControllerInput {
   readonly ownerUsername: string;
   readonly taskTimeoutMs: number;
   readonly retryLimit: number;
+  readonly maxMoveDistance?: number;
   readonly logger: Logger;
   readonly memory: MemoryStore;
 }
@@ -45,6 +49,8 @@ interface CompanionGameControllerInput {
 const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
 
 export class CompanionGameController implements GameController {
+  public readonly delivery: DeliveryController;
+  readonly #deliverySkill: DeliverLogsSkill;
   readonly #minecraft: MinecraftPort;
   readonly #tasks: TaskRuntime;
   readonly #arbiter: ActionArbiter;
@@ -59,6 +65,21 @@ export class CompanionGameController implements GameController {
   readonly #memory: MemoryStore;
 
   public constructor(input: CompanionGameControllerInput) {
+    this.delivery = new DeliveryController(
+      input.minecraft,
+      input.memory,
+      input.ownerUsername,
+      input.arbiter,
+      (resource, count, gather, signal) =>
+        this.#deliverLogs(resource, count, gather, signal),
+    );
+    this.#deliverySkill = new DeliverLogsSkill(
+      input.minecraft,
+      input.tasks,
+      input.arbiter,
+      input.gatherLogs,
+      input.maxMoveDistance ?? 128,
+    );
     this.#minecraft = input.minecraft;
     this.#tasks = input.tasks;
     this.#arbiter = input.arbiter;
@@ -270,6 +291,67 @@ export class CompanionGameController implements GameController {
       };
     }
     return report;
+  }
+
+  async #deliverLogs(
+    resource: string,
+    count: number,
+    gather: boolean,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    if (!isGatherableLog(resource))
+      throw new AppError({
+        category: "validation",
+        code: "UNSUPPORTED_GATHER_RESOURCE",
+        message: "対象外の資源です。",
+        retryable: false,
+      });
+    const targets = this.delivery.list();
+    const home = targets.find((target) => target.kind === "home"),
+      chest = targets.find((target) => target.kind === "chest");
+    if (!home || !chest)
+      throw new AppError({
+        category: "validation",
+        code: "DELIVERY_TARGET_NOT_REGISTERED",
+        message:
+          "帰還拠点と指定チェストを先に登録してください。収納先は推測しません。",
+        retryable: false,
+      });
+    let receipt: DepositResult | undefined;
+    const report = await this.#executeTask(
+      signal,
+      () =>
+        this.#deliverySkill.run(
+          {
+            resource,
+            count,
+            gather,
+            requester: this.#ownerUsername,
+            home,
+            chest,
+          },
+          (result) => {
+            receipt = result;
+          },
+        ),
+      (output) => ({
+        outcome: "completed",
+        evidenceKind: "inventory_delta",
+        confirmedState: { ...output },
+        summary: `登録拠点への帰還と指定チェストへの${String(output.deposited)}個の収納を観測しました。${resource}の残り所持数は${String(output.heldCount)}個です。`,
+      }),
+    );
+    if (report.outcome === "completed") return report;
+    return {
+      ...report,
+      confirmedState: { ...report.confirmedState, ...receipt },
+      summary: receipt?.verified
+        ? `収納は途中で終了しました。確認できた収納数は${String(receipt.deposited)}個、未収納は${String(receipt.remaining)}個、${resource}の残り所持数は${String(receipt.heldCount)}個です。`
+        : `帰還・収納を完了できませんでした（${report.failureCode ?? "UNVERIFIED"}）。収納数は未確認です。`,
+      nextActions: [
+        "登録先と現在の所持品を確認し、残りの数量を新しい依頼として指示してください。過去の収納数は加算しません。",
+      ],
+    };
   }
 
   public async returnToOwner(

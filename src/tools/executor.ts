@@ -10,12 +10,15 @@ const runtimeReassessmentTools = new Set([
   "observe_status",
   "observe_surroundings",
   "recall_memory",
+  "get_delivery_targets",
 ]);
 
-const memoryReadTools = new Set(["recall_memory"]);
+const memoryReadTools = new Set(["recall_memory", "get_delivery_targets"]);
 const memoryWriteTools = new Set([
   "remember_player_fact",
   "remember_location",
+  "register_delivery_target",
+  "forget_delivery_target",
   "set_commitment",
   "complete_commitment",
 ]);

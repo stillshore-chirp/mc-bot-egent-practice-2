@@ -762,6 +762,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     ownerUsername: config.ownerUsername,
     taskTimeoutMs: config.limits.taskTimeoutMs,
     retryLimit: config.limits.skillRetryLimit,
+    maxMoveDistance: config.limits.maxMoveDistance,
     logger,
     memory,
   });

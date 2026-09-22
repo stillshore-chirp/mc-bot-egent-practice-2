@@ -52,7 +52,13 @@ import type {
   WorldMemoryStatus,
 } from "./types.js";
 
-const SCHEMA_VERSION = 2;
+import {
+  deliveryTargetSchema,
+  type DeliveryTarget,
+  type DeliveryTargetKind,
+} from "./delivery-targets.js";
+
+const SCHEMA_VERSION = 3;
 const DEFAULT_RECALL_LIMIT = 8;
 const MAX_RECALL_LIMIT = 30;
 const MAX_TEXT_LENGTH = 1_000;
@@ -237,6 +243,40 @@ export class MemoryStore {
     if (this.database.open) {
       this.database.close();
     }
+  }
+
+  public saveDeliveryTarget(
+    playerId: string,
+    target: DeliveryTarget,
+  ): DeliveryTarget {
+    this.requirePlayer(playerId);
+    const validated = deliveryTargetSchema.parse(target);
+    this.database
+      .prepare(
+        "INSERT INTO delivery_targets (player_id, kind, value_json) VALUES (?, ?, ?) ON CONFLICT(player_id,kind) DO UPDATE SET value_json=excluded.value_json",
+      )
+      .run(playerId, validated.kind, JSON.stringify(validated));
+    return validated;
+  }
+
+  public getDeliveryTargets(playerId: string): DeliveryTarget[] {
+    this.requirePlayer(playerId);
+    return this.database
+      .prepare<[string], { value_json: string }>(
+        "SELECT value_json FROM delivery_targets WHERE player_id=? ORDER BY kind",
+      )
+      .all(playerId)
+      .map((row) => deliveryTargetSchema.parse(JSON.parse(row.value_json)));
+  }
+
+  public forgetDeliveryTarget(
+    playerId: string,
+    kind: DeliveryTargetKind,
+  ): void {
+    this.requirePlayer(playerId);
+    this.database
+      .prepare("DELETE FROM delivery_targets WHERE player_id=? AND kind=?")
+      .run(playerId, kind);
   }
 
   public getOrCreatePlayer(externalName: string): PlayerRecord {
@@ -1311,6 +1351,10 @@ export class MemoryStore {
     }[] = [
       { version: 1, sql: migrationV1 },
       { version: 2, sql: migrationV2 },
+      {
+        version: 3,
+        sql: "CREATE TABLE delivery_targets (player_id TEXT NOT NULL REFERENCES players(id), kind TEXT NOT NULL CHECK(kind IN ('home','chest')), value_json TEXT NOT NULL, PRIMARY KEY(player_id, kind))",
+      },
     ];
     for (const migration of migrations) {
       if (appliedVersions.has(migration.version)) {

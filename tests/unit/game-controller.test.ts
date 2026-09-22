@@ -157,3 +157,34 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   }
   throw new Error("condition was not reached");
 }
+
+describe("delivery user reports", () => {
+  it("asks for missing registrations and reports verified partial quantities", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.snapshot = {
+      ...minecraft.snapshot,
+      inventory: [{ name: "oak_log", count: 2 }],
+    };
+    const { game, close } = createController(minecraft);
+    const signal = new AbortController().signal;
+    try {
+      await expect(
+        game.delivery.deliver("oak_log", 2, false, signal),
+      ).rejects.toMatchObject({
+        detail: { code: "DELIVERY_TARGET_NOT_REGISTERED" },
+      });
+      await game.delivery.register("home", null, signal);
+      const position = { x: 2, y: 64, z: 0 };
+      minecraft.storageIdentities.set(JSON.stringify(position), "fixture");
+      await game.delivery.register("chest", position, signal);
+      minecraft.chestCapacity = 1;
+      const report = await game.delivery.deliver("oak_log", 2, false, signal);
+      expect(report.outcome).toBe("failed");
+      expect(report.summary).toContain("収納数は1個");
+      expect(report.summary).toContain("未収納は1個");
+      expect(report.summary).toContain("残り所持数は1個");
+    } finally {
+      close();
+    }
+  });
+});

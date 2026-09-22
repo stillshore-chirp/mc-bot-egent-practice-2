@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { Vec3 } from "vec3";
+import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
+import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/minecraft/connection-manager.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
 
@@ -76,5 +78,50 @@ describe("Minecraft boundary", () => {
       detail: { code: "RECONNECT_DISABLED" },
     });
     await manager.shutdown();
+  });
+});
+
+describe("Mineflayer player observation", () => {
+  it("ignores distant unloaded players while preserving visible observations", async () => {
+    const client = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    Object.assign(client, {
+      spawned: true,
+      botInstance: {
+        username: "fixture_bot",
+        entity: {
+          id: 1,
+          position: new Vec3(0, 64, 0),
+          velocity: new Vec3(0, 0, 0),
+        },
+        inventory: { items: () => [] },
+        players: {
+          unloaded: { username: "unloaded", entity: null },
+          missing: { username: "missing", entity: undefined },
+          visible: {
+            username: "visible",
+            entity: { position: new Vec3(2, 64, 0) },
+          },
+        },
+        entities: {},
+        blockAt: () => null,
+        game: { dimension: "overworld" },
+        health: 20,
+        food: 20,
+        oxygenLevel: 20,
+      },
+    });
+    const state = await client.observe();
+    expect(state.players).toEqual([
+      { username: "visible", position: { x: 2, y: 64, z: 0 }, distance: 2 },
+    ]);
+    expect(state.connected).toBe(true);
   });
 });

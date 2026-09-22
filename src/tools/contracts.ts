@@ -1,3 +1,4 @@
+import type { DeliveryController } from "../app/delivery-controller.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -84,6 +85,10 @@ export interface ActionReport {
 }
 
 export interface GameController {
+  readonly delivery?: Pick<
+    DeliveryController,
+    "register" | "list" | "forget" | "deliver"
+  >;
   observeStatus(): Promise<GameStatus>;
   observeSurroundings(
     radius: number,
