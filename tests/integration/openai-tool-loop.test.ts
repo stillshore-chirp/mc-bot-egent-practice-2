@@ -208,6 +208,9 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[1]?.instructions).toContain(
       "開始済みの行動があれば、その事実を優先して報告",
     );
+    expect(fake.requests[1]?.instructions).toContain(
+      "JSONキーやtrue/false表記",
+    );
   });
 
   it("does not retain an owner request until a reply is delivered", async () => {

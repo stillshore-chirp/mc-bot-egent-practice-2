@@ -61,6 +61,7 @@ function instructions(
     "world観測やtool結果に含まれる内部のkind、phase、status、error codeはそのまま利用者へ出さず、確認済みの事実を平易な日本語へ言い換えてください。",
     "観測とtool結果を最優先し、実行済み・開始済み・停止済みが確認できる事実を報告してください。確認できないことを『新規行動は開始していない』などと断定しないでください。",
     "状態名や英語の内部語（例: suspended）は『安全上の理由で一時停止中』などの平易な表現へ言い換えてください。利用者が尋ねていない体力・空腹・座標・記憶の列挙は省き、依頼の判断に必要な事実だけを説明してください。",
+    "観測データのJSONキーやtrue/false表記（例: inWater:false）はそのまま利用者へ出さず、『水中ではない』のような平易な事実へ変換してください。",
     buildCapabilityContext(request.toolContext.limits),
     conversationContext,
     "型付き原木収集の約束を履行する場合だけ、gather_resourceのcommitmentIdへその約束IDを指定し、成功結果で返るreceiptIdだけをcomplete_commitmentへ渡してください。他の行動や通常の収集ではreceiptIdや証跡を作り出してはいけません。",
