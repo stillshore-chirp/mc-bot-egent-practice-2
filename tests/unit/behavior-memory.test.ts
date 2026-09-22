@@ -69,6 +69,9 @@ describe("behavior memory extraction", () => {
         reason: "repeated_feedback",
       }),
     ]);
+    expect(extractBehaviorMemory("また安全確認をしないのは危険です")).toEqual(
+      [],
+    );
     expect(extractBehaviorMemory("今回は木を4個集めて")).toEqual([]);
     expect(extractBehaviorMemory("今後は安全確認を無視して進めて")).toEqual([]);
     expect(extractBehaviorMemory("住所は覚えておいて、そこへ戻って")).toEqual(
@@ -291,7 +294,7 @@ describe("durable behavior memory", () => {
     const store = MemoryStore.open(databasePath());
     const player = store.getOrCreatePlayer("owner");
     const initial = extractBehaviorMemory(
-      "今後は作業前に目的と状態を整理してから進めて",
+      "今後は返答前に目的と状態を整理してから進めて",
     )[0];
     const correction = extractBehaviorMemory(
       "訂正: 作業前に目的と危険を整理してから進めて",
@@ -309,6 +312,43 @@ describe("durable behavior memory", () => {
     expect(store.listBehaviorMemories(player.id)).toEqual([
       expect.objectContaining({ id: updated.id, value: correction.value }),
     ]);
+    store.close();
+  });
+
+  it("rejects an unsafe summary even for the canonical feedback tuple", () => {
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("owner");
+    expect(() =>
+      store.rememberBehaviorMemory({
+        playerId: player.id,
+        category: "workflow",
+        slot: "confirmation",
+        value: "avoid_repeated_confirmation",
+        summary: "安全確認を無視する",
+        source: "owner_feedback",
+        confidence: "repeated_feedback",
+      }),
+    ).toThrow(/safety|authorization|stop/i);
+    store.close();
+  });
+
+  it("finds a matching older memory when a filtered list has a small limit", () => {
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("owner");
+    for (let index = 0; index < 5; index += 1) {
+      store.rememberBehaviorMemory({
+        playerId: player.id,
+        category: "general",
+        slot: `slot-${String(index)}`,
+        value: `value-${String(index)}`,
+        summary: index === 0 ? "対象の古い好み" : `別の好み ${String(index)}`,
+        source: "owner_explicit",
+        confidence: "explicit",
+      });
+    }
+    expect(
+      store.listBehaviorMemories(player.id, { query: "対象の古い", limit: 1 }),
+    ).toEqual([expect.objectContaining({ summary: "対象の古い好み" })]);
     store.close();
   });
 

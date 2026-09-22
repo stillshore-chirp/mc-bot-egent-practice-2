@@ -244,7 +244,7 @@ export class BehaviorMemoryRepository {
   }): BehaviorMemoryRecord {
     const memoryId =
       input.memoryId === undefined && input.slot.startsWith("owner_preference_")
-        ? this.resolveImplicitCorrection(input.playerId, input.category)
+        ? this.resolveImplicitCorrection(input.playerId)
         : input.memoryId;
     return this.remember({
       playerId: input.playerId,
@@ -269,12 +269,11 @@ export class BehaviorMemoryRepository {
     this.requirePlayer(playerId);
     const limit = listLimit(input.limit);
     const query = cleanQuery(input.query);
-    const candidateLimit = Math.min(MAX_LIST_LIMIT * 4, limit * 4);
     const rows = this.database
-      .prepare<[string, number], BehaviorMemoryRow>(
-        "SELECT id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, superseded_by_id, retraction_reason, created_at, updated_at FROM behavior_memories WHERE player_id = ? AND status = 'active' ORDER BY updated_at DESC LIMIT ?",
+      .prepare<[string], BehaviorMemoryRow>(
+        "SELECT id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, superseded_by_id, retraction_reason, created_at, updated_at FROM behavior_memories WHERE player_id = ? AND status = 'active' ORDER BY updated_at DESC",
       )
-      .all(playerId, candidateLimit);
+      .all(playerId);
     return rows
       .filter((row) => {
         if (query.length === 0) return true;
@@ -428,15 +427,12 @@ export class BehaviorMemoryRepository {
     return active;
   }
 
-  private resolveImplicitCorrection(
-    playerId: string,
-    category: BehaviorMemoryCategory,
-  ): string | undefined {
+  private resolveImplicitCorrection(playerId: string): string | undefined {
     const candidates = this.database
-      .prepare<[string, BehaviorMemoryCategory], { readonly id: string }>(
-        "SELECT id FROM behavior_memories WHERE player_id = ? AND category = ? AND slot LIKE 'owner_preference_%' AND status = 'active' ORDER BY updated_at DESC",
+      .prepare<[string], { readonly id: string }>(
+        "SELECT id FROM behavior_memories WHERE player_id = ? AND slot LIKE 'owner_preference_%' AND status = 'active' ORDER BY updated_at DESC",
       )
-      .all(playerId, category);
+      .all(playerId);
     if (candidates.length > 1) {
       throw new BehaviorMemoryError(
         "Multiple open-ended behavior memories require an explicit id for correction.",
@@ -490,6 +486,7 @@ export function extractBehaviorMemory(
       normalized,
     );
   const correction = /訂正|修正|違う|前の/u.test(normalized);
+  if (isSafetyConcern(normalized)) return [];
   const known =
     stable || hasFeedbackSignal(normalized)
       ? knownPreference(normalized, stable, correction)
@@ -662,6 +659,15 @@ function hasFeedbackSignal(message: string): boolean {
   );
 }
 
+function isSafetyConcern(message: string): boolean {
+  return (
+    /安全確認|安全|保護|認証|権限|停止/iu.test(message) &&
+    /しない|なく|無い|できていない|されていない|不足|不十分|欠け|抜け|軽視|怠|無視|回避/iu.test(
+      message,
+    )
+  );
+}
+
 export function parseBehaviorMemoryCommand(
   message: string,
 ): BehaviorMemoryCommand | undefined {
@@ -773,8 +779,8 @@ function normalizeInput(
     slot === "confirmation" &&
     value === "avoid_repeated_confirmation";
   if (
-    (protectedOverride.test(value) || protectedOverride.test(summary)) &&
-    !safeKnownConfirmation
+    protectedOverride.test(summary) ||
+    (protectedOverride.test(value) && !safeKnownConfirmation)
   ) {
     throw new BehaviorMemoryError(
       "Behavior memory cannot weaken safety, authorization, or stop rules.",
