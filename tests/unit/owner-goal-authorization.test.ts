@@ -62,10 +62,29 @@ describe("owner goal authorization", () => {
     });
   });
 
-  it("does not authorize a negated collection request", () => {
+  it("keeps a specific wood alias ahead of its generic substring", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,
-      message: "オークの原木を1本集めないで",
+      message: "ダークオークの原木を2本集めて",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: ["dark_oak_log"],
+        targetItem: "dark_oak_log",
+      },
+    });
+  });
+
+  it.each([
+    "オークの原木を1本集めないで",
+    "オークの原木を1本集めるな",
+    "do not collect oak_log 2 items",
+  ])("does not authorize a negated collection request: %s", (message) => {
+    const result = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message,
     });
 
     expect(result).toMatchObject({ outcome: "clarify" });

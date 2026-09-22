@@ -177,7 +177,7 @@ const resourceGoals: readonly ResourceGoal[] = [
 const collectionIntentPattern =
   /(集め|集めたい|採掘|掘る|掘って|採取|持ってき|取ってき|作る|作って|精錬|mine|collect|gather|obtain|fetch|harvest|craft|smelt)/iu;
 const negatedCollectionIntentPattern =
-  /(?:集め|採掘|掘|採取|持ってき|取ってき|作|精錬)(?:ない|ません|ず|ないで|しないで|するな)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)(?:\s+)?(?:not|never|don't|do not|cancel)/iu;
+  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const operationWords = new Set([
   "collect_resource",
   "gather_resource",
@@ -223,9 +223,13 @@ export function deriveOwnerGoalAuthorization(
 
   const message = normalize(input.message);
   const nowMs = input.nowMs ?? Date.now();
-  const namedResource = resourceGoals.find(({ aliases }) =>
-    aliases.some((alias) => containsAlias(message, alias)),
-  );
+  const namedResource = resourceGoals
+    .flatMap((goal) => goal.aliases.map((alias) => ({ alias, goal })))
+    .filter(({ alias }) => containsAlias(message, alias))
+    .sort(
+      (left, right) =>
+        normalize(right.alias).length - normalize(left.alias).length,
+    )[0]?.goal;
   const resource = namedResource ?? canonicalResourceGoal(message);
   const unresolvedCanonicalResource =
     namedResource === undefined && resource === undefined

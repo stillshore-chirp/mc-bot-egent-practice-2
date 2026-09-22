@@ -828,6 +828,59 @@ describe("ToolExecutor", () => {
     });
   });
 
+  it("rejects goal progress without a verified inventory item", async () => {
+    const toolContext = context();
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "unidentified-output",
+        label: "対象不明の採取",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "oak_log",
+        goalItem: "oak_log",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      confirmedState: {
+        requestedCount: 1,
+        collectedCount: 1,
+      },
+      summary: "対象itemを特定できない採取結果です。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_PROGRESS_INVALID" },
+    });
+  });
+
   it("does not treat intermediate material as the requested final inventory item", async () => {
     const toolContext = context();
     toolContext.game.findSafeActionCandidates = async () => [

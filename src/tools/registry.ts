@@ -684,6 +684,7 @@ export const toolDefinitions = [
 
         const progresses = actionProgresses(successfulResults);
         const progress = latestActionProgress(successfulResults);
+        const goalItem = planned.candidate.goalItem;
         const progressByItem = new Map<string, number>();
         let invalidProgress: ActionProgress | undefined;
         for (const candidateProgress of progresses) {
@@ -694,7 +695,8 @@ export const toolDefinitions = [
             candidateProgress.requestedCount < 1 ||
             candidateProgress.requestedCount > remainingCount ||
             (expectedCount !== undefined &&
-              candidateProgress.requestedCount > expectedCount)
+              candidateProgress.requestedCount > expectedCount) ||
+            (goalItem !== undefined && candidateProgress.item === undefined)
           ) {
             invalidProgress = candidateProgress;
             break;
@@ -729,7 +731,6 @@ export const toolDefinitions = [
             "操作は完了したものの、対象または数量の結果を安全に確認できないため停止しました。",
           );
         }
-        const goalItem = planned.candidate.goalItem;
         const intermediateResults = progresses.filter(
           (candidateProgress) =>
             goalItem !== undefined &&
