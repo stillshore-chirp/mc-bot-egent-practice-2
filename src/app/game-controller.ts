@@ -597,6 +597,7 @@ export class CompanionGameController implements GameController {
             };
       },
       initial,
+      true,
     );
     return report.failureCategory === "path"
       ? {
@@ -1141,6 +1142,7 @@ export class CompanionGameController implements GameController {
       | "summary"
     >,
     capturedBefore?: WorldSnapshot,
+    allowSafetyResponse = false,
   ): Promise<ActionReport> {
     const beforeSnapshot = capturedBefore ?? (await this.#tryObserveSnapshot());
     const before =
@@ -1157,6 +1159,32 @@ export class CompanionGameController implements GameController {
         nextActions: ["新しい依頼として再度指示する"],
         summary: "停止指示済みのためMinecraft作業を開始しませんでした。",
       };
+    }
+    if (this.#tasks.current?.status === "suspended" && !allowSafetyResponse) {
+      const danger = observedCurrentDanger(beforeSnapshot);
+      if (
+        beforeSnapshot === null ||
+        !beforeSnapshot.connected ||
+        !beforeSnapshot.spawned ||
+        danger !== null
+      ) {
+        return {
+          before,
+          after: before,
+          outcome: "failed",
+          failureCategory: "safety",
+          failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+          failureRetryable: true,
+          failedAt: "precondition",
+          nextActions: ["現在の危険がなくなったことを確認してから再開する"],
+          summary:
+            beforeSnapshot === null ||
+            !beforeSnapshot.connected ||
+            !beforeSnapshot.spawned
+              ? "Botの現在の安全状態を確認できないため、作業を再開しませんでした。"
+              : `${danger} 安全を確認できないため、作業を再開しませんでした。`,
+        };
+      }
     }
 
     const timeoutSignal = AbortSignal.timeout(this.#taskTimeoutMs);
@@ -1422,7 +1450,7 @@ function suspendedTaskRecovery(
   }
   if (reason === "reflex:hostile") {
     return {
-      summary: `直前にBotの近くで敵を確認し、作業を一時停止しました。${currentDanger ?? "今回の観測では近くの敵を確認していません。"} 敵から距離を取れたら「続けて」で再開できます。`,
+      summary: `直前にBotの近くで敵を確認し、作業を一時停止しました。${currentDanger ?? (snapshot?.connected !== true ? "現在の周囲はまだ観測できていません。" : "今回の観測では近くの敵を確認していません。")} 敵から距離を取れたら「続けて」で再開できます。`,
       nextActions: [
         "敵から距離を取り周囲の安全を確認する",
         "安全になったら「続けて」で再開する",
@@ -1459,6 +1487,9 @@ function observedCurrentDanger(snapshot?: WorldSnapshot | null): string | null {
   if (snapshot === undefined || snapshot === null) return null;
   if (snapshot.inLava || snapshot.onFire || snapshot.suffocating) {
     return "今もBotの周囲に環境上の危険を観測しています。";
+  }
+  if (snapshot.velocityY <= -1.2) {
+    return "Botが今も落下しているため、移動の安全を確認できません。";
   }
   if (snapshot.inWater && snapshot.oxygenState !== "normal") {
     return "Botは水中にいて、呼吸の安全を確認できません。";

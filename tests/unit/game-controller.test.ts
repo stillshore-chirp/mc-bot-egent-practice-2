@@ -417,6 +417,25 @@ describe("CompanionGameController", () => {
     },
   );
 
+  it("still permits an explicit safety response while a prior task is suspended", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hostile");
+    await follow;
+    minecraft.snapshot = createSnapshot({ nearbyEntities: [hostile(1, 4)] });
+
+    const response = await game.respondToHostiles(
+      "evade",
+      new AbortController().signal,
+    );
+
+    expect(minecraft.actions).toContain("retreat:hostile");
+    expect(response.failureCode).not.toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    close();
+  });
+
   it("reports a currently observed threat separately from the reason a task stopped", async () => {
     const minecraft = new FakeMinecraft();
     const { game, tasks, close } = createController(minecraft);
@@ -436,6 +455,56 @@ describe("CompanionGameController", () => {
     );
     close();
   });
+
+  it.each([
+    { danger: "fire", snapshot: createSnapshot({ onFire: true }) },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+      }),
+    },
+    {
+      danger: "hostile",
+      snapshot: createSnapshot({ nearbyEntities: [hostile(1, 4)] }),
+    },
+  ])(
+    "does not start a replacement action while $danger remains",
+    async ({ snapshot }) => {
+      const minecraft = new FakeMinecraft();
+      const { game, tasks, close } = createController(minecraft);
+      const follow = game.followOwner(3, 60, new AbortController().signal);
+      await waitUntil(() => minecraft.actions.includes("follow:owner"));
+      await tasks.suspend("reflex:stuck");
+      await follow;
+      minecraft.snapshot = snapshot;
+      const actionCount = minecraft.actions.length;
+
+      const retry = await game.followOwner(3, 60, new AbortController().signal);
+      const move = await game.moveTo(
+        { x: 3, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+
+      expect(retry).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      expect(move).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      expect(tasks.current?.status).toBe("suspended");
+      expect(minecraft.actions).toHaveLength(actionCount);
+      expect(retry.summary).not.toContain("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+      close();
+    },
+  );
 
   it("reports the observed new inventory count after gathering and returning", async () => {
     const minecraft = new FakeMinecraft();
