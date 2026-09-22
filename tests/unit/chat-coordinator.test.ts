@@ -289,6 +289,74 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it("keeps a post-reinstruction runtime report concise and owner-facing", async () => {
+    const requests: {
+      message: string;
+      requestKind: ToolContext["requestKind"];
+    }[] = [];
+    const say = vi.fn(async () => undefined);
+    const deliberate = vi.fn(
+      async (request: {
+        readonly message: string;
+        readonly toolContext: ToolContext;
+      }) => {
+        requests.push({
+          message: request.message,
+          requestKind: request.toolContext.requestKind,
+        });
+        return {
+          text:
+            request.toolContext.requestKind === "runtime_reassessment"
+              ? "危険が続いています。作業状態を確認してください。"
+              : "新しい追従を開始しました。",
+          toolResults: [],
+        };
+      },
+    );
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(
+          async (
+            _username: string,
+            _message: string,
+            signal: AbortSignal,
+            _correlationId: string,
+            requestKind: ToolContext["requestKind"],
+          ) => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み作業状態: 実行中",
+            toolContext: { ...minimalToolContext, signal, requestKind },
+          }),
+        ),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "来て");
+    await coordinator.handleRuntimeEvent("safety_failed", {
+      stateKey: "safety:failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+
+    expect(requests).toEqual([
+      { message: "来て", requestKind: "owner_message" },
+      expect.objectContaining({ requestKind: "runtime_reassessment" }),
+    ]);
+    expect(requests[1]?.message).toContain("2文以内");
+    expect(requests[1]?.message).toContain("作業状態");
+    expect(requests[1]?.message).not.toContain("新規行動");
+    expect(requests[1]?.message).not.toContain("suspended");
+    expect(say).toHaveBeenNthCalledWith(1, "新しい追従を開始しました。");
+    expect(say).toHaveBeenNthCalledWith(
+      2,
+      "危険が続いています。作業状態を確認してください。",
+    );
+  });
+
   it("prioritizes a new owner question over an active automatic reassessment", async () => {
     let notifyRuntimeStarted!: () => void;
     const runtimeStarted = new Promise<void>((resolve) => {
