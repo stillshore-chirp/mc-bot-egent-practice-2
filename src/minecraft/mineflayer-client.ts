@@ -158,7 +158,7 @@ export function oxygenFromEntityMetadata(
   ) {
     return null;
   }
-  const oxygen = Math.round(airSupply.value / 15);
+  const oxygen = Math.ceil(airSupply.value / 15);
   return Number.isFinite(oxygen) && oxygen >= 0 && oxygen <= 20 ? oxygen : null;
 }
 

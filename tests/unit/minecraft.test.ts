@@ -115,6 +115,13 @@ describe("Mineflayer player observation", () => {
     ).toBeUndefined();
     expect(
       oxygenFromEntityMetadata(
+        { entityId: 1, metadata: [{ key: 4, value: 76 }] },
+        1,
+        metadataKeys,
+      ),
+    ).toBe(6);
+    expect(
+      oxygenFromEntityMetadata(
         { entityId: 1, metadata: [{ key: 4, value: 399 }] },
         1,
         metadataKeys,
