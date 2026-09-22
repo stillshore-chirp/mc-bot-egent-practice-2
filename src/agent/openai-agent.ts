@@ -17,6 +17,11 @@ import {
 
 const MAX_TOOL_ROUNDS = 8;
 
+interface PendingOwnerTurn {
+  readonly message: string;
+  userRecorded: boolean;
+}
+
 export interface DeliberationRequest {
   message: string;
   personaContext: string;
@@ -141,6 +146,7 @@ export class OpenAIDeliberationAgent {
   readonly #logger: Logger;
   readonly #traceService: TraceService | undefined;
   readonly #conversation = new ConversationContextStore();
+  readonly #pendingOwnerTurns = new Map<string, PendingOwnerTurn>();
 
   public constructor(input: {
     apiKey: string;
@@ -168,8 +174,18 @@ export class OpenAIDeliberationAgent {
       ? this.#conversation.previewUser(conversationKey, request.message)
       : conversationSnapshot;
     if (shouldRecordConversation) {
-      this.#conversation.recordUser(conversationKey, request.message);
+      this.#pendingOwnerTurns.set(conversationKey, {
+        message: request.message,
+        userRecorded: false,
+      });
     }
+    const toolContext: ToolContext = shouldRecordConversation
+      ? {
+          ...request.toolContext,
+          recordDeliveredAssistantMessage: (text) =>
+            this.#recordAssistantDelivery(conversationKey, text),
+        }
+      : request.toolContext;
     const inputItems: ResponseInputItem[] = [
       ...conversationSnapshot.turns.map((turn): ResponseInputItem => ({
         role: turn.role,
@@ -254,7 +270,7 @@ export class OpenAIDeliberationAgent {
         const result = await this.#executor.execute(
           call.name,
           call.arguments,
-          request.toolContext,
+          toolContext,
         );
         toolResults.push({ name: call.name, result });
         inputItems.push({
@@ -275,7 +291,18 @@ export class OpenAIDeliberationAgent {
     text: string,
   ): void {
     if (requestKind === "owner_message") {
-      this.#conversation.recordAssistant(requesterUsername, text);
+      this.#recordAssistantDelivery(requesterUsername, text);
+      this.#pendingOwnerTurns.delete(requesterUsername);
     }
+  }
+
+  #recordAssistantDelivery(requesterUsername: string, text: string): void {
+    const pending = this.#pendingOwnerTurns.get(requesterUsername);
+    if (pending === undefined) return;
+    if (!pending.userRecorded) {
+      this.#conversation.recordUser(requesterUsername, pending.message);
+      pending.userRecorded = true;
+    }
+    this.#conversation.recordAssistant(requesterUsername, text);
   }
 }

@@ -1,5 +1,5 @@
 import pino from "pino";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { OpenAIDeliberationAgent } from "../../src/agent/openai-agent.js";
 import type {
@@ -199,6 +199,85 @@ describe("OpenAI tool loop", () => {
     expect(thirdInput).toContain("続けて");
     expect(thirdInput).not.toContain("安全状態を再確認して");
     expect(thirdInput).not.toContain("現在の状態を確認しました。");
+  });
+
+  it("does not retain an owner request until a reply is delivered", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "送信前に中断されました。"),
+      response([], "要点だけで返します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "中断された依頼",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    await agent.deliberate({
+      message: "もっと短く",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(JSON.stringify(fake.requests[1]?.input)).not.toContain(
+      "中断された依頼",
+    );
+  });
+
+  it("records a say tool message after Minecraft chat delivery", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-say",
+          name: "say",
+          arguments: JSON.stringify({ message: "木の位置を確認しました。" }),
+          status: "completed",
+        },
+      ]),
+      response([], "送信処理を終えました。"),
+      response([], "続けます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const say = vi.fn(async () => undefined);
+    context.game.say = say;
+
+    const reply = await agent.deliberate({
+      message: "木の位置を教えて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", reply.text);
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(say).toHaveBeenCalledWith("木の位置を確認しました。");
+    expect(JSON.stringify(fake.requests[2]?.input)).toContain(
+      "木の位置を確認しました。",
+    );
   });
 
   it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {

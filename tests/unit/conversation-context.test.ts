@@ -59,4 +59,19 @@ describe("conversation context", () => {
       ),
     ).toEqual({ concise: true, avoidJargon: false });
   });
+
+  it("keeps jargon avoidance for polite negative requests", () => {
+    expect(
+      updateConversationPreferences(
+        { concise: false, avoidJargon: true },
+        "専門用語は使いません。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: true });
+    expect(
+      updateConversationPreferences(
+        { concise: false, avoidJargon: true },
+        "専門用語を使いたくないです。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: true });
+  });
 });

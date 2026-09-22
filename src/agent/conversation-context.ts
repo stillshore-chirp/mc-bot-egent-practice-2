@@ -30,14 +30,17 @@ function compactText(value: string): string {
 function mentionsAvoidJargon(message: string): boolean {
   return (
     /(専門用語|内部用語|エラーコード|コード名)/u.test(message) &&
-    /(使わない|使わず|避け|なし|やめて|出さない)/u.test(message)
+    /(使わない|使わず|使いません|使いたくない|避け|なし|やめて|出さない)/u.test(
+      message,
+    )
   );
 }
 
 function requestsJargon(message: string): boolean {
   return (
     /(専門用語|内部用語|エラーコード|コード名)/u.test(message) &&
-    /(使って|使い|含めて|詳しいコード)/u.test(message)
+    /(使って|使いましょう|含めて|詳しいコード)/u.test(message) &&
+    !mentionsAvoidJargon(message)
   );
 }
 

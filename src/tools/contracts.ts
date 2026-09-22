@@ -180,6 +180,8 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
+  /** Called only after the public say tool has delivered a message. */
+  recordDeliveredAssistantMessage?: (message: string) => void;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;

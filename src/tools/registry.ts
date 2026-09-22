@@ -94,6 +94,7 @@ export const toolDefinitions = [
     action: false,
     execute: async (input, context) => {
       await context.game.say(input.message);
+      context.recordDeliveredAssistantMessage?.(input.message);
       return {
         success: true,
         data: { delivered: true },
