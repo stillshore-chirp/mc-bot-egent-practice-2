@@ -330,7 +330,18 @@ export class CompanionGameController implements GameController {
       input.position,
       "MINING_DISTANCE_EXCEEDED",
     );
-    const itemName = minedItemName(input.name);
+    const itemName = knownBlockDrops[input.name];
+    if (itemName === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "UNSUPPORTED_BLOCK_DROP",
+        message:
+          "The requested block has no verified drop mapping, so mining was not started",
+        retryable: false,
+        failedAt: "mine_block",
+        confirmedState: { block: input.name },
+      });
+    }
     const baseline = countInventory(current, itemName);
     return this.#executeTask(
       signal,
@@ -874,10 +885,6 @@ export class CompanionGameController implements GameController {
 
 function isGatherableLog(resource: string): resource is GatherableLog {
   return (gatherableLogs as readonly string[]).includes(resource);
-}
-
-function minedItemName(blockName: string): string {
-  return knownBlockDrops[blockName] ?? blockName;
 }
 
 function mapFailureCategory(

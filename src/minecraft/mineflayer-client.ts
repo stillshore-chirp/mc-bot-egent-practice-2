@@ -29,6 +29,7 @@ import {
 import type {
   CollectItemInput,
   CraftItemInput,
+  FurnaceSlotState,
   GeneralActionCandidate,
   GeneralActionObservationInput,
   MineBlockInput,
@@ -36,8 +37,12 @@ import type {
   SmeltItemInput,
 } from "./general-actions.js";
 import {
+  craftRunsForOutput,
+  furnaceBatchReadiness,
   goalMetadataForBlock,
   goalMetadataForOutput,
+  knownBlockDrops,
+  selectBalancedActionCandidates,
 } from "./general-actions.js";
 
 import {
@@ -700,13 +705,11 @@ export class MineflayerClient implements MinecraftPort {
     const requested = new Set(input.requestedItems);
     const candidates: GeneralActionCandidate[] = [];
     const add = (candidate: Omit<GeneralActionCandidate, "order">): void => {
-      if (candidates.length < input.maxCandidates) {
-        candidates.push({ ...candidate, order: candidates.length });
-      }
+      candidates.push({ ...candidate, order: candidates.length });
     };
 
     for (const block of surrounding.blocks) {
-      if (candidates.length >= input.maxCandidates) break;
+      if (knownBlockDrops[block.name] === undefined) continue;
       const target: ResourceTarget = {
         name: block.name,
         position: block.position,
@@ -764,7 +767,6 @@ export class MineflayerClient implements MinecraftPort {
     }
     const craftingTable = findCraftingTable(bot, input.radius);
     for (const itemName of requested) {
-      if (candidates.length >= input.maxCandidates) break;
       const item = bot.registry.itemsByName[itemName];
       const recipesFor = (
         bot as unknown as {
@@ -819,7 +821,6 @@ export class MineflayerClient implements MinecraftPort {
     });
     if (placePosition !== undefined) {
       for (const [itemName, held] of inventory) {
-        if (candidates.length >= input.maxCandidates) break;
         if (held <= 0 || bot.registry.blocksByName[itemName] === undefined)
           continue;
         const position = positionOf(placePosition);
@@ -864,7 +865,6 @@ export class MineflayerClient implements MinecraftPort {
     }
 
     for (const entity of surrounding.entities) {
-      if (candidates.length >= input.maxCandidates) break;
       const itemName = droppedItemName(
         entity as unknown as Parameters<typeof droppedItemName>[0],
       );
@@ -909,7 +909,7 @@ export class MineflayerClient implements MinecraftPort {
       copper_ingot: "raw_copper",
     };
     for (const output of requested) {
-      if (candidates.length >= input.maxCandidates || furnace === null) break;
+      if (furnace === null) break;
       const inputName = smeltingRecipes[output];
       if (inputName === undefined || (inventory.get(inputName) ?? 0) < 1)
         continue;
@@ -940,7 +940,7 @@ export class MineflayerClient implements MinecraftPort {
         distance: bot.entity.position.distanceTo(furnace.position),
       });
     }
-    return candidates;
+    return selectBalancedActionCandidates(candidates, input.maxCandidates);
   }
 
   public async dig(target: ResourceTarget, signal: AbortSignal): Promise<void> {
@@ -1217,8 +1217,18 @@ export class MineflayerClient implements MinecraftPort {
         failedAt: "craft_item",
       });
     }
+    const runCount = craftRunsForOutput(target.count, recipe.result?.count);
+    if (runCount === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "CRAFT_OUTPUT_UNKNOWN",
+        message: "The observed recipe does not expose a safe output count",
+        retryable: false,
+        failedAt: "craft_item",
+      });
+    }
     const before = await this.observe();
-    await craft.call(bot, recipe, target.count, craftingTable);
+    await craft.call(bot, recipe, runCount, craftingTable);
     throwIfAborted(signal, "craft_item");
     const after = await this.observe();
     const beforeCount =
@@ -1396,7 +1406,18 @@ export class MineflayerClient implements MinecraftPort {
         ): Promise<void>;
         takeOutput(): Promise<void>;
         close(): void;
-        outputItem?: () => unknown;
+        inputItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
+        fuelItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
+        outputItem?: () => {
+          readonly name: string;
+          readonly count: number;
+        } | null;
       }>;
     };
     const inputItem = bot.registry.itemsByName[target.input];
@@ -1418,8 +1439,53 @@ export class MineflayerClient implements MinecraftPort {
     const before = await this.observe();
     const furnace = await typedBot.openFurnace(furnaceBlock);
     try {
+      const initialSlots = furnaceBatchReadiness({
+        input: readFurnaceSlot(furnace.inputItem?.bind(furnace)),
+        fuel: readFurnaceSlot(furnace.fuelItem?.bind(furnace)),
+        output: readFurnaceSlot(furnace.outputItem?.bind(furnace)),
+      });
+      if (!initialSlots.allowed) {
+        throw new AppError({
+          category: "safety",
+          code:
+            initialSlots.reason === "occupied"
+              ? "SMELT_FURNACE_NOT_EMPTY"
+              : "SMELT_FURNACE_STATE_UNKNOWN",
+          message:
+            initialSlots.reason === "occupied"
+              ? "The observed furnace contains an unrelated batch"
+              : "The furnace slots could not be verified before smelting",
+          retryable: initialSlots.reason === "unknown",
+          failedAt: "smelt_item",
+          confirmedState: {
+            slot: initialSlots.slot,
+            item: initialSlots.itemName ?? null,
+          },
+        });
+      }
       await furnace.putInput(inputItem.id, null, target.count);
       await furnace.putFuel(fuelItem.id, null, target.count);
+      const boundInput = readFurnaceSlot(furnace.inputItem?.bind(furnace));
+      const boundFuel = readFurnaceSlot(furnace.fuelItem?.bind(furnace));
+      if (
+        !boundInput.known ||
+        boundInput.itemName !== target.input ||
+        !boundFuel.known ||
+        boundFuel.itemName !== fuelItem.name
+      ) {
+        throw new AppError({
+          category: "safety",
+          code: "SMELT_BATCH_NOT_BOUND",
+          message: "The furnace did not confirm the bot-owned input batch",
+          retryable: true,
+          failedAt: "smelt_item",
+          confirmedState: {
+            input: boundInput.itemName ?? null,
+            fuel: boundFuel.itemName ?? null,
+          },
+        });
+      }
+      const boundInputCount = boundInput.count ?? target.count;
       const deadline = Date.now() + this.options.collectTimeoutMs;
       while (Date.now() < deadline) {
         throwIfAborted(signal, "smelt_item");
@@ -1432,7 +1498,44 @@ export class MineflayerClient implements MinecraftPort {
           before.inventory.find((entry) => entry.name === target.output)
             ?.count ?? 0;
         if (count - baseline >= target.count) return count - baseline;
-        if (furnace.outputItem?.() != null) {
+        const outputSlot = readFurnaceSlot(furnace.outputItem?.bind(furnace));
+        if (!outputSlot.known) {
+          throw new AppError({
+            category: "safety",
+            code: "SMELT_FURNACE_STATE_UNKNOWN",
+            message: "The furnace output slot could not be verified",
+            retryable: true,
+            failedAt: "smelt_item",
+          });
+        }
+        if (outputSlot.itemName !== undefined && (outputSlot.count ?? 1) > 0) {
+          if (outputSlot.itemName !== target.output) {
+            throw new AppError({
+              category: "safety",
+              code: "SMELT_OUTPUT_UNEXPECTED",
+              message: "The furnace produced an output outside this batch",
+              retryable: false,
+              failedAt: "smelt_item",
+              confirmedState: { output: outputSlot.itemName },
+            });
+          }
+          const currentInput = readFurnaceSlot(
+            furnace.inputItem?.bind(furnace),
+          );
+          if (
+            !currentInput.known ||
+            (currentInput.itemName === target.input &&
+              (currentInput.count ?? 0) >= boundInputCount)
+          ) {
+            throw new AppError({
+              category: "safety",
+              code: "SMELT_OUTPUT_NOT_BOUND",
+              message:
+                "The furnace output was not linked to consumed batch input",
+              retryable: true,
+              failedAt: "smelt_item",
+            });
+          }
           await furnace.takeOutput();
         }
       }
@@ -1682,6 +1785,28 @@ function findCraftingTable(bot: Bot, maxDistance: number): unknown {
   const tableId = bot.registry.blocksByName.crafting_table?.id;
   if (tableId === undefined) return null;
   return bot.findBlock({ matching: tableId, maxDistance, count: 1 });
+}
+
+function readFurnaceSlot(
+  reader:
+    | (() => { readonly name: string; readonly count: number } | null)
+    | undefined,
+): FurnaceSlotState {
+  if (reader === undefined) return { known: false };
+  try {
+    const item = reader();
+    if (item === null) return { known: true };
+    if (
+      typeof item.name !== "string" ||
+      !Number.isFinite(item.count) ||
+      item.count < 0
+    ) {
+      return { known: false };
+    }
+    return { known: true, itemName: item.name, count: item.count };
+  } catch {
+    return { known: false };
+  }
 }
 
 function droppedItemName(entity: {

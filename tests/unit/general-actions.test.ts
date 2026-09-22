@@ -13,6 +13,12 @@ import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { createSnapshot, FakeMinecraft } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
+import {
+  craftRunsForOutput,
+  furnaceBatchReadiness,
+  selectBalancedActionCandidates,
+  type GeneralActionCandidate,
+} from "../../src/minecraft/general-actions.js";
 
 function controller(minecraft: FakeMinecraft) {
   const directory = mkdtempSync(join(tmpdir(), "mc-general-actions-"));
@@ -54,6 +60,79 @@ function controller(minecraft: FakeMinecraft) {
 }
 
 describe("general safe actions", () => {
+  it("reserves bounded observation slots across action classes", () => {
+    const candidate = (
+      action: GeneralActionCandidate["action"],
+      purposeFit: GeneralActionCandidate["purposeFit"],
+      order: number,
+    ): GeneralActionCandidate => ({
+      id: `${action}:${order}`,
+      label: action,
+      action,
+      args: {},
+      steps: [],
+      observed: true,
+      purposeFit,
+      permission: "allowed",
+      safety: "allowed",
+      reversible: false,
+      impact: "low",
+      distance: 1,
+      order,
+    });
+    const selected = selectBalancedActionCandidates(
+      [
+        candidate("mine_block", "unknown", 0),
+        candidate("mine_block", "unknown", 1),
+        candidate("mine_block", "unknown", 2),
+        candidate("craft_item", "direct", 3),
+        candidate("place_block", "unknown", 4),
+        candidate("smelt_item", "direct", 5),
+      ],
+      3,
+    );
+    expect(selected.map(({ action }) => action)).toEqual([
+      "craft_item",
+      "smelt_item",
+      "mine_block",
+    ]);
+    expect(selected.map(({ order }) => order)).toEqual([0, 1, 2]);
+  });
+
+  it("derives craft runs from the recipe output count", () => {
+    expect(craftRunsForOutput(4, 4)).toBe(1);
+    expect(craftRunsForOutput(5, 4)).toBe(2);
+    expect(craftRunsForOutput(1, undefined)).toBeUndefined();
+  });
+
+  it("requires a fully observed empty furnace before starting a batch", () => {
+    expect(
+      furnaceBatchReadiness({
+        input: { known: true },
+        fuel: { known: true },
+        output: { known: true },
+      }),
+    ).toEqual({ allowed: true });
+    expect(
+      furnaceBatchReadiness({
+        input: { known: true },
+        fuel: { known: true },
+        output: { known: true, itemName: "iron_ingot", count: 1 },
+      }),
+    ).toMatchObject({
+      allowed: false,
+      reason: "occupied",
+      slot: "output",
+    });
+    expect(
+      furnaceBatchReadiness({
+        input: { known: false },
+        fuel: { known: true },
+        output: { known: true },
+      }),
+    ).toMatchObject({ allowed: false, reason: "unknown", slot: "input" });
+  });
+
   it("returns observed candidates and preserves a denied server decision", async () => {
     const minecraft = new FakeMinecraft();
     const resource = { name: "iron_ore", position: { x: 2, y: 63, z: 0 } };
@@ -153,6 +232,29 @@ describe("general safe actions", () => {
         collectedCount: 1,
       },
     });
+    close();
+  });
+
+  it("refuses to mine a block whose drop is not verified", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "grass_block",
+      position: { x: 2, y: 63, z: 0 },
+    });
+    const { game, close } = controller(minecraft);
+    await expect(
+      game.observeActionCandidates(
+        { radius: 8, requestedItems: ["grass_block"], maxCandidates: 8 },
+        new AbortController().signal,
+      ),
+    ).resolves.toEqual([]);
+    await expect(
+      game.mineBlock(
+        { name: "grass_block", position: { x: 2, y: 63, z: 0 } },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ detail: { code: "UNSUPPORTED_BLOCK_DROP" } });
+    expect(minecraft.actions).toEqual([]);
     close();
   });
 

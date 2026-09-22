@@ -23,7 +23,10 @@ import type {
   PlaceBlockInput,
   SmeltItemInput,
 } from "../../src/minecraft/general-actions.js";
-import { goalMetadataForBlock } from "../../src/minecraft/general-actions.js";
+import {
+  goalMetadataForBlock,
+  knownBlockDrops,
+} from "../../src/minecraft/general-actions.js";
 
 const now = (): string => new Date().toISOString();
 
@@ -266,6 +269,7 @@ export class FakeMinecraft implements MinecraftPort {
     signal.throwIfAborted();
     const candidates: GeneralActionCandidate[] = [];
     for (const resource of this.resources.slice(0, input.maxCandidates)) {
+      if (knownBlockDrops[resource.name] === undefined) continue;
       const key = `${resource.name}:${resource.position.x}:${resource.position.y}:${resource.position.z}`;
       const permission = this.actionGuardDecisions.get(key) ?? "allowed";
       const goalMetadata = goalMetadataForBlock(

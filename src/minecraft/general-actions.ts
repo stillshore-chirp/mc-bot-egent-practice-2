@@ -50,6 +50,115 @@ export interface GeneralActionCandidate {
   readonly order: number;
 }
 
+const purposeFitRank: Readonly<
+  Record<GeneralActionCandidate["purposeFit"], number>
+> = {
+  direct: 0,
+  compatible: 1,
+  unknown: 2,
+};
+
+/**
+ * Keep observation bounded while reserving a slot for each observed action
+ * class. A nearby solid block must not hide every other safe operation just
+ * because it was enumerated first by the world observer.
+ */
+export function selectBalancedActionCandidates(
+  candidates: readonly GeneralActionCandidate[],
+  maxCandidates: number,
+): readonly GeneralActionCandidate[] {
+  const limit = Math.max(0, Math.floor(maxCandidates));
+  if (limit === 0) return [];
+
+  const groups = new Map<GeneralActionName, GeneralActionCandidate[]>();
+  for (const candidate of candidates) {
+    const group = groups.get(candidate.action) ?? [];
+    group.push(candidate);
+    groups.set(candidate.action, group);
+  }
+
+  const orderedGroups = [...groups.values()].sort((left, right) => {
+    const leftRank = purposeFitRank[left[0]?.purposeFit ?? "unknown"];
+    const rightRank = purposeFitRank[right[0]?.purposeFit ?? "unknown"];
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    return (left[0]?.order ?? 0) - (right[0]?.order ?? 0);
+  });
+  const offsets = orderedGroups.map(() => 0);
+  const selected: GeneralActionCandidate[] = [];
+  while (selected.length < limit) {
+    let selectedFromRound = false;
+    for (let index = 0; index < orderedGroups.length; index += 1) {
+      const group = orderedGroups[index];
+      const offset = offsets[index] ?? 0;
+      const candidate = group?.[offset];
+      if (candidate === undefined) continue;
+      selected.push({ ...candidate, order: selected.length });
+      offsets[index] = offset + 1;
+      selectedFromRound = true;
+      if (selected.length >= limit) break;
+    }
+    if (!selectedFromRound) break;
+  }
+  return selected;
+}
+
+/** Return the recipe execution count needed to meet an item-count request. */
+export function craftRunsForOutput(
+  requestedCount: number,
+  outputCount: number | undefined,
+): number | undefined {
+  if (
+    !Number.isSafeInteger(requestedCount) ||
+    requestedCount <= 0 ||
+    outputCount === undefined ||
+    !Number.isSafeInteger(outputCount) ||
+    outputCount <= 0
+  ) {
+    return undefined;
+  }
+  return Math.ceil(requestedCount / outputCount);
+}
+
+export interface FurnaceSlotState {
+  readonly known: boolean;
+  readonly itemName?: string;
+  readonly count?: number;
+}
+
+export type FurnaceBatchReadiness =
+  | { readonly allowed: true }
+  | {
+      readonly allowed: false;
+      readonly reason: "unknown" | "occupied";
+      readonly slot: "input" | "fuel" | "output";
+      readonly itemName?: string;
+    };
+
+/** A batch may start only after all furnace slots are authoritatively empty. */
+export function furnaceBatchReadiness(slots: {
+  readonly input: FurnaceSlotState;
+  readonly fuel: FurnaceSlotState;
+  readonly output: FurnaceSlotState;
+}): FurnaceBatchReadiness {
+  for (const [slot, state] of Object.entries(slots) as readonly [
+    "input" | "fuel" | "output",
+    FurnaceSlotState,
+  ][]) {
+    if (!state.known) {
+      return { allowed: false, reason: "unknown", slot };
+    }
+    if (state.itemName !== undefined && (state.count ?? 1) > 0) {
+      return {
+        allowed: false,
+        reason: "occupied",
+        slot,
+        itemName: state.itemName,
+      };
+    }
+  }
+  return { allowed: true };
+}
+
 export interface ActionGoalMetadata {
   readonly goalItem?: string;
   readonly intermediateItems?: readonly string[];
