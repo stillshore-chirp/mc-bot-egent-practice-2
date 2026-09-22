@@ -62,6 +62,26 @@ describe("owner goal authorization", () => {
     });
   });
 
+  it("authorizes a bounded generic log goal while requiring observed selection", () => {
+    const result = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "近くの原木を2本集めて、種類は任せる",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        targetItem: "*",
+        targetCount: 2,
+        selectionRequired: true,
+      },
+    });
+    if (result.outcome === "authorized") {
+      expect(result.authorization.allowedResources).toContain("birch_log");
+      expect(result.authorization.allowedResources).toContain("oak_log");
+    }
+  });
+
   it("keeps a specific wood alias ahead of its generic substring", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,

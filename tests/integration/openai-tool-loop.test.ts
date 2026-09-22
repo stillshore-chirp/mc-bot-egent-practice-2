@@ -263,6 +263,44 @@ describe("OpenAI tool loop", () => {
         "近くで安全を確認できたシラカバの原木を1個集めました。",
       ),
     ]);
+    const context = toolContext();
+    context.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "原木を1個集めて、種類は任せる",
+      allowedResources: [
+        "oak_log",
+        "spruce_log",
+        "birch_log",
+        "jungle_log",
+        "acacia_log",
+        "dark_oak_log",
+        "mangrove_log",
+        "cherry_log",
+        "pale_oak_log",
+        "crimson_stem",
+        "warped_stem",
+      ],
+      targetItem: "*",
+      targetCount: 1,
+      maxCount: 16,
+      selectionRequired: true,
+    };
+    context.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    context.game.gatherResource = async (resource, count) => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      confirmedState: {
+        resource,
+        requestedCount: count,
+        collectedCount: count,
+        heldCount: count,
+      },
+      summary: "シラカバを収集しました。",
+    });
     const agent = new OpenAIDeliberationAgent({
       apiKey: "test-only",
       model: "test-model",
@@ -275,7 +313,7 @@ describe("OpenAI tool loop", () => {
       personaContext: "テスト人格",
       memoryContext: "なし",
       worldContext: JSON.stringify(status),
-      toolContext: toolContext(),
+      toolContext: context,
     });
 
     expect(reply.text).toContain("安全条件を確認できた");

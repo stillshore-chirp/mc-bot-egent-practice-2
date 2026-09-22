@@ -154,6 +154,23 @@ describe("CompanionContextFactory owner action boundary", () => {
     expect(second.toolContext.safeActionClarification).toBeUndefined();
   });
 
+  it("passes a generic log goal to the observed selector with a bounded owner authorization", async () => {
+    const result = await factory().create(
+      "owner",
+      "近くの原木を2本集めて、種類は任せる",
+      new AbortController().signal,
+      "correlation-generic-log",
+      "owner_message",
+    );
+
+    expect(result.toolContext.safeActionAuthorization).toMatchObject({
+      targetItem: "*",
+      targetCount: 2,
+      selectionRequired: true,
+    });
+    expect(result.toolContext.safeActionClarification).toBeUndefined();
+  });
+
   it("preserves pending owner goals across runtime reassessment but clears on stop", async () => {
     const contextFactory = factory();
     await contextFactory.create(

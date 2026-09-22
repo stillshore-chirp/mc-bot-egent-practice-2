@@ -947,6 +947,35 @@ export const toolDefinitions = [
           },
         };
       }
+      const authorization = context.safeActionAuthorization;
+      if (
+        authorization?.kind === "owner_bounded_resource" &&
+        authorization.selectionRequired === true
+      ) {
+        const usage = context.safeActionAuthorizationUsage;
+        if (
+          usage === undefined ||
+          usage.consumed ||
+          input.count > usage.remainingCount ||
+          !authorization.allowedResources.includes(decision.candidate.id)
+        ) {
+          return safeActionFailure(
+            "authorization",
+            "SAFE_ACTION_AUTHORIZATION_INVALID",
+            false,
+            "choose_safe_resource",
+            { selectedResource: decision.candidate.id },
+            ["所有者の対象と数量を確認してから再依頼する"],
+            "選択した原木が所有者の認可範囲に含まれないため、採取を開始しませんでした。",
+          );
+        }
+        context.safeActionAuthorization = {
+          ...authorization,
+          allowedResources: [decision.candidate.id],
+          targetItem: decision.candidate.id,
+          selectionRequired: false,
+        };
+      }
       return {
         success: true,
         data: {
@@ -1102,6 +1131,7 @@ export const toolDefinitions = [
       invalid: [{ resource: "stone", count: 4, commitmentId: null }],
     },
     action: true,
+    authorization: "owner_bounded_resource",
     execute: async (input, context) => {
       if (input.count > context.limits.maxGatherCount) {
         return {

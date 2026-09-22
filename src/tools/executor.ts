@@ -83,7 +83,10 @@ export class ToolExecutor {
     const executionContext: ToolContext = {
       ...context,
       executeSafeActionStep: (step, stepContext) =>
-        this.execute(step.tool, JSON.stringify(step.input), stepContext),
+        this.execute(step.tool, JSON.stringify(step.input), {
+          ...stepContext,
+          safeActionStepExecution: true,
+        }),
     };
     const definition = getToolDefinition(name);
     const traceName =
@@ -172,6 +175,19 @@ export class ToolExecutor {
       );
     }
 
+    if (
+      definition.authorization !== undefined &&
+      !context.safeActionStepExecution &&
+      !isStaticGatherLimitFailure(name, parsed.data, context) &&
+      !isDirectActionAuthorized(definition.authorization, parsed.data, context)
+    ) {
+      return failure(
+        "SAFE_ACTION_AUTHORIZATION_INVALID",
+        "authorization",
+        "この操作の対象と数量を所有者の認可範囲で確認できないため、開始しませんでした。",
+      );
+    }
+
     try {
       const stage = memoryReadTools.has(name)
         ? "memory_read"
@@ -182,6 +198,20 @@ export class ToolExecutor {
             : undefined;
       const executeAction = async (): Promise<ToolResult<unknown>> => {
         const actionResult = await definition.execute(parsed.data, context);
+        if (
+          name === "gather_resource" &&
+          !context.safeActionStepExecution &&
+          context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
+          actionResult.success &&
+          actionResult.progress === undefined
+        ) {
+          return failure(
+            "SAFE_ACTION_PROGRESS_UNCONFIRMED",
+            "observation",
+            "採取結果の所持品差分を確認できないため、完了として扱いませんでした。",
+            true,
+          );
+        }
         if (
           actionResult.success ||
           (Object.prototype.hasOwnProperty.call(
@@ -330,23 +360,148 @@ function consumeSafeActionAuthorization(
   context: ToolContext,
 ): void {
   if (
-    toolName !== "plan_safe_action" ||
+    (toolName !== "plan_safe_action" && toolName !== "gather_resource") ||
+    (toolName === "gather_resource" && context.safeActionStepExecution) ||
     context.safeActionAuthorization?.kind !== "owner_bounded_resource" ||
     context.safeActionAuthorizationUsage === undefined
   ) {
     return;
   }
   const completedCount =
-    result.success && isRecord(result.data)
-      ? integerField(result.data.completedCount)
-      : !result.success
-        ? integerField(result.error.confirmedState.completedCount)
-        : undefined;
+    result.success && result.progress !== undefined
+      ? result.progress.completedCount
+      : result.success && isRecord(result.data)
+        ? integerField(result.data.completedCount)
+        : !result.success
+          ? integerField(result.error.confirmedState.completedCount)
+          : undefined;
   if (completedCount === undefined || completedCount < 0) return;
   const remaining = context.safeActionAuthorizationUsage.remainingCount;
   if (completedCount > remaining) return;
   context.safeActionAuthorizationUsage.remainingCount =
     remaining - completedCount;
+}
+
+function isDirectActionAuthorized(
+  kind: "owner_bounded_resource" | "owner_scoped_change",
+  input: unknown,
+  context: ToolContext,
+): boolean {
+  const resource =
+    kind === "owner_bounded_resource"
+      ? firstStringField(input, [
+          "resource",
+          "resourceName",
+          "block",
+          "blockName",
+          "item",
+          "itemName",
+          "targetItem",
+        ])
+      : undefined;
+  const count =
+    kind === "owner_bounded_resource"
+      ? firstPositiveIntegerField(input, [
+          "count",
+          "requestedCount",
+          "targetCount",
+          "quantity",
+        ])
+      : undefined;
+  if (
+    kind === "owner_bounded_resource" &&
+    isBoundCommitmentGather(input, resource, count, context)
+  ) {
+    return true;
+  }
+  const authorization = context.safeActionAuthorization;
+  const usage = context.safeActionAuthorizationUsage;
+  if (usage === undefined || usage.consumed || authorization === undefined) {
+    return false;
+  }
+  if (kind === "owner_bounded_resource") {
+    if (authorization.kind !== "owner_bounded_resource") return false;
+    if (authorization.selectionRequired === true) return false;
+    return (
+      resource !== undefined &&
+      authorization.allowedResources.includes(resource) &&
+      count !== undefined &&
+      count <= usage.remainingCount &&
+      count <= authorization.targetCount &&
+      count <= authorization.maxCount
+    );
+  }
+  if (authorization.kind !== "owner_scoped_change") return false;
+  return (
+    firstStringField(input, ["scopeId", "areaId"]) === authorization.scopeId
+  );
+}
+
+function isStaticGatherLimitFailure(
+  toolName: string,
+  input: unknown,
+  context: ToolContext,
+): boolean {
+  return (
+    toolName === "gather_resource" &&
+    isRecord(input) &&
+    typeof input.count === "number" &&
+    input.count > context.limits.maxGatherCount
+  );
+}
+
+function isBoundCommitmentGather(
+  input: unknown,
+  resource: string | undefined,
+  count: number | undefined,
+  context: ToolContext,
+): boolean {
+  if (!isRecord(input) || typeof input.commitmentId !== "string") return false;
+  if (resource === undefined || count === undefined) return false;
+  if (
+    context.executionEvidence.verifiedActionReceipts.some(
+      (receipt) => receipt.commitmentId === input.commitmentId && !receipt.used,
+    )
+  ) {
+    return false;
+  }
+  const commitment = context.memory.getCommitment({
+    playerId: context.playerId,
+    commitmentId: input.commitmentId,
+  });
+  return (
+    commitment?.status === "active" &&
+    commitment.fulfillment?.toolName === "gather_resource" &&
+    commitment.fulfillment.resource === resource &&
+    commitment.fulfillment.count === count
+  );
+}
+
+function firstStringField(
+  input: unknown,
+  keys: readonly string[],
+): string | undefined {
+  if (!isRecord(input)) return undefined;
+  for (const key of keys) {
+    if (typeof input[key] === "string" && input[key].length > 0) {
+      return input[key];
+    }
+  }
+  return undefined;
+}
+
+function firstPositiveIntegerField(
+  input: unknown,
+  keys: readonly string[],
+): number | undefined {
+  if (!isRecord(input)) return undefined;
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

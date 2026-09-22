@@ -25,6 +25,8 @@ export type SafeChoiceAuthorization =
       readonly allowedResources: readonly string[];
       /** Canonical inventory item the owner asked to obtain. */
       readonly targetItem: string;
+      /** `*` permits one observed item from the bounded allowed resource set. */
+      readonly selectionRequired?: boolean;
       /** Exact quantity extracted from the owner message. */
       readonly targetCount: number;
       readonly maxCount: number;
@@ -177,7 +179,7 @@ function isEligible(
     trustedAuthorization.allowedResources.length > 0 &&
     candidate.resourceName !== undefined &&
     trustedAuthorization.allowedResources.includes(candidate.resourceName) &&
-    candidate.goalItem === trustedAuthorization.targetItem &&
+    matchesAuthorizedGoalItem(candidate, trustedAuthorization) &&
     candidate.operationClass === "natural_resource" &&
     candidate.impact === "medium" &&
     Number.isInteger(trustedAuthorization.targetCount) &&
@@ -196,6 +198,22 @@ function isEligible(
     candidate.operationClass === "world_change" &&
     candidate.scopeId === trustedAuthorization.scopeId &&
     impactRank(candidate.impact) <= impactRank(trustedAuthorization.maxImpact)
+  );
+}
+
+function matchesAuthorizedGoalItem(
+  candidate: SafeChoiceCandidate,
+  authorization: Extract<
+    SafeChoiceAuthorization,
+    { kind: "owner_bounded_resource" }
+  >,
+): boolean {
+  if (authorization.targetItem !== "*") {
+    return candidate.goalItem === authorization.targetItem;
+  }
+  return (
+    candidate.goalItem !== undefined &&
+    authorization.allowedResources.includes(candidate.goalItem)
   );
 }
 

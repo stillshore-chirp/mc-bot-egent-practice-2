@@ -130,7 +130,17 @@ function isAuthorizedBound(
   )
     return false;
   if (!stepsMatchResource(candidate, candidate.resourceName)) return false;
-  if (candidate.goalItem !== authorization.targetItem) return false;
+  if (
+    authorization.targetItem !== "*" &&
+    candidate.goalItem !== authorization.targetItem
+  )
+    return false;
+  if (
+    authorization.targetItem === "*" &&
+    (candidate.goalItem === undefined ||
+      !authorization.allowedResources.includes(candidate.goalItem))
+  )
+    return false;
   if (
     !Number.isInteger(authorization.targetCount) ||
     authorization.targetCount < 1 ||

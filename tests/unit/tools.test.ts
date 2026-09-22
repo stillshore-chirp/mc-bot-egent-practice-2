@@ -1152,6 +1152,78 @@ describe("ToolExecutor", () => {
       expect(result.error.code).toBe("GATHER_COUNT_EXCEEDED");
   });
 
+  it("binds a direct gather to the trusted resource and remaining quantity", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を1本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let gatherCalls = 0;
+    toolContext.game.gatherResource = async (resource, count) => {
+      gatherCalls += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource,
+          requestedCount: count,
+          collectedCount: count,
+        },
+        summary: "原木を収集しました。",
+      };
+    };
+
+    const wrongResource = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "spruce_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+    const wrongCount = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 2, commitmentId: null }),
+      toolContext,
+    );
+    expect(wrongResource).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(wrongCount).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(gatherCalls).toBe(0);
+
+    const first = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+    const replay = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+    expect(first).toMatchObject({ success: true });
+    expect(replay).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(toolContext.safeActionAuthorizationUsage).toEqual({
+      remainingCount: 0,
+      consumed: false,
+    });
+    expect(gatherCalls).toBe(1);
+  });
+
   it("selects the nearest observed and protection-checked resource without asking again", async () => {
     const toolContext = context();
     const result = await new ToolExecutor().execute(
@@ -1337,7 +1409,7 @@ describe("ToolExecutor", () => {
     });
   });
 
-  it("does not issue a receipt for an unbound action or stop", async () => {
+  it("rejects an unbound gather while still allowing an explicit stop", async () => {
     const toolContext = context();
     const unbound = await new ToolExecutor().execute(
       "gather_resource",
@@ -1354,7 +1426,10 @@ describe("ToolExecutor", () => {
       toolContext,
     );
 
-    expect(unbound.success && unbound.verificationReceipt).toBeUndefined();
+    expect(unbound).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
     expect(stopped.success).toBe(true);
     expect(toolContext.executionEvidence.verifiedActionReceipts).toEqual([]);
   });
@@ -1371,8 +1446,10 @@ describe("ToolExecutor", () => {
       toolContext,
     );
 
-    expect(unrelated.success).toBe(true);
-    expect(unrelated.success && unrelated.verificationReceipt).toBeUndefined();
+    expect(unrelated).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
     expect(toolContext.executionEvidence.verifiedActionReceipts).toEqual([]);
   });
 });

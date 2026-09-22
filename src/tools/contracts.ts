@@ -272,6 +272,8 @@ export interface ToolContext {
     remainingCount: number;
     consumed: boolean;
   };
+  /** Internal marker set only while the deterministic plan executor runs a step. */
+  safeActionStepExecution?: boolean;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;

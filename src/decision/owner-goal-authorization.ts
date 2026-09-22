@@ -47,6 +47,24 @@ interface ResourceGoal {
 
 const resourceGoals: readonly ResourceGoal[] = [
   {
+    label: "原木",
+    aliases: ["原木", "木材", "log", "logs", "wood"],
+    allowedResources: [
+      "oak_log",
+      "spruce_log",
+      "birch_log",
+      "jungle_log",
+      "acacia_log",
+      "dark_oak_log",
+      "mangrove_log",
+      "cherry_log",
+      "pale_oak_log",
+      "crimson_stem",
+      "warped_stem",
+    ],
+    targetItem: "*",
+  },
+  {
     label: "鉄インゴット",
     aliases: ["鉄インゴット", "iron ingot", "iron_ingot"],
     allowedResources: ["iron_ore", "deepslate_iron_ore"],
@@ -336,6 +354,7 @@ export function deriveOwnerGoalAuthorization(
       targetItem: resource.targetItem,
       targetCount: count,
       maxCount: input.maxCount,
+      ...(resource.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
 }
@@ -367,6 +386,7 @@ function authorizePendingGoal(
       targetItem: pendingGoal.targetItem,
       targetCount: count,
       maxCount,
+      ...(pendingGoal.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
 }
