@@ -56,10 +56,8 @@ function splitInlineStopClause(clause: string): string[] {
     if (
       rest.length > 0 &&
       isStopClause(stop) &&
-      !(
-        /ほしい(?:です)?$/u.test(match[0]) &&
-        /^(?:理由|意味|気持ち|わけ|とは|という|のか|かどうか)/u.test(rest)
-      ) &&
+      (!/ほしい(?:です)?(?:ね|よ)?$/u.test(match[0]) ||
+        /^(?:今すぐ|すぐに?|直ちに|ただちに)$/u.test(rest)) &&
       !/(?:ない|ません|ではない|じゃない|不要|しまった|かどうか|^い(?:る|た|ました)|^みた|^もら|^くれた|^くれて|^いい|^よい|^良い|^と|^って|^は)/u.test(
         rest,
       )
@@ -94,9 +92,7 @@ function isSafeReadOnlyFollowUp(message: string): boolean {
     /(?:短く|簡潔に|詳しく|専門用語).*(?:話して|説明して|答えて|使わないで)(?:ください|下さい)?[。！!]?$/u.test(
       message,
     ) ||
-    /^(?:今|現在|いま|なぜ|どうして|状態|状況|進捗|何してる|何をしてる)/u.test(
-      message,
-    )
+    /^(?:なぜ|どうして)[?？]?$/u.test(message)
   );
 }
 
@@ -344,6 +340,7 @@ export class ChatCoordinator {
   readonly #immediateStopListeners = new Set<() => void>();
   readonly #ownerMessageListeners = new Set<() => void>();
   readonly #readOnlyStatusQuestions = new Set<Promise<void>>();
+  readonly #readOnlyStatusDeliveries = new Set<Promise<boolean>>();
   #activeController: AbortController | undefined;
   #activeRequestKind: ToolContext["requestKind"] | undefined;
   #stopTail: Promise<void> = Promise.resolve();
@@ -415,6 +412,9 @@ export class ChatCoordinator {
                 );
               }
             }
+            // Any status reply already being sent must finish before the
+            // stop result. Pending observations are invalidated by generation.
+            await Promise.allSettled([...this.#readOnlyStatusDeliveries]);
             await safeWithTraceSpan(
               this.#traceService,
               "response",
@@ -461,6 +461,7 @@ export class ChatCoordinator {
     }
 
     if (isReadOnlyStatusQuestion(normalized)) {
+      const questionGeneration = this.#generation;
       let prefetchedStatus: GameStatus | undefined;
       if (normalized === "なぜ") {
         try {
@@ -469,6 +470,7 @@ export class ChatCoordinator {
           // Without a confirmed live task, let the normal conversation path
           // use the prior explanation instead of inventing a current reason.
         }
+        if (questionGeneration !== this.#generation) return true;
         const activeTask =
           prefetchedStatus?.activeTaskSummary?.trim() ??
           prefetchedStatus?.activeTaskState?.trim();
@@ -480,6 +482,7 @@ export class ChatCoordinator {
         const statusQuestion = this.#answerReadOnlyStatusQuestion(
           username,
           normalized,
+          questionGeneration,
           prefetchedStatus,
         );
         this.#readOnlyStatusQuestions.add(statusQuestion);
@@ -602,6 +605,7 @@ export class ChatCoordinator {
   async #answerReadOnlyStatusQuestion(
     username: string,
     message: string,
+    questionGeneration: number,
     prefetchedStatus?: GameStatus,
   ): Promise<void> {
     const recorder = this.#agent as unknown as DeliveredReplyRecorder;
@@ -611,7 +615,8 @@ export class ChatCoordinator {
       "owner_message",
       { responseMode: "read_only_status" },
     );
-    const process = async (): Promise<void> => {
+    const process = async (): Promise<boolean> => {
+      if (questionGeneration !== this.#generation) return false;
       let status: GameStatus | undefined = prefetchedStatus;
       if (status === undefined) {
         try {
@@ -631,11 +636,12 @@ export class ChatCoordinator {
           // observation is temporarily unavailable.
         }
       }
+      if (questionGeneration !== this.#generation) return false;
       const reply =
         status === undefined
           ? "現在のMinecraft状態を確認できません。再観測が必要です。"
           : renderReadOnlyStatus(status);
-      await safeWithTraceSpan(
+      const delivery = safeWithTraceSpan(
         this.#traceService,
         "response",
         "状態質問への応答",
@@ -644,14 +650,33 @@ export class ChatCoordinator {
           resultKind: "final_response",
           summarizeResult: () => "確認済み状態を送信",
         },
-        () => this.#game.say(reply),
+        async () => {
+          if (questionGeneration !== this.#generation) return false;
+          await this.#game.say(reply);
+          return true;
+        },
       );
-      recorder.recordDeliveredOwnerExchange?.(username, message, reply);
+      this.#readOnlyStatusDeliveries.add(delivery);
+      try {
+        const delivered = await delivery;
+        if (delivered && questionGeneration === this.#generation) {
+          recorder.recordDeliveredOwnerExchange?.(username, message, reply);
+        }
+        return delivered;
+      } finally {
+        this.#readOnlyStatusDeliveries.delete(delivery);
+      }
     };
     try {
-      if (session === undefined) await process();
-      else await safeWithTrace(this.#traceService, session, process);
-      await safeCompleteTrace(session, "succeeded", "状態質問へ応答");
+      const delivered =
+        session === undefined
+          ? await process()
+          : await safeWithTrace(this.#traceService, session, process);
+      await safeCompleteTrace(
+        session,
+        delivered ? "succeeded" : "cancelled",
+        delivered ? "状態質問へ応答" : "停止指示を優先",
+      );
     } catch (error) {
       this.#logger.error(
         {

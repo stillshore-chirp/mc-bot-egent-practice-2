@@ -61,6 +61,16 @@ const AFFIRMATIVE_GOAL_ACTION_PATTERN =
 const NON_GAME_ACTION_PATTERN =
   /(?:要約|手順|説明|解説|話|会話|文章|文|返答|回答|例|たとえ|比喩|図|表|リスト|計画|理由|質問|答え|言い方|表現|続きを)(?:を|は|について|で|に)?(?:.{0,8}?)(?:使って|作って|続けて|続行して|再開して|再開しよう|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|始めて|探して)/gu;
 
+function goalActionFamily(value: string): string | undefined {
+  if (/(?:戻|帰)/u.test(value)) return "return";
+  if (/(?:追従|ついて|おいで|来て)/u.test(value)) return "follow";
+  if (/(?:集め|採取|収集|掘)/u.test(value)) return "gather";
+  if (/(?:移動|行|向か)/u.test(value)) return "move";
+  if (/(?:収納|拾|捨)/u.test(value)) return "inventory";
+  if (/(?:登録|覚え|記録|記憶)/u.test(value)) return "memory";
+  return undefined;
+}
+
 function goalActionClauses(message: string): string[] {
   const punctuationClauses =
     message.match(/[^、，,。！？!?]+(?:[、，,。！？!?]|$)/gu) ?? [];
@@ -85,9 +95,38 @@ function isAffirmativeActionClause(clause: string): boolean {
   const affirmativeIndex = actionableClause.search(
     AFFIRMATIVE_GOAL_ACTION_PATTERN,
   );
-  if (affirmativeIndex < 0) return false;
   const nonAuthorizingIndex = actionableClause.search(NON_AUTHORIZING_PATTERN);
-  return nonAuthorizingIndex < 0 || affirmativeIndex > nonAuthorizingIndex;
+  if (
+    affirmativeIndex >= 0 &&
+    (nonAuthorizingIndex < 0 || affirmativeIndex > nonAuthorizingIndex)
+  ) {
+    return true;
+  }
+  if (nonAuthorizingIndex < 0) return false;
+  // A later prohibition on a different action does not revoke the earlier
+  // affirmative request. Keep the prohibition itself out of the resume grant.
+  const actionMarkers = [
+    ...actionableClause
+      .slice(0, nonAuthorizingIndex)
+      .matchAll(new RegExp(GOAL_ACTION_PATTERN.source, "gu")),
+  ];
+  const prohibitedActionStart = actionMarkers.at(-1)?.index;
+  if (prohibitedActionStart === undefined || prohibitedActionStart === 0) {
+    return false;
+  }
+  const affirmative = AFFIRMATIVE_GOAL_ACTION_PATTERN.exec(
+    actionableClause.slice(0, prohibitedActionStart).trim(),
+  )?.[0];
+  const prohibited = actionMarkers.at(-1)?.[0];
+  const affirmativeFamily =
+    affirmative === undefined ? undefined : goalActionFamily(affirmative);
+  const prohibitedFamily =
+    prohibited === undefined ? undefined : goalActionFamily(prohibited);
+  return (
+    affirmativeFamily !== undefined &&
+    prohibitedFamily !== undefined &&
+    affirmativeFamily !== prohibitedFamily
+  );
 }
 
 function negatesGoalAction(message: string): boolean {

@@ -12,6 +12,7 @@ import { TraceService } from "../../src/trace/service.js";
 import { TraceStore } from "../../src/trace/store.js";
 import type {
   GameController,
+  GameStatus,
   MemoryPort,
   ToolContext,
 } from "../../src/tools/contracts.js";
@@ -98,6 +99,9 @@ describe("immediate stop command", () => {
     "採取を止めてほしいわけじゃない",
     "採取を止めてほしい理由を教えて",
     "採取を停止してほしい意味を説明して",
+    "採取を止めてほしい場合は言って",
+    "追従を止めてほしい時は知らせて",
+    "採取を止めてほしいと思ったら相談して",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
@@ -249,7 +253,11 @@ describe("immediate stop command", () => {
     },
   );
 
-  it.each(["採取を止めて、もういい", "採取を止めて、拠点へ戻っていい？"])(
+  it.each([
+    "採取を止めて、もういい",
+    "採取を止めて、拠点へ戻っていい？",
+    "採取を止めてほしい今すぐ",
+  ])(
     "does not treat a non-action tail as a replacement: %s",
     async (message) => {
       const deliberate = vi.fn();
@@ -1019,6 +1027,99 @@ describe("immediate stop command", () => {
 
     releaseAction();
     await action;
+  });
+
+  it("drops an observed status when a newer stop supersedes the question", async () => {
+    let releaseObservation!: (status: GameStatus) => void;
+    let notifyObservationStarted!: () => void;
+    const observationStarted = new Promise<void>((resolve) => {
+      notifyObservationStarted = resolve;
+    });
+    const say = vi.fn(async () => undefined);
+    const recordDeliveredOwnerExchange = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(() => {
+          notifyObservationStarted();
+          return new Promise<GameStatus>((resolve) => {
+            releaseObservation = resolve;
+          });
+        }),
+        stopCurrentAction: vi.fn(async () => ({
+          outcome: "completed",
+          summary: "停止しました。",
+        })),
+        say,
+      } as unknown as GameController,
+      agent: {
+        recordDeliveredOwnerExchange,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const question = coordinator.handleChat("owner", "今どうなってる？");
+    await observationStarted;
+    await coordinator.handleChat("owner", "停止");
+    releaseObservation({
+      connected: true,
+      activeTaskSummary: "利用者への追従を続けています。",
+    } as GameStatus);
+    await question;
+
+    expect(say).toHaveBeenCalledTimes(1);
+    expect(say).toHaveBeenCalledWith("停止しました。");
+    expect(recordDeliveredOwnerExchange).not.toHaveBeenCalled();
+  });
+
+  it("sends an already started status reply before the later stop result", async () => {
+    let releaseStatusSay!: () => void;
+    let notifyStatusSayStarted!: () => void;
+    let notifyStopStarted!: () => void;
+    const statusSayStarted = new Promise<void>((resolve) => {
+      notifyStatusSayStarted = resolve;
+    });
+    const stopStarted = new Promise<void>((resolve) => {
+      notifyStopStarted = resolve;
+    });
+    const sent: string[] = [];
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          connected: true,
+          activeTaskSummary: "利用者への追従を続けています。",
+        })),
+        stopCurrentAction: vi.fn(async () => {
+          notifyStopStarted();
+          return { outcome: "completed", summary: "停止しました。" };
+        }),
+        say: vi.fn((message: string) => {
+          sent.push(message);
+          if (message !== "利用者への追従を続けています。") {
+            return Promise.resolve();
+          }
+          notifyStatusSayStarted();
+          return new Promise<void>((resolve) => {
+            releaseStatusSay = resolve;
+          });
+        }),
+      } as unknown as GameController,
+      agent: {} as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const question = coordinator.handleChat("owner", "今どうなってる？");
+    await statusSayStarted;
+    const stopping = coordinator.handleChat("owner", "停止");
+    await stopStarted;
+    expect(sent).toEqual(["利用者への追従を続けています。"]);
+
+    releaseStatusSay();
+    await Promise.all([question, stopping]);
+    expect(sent).toEqual(["利用者への追従を続けています。", "停止しました。"]);
   });
 
   it("does not shortcut a bare why without a confirmed live task", async () => {

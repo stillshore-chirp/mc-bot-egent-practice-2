@@ -144,6 +144,19 @@ describe("conversation context", () => {
     expect(store.snapshot("owner").cancelledGoal).toBe(false);
   });
 
+  it("keeps an earlier affirmative action when a different action is prohibited", () => {
+    const store = new ConversationContextStore();
+    store.recordCancellation("owner");
+    store.recordUser("owner", "拠点に戻って追従しないで");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(isExplicitGoalResumeMessage("戻って来て追従しないで")).toBe(true);
+    expect(isExplicitGoalResumeMessage("戻ってないで")).toBe(false);
+    expect(isExplicitGoalResumeMessage("追従して追従しないで")).toBe(false);
+    expect(isExplicitGoalResumeMessage("木を集めて採取しないで")).toBe(false);
+    expect(isExplicitGoalResumeMessage("説明を続けて追従しないで")).toBe(false);
+  });
+
   it("requires an explicit action before lifting a stop boundary", () => {
     expect(isExplicitGoalResumeMessage("もっと短く。")).toBe(false);
     expect(isExplicitGoalResumeMessage("専門用語を使って説明して。")).toBe(
