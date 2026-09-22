@@ -55,6 +55,11 @@ describe("hostile response command", () => {
     ["木を倒して、敵は近い", null],
     ["敵を倒せる？", null],
     ["敵を倒さないで", null],
+    ["撃滅は不要", null],
+    ["討伐しなくていい", null],
+    ["退治はしないで", null],
+    ["敵を倒す必要はない", null],
+    ["敵を倒してほしくない", null],
     ["木を倒して、退避しないで", null],
   ] as const)("classifies %s as %s", (message, expected) => {
     expect(hostileResponseIntent(message)).toBe(expected);
@@ -92,33 +97,36 @@ describe("hostile response command", () => {
     );
   });
 
-  it("keeps a tree-cutting request on the ordinary task path", async () => {
-    const respondToHostiles = vi.fn();
-    const deliberate = vi.fn(async () => ({
-      text: "作業の対象を確認します。",
-      toolResults: [],
-    }));
-    const coordinator = new ChatCoordinator({
-      ownerUsername: "owner",
-      game: {
-        respondToHostiles,
-        say: vi.fn(async () => undefined),
-      } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
-      contextFactory: {
-        create: vi.fn(async () => ({
-          personaContext: "固定人格要約",
-          memoryContext: "固定記憶要約",
-          worldContext: "確認済み状態",
-          toolContext: minimalToolContext,
-        })),
-      },
-      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
-    });
-    await coordinator.handleChat("owner", "木を倒して");
-    expect(deliberate).toHaveBeenCalledOnce();
-    expect(respondToHostiles).not.toHaveBeenCalled();
-  });
+  it.each(["木を倒して", "撃滅は不要", "討伐しなくていい"])(
+    "keeps %s on the ordinary task path",
+    async (message) => {
+      const respondToHostiles = vi.fn();
+      const deliberate = vi.fn(async () => ({
+        text: "作業の対象を確認します。",
+        toolResults: [],
+      }));
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          respondToHostiles,
+          say: vi.fn(async () => undefined),
+        } as unknown as GameController,
+        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: minimalToolContext,
+          })),
+        },
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
+      await coordinator.handleChat("owner", message);
+      expect(deliberate).toHaveBeenCalledOnce();
+      expect(respondToHostiles).not.toHaveBeenCalled();
+    },
+  );
 
   it("preempts the prior task and acts without waiting for an LLM refusal", async () => {
     const events: string[] = [];

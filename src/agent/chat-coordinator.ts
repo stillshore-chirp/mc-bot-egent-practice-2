@@ -207,7 +207,7 @@ export function hostileResponseIntent(message: string): HostileGoal | null {
   const negatedEvade =
     /(?:逃げ(?:ないで|るな|なくていい)|退避(?:しないで|するな|は不要|不要)|距離を取(?:らないで|るな)|離れ(?:ないで|るな))/gu;
   const negatedAttack =
-    /(?:倒(?:さないで|すな|さなくていい|してはいけない)|攻撃(?:しないで|するな|は不要|不要|してはいけない)|戦(?:わないで|うな)|撃滅(?:しないで|するな)|討伐(?:しないで|するな)|退治(?:しないで|するな)|やっつけないで)/gu;
+    /(?:倒|攻撃|戦|撃滅|討伐|退治|やっつけ)[^、，,。]{0,8}(?:ないで|なくていい|不要|するな|すな|はいけない|必要はない|ほしくない|やめて)/gu;
   const hasNegatedEvade = negatedEvade.test(normalized);
   const hasNegatedAttack = negatedAttack.test(normalized);
   const affirmativeEvade = normalized.replace(negatedEvade, "");
