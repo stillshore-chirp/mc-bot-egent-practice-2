@@ -75,6 +75,10 @@ export interface GameStatus {
   position: Position | null;
   inventory: Readonly<Record<string, number>>;
   activeTaskState: string | null;
+  /** Plain-language summary of the currently running task, when any. */
+  readonly activeTaskSummary?: string | null;
+  /** Latest task outcome, including terminal work, in plain user-facing text. */
+  readonly latestTaskState?: string | null;
 }
 
 export interface Surroundings {

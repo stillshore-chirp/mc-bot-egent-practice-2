@@ -11,7 +11,11 @@ import type {
   TraceSession,
   WithSpanOptions,
 } from "../trace/service.js";
-import type { GameController, ToolContext } from "../tools/contracts.js";
+import type {
+  GameController,
+  GameStatus,
+  ToolContext,
+} from "../tools/contracts.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
 
 const STOP_COMMANDS = new Set([
@@ -24,6 +28,74 @@ const STOP_COMMANDS = new Set([
   "中止",
   "中断",
 ]);
+
+/**
+ * Short, read-only status questions are answered independently of a long
+ * running owner action. This keeps a harmless question from waiting behind a
+ * follow or gather operation while leaving that operation untouched.
+ */
+export function isReadOnlyStatusQuestion(message: string): boolean {
+  const normalized = message.trim().replace(/\s+/gu, " ");
+  if (normalized === "なぜ") return true;
+  if (/^(?:状態|状況|進捗)(?:を教えて|を説明して)?[?？]?$/u.test(normalized)) {
+    return true;
+  }
+  if (!/[?？]/u.test(normalized)) return false;
+  const questionMark = normalized.search(/[?？]/u);
+  if (
+    questionMark >= 0 &&
+    !/^[。！!]*$/u.test(normalized.slice(questionMark + 1).trim())
+  ) {
+    return false;
+  }
+  const includesAction =
+    /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作って|始め|続け|再開|使って|置いて|取り)/u.test(
+      normalized,
+    );
+  const isReasonForStoppedWork =
+    /^(?:なぜ|どうして).*(?:止ま|失敗|できな)/u.test(normalized);
+  if (includesAction && !isReasonForStoppedWork) return false;
+  return (
+    isReasonForStoppedWork ||
+    /(?:今|現在|いま).*(?:どうな|何して|状態|状況|進捗|止ま)/u.test(
+      normalized,
+    ) ||
+    /(?:何してる|何をしてる|どうなってる|どうなっています|なぜ(?:止ま|失敗|できな))/u.test(
+      normalized,
+    )
+  );
+}
+
+function renderReadOnlyStatus(status: GameStatus): string {
+  if (!status.connected) {
+    return "Minecraftへの接続を確認できません。再接続後に現在の状態を確認してください。";
+  }
+  const summary = status.activeTaskSummary?.trim();
+  if (summary !== undefined && summary.length > 0) return summary;
+  const task = status.activeTaskState?.trim();
+  if (task === undefined || task.length === 0) {
+    const latest = status.latestTaskState?.trim();
+    if (latest !== undefined && latest.length > 0) {
+      return `${latest}現在、進行中のMinecraft作業はありません。`;
+    }
+    return "現在、進行中のMinecraft作業は確認できません。直前の作業結果は追加の観測が必要です。";
+  }
+  if (task.startsWith("作業を一時停止中")) {
+    return task;
+  }
+  const [kind] = task.split(":", 1);
+  const description =
+    kind === "follow_player"
+      ? "利用者への追従を続けています。"
+      : kind === "gather_resource"
+        ? "資源の収集を続けています。"
+        : kind === "move_to"
+          ? "指定場所への移動を続けています。"
+          : kind === "return_to_player"
+            ? "利用者の場所への帰還を続けています。"
+            : "Minecraft作業を続けています。";
+  return description;
+}
 
 export interface ChatContextFactory {
   create(
@@ -52,6 +124,12 @@ interface DeliveredReplyRecorder {
     message: string,
   ) => number | undefined;
   pendingOwnerRequestId?: (requesterUsername: string) => number | undefined;
+  latestOwnerRequestId?: (requesterUsername: string) => number | undefined;
+  recordDeliveredOwnerExchange?: (
+    requesterUsername: string,
+    message: string,
+    text: string,
+  ) => void;
   recordDeliveredReply?: (
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
@@ -160,6 +238,7 @@ export class ChatCoordinator {
   readonly #traceService: TraceService | undefined;
   readonly #immediateStopListeners = new Set<() => void>();
   readonly #ownerMessageListeners = new Set<() => void>();
+  readonly #readOnlyStatusQuestions = new Set<Promise<void>>();
   #activeController: AbortController | undefined;
   #activeRequestKind: ToolContext["requestKind"] | undefined;
   #conversationTail: Promise<RuntimeReassessmentRunOutcome | undefined> =
@@ -193,7 +272,9 @@ export class ChatCoordinator {
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
       const recorder = this.#agent as unknown as DeliveredReplyRecorder;
-      const interruptedRequestId = recorder.pendingOwnerRequestId?.(username);
+      const interruptedRequestId =
+        recorder.pendingOwnerRequestId?.(username) ??
+        recorder.latestOwnerRequestId?.(username);
       const session = await safeStartTrace(
         this.#traceService,
         "停止指示を受信",
@@ -247,6 +328,20 @@ export class ChatCoordinator {
 
     if (this.#activeRequestKind === "runtime_reassessment") {
       this.#activeController?.abort(new Error("OWNER_MESSAGE_PRIORITIZED"));
+    }
+
+    if (isReadOnlyStatusQuestion(normalized)) {
+      const statusQuestion = this.#answerReadOnlyStatusQuestion(
+        username,
+        normalized,
+      );
+      this.#readOnlyStatusQuestions.add(statusQuestion);
+      try {
+        await statusQuestion;
+      } finally {
+        this.#readOnlyStatusQuestions.delete(statusQuestion);
+      }
+      return true;
     }
 
     const generation = this.#generation;
@@ -308,7 +403,10 @@ export class ChatCoordinator {
   public async shutdown(): Promise<void> {
     this.#generation += 1;
     this.#activeController?.abort(new Error("APPLICATION_SHUTDOWN"));
-    await this.#conversationTail;
+    await Promise.allSettled([
+      this.#conversationTail,
+      ...this.#readOnlyStatusQuestions,
+    ]);
   }
 
   #notifyImmediateStop(): void {
@@ -340,6 +438,68 @@ export class ChatCoordinator {
           "owner message listener failed",
         );
       }
+    }
+  }
+
+  async #answerReadOnlyStatusQuestion(
+    username: string,
+    message: string,
+  ): Promise<void> {
+    const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+    const session = await safeStartTrace(
+      this.#traceService,
+      "利用者の状態質問を受信",
+      "owner_message",
+      { responseMode: "read_only_status" },
+    );
+    const process = async (): Promise<void> => {
+      let status: GameStatus | undefined;
+      try {
+        status = await safeWithTraceSpan(
+          this.#traceService,
+          "perception",
+          "Minecraft状態を観測",
+          {
+            summary: "現在のMinecraft状態を観測",
+            resultKind: "minecraft_state_delta",
+            summarizeResult: () => "現在状態を観測",
+          },
+          () => this.#game.observeStatus(),
+        );
+      } catch {
+        // A status question still receives an honest, bounded answer when
+        // observation is temporarily unavailable.
+      }
+      const reply =
+        status === undefined
+          ? "現在のMinecraft状態を確認できません。再観測が必要です。"
+          : renderReadOnlyStatus(status);
+      await safeWithTraceSpan(
+        this.#traceService,
+        "response",
+        "状態質問への応答",
+        {
+          summary: "確認済み状態を送信",
+          resultKind: "final_response",
+          summarizeResult: () => "確認済み状態を送信",
+        },
+        () => this.#game.say(reply),
+      );
+      recorder.recordDeliveredOwnerExchange?.(username, message, reply);
+    };
+    try {
+      if (session === undefined) await process();
+      else await safeWithTrace(this.#traceService, session, process);
+      await safeCompleteTrace(session, "succeeded", "状態質問へ応答");
+    } catch (error) {
+      this.#logger.error(
+        {
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "read-only status question failed",
+      );
+      await safeCompleteTrace(session, "failed", "状態質問への応答に失敗");
+      throw error;
     }
   }
 

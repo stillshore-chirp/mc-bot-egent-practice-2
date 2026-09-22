@@ -536,6 +536,8 @@ export class CompanionGameController implements GameController {
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
       activeTaskState: activeTaskState(task),
+      activeTaskSummary: activeTaskSummary(task),
+      latestTaskState: latestTaskState(task),
     };
   }
 
@@ -678,6 +680,38 @@ function activeTaskState(task: TaskRecord | undefined): string | null {
     return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
   }
   return `${task.kind}:${task.phase}:${task.status}`;
+}
+
+function activeTaskSummary(task: TaskRecord | undefined): string | null {
+  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+  if (task.status === "suspended") {
+    const recovery = suspendedTaskRecovery(task);
+    return `${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+  }
+  switch (task.kind) {
+    case "follow_player":
+      return "利用者への追従を続けています。";
+    case "gather_resource":
+      return "資源の収集を続けています。";
+    case "move_to":
+      return "指定場所への移動を続けています。";
+    case "return_to_player":
+      return "利用者の場所への帰還を続けています。";
+    default:
+      return "Minecraft作業を続けています。";
+  }
+}
+
+function latestTaskState(task: TaskRecord | undefined): string | null {
+  if (task === undefined) return null;
+  if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
+  if (task.status === "failed") {
+    return "直前のMinecraft作業は完了を確認できませんでした。";
+  }
+  if (task.status === "cancelled") return "直前のMinecraft作業は停止しました。";
+  if (task.status === "suspended") return suspendedTaskRecovery(task).summary;
+  if (task.status === "queued") return "Minecraft作業の開始を待っています。";
+  return activeTaskSummary(task);
 }
 
 function formatCoordinates(position: {

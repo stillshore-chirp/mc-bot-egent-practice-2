@@ -163,6 +163,7 @@ export class OpenAIDeliberationAgent {
   readonly #traceService: TraceService | undefined;
   readonly #conversation = new ConversationContextStore();
   readonly #pendingOwnerTurns = new Map<string, PendingOwnerTurn>();
+  readonly #latestOwnerRequestIds = new Map<string, number>();
   #nextConversationRequestId = 0;
 
   public constructor(input: {
@@ -330,6 +331,21 @@ export class OpenAIDeliberationAgent {
     return this.#pendingOwnerTurns.get(requesterUsername)?.requestId;
   }
 
+  /** Returns the newest owner request even after its reply was delivered. */
+  public latestOwnerRequestId(requesterUsername: string): number | undefined {
+    return this.#latestOwnerRequestIds.get(requesterUsername);
+  }
+
+  /** Record a read-only owner exchange after its direct status reply is sent. */
+  public recordDeliveredOwnerExchange(
+    requesterUsername: string,
+    message: string,
+    reply: string,
+  ): void {
+    this.#conversation.recordUser(requesterUsername, message);
+    this.#conversation.recordAssistant(requesterUsername, reply);
+  }
+
   public recordDeliveredReply(
     requesterUsername: string,
     requestKind: ToolContext["requestKind"],
@@ -359,6 +375,15 @@ export class OpenAIDeliberationAgent {
     conversationRequestId?: number,
   ): void {
     if (requestKind === "owner_message") {
+      const latestRequestId =
+        this.#latestOwnerRequestIds.get(requesterUsername);
+      if (
+        conversationRequestId !== undefined &&
+        latestRequestId !== undefined &&
+        latestRequestId !== conversationRequestId
+      ) {
+        return;
+      }
       const pending = this.#pendingOwnerTurns.get(requesterUsername);
       if (
         conversationRequestId !== undefined &&
@@ -378,6 +403,14 @@ export class OpenAIDeliberationAgent {
     const requestId =
       conversationRequestId ?? ++this.#nextConversationRequestId;
     const pending = this.#pendingOwnerTurns.get(requesterUsername);
+    const latestRequestId = this.#latestOwnerRequestIds.get(requesterUsername);
+    if (
+      latestRequestId === undefined ||
+      requestId > latestRequestId ||
+      conversationRequestId === undefined
+    ) {
+      this.#latestOwnerRequestIds.set(requesterUsername, requestId);
+    }
     if (
       conversationRequestId !== undefined &&
       pending !== undefined &&

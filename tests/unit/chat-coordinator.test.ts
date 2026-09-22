@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenAIDeliberationAgent } from "../../src/agent/openai-agent.js";
 import {
   ChatCoordinator,
+  isReadOnlyStatusQuestion,
   isImmediateStopCommand,
   type ChatContextFactory,
 } from "../../src/agent/chat-coordinator.js";
@@ -50,6 +51,26 @@ describe("immediate stop command", () => {
   it("does not treat an ordinary sentence as a stop command", () => {
     expect(isImmediateStopCommand("停止方法を教えて")).toBe(false);
   });
+
+  it.each([
+    "今どうなってる？",
+    "何してる？",
+    "なぜ止まった？",
+    "なぜ採取が止まった？",
+  ])("recognizes a standalone read-only status question: %s", (message) => {
+    expect(isReadOnlyStatusQuestion(message)).toBe(true);
+  });
+
+  it.each([
+    "今の状況を教えて、木を集めて？",
+    "なぜ止まった？ もう一度来て",
+    "なぜ失敗？木を集めて",
+  ])(
+    "keeps a mixed status and action request on the normal path: %s",
+    (message) => {
+      expect(isReadOnlyStatusQuestion(message)).toBe(false);
+    },
+  );
 
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
@@ -625,6 +646,121 @@ describe("immediate stop command", () => {
     expect(deliberate).toHaveBeenCalledTimes(2);
     expect(say).toHaveBeenCalledTimes(1);
     expect(say).toHaveBeenCalledWith("応答:今どうなっていますか");
+  });
+
+  it("answers a read-only status question while an owner action is running", async () => {
+    let releaseAction!: () => void;
+    let notifyActionStarted!: () => void;
+    const actionStarted = new Promise<void>((resolve) => {
+      notifyActionStarted = resolve;
+    });
+    const say = vi.fn(async () => undefined);
+    const recordDeliveredOwnerExchange = vi.fn();
+    const deliberate = vi.fn(async () => {
+      notifyActionStarted();
+      await new Promise<void>((resolve) => {
+        releaseAction = resolve;
+      });
+      return { text: "作業を開始しました。", toolResults: [] };
+    });
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          ...minimalToolContext.game,
+          observedAt: "2026-09-22T00:00:00.000Z",
+          subject: "bot",
+          source: "minecraft",
+          requesterVitals: "unobserved",
+          connected: true,
+          spawned: true,
+          health: 20,
+          food: 20,
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+          position: null,
+          inventory: {},
+          activeTaskState: "follow_player:following:running",
+        })),
+        say,
+      } as unknown as GameController,
+      agent: {
+        beginOwnerRequest: vi.fn(() => 1),
+        deliberate,
+        recordDeliveredReply: vi.fn(),
+        recordDeliveredOwnerExchange,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "固定観測要約",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const action = coordinator.handleChat("owner", "来て");
+    await actionStarted;
+    const question = coordinator.handleChat(
+      "owner",
+      "専門用語なしで、今どうなってる？",
+    );
+    await question;
+
+    expect(deliberate).toHaveBeenCalledTimes(1);
+    expect(say).toHaveBeenCalledWith("利用者への追従を続けています。");
+    expect(recordDeliveredOwnerExchange).toHaveBeenCalledWith(
+      "owner",
+      "専門用語なしで、今どうなってる？",
+      "利用者への追従を続けています。",
+    );
+
+    releaseAction();
+    await action;
+  });
+
+  it("reports the latest completed task without reviving an older failure", async () => {
+    const say = vi.fn(async () => undefined);
+    const recordDeliveredOwnerExchange = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          ...minimalToolContext.game,
+          observedAt: "2026-09-22T00:00:00.000Z",
+          subject: "bot",
+          source: "minecraft",
+          requesterVitals: "unobserved",
+          connected: true,
+          spawned: true,
+          health: 20,
+          food: 20,
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+          position: null,
+          inventory: {},
+          activeTaskState: null,
+          latestTaskState: "直前のMinecraft作業は完了しました。",
+        })),
+        say,
+      } as unknown as GameController,
+      agent: {
+        recordDeliveredOwnerExchange,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "なぜ止まった？");
+
+    expect(say).toHaveBeenCalledWith(
+      "直前のMinecraft作業は完了しました。現在、進行中のMinecraft作業はありません。",
+    );
+    expect(recordDeliveredOwnerExchange).toHaveBeenCalled();
   });
 
   it("returns cancelled when an owner message invalidates queued runtime work", async () => {

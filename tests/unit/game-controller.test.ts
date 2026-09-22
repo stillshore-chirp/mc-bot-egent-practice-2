@@ -129,6 +129,7 @@ describe("CompanionGameController", () => {
     const report = await follow;
 
     expect(status.activeTaskState).toContain("移動が進まなかった");
+    expect(status.activeTaskSummary).toContain("移動が進まなかった");
     expect(report).toMatchObject({
       outcome: "failed",
       failureCategory: "safety",

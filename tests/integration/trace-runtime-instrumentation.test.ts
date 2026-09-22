@@ -235,6 +235,71 @@ describe("runtime trace instrumentation", () => {
     store.close();
   });
 
+  it("passes only the newest task result to a current conversation", async () => {
+    const tasks = new TaskRuntime(
+      new InMemoryTaskStore(),
+      async () => undefined,
+    );
+    const newest = {
+      id: "newest-task",
+      playerId: "player",
+      kind: "follow_player",
+      status: "completed",
+      phase: "completed",
+      input: {},
+      output: { followedUntil: "observed" },
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:01:00.000Z",
+    };
+    const olderFailure = {
+      id: "older-task",
+      playerId: "player",
+      kind: "follow_player",
+      status: "failed",
+      phase: "following",
+      input: {},
+      failure: { code: "PLAYER_NOT_VISIBLE" },
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:30.000Z",
+    };
+    const memoryStore = {
+      getRelationship: () => ({
+        playerId: "player",
+        trust: 50,
+        intimacy: 20,
+        state: {},
+        updatedAt: new Date().toISOString(),
+      }),
+      getLifeState: () => undefined,
+      searchWorldMemories: () => [],
+      listRecentTaskRuns: () => [newest, olderFailure],
+      recall: () => [],
+    } as unknown as MemoryStore;
+    const factory = new CompanionContextFactory(
+      config(),
+      "player",
+      memoryStore,
+      memory(),
+      persona(),
+      game(),
+      tasks,
+    );
+
+    const context = await factory.create(
+      "owner",
+      "今どうなってる？",
+      new AbortController().signal,
+      "correlation",
+      "owner_message",
+    );
+
+    expect(context.memoryContext).toContain(
+      "[latest_task] 最新の作業結果: follow_player completed/completed",
+    );
+    expect(context.memoryContext).not.toContain("PLAYER_NOT_VISIBLE");
+    expect(context.memoryContext).not.toContain("older-task");
+  });
+
   it("keeps deliberation, tool, action, verification, and memory-write summaries redacted", async () => {
     const { service, store } = trace();
     const fake = new ScriptedOpenAI([

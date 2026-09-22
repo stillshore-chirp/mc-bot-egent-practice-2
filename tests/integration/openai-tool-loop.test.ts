@@ -387,6 +387,9 @@ describe("OpenAI tool loop", () => {
     expect(input).toContain("新しい依頼");
     expect(input).toContain("新しい返答です。");
     expect(input).not.toContain("古い依頼");
+    expect(fake.requests[0]?.instructions).not.toContain(
+      "直前の作業は停止済みです",
+    );
   });
 
   it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {

@@ -119,6 +119,9 @@ describe("conversation context", () => {
       "採取は再開しないで。",
       "移動しなくていい。",
       "停止できたか確認して。",
+      "再開していい？",
+      "再開してはいけない。",
+      "来てほしくない。",
     ]) {
       const store = new ConversationContextStore();
       store.recordCancellation("owner");
