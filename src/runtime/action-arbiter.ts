@@ -22,6 +22,40 @@ interface ActiveLease {
 
 export class ActionArbiter {
   private active: ActiveLease | undefined;
+  private readonly availabilityWaiters = new Set<() => void>();
+
+  public async waitForAvailable(
+    priority: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) throw actionWaitAbortError(signal.reason);
+    if (this.active === undefined || this.active.priority < priority) return;
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const check = () => {
+        if (
+          settled ||
+          (this.active !== undefined && this.active.priority >= priority)
+        )
+          return;
+        settled = true;
+        this.availabilityWaiters.delete(check);
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        this.availabilityWaiters.delete(check);
+        signal?.removeEventListener("abort", onAbort);
+        reject(actionWaitAbortError(signal?.reason));
+      };
+      this.availabilityWaiters.add(check);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      check();
+    });
+  }
 
   public acquire(owner: string, priority: number): ActionLease {
     if (this.active !== undefined && this.active.priority >= priority) {
@@ -45,7 +79,10 @@ export class ActionArbiter {
       priority,
       signal: lease.controller.signal,
       release: () => {
-        if (this.active === lease) this.active = undefined;
+        if (this.active === lease) {
+          this.active = undefined;
+          this.notifyAvailabilityWaiters();
+        }
       },
     };
   }
@@ -53,9 +90,18 @@ export class ActionArbiter {
   public stop(reason: string): void {
     this.active?.controller.abort(new Error(reason));
     this.active = undefined;
+    this.notifyAvailabilityWaiters();
   }
 
   public get currentOwner(): string | undefined {
     return this.active?.owner;
   }
+
+  private notifyAvailabilityWaiters(): void {
+    for (const check of [...this.availabilityWaiters]) check();
+  }
+}
+
+function actionWaitAbortError(reason: unknown): Error {
+  return reason instanceof Error ? reason : new Error("Action wait aborted");
 }
