@@ -1163,7 +1163,7 @@ export class CompanionGameController implements GameController {
         summary: "停止指示済みのためMinecraft作業を開始しませんでした。",
       };
     }
-    if (this.#tasks.current?.status === "suspended") {
+    if (this.#requiresSafetyResumeGate()) {
       const danger = observedCurrentDanger(
         beforeSnapshot,
         this.#hungerThreshold,
@@ -1364,6 +1364,22 @@ export class CompanionGameController implements GameController {
     return terminalTaskStatuses.has(persisted.status)
       ? persisted
       : { ...persisted, persistedWithoutRuntime: true };
+  }
+
+  #requiresSafetyResumeGate(): boolean {
+    const current = this.#tasks.current;
+    if (current !== undefined) return current.status === "suspended";
+    if (this.#playerId === undefined) return false;
+    try {
+      const latest = this.#memory.listRecentTaskRuns(this.#playerId, 1)[0];
+      return (
+        latest !== undefined &&
+        ["queued", "running", "suspended"].includes(latest.status)
+      );
+    } catch {
+      // Without a durable task read, a restart cannot rule out a suspension.
+      return true;
+    }
   }
 
   #syncLifeState(snapshot: WorldSnapshot): void {

@@ -819,6 +819,45 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it.each([
+    { danger: "fire", snapshot: createSnapshot({ onFire: true }) },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+      }),
+    },
+    { danger: "falling", snapshot: createSnapshot({ velocityY: -1.5 }) },
+    { danger: "hunger", snapshot: createSnapshot({ food: 10 }) },
+  ])(
+    "checks a persisted suspension before resuming during $danger",
+    async ({ snapshot }) => {
+      const minecraft = new FakeMinecraft(snapshot);
+      const { game, memory, tasks, close } = createController(minecraft, true);
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status: "suspended",
+        input: { range: 3 },
+      });
+
+      const retry = await game.followOwner(3, 60, new AbortController().signal);
+
+      expect(tasks.current).toBeUndefined();
+      expect(minecraft.actions).not.toContain("follow:owner");
+      expect(retry).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      close();
+    },
+  );
+
   it.each(["queued", "running", "suspended"] as const)(
     "does not present a persisted %s task as active after restart",
     async (status) => {
