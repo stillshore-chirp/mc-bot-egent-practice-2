@@ -192,6 +192,7 @@ export interface BehaviorMemoryPort {
     playerId: string,
     input?: { readonly limit?: number; readonly query?: string },
   ): BehaviorMemoryRecord[];
+  isApplicable(record: BehaviorMemoryRecord): boolean;
   forget(input: ForgetBehaviorMemoryInput): BehaviorMemoryRecord[];
 }
 

@@ -108,6 +108,7 @@ describe("durable behavior memory", () => {
       supportCount: 1,
       status: "active",
     });
+    expect(first.behaviorMemoryIsApplicable(firstRecord)).toBe(false);
 
     const promoted = first.rememberBehaviorMemory({
       playerId: player.id,
@@ -117,6 +118,7 @@ describe("durable behavior memory", () => {
       confidence: "corroborated",
       supportCount: 2,
     });
+    expect(first.behaviorMemoryIsApplicable(promoted)).toBe(true);
     first.close();
 
     const restarted = MemoryStore.open(path);

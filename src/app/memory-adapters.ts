@@ -60,6 +60,12 @@ export class ToolBehaviorMemoryAdapter implements BehaviorMemoryPort {
     return this.store.listBehaviorMemories(playerId, input);
   }
 
+  public isApplicable(
+    record: Parameters<BehaviorMemoryPort["isApplicable"]>[0],
+  ) {
+    return this.store.behaviorMemoryIsApplicable(record);
+  }
+
   public forget(input: Parameters<BehaviorMemoryPort["forget"]>[0]) {
     return this.store.forgetBehaviorMemories(input);
   }
