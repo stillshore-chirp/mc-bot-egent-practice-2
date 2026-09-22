@@ -54,12 +54,19 @@ const actionToolFamilies: Readonly<
 function scopedActionToolNames(
   authorized: ReadonlySet<GoalActionFamily> | undefined,
   prohibited: ReadonlySet<GoalActionFamily>,
+  authorizedMemoryTools: ReadonlySet<string>,
 ): string[] | undefined {
   if (authorized === undefined && prohibited.size === 0) return undefined;
   return toolDefinitions
     .filter(({ name, action }) => {
       if (!action && !ownerScopedMutationToolNames.has(name)) return false;
       if (name === "stop_current_action") return true;
+      if (
+        ownerScopedMutationToolNames.has(name) &&
+        !authorizedMemoryTools.has(name)
+      ) {
+        return false;
+      }
       const families = actionToolFamilies[name];
       return (
         families?.every(
@@ -70,6 +77,50 @@ function scopedActionToolNames(
       );
     })
     .map(({ name }) => name);
+}
+
+/** A broad "memory" family never grants unrelated persistent mutations. */
+function explicitlyRequestedMemoryTools(message: string): Set<string> {
+  const requested = new Set<string>();
+  if (explicitlyProhibitedActionFamilies(message).includes("memory")) {
+    return requested;
+  }
+  for (const clause of message.split(/[、，,。！？!?]/u)) {
+    if (!explicitlyAuthorizedActionFamilies(clause).includes("memory")) {
+      continue;
+    }
+    if (clause.includes("登録して")) {
+      requested.add("register_delivery_target");
+    }
+    if (clause.includes("忘れて")) {
+      requested.add("forget_delivery_target");
+    }
+    if (/(?:覚えて|記録して|記憶して)/u.test(clause)) {
+      if (/(?:約束|コミットメント)/u.test(clause)) {
+        requested.add(
+          /(?:完了|済み)/u.test(clause)
+            ? "complete_commitment"
+            : "set_commitment",
+        );
+      } else {
+        requested.add(
+          /(?:ここ|現在地|この場所|場所|座標|拠点)/u.test(clause)
+            ? "remember_location"
+            : "remember_player_fact",
+        );
+      }
+    }
+  }
+  return requested;
+}
+
+function explicitlyRequestedDeliveryTargetKinds(
+  message: string,
+): ("home" | "chest")[] {
+  const kinds: ("home" | "chest")[] = [];
+  if (/(?:拠点|帰還先|ホーム)/u.test(message)) kinds.push("home");
+  if (/(?:チェスト|収納先|保管箱)/u.test(message)) kinds.push("chest");
+  return kinds;
 }
 
 interface PendingOwnerTurn {
@@ -271,6 +322,7 @@ export class OpenAIDeliberationAgent {
       genericResume
         ? conversationSnapshot.stoppedActionFamilies.filter(
             (family) =>
+              family !== "memory" &&
               !explicitProhibited.includes(family) &&
               !conversationSnapshot.explicitProhibitedActionFamilies.includes(
                 family,
@@ -291,9 +343,13 @@ export class OpenAIDeliberationAgent {
       (conversationSnapshot.cancelledGoal || explicitProhibited.length > 0)
         ? new Set(resumedFamilies)
         : undefined;
+    const requestedMemoryTools = explicitlyRequestedMemoryTools(
+      request.message,
+    );
     const allowedActionToolNames = scopedActionToolNames(
       authorizedFamilies,
       prohibitedFamilies,
+      requestedMemoryTools,
     );
     const inheritedActionToolNames = request.toolContext.allowedActionToolNames;
     const effectiveActionToolNames =
@@ -311,6 +367,14 @@ export class OpenAIDeliberationAgent {
           ...(effectiveActionToolNames === undefined
             ? {}
             : { allowedActionToolNames: effectiveActionToolNames }),
+          ...(effectiveActionToolNames !== undefined &&
+          (requestedMemoryTools.has("register_delivery_target") ||
+            requestedMemoryTools.has("forget_delivery_target"))
+            ? {
+                allowedDeliveryTargetKinds:
+                  explicitlyRequestedDeliveryTargetKinds(request.message),
+              }
+            : {}),
           recordDeliveredAssistantMessage: (text) =>
             this.#recordAssistantDelivery(
               conversationKey,

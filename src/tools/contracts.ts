@@ -227,6 +227,8 @@ export interface ToolContext {
   allowActionTools?: boolean;
   /** Trusted per-request action and memory-write scope. */
   allowedActionToolNames?: readonly string[];
+  /** Requested delivery-target kinds for registration or forgetting. */
+  allowedDeliveryTargetKinds?: readonly ("home" | "chest")[];
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;
   executionEvidence: {

@@ -159,6 +159,20 @@ export class ToolExecutor {
         "操作引数がschemaに一致しないため実行しませんでした。",
       );
     }
+    if (
+      (name === "register_delivery_target" ||
+        name === "forget_delivery_target") &&
+      context.allowedDeliveryTargetKinds !== undefined &&
+      !context.allowedDeliveryTargetKinds.includes(
+        (parsed.data as { kind: "home" | "chest" }).kind,
+      )
+    ) {
+      return failure(
+        "OWNER_ACTION_TARGET_NOT_ALLOWED",
+        "authorization",
+        "今回の依頼で指定された登録先ではないため変更しません。",
+      );
+    }
 
     try {
       const stage = memoryReadTools.has(name)

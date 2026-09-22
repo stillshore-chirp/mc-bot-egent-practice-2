@@ -132,6 +132,19 @@ describe("conversation context", () => {
     );
   });
 
+  it("keeps a stopped memory write paused on a generic restart", () => {
+    const store = new ConversationContextStore();
+    store.recordCancellation("owner", "拠点を登録して");
+    store.recordUser("owner", "続けて");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(true);
+    expect(store.snapshot("owner").prohibitedActionFamilies).toContain(
+      "memory",
+    );
+    store.recordUser("owner", "拠点を登録して");
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+  });
+
   it("retains a prohibited action when a different action replaces the stopped goal", () => {
     const store = new ConversationContextStore();
     store.recordUser("owner", "木を集めて。");

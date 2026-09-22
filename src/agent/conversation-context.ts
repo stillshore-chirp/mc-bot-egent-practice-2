@@ -320,6 +320,7 @@ export class ConversationContextStore {
       genericResume && state.cancelledGoal
         ? state.stoppedActionFamilies.filter(
             (family) =>
+              family !== "memory" &&
               !prohibited.includes(family) &&
               !state.explicitProhibitedActionFamilies.has(family),
           )
