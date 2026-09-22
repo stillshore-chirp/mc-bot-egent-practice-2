@@ -26,6 +26,9 @@ describe("conversation context", () => {
     expect(renderConversationContext(snapshot)).toContain(
       "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
     );
+    expect(renderConversationContext(snapshot)).not.toContain(
+      "目の前の木を選んで",
+    );
 
     for (let index = 0; index < 10; index += 1) {
       store.recordUser("owner", `追加の依頼${String(index)}`);
