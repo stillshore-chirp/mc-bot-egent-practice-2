@@ -213,6 +213,10 @@ export class BehaviorMemoryRepository {
     readonly value: string;
     readonly summary: string;
   }): BehaviorMemoryRecord {
+    const memoryId =
+      input.memoryId === undefined && input.slot.startsWith("owner_preference_")
+        ? this.resolveImplicitCorrection(input.playerId, input.category)
+        : input.memoryId;
     return this.remember({
       playerId: input.playerId,
       category: input.category,
@@ -222,7 +226,7 @@ export class BehaviorMemoryRepository {
       source: "owner_correction",
       confidence: "corrected",
       scope: "owner_global",
-      ...(input.memoryId === undefined ? {} : { supersedesId: input.memoryId }),
+      ...(memoryId === undefined ? {} : { supersedesId: memoryId }),
     });
   }
 
@@ -356,6 +360,23 @@ export class BehaviorMemoryRepository {
     return active;
   }
 
+  private resolveImplicitCorrection(
+    playerId: string,
+    category: BehaviorMemoryCategory,
+  ): string | undefined {
+    const candidates = this.database
+      .prepare<[string, BehaviorMemoryCategory], { readonly id: string }>(
+        "SELECT id FROM behavior_memories WHERE player_id = ? AND category = ? AND slot LIKE 'owner_preference_%' AND status = 'active' ORDER BY updated_at DESC",
+      )
+      .all(playerId, category);
+    if (candidates.length > 1) {
+      throw new BehaviorMemoryError(
+        "Multiple open-ended behavior memories require an explicit id for correction.",
+      );
+    }
+    return candidates[0]?.id;
+  }
+
   private requirePlayer(playerId: string): void {
     const id = cleanId(playerId);
     const row = this.database
@@ -401,7 +422,10 @@ export function extractBehaviorMemory(
       normalized,
     );
   const correction = /訂正|修正|違う|前の/u.test(normalized);
-  const known = knownPreference(normalized, stable, correction);
+  const known =
+    stable || hasFeedbackSignal(normalized)
+      ? knownPreference(normalized, stable, correction)
+      : undefined;
   if (known !== undefined) return [known];
   if (!stable) return [];
 
@@ -444,10 +468,7 @@ function knownPreference(
   stable: boolean,
   correction: boolean,
 ): BehaviorMemoryExtraction | undefined {
-  const feedback =
-    /また|何度も|繰り返|同じ|長すぎ|冗長|くどい|分かりにく|わかりにく|細かく指示|プログラムされた動作|状況を読|文脈を読/u.test(
-      message,
-    );
+  const feedback = hasFeedbackSignal(message);
   const repeated = !stable && feedback;
   const reason = correction
     ? "owner_correction"
@@ -565,6 +586,12 @@ function knownPreference(
     );
   }
   return undefined;
+}
+
+function hasFeedbackSignal(message: string): boolean {
+  return /また|何度も|繰り返|同じ|長すぎ|冗長|くどい|分かりにく|わかりにく|細かく指示|プログラムされた動作|状況を読|文脈を読/u.test(
+    message,
+  );
 }
 
 export function parseBehaviorMemoryCommand(

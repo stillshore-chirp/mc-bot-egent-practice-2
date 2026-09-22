@@ -74,6 +74,7 @@ describe("behavior memory extraction", () => {
     expect(extractBehaviorMemory("住所は覚えておいて、そこへ戻って")).toEqual(
       [],
     );
+    expect(extractBehaviorMemory("専門用語って何？")).toEqual([]);
   });
 
   it("parses list and forget requests without storing the request text", () => {
@@ -183,6 +184,31 @@ describe("durable behavior memory", () => {
       expect.objectContaining({ id: corrected.id, status: "retracted" }),
     ]);
     expect(store.listBehaviorMemories(player.id)).toEqual([]);
+    store.close();
+  });
+
+  it("resolves a single open-ended correction without keeping the old wording active", () => {
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("owner");
+    const initial = extractBehaviorMemory(
+      "今後は作業前に目的と状態を整理してから進めて",
+    )[0];
+    const correction = extractBehaviorMemory(
+      "訂正: 作業前に目的と危険を整理してから進めて",
+    )[0];
+    if (initial === undefined || correction === undefined) {
+      throw new Error("open-ended preference was not extracted");
+    }
+    store.rememberBehaviorMemory({ playerId: player.id, ...initial });
+    const updated = store.correctBehaviorMemory({
+      playerId: player.id,
+      ...correction,
+    });
+
+    expect(updated.source).toBe("owner_correction");
+    expect(store.listBehaviorMemories(player.id)).toEqual([
+      expect.objectContaining({ id: updated.id, value: correction.value }),
+    ]);
     store.close();
   });
 
