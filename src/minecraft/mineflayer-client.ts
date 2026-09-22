@@ -753,6 +753,7 @@ export class MineflayerClient implements MinecraftPort {
     for (const item of bot.inventory.items()) {
       inventory.set(item.name, (inventory.get(item.name) ?? 0) + item.count);
     }
+    const craftingTable = findCraftingTable(bot, input.radius);
     for (const itemName of requested) {
       if (candidates.length >= input.maxCandidates) break;
       const item = bot.registry.itemsByName[itemName];
@@ -764,7 +765,7 @@ export class MineflayerClient implements MinecraftPort {
       if (item === undefined || recipesFor === undefined) continue;
       let recipe: unknown;
       try {
-        recipe = recipesFor.call(bot, item.id, null, 1, null)[0];
+        recipe = recipesFor.call(bot, item.id, null, 1, craftingTable)[0];
       } catch {
         recipe = undefined;
       }
@@ -1166,7 +1167,8 @@ export class MineflayerClient implements MinecraftPort {
         failedAt: "craft_item",
       });
     }
-    const recipe = recipesFor.call(bot, item.id, null, 1, null)[0];
+    const craftingTable = findCraftingTable(bot, 8);
+    const recipe = recipesFor.call(bot, item.id, null, 1, craftingTable)[0];
     if (recipe === undefined) {
       throw new AppError({
         category: "resource",
@@ -1177,7 +1179,7 @@ export class MineflayerClient implements MinecraftPort {
       });
     }
     const before = await this.observe();
-    await craft.call(bot, recipe, target.count, null);
+    await craft.call(bot, recipe, target.count, craftingTable);
     throwIfAborted(signal, "craft_item");
     const after = await this.observe();
     const beforeCount =
@@ -1612,6 +1614,12 @@ export class MineflayerClient implements MinecraftPort {
       }
     }
   }
+}
+
+function findCraftingTable(bot: Bot, maxDistance: number): unknown {
+  const tableId = bot.registry.blocksByName.crafting_table?.id;
+  if (tableId === undefined) return null;
+  return bot.findBlock({ matching: tableId, maxDistance, count: 1 });
 }
 
 function droppedItemName(entity: {

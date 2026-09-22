@@ -246,6 +246,8 @@ export class FakeMinecraft implements MinecraftPort {
       ...target,
       name:
         {
+          stone: "cobblestone",
+          deepslate: "cobbled_deepslate",
           iron_ore: "raw_iron",
           deepslate_iron_ore: "raw_iron",
           gold_ore: "raw_gold",

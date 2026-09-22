@@ -519,6 +519,13 @@ export class CompanionGameController implements GameController {
     signal: AbortSignal,
   ): Promise<ActionReport> {
     const current = await this.#minecraft.observe();
+    if (input.furnace !== null && input.furnace !== undefined) {
+      this.#assertActionDistance(
+        current,
+        input.furnace,
+        "SMELT_DISTANCE_EXCEEDED",
+      );
+    }
     const baseline = countInventory(current, input.output);
     return this.#executeTask(
       signal,
@@ -870,6 +877,9 @@ function isGatherableLog(resource: string): resource is GatherableLog {
 
 function minedItemName(blockName: string): string {
   const drops: Record<string, string> = {
+    stone: "cobblestone",
+    deepslate: "cobbled_deepslate",
+    clay: "clay_ball",
     coal_ore: "coal",
     deepslate_coal_ore: "coal",
     iron_ore: "raw_iron",

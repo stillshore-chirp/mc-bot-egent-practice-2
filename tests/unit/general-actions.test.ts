@@ -11,7 +11,7 @@ import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.
 import { MoveToSkill } from "../../src/skills/move-to.js";
 import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
 import { MemoryStore } from "../../src/memory/store.js";
-import { FakeMinecraft } from "../support/fake-minecraft.js";
+import { createSnapshot, FakeMinecraft } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
 function controller(minecraft: FakeMinecraft) {
@@ -114,6 +114,28 @@ describe("general safe actions", () => {
     close();
   });
 
+  it("confirms the authoritative drop for ordinary stone", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "stone",
+      position: { x: 2, y: 63, z: 0 },
+    });
+    const { game, close } = controller(minecraft);
+    const report = await game.mineBlock(
+      { name: "stone", position: { x: 2, y: 63, z: 0 } },
+      new AbortController().signal,
+    );
+    expect(report).toMatchObject({
+      outcome: "completed",
+      confirmedState: {
+        block: "stone",
+        item: "cobblestone",
+        collectedCount: 1,
+      },
+    });
+    close();
+  });
+
   it("verifies craft, place, and smelt outputs through observed state", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.snapshot = {
@@ -141,6 +163,27 @@ describe("general safe actions", () => {
     expect(smelted).toMatchObject({
       outcome: "completed",
       confirmedState: { output: "iron_ingot", smeltedCount: 2 },
+    });
+    close();
+  });
+
+  it("rejects a furnace outside the controller action range", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ inventory: [{ name: "raw_iron", count: 1 }] }),
+    );
+    const { game, close } = controller(minecraft);
+    await expect(
+      game.smeltItem(
+        {
+          input: "raw_iron",
+          output: "iron_ingot",
+          count: 1,
+          furnace: { x: 129, y: 64, z: 0 },
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      detail: { code: "SMELT_DISTANCE_EXCEEDED" },
     });
     close();
   });
