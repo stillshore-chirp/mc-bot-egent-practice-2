@@ -8,6 +8,7 @@ import {
   isImmediateStopCommand,
   isHostileResponseCommand,
   isHostileEvadeIntent,
+  hostileResponseIntent,
   type ChatContextFactory,
 } from "../../src/agent/chat-coordinator.js";
 import { TraceService } from "../../src/trace/service.js";
@@ -38,18 +39,34 @@ const minimalToolContext: ToolContext = {
 };
 
 describe("hostile response command", () => {
-  it("recognizes a contextual elimination request but not questions or negation", () => {
-    expect(isHostileResponseCommand("そいつらを撃滅せよ")).toBe(true);
-    expect(isHostileResponseCommand("敵をどうにかして")).toBe(true);
-    expect(isHostileResponseCommand("敵を倒せる？")).toBe(false);
-    expect(isHostileResponseCommand("敵を倒さないで")).toBe(false);
-    expect(isHostileResponseCommand("敵から逃げるのを助けて")).toBe(true);
-    expect(isHostileEvadeIntent("敵から逃げるのを助けて")).toBe(true);
-    expect(isHostileEvadeIntent("そいつらを撃滅せよ")).toBe(false);
-    expect(isHostileEvadeIntent("逃げないで倒して")).toBe(false);
+  it.each([
+    ["そいつらを撃滅せよ", "eliminate"],
+    ["敵をどうにかして", "eliminate"],
+    ["敵を倒して", "eliminate"],
+    ["退避しないで倒して", "eliminate"],
+    ["距離を取らないで攻撃して", "eliminate"],
+    ["逃げないで倒して", "eliminate"],
+    ["敵から逃げるのを助けて", "evade"],
+    ["攻撃しないで逃げて", "evade"],
+    ["攻撃は不要、退避して", "evade"],
+    ["敵を攻撃しないでどうにかして", "evade"],
+    ["木を倒して", null],
+    ["原木を攻撃して", null],
+    ["木を倒して、敵は近い", null],
+    ["敵を倒せる？", null],
+    ["敵を倒さないで", null],
+    ["木を倒して、退避しないで", null],
+  ] as const)("classifies %s as %s", (message, expected) => {
+    expect(hostileResponseIntent(message)).toBe(expected);
+    expect(isHostileResponseCommand(message)).toBe(expected !== null);
+    expect(isHostileEvadeIntent(message)).toBe(expected === "evade");
   });
 
-  it("routes an embedded escape request to evacuation, not combat", async () => {
+  it.each([
+    "敵から逃げるのを助けて",
+    "攻撃しないで逃げて",
+    "攻撃は不要、退避して",
+  ])("routes %s to evacuation, not combat", async (message) => {
     const respondToHostiles = vi.fn(async () => ({
       outcome: "completed" as const,
       summary: "距離を取りました。",
@@ -68,11 +85,39 @@ describe("hostile response command", () => {
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
-    await coordinator.handleChat("owner", "敵から逃げるのを助けて");
+    await coordinator.handleChat("owner", message);
     expect(respondToHostiles).toHaveBeenCalledWith(
       "evade",
       expect.any(AbortSignal),
     );
+  });
+
+  it("keeps a tree-cutting request on the ordinary task path", async () => {
+    const respondToHostiles = vi.fn();
+    const deliberate = vi.fn(async () => ({
+      text: "作業の対象を確認します。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        respondToHostiles,
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "確認済み状態",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+    await coordinator.handleChat("owner", "木を倒して");
+    expect(deliberate).toHaveBeenCalledOnce();
+    expect(respondToHostiles).not.toHaveBeenCalled();
   });
 
   it("preempts the prior task and acts without waiting for an LLM refusal", async () => {

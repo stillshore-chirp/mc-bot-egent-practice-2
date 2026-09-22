@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 
 import type { RuntimeReassessmentRunOutcome } from "../app/runtime-reassessment-gate.js";
+import type { HostileGoal } from "../decision/hostile-response.js";
 import {
   createCorrelationId,
   runWithCorrelation,
@@ -199,21 +200,62 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
   );
 }
 
-export function isHostileResponseCommand(message: string): boolean {
+export function hostileResponseIntent(message: string): HostileGoal | null {
   const normalized = message.trim();
-  if (/[?？「」『』“”]/u.test(normalized)) return false;
-  if (/(?:倒|攻撃|戦|撃滅|退治).{0,8}(?:ない|ません|不要)/u.test(normalized)) {
-    return false;
+  if (/[?？「」『』“”]/u.test(normalized)) return null;
+
+  const negatedEvade =
+    /(?:逃げ(?:ないで|るな|なくていい)|退避(?:しないで|するな|は不要|不要)|距離を取(?:らないで|るな)|離れ(?:ないで|るな))/gu;
+  const negatedAttack =
+    /(?:倒(?:さないで|すな|さなくていい|してはいけない)|攻撃(?:しないで|するな|は不要|不要|してはいけない)|戦(?:わないで|うな)|撃滅(?:しないで|するな)|討伐(?:しないで|するな)|退治(?:しないで|するな)|やっつけないで)/gu;
+  const hasNegatedEvade = negatedEvade.test(normalized);
+  const hasNegatedAttack = negatedAttack.test(normalized);
+  const affirmativeEvade = normalized.replace(negatedEvade, "");
+  const affirmativeAttack = normalized.replace(negatedAttack, "");
+  if (
+    /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))/u.test(
+      affirmativeEvade,
+    )
+  ) {
+    return "evade";
   }
-  return /(?:撃滅|討伐|退治|やっつけ(?:て|ろ)|倒(?:せ|して|しろ|しなさい)|攻撃(?:して|しろ|せよ)|(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)|^(?:逃げて|退避して|距離を取って))/u.test(
-    normalized,
+
+  const clauses = affirmativeAttack.split(/[、，,。]/u);
+  const distress = clauses.some((clause) =>
+    /(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)/u.test(
+      clause,
+    ),
   );
+  if (hasNegatedAttack) return distress ? "evade" : null;
+  const combat = clauses.some((clause) => {
+    const hostileTarget =
+      /(?:敵|モンスター|ゾンビ|スケルトン|クリーパー|そいつら?|あいつら?|やつら|奴ら)/u.test(
+        clause,
+      );
+    const nonHostileTarget =
+      /(?:木|樹|原木|竹|草|ブロック).{0,5}(?:倒|攻撃|撃滅|討伐|退治)/u.test(
+        clause,
+      );
+    const explicitCombat =
+      /(?:撃滅(?:して|せよ|しろ)?|討伐(?:して|しろ)?|退治(?:して|しろ)?|やっつけ(?:て|ろ))/u.test(
+        clause,
+      );
+    const genericCombat =
+      /(?:倒(?:して|せ|しろ|しなさい)|攻撃(?:して|しろ|せよ))/u.test(clause);
+    return (
+      (explicitCombat && (!nonHostileTarget || hostileTarget)) ||
+      (genericCombat && !nonHostileTarget && (hostileTarget || hasNegatedEvade))
+    );
+  });
+  return combat || distress ? "eliminate" : null;
+}
+
+export function isHostileResponseCommand(message: string): boolean {
+  return hostileResponseIntent(message) !== null;
 }
 
 export function isHostileEvadeIntent(message: string): boolean {
-  return /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|退避|距離を取|(?:敵|モンスター).{0,8}離れて|安全な場所へ(?:移動|行って))/u.test(
-    message,
-  );
+  return hostileResponseIntent(message) === "evade";
 }
 
 function renderReadOnlyStatus(status: GameStatus): string {
