@@ -36,6 +36,7 @@ const STOP_COMMANDS = new Set([
  */
 export function isReadOnlyStatusQuestion(message: string): boolean {
   const normalized = message.trim().replace(/\s+/gu, " ");
+  if (isImmediateStopCommand(normalized)) return false;
   if (normalized === "なぜ") return true;
   if (/^(?:状態|状況|進捗)(?:を教えて|を説明して)?[?？]?$/u.test(normalized)) {
     return true;
@@ -50,7 +51,7 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
     }
   }
   const includesAction =
-    /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作って|始め|続け|再開|使って|置いて|取り)/u.test(
+    /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作って|始め|続け|再開|使って|置いて|取り|停止|止ま|止め|ストップ|やめ|中止|中断)/u.test(
       normalized,
     );
   const isReasonForStoppedWork =
@@ -268,7 +269,7 @@ export class ChatCoordinator {
     if (username !== this.#ownerUsername) return false;
 
     const normalized = message.trim();
-    if (STOP_COMMANDS.has(normalized)) {
+    if (isImmediateStopCommand(normalized)) {
       this.#runtimeGeneration += 1;
       this.#generation += 1;
       this.#notifyImmediateStop();
@@ -708,5 +709,8 @@ export class ChatCoordinator {
 }
 
 export function isImmediateStopCommand(message: string): boolean {
-  return STOP_COMMANDS.has(message.trim());
+  const normalized = message.trim().replace(/\s+/gu, " ");
+  return normalized
+    .split(/[、，,。！？!?]/u)
+    .some((clause) => STOP_COMMANDS.has(clause.trim()));
 }

@@ -52,22 +52,44 @@ function permitsJargon(message: string): boolean {
   );
 }
 
+const GOAL_ACTION_PATTERN =
+  /(?:続け|続行|再開|集め|採取|移動|追従|来|戻|探|収納|登録|始め|使|置|掘|作|建築|攻撃|戦|食べ|飲み|拾|捨て|もう一度|もう一回)/u;
+const NON_AUTHORIZING_PATTERN =
+  /(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|(?:して|て|って|で)(?:も)?(?:いい|よい|大丈夫|はいけない|はならない|ほしくない|ほしくありません))[?？]?/u;
+const AFFIRMATIVE_GOAL_ACTION_PATTERN =
+  /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|来て|戻って|探して|収納して|登録して|始めて|使って|置いて|掘って|作って|建築して|攻撃して|食べて|飲んで|拾って|捨てて)/u;
+
+function goalActionClauses(message: string): string[] {
+  return message
+    .split(/[、，,。！？!?]/u)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+}
+
+function isNonAuthorizingActionClause(clause: string): boolean {
+  return (
+    GOAL_ACTION_PATTERN.test(clause) && NON_AUTHORIZING_PATTERN.test(clause)
+  );
+}
+
+function isAffirmativeActionClause(clause: string): boolean {
+  return (
+    !isNonAuthorizingActionClause(clause) &&
+    AFFIRMATIVE_GOAL_ACTION_PATTERN.test(clause)
+  );
+}
+
 function negatesGoalAction(message: string): boolean {
-  const mentionsAction =
-    /(?:続け|続行|再開|集め|採取|移動|追従|来|戻|探|収納|登録|始め|使|置|掘|作|建築|攻撃|戦|食べ|飲み|拾|捨て|もう一度|もう一回)/u.test(
-      message,
-    );
-  const nonAuthorizingPhrase =
-    /(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|(?:して|て|って|で)(?:も)?(?:いい|よい|大丈夫|はいけない|はならない|ほしくない|ほしくありません))[?？]?/u.test(
-      message,
-    );
-  return mentionsAction && nonAuthorizingPhrase;
+  const clauses = goalActionClauses(message);
+  return (
+    clauses.some((clause) => isNonAuthorizingActionClause(clause)) &&
+    !clauses.some((clause) => isAffirmativeActionClause(clause))
+  );
 }
 
 function explicitlyResumesGoal(message: string): boolean {
-  if (negatesGoalAction(message)) return false;
-  return /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|来て|戻って|探して|収納して|登録して|始めて)/u.test(
-    message,
+  return goalActionClauses(message).some((clause) =>
+    isAffirmativeActionClause(clause),
   );
 }
 

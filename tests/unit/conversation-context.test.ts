@@ -135,6 +135,14 @@ describe("conversation context", () => {
     }
   });
 
+  it("allows an explicit replacement action after a prohibition", () => {
+    const store = new ConversationContextStore();
+    store.recordCancellation("owner");
+    store.recordUser("owner", "採取は再開しないで、拠点に戻って。");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+  });
+
   it("honors requests to stop being concise", () => {
     expect(
       updateConversationPreferences(

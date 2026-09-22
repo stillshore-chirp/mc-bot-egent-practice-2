@@ -52,6 +52,32 @@ describe("immediate stop command", () => {
     expect(isImmediateStopCommand("停止方法を教えて")).toBe(false);
   });
 
+  it("prioritizes a compound stop clause over a status question", () => {
+    expect(isImmediateStopCommand("今どうなってる、止まって")).toBe(true);
+    expect(isReadOnlyStatusQuestion("今どうなってる、止まって")).toBe(false);
+  });
+
+  it("executes a compound stop clause before answering its status prefix", async () => {
+    const stopCurrentAction = vi.fn(async () => ({
+      outcome: "completed",
+      summary: "停止しました。",
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction,
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {} as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "今どうなってる、止まって");
+
+    expect(stopCurrentAction).toHaveBeenCalledWith("利用者の即時停止指示");
+  });
+
   it.each([
     "今どうなってる？",
     "今どうなってる",
@@ -66,6 +92,7 @@ describe("immediate stop command", () => {
   it.each([
     "今の状況を教えて、木を集めて？",
     "今どうなってる、木を集めて",
+    "今どうなってる、止まらないで",
     "なぜ止まった？ もう一度来て",
     "なぜ失敗？木を集めて",
   ])(

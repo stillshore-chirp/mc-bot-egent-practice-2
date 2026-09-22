@@ -56,6 +56,7 @@ interface TaskStateForSummary {
   readonly phase: string;
   readonly updatedAt: string;
   readonly failureCategory?: string;
+  readonly failureCode?: string;
   readonly checkpoint?: Readonly<Record<string, unknown>>;
 }
 
@@ -439,12 +440,16 @@ export class CompanionGameController implements GameController {
       const reason = timeoutSignal.aborted
         ? "設定された作業時間を超過"
         : "利用者または上位処理による停止";
-      cancellation = this.#tasks.cancel(reason).catch((error: unknown) => {
-        this.#logger.error(
-          { errorType: error instanceof Error ? error.name : "UnknownError" },
-          "task cancellation persistence failed",
-        );
-      });
+      cancellation = this.#tasks
+        .cancel(reason, timeoutSignal.aborted ? "TASK_TIMEOUT" : undefined)
+        .catch((error: unknown) => {
+          this.#logger.error(
+            {
+              errorType: error instanceof Error ? error.name : "UnknownError",
+            },
+            "task cancellation persistence failed",
+          );
+        });
     };
     cancellationSignal.addEventListener("abort", cancel, { once: true });
 
@@ -567,6 +572,9 @@ export class CompanionGameController implements GameController {
             ...(active.failure === undefined
               ? {}
               : { failureCategory: active.failure.category }),
+            ...(active.failure === undefined
+              ? {}
+              : { failureCode: active.failure.code }),
             ...(active.checkpoint === undefined
               ? {}
               : { checkpoint: active.checkpoint }),
@@ -757,13 +765,13 @@ function latestTaskState(task: TaskStateForSummary | undefined): string | null {
   if (task === undefined) return null;
   if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
   if (task.status === "failed") {
-    const reason = taskFailureReason(task.failureCategory);
+    const reason = taskFailureReason(task.failureCategory, task.failureCode);
     return reason === undefined
       ? "直前のMinecraft作業は完了を確認できませんでした。"
       : "直前のMinecraft作業は完了を確認できませんでした。" + reason;
   }
   if (task.status === "cancelled") {
-    const reason = taskFailureReason(task.failureCategory);
+    const reason = taskFailureReason(task.failureCategory, task.failureCode);
     return reason === undefined
       ? "直前のMinecraft作業は停止しました。"
       : "直前のMinecraft作業は停止しました。" + reason;
@@ -783,13 +791,17 @@ function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {
     ...(task.failure === undefined
       ? {}
       : { failureCategory: task.failure.category }),
+    ...(task.failure === undefined ? {} : { failureCode: task.failure.code }),
     ...(typeof suspendReason === "string"
       ? { checkpoint: { suspendReason } }
       : {}),
   };
 }
 
-function taskFailureReason(category: string | undefined): string | undefined {
+function taskFailureReason(
+  category: string | undefined,
+  code: string | undefined,
+): string | undefined {
   switch (category) {
     case "connection":
       return "Minecraftへの接続を確認できませんでした。";
@@ -804,6 +816,12 @@ function taskFailureReason(category: string | undefined): string | undefined {
     case "timeout":
       return "設定時間内に完了しませんでした。";
     case "cancelled":
+      if (code === "TASK_TIMEOUT") {
+        return "設定時間内に完了しませんでした。";
+      }
+      if (code === "TASK_REPLACED_AFTER_SUSPENSION") {
+        return "安全待機中に別の依頼へ切り替えました。";
+      }
       return "停止指示で中断しました。";
     case "safety":
       return "安全確認のため停止しました。";
