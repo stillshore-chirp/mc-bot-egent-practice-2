@@ -115,6 +115,51 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it.each([
+    {
+      reason: "reflex:hazard",
+      observed: "危険を確認したため",
+      currentCheck: "現在も危険があるかは再確認が必要",
+      nextAction: "周囲が安全か再確認する",
+    },
+    {
+      reason: "reflex:hostile",
+      observed: "危険な相手または被害を確認したため",
+      currentCheck: "現在も危険があるかは再確認が必要",
+      nextAction: "周囲の安全を再確認してからもう一度指示する",
+    },
+    {
+      reason: "reflex:damage",
+      observed: "危険な相手または被害を確認したため",
+      currentCheck: "現在も危険があるかは再確認が必要",
+      nextAction: "周囲の安全を再確認してからもう一度指示する",
+    },
+    {
+      reason: "reflex:hunger",
+      observed: "空腹を確認したため",
+      currentCheck: "現在の空腹状態と食料を再確認し",
+      nextAction: "現在の空腹状態と食料を再確認する",
+    },
+  ])(
+    "separates a remembered $reason observation from the current state",
+    async ({ reason, observed, currentCheck, nextAction }) => {
+      const minecraft = new FakeMinecraft();
+      const { game, tasks, close } = createController(minecraft);
+      const follow = game.followOwner(3, 60, new AbortController().signal);
+      await waitUntil(() => minecraft.actions.includes("follow:owner"));
+
+      await tasks.suspend(reason);
+      const report = await follow;
+
+      expect(report.summary).toContain(observed);
+      expect(report.summary).toContain(currentCheck);
+      expect(report.nextActions).toContain(nextAction);
+      expect(report.summary).not.toContain("現在の周囲に危険を観測");
+      expect(report.summary).not.toContain("近くの危険を確認したため");
+      close();
+    },
+  );
+
   it("reports the observed new inventory count after gathering and returning", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push(

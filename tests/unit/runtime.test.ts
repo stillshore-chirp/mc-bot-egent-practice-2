@@ -143,14 +143,10 @@ describe("TaskRuntime", () => {
     const replacementReady = new Promise<void>((resolve) => {
       replacementStarted = resolve;
     });
-    const replacement = runtime.run(
-      "follow_player",
-      { retry: true },
-      async () => {
-        replacementStarted();
-        return { restarted: true };
-      },
-    );
+    const replacement = runtime.run("move_to", { retry: true }, async () => {
+      replacementStarted();
+      return { restarted: true };
+    });
     await replacementReady;
     releaseFirst();
 
@@ -167,7 +163,7 @@ describe("TaskRuntime", () => {
       output: { restarted: true },
     });
     expect(runtime.current).toMatchObject({
-      kind: "follow_player",
+      kind: "move_to",
       status: "completed",
     });
     expect(stopCount).toBe(1);
