@@ -198,7 +198,9 @@ export class CompanionContextFactory implements ChatContextFactory {
             contextLines.length === 0
               ? "関連する保存済み記憶はありません。"
               : contextLines.map((line) => `- ${line}`).join("\n"),
-          worldContext: JSON.stringify(status),
+          worldContext:
+            "Bot自身のMinecraft観測（利用者の体力・空腹・酸素・水中状態は未観測）:\n" +
+            JSON.stringify(status),
           toolContext: {
             correlationId,
             requesterUsername,
