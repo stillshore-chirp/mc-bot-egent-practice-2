@@ -22,6 +22,7 @@ function createController(
   minecraft: FakeMinecraft,
   withPlayer = false,
   taskStore: TaskStore = new InMemoryTaskStore(),
+  hungerThreshold = 14,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "mc-game-controller-"));
   const memory = MemoryStore.open(join(directory, "memory.sqlite"));
@@ -51,6 +52,7 @@ function createController(
       ownerUsername: "owner",
       ...(playerId === undefined ? {} : { playerId }),
       taskTimeoutMs: 2_000,
+      hungerThreshold,
       retryLimit: 1,
       logger: pino({ level: "silent" }),
       memory,
@@ -393,8 +395,8 @@ describe("CompanionGameController", () => {
     },
     {
       reason: "reflex:hunger",
-      observed: "Botの空腹を確認したため",
-      currentCheck: "食料を確保して安全を確認",
+      observed: "直前にBotの空腹を確認し",
+      currentCheck: "今回の観測では空腹が解消しています",
       nextAction: "Botの食料と空腹状態を確認する",
     },
   ])(
@@ -436,6 +438,75 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it.each([
+    {
+      danger: "fire",
+      snapshot: createSnapshot({
+        onFire: true,
+        nearbyEntities: [hostile(1, 4)],
+      }),
+    },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+        nearbyEntities: [hostile(1, 4)],
+      }),
+    },
+    {
+      danger: "hunger",
+      snapshot: createSnapshot({ food: 10, nearbyEntities: [hostile(1, 4)] }),
+    },
+  ])("does not use hostile retreat to bypass $danger", async ({ snapshot }) => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hostile");
+    await follow;
+    minecraft.snapshot = snapshot;
+
+    const response = await game.respondToHostiles(
+      "evade",
+      new AbortController().signal,
+    );
+
+    expect(response).toMatchObject({
+      outcome: "failed",
+      failureCategory: "safety",
+      failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+    });
+    expect(minecraft.actions).not.toContain("retreat:hostile");
+    expect(tasks.current?.status).toBe("suspended");
+    close();
+  });
+
+  it("uses the configured food threshold before replacing a hunger suspension", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(
+      minecraft,
+      false,
+      new InMemoryTaskStore(),
+      16,
+    );
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hunger");
+    await follow;
+    minecraft.snapshot = createSnapshot({ food: 15 });
+
+    const retry = await game.followOwner(3, 60, new AbortController().signal);
+
+    expect(retry.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    expect(tasks.current?.status).toBe("suspended");
+    expect((await game.observeStatus()).activeTaskSummary).toContain(
+      "今も空腹",
+    );
+    close();
+  });
+
   it("reports a currently observed threat separately from the reason a task stopped", async () => {
     const minecraft = new FakeMinecraft();
     const { game, tasks, close } = createController(minecraft);
@@ -470,6 +541,7 @@ describe("CompanionGameController", () => {
       danger: "hostile",
       snapshot: createSnapshot({ nearbyEntities: [hostile(1, 4)] }),
     },
+    { danger: "hunger", snapshot: createSnapshot({ food: 10 }) },
   ])(
     "does not start a replacement action while $danger remains",
     async ({ snapshot }) => {

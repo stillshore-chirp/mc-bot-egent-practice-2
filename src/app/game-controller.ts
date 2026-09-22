@@ -74,6 +74,7 @@ interface CompanionGameControllerInput {
   readonly ownerUsername: string;
   readonly playerId?: string;
   readonly taskTimeoutMs: number;
+  readonly hungerThreshold?: number;
   readonly retryLimit: number;
   readonly maxMoveDistance?: number;
   readonly logger: Logger;
@@ -137,6 +138,7 @@ export class CompanionGameController implements GameController {
   readonly #ownerUsername: string;
   readonly #playerId: string | undefined;
   readonly #taskTimeoutMs: number;
+  readonly #hungerThreshold: number;
   readonly #retryLimit: number;
   readonly #maxMoveDistance: number;
   readonly #logger: Logger;
@@ -168,6 +170,7 @@ export class CompanionGameController implements GameController {
     this.#ownerUsername = input.ownerUsername;
     this.#playerId = input.playerId;
     this.#taskTimeoutMs = input.taskTimeoutMs;
+    this.#hungerThreshold = input.hungerThreshold ?? 14;
     this.#retryLimit = input.retryLimit;
     this.#maxMoveDistance = input.maxMoveDistance ?? 128;
     this.#logger = input.logger;
@@ -1142,7 +1145,7 @@ export class CompanionGameController implements GameController {
       | "summary"
     >,
     capturedBefore?: WorldSnapshot,
-    allowSafetyResponse = false,
+    allowHostileResponse = false,
   ): Promise<ActionReport> {
     const beforeSnapshot = capturedBefore ?? (await this.#tryObserveSnapshot());
     const before =
@@ -1160,8 +1163,12 @@ export class CompanionGameController implements GameController {
         summary: "停止指示済みのためMinecraft作業を開始しませんでした。",
       };
     }
-    if (this.#tasks.current?.status === "suspended" && !allowSafetyResponse) {
-      const danger = observedCurrentDanger(beforeSnapshot);
+    if (this.#tasks.current?.status === "suspended") {
+      const danger = observedCurrentDanger(
+        beforeSnapshot,
+        this.#hungerThreshold,
+        allowHostileResponse,
+      );
       if (
         beforeSnapshot === null ||
         !beforeSnapshot.connected ||
@@ -1241,7 +1248,11 @@ export class CompanionGameController implements GameController {
       };
     }
     if (record.status === "suspended") {
-      const recovery = suspendedTaskRecovery(record, afterSnapshot);
+      const recovery = suspendedTaskRecovery(
+        record,
+        afterSnapshot,
+        this.#hungerThreshold,
+      );
       return {
         before,
         after,
@@ -1308,9 +1319,13 @@ export class CompanionGameController implements GameController {
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
       armor: snapshot.armor,
-      activeTaskState: activeTaskState(task, snapshot),
-      activeTaskSummary: activeTaskSummary(task, snapshot),
-      latestTaskState: latestTaskState(task, snapshot),
+      activeTaskState: activeTaskState(task, snapshot, this.#hungerThreshold),
+      activeTaskSummary: activeTaskSummary(
+        task,
+        snapshot,
+        this.#hungerThreshold,
+      ),
+      latestTaskState: latestTaskState(task, snapshot, this.#hungerThreshold),
     };
   }
 
@@ -1426,10 +1441,11 @@ interface SuspendedTaskRecovery {
 function suspendedTaskRecovery(
   task: TaskStateForSummary,
   snapshot?: WorldSnapshot | null,
+  hungerThreshold = 14,
 ): SuspendedTaskRecovery {
   const reason = task.checkpoint?.suspendReason;
   const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
-  const currentDanger = observedCurrentDanger(snapshot);
+  const currentDanger = observedCurrentDanger(snapshot, hungerThreshold);
   if (reason === "reflex:stuck") {
     return {
       summary: `移動中にBotの位置が変わらず、${actionLabel}を一時停止しました。${currentDanger ?? "通れない地形の詳細はまだ確認できていません。"} 通れる道を確保できたら「続けて」で再開できます。`,
@@ -1468,8 +1484,7 @@ function suspendedTaskRecovery(
   }
   if (reason === "reflex:hunger") {
     return {
-      summary:
-        "Botの空腹を確認したため、作業を一時停止しました。食料を確保して安全を確認できたら「続けて」で再開できます。",
+      summary: `直前にBotの空腹を確認し、作業を一時停止しました。${currentDanger ?? (snapshot?.connected === true ? "今回の観測では空腹が解消しています。" : "現在の空腹状態はまだ観測できていません。")} 安全を確認できたら「続けて」で再開できます。`,
       nextActions: [
         "Botの食料と空腹状態を確認する",
         "食料を確保した後に「続けて」で再開する",
@@ -1483,7 +1498,11 @@ function suspendedTaskRecovery(
   };
 }
 
-function observedCurrentDanger(snapshot?: WorldSnapshot | null): string | null {
+function observedCurrentDanger(
+  snapshot?: WorldSnapshot | null,
+  hungerThreshold = 14,
+  allowHostileResponse = false,
+): string | null {
   if (snapshot === undefined || snapshot === null) return null;
   if (snapshot.inLava || snapshot.onFire || snapshot.suffocating) {
     return "今もBotの周囲に環境上の危険を観測しています。";
@@ -1495,11 +1514,15 @@ function observedCurrentDanger(snapshot?: WorldSnapshot | null): string | null {
     return "Botは水中にいて、呼吸の安全を確認できません。";
   }
   if (
+    !allowHostileResponse &&
     snapshot.nearbyEntities.some(
       (entity) => entity.hostile && entity.distance <= 8,
     )
   ) {
     return "今もBotの近くに敵を観測しています。";
+  }
+  if (snapshot.food <= hungerThreshold) {
+    return "Botは今も空腹で、安全に作業できる状態を確認できません。";
   }
   return null;
 }
@@ -1507,6 +1530,7 @@ function observedCurrentDanger(snapshot?: WorldSnapshot | null): string | null {
 function activeTaskState(
   task: TaskStateForSummary | undefined,
   snapshot: WorldSnapshot,
+  hungerThreshold: number,
 ): string | null {
   if (
     task === undefined ||
@@ -1515,7 +1539,7 @@ function activeTaskState(
   )
     return null;
   if (task.status === "suspended") {
-    return suspendedTaskRecovery(task, snapshot).summary;
+    return suspendedTaskRecovery(task, snapshot, hungerThreshold).summary;
   }
   return `${task.kind}:${task.phase}:${task.status}`;
 }
@@ -1523,6 +1547,7 @@ function activeTaskState(
 function activeTaskSummary(
   task: TaskStateForSummary | undefined,
   snapshot: WorldSnapshot,
+  hungerThreshold: number,
 ): string | null {
   if (
     task === undefined ||
@@ -1531,7 +1556,7 @@ function activeTaskSummary(
   )
     return null;
   if (task.status === "suspended") {
-    return suspendedTaskRecovery(task, snapshot).summary;
+    return suspendedTaskRecovery(task, snapshot, hungerThreshold).summary;
   }
   if (task.status === "queued") {
     return "Minecraft作業の開始を待っています。";
@@ -1553,6 +1578,7 @@ function activeTaskSummary(
 function latestTaskState(
   task: TaskStateForSummary | undefined,
   snapshot: WorldSnapshot,
+  hungerThreshold: number,
 ): string | null {
   if (task === undefined) return null;
   if (task.persistedWithoutRuntime === true) {
@@ -1572,9 +1598,9 @@ function latestTaskState(
       : "直前のMinecraft作業は停止しました。" + reason;
   }
   if (task.status === "suspended")
-    return suspendedTaskRecovery(task, snapshot).summary;
+    return suspendedTaskRecovery(task, snapshot, hungerThreshold).summary;
   if (task.status === "queued") return "Minecraft作業の開始を待っています。";
-  return activeTaskSummary(task, snapshot);
+  return activeTaskSummary(task, snapshot, hungerThreshold);
 }
 
 function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {

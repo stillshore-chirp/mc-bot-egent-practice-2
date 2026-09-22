@@ -899,6 +899,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     ownerUsername: config.ownerUsername,
     playerId: player.id,
     taskTimeoutMs: config.limits.taskTimeoutMs,
+    hungerThreshold: config.limits.hungerThreshold,
     retryLimit: config.limits.skillRetryLimit,
     maxMoveDistance: config.limits.maxMoveDistance,
     logger,
