@@ -684,6 +684,94 @@ describe("OpenAI tool loop", () => {
     ).toEqual([allowed]);
   });
 
+  it.each([
+    ["拠点ではなくチェストを登録して", "home"],
+    ["チェストじゃなく拠点を登録して", "chest"],
+    ["拠点でなくチェストを忘れて", "home"],
+  ] as const)(
+    "does not mutate a contrasted delivery target in %s",
+    async (message, rejectedKind) => {
+      const toolName = message.includes("忘れて")
+        ? "forget_delivery_target"
+        : "register_delivery_target";
+      const fake = new ScriptedOpenAI([
+        response([], "停止しました。"),
+        response([
+          {
+            type: "function_call",
+            call_id: "call-contrasted-target",
+            name: toolName,
+            arguments: JSON.stringify(
+              toolName === "forget_delivery_target"
+                ? { kind: rejectedKind }
+                : { kind: rejectedKind, position: null },
+            ),
+            status: "completed",
+          },
+        ]),
+        response([], "対象を確認しました。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const request = {
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: toolContext(),
+      };
+      const first = await agent.deliberate({
+        ...request,
+        message: "木を集めて",
+      });
+      agent.recordDeliveredReply("owner", "owner_message", first.text);
+      agent.recordCancelledRequest("owner", "owner_message");
+      const result = await agent.deliberate({ ...request, message });
+
+      expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+        toolName,
+      );
+      expect(result.toolResults[0]?.result).toMatchObject({
+        success: false,
+        error: { code: "OWNER_ACTION_TARGET_NOT_ALLOWED" },
+      });
+    },
+  );
+
+  it.each([
+    "この約束はまだ未完了だと記録して",
+    "この約束は完了していないと記録して",
+    "この約束はまだ済んでいないと記録して",
+  ])("does not complete a negated commitment in %s", async (message) => {
+    const fake = new ScriptedOpenAI([
+      response([], "停止しました。"),
+      response([], "未完了として受け取りました。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({ ...request, message });
+
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "complete_commitment",
+    );
+  });
+
   it("does not turn a generic restart into authorization for every memory write", async () => {
     const fake = new ScriptedOpenAI([
       response([], "登録を始めます。"),

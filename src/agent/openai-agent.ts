@@ -80,15 +80,26 @@ function scopedActionToolNames(
 }
 
 /** A broad "memory" family never grants unrelated persistent mutations. */
+function requestedMemoryClauses(message: string): string[] {
+  if (explicitlyProhibitedActionFamilies(message).includes("memory")) {
+    return [];
+  }
+  return message
+    .split(/[、，,。！？!?]/u)
+    .map(
+      (clause) =>
+        clause
+          .split(/(?:ではなく(?:て)?|じゃなく(?:て)?|でなく(?:て)?)/u)
+          .at(-1) ?? "",
+    )
+    .filter((clause) =>
+      explicitlyAuthorizedActionFamilies(clause).includes("memory"),
+    );
+}
+
 function explicitlyRequestedMemoryTools(message: string): Set<string> {
   const requested = new Set<string>();
-  if (explicitlyProhibitedActionFamilies(message).includes("memory")) {
-    return requested;
-  }
-  for (const clause of message.split(/[、，,。！？!?]/u)) {
-    if (!explicitlyAuthorizedActionFamilies(clause).includes("memory")) {
-      continue;
-    }
+  for (const clause of requestedMemoryClauses(message)) {
     if (clause.includes("登録して")) {
       requested.add("register_delivery_target");
     }
@@ -97,11 +108,22 @@ function explicitlyRequestedMemoryTools(message: string): Set<string> {
     }
     if (/(?:覚えて|記録して|記憶して)/u.test(clause)) {
       if (/(?:約束|コミットメント)/u.test(clause)) {
-        requested.add(
-          /(?:完了|済み)/u.test(clause)
-            ? "complete_commitment"
-            : "set_commitment",
-        );
+        if (
+          /(?:未完了|未達|まだ.{0,12}(?:完了|済み)|(?:完了|済み).{0,12}(?:ない|いない|ません|ではない))/u.test(
+            clause,
+          )
+        ) {
+          continue;
+        }
+        if (
+          /(?:完了|済み)(?:として|に|と)(?:記録して|覚えて|記憶して)/u.test(
+            clause,
+          )
+        ) {
+          requested.add("complete_commitment");
+        } else if (!/(?:完了|済み)/u.test(clause)) {
+          requested.add("set_commitment");
+        }
       } else {
         requested.add(
           /(?:ここ|現在地|この場所|場所|座標|拠点)/u.test(clause)
@@ -117,10 +139,15 @@ function explicitlyRequestedMemoryTools(message: string): Set<string> {
 function explicitlyRequestedDeliveryTargetKinds(
   message: string,
 ): ("home" | "chest")[] {
-  const kinds: ("home" | "chest")[] = [];
-  if (/(?:拠点|帰還先|ホーム)/u.test(message)) kinds.push("home");
-  if (/(?:チェスト|収納先|保管箱)/u.test(message)) kinds.push("chest");
-  return kinds;
+  const clauses = requestedMemoryClauses(message).filter((clause) =>
+    /(?:登録して|忘れて)/u.test(clause),
+  );
+  const kinds = new Set<"home" | "chest">();
+  for (const clause of clauses) {
+    if (/(?:拠点|帰還先|ホーム)/u.test(clause)) kinds.add("home");
+    if (/(?:チェスト|収納先|保管箱)/u.test(clause)) kinds.add("chest");
+  }
+  return [...kinds];
 }
 
 interface PendingOwnerTurn {
