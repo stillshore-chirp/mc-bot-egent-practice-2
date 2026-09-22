@@ -10,10 +10,16 @@ export interface ConversationPreferences {
   readonly avoidJargon: boolean;
 }
 
+export type GoalActionFamily =
+  "return" | "follow" | "gather" | "move" | "inventory" | "memory";
+
 export interface ConversationSnapshot {
   readonly turns: readonly ConversationTurn[];
   readonly preferences: ConversationPreferences;
   readonly cancelledGoal: boolean;
+  readonly prohibitedActionFamilies: readonly GoalActionFamily[];
+  readonly explicitProhibitedActionFamilies: readonly GoalActionFamily[];
+  readonly stoppedActionFamilies: readonly GoalActionFamily[];
 }
 
 const MAX_TURNS = 8;
@@ -60,15 +66,59 @@ const AFFIRMATIVE_GOAL_ACTION_PATTERN =
   /(?:続けて|続行して|再開して|再開しよう|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|ついてきて|ついて来て|戻ってきて|戻って来て|来て|戻って|帰って|帰還して|行って|向かって|収納して|登録して|覚えて|記録して|記憶して|おいで|(?:追従|採取|収集|移動|帰還|収納)を始めて)(?:ください|下さい|ほしい(?:です)?|ね|よ)?$/u;
 const NON_GAME_ACTION_PATTERN =
   /(?:要約|手順|説明|解説|話|会話|文章|文|返答|回答|例|たとえ|比喩|図|表|リスト|計画|理由|質問|答え|言い方|表現|続きを)(?:を|は|について|で|に)?(?:.{0,8}?)(?:使って|作って|続けて|続行して|再開して|再開しよう|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|始めて|探して)/gu;
+const CONCRETE_ACTION_MARKER_PATTERN =
+  /戻|帰|追従|ついて|おいで|来(?:て|ない|なく)|集め|採取|収集|掘|移動|行って|向か|収納|拾|捨|登録|覚え|記録|記憶/gu;
+const EXPLICIT_ACTION_PROHIBITION_PATTERN =
+  /(?:しないで|しなくていい|しなくてもいい|しません|ないで|なくていい|不要|いらない|ほしくない|禁止)/gu;
 
-function goalActionFamily(value: string): string | undefined {
+function goalActionFamily(value: string): GoalActionFamily | undefined {
   if (/(?:戻|帰)/u.test(value)) return "return";
-  if (/(?:追従|ついて|おいで|来て)/u.test(value)) return "follow";
+  if (/(?:追従|ついて|おいで|来(?:て|ない|なく))/u.test(value)) return "follow";
   if (/(?:集め|採取|収集|掘)/u.test(value)) return "gather";
   if (/(?:移動|行|向か)/u.test(value)) return "move";
   if (/(?:収納|拾|捨)/u.test(value)) return "inventory";
   if (/(?:登録|覚え|記録|記憶)/u.test(value)) return "memory";
   return undefined;
+}
+
+function concreteActionMarkers(value: string): GoalActionFamily[] {
+  const normalized = value.replace(/(?:戻|帰)って(?:きて|来て)/gu, "戻って");
+  return [...normalized.matchAll(CONCRETE_ACTION_MARKER_PATTERN)]
+    .map(([marker]) => goalActionFamily(marker))
+    .filter((family): family is GoalActionFamily => family !== undefined);
+}
+
+function concreteActionFamilies(value: string): GoalActionFamily[] {
+  return [...new Set(concreteActionMarkers(value))];
+}
+
+export function explicitlyProhibitedActionFamilies(
+  message: string,
+): GoalActionFamily[] {
+  const prohibited = new Set<GoalActionFamily>();
+  for (const clause of goalActionClauses(compactText(message))) {
+    if (/[?？]/u.test(clause)) continue;
+    for (const match of clause.matchAll(EXPLICIT_ACTION_PROHIBITION_PATTERN)) {
+      const before = clause.slice(0, match.index);
+      const family = concreteActionMarkers(before).at(-1);
+      if (family !== undefined) prohibited.add(family);
+    }
+  }
+  return [...prohibited];
+}
+
+export function explicitlyAuthorizedActionFamilies(
+  message: string,
+): GoalActionFamily[] {
+  const prohibited = new Set(explicitlyProhibitedActionFamilies(message));
+  return [
+    ...new Set(
+      goalActionClauses(compactText(message))
+        .filter(isAffirmativeActionClause)
+        .flatMap(concreteActionFamilies)
+        .filter((family) => !prohibited.has(family)),
+    ),
+  ];
 }
 
 function goalActionClauses(message: string): string[] {
@@ -202,6 +252,10 @@ interface ConversationState {
   turns: ConversationTurn[];
   preferences: ConversationPreferences;
   cancelledGoal: boolean;
+  prohibitedActionFamilies: Set<GoalActionFamily>;
+  explicitProhibitedActionFamilies: Set<GoalActionFamily>;
+  stoppedActionFamilies: GoalActionFamily[];
+  lastActionFamilies: GoalActionFamily[];
 }
 
 /**
@@ -218,12 +272,20 @@ export class ConversationContextStore {
         turns: [],
         preferences: DEFAULT_PREFERENCES,
         cancelledGoal: false,
+        prohibitedActionFamilies: [],
+        explicitProhibitedActionFamilies: [],
+        stoppedActionFamilies: [],
       };
     }
     return {
       turns: [...state.turns],
       preferences: state.preferences,
       cancelledGoal: state.cancelledGoal,
+      prohibitedActionFamilies: [...state.prohibitedActionFamilies],
+      explicitProhibitedActionFamilies: [
+        ...state.explicitProhibitedActionFamilies,
+      ],
+      stoppedActionFamilies: [...state.stoppedActionFamilies],
     };
   }
 
@@ -235,15 +297,45 @@ export class ConversationContextStore {
     };
   }
 
+  /** Safety prohibitions take effect at receipt, even if no reply is sent. */
+  public recordOwnerSafetyIntent(key: string, message: string): void {
+    const state = this.#state(key);
+    for (const family of explicitlyProhibitedActionFamilies(message)) {
+      state.prohibitedActionFamilies.add(family);
+      state.explicitProhibitedActionFamilies.add(family);
+    }
+  }
+
   public recordUser(key: string, message: string): void {
     const state = this.#state(key);
     state.preferences = updateConversationPreferences(
       state.preferences,
       message,
     );
-    if (state.cancelledGoal && explicitlyResumesGoal(compactText(message))) {
+    const prohibited = explicitlyProhibitedActionFamilies(message);
+    const authorized = explicitlyAuthorizedActionFamilies(message);
+    const genericResume =
+      explicitlyResumesGoal(compactText(message)) && authorized.length === 0;
+    const resumedFamilies =
+      genericResume && state.cancelledGoal
+        ? state.stoppedActionFamilies.filter(
+            (family) =>
+              !prohibited.includes(family) &&
+              !state.explicitProhibitedActionFamilies.has(family),
+          )
+        : authorized;
+    for (const family of resumedFamilies) {
+      state.prohibitedActionFamilies.delete(family);
+      state.explicitProhibitedActionFamilies.delete(family);
+    }
+    for (const family of prohibited) {
+      state.prohibitedActionFamilies.add(family);
+      state.explicitProhibitedActionFamilies.add(family);
+    }
+    if (state.cancelledGoal && resumedFamilies.length > 0) {
       state.cancelledGoal = false;
     }
+    if (resumedFamilies.length > 0) state.lastActionFamilies = resumedFamilies;
     this.#append(state, { role: "user", text: message });
   }
 
@@ -251,9 +343,18 @@ export class ConversationContextStore {
     this.#append(this.#state(key), { role: "assistant", text: message });
   }
 
-  public recordCancellation(key: string): void {
+  public recordCancellation(key: string, goalMessage?: string): void {
     const state = this.#state(key);
     if (state.cancelledGoal) return;
+    const requested =
+      goalMessage === undefined
+        ? []
+        : explicitlyAuthorizedActionFamilies(goalMessage);
+    state.stoppedActionFamilies =
+      requested.length > 0 ? requested : state.lastActionFamilies;
+    for (const family of state.stoppedActionFamilies) {
+      state.prohibitedActionFamilies.add(family);
+    }
     state.cancelledGoal = true;
     this.#append(state, {
       role: "assistant",
@@ -268,6 +369,10 @@ export class ConversationContextStore {
       turns: [],
       preferences: DEFAULT_PREFERENCES,
       cancelledGoal: false,
+      prohibitedActionFamilies: new Set(),
+      explicitProhibitedActionFamilies: new Set(),
+      stoppedActionFamilies: [],
+      lastActionFamilies: [],
     };
     this.#sessions.set(key, created);
     return created;
@@ -307,6 +412,11 @@ export function renderConversationContext(
   if (snapshot.cancelledGoal) {
     lines.push(
       "直前の作業は停止済みです。「短く」「詳しく」など説明方法だけの指示では再開せず、「続けて」「再開して」または新しい対象と動作が明示された場合だけ再開してください。",
+    );
+  }
+  if (snapshot.prohibitedActionFamilies.length > 0) {
+    lines.push(
+      "利用者が停止または禁止した操作は、対象を明示して再依頼するまで実行しないでください。",
     );
   }
   return lines.join("\n");

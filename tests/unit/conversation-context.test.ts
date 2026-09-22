@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ConversationContextStore,
+  explicitlyAuthorizedActionFamilies,
+  explicitlyProhibitedActionFamilies,
   isExplicitGoalResumeMessage,
   renderConversationContext,
   updateConversationPreferences,
@@ -109,10 +111,105 @@ describe("conversation context", () => {
 
   it("clears the cancellation boundary after an explicit restart", () => {
     const store = new ConversationContextStore();
+    store.recordUser("owner", "木を集めて。");
     store.recordCancellation("owner");
     store.recordUser("owner", "再開して。");
 
     expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(store.snapshot("owner").prohibitedActionFamilies).not.toContain(
+      "gather",
+    );
+  });
+
+  it("uses the interrupted request to scope a short restart", () => {
+    const store = new ConversationContextStore();
+    store.recordCancellation("owner", "木を集めて");
+    store.recordUser("owner", "再開して");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(store.snapshot("owner").prohibitedActionFamilies).not.toContain(
+      "gather",
+    );
+  });
+
+  it("retains a prohibited action when a different action replaces the stopped goal", () => {
+    const store = new ConversationContextStore();
+    store.recordUser("owner", "木を集めて。");
+    store.recordCancellation("owner");
+    store.recordUser("owner", "採取は再開しないで、拠点に戻って。");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(store.snapshot("owner").prohibitedActionFamilies).toContain(
+      "gather",
+    );
+    expect(store.snapshot("owner").prohibitedActionFamilies).not.toContain(
+      "return",
+    );
+    store.recordUser("owner", "続けて。");
+    expect(store.snapshot("owner").prohibitedActionFamilies).toContain(
+      "gather",
+    );
+  });
+
+  it("applies an owner prohibition before a reply is delivered", () => {
+    const store = new ConversationContextStore();
+    store.recordOwnerSafetyIntent("owner", "採取しないで");
+
+    expect(store.snapshot("owner").prohibitedActionFamilies).toContain(
+      "gather",
+    );
+    expect(store.snapshot("owner").turns).toEqual([]);
+  });
+
+  it("lifts a family's prohibition when the owner explicitly requests that action", () => {
+    const store = new ConversationContextStore();
+    store.recordUser("owner", "木を集めて。");
+    store.recordCancellation("owner");
+    store.recordUser("owner", "同じ木を採取して。");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(store.snapshot("owner").prohibitedActionFamilies).not.toContain(
+      "gather",
+    );
+  });
+
+  it("does not let a generic restart undo an explicit prohibition", () => {
+    const store = new ConversationContextStore();
+    store.recordUser("owner", "木を集めて。");
+    store.recordCancellation("owner");
+    store.recordUser("owner", "採取しないで。");
+    store.recordUser("owner", "再開して。");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(true);
+    expect(store.snapshot("owner").prohibitedActionFamilies).toContain(
+      "gather",
+    );
+    store.recordUser("owner", "木を採取して。");
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
+    expect(store.snapshot("owner").prohibitedActionFamilies).not.toContain(
+      "gather",
+    );
+  });
+
+  it("extracts the authorized return without granting a prohibited gathering action", () => {
+    const message = "採取は再開しないで、拠点に戻って。";
+    expect(explicitlyAuthorizedActionFamilies(message)).toEqual(["return"]);
+    expect(explicitlyProhibitedActionFamilies(message)).toEqual(["gather"]);
+    expect(
+      explicitlyAuthorizedActionFamilies("追従しないで採取して。"),
+    ).toEqual(["gather"]);
+    expect(
+      explicitlyAuthorizedActionFamilies("採取は再開しないで拠点に戻って。"),
+    ).toEqual(["return"]);
+    expect(
+      explicitlyAuthorizedActionFamilies("拠点に戻って追従しないで。"),
+    ).toEqual(["return"]);
+    expect(
+      explicitlyProhibitedActionFamilies("採取を止めてほしい理由を教えて。"),
+    ).toEqual([]);
+    expect(
+      explicitlyProhibitedActionFamilies("採取して追従して採取しないで。"),
+    ).toEqual(["gather"]);
   });
 
   it("keeps the cancellation boundary for negated or status-only messages", () => {

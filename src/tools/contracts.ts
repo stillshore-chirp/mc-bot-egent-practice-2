@@ -225,6 +225,8 @@ export interface ToolContext {
   requestKind: "owner_message" | "runtime_reassessment";
   /** False while a stopped owner goal is being discussed without resuming it. */
   allowActionTools?: boolean;
+  /** Trusted per-request action scope; model tool arguments cannot expand it. */
+  allowedActionToolNames?: readonly string[];
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;
   executionEvidence: {

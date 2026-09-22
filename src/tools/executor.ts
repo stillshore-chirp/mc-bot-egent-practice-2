@@ -135,6 +135,17 @@ export class ToolExecutor {
         "停止済みの作業は、明示的に再開するまで動かしません。",
       );
     }
+    if (
+      definition.action &&
+      context.allowedActionToolNames !== undefined &&
+      !context.allowedActionToolNames.includes(name)
+    ) {
+      return failure(
+        "OWNER_ACTION_SCOPE_NOT_ALLOWED",
+        "authorization",
+        "今回の依頼で許可された操作ではないため開始しません。",
+      );
+    }
 
     let rawArguments: unknown;
     try {

@@ -433,6 +433,114 @@ describe("OpenAI tool loop", () => {
     },
   );
 
+  it("allows a replacement return but rejects gathering prohibited in that turn and the next", async () => {
+    const gatherCall = (callId: string) => ({
+      type: "function_call",
+      call_id: callId,
+      name: "gather_resource",
+      arguments: JSON.stringify({
+        resource: "oak_log",
+        count: 1,
+        commitmentId: null,
+      }),
+      status: "completed",
+    });
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([
+        gatherCall("call-prohibited"),
+        {
+          type: "function_call",
+          call_id: "call-return",
+          name: "return_to_player",
+          arguments: JSON.stringify({ safeDistance: 3 }),
+          status: "completed",
+        },
+      ]),
+      response([], "拠点への帰還を確認しました。"),
+      response([gatherCall("call-still-prohibited")]),
+      response([], "採取は再開しません。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    const replacement = await agent.deliberate({
+      ...request,
+      message: "採取は再開しないで、拠点に戻って",
+    });
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "return_to_player",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+    expect(replacement.toolResults).toMatchObject([
+      {
+        name: "gather_resource",
+        result: {
+          success: false,
+          error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+        },
+      },
+      { name: "return_to_player", result: { success: true } },
+    ]);
+    agent.recordDeliveredReply("owner", "owner_message", replacement.text);
+
+    const next = await agent.deliberate({ ...request, message: "続けて" });
+    expect(fake.requests[3]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+    expect(next.toolResults[0]?.result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+  });
+
+  it("keeps an explicitly requested delivery registration available after a stop", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([], "登録する対象を確認します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({ ...request, message: "拠点を登録して" });
+
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "register_delivery_target",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+  });
+
   it("does not let an older cancellation remove a newer pending owner turn", async () => {
     const fake = new ScriptedOpenAI([response([], "次の返答です。")]);
     const agent = new OpenAIDeliberationAgent({

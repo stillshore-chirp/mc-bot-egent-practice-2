@@ -15,8 +15,11 @@ import { getToolDefinition, toolDefinitions } from "../tools/registry.js";
 import { buildCapabilityContext } from "./capability-context.js";
 import {
   ConversationContextStore,
+  explicitlyAuthorizedActionFamilies,
+  explicitlyProhibitedActionFamilies,
   isExplicitGoalResumeMessage,
   renderConversationContext,
+  type GoalActionFamily,
 } from "./conversation-context.js";
 
 const MAX_TOOL_ROUNDS = 8;
@@ -27,6 +30,38 @@ const stoppedGoalReadOnlyToolNames = new Set([
   "get_delivery_targets",
   "say",
 ]);
+const actionToolFamilies: Readonly<
+  Record<string, readonly GoalActionFamily[]>
+> = {
+  gather_and_store: ["gather", "inventory"],
+  store_logs: ["inventory"],
+  register_delivery_target: ["memory"],
+  follow_player: ["follow"],
+  move_to: ["move"],
+  gather_resource: ["gather"],
+  return_to_player: ["return"],
+};
+
+function scopedActionToolNames(
+  authorized: ReadonlySet<GoalActionFamily> | undefined,
+  prohibited: ReadonlySet<GoalActionFamily>,
+): string[] | undefined {
+  if (authorized === undefined && prohibited.size === 0) return undefined;
+  return toolDefinitions
+    .filter(({ name, action }) => {
+      if (!action) return false;
+      if (name === "stop_current_action") return true;
+      const families = actionToolFamilies[name];
+      return (
+        families?.every(
+          (family) =>
+            !prohibited.has(family) &&
+            (authorized === undefined || authorized.has(family)),
+        ) ?? false
+      );
+    })
+    .map(({ name }) => name);
+}
 
 interface PendingOwnerTurn {
   readonly requestId: number;
@@ -212,14 +247,61 @@ export class OpenAIDeliberationAgent {
           request.conversationRequestId,
         )
       : undefined;
+    const explicitAuthorized = shouldRecordConversation
+      ? explicitlyAuthorizedActionFamilies(request.message)
+      : [];
+    const explicitProhibited = shouldRecordConversation
+      ? explicitlyProhibitedActionFamilies(request.message)
+      : [];
+    const genericResume =
+      explicitAuthorized.length === 0 &&
+      isExplicitGoalResumeMessage(request.message);
+    const resumedFamilies =
+      shouldRecordConversation &&
+      conversationSnapshot.cancelledGoal &&
+      genericResume
+        ? conversationSnapshot.stoppedActionFamilies.filter(
+            (family) =>
+              !explicitProhibited.includes(family) &&
+              !conversationSnapshot.explicitProhibitedActionFamilies.includes(
+                family,
+              ),
+          )
+        : explicitAuthorized;
     const keepStoppedGoal =
       shouldRecordConversation &&
       conversationSnapshot.cancelledGoal &&
-      !isExplicitGoalResumeMessage(request.message);
+      resumedFamilies.length === 0;
+    const prohibitedFamilies = new Set(
+      conversationSnapshot.prohibitedActionFamilies,
+    );
+    for (const family of resumedFamilies) prohibitedFamilies.delete(family);
+    for (const family of explicitProhibited) prohibitedFamilies.add(family);
+    const authorizedFamilies =
+      shouldRecordConversation &&
+      (conversationSnapshot.cancelledGoal || explicitProhibited.length > 0)
+        ? new Set(resumedFamilies)
+        : undefined;
+    const allowedActionToolNames = scopedActionToolNames(
+      authorizedFamilies,
+      prohibitedFamilies,
+    );
+    const inheritedActionToolNames = request.toolContext.allowedActionToolNames;
+    const effectiveActionToolNames =
+      inheritedActionToolNames === undefined
+        ? allowedActionToolNames
+        : allowedActionToolNames === undefined
+          ? [...inheritedActionToolNames]
+          : allowedActionToolNames.filter((name) =>
+              inheritedActionToolNames.includes(name),
+            );
     const toolContext: ToolContext = shouldRecordConversation
       ? {
           ...request.toolContext,
           ...(keepStoppedGoal ? { allowActionTools: false } : {}),
+          ...(effectiveActionToolNames === undefined
+            ? {}
+            : { allowedActionToolNames: effectiveActionToolNames }),
           recordDeliveredAssistantMessage: (text) =>
             this.#recordAssistantDelivery(
               conversationKey,
@@ -246,7 +328,12 @@ export class OpenAIDeliberationAgent {
               ({ name, action }) =>
                 !action && stoppedGoalReadOnlyToolNames.has(name),
             )
-          : toolDefinitions;
+          : effectiveActionToolNames === undefined
+            ? toolDefinitions
+            : toolDefinitions.filter(
+                ({ name, action }) =>
+                  !action || effectiveActionToolNames.includes(name),
+              );
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const startedAt = performance.now();
@@ -421,7 +508,10 @@ export class OpenAIDeliberationAgent {
         this.#flushReadOnlyExchanges(requesterUsername, pending);
         this.#pendingOwnerTurns.delete(requesterUsername);
       }
-      this.#conversation.recordCancellation(requesterUsername);
+      this.#conversation.recordCancellation(
+        requesterUsername,
+        pending?.message,
+      );
     }
   }
 
@@ -434,6 +524,10 @@ export class OpenAIDeliberationAgent {
       conversationRequestId ?? ++this.#nextConversationRequestId;
     const pending = this.#pendingOwnerTurns.get(requesterUsername);
     const latestRequestId = this.#latestOwnerRequestIds.get(requesterUsername);
+    if (latestRequestId !== undefined && requestId < latestRequestId) {
+      return requestId;
+    }
+    this.#conversation.recordOwnerSafetyIntent(requesterUsername, message);
     if (
       latestRequestId === undefined ||
       requestId > latestRequestId ||
