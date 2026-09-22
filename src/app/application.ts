@@ -42,7 +42,10 @@ import { TraceStore } from "../trace/store.js";
 import { CompanionContextFactory } from "./context-factory.js";
 import { CompanionGameController } from "./game-controller.js";
 import { MemoryTaskStore, ToolMemoryAdapter } from "./memory-adapters.js";
-import { RuntimeReassessmentGate } from "./runtime-reassessment-gate.js";
+import {
+  RuntimeReassessmentGate,
+  type RuntimeReassessmentRequest,
+} from "./runtime-reassessment-gate.js";
 
 const REFLEX_INTERVAL_MS = 250;
 const RUNTIME_REASSESSMENT_COOLDOWN_MS = 30_000;
@@ -117,6 +120,52 @@ export function reflexReassessmentForTransition(
     : undefined;
 }
 
+function safeRuntimeKey(value: string): string {
+  return value.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 96);
+}
+
+export function runtimeReassessmentState(
+  event: RuntimeReassessmentEvent,
+  previous: ReflexState,
+  current: ReflexState,
+  connectionRecoveryEpisode?: number,
+): { readonly stateKey: string; readonly causeKey: string } {
+  if (event === "safety_failed" && current.state === "failed") {
+    const attemptSuffix =
+      previous.state === "stabilizing"
+        ? `:attempt:${safeRuntimeKey(current.startedAt ?? current.endedAt ?? "unknown")}`
+        : "";
+    return {
+      stateKey: `safety:failed:${current.incident.kind}:${safeRuntimeKey(current.failure.code)}${attemptSuffix}`,
+      causeKey: `reflex:${current.incident.kind}`,
+    };
+  }
+  if (event === "safety_stabilized") {
+    const kind = previous.state === "safe" ? "unknown" : previous.incident.kind;
+    const episode =
+      previous.state === "safe"
+        ? undefined
+        : (previous.startedAt ?? previous.endedAt);
+    const episodeSuffix =
+      episode === undefined ? "" : `:episode:${safeRuntimeKey(episode)}`;
+    return {
+      stateKey: `safety:stabilized:${kind}${episodeSuffix}`,
+      causeKey: `reflex:${kind}`,
+    };
+  }
+  if (event === "connection_recovered") {
+    const suffix =
+      connectionRecoveryEpisode === undefined
+        ? ""
+        : `:${Math.max(1, Math.floor(connectionRecoveryEpisode))}`;
+    return {
+      stateKey: `connection:recovered${suffix}`,
+      causeKey: "connection",
+    };
+  }
+  return { stateKey: "startup:reassessment", causeKey: "startup" };
+}
+
 export interface CompanionApplication {
   start(): Promise<void>;
   shutdown(reason?: string): Promise<void>;
@@ -177,9 +226,11 @@ class DefaultCompanionApplication implements CompanionApplication {
   readonly #dashboard: DashboardHttpServer | undefined;
   #unsubscribeChat: (() => void) | undefined;
   #unsubscribeImmediateStop: (() => void) | undefined;
+  #unsubscribeOwnerMessage: (() => void) | undefined;
   #reflexTimer: NodeJS.Timeout | undefined;
   #reflexTickPromise: Promise<void> | undefined;
   #observationUnavailable = false;
+  #connectionRecoveryEpisode = 0;
   #lastReflexFailure = "";
   #lastRememberedIncident = "";
   #reconnectFailureLogged = false;
@@ -217,23 +268,52 @@ class DefaultCompanionApplication implements CompanionApplication {
     this.#traceService = input.traceService;
     this.#dashboard = this.#createDashboard(input.dashboard);
     this.#runtimeReassessments = new RuntimeReassessmentGate({
-      run: (event) => this.#coordinator.handleRuntimeEvent(event),
+      run: (event, request) =>
+        this.#coordinator.handleRuntimeEvent(event, {
+          stateKey: request.stateKey,
+          ...(request.causeKey === undefined
+            ? {}
+            : { causeKey: request.causeKey }),
+        }),
       priority: runtimeReassessmentPriority,
       cooldownMs: RUNTIME_REASSESSMENT_COOLDOWN_MS,
-      onError: (error, event) => {
+      onError: (error, event, request) => {
         this.#logger.error(
           {
             category: "llm",
             code: "RUNTIME_REASSESSMENT_FAILED",
             event,
+            cause: request.causeKey ?? "unspecified",
             errorType: error instanceof Error ? error.name : "UnknownError",
           },
           "runtime reassessment failed",
         );
       },
+      onDecision: (decision) => {
+        this.#logger.info(
+          {
+            category: "llm",
+            code: "RUNTIME_REASSESSMENT_GATE_DECISION",
+            event: decision.event,
+            cause: decision.causeKey ?? "unspecified",
+            outcome: decision.outcome,
+            reason: decision.reason ?? "none",
+            requested: decision.stats.requested,
+            started: decision.stats.started,
+            completed: decision.stats.completed,
+            failed: decision.stats.failed,
+            cancelled: decision.stats.cancelled,
+            suppressed: decision.stats.suppressed,
+          },
+          "runtime reassessment gate decision",
+        );
+      },
     });
     this.#unsubscribeImmediateStop = this.#coordinator.onImmediateStop(() =>
-      this.#runtimeReassessments.cancelPending(),
+      this.#runtimeReassessments.cancelPending("stopped"),
+    );
+    this.#unsubscribeOwnerMessage = this.#coordinator.onOwnerMessage(() =>
+      this.#runtimeReassessments.cancelPending("owner_message"),
     );
   }
 
@@ -334,6 +414,8 @@ class DefaultCompanionApplication implements CompanionApplication {
     ]);
     this.#unsubscribeImmediateStop?.();
     this.#unsubscribeImmediateStop = undefined;
+    this.#unsubscribeOwnerMessage?.();
+    this.#unsubscribeOwnerMessage = undefined;
     await this.#tasks.suspend(reason);
     await this.#connection.shutdown(reason);
     await this.#stopDashboard();
@@ -371,8 +453,6 @@ class DefaultCompanionApplication implements CompanionApplication {
 
   async #runReflexTick(): Promise<void> {
     if (this.#shutdownPromise !== undefined) return;
-    const reassessmentGeneration =
-      this.#runtimeReassessments.captureGeneration();
     try {
       const snapshot = await this.#minecraft.observe();
       if (this.#connection.state === "connected") {
@@ -383,7 +463,12 @@ class DefaultCompanionApplication implements CompanionApplication {
         this.#observationUnavailable = false;
         this.#requestRuntimeReassessment(
           "connection_recovered",
-          reassessmentGeneration,
+          runtimeReassessmentState(
+            "connection_recovered",
+            { state: "safe" },
+            { state: "safe" },
+            this.#connectionRecoveryEpisode,
+          ),
         );
       }
       const previousReflexState = this.#reflexes.state;
@@ -439,8 +524,12 @@ class DefaultCompanionApplication implements CompanionApplication {
         previousReflexState,
         state,
       );
-      if (reassessment !== undefined)
-        this.#requestRuntimeReassessment(reassessment, reassessmentGeneration);
+      if (reassessment !== undefined) {
+        this.#requestRuntimeReassessment(
+          reassessment,
+          runtimeReassessmentState(reassessment, previousReflexState, state),
+        );
+      }
       if (state.state === "failed") {
         const key = `${state.incident.kind}:${state.failure.code}`;
         if (key !== this.#lastReflexFailure) {
@@ -472,6 +561,7 @@ class DefaultCompanionApplication implements CompanionApplication {
           "Minecraft observation unavailable",
         );
         this.#observationUnavailable = true;
+        this.#connectionRecoveryEpisode += 1;
       }
       if (
         this.#connection.state === "failed" &&
@@ -493,9 +583,15 @@ class DefaultCompanionApplication implements CompanionApplication {
 
   #requestRuntimeReassessment(
     event: RuntimeReassessmentEvent,
-    generation?: number,
+    context: { readonly stateKey: string; readonly causeKey?: string } = {
+      stateKey: event,
+    },
   ): void {
-    this.#runtimeReassessments.request(event, generation);
+    const request: RuntimeReassessmentRequest<RuntimeReassessmentEvent> = {
+      event,
+      ...context,
+    };
+    this.#runtimeReassessments.request(request);
   }
 
   #createDashboard(

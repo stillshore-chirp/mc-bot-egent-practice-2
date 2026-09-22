@@ -28,7 +28,9 @@ const status = {
   activeTaskState: null,
 };
 
-function toolContext(): ToolContext {
+function toolContext(
+  requestKind: ToolContext["requestKind"] = "owner_message",
+): ToolContext {
   const game: GameController = {
     observeStatus: async () => status,
     observeSurroundings: async () => ({
@@ -90,7 +92,7 @@ function toolContext(): ToolContext {
     authorizedOwnerUsername: "owner",
     playerId: "player",
     signal: new AbortController().signal,
-    requestKind: "owner_message",
+    requestKind,
     executionEvidence: { verifiedActionReceipts: [] },
     game,
     memory,
@@ -520,6 +522,65 @@ describe("OpenAI tool loop", () => {
     ).rejects.toMatchObject({
       detail: { code: "LLM_RESPONSE_NOT_COMPLETED" },
     });
+  });
+
+  it("keeps runtime reassessment reports concise when an action call is denied", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-runtime-action",
+          name: "move_to",
+          arguments: JSON.stringify({ x: 1, y: 64, z: 0, radius: 2 }),
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-runtime-final",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "危険が続いています。作業状態を確認してください。",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        "危険が続いています。作業状態を確認してください。",
+      ),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const reply = await agent.deliberate({
+      message: "状態を再確認して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "確認済み作業状態: 実行中",
+      toolContext: toolContext("runtime_reassessment"),
+    });
+
+    expect(reply.text).toBe("危険が続いています。作業状態を確認してください。");
+    const offeredTools = fake.requests[0]?.tools ?? [];
+    expect(offeredTools.map(({ name }) => name)).toEqual(
+      expect.arrayContaining([
+        "observe_status",
+        "observe_surroundings",
+        "recall_memory",
+        "get_delivery_targets",
+      ]),
+    );
+    expect(offeredTools.map(({ name }) => name)).not.toContain("move_to");
+    expect(reply.text).not.toContain("状態再評価では観測と記憶参照以外");
   });
 
   it("rejects an unrelated action as commitment completion evidence", async () => {

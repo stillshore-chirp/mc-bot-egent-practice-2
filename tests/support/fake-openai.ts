@@ -5,6 +5,7 @@ export interface RecordedOpenAIRequest {
   store?: boolean | null;
   instructions?: string;
   input?: unknown;
+  tools?: { name: string }[];
 }
 
 export class ScriptedOpenAI {
