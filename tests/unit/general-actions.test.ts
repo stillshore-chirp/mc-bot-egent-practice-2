@@ -173,6 +173,39 @@ describe("general safe actions", () => {
     close();
   });
 
+  it("collects ancient debris before treating netherite scrap as a smelting goal", async () => {
+    const minecraft = new FakeMinecraft();
+    const resource = {
+      name: "ancient_debris",
+      position: { x: 2, y: 63, z: 0 },
+    };
+    minecraft.resources.push(resource);
+    const { game, close } = controller(minecraft);
+    try {
+      const candidates = await game.observeActionCandidates(
+        { radius: 8, requestedItems: ["netherite_scrap"], maxCandidates: 8 },
+        new AbortController().signal,
+      );
+      expect(candidates[0]).toMatchObject({
+        action: "mine_block",
+        goalItem: "netherite_scrap",
+        intermediateItems: ["ancient_debris"],
+      });
+
+      const report = await game.mineBlock(
+        resource,
+        new AbortController().signal,
+      );
+      expect(report).toMatchObject({
+        outcome: "completed",
+        confirmedState: { item: "ancient_debris", collectedCount: 1 },
+      });
+      expect(minecraft.actions).toContain("collect:ancient_debris");
+    } finally {
+      close();
+    }
+  });
+
   it("rechecks the server guard and verifies a natural block inventory delta", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push({

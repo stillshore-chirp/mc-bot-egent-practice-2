@@ -195,7 +195,7 @@ export const knownBlockDrops: Readonly<Record<string, string>> = {
   deepslate_redstone_ore: "redstone",
   lapis_ore: "lapis_lazuli",
   deepslate_lapis_ore: "lapis_lazuli",
-  ancient_debris: "netherite_scrap",
+  ancient_debris: "ancient_debris",
   oak_log: "oak_log",
   spruce_log: "spruce_log",
   birch_log: "birch_log",
@@ -213,6 +213,7 @@ export const knownSmeltInputs: Readonly<Record<string, string>> = {
   iron_ingot: "raw_iron",
   gold_ingot: "raw_gold",
   copper_ingot: "raw_copper",
+  netherite_scrap: "ancient_debris",
 };
 
 export function goalMetadataForOutput(
