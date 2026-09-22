@@ -142,8 +142,14 @@ export function runtimeReassessmentState(
   }
   if (event === "safety_stabilized") {
     const kind = previous.state === "safe" ? "unknown" : previous.incident.kind;
+    const episode =
+      previous.state === "safe"
+        ? undefined
+        : (previous.startedAt ?? previous.endedAt);
+    const episodeSuffix =
+      episode === undefined ? "" : `:episode:${safeRuntimeKey(episode)}`;
     return {
-      stateKey: `safety:stabilized:${kind}`,
+      stateKey: `safety:stabilized:${kind}${episodeSuffix}`,
       causeKey: `reflex:${kind}`,
     };
   }

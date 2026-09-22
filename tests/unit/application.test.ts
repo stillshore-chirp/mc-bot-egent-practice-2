@@ -141,6 +141,16 @@ describe("application reflex policy", () => {
       stateKey: "safety:stabilized:stuck",
       causeKey: "reflex:stuck",
     });
+    const nextStabilizing: ReflexState = {
+      ...stabilizing,
+      startedAt: "2026-08-25T00:05:00.000Z",
+    };
+    expect(
+      runtimeReassessmentState("safety_stabilized", nextStabilizing, safe),
+    ).toEqual({
+      stateKey: "safety:stabilized:stuck:episode:2026-08-25T00:05:00_000Z",
+      causeKey: "reflex:stuck",
+    });
     const retriedFailure: ReflexState = {
       ...failedState,
       startedAt: "2026-09-22T00:05:00.000Z",
