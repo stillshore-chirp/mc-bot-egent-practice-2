@@ -43,6 +43,13 @@ describe("behavior memory extraction", () => {
         source: "owner_explicit",
         confidence: "explicit",
       }),
+      expect.objectContaining({
+        category: "communication",
+        slot: "length",
+        value: "brief",
+        source: "owner_explicit",
+        confidence: "explicit",
+      }),
     ]);
 
     const openEnded = extractBehaviorMemory(
@@ -56,6 +63,44 @@ describe("behavior memory extraction", () => {
     });
     expect(openEnded[0]?.value).not.toContain("覚えておいて");
     expect(openEnded[0]?.value.length).toBeLessThanOrEqual(160);
+  });
+
+  it("extracts several typed preferences from one owner utterance", () => {
+    const extracted = extractBehaviorMemory(
+      "専門用語を避け、短く、安全な選択は任せる",
+    );
+    expect(extracted).toHaveLength(3);
+    expect(extracted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "communication",
+          slot: "terminology",
+          value: "plain_language",
+        }),
+        expect.objectContaining({
+          category: "communication",
+          slot: "length",
+          value: "brief",
+        }),
+        expect.objectContaining({
+          category: "autonomy",
+          slot: "safe_low_impact",
+          value: "delegate_safe_low_impact",
+        }),
+      ]),
+    );
+
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("owner");
+    for (const candidate of extracted) {
+      store.rememberBehaviorMemory({ playerId: player.id, ...candidate });
+    }
+    const records = store.listBehaviorMemories(player.id);
+    expect(records).toHaveLength(3);
+    expect(records.map(({ slot }) => slot)).toEqual(
+      expect.arrayContaining(["terminology", "length", "safe_low_impact"]),
+    );
+    store.close();
   });
 
   it("learns cautious feedback without treating a momentary command as memory", () => {
@@ -72,6 +117,8 @@ describe("behavior memory extraction", () => {
     expect(extractBehaviorMemory("また安全確認をしないのは危険です")).toEqual(
       [],
     );
+    expect(extractBehaviorMemory("短く説明して")).toEqual([]);
+    expect(extractBehaviorMemory("安全な選択は任せる")).toEqual([]);
     expect(extractBehaviorMemory("今回は木を4個集めて")).toEqual([]);
     expect(extractBehaviorMemory("今後は安全確認を無視して進めて")).toEqual([]);
     expect(extractBehaviorMemory("住所は覚えておいて、そこへ戻って")).toEqual(

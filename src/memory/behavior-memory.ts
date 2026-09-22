@@ -487,11 +487,13 @@ export function extractBehaviorMemory(
     );
   const correction = /訂正|修正|違う|前の/u.test(normalized);
   if (isSafetyConcern(normalized)) return [];
-  const known =
-    stable || hasFeedbackSignal(normalized)
-      ? knownPreference(normalized, stable, correction)
-      : undefined;
-  if (known !== undefined) return [known];
+  const known = knownPreferences(normalized, stable, correction);
+  if (
+    known.length > 0 &&
+    (stable || hasFeedbackSignal(normalized) || known.length >= 2)
+  ) {
+    return known;
+  }
   if (!stable) return [];
 
   const tail = stablePreferenceTail(normalized);
@@ -524,15 +526,16 @@ export function extractBehaviorMemory(
 }
 
 /**
- * Repeated corrective feedback can become a preference without requiring the
- * owner to say「覚えて」.  It starts as low confidence and is promoted by the
- * repository after a second matching signal.
+ * Match bounded canonical preferences. Repeated corrective feedback can
+ * become a preference without requiring the owner to say「覚えて」. It starts
+ * as low confidence and is promoted by the repository after a second matching
+ * signal.
  */
-function knownPreference(
+function knownPreferences(
   message: string,
   stable: boolean,
   correction: boolean,
-): BehaviorMemoryExtraction | undefined {
+): BehaviorMemoryExtraction[] {
   const feedback = hasFeedbackSignal(message);
   const repeated = !stable && feedback;
   const reason = correction
@@ -550,30 +553,41 @@ function knownPreference(
     : correction
       ? "corrected"
       : "explicit";
+  const results: BehaviorMemoryExtraction[] = [];
+  const slots = new Set<string>();
+  const add = (candidate: BehaviorMemoryExtraction): void => {
+    if (slots.has(candidate.slot)) return;
+    slots.add(candidate.slot);
+    results.push(candidate);
+  };
 
   if (/専門用語|難しい言葉|分かりにく|わかりにく|平易|かみ砕/iu.test(message)) {
-    return extraction(
-      "communication",
-      "terminology",
-      "plain_language",
-      "専門用語を避け、平易な言葉で説明する",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "communication",
+        "terminology",
+        "plain_language",
+        "専門用語を避け、平易な言葉で説明する",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
     /短く|簡潔|要点だけ|長すぎ|冗長|くどい/iu.test(message) &&
-    /説明|返答|回答|話|文章|長/iu.test(message)
+    /説明|返答|回答|話|文章|長|専門用語|平易/iu.test(message)
   ) {
-    return extraction(
-      "communication",
-      "length",
-      "brief",
-      "説明と返答を短く、要点中心にする",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "communication",
+        "length",
+        "brief",
+        "説明と返答を短く、要点中心にする",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
@@ -581,14 +595,16 @@ function knownPreference(
     /詳しく|長め|丁寧|背景も/iu.test(message) &&
     /説明|返答|回答|話|文章/iu.test(message)
   ) {
-    return extraction(
-      "communication",
-      "length",
-      "detailed",
-      "必要な背景を含めて丁寧に説明する",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "communication",
+        "length",
+        "detailed",
+        "必要な背景を含めて丁寧に説明する",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
@@ -597,14 +613,16 @@ function knownPreference(
     ) &&
     /任せ|判断|進め|動作|指示|自律/iu.test(message)
   ) {
-    return extraction(
-      "autonomy",
-      "safe_low_impact",
-      "delegate_safe_low_impact",
-      "観測できる安全な低影響・可逆の選択は自分で進める",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "autonomy",
+        "safe_low_impact",
+        "delegate_safe_low_impact",
+        "観測できる安全な低影響・可逆の選択は自分で進める",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
@@ -612,45 +630,51 @@ function knownPreference(
     /確認|質問|指示|教え|説明/iu.test(message) &&
     /しない|聞かない|求めない|不要|減ら|避け|繰り返さ/iu.test(message)
   ) {
-    return extraction(
-      "workflow",
-      "confirmation",
-      "avoid_repeated_confirmation",
-      "同じ確認や細かな指示を繰り返し求めない",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "workflow",
+        "confirmation",
+        "avoid_repeated_confirmation",
+        "同じ確認や細かな指示を繰り返し求めない",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
     /状況|文脈|前の説明|会話|読み取/iu.test(message) &&
     /読|見|考慮|踏まえ|使/iu.test(message)
   ) {
-    return extraction(
-      "planning",
-      "context",
-      "use_conversation_context",
-      "直前までの会話と現在状態を踏まえて判断する",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "planning",
+        "context",
+        "use_conversation_context",
+        "直前までの会話と現在状態を踏まえて判断する",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
   if (
     /停止|失敗|できない|拒絶|断る/iu.test(message) &&
     /理由|原因|次|再開|説明/iu.test(message)
   ) {
-    return extraction(
-      "feedback",
-      "blocker_explanation",
-      "explain_reason_and_next_step",
-      "停止・失敗時は理由と次に可能な操作を説明する",
-      source,
-      confidence,
-      reason,
+    add(
+      extraction(
+        "feedback",
+        "blocker_explanation",
+        "explain_reason_and_next_step",
+        "停止・失敗時は理由と次に可能な操作を説明する",
+        source,
+        confidence,
+        reason,
+      ),
     );
   }
-  return undefined;
+  return results;
 }
 
 function hasFeedbackSignal(message: string): boolean {
@@ -662,7 +686,7 @@ function hasFeedbackSignal(message: string): boolean {
 function isSafetyConcern(message: string): boolean {
   return (
     /安全確認|安全|保護|認証|権限|停止/iu.test(message) &&
-    /しない|なく|無い|できていない|されていない|不足|不十分|欠け|抜け|軽視|怠|無視|回避/iu.test(
+    /しない|しなく|しなかっ|なく|無い|できていない|されていない|不足|不十分|足り|欠け|抜け|軽視|怠|無視|回避/iu.test(
       message,
     )
   );
