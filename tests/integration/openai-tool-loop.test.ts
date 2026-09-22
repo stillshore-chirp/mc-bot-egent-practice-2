@@ -7,6 +7,7 @@ import type {
   MemoryPort,
   ToolContext,
 } from "../../src/tools/contracts.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { ScriptedOpenAI } from "../support/fake-openai.js";
 
 const status = {
@@ -796,6 +797,128 @@ describe("OpenAI tool loop", () => {
       );
     },
   );
+
+  it("offers goal planning for a new resource goal after stopping an earlier task", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([], "鉄の調達方法を確認します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    const firstReply = await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+
+    await agent.deliberate({
+      message: "鉄のインゴットを2個集めたい",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: {
+        ...context,
+        safeActionAuthorization: {
+          kind: "owner_bounded_resource",
+          goal: "鉄のインゴットを2個集めたい",
+          allowedResources: ["iron_ore", "deepslate_iron_ore"],
+          targetItem: "iron_ingot",
+          targetCount: 2,
+          maxCount: 2,
+        },
+      },
+    });
+
+    const availableTools = fake.requests[1]?.tools?.map((tool) => tool.name);
+    expect(availableTools).toContain("plan_safe_action");
+    expect(availableTools).toContain("mine_block");
+    expect(availableTools).toContain("smelt_item");
+  });
+
+  it("rejects an out-of-scope plan before an earlier harmless step runs", async () => {
+    const context = toolContext();
+    const actions: string[] = [];
+    context.allowedActionToolNames = ["plan_safe_action"];
+    context.game.say = async () => {
+      actions.push("say");
+    };
+    context.game.gatherResource = async () => {
+      actions.push("gather_resource");
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "収集しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      context,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+    expect(actions).toEqual([]);
+  });
+
+  it("does not mine ore when the requested ingot needs prohibited smelting", async () => {
+    const context = toolContext();
+    const actions: string[] = [];
+    context.allowedActionToolNames = ["plan_safe_action", "mine_block"];
+    context.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "鉄インゴットを1個集めたい",
+      allowedResources: ["iron_ore"],
+      targetItem: "iron_ingot",
+      targetCount: 1,
+      maxCount: 1,
+    };
+    context.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    context.game.findSafeActionCandidates = async () => {
+      actions.push("observe_candidates");
+      return [];
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "鉄インゴットを1個集めたい",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      context,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_GOAL_REQUIRES_DISALLOWED_STEP" },
+    });
+    expect(actions).toEqual([]);
+    expect(context.safeActionAuthorizationUsage.consumed).toBe(false);
+  });
 
   it("allows a replacement return but rejects gathering prohibited in that turn and the next", async () => {
     const gatherCall = (callId: string) => ({

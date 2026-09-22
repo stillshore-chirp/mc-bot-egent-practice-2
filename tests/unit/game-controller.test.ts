@@ -366,6 +366,11 @@ describe("CompanionGameController", () => {
         signal: new AbortController().signal,
         requestKind: "owner_message",
         safeActionAuthorization: authorization,
+        allowedActionToolNames: [
+          "plan_safe_action",
+          "mine_block",
+          "smelt_item",
+        ],
         safeActionAuthorizationUsage: {
           remainingCount: 1,
           consumed: false,

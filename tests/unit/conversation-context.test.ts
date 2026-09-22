@@ -231,6 +231,25 @@ describe("conversation context", () => {
     ).toEqual(["gather"]);
   });
 
+  it("treats a concrete new resource goal as authorization after a stop", () => {
+    expect(
+      explicitlyAuthorizedActionFamilies("鉄のインゴットを2個集めたい"),
+    ).toEqual(["gather"]);
+    expect(explicitlyAuthorizedActionFamilies("鉄を掘って")).toEqual([
+      "gather",
+    ]);
+    expect(explicitlyAuthorizedActionFamilies("鉄を精錬して")).toEqual([
+      "smelt",
+    ]);
+    expect(explicitlyAuthorizedActionFamilies("ここに置いて")).toEqual([
+      "place",
+    ]);
+    expect(explicitlyAuthorizedActionFamilies("鉄を集めたい？")).toEqual([]);
+    expect(
+      explicitlyProhibitedActionFamilies("鉄を掘らないで、木を集めたい"),
+    ).toEqual(["gather"]);
+  });
+
   it("keeps the cancellation boundary for negated or status-only messages", () => {
     for (const message of [
       "採取は再開しないで。",
@@ -294,7 +313,7 @@ describe("conversation context", () => {
     expect(isExplicitGoalResumeMessage("採取を始めていい？")).toBe(false);
     expect(isExplicitGoalResumeMessage("説明を続けてください。")).toBe(false);
     expect(isExplicitGoalResumeMessage("理由を探して。")).toBe(false);
-    expect(isExplicitGoalResumeMessage("鉄の剣を作って。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("鉄の剣を作って。")).toBe(true);
     expect(isExplicitGoalResumeMessage("例を作って、木を集めて。")).toBe(true);
     expect(isExplicitGoalResumeMessage("集めていい？")).toBe(false);
     expect(

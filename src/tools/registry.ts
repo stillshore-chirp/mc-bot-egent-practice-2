@@ -7,6 +7,7 @@ import {
   type SafeActionStep,
 } from "../decision/safe-action-planner.js";
 import { chooseSafeCandidate } from "../decision/safe-choice.js";
+import { knownSmeltInputs } from "../minecraft/general-actions.js";
 
 import {
   actionReportResult,
@@ -281,6 +282,23 @@ export const toolDefinitions = [
           "所有者の目的または数量上限を確認できないため、操作を開始しません。",
         );
       }
+      if (
+        context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
+        knownSmeltInputs[context.safeActionAuthorization.targetItem] !==
+          undefined &&
+        context.allowedActionToolNames !== undefined &&
+        !context.allowedActionToolNames.includes("smelt_item")
+      ) {
+        return safeActionFailure(
+          "authorization",
+          "OWNER_GOAL_REQUIRES_DISALLOWED_STEP",
+          false,
+          "owner_goal_boundary",
+          { goal: input.goal, requiredStep: "smelt_item" },
+          ["精錬を許可するか、原料の収集だけに目的を変更する"],
+          "希望する完成品には精錬が必要ですが、今回は許可されていないため採掘も開始しませんでした。",
+        );
+      }
       if (context.safeActionAuthorization?.kind === "owner_bounded_resource") {
         const usage = context.safeActionAuthorizationUsage;
         if (usage === undefined) {
@@ -503,6 +521,31 @@ export const toolDefinitions = [
             },
             [planned.question],
             planned.question,
+          );
+        }
+        const outOfScopeStep = planned.steps.find((step) => {
+          const definition = getToolDefinition(step.tool);
+          return (
+            (definition?.action === true ||
+              ownerScopedMutationToolNames.has(step.tool)) &&
+            context.allowedActionToolNames !== undefined &&
+            !context.allowedActionToolNames.includes(step.tool)
+          );
+        });
+        if (outOfScopeStep !== undefined) {
+          return safeActionFailure(
+            "authorization",
+            "OWNER_ACTION_SCOPE_NOT_ALLOWED",
+            false,
+            "plan_safe_action",
+            {
+              goal: input.goal,
+              completedCount,
+              remainingCount,
+              rejectedStep: outOfScopeStep.tool,
+            },
+            ["今回の依頼で許可する操作を明示してから再依頼する"],
+            "今回許可されていない操作を計画に含むため、作業を開始しませんでした。",
           );
         }
         const intermediateCountBefore = intermediateProgress.reduce(

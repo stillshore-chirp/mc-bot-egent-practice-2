@@ -3,6 +3,7 @@ import type { ResponseInputItem } from "openai/resources/responses/responses";
 import type { Logger } from "pino";
 
 import { AppError } from "../domain/errors.js";
+import { knownSmeltInputs } from "../minecraft/general-actions.js";
 import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
@@ -37,12 +38,20 @@ const stoppedGoalReadOnlyToolNames = new Set([
 const actionToolFamilies: Readonly<
   Record<string, readonly GoalActionFamily[]>
 > = {
+  // The planner is only a wrapper. Its mutating steps are scoped separately
+  // by the same request and rechecked by ToolExecutor before each action.
+  plan_safe_action: [],
   gather_and_store: ["gather", "inventory"],
   store_logs: ["inventory"],
   register_delivery_target: ["memory"],
   follow_player: ["follow"],
   move_to: ["move"],
   gather_resource: ["gather"],
+  mine_block: ["gather"],
+  collect_item: ["gather"],
+  craft_item: ["craft"],
+  place_block: ["place"],
+  smelt_item: ["smelt"],
   return_to_player: ["return"],
   forget_delivery_target: ["memory"],
   remember_player_fact: ["memory"],
@@ -375,6 +384,15 @@ export class OpenAIDeliberationAgent {
       (conversationSnapshot.cancelledGoal || explicitProhibited.length > 0)
         ? new Set(resumedFamilies)
         : undefined;
+    const resourceAuthorization = request.toolContext.safeActionAuthorization;
+    if (
+      authorizedFamilies?.has("gather") &&
+      resourceAuthorization?.kind === "owner_bounded_resource" &&
+      knownSmeltInputs[resourceAuthorization.targetItem] !== undefined &&
+      !prohibitedFamilies.has("smelt")
+    ) {
+      authorizedFamilies.add("smelt");
+    }
     const requestedMemoryTools = explicitlyRequestedMemoryTools(
       request.message,
     );
