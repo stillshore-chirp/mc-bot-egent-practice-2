@@ -199,6 +199,15 @@ describe("OpenAI tool loop", () => {
     expect(thirdInput).toContain("続けて");
     expect(thirdInput).not.toContain("安全状態を再確認して");
     expect(thirdInput).not.toContain("現在の状態を確認しました。");
+    expect(fake.requests[1]?.instructions).toContain(
+      "観測とtool結果を最優先し",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "体力・空腹・座標・記憶の列挙は省き",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "開始済みの行動があれば、その事実を優先して報告",
+    );
   });
 
   it("does not retain an owner request until a reply is delivered", async () => {

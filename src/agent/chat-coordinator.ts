@@ -237,13 +237,13 @@ export class ChatCoordinator {
   ): Promise<void> {
     const messages = {
       startup_reassessment:
-        "再起動後の未完了の約束またはsuspended作業を再評価し、新規行動を開始せず現在状態を短く報告してください。",
+        "再起動後の未完了の約束または一時停止中の作業を再評価し、新規行動を指示せず、開始済みの行動があればその事実を含めて現在状態を短く報告してください。",
       safety_stabilized:
-        "安全介入後の状態とsuspended作業を再評価し、新規行動を開始せず現在状態を短く報告してください。",
+        "安全介入後の状態と一時停止中の作業を再評価し、新規行動を指示せず、開始済みの行動があればその事実を含めて現在状態を短く報告してください。",
       safety_failed:
-        "安全介入が安定状態を確認できなかったため、現在状態とsuspended作業を観測し、新規行動を開始せず利用者に判断を求めてください。",
+        "安全介入が安定状態を確認できなかったため、現在状態と一時停止中の作業を観測し、新規行動を指示せず、確認できた開始済みの行動を含めて利用者に判断を求めてください。",
       connection_recovered:
-        "Minecraft接続復旧後の状態を再評価し、新規行動を開始せず現在状態を短く報告してください。",
+        "Minecraft接続復旧後の状態を再評価し、新規行動を指示せず、開始済みの行動があればその事実を含めて現在状態を短く報告してください。",
     } as const;
     const generation = this.#generation;
     this.#conversationTail = this.#conversationTail
