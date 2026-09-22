@@ -1245,6 +1245,75 @@ describe("ToolExecutor", () => {
     expect(gatherCalls).toBe(1);
   });
 
+  it("consumes a confirmed partial direct gather before allowing the remainder", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を3本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 3,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 3,
+      consumed: false,
+    };
+    let gatherCalls = 0;
+    toolContext.game.gatherResource = async (resource, count) => {
+      gatherCalls += 1;
+      if (gatherCalls === 1) {
+        return {
+          before: status,
+          after: status,
+          outcome: "failed",
+          failureCategory: "internal",
+          failureCode: "GATHER_INTERRUPTED",
+          failureRetryable: true,
+          confirmedState: {
+            resource,
+            requestedCount: count,
+            collectedCount: 2,
+          },
+          summary: "2個を確認したところで採取を中断しました。",
+        };
+      }
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource,
+          requestedCount: count,
+          collectedCount: count,
+        },
+        summary: "残りを収集しました。",
+      };
+    };
+
+    const partial = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 3, commitmentId: null }),
+      toolContext,
+    );
+    expect(partial).toMatchObject({
+      success: false,
+      error: { code: "GATHER_INTERRUPTED" },
+    });
+    expect(toolContext.safeActionAuthorizationUsage).toEqual({
+      remainingCount: 1,
+      consumed: false,
+    });
+
+    const remainder = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+    expect(remainder).toMatchObject({ success: true });
+    expect(gatherCalls).toBe(2);
+  });
+
   it("uses bounded defaults when follow distance and duration are omitted", async () => {
     const toolContext = context();
     let received: { distance: number; duration: number } | undefined;

@@ -192,8 +192,8 @@ const resourceGoals: readonly ResourceGoal[] = [
   },
 ];
 
-const collectionIntentPattern =
-  /(集め|集めたい|採掘|掘る|掘って|採取|持ってき|取ってき|作る|作って|精錬|mine|collect|gather|obtain|fetch|harvest|craft|smelt)/iu;
+const affirmativeCollectionIntentPattern =
+  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
 const negatedCollectionIntentPattern =
   /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const operationWords = new Set([
@@ -254,7 +254,7 @@ export function deriveOwnerGoalAuthorization(
       ? canonicalResourceId(message)
       : undefined;
   const count = parseCount(message);
-  const hasCollectionIntent = collectionIntentPattern.test(message);
+  const hasCollectionIntent = affirmativeCollectionIntentPattern.test(message);
   const hasNegatedCollectionIntent =
     negatedCollectionIntentPattern.test(message);
 
@@ -298,13 +298,6 @@ export function deriveOwnerGoalAuthorization(
   }
 
   if (!hasCollectionIntent) {
-    if (resource !== undefined || unresolvedCanonicalResource !== undefined) {
-      return {
-        outcome: "clarify",
-        question:
-          "資源名と数量は確認しました。収集する依頼なら「集めて」「掘って」などの操作を明示してください。",
-      };
-    }
     return { outcome: "none" };
   }
   if (resource === undefined) {

@@ -113,17 +113,23 @@ describe("owner goal authorization", () => {
     }
   });
 
-  it.each(["oak_logを20個持っている", "鉄を10秒採掘して"])(
-    "does not authorize a named resource without an explicit item goal: %s",
-    (message) => {
-      const result = deriveOwnerGoalAuthorization({
+  it("does not authorize a named resource statement", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
         ...ownerInput,
-        message,
-      });
+        message: "oak_logを20個持っている",
+      }),
+    ).toEqual({ outcome: "none" });
+  });
 
-      expect(result).toMatchObject({ outcome: "clarify" });
-    },
-  );
+  it("asks for a quantity when a collection command lacks an item count", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "鉄を10秒採掘して",
+      }),
+    ).toMatchObject({ outcome: "clarify" });
+  });
 
   it("accepts an arbitrary canonical resource id with a bounded quantity", () => {
     const result = deriveOwnerGoalAuthorization({
@@ -245,6 +251,27 @@ describe("owner goal authorization", () => {
       nowMs: 1_001,
     });
     expect(result).not.toMatchObject({ outcome: "authorized" });
+  });
+
+  it.each(["オークの原木を3本集めた", "オークの原木を3本集められる？"])(
+    "does not authorize a statement or question as collection: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({
+          ...ownerInput,
+          message,
+        }),
+      ).toEqual({ outcome: "none" });
+    },
+  );
+
+  it("does not block an unrelated action when a message only mentions a resource", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "オークは好き。ついてきて",
+      }),
+    ).toEqual({ outcome: "none" });
   });
 
   it("does not use an expired or foreign pending goal", () => {

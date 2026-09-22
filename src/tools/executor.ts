@@ -373,13 +373,18 @@ function consumeSafeActionAuthorization(
       : result.success && isRecord(result.data)
         ? integerField(result.data.completedCount)
         : !result.success
-          ? integerField(result.error.confirmedState.completedCount)
+          ? (integerField(result.error.confirmedState.completedCount) ??
+            integerField(result.error.confirmedState.collectedCount))
           : undefined;
   if (completedCount === undefined || completedCount < 0) return;
   const remaining = context.safeActionAuthorizationUsage.remainingCount;
-  if (completedCount > remaining) return;
-  context.safeActionAuthorizationUsage.remainingCount =
-    remaining - completedCount;
+  context.safeActionAuthorizationUsage.remainingCount = Math.max(
+    0,
+    remaining - completedCount,
+  );
+  if (completedCount > remaining) {
+    context.safeActionAuthorizationUsage.consumed = true;
+  }
 }
 
 function isDirectActionAuthorized(

@@ -384,6 +384,12 @@ describe("OpenAI tool loop", () => {
       "select_safe_resource",
       "gather_resource",
     ]);
+    expect(reply.toolResults[1]?.result).toMatchObject({ success: true });
+    expect(context.safeActionAuthorization).toMatchObject({
+      allowedResources: ["birch_log"],
+      targetItem: "birch_log",
+      selectionRequired: false,
+    });
     expect(fake.requests).toHaveLength(3);
     expect(JSON.stringify(fake.requests[1]?.input)).toContain("birch_log");
   });

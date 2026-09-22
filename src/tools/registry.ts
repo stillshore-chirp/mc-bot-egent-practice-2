@@ -969,12 +969,11 @@ export const toolDefinitions = [
             "選択した原木が所有者の認可範囲に含まれないため、採取を開始しませんでした。",
           );
         }
-        context.safeActionAuthorization = {
-          ...authorization,
+        Object.assign(authorization, {
           allowedResources: [decision.candidate.id],
           targetItem: decision.candidate.id,
           selectionRequired: false,
-        };
+        });
       }
       return {
         success: true,
