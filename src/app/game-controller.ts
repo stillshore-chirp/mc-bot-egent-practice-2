@@ -55,6 +55,7 @@ interface TaskStateForSummary {
   readonly status: TaskRecord["status"];
   readonly phase: string;
   readonly updatedAt: string;
+  readonly failureCategory?: string;
   readonly checkpoint?: Readonly<Record<string, unknown>>;
 }
 
@@ -555,6 +556,21 @@ export class CompanionGameController implements GameController {
 
   #latestTaskForStatus(): TaskStateForSummary | undefined {
     const active = this.#tasks.current;
+    const activeSummary =
+      active === undefined
+        ? undefined
+        : {
+            kind: active.kind,
+            status: active.status,
+            phase: active.phase,
+            updatedAt: active.updatedAt,
+            ...(active.failure === undefined
+              ? {}
+              : { failureCategory: active.failure.category }),
+            ...(active.checkpoint === undefined
+              ? {}
+              : { checkpoint: active.checkpoint }),
+          };
     let persisted: TaskStateForSummary | undefined;
     if (this.#playerId !== undefined) {
       try {
@@ -565,9 +581,11 @@ export class CompanionGameController implements GameController {
         // temporarily unavailable; the live task state is still authoritative.
       }
     }
-    if (active === undefined) return persisted;
-    if (persisted === undefined) return active;
-    return active.updatedAt >= persisted.updatedAt ? active : persisted;
+    if (activeSummary === undefined) return persisted;
+    if (persisted === undefined) return activeSummary;
+    return activeSummary.updatedAt >= persisted.updatedAt
+      ? activeSummary
+      : persisted;
   }
 
   #syncLifeState(snapshot: WorldSnapshot): void {
@@ -739,9 +757,17 @@ function latestTaskState(task: TaskStateForSummary | undefined): string | null {
   if (task === undefined) return null;
   if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
   if (task.status === "failed") {
-    return "直前のMinecraft作業は完了を確認できませんでした。";
+    const reason = taskFailureReason(task.failureCategory);
+    return reason === undefined
+      ? "直前のMinecraft作業は完了を確認できませんでした。"
+      : "直前のMinecraft作業は完了を確認できませんでした。" + reason;
   }
-  if (task.status === "cancelled") return "直前のMinecraft作業は停止しました。";
+  if (task.status === "cancelled") {
+    const reason = taskFailureReason(task.failureCategory);
+    return reason === undefined
+      ? "直前のMinecraft作業は停止しました。"
+      : "直前のMinecraft作業は停止しました。" + reason;
+  }
   if (task.status === "suspended") return suspendedTaskRecovery(task).summary;
   if (task.status === "queued") return "Minecraft作業の開始を待っています。";
   return activeTaskSummary(task);
@@ -754,10 +780,42 @@ function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {
     status: task.status,
     phase: task.phase,
     updatedAt: task.updatedAt,
+    ...(task.failure === undefined
+      ? {}
+      : { failureCategory: task.failure.category }),
     ...(typeof suspendReason === "string"
       ? { checkpoint: { suspendReason } }
       : {}),
   };
+}
+
+function taskFailureReason(category: string | undefined): string | undefined {
+  switch (category) {
+    case "connection":
+      return "Minecraftへの接続を確認できませんでした。";
+    case "observation":
+      return "Minecraftの状態を確認できませんでした。";
+    case "path":
+      return "経路を確認できませんでした。";
+    case "resource":
+      return "必要な資源を確認できませんでした。";
+    case "inventory":
+      return "所持品の状態を確認できませんでした。";
+    case "timeout":
+      return "設定時間内に完了しませんでした。";
+    case "cancelled":
+      return "停止指示で中断しました。";
+    case "safety":
+      return "安全確認のため停止しました。";
+    case "permission":
+    case "validation":
+    case "llm":
+    case "persistence":
+    case undefined:
+      return undefined;
+    default:
+      return undefined;
+  }
 }
 
 function formatCoordinates(position: {

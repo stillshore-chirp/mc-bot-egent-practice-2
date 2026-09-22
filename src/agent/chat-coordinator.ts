@@ -40,13 +40,14 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
   if (/^(?:状態|状況|進捗)(?:を教えて|を説明して)?[?？]?$/u.test(normalized)) {
     return true;
   }
-  if (!/[?？]/u.test(normalized)) return false;
-  const questionMark = normalized.search(/[?？]/u);
-  if (
-    questionMark >= 0 &&
-    !/^[。！!]*$/u.test(normalized.slice(questionMark + 1).trim())
-  ) {
-    return false;
+  if (/[?？]/u.test(normalized)) {
+    const questionMark = normalized.search(/[?？]/u);
+    if (
+      questionMark >= 0 &&
+      !/^[。！!]*$/u.test(normalized.slice(questionMark + 1).trim())
+    ) {
+      return false;
+    }
   }
   const includesAction =
     /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作って|始め|続け|再開|使って|置いて|取り)/u.test(
@@ -273,9 +274,9 @@ export class ChatCoordinator {
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
       const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+      const pendingRequestId = recorder.pendingOwnerRequestId?.(username);
       const interruptedRequestId =
-        recorder.pendingOwnerRequestId?.(username) ??
-        recorder.latestOwnerRequestId?.(username);
+        pendingRequestId ?? recorder.latestOwnerRequestId?.(username);
       const stopRun = this.#stopTail
         .catch(() => undefined)
         .then(async () => {
@@ -295,14 +296,19 @@ export class ChatCoordinator {
               },
               () => this.#game.stopCurrentAction("利用者の即時停止指示"),
             );
-            if (interruptedRequestId === undefined) {
-              recorder.recordCancelledRequest?.(username, "owner_message");
-            } else {
-              recorder.recordCancelledRequest?.(
-                username,
-                "owner_message",
-                interruptedRequestId,
-              );
+            const hadActiveTask =
+              (report.before?.activeTaskSummary?.trim().length ?? 0) > 0 ||
+              (report.before?.activeTaskState?.trim().length ?? 0) > 0;
+            if (pendingRequestId !== undefined || hadActiveTask) {
+              if (interruptedRequestId === undefined) {
+                recorder.recordCancelledRequest?.(username, "owner_message");
+              } else {
+                recorder.recordCancelledRequest?.(
+                  username,
+                  "owner_message",
+                  interruptedRequestId,
+                );
+              }
             }
             await safeWithTraceSpan(
               this.#traceService,
@@ -373,12 +379,19 @@ export class ChatCoordinator {
     const stopBoundary = this.#stopTail;
     this.#conversationTail = this.#conversationTail
       .catch(() => undefined)
-      .then(() => stopBoundary.catch(() => undefined))
-      .then(() =>
-        generation === this.#generation
+      .then(async () => {
+        try {
+          await stopBoundary;
+        } catch {
+          await this.#game.say(
+            "前のMinecraft作業を安全に停止できなかったため、新しい作業は開始しません。",
+          );
+          return undefined;
+        }
+        return generation === this.#generation
           ? this.#deliberate(username, normalized, "owner_message")
-          : undefined,
-      );
+          : undefined;
+      });
     await this.#conversationTail;
     return true;
   }

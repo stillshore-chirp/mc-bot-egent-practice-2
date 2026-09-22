@@ -54,7 +54,9 @@ describe("immediate stop command", () => {
 
   it.each([
     "今どうなってる？",
+    "今どうなってる",
     "何してる？",
+    "何してる",
     "なぜ止まった？",
     "なぜ採取が止まった？",
   ])("recognizes a standalone read-only status question: %s", (message) => {
@@ -63,6 +65,7 @@ describe("immediate stop command", () => {
 
   it.each([
     "今の状況を教えて、木を集めて？",
+    "今どうなってる、木を集めて",
     "なぜ止まった？ もう一度来て",
     "なぜ失敗？木を集めて",
   ])(
@@ -304,6 +307,71 @@ describe("immediate stop command", () => {
       "STOP_FAILED",
     );
     expect(recordCancelledRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not mark an idle stop as a cancelled conversation", async () => {
+    const recordCancelledRequest = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => ({
+          before: null,
+          after: null,
+          outcome: "completed",
+          summary: "実行中のMinecraft作業はありません。",
+        })),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        recordCancelledRequest,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "停止");
+
+    expect(recordCancelledRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not start a new owner action after the stop boundary fails", async () => {
+    const say = vi.fn(async () => undefined);
+    const deliberate = vi.fn(async () => ({
+      text: "新しい作業を始めます。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => {
+          throw new Error("STOP_FAILED");
+        }),
+        say,
+      } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "確認済み状態",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await expect(coordinator.handleChat("owner", "停止")).rejects.toThrow(
+      "STOP_FAILED",
+    );
+    await coordinator.handleChat("owner", "来て");
+
+    expect(deliberate).not.toHaveBeenCalled();
+    expect(say).toHaveBeenCalledWith(
+      "前のMinecraft作業を安全に停止できなかったため、新しい作業は開始しません。",
+    );
   });
 
   it("records a cancellation and response when the owner issues stop", async () => {
@@ -640,12 +708,12 @@ describe("immediate stop command", () => {
       causeKey: "reflex:stuck",
     });
     await runtimeStarted;
-    await coordinator.handleChat("owner", "今どうなっていますか");
+    await coordinator.handleChat("owner", "なぜ続けているのですか");
     await automatic;
 
     expect(deliberate).toHaveBeenCalledTimes(2);
     expect(say).toHaveBeenCalledTimes(1);
-    expect(say).toHaveBeenCalledWith("応答:今どうなっていますか");
+    expect(say).toHaveBeenCalledWith("応答:なぜ続けているのですか");
   });
 
   it("answers a read-only status question while an owner action is running", async () => {

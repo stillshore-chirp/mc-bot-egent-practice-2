@@ -235,6 +235,37 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("keeps a safe persisted failure reason for direct status questions", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, memory, close } = createController(minecraft, true);
+    const playerId = memory.getOrCreatePlayer("owner").id;
+    const task = memory.createTaskRun({
+      playerId,
+      kind: "move_to",
+      phase: "moving",
+      status: "running",
+      input: {},
+    });
+    memory.updateTaskRun({
+      taskRunId: task.id,
+      status: "failed",
+      phase: "moving",
+      failure: {
+        category: "path",
+        code: "PATH_BLOCKED",
+        message: "raw internal failure detail",
+        retryable: true,
+      },
+    });
+
+    const status = await game.observeStatus();
+
+    expect(status.latestTaskState).toContain("経路を確認できませんでした。");
+    expect(status.latestTaskState).not.toContain("PATH_BLOCKED");
+    expect(status.latestTaskState).not.toContain("raw internal failure detail");
+    close();
+  });
+
   it("reports acquired and held counts when gathering is stopped after pickup", async () => {
     const signal = new AbortController();
     class StopAfterPickup extends FakeMinecraft {

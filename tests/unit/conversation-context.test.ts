@@ -122,6 +122,10 @@ describe("conversation context", () => {
       "再開していい？",
       "再開してはいけない。",
       "来てほしくない。",
+      "集めていい？",
+      "来ていい？",
+      "戻っていい？",
+      "来ないで。",
     ]) {
       const store = new ConversationContextStore();
       store.recordCancellation("owner");
@@ -129,5 +133,20 @@ describe("conversation context", () => {
 
       expect(store.snapshot("owner").cancelledGoal).toBe(true);
     }
+  });
+
+  it("honors requests to stop being concise", () => {
+    expect(
+      updateConversationPreferences(
+        { concise: true, avoidJargon: false },
+        "短くしないで。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: false });
+    expect(
+      updateConversationPreferences(
+        { concise: true, avoidJargon: false },
+        "簡潔にしなくていい。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: false });
   });
 });

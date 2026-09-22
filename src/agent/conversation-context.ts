@@ -53,9 +53,15 @@ function permitsJargon(message: string): boolean {
 }
 
 function negatesGoalAction(message: string): boolean {
-  return /(?:続け|続行|再開|集め|採取|移動|追従|来て|戻|探|収納|登録|始め|もう一度|もう一回)[^。！？!?]{0,16}(?:し|や|行)?(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|してはいけない|してはならない|してほしくない|してほしくありません|していい[?？]?|してもいい[?？]?|してよい[?？]?|して大丈夫[?？]?|しても大丈夫[?？]?)/u.test(
-    message,
-  );
+  const mentionsAction =
+    /(?:続け|続行|再開|集め|採取|移動|追従|来|戻|探|収納|登録|始め|使|置|掘|作|建築|攻撃|戦|食べ|飲み|拾|捨て|もう一度|もう一回)/u.test(
+      message,
+    );
+  const nonAuthorizingPhrase =
+    /(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|(?:して|て|って|で)(?:も)?(?:いい|よい|大丈夫|はいけない|はならない|ほしくない|ほしくありません))[?？]?/u.test(
+      message,
+    );
+  return mentionsAction && nonAuthorizingPhrase;
 }
 
 function explicitlyResumesGoal(message: string): boolean {
@@ -73,18 +79,27 @@ export function isNonAuthorizingGoalMessage(message: string): boolean {
   return negatesGoalAction(compactText(message));
 }
 
+function negatesConcise(message: string): boolean {
+  return /(?:短く|簡潔に|手短に|ひとことで|要点だけ)(?:に|と)?(?:しないで|しなくていい|しなくてもいい|不要|いらない)/u.test(
+    message,
+  );
+}
+
 function requestsConcise(message: string): boolean {
-  return (
-    /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(message) ||
+  const positive = /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(
+    message,
+  );
+  const negatedDetail =
     /(詳しく|詳細に|長めに|丁寧に).{0,8}(ないで|なくていい|不要|いらない)/u.test(
       message,
-    )
-  );
+    );
+  return (!negatesConcise(message) && positive) || negatedDetail;
 }
 
 function requestsDetailed(message: string): boolean {
   return (
-    /(詳しく|詳細に|長めに|丁寧に|理由も説明)/u.test(message) &&
+    (negatesConcise(message) ||
+      /(詳しく|詳細に|長めに|丁寧に|理由も説明)/u.test(message)) &&
     !/(詳しく|詳細に|長めに|丁寧に).{0,8}(ないで|なくていい|不要|いらない)/u.test(
       message,
     )
