@@ -291,6 +291,44 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("finds the authorized log species behind other nearby logs", async () => {
+    const minecraft = new FakeMinecraft();
+    for (let index = 0; index < 8; index += 1) {
+      minecraft.resources.push({
+        name: "oak_log",
+        position: { x: 1 + index, y: 64, z: 0 },
+      });
+    }
+    minecraft.resources.push({
+      name: "spruce_log",
+      position: { x: 10, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const candidates = await game.findSafeActionCandidates(
+        {
+          goal: "トウヒの原木を1本集める",
+          count: 1,
+          maxCandidates: 8,
+          authorization: {
+            kind: "owner_bounded_resource",
+            goal: "トウヒの原木を1本集めて",
+            allowedResources: ["spruce_log"],
+            targetItem: "spruce_log",
+            targetCount: 1,
+            maxCount: 16,
+          },
+        },
+        new AbortController().signal,
+      );
+      expect(candidates.map((candidate) => candidate.resourceName)).toEqual([
+        "spruce_log",
+      ]);
+    } finally {
+      close();
+    }
+  });
+
   it.each([
     ["鉄", "iron_ore", "iron_ingot", "raw_iron"],
     ["銅", "copper_ore", "copper_ingot", "raw_copper"],

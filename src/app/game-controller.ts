@@ -185,6 +185,7 @@ export class CompanionGameController implements GameController {
     maxDistance: number,
     count: number,
     signal: AbortSignal,
+    allowedNames?: readonly string[],
   ): Promise<readonly SafeResourceCandidate[]> {
     if (!Number.isFinite(maxDistance) || maxDistance < 1) {
       throw new AppError({
@@ -202,17 +203,21 @@ export class CompanionGameController implements GameController {
         retryable: false,
       });
     }
+    const names =
+      allowedNames === undefined
+        ? [...gatherableLogs]
+        : allowedNames.filter(isGatherableLog);
+    if (names.length === 0) return [];
+    const allowedNameSet = new Set<string>(names);
     const current = await this.#minecraft.observe();
     const targets = await this.#minecraft.findResources(
-      [...gatherableLogs],
+      names,
       Math.min(maxDistance, this.#maxMoveDistance),
       count,
       signal,
     );
     return targets
-      .filter((target) =>
-        (gatherableLogs as readonly string[]).includes(target.name),
-      )
+      .filter((target) => allowedNameSet.has(target.name))
       .map((target) => ({
         resource: target.name,
         distance: Math.hypot(
@@ -284,10 +289,15 @@ export class CompanionGameController implements GameController {
     }
     if (!isResourceCollectionGoal(request.goal)) return [];
 
+    const allowedLogNames =
+      authorization?.kind === "owner_bounded_resource"
+        ? authorization.allowedResources.filter(isGatherableLog)
+        : undefined;
     const resources = await this.findSafeResourceCandidates(
       Math.min(32, this.#maxMoveDistance),
       Math.min(8, request.maxCandidates),
       signal,
+      allowedLogNames,
     );
     const nearestByResource = new Map<string, SafeResourceCandidate>();
     for (const resource of resources) {
