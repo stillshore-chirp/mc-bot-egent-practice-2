@@ -204,11 +204,11 @@ export class CompanionGameController implements GameController {
       evidenceKind: "task_state",
       summary: hadActiveTask
         ? after === null
-          ? "進行中の作業をcancelledとして保存し、操作停止命令を実行しました。Minecraft接続状態は観測できませんでした。"
-          : "進行中のMinecraft作業を停止し、cancelled状態を保存しました。"
+          ? "進行中のMinecraft作業を停止しました。Minecraftとの接続状態は確認できませんでした。"
+          : "進行中のMinecraft作業を停止しました。"
         : after === null
-          ? "操作停止命令を実行しました。Minecraft接続状態は観測できませんでした。"
-          : "実行中のMinecraft作業がないことを確認し、操作入力を停止しました。",
+          ? "操作入力の停止を指示しました。Minecraftとの接続状態は確認できませんでした。"
+          : "実行中のMinecraft作業はありません。操作入力を停止しました。",
     };
   }
 
