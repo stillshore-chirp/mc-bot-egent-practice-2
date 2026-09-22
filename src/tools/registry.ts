@@ -9,6 +9,9 @@ import {
 import type { ToolDefinition } from "./definition.js";
 
 const noInput = z.object({}).strict();
+const actionPosition = z
+  .object({ x: z.number(), y: z.number(), z: z.number() })
+  .strict();
 const resourceNames = [
   "oak_log",
   "spruce_log",
@@ -81,6 +84,185 @@ export const toolDefinitions = [
         evidence: nowEvidence("minecraft_snapshot", "周囲を観測した"),
         userSummary: "周囲のMinecraft状態を確認しました。",
       };
+    },
+  }),
+  defineTool({
+    name: "observe_action_candidates",
+    description:
+      "現在観測できる採掘、回収、クラフト、設置、精錬の候補と、server guardが返した権限・安全状態を取得する。候補のmetadataは説明用で、実行時に再検査される。",
+    input: z
+      .object({
+        radius: z.number().int().min(1).max(32),
+        requestedItems: z.array(z.string().trim().min(1).max(64)).max(16),
+        maxCandidates: z.number().int().min(1).max(16),
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ radius: 8, requestedItems: ["iron_ore"], maxCandidates: 8 }],
+      invalid: [{ radius: 0, requestedItems: [], maxCandidates: 8 }],
+    },
+    action: false,
+    execute: async (input, context) => ({
+      success: true,
+      data: await context.game.observeActionCandidates(input, context.signal),
+      evidence: nowEvidence("minecraft_snapshot", "一般操作候補を観測した"),
+      userSummary: "周囲から実行可能性を観測できる操作候補を取得しました。",
+    }),
+  }),
+  defineTool({
+    name: "mine_block",
+    description:
+      "観測した単一ブロックを、距離・停止・server guardを再確認して採掘し、所持品差分を確認する。",
+    input: z
+      .object({
+        name: z.string().trim().min(1).max(64),
+        position: actionPosition,
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ name: "iron_ore", position: { x: 1, y: 63, z: 0 } }],
+      invalid: [{ name: "", position: { x: 1, y: 63, z: 0 } }],
+    },
+    action: true,
+    execute: async (input, context) =>
+      actionReportResult(await context.game.mineBlock(input, context.signal)),
+  }),
+  defineTool({
+    name: "collect_item",
+    description:
+      "観測したitem dropへ移動して指定数を回収し、所持品差分を確認する。",
+    input: z
+      .object({
+        name: z.string().trim().min(1).max(64),
+        position: actionPosition,
+        count: z.number().int().min(1).max(64),
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ name: "raw_iron", position: { x: 1, y: 63, z: 0 }, count: 1 }],
+      invalid: [
+        { name: "raw_iron", position: { x: 1, y: 63, z: 0 }, count: 0 },
+      ],
+    },
+    action: true,
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount)
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "COLLECT_COUNT_EXCEEDED",
+            retryable: false,
+            failedAt: "precondition",
+            confirmedState: {
+              requested: input.count,
+              maximum: context.limits.maxGatherCount,
+            },
+            nextActions: ["数量を減らして依頼する"],
+            userSummary: "許可された回収数を超えるため開始しませんでした。",
+          },
+        };
+      return actionReportResult(
+        await context.game.collectItem(input, context.signal),
+      );
+    },
+  }),
+  defineTool({
+    name: "craft_item",
+    description:
+      "観測したレシピと所持品を使って指定数をクラフトし、所持品差分を確認する。",
+    input: z
+      .object({
+        name: z.string().trim().min(1).max(64),
+        count: z.number().int().min(1).max(64),
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ name: "iron_pickaxe", count: 1 }],
+      invalid: [{ name: "", count: 1 }],
+    },
+    action: true,
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount)
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "CRAFT_COUNT_EXCEEDED",
+            retryable: false,
+            failedAt: "precondition",
+            confirmedState: {
+              requested: input.count,
+              maximum: context.limits.maxGatherCount,
+            },
+            nextActions: ["数量を減らして依頼する"],
+            userSummary: "許可されたクラフト数を超えるため開始しませんでした。",
+          },
+        };
+      return actionReportResult(
+        await context.game.craftItem(input, context.signal),
+      );
+    },
+  }),
+  defineTool({
+    name: "place_block",
+    description:
+      "観測した空き位置へ所持ブロックを設置する。距離・support・server guard・設置後のblock状態を確認する。",
+    input: z
+      .object({
+        name: z.string().trim().min(1).max(64),
+        position: actionPosition,
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ name: "cobblestone", position: { x: 1, y: 64, z: 0 } }],
+      invalid: [{ name: "", position: { x: 1, y: 64, z: 0 } }],
+    },
+    action: true,
+    execute: async (input, context) =>
+      actionReportResult(await context.game.placeBlock(input, context.signal)),
+  }),
+  defineTool({
+    name: "smelt_item",
+    description:
+      "観測したfurnaceと安全な燃料を使って指定数を精錬し、出力所持品差分を確認する。",
+    input: z
+      .object({
+        input: z.string().trim().min(1).max(64),
+        output: z.string().trim().min(1).max(64),
+        count: z.number().int().min(1).max(64),
+        furnace: actionPosition.nullable(),
+      })
+      .strict(),
+    fixtures: {
+      valid: [
+        { input: "raw_iron", output: "iron_ingot", count: 1, furnace: null },
+      ],
+      invalid: [
+        { input: "raw_iron", output: "iron_ingot", count: 0, furnace: null },
+      ],
+    },
+    action: true,
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount)
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "SMELT_COUNT_EXCEEDED",
+            retryable: false,
+            failedAt: "precondition",
+            confirmedState: {
+              requested: input.count,
+              maximum: context.limits.maxGatherCount,
+            },
+            nextActions: ["数量を減らして依頼する"],
+            userSummary: "許可された精錬数を超えるため開始しませんでした。",
+          },
+        };
+      return actionReportResult(
+        await context.game.smeltItem(input, context.signal),
+      );
     },
   }),
   defineTool({

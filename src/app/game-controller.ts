@@ -7,11 +7,27 @@ import {
   AppError,
   type ErrorCategory as DomainErrorCategory,
 } from "../domain/errors.js";
-import type { WorldSnapshot } from "../domain/snapshot.js";
+import {
+  countInventory,
+  distance,
+  type WorldSnapshot,
+} from "../domain/snapshot.js";
 import type { TaskRecord } from "../domain/task.js";
 import type { MinecraftPort } from "../minecraft/port.js";
+import type {
+  CollectItemInput,
+  CraftItemInput,
+  GeneralActionCandidate,
+  GeneralActionObservationInput,
+  MineBlockInput,
+  PlaceBlockInput,
+  SmeltItemInput,
+} from "../minecraft/general-actions.js";
 import type { MemoryStore } from "../memory/store.js";
-import type { ActionArbiter } from "../runtime/action-arbiter.js";
+import {
+  actionPriorities,
+  type ActionArbiter,
+} from "../runtime/action-arbiter.js";
 import type { TaskRuntime } from "../runtime/task-service.js";
 import type { FollowPlayerSkill } from "../skills/follow-player.js";
 import type { GatherLogsSkill } from "../skills/gather-logs/gather-logs-skill.js";
@@ -61,6 +77,7 @@ export class CompanionGameController implements GameController {
   readonly #ownerUsername: string;
   readonly #taskTimeoutMs: number;
   readonly #retryLimit: number;
+  readonly #maxMoveDistance: number;
   readonly #logger: Logger;
   readonly #memory: MemoryStore;
 
@@ -90,6 +107,7 @@ export class CompanionGameController implements GameController {
     this.#ownerUsername = input.ownerUsername;
     this.#taskTimeoutMs = input.taskTimeoutMs;
     this.#retryLimit = input.retryLimit;
+    this.#maxMoveDistance = input.maxMoveDistance ?? 128;
     this.#logger = input.logger;
     this.#memory = input.memory;
   }
@@ -114,6 +132,14 @@ export class CompanionGameController implements GameController {
       })),
       hazards: observed.hazards,
     };
+  }
+
+  public async observeActionCandidates(
+    input: GeneralActionObservationInput,
+    signal: AbortSignal,
+  ): Promise<readonly GeneralActionCandidate[]> {
+    if (signal.aborted) throw signal.reason;
+    return this.#minecraft.observeActionCandidates(input, signal);
   }
 
   public async say(message: string): Promise<void> {
@@ -293,6 +319,247 @@ export class CompanionGameController implements GameController {
     return report;
   }
 
+  public async mineBlock(
+    input: MineBlockInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const current = await this.#minecraft.observe();
+    this.#assertActionDistance(
+      current,
+      input.position,
+      "MINING_DISTANCE_EXCEEDED",
+    );
+    const itemName = minedItemName(input.name);
+    const baseline = countInventory(current, itemName);
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "mine_block",
+          input,
+          signal,
+          async (actionSignal) => {
+            await this.#minecraft.moveTo(input.position, 3, actionSignal);
+            await this.#minecraft.mineBlock(input, actionSignal);
+            await this.#minecraft.collectDropsNear(
+              input.position,
+              itemName,
+              baseline + 1,
+              actionSignal,
+            );
+            return { itemName, baseline };
+          },
+        ),
+      (output, after) => {
+        const held =
+          after === null ? null : countInventory(after, output.itemName);
+        const collected =
+          held === null ? null : Math.max(0, held - output.baseline);
+        if (held === null || collected === null || collected < 1) {
+          return {
+            outcome: "failed",
+            failureCategory: "inventory",
+            failureCode: "MINE_OUTPUT_NOT_VERIFIED",
+            summary:
+              "採掘は完了したように見えましたが、所持品の増加を確認できませんでした。",
+          };
+        }
+        return {
+          outcome: "completed",
+          evidenceKind: "inventory_delta",
+          confirmedState: {
+            block: input.name,
+            item: output.itemName,
+            requestedCount: 1,
+            minedCount: 1,
+            collectedCount: collected,
+            heldCount: held,
+          },
+          summary: `${input.name}を採掘し、${output.itemName}を${String(collected)}個増やしたことを所持品で確認しました。`,
+        };
+      },
+      current,
+    );
+  }
+
+  public async collectItem(
+    input: CollectItemInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const current = await this.#minecraft.observe();
+    this.#assertActionDistance(
+      current,
+      input.position,
+      "COLLECT_DISTANCE_EXCEEDED",
+    );
+    const baseline = countInventory(current, input.name);
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "collect_item",
+          input,
+          signal,
+          async (actionSignal) => {
+            await this.#minecraft.collectItem(input, actionSignal);
+            return { baseline };
+          },
+        ),
+      (output, after) => {
+        const held = after === null ? null : countInventory(after, input.name);
+        const collected =
+          held === null ? null : Math.max(0, held - output.baseline);
+        if (held === null || collected === null || collected < input.count) {
+          return {
+            outcome: "failed",
+            failureCategory: "inventory",
+            failureCode: "COLLECT_OUTPUT_NOT_VERIFIED",
+            summary: "回収後の所持品増加を確認できませんでした。",
+          };
+        }
+        return {
+          outcome: "completed",
+          evidenceKind: "inventory_delta",
+          confirmedState: {
+            item: input.name,
+            requestedCount: input.count,
+            collectedCount: collected,
+            heldCount: held,
+          },
+          summary: `${input.name}を${String(collected)}個回収し、所持品の増加を確認しました。`,
+        };
+      },
+      current,
+    );
+  }
+
+  public async craftItem(
+    input: CraftItemInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const current = await this.#minecraft.observe();
+    const baseline = countInventory(current, input.name);
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "craft_item",
+          input,
+          signal,
+          async (actionSignal) => ({
+            produced: await this.#minecraft.craftItem(input, actionSignal),
+          }),
+        ),
+      (output, after) => {
+        const held = after === null ? null : countInventory(after, input.name);
+        const produced = held === null ? null : Math.max(0, held - baseline);
+        if (held === null || produced === null || produced < input.count) {
+          return {
+            outcome: "failed",
+            failureCategory: "inventory",
+            failureCode: "CRAFT_OUTPUT_NOT_VERIFIED",
+            summary: "クラフト後の所持品増加を確認できませんでした。",
+          };
+        }
+        return {
+          outcome: "completed",
+          evidenceKind: "inventory_delta",
+          confirmedState: {
+            item: input.name,
+            requestedCount: input.count,
+            craftedCount: produced,
+            heldCount: held,
+          },
+          summary: `${input.name}を${String(produced)}個クラフトし、所持品で確認しました。`,
+        };
+      },
+      current,
+    );
+  }
+
+  public async placeBlock(
+    input: PlaceBlockInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const current = await this.#minecraft.observe();
+    this.#assertActionDistance(
+      current,
+      input.position,
+      "PLACE_DISTANCE_EXCEEDED",
+    );
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "place_block",
+          input,
+          signal,
+          async (actionSignal) => {
+            await this.#minecraft.placeBlock(input, actionSignal);
+            return { position: input.position };
+          },
+        ),
+      () => ({
+        outcome: "completed",
+        evidenceKind: "minecraft_snapshot",
+        confirmedState: {
+          block: input.name,
+          position: input.position,
+          requestedCount: 1,
+          placedCount: 1,
+        },
+        summary: `${input.name}を指定位置へ設置し、ゲーム内のブロック状態を確認しました。`,
+      }),
+      current,
+    );
+  }
+
+  public async smeltItem(
+    input: SmeltItemInput,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const current = await this.#minecraft.observe();
+    const baseline = countInventory(current, input.output);
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "smelt_item",
+          input,
+          signal,
+          async (actionSignal) => ({
+            produced: await this.#minecraft.smeltItem(input, actionSignal),
+          }),
+        ),
+      (_output, after) => {
+        const held =
+          after === null ? null : countInventory(after, input.output);
+        const produced = held === null ? null : Math.max(0, held - baseline);
+        if (held === null || produced === null || produced < input.count) {
+          return {
+            outcome: "failed",
+            failureCategory: "inventory",
+            failureCode: "SMELT_OUTPUT_NOT_VERIFIED",
+            summary: "精錬後の所持品増加を確認できませんでした。",
+          };
+        }
+        return {
+          outcome: "completed",
+          evidenceKind: "inventory_delta",
+          confirmedState: {
+            input: input.input,
+            output: input.output,
+            requestedCount: input.count,
+            smeltedCount: produced,
+            heldCount: held,
+          },
+          summary: `${input.input}を${input.output}へ${String(produced)}個精錬し、所持品で確認しました。`,
+        };
+      },
+      current,
+    );
+  }
+
   async #deliverLogs(
     resource: string,
     count: number,
@@ -376,6 +643,52 @@ export class CompanionGameController implements GameController {
   public async currentPosition(): Promise<Position> {
     const snapshot = await this.#minecraft.observe();
     return { ...snapshot.position, dimension: snapshot.dimension };
+  }
+
+  #assertActionDistance(
+    current: WorldSnapshot,
+    target: { readonly x: number; readonly y: number; readonly z: number },
+    code: string,
+  ): void {
+    const targetPosition = { x: target.x, y: target.y, z: target.z };
+    const targetDistance = distance(current.position, targetPosition);
+    if (targetDistance <= this.#configuredMaxMoveDistance()) return;
+    throw new AppError({
+      category: "validation",
+      code,
+      message: "操作対象が許可された距離の外にあります。",
+      retryable: false,
+      failedAt: "precondition",
+      confirmedState: { distance: targetDistance },
+    });
+  }
+
+  #configuredMaxMoveDistance(): number {
+    return this.#maxMoveDistance;
+  }
+
+  async #runGeneralTask<Input, Output>(
+    kind: string,
+    input: Input,
+    externalSignal: AbortSignal,
+    operation: (signal: AbortSignal) => Promise<Output>,
+  ): Promise<TaskRecord<Input, Output>> {
+    return this.#tasks.run(kind, input, async (context) => {
+      const lease = this.#arbiter.acquire(
+        `task:${context.taskId}`,
+        actionPriorities.task,
+      );
+      const signal = AbortSignal.any([
+        context.signal,
+        externalSignal,
+        lease.signal,
+      ]);
+      try {
+        return await operation(signal);
+      } finally {
+        lease.release();
+      }
+    });
   }
 
   async #executeTask<Input, Output>(
@@ -553,6 +866,28 @@ export class CompanionGameController implements GameController {
 
 function isGatherableLog(resource: string): resource is GatherableLog {
   return (gatherableLogs as readonly string[]).includes(resource);
+}
+
+function minedItemName(blockName: string): string {
+  const drops: Record<string, string> = {
+    coal_ore: "coal",
+    deepslate_coal_ore: "coal",
+    iron_ore: "raw_iron",
+    deepslate_iron_ore: "raw_iron",
+    gold_ore: "raw_gold",
+    deepslate_gold_ore: "raw_gold",
+    copper_ore: "raw_copper",
+    deepslate_copper_ore: "raw_copper",
+    diamond_ore: "diamond",
+    deepslate_diamond_ore: "diamond",
+    emerald_ore: "emerald",
+    deepslate_emerald_ore: "emerald",
+    redstone_ore: "redstone",
+    deepslate_redstone_ore: "redstone",
+    lapis_ore: "lapis_lazuli",
+    deepslate_lapis_ore: "lapis_lazuli",
+  };
+  return drops[blockName] ?? blockName;
 }
 
 function mapFailureCategory(

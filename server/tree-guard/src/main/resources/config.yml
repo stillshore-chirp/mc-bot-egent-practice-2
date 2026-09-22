@@ -2,3 +2,6 @@
 bot-names: []
 # 保護領域。worldはworld名、min/maxは包含端点。実座標をgitへ入れない。
 protected-regions: []
+# 汎用採掘を許可する既知の安全な試験領域。未設定なら原木以外の採掘照会は拒否する。
+# 建築物が存在しないことを管理者が確認した領域だけを、稼働環境の設定で指定する。
+natural-resource-regions: []

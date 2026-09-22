@@ -28,6 +28,7 @@ function toolContext(): ToolContext {
       entities: [],
       hazards: [],
     }),
+    observeActionCandidates: async () => [],
     say: async () => undefined,
     followOwner: async () => ({
       before: status,
@@ -52,6 +53,36 @@ function toolContext(): ToolContext {
       after: status,
       outcome: "completed",
       summary: "収集しました。",
+    }),
+    mineBlock: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "採掘しました。",
+    }),
+    collectItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "回収しました。",
+    }),
+    craftItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "クラフトしました。",
+    }),
+    placeBlock: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "設置しました。",
+    }),
+    smeltItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "精錬しました。",
     }),
     returnToOwner: async () => ({
       before: status,

@@ -13,6 +13,16 @@ import type {
   MinecraftPort,
   ResourceTarget,
 } from "../../src/minecraft/port.js";
+import { AppError } from "../../src/domain/errors.js";
+import type {
+  CollectItemInput,
+  CraftItemInput,
+  GeneralActionCandidate,
+  GeneralActionObservationInput,
+  MineBlockInput,
+  PlaceBlockInput,
+  SmeltItemInput,
+} from "../../src/minecraft/general-actions.js";
 
 const now = (): string => new Date().toISOString();
 
@@ -47,6 +57,12 @@ export class FakeMinecraft implements MinecraftPort {
   public resources: ResourceTarget[] = [];
   public readonly actions: string[] = [];
   public stopCount = 0;
+  public actionGuardDecisions = new Map<
+    string,
+    "allowed" | "unknown" | "denied"
+  >();
+  public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
+  public placedBlocks = new Map<string, string>();
   private pendingDrop: ResourceTarget | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
@@ -226,7 +242,174 @@ export class FakeMinecraft implements MinecraftPort {
     );
     if (index < 0) throw new Error("RESOURCE_CHANGED");
     this.resources.splice(index, 1);
-    this.pendingDrop = target;
+    this.pendingDrop = {
+      ...target,
+      name:
+        {
+          iron_ore: "raw_iron",
+          deepslate_iron_ore: "raw_iron",
+          gold_ore: "raw_gold",
+          deepslate_gold_ore: "raw_gold",
+          copper_ore: "raw_copper",
+          deepslate_copper_ore: "raw_copper",
+        }[target.name] ?? target.name,
+    };
+  }
+
+  public async observeActionCandidates(
+    input: GeneralActionObservationInput,
+    signal: AbortSignal,
+  ): Promise<readonly GeneralActionCandidate[]> {
+    signal.throwIfAborted();
+    const candidates: GeneralActionCandidate[] = [];
+    for (const resource of this.resources.slice(0, input.maxCandidates)) {
+      const key = `${resource.name}:${resource.position.x}:${resource.position.y}:${resource.position.z}`;
+      const permission = this.actionGuardDecisions.get(key) ?? "allowed";
+      candidates.push({
+        id: `mine_block:${key}`,
+        label: `${resource.name}を採掘`,
+        action: "mine_block",
+        args: { name: resource.name, position: resource.position },
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: resource.name, position: resource.position },
+          },
+        ],
+        observed: true,
+        purposeFit: input.requestedItems.includes(resource.name)
+          ? "direct"
+          : "unknown",
+        permission,
+        safety:
+          permission === "allowed"
+            ? "allowed"
+            : permission === "denied"
+              ? "blocked"
+              : "unknown",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: resource.name,
+        distance: 1,
+        order: candidates.length,
+      });
+    }
+    return candidates;
+  }
+
+  public async mineBlock(
+    target: MineBlockInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const key = `${target.name}:${target.position.x}:${target.position.y}:${target.position.z}`;
+    const decision = this.actionGuardDecisions.get(key) ?? "allowed";
+    if (decision !== "allowed") {
+      throw new AppError({
+        category: "safety",
+        code: `ACTION_${decision.toUpperCase()}`,
+        message: "server guard denied the requested block mutation",
+        retryable: false,
+        failedAt: "action_guard",
+        confirmedState: { decision },
+      });
+    }
+    await this.dig(target, signal);
+  }
+
+  public async collectItem(
+    target: CollectItemInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const held =
+      this.snapshot.inventory.find((entry) => entry.name === target.name)
+        ?.count ?? 0;
+    await this.collectDropsNear(
+      target.position,
+      target.name,
+      held + target.count,
+      signal,
+    );
+  }
+
+  public async craftItem(
+    target: CraftItemInput,
+    signal: AbortSignal,
+  ): Promise<number> {
+    signal.throwIfAborted();
+    if (!this.craftableItems.has(target.name)) {
+      throw new AppError({
+        category: "resource",
+        code: "CRAFT_RECIPE_UNAVAILABLE",
+        message: "no observed recipe",
+        retryable: false,
+        failedAt: "craft_item",
+      });
+    }
+    const inventory = this.snapshot.inventory.map((entry) =>
+      entry.name === target.name
+        ? { ...entry, count: entry.count + target.count }
+        : { ...entry },
+    );
+    if (!inventory.some((entry) => entry.name === target.name))
+      inventory.push({ name: target.name, count: target.count });
+    this.snapshot = { ...this.snapshot, inventory };
+    this.actions.push(`craft:${target.name}:${target.count}`);
+    return target.count;
+  }
+
+  public async placeBlock(
+    target: PlaceBlockInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted();
+    const key = `${target.position.x}:${target.position.y}:${target.position.z}`;
+    const decision =
+      this.actionGuardDecisions.get(`${target.name}:${key}`) ?? "allowed";
+    if (decision !== "allowed") {
+      throw new AppError({
+        category: "safety",
+        code: `ACTION_${decision.toUpperCase()}`,
+        message: "server guard denied the requested block mutation",
+        retryable: false,
+        failedAt: "action_guard",
+        confirmedState: { decision },
+      });
+    }
+    this.placedBlocks.set(key, target.name);
+    this.actions.push(`place:${target.name}:${key}`);
+  }
+
+  public async smeltItem(
+    target: SmeltItemInput,
+    signal: AbortSignal,
+  ): Promise<number> {
+    signal.throwIfAborted();
+    const input = this.snapshot.inventory.find(
+      (entry) => entry.name === target.input,
+    );
+    if (input === undefined || input.count < target.count) {
+      throw new AppError({
+        category: "inventory",
+        code: "SMELT_INPUT_INSUFFICIENT",
+        message: "insufficient smelting input",
+        retryable: false,
+        failedAt: "smelt_item",
+      });
+    }
+    const inventory = this.snapshot.inventory.map((entry) => {
+      if (entry.name === target.input)
+        return { ...entry, count: entry.count - target.count };
+      if (entry.name === target.output)
+        return { ...entry, count: entry.count + target.count };
+      return { ...entry };
+    });
+    if (!inventory.some((entry) => entry.name === target.output))
+      inventory.push({ name: target.output, count: target.count });
+    this.snapshot = { ...this.snapshot, inventory };
+    this.actions.push(`smelt:${target.input}:${target.output}:${target.count}`);
+    return target.count;
   }
 
   public async collectDropsNear(

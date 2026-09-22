@@ -146,6 +146,8 @@ describe("follow recovery conversation", () => {
       observeStatus: () => game.observeStatus(),
       observeSurroundings: (radius, includeEntities) =>
         game.observeSurroundings(radius, includeEntities),
+      observeActionCandidates: (...args) =>
+        game.observeActionCandidates(...args),
       say: async (message: string) => {
         replies.push(message);
         await game.say(message);
@@ -154,6 +156,11 @@ describe("follow recovery conversation", () => {
       stopCurrentAction: (...args) => game.stopCurrentAction(...args),
       moveTo: (...args) => game.moveTo(...args),
       gatherResource: (...args) => game.gatherResource(...args),
+      mineBlock: (...args) => game.mineBlock(...args),
+      collectItem: (...args) => game.collectItem(...args),
+      craftItem: (...args) => game.craftItem(...args),
+      placeBlock: (...args) => game.placeBlock(...args),
+      smeltItem: (...args) => game.smeltItem(...args),
       returnToOwner: (...args) => game.returnToOwner(...args),
       currentPosition: () => game.currentPosition(),
     };

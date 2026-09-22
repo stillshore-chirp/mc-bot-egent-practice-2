@@ -42,6 +42,7 @@ function game(): GameController {
       entities: [],
       hazards: [],
     }),
+    observeActionCandidates: async () => [],
     say: async () => undefined,
     followOwner: async () => ({
       before: status,
@@ -66,6 +67,36 @@ function game(): GameController {
       after: status,
       outcome: "completed",
       summary: "収集を確認しました。",
+    }),
+    mineBlock: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "採掘を確認しました。",
+    }),
+    collectItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "回収を確認しました。",
+    }),
+    craftItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "クラフトを確認しました。",
+    }),
+    placeBlock: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "設置を確認しました。",
+    }),
+    smeltItem: async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      summary: "精錬を確認しました。",
     }),
     returnToOwner: async () => ({
       before: status,
