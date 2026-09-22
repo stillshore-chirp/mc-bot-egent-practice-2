@@ -57,8 +57,18 @@ import {
   type DeliveryTarget,
   type DeliveryTargetKind,
 } from "./delivery-targets.js";
+import {
+  behaviorMemoryEventMigration,
+  behaviorMemoryMigration,
+  BehaviorMemoryRepository,
+} from "./behavior-memory.js";
+import type {
+  BehaviorMemoryRecord,
+  ForgetBehaviorMemoryInput,
+  RememberBehaviorMemoryInput,
+} from "./types.js";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 const DEFAULT_RECALL_LIMIT = 8;
 const MAX_RECALL_LIMIT = 30;
 const MAX_TEXT_LENGTH = 1_000;
@@ -223,7 +233,11 @@ const migrationV2 = [
  * raw chat transcripts; callers must provide small, typed facts and outcomes.
  */
 export class MemoryStore {
-  private constructor(private readonly database: Database.Database) {}
+  private readonly behaviorMemory: BehaviorMemoryRepository;
+
+  private constructor(private readonly database: Database.Database) {
+    this.behaviorMemory = new BehaviorMemoryRepository(database);
+  }
 
   public static open(path: string): MemoryStore {
     const database = new Database(path, { timeout: 5_000 });
@@ -277,6 +291,41 @@ export class MemoryStore {
     this.database
       .prepare("DELETE FROM delivery_targets WHERE player_id=? AND kind=?")
       .run(playerId, kind);
+  }
+
+  public rememberBehaviorMemory(
+    input: RememberBehaviorMemoryInput,
+  ): BehaviorMemoryRecord {
+    return this.behaviorMemory.remember(input);
+  }
+
+  public correctBehaviorMemory(input: {
+    readonly playerId: string;
+    readonly memoryId?: string;
+    readonly category: RememberBehaviorMemoryInput["category"];
+    readonly slot: string;
+    readonly value: string;
+    readonly summary: string;
+    readonly idempotencyKey?: string;
+  }): BehaviorMemoryRecord {
+    return this.behaviorMemory.correct(input);
+  }
+
+  public listBehaviorMemories(
+    playerId: string,
+    input: { readonly limit?: number; readonly query?: string } = {},
+  ): BehaviorMemoryRecord[] {
+    return this.behaviorMemory.list(playerId, input);
+  }
+
+  public forgetBehaviorMemories(
+    input: ForgetBehaviorMemoryInput,
+  ): BehaviorMemoryRecord[] {
+    return this.behaviorMemory.forget(input);
+  }
+
+  public behaviorMemoryIsApplicable(record: BehaviorMemoryRecord): boolean {
+    return this.behaviorMemory.isApplicable(record);
   }
 
   public getOrCreatePlayer(externalName: string): PlayerRecord {
@@ -1355,6 +1404,8 @@ export class MemoryStore {
         version: 3,
         sql: "CREATE TABLE delivery_targets (player_id TEXT NOT NULL REFERENCES players(id), kind TEXT NOT NULL CHECK(kind IN ('home','chest')), value_json TEXT NOT NULL, PRIMARY KEY(player_id, kind))",
       },
+      { version: 4, sql: behaviorMemoryMigration },
+      { version: 5, sql: behaviorMemoryEventMigration },
     ];
     for (const migration of migrations) {
       if (appliedVersions.has(migration.version)) {
