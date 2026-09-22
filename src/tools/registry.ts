@@ -42,7 +42,7 @@ export const toolDefinitions = [
   defineTool({
     name: "observe_status",
     description:
-      "Minecraftで現在観測できる体力、空腹、位置、所持品、作業状態を返す。",
+      "Bot自身について、Minecraftで現在観測できる体力、空腹、酸素、水中状態、位置、所持品、作業状態を返す。利用者の体力・空腹・酸素・水中状態は観測しない。",
     input: noInput,
     fixtures: { valid: [{}], invalid: [{ unexpected: true }] },
     action: false,
@@ -58,7 +58,8 @@ export const toolDefinitions = [
   }),
   defineTool({
     name: "observe_surroundings",
-    description: "指定半径内で実際に観測できるblock、entity、危険を返す。",
+    description:
+      "Botの位置を基準に、指定半径内で実際に観測できるblock、entity、危険を返す。酸素と水中状態もBot自身の同時刻の観測であり、利用者の状態は観測しない。",
     input: z
       .object({
         radius: z.number().int().min(1).max(32),

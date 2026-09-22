@@ -1,4 +1,9 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
+import type {
+  BehaviorMemoryRecord,
+  ForgetBehaviorMemoryInput,
+  RememberBehaviorMemoryInput,
+} from "../memory/types.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -54,17 +59,32 @@ export interface Position {
 }
 
 export interface GameStatus {
+  readonly observedAt: string;
+  readonly subject: "bot";
+  readonly source: "minecraft";
+  readonly requesterVitals: "unobserved";
   connected: boolean;
   spawned: boolean;
   health: number;
   food: number;
-  oxygen: number;
+  oxygen: number | null;
+  oxygenState: "normal" | "low" | "not_applicable" | "unknown";
+  inWater: boolean;
+  inLava: boolean;
+  suffocating: boolean;
   position: Position | null;
   inventory: Readonly<Record<string, number>>;
   activeTaskState: string | null;
 }
 
 export interface Surroundings {
+  readonly observedAt: string;
+  readonly subject: "bot";
+  readonly source: "minecraft";
+  readonly requesterVitals: "unobserved";
+  readonly oxygen: number | null;
+  readonly oxygenState: "normal" | "low" | "not_applicable" | "unknown";
+  readonly inWater: boolean;
   blocks: readonly { name: string; distance: number }[];
   entities: readonly { kind: string; distance: number }[];
   hazards: readonly string[];
@@ -173,6 +193,25 @@ export interface MemoryPort {
   }): unknown;
 }
 
+export interface BehaviorMemoryPort {
+  remember(input: RememberBehaviorMemoryInput): BehaviorMemoryRecord;
+  correct(input: {
+    readonly playerId: string;
+    readonly memoryId?: string;
+    readonly category: RememberBehaviorMemoryInput["category"];
+    readonly slot: string;
+    readonly value: string;
+    readonly summary: string;
+    readonly idempotencyKey?: string;
+  }): BehaviorMemoryRecord;
+  list(
+    playerId: string,
+    input?: { readonly limit?: number; readonly query?: string },
+  ): BehaviorMemoryRecord[];
+  isApplicable(record: BehaviorMemoryRecord): boolean;
+  forget(input: ForgetBehaviorMemoryInput): BehaviorMemoryRecord[];
+}
+
 export interface ToolContext {
   correlationId: string;
   requesterUsername: string;
@@ -194,6 +233,8 @@ export interface ToolContext {
   };
   game: GameController;
   memory: MemoryPort;
+  /** Optional on older integrations; behavior tools fail closed when absent. */
+  behaviorMemory?: BehaviorMemoryPort;
   limits: {
     maxMoveDistance: number;
     maxGatherCount: number;

@@ -59,6 +59,10 @@ export class GatherLogsSkill implements Skill<
   ): Promise<TaskRecord<GatherLogsInput, GatherLogsOutput>> {
     this.validateInput(input);
     return this.tasks.run(this.name, input, async (context) => {
+      await this.arbiter.waitForAvailable(
+        actionPriorities.task,
+        context.signal,
+      );
       const lease = this.arbiter.acquire(
         `task:${context.taskId}`,
         actionPriorities.task,

@@ -107,6 +107,13 @@ export class CompanionGameController implements GameController {
       includeEntities,
     );
     return {
+      observedAt: observed.observedAt,
+      subject: observed.subject,
+      source: observed.source,
+      requesterVitals: "unobserved",
+      oxygen: observed.oxygen,
+      oxygenState: observed.oxygenState,
+      inWater: observed.inWater,
       blocks: observed.blocks.map(({ name, distance }) => ({ name, distance })),
       entities: observed.entities.map(({ kind, distance }) => ({
         kind,
@@ -462,6 +469,7 @@ export class CompanionGameController implements GameController {
       };
     }
     if (record.status === "suspended") {
+      const recovery = suspendedTaskRecovery(record);
       return {
         before,
         after,
@@ -470,9 +478,8 @@ export class CompanionGameController implements GameController {
         failureCode: "TASK_SUSPENDED_FOR_SAFETY",
         failureRetryable: true,
         failedAt: record.phase,
-        nextActions: ["安全状態を再観測して再開可否を判断する"],
-        summary:
-          "安全処理が介入したため作業を中断し、再評価待ちとして保存しました。",
+        nextActions: recovery.nextActions,
+        summary: recovery.summary,
       };
     }
     return {
@@ -513,17 +520,22 @@ export class CompanionGameController implements GameController {
     }
     const task = this.#tasks.current;
     return {
+      observedAt: snapshot.observedAt,
+      subject: snapshot.subject,
+      source: snapshot.source,
+      requesterVitals: "unobserved",
       connected: snapshot.connected,
       spawned: snapshot.spawned,
       health: snapshot.health,
       food: snapshot.food,
       oxygen: snapshot.oxygen,
+      oxygenState: snapshot.oxygenState,
+      inWater: snapshot.inWater,
+      inLava: snapshot.inLava,
+      suffocating: snapshot.suffocating,
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
-      activeTaskState:
-        task === undefined || terminalTaskStatuses.has(task.status)
-          ? null
-          : `${task.kind}:${task.phase}:${task.status}`,
+      activeTaskState: activeTaskState(task),
     };
   }
 
@@ -592,6 +604,80 @@ function failureNextActions(
     case undefined:
       return ["状態と依頼内容を確認してから再試行する"];
   }
+}
+
+interface SuspendedTaskRecovery {
+  readonly summary: string;
+  readonly nextActions: readonly string[];
+}
+
+function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
+  const reason = task.checkpoint?.suspendReason;
+  const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
+  if (reason === "reflex:stuck") {
+    const nextInstruction =
+      task.kind === "follow_player"
+        ? "もう一度「こっちおいで」と指示する"
+        : "もう一度作業を指示する";
+    return {
+      summary: `移動が進まなかったため、${actionLabel}を安全に一時停止しました。周囲の障害物を避けてから、${nextInstruction}。`,
+      nextActions: ["周囲の障害物を避ける", nextInstruction],
+    };
+  }
+  if (reason === "reflex:hazard") {
+    return {
+      summary:
+        "危険を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。周囲の安全を確かめてから、もう一度指示してください。",
+      nextActions: [
+        "周囲が安全か再確認する",
+        "安全を確かめてからもう一度指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:hostile") {
+    return {
+      summary:
+        "危険な相手を確認したため、安全のため作業を一時停止しました。現在も相手が近くにいるかは再確認が必要です。相手から離れて安全を確かめてから、もう一度指示してください。",
+      nextActions: [
+        "危険な相手から離れる",
+        "周囲の安全を再確認してからもう一度指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:damage") {
+    return {
+      summary:
+        "被害を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。周囲の安全と被害の原因を確かめてから、もう一度指示してください。",
+      nextActions: [
+        "周囲の安全と被害の原因を再確認する",
+        "安全を確かめてからもう一度指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:hunger") {
+    return {
+      summary:
+        "空腹を確認したため、安全のため作業を一時停止しました。現在の空腹状態と食料を再確認し、必要なら食料を確保してから、もう一度指示してください。",
+      nextActions: [
+        "現在の空腹状態と食料を再確認する",
+        "必要なら食料を確保してからもう一度指示する",
+      ],
+    };
+  }
+  return {
+    summary:
+      "安全確認のため作業を一時停止しました。現在の状態を確認してから、もう一度指示してください。",
+    nextActions: ["現在の安全状態を確認する", "確認後にもう一度指示する"],
+  };
+}
+
+function activeTaskState(task: TaskRecord | undefined): string | null {
+  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+  if (task.status === "suspended") {
+    const recovery = suspendedTaskRecovery(task);
+    return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+  }
+  return `${task.kind}:${task.phase}:${task.status}`;
 }
 
 function formatCoordinates(position: {

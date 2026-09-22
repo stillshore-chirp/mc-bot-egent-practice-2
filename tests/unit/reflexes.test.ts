@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ReflexDetector,
+  reflexObservation,
   type ReflexThresholds,
 } from "../../src/reflexes/detectors.js";
 import { ReflexCoordinator } from "../../src/reflexes/reflex-coordinator.js";
-import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
+import {
+  actionPriorities,
+  ActionArbiter,
+} from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
@@ -51,6 +55,82 @@ describe("reflex loop", () => {
     );
     expect(state.state).toBe("stabilizing");
     expect(minecraft.actions).toContain("escape:environment");
+  });
+
+  it("treats low oxygen as a hazard only when the Bot is underwater", () => {
+    const detector = new ReflexDetector(thresholds);
+    const land = detector.detect(
+      createSnapshot({ oxygen: 5, inWater: false }),
+      false,
+    );
+    expect(land).toBeUndefined();
+
+    const underwater = detector.detect(
+      createSnapshot({ oxygen: 5, inWater: true }),
+      false,
+    );
+    expect(underwater).toMatchObject({
+      kind: "hazard",
+      reason: "Bot oxygen is low while underwater",
+      observation: {
+        subject: "bot",
+        source: "minecraft",
+        oxygen: 5,
+        oxygenState: "low",
+        inWater: true,
+      },
+    });
+
+    const recovered = detector.detect(
+      createSnapshot({ oxygen: 20, inWater: true }),
+      false,
+    );
+    expect(recovered).toBeUndefined();
+  });
+
+  it("uses an explicit unknown observation for underwater oxygen it cannot confirm", () => {
+    const detector = new ReflexDetector(thresholds);
+    const incident = detector.detect(
+      createSnapshot({ oxygen: null, inWater: true }),
+      false,
+    );
+
+    expect(incident).toMatchObject({
+      kind: "hazard",
+      reason: "Bot oxygen cannot be confirmed while underwater",
+      observation: { oxygen: null, oxygenState: "unknown", inWater: true },
+    });
+  });
+
+  it("keeps the intervention timeline and reports an unstable oxygen state as failure", async () => {
+    class UnstableMinecraft extends FakeMinecraft {
+      public override async escapeDanger(
+        _mode: "environment" | "hostile",
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (signal.aborted) throw signal.reason;
+        this.actions.push("escape:unstable");
+      }
+    }
+
+    const minecraft = new UnstableMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+    const coordinator = coordinatorFor(minecraft);
+    const failed = await coordinator.tick(await minecraft.observe(), false);
+
+    expect(failed).toMatchObject({
+      state: "failed",
+      failure: { code: "REFLEX_NOT_STABLE" },
+      incident: {
+        observation: { oxygen: 5, oxygenState: "low", inWater: true },
+      },
+      after: { oxygen: 5, oxygenState: "low", inWater: true },
+    });
+    if (failed.state !== "failed") throw new Error("expected failed reflex");
+    expect(failed.startedAt).toBe(failed.incident.observation.observedAt);
+    expect(failed.endedAt).toBe(failed.after?.observedAt);
+    expect(minecraft.actions).toContain("escape:unstable");
   });
 
   it("uses the environmental escape when lava and a hostile coexist", async () => {
@@ -157,5 +237,55 @@ describe("reflex loop", () => {
     const state = await coordinator.tick(await minecraft.observe(), true);
     expect(state.state).toBe("stabilizing");
     expect(minecraft.actions).toContain("recover:stuck");
+  });
+
+  it("reserves the reflex lease before suspending the task", async () => {
+    let startSuspending!: () => void;
+    const suspensionStarted = new Promise<void>((resolve) => {
+      startSuspending = resolve;
+    });
+    let releaseSuspension!: () => void;
+    const suspension = new Promise<void>((resolve) => {
+      releaseSuspension = resolve;
+    });
+    const minecraft = new FakeMinecraft();
+    const initialSnapshot = await minecraft.observe();
+    const tasks = {
+      suspend: async () => {
+        startSuspending();
+        await suspension;
+      },
+    } as unknown as TaskRuntime;
+    const detector = {
+      detect: () => ({
+        kind: "stuck" as const,
+        reason: "Movement was requested but position did not change",
+        priority: 100,
+        observation: reflexObservation(initialSnapshot),
+      }),
+    } as unknown as ReflexDetector;
+    const arbiter = new ActionArbiter();
+    const coordinator = new ReflexCoordinator(
+      detector,
+      thresholds,
+      minecraft,
+      tasks,
+      arbiter,
+      1_000,
+    );
+
+    const tick = coordinator.tick(initialSnapshot, true);
+    await suspensionStarted;
+
+    let error: unknown;
+    try {
+      arbiter.acquire("task:replacement", actionPriorities.task);
+    } catch (candidate) {
+      error = candidate;
+    }
+    expect(error).toMatchObject({ detail: { code: "ACTION_LEASE_BUSY" } });
+
+    releaseSuspension();
+    expect((await tick).state).toBe("stabilizing");
   });
 });
