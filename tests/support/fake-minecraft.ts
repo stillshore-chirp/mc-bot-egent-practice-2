@@ -9,6 +9,7 @@ import type {
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
 import { oxygenObservationState } from "../../src/domain/snapshot.js";
+import { recommendArmor } from "../../src/decision/armor-equipment.js";
 import type {
   EscapeMode,
   MinecraftPort,
@@ -53,6 +54,7 @@ export function createSnapshot(
     inLava: false,
     suffocating: false,
     inventory: [],
+    armor: { head: null, torso: null, legs: null, feet: null },
     players: [
       { username: "owner", position: { x: 0, y: 64, z: 0 }, distance: 0 },
     ],
@@ -529,6 +531,28 @@ export class FakeMinecraft implements MinecraftPort {
       };
     }
     return this.attackSucceeds;
+  }
+
+  public async equipAvailableArmor(signal: AbortSignal) {
+    signal.throwIfAborted();
+    const choices = recommendArmor(this.snapshot);
+    if (choices.length === 0 || this.snapshot.armor === null)
+      return { equipped: [], failed: false };
+    const inventory = this.snapshot.inventory.map((item) => ({ ...item }));
+    const armor = { ...this.snapshot.armor };
+    for (const choice of choices) {
+      const item = inventory.find((entry) => entry.name === choice.itemName);
+      if (item === undefined || item.count < 1) continue;
+      item.count -= 1;
+      armor[choice.slot] = choice.itemName;
+      this.actions.push(`equip:${choice.slot}:${choice.itemName}`);
+    }
+    this.snapshot = {
+      ...this.snapshot,
+      inventory: inventory.filter((item) => item.count > 0),
+      armor,
+    };
+    return { equipped: choices.map(({ slot }) => slot), failed: false };
   }
 
   public async retreatFromHostiles(signal: AbortSignal): Promise<void> {

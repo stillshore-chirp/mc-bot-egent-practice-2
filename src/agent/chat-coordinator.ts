@@ -210,6 +210,12 @@ export function isHostileResponseCommand(message: string): boolean {
   );
 }
 
+export function isHostileEvadeIntent(message: string): boolean {
+  return /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|退避|距離を取|(?:敵|モンスター).{0,8}離れて|安全な場所へ(?:移動|行って))/u.test(
+    message,
+  );
+}
+
 function renderReadOnlyStatus(status: GameStatus): string {
   if (!status.connected) {
     return "Minecraftへの接続を確認できません。再接続後に現在の状態を確認してください。";
@@ -777,9 +783,7 @@ export class ChatCoordinator {
         { summary: "観測に応じた攻撃または退避" },
         () =>
           this.#game.respondToHostiles(
-            /^(?:逃げて|退避して|距離を取って)/u.test(message)
-              ? "evade"
-              : "eliminate",
+            isHostileEvadeIntent(message) ? "evade" : "eliminate",
             controller.signal,
           ),
       );

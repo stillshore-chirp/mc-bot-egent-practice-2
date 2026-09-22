@@ -7,6 +7,7 @@ import {
   isReadOnlyStatusQuestion,
   isImmediateStopCommand,
   isHostileResponseCommand,
+  isHostileEvadeIntent,
   type ChatContextFactory,
 } from "../../src/agent/chat-coordinator.js";
 import { TraceService } from "../../src/trace/service.js";
@@ -42,6 +43,36 @@ describe("hostile response command", () => {
     expect(isHostileResponseCommand("敵をどうにかして")).toBe(true);
     expect(isHostileResponseCommand("敵を倒せる？")).toBe(false);
     expect(isHostileResponseCommand("敵を倒さないで")).toBe(false);
+    expect(isHostileResponseCommand("敵から逃げるのを助けて")).toBe(true);
+    expect(isHostileEvadeIntent("敵から逃げるのを助けて")).toBe(true);
+    expect(isHostileEvadeIntent("そいつらを撃滅せよ")).toBe(false);
+    expect(isHostileEvadeIntent("逃げないで倒して")).toBe(false);
+  });
+
+  it("routes an embedded escape request to evacuation, not combat", async () => {
+    const respondToHostiles = vi.fn(async () => ({
+      outcome: "completed" as const,
+      summary: "距離を取りました。",
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => ({
+          outcome: "completed",
+          summary: "停止しました。",
+        })),
+        respondToHostiles,
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {} as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+    await coordinator.handleChat("owner", "敵から逃げるのを助けて");
+    expect(respondToHostiles).toHaveBeenCalledWith(
+      "evade",
+      expect.any(AbortSignal),
+    );
   });
 
   it("preempts the prior task and acts without waiting for an LLM refusal", async () => {

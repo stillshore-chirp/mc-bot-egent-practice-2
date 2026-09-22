@@ -6,9 +6,13 @@ import pathfinderPackage, {
 import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
+import { isHostileEntity } from "../decision/hostile-classification.js";
 import {
   distance,
   oxygenObservationState,
+  type ArmorEquipment,
+  type ArmorSlot,
   type EntityObservation,
   type Position,
   type SurroundingsObservation,
@@ -17,6 +21,7 @@ import {
 import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay } from "../runtime/timeout.js";
 import type {
+  ArmorEquipResult,
   EscapeMode,
   MinecraftLogger,
   MinecraftPort,
@@ -57,39 +62,6 @@ import { queryStorageIdentity, storageChannel } from "./storage-identity.js";
 import { depositIntoChest } from "./chest-deposit.js";
 import type { ChestTarget } from "../memory/delivery-targets.js";
 import { gatherableLogs } from "../skills/gather-logs/resource-catalog.js";
-
-const hostileNames = new Set([
-  "blaze",
-  "cave_spider",
-  "creeper",
-  "drowned",
-  "enderman",
-  "endermite",
-  "evoker",
-  "ghast",
-  "guardian",
-  "hoglin",
-  "husk",
-  "magma_cube",
-  "phantom",
-  "piglin_brute",
-  "pillager",
-  "ravager",
-  "shulker",
-  "silverfish",
-  "skeleton",
-  "slime",
-  "spider",
-  "stray",
-  "vex",
-  "vindicator",
-  "warden",
-  "witch",
-  "wither_skeleton",
-  "zoglin",
-  "zombie",
-  "zombie_villager",
-]);
 
 const unsafeFoods = new Set([
   "chicken",
@@ -428,6 +400,25 @@ export class MineflayerClient implements MinecraftPort {
     for (const item of bot.inventory.items())
       inventory.set(item.name, (inventory.get(item.name) ?? 0) + item.count);
 
+    const armorSlots: readonly ArmorSlot[] = ["head", "torso", "legs", "feet"];
+    const observedArmor =
+      typeof bot.getEquipmentDestSlot === "function"
+        ? armorSlots.map((slot) => ({
+            slot,
+            item: bot.inventory.slots[bot.getEquipmentDestSlot(slot)],
+          }))
+        : null;
+    const armor: ArmorEquipment | null =
+      observedArmor === null ||
+      observedArmor.some(({ item }) => item === undefined)
+        ? null
+        : {
+            head: observedArmor[0]?.item?.name ?? null,
+            torso: observedArmor[1]?.item?.name ?? null,
+            legs: observedArmor[2]?.item?.name ?? null,
+            feet: observedArmor[3]?.item?.name ?? null,
+          };
+
     const players = Object.values(bot.players)
       .filter(
         (player) =>
@@ -450,7 +441,7 @@ export class MineflayerClient implements MinecraftPort {
           kind: entity.type,
           position: positionOf(entity.position),
           distance: bot.entity.position.distanceTo(entity.position),
-          hostile: hostileNames.has(name),
+          hostile: isHostileEntity(name, entity.type, bot.registry),
         };
       })
       .filter((entity) => entity.distance <= 32);
@@ -488,6 +479,7 @@ export class MineflayerClient implements MinecraftPort {
         !["air", "cave_air", "void_air", "water", "lava"].includes(head.name) &&
         head.boundingBox === "block",
       inventory: [...inventory].map(([name, count]) => ({ name, count })),
+      armor,
       players,
       nearbyEntities,
     };
@@ -539,7 +531,7 @@ export class MineflayerClient implements MinecraftPort {
               kind: entity.type,
               position: positionOf(entity.position),
               distance: origin.distanceTo(entity.position),
-              hostile: hostileNames.has(name),
+              hostile: isHostileEntity(name, entity.type, bot.registry),
             };
           })
           .sort((left, right) => left.distance - right.distance)
@@ -1818,6 +1810,69 @@ export class MineflayerClient implements MinecraftPort {
     }
   }
 
+  public async equipAvailableArmor(
+    signal: AbortSignal,
+  ): Promise<ArmorEquipResult> {
+    throwIfAborted(signal, "equip_armor");
+    const bot = this.requireBot();
+    const choices = recommendArmor(await this.observe());
+    const equipped: ArmorSlot[] = [];
+    let failed = false;
+    for (const choice of choices) {
+      throwIfAborted(signal, "equip_armor");
+      const physics = bot.entity as unknown as {
+        isInWater?: boolean;
+        isInLava?: boolean;
+        onFire?: boolean;
+      };
+      const threatClose = Object.values(bot.entities).some(
+        (entity) =>
+          isHostileEntity(
+            entity.name ?? entity.displayName ?? entity.type,
+            entity.type,
+            bot.registry,
+          ) && bot.entity.position.distanceTo(entity.position) < 6,
+      );
+      if (
+        threatClose ||
+        physics.isInWater === true ||
+        physics.isInLava === true ||
+        physics.onFire === true
+      ) {
+        failed = true;
+        break;
+      }
+      const slotIndex = bot.getEquipmentDestSlot(choice.slot);
+      if (bot.inventory.slots[slotIndex] !== null) {
+        failed = true;
+        continue;
+      }
+      const item = bot.inventory
+        .items()
+        .find((candidate) => candidate.name === choice.itemName);
+      if (item === undefined) {
+        failed = true;
+        continue;
+      }
+      try {
+        await bot.equip(item, choice.slot);
+        throwIfAborted(signal, "equip_armor");
+        const equippedItem = bot.inventory.slots[slotIndex] as {
+          readonly name: string;
+        } | null;
+        if (equippedItem?.name === choice.itemName) {
+          equipped.push(choice.slot);
+        } else {
+          failed = true;
+        }
+      } catch (error) {
+        if (signal.aborted) throw error;
+        failed = true;
+      }
+    }
+    return { equipped, failed };
+  }
+
   public async retreatFromHostiles(signal: AbortSignal): Promise<void> {
     throwIfAborted(signal, "hostile_retreat");
     const bot = this.requireBot();
@@ -1825,8 +1880,11 @@ export class MineflayerClient implements MinecraftPort {
     const threats = Object.values(bot.entities)
       .filter(
         (entity) =>
-          hostileNames.has(entity.name ?? entity.displayName ?? entity.type) &&
-          bot.entity.position.distanceTo(entity.position) <= 32,
+          isHostileEntity(
+            entity.name ?? entity.displayName ?? entity.type,
+            entity.type,
+            bot.registry,
+          ) && bot.entity.position.distanceTo(entity.position) <= 32,
       )
       .map((entity) => positionOf(entity.position));
     const target = escapeTarget(origin, threats, 8);
@@ -1860,8 +1918,10 @@ export class MineflayerClient implements MinecraftPort {
             Object.values(bot.entities)
               .filter(
                 (entity) =>
-                  hostileNames.has(
+                  isHostileEntity(
                     entity.name ?? entity.displayName ?? entity.type,
+                    entity.type,
+                    bot.registry,
                   ) && bot.entity.position.distanceTo(entity.position) <= 32,
               )
               .map((entity) => positionOf(entity.position)),

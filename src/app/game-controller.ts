@@ -4,6 +4,8 @@ import type {
   SafeActionObservationRequest,
 } from "../decision/safe-action-planner.js";
 import type { DepositResult } from "../minecraft/port.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
+import type { ArmorSlot } from "../domain/snapshot.js";
 import {
   closestHostileDistance,
   decideHostileResponse,
@@ -446,7 +448,29 @@ export class CompanionGameController implements GameController {
           },
           signal,
           async (actionSignal) => {
-            const current = await this.#minecraft.observe();
+            let current = await this.#minecraft.observe();
+            const equippedArmor: ArmorSlot[] = [];
+            let armorEquipFailed = false;
+            const equipWhenSafe = async (snapshot: WorldSnapshot) => {
+              const hostileDistance = closestHostileDistance(snapshot);
+              if (
+                (hostileDistance !== null && hostileDistance < 6) ||
+                snapshot.onFire ||
+                snapshot.inLava ||
+                snapshot.inWater ||
+                snapshot.suffocating ||
+                recommendArmor(snapshot).length === 0
+              ) {
+                return;
+              }
+              const result =
+                await this.#minecraft.equipAvailableArmor(actionSignal);
+              equippedArmor.push(...result.equipped);
+              armorEquipFailed ||= result.failed;
+            };
+            await equipWhenSafe(current);
+            if (equippedArmor.length > 0)
+              current = await this.#minecraft.observe();
             const choice =
               goal === "evade"
                 ? closestHostileDistance(current) === null
@@ -456,7 +480,8 @@ export class CompanionGameController implements GameController {
                       reason: "退避を指示されたため",
                     } as const)
                 : decideHostileResponse(current);
-            if (choice.mode === "none") return { mode: "none" as const };
+            if (choice.mode === "none")
+              return { mode: "none" as const, equippedArmor };
             let attackedEntityId: number | undefined;
             let reason = choice.mode === "retreat" ? choice.reason : "";
             if (choice.mode === "attack") {
@@ -468,7 +493,11 @@ export class CompanionGameController implements GameController {
                     actionSignal,
                   )
                 ) {
-                  return { mode: "attack" as const, entityId: choice.entityId };
+                  return {
+                    mode: "attack" as const,
+                    entityId: choice.entityId,
+                    equippedArmor,
+                  };
                 }
                 reason = "攻撃しましたが撃破を確認できないため";
               } catch (error) {
@@ -504,22 +533,30 @@ export class CompanionGameController implements GameController {
               await this.#minecraft.recoverFromStuck(2, actionSignal);
               await this.#minecraft.retreatFromHostiles(actionSignal);
             }
+            await equipWhenSafe(await this.#minecraft.observe());
             return {
               mode: "retreat" as const,
               reason,
               distanceBefore,
+              equippedArmor,
+              armorEquipFailed,
               ...(attackedEntityId === undefined ? {} : { attackedEntityId }),
             };
           },
         ),
       (result, after) => {
+        const armorSummary =
+          result.equippedArmor.length > 0
+            ? `所持防具を${result.equippedArmor.length}箇所装着し、`
+            : result.mode === "retreat" && result.armorEquipFailed
+              ? "防具の装着を確認できず、"
+              : "";
         if (result.mode === "none") {
           return {
             outcome: "failed",
             failureCategory: "observation",
             failureCode: "HOSTILE_TARGET_CHANGED",
-            summary:
-              "対象が観測範囲からいなくなったため、攻撃や退避は始めませんでした。",
+            summary: `${armorSummary}対象が観測範囲からいなくなったため、攻撃や退避は始めませんでした。`,
           };
         }
         if (result.mode === "attack") {
@@ -528,8 +565,7 @@ export class CompanionGameController implements GameController {
           return {
             outcome: "completed",
             evidenceKind: "minecraft_snapshot",
-            summary:
-              "敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。",
+            summary: `${armorSummary}敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。`,
           };
         }
         const moved =
@@ -551,14 +587,13 @@ export class CompanionGameController implements GameController {
                     failureCode: "HOSTILE_ELIMINATION_NOT_CONFIRMED",
                   }),
               evidenceKind: "minecraft_snapshot",
-              summary: `${result.reason}攻撃は続けず、実際に${moved.toFixed(1)}ブロック移動して距離を取りました。敵の撃破は未確認です。`,
+              summary: `${armorSummary}${result.reason}攻撃は続けず、実際に${moved.toFixed(1)}ブロック移動して距離を取りました。敵の撃破は未確認です。`,
             }
           : {
               outcome: "failed",
               failureCategory: "safety",
               failureCode: "HOSTILE_RETREAT_NOT_VERIFIED",
-              summary:
-                "退避を試みましたが、敵との距離が広がったことを確認できませんでした。撃破や安全確保は未確認です。",
+              summary: `${armorSummary}退避を試みましたが、敵との距離が広がったことを確認できませんでした。撃破や安全確保は未確認です。`,
             };
       },
       initial,
@@ -1244,6 +1279,7 @@ export class CompanionGameController implements GameController {
       suffocating: snapshot.suffocating,
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
+      armor: snapshot.armor,
       activeTaskState: activeTaskState(task),
       activeTaskSummary: activeTaskSummary(task),
       latestTaskState: latestTaskState(task),

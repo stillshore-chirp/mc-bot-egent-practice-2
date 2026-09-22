@@ -96,6 +96,58 @@ describe("CompanionGameController", () => {
     }
   });
 
+  it("equips carried armor at a safe distance before choosing retreat", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        nearbyEntities: [hostile(1, 21), hostile(2, 23)],
+        inventory: [
+          { name: "iron_helmet", count: 1 },
+          { name: "iron_chestplate", count: 1 },
+        ],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(minecraft.actions).toEqual(
+        expect.arrayContaining([
+          "equip:head:iron_helmet",
+          "equip:torso:iron_chestplate",
+          "retreat:hostile",
+        ]),
+      );
+      expect(minecraft.snapshot.armor).toMatchObject({
+        head: "iron_helmet",
+        torso: "iron_chestplate",
+      });
+      expect(report.summary).toContain("防具を2箇所装着");
+      expect(report.summary).toContain("撃破は未確認");
+    } finally {
+      close();
+    }
+  });
+
+  it("retreats before equipping when a hostile is too close", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        nearbyEntities: [hostile(1, 2)],
+        inventory: [{ name: "iron_helmet", count: 1 }],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      await game.respondToHostiles("evade", new AbortController().signal);
+      expect(minecraft.actions.indexOf("retreat:hostile")).toBeLessThan(
+        minecraft.actions.indexOf("equip:head:iron_helmet"),
+      );
+    } finally {
+      close();
+    }
+  });
+
   it("attacks one adjacent hostile with a weapon and verifies death", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({

@@ -1,5 +1,6 @@
 import type { ChestTarget } from "../memory/delivery-targets.js";
 import type {
+  ArmorSlot,
   Position,
   SurroundingsObservation,
   WorldSnapshot,
@@ -20,6 +21,11 @@ export interface ResourceTarget {
 }
 
 export type EscapeMode = "environment" | "hostile";
+
+export interface ArmorEquipResult {
+  readonly equipped: readonly ArmorSlot[];
+  readonly failed: boolean;
+}
 
 export interface StorageObservation {
   readonly chestCount: number;
@@ -99,6 +105,7 @@ export interface MinecraftPort {
   /** Returns true only after the server reports the target entity's death. */
   attackHostile(entityId: number, signal: AbortSignal): Promise<boolean>;
   retreatFromHostiles(signal: AbortSignal): Promise<void>;
+  equipAvailableArmor(signal: AbortSignal): Promise<ArmorEquipResult>;
   escapeDanger(mode: EscapeMode, signal: AbortSignal): Promise<void>;
   recoverFromStuck(maxAttempts: number, signal: AbortSignal): Promise<void>;
   stopCurrentAction(): Promise<void>;
