@@ -523,23 +523,14 @@ export class CompanionGameController implements GameController {
           };
         }
         if (result.mode === "attack") {
-          return after !== null &&
-            !after.nearbyEntities.some(
-              (entity) => entity.id === result.entityId,
-            )
-            ? {
-                outcome: "completed",
-                evidenceKind: "minecraft_snapshot",
-                summary:
-                  "敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。",
-              }
-            : {
-                outcome: "failed",
-                failureCategory: "observation",
-                failureCode: "HOSTILE_DEATH_NOT_VERIFIED",
-                summary:
-                  "攻撃後に相手の死亡を確認できませんでした。撃破済みとは扱いません。",
-              };
+          // attackHostile returns true only after Mineflayer's entityDead event.
+          // A dead entity can remain visible during its death animation.
+          return {
+            outcome: "completed",
+            evidenceKind: "minecraft_snapshot",
+            summary:
+              "敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。",
+          };
         }
         const moved =
           after === null ? 0 : distance(initial.position, after.position);

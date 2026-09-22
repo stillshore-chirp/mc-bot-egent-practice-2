@@ -1799,6 +1799,8 @@ export class MineflayerClient implements MinecraftPort {
             (other) =>
               other.id !== entityId &&
               other.id !== bot.entity.id &&
+              other.name !== "item" &&
+              other.name !== "experience_orb" &&
               bot.entity.position.distanceTo(other.position) <= 4,
           )
         ) {

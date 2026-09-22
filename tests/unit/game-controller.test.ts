@@ -118,6 +118,36 @@ describe("CompanionGameController", () => {
     }
   });
 
+  it("accepts the death event while the dead mob remains briefly visible", async () => {
+    class LingeringDeadMob extends FakeMinecraft {
+      public override async attackHostile(
+        entityId: number,
+        signal: AbortSignal,
+      ): Promise<boolean> {
+        signal.throwIfAborted();
+        this.actions.push(`attack:${entityId}`);
+        return true;
+      }
+    }
+    const minecraft = new LingeringDeadMob(
+      createSnapshot({
+        nearbyEntities: [hostile(7, 2)],
+        inventory: [{ name: "iron_sword", count: 1 }],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.respondToHostiles(
+        "eliminate",
+        new AbortController().signal,
+      );
+      expect(report.outcome).toBe("completed");
+      expect(report.summary).toContain("死亡を確認");
+    } finally {
+      close();
+    }
+  });
+
   it("retreats after an inconclusive attack and never claims a kill", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({
