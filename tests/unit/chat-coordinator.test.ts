@@ -45,6 +45,13 @@ describe("immediate stop command", () => {
     "やめて",
     "中止",
     "中断",
+    "止まれ",
+    "止めろ",
+    "やめろ",
+    "停止しろ",
+    "やめなさい",
+    "今すぐストップ",
+    "やめてくれ",
   ])("accepts the exact safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -66,6 +73,11 @@ describe("immediate stop command", () => {
     "採取を止めてもういい",
     "採取を止めてから説明して",
     "採取を止めて今何してる",
+    "今すぐやめろ",
+    "採取を止めろ",
+    "止まれ説明して",
+    "追従をやめてくれ",
+    "採取をやめなさい",
   ])("accepts a targeted affirmative safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -102,6 +114,9 @@ describe("immediate stop command", () => {
     "採取を止めてほしい場合は言って",
     "追従を止めてほしい時は知らせて",
     "採取を止めてほしいと思ったら相談して",
+    "止まれ？",
+    "今すぐやめろと言っただけ",
+    "「止まれ」と表示して",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
@@ -110,6 +125,53 @@ describe("immediate stop command", () => {
   it("does not treat an ordinary sentence as a stop command", () => {
     expect(isImmediateStopCommand("停止方法を教えて")).toBe(false);
   });
+
+  it.each(["止まれ", "今すぐやめろ"])(
+    "handles an imperative stop before a running conversation completes: %s",
+    async (command) => {
+      let releaseAction!: () => void;
+      let notifyActionStarted!: () => void;
+      const actionStarted = new Promise<void>((resolve) => {
+        notifyActionStarted = resolve;
+      });
+      const stopCurrentAction = vi.fn(async () => ({
+        outcome: "completed",
+        summary: "停止しました。",
+      }));
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          stopCurrentAction,
+          say: vi.fn(async () => undefined),
+        } as unknown as GameController,
+        agent: {
+          deliberate: vi.fn(async () => {
+            notifyActionStarted();
+            await new Promise<void>((resolve) => {
+              releaseAction = resolve;
+            });
+            return { text: "作業を開始しました。", toolResults: [] };
+          }),
+        } as unknown as OpenAIDeliberationAgent,
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: minimalToolContext,
+          })),
+        },
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
+
+      const active = coordinator.handleChat("owner", "長時間の作業");
+      await actionStarted;
+      await coordinator.handleChat("owner", command);
+      expect(stopCurrentAction).toHaveBeenCalledTimes(1);
+      releaseAction();
+      await active;
+    },
+  );
 
   it("prioritizes a compound stop clause over a status question", () => {
     expect(isImmediateStopCommand("今どうなってる、止まって")).toBe(true);
@@ -202,6 +264,53 @@ describe("immediate stop command", () => {
     await expect(
       coordinator.handleChat("owner", "採取を止めて、拠点へ戻って"),
     ).rejects.toThrow("STOP_FAILED");
+    expect(deliberate).not.toHaveBeenCalled();
+  });
+
+  it("drops a compound follow-up when a newer stop arrives first", async () => {
+    let releaseFirstStop!: () => void;
+    let notifyFirstStopStarted!: () => void;
+    const firstStopStarted = new Promise<void>((resolve) => {
+      notifyFirstStopStarted = resolve;
+    });
+    let stopCount = 0;
+    const stopCurrentAction = vi.fn(() => {
+      stopCount += 1;
+      if (stopCount > 1) {
+        return Promise.resolve({
+          outcome: "completed",
+          summary: "停止しました。",
+        });
+      }
+      notifyFirstStopStarted();
+      return new Promise<{ outcome: "completed"; summary: string }>(
+        (resolve) => {
+          releaseFirstStop = () =>
+            resolve({ outcome: "completed", summary: "停止しました。" });
+        },
+      );
+    });
+    const deliberate = vi.fn();
+    const say = vi.fn(async () => undefined);
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { stopCurrentAction, say } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+
+    const compound = coordinator.handleChat(
+      "owner",
+      "採取を止めて拠点へ戻って",
+    );
+    await firstStopStarted;
+    const secondStop = coordinator.handleChat("owner", "停止");
+    releaseFirstStop();
+    await Promise.all([compound, secondStop]);
+
+    expect(stopCurrentAction).toHaveBeenCalledTimes(2);
+    expect(say).toHaveBeenCalledTimes(2);
     expect(deliberate).not.toHaveBeenCalled();
   });
 
@@ -1084,6 +1193,7 @@ describe("immediate stop command", () => {
       notifyStopStarted = resolve;
     });
     const sent: string[] = [];
+    const history: string[] = [];
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: {
@@ -1093,10 +1203,19 @@ describe("immediate stop command", () => {
         })),
         stopCurrentAction: vi.fn(async () => {
           notifyStopStarted();
-          return { outcome: "completed", summary: "停止しました。" };
+          return {
+            outcome: "completed",
+            summary: "停止しました。",
+            before: { activeTaskState: "follow_player:running" },
+          };
         }),
         say: vi.fn((message: string) => {
           sent.push(message);
+          history.push(
+            message === "利用者への追従を続けています。"
+              ? "status_send"
+              : "stop_send",
+          );
           if (message !== "利用者への追従を続けています。") {
             return Promise.resolve();
           }
@@ -1106,7 +1225,12 @@ describe("immediate stop command", () => {
           });
         }),
       } as unknown as GameController,
-      agent: {} as OpenAIDeliberationAgent,
+      agent: {
+        recordDeliveredOwnerExchange: vi.fn(() =>
+          history.push("status_recorded"),
+        ),
+        recordCancelledRequest: vi.fn(() => history.push("cancel_recorded")),
+      } as unknown as OpenAIDeliberationAgent,
       contextFactory: {} as ChatContextFactory,
       logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
     });
@@ -1120,6 +1244,12 @@ describe("immediate stop command", () => {
     releaseStatusSay();
     await Promise.all([question, stopping]);
     expect(sent).toEqual(["利用者への追従を続けています。", "停止しました。"]);
+    expect(history).toEqual([
+      "status_send",
+      "status_recorded",
+      "cancel_recorded",
+      "stop_send",
+    ]);
   });
 
   it("does not shortcut a bare why without a confirmed live task", async () => {

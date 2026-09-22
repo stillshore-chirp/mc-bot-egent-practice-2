@@ -19,18 +19,15 @@ import type {
 import { isExplicitGoalResumeMessage } from "./conversation-context.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
 
-const STOP_COMMANDS = new Set([
-  "停止",
-  "停止して",
-  "止まって",
-  "止めて",
-  "ストップ",
-  "やめて",
-  "中止",
-  "中断",
-]);
-const TARGETED_STOP_COMMAND_PATTERN =
-  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?(?:ね|よ)?$|(?:停止|中止|中断)$/u;
+const stopTeForms = "(?:止めて|停止して|やめて|中止して|中断して|止まって)";
+const stopTeSuffix =
+  "(?:ください|下さい|ほしい(?:です)?|くれ(?![てた])|ちょうだい|お願い(?:します)?)?(?:ね|よ)?";
+const stopImperatives =
+  "(?:止まれ|止めろ|やめろ|停止しろ|中止しろ|中断しろ|止まりなさい|止めなさい|やめなさい|停止しなさい|中止しなさい|中断しなさい)";
+const TARGETED_STOP_COMMAND_PATTERN = new RegExp(
+  `${stopTeForms}${stopTeSuffix}$|${stopImperatives}$|(?:停止|中止|中断|ストップ)$`,
+  "u",
+);
 const STOP_FAILURE_MESSAGE =
   "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
 
@@ -47,8 +44,10 @@ function splitStopClauses(message: string): string[] {
 function splitInlineStopClause(clause: string): string[] {
   if (/[?？]/u.test(clause)) return [clause];
   const normalized = normalizedStopClause(clause);
-  const commands =
-    /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?(?:ね|よ)?/gu;
+  const commands = new RegExp(
+    `${stopTeForms}${stopTeSuffix}|${stopImperatives}`,
+    "gu",
+  );
   for (const match of normalized.matchAll(commands)) {
     const end = match.index + match[0].length;
     const stop = normalized.slice(0, end).trim();
@@ -76,7 +75,6 @@ function isStopClause(clause: string): boolean {
   if (/[?？]/u.test(clause)) return false;
   const normalized = normalizedStopClause(clause);
   if (/[「」『』“”"'`]/u.test(normalized)) return false;
-  if (STOP_COMMANDS.has(normalized)) return true;
   return TARGETED_STOP_COMMAND_PATTERN.test(normalized);
 }
 
@@ -373,6 +371,7 @@ export class ChatCoordinator {
     if (isImmediateStopCommand(normalized)) {
       this.#runtimeGeneration += 1;
       this.#generation += 1;
+      const stopGeneration = this.#generation;
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
       const recorder = this.#agent as unknown as DeliveredReplyRecorder;
@@ -401,6 +400,9 @@ export class ChatCoordinator {
             const hadActiveTask =
               (report.before?.activeTaskSummary?.trim().length ?? 0) > 0 ||
               (report.before?.activeTaskState?.trim().length ?? 0) > 0;
+            // A status message already being sent precedes the stop result
+            // in both chat and the recorded conversation history.
+            await Promise.allSettled([...this.#readOnlyStatusDeliveries]);
             if (pendingRequestId !== undefined || hadActiveTask) {
               if (interruptedRequestId === undefined) {
                 recorder.recordCancelledRequest?.(username, "owner_message");
@@ -412,9 +414,6 @@ export class ChatCoordinator {
                 );
               }
             }
-            // Any status reply already being sent must finish before the
-            // stop result. Pending observations are invalidated by generation.
-            await Promise.allSettled([...this.#readOnlyStatusDeliveries]);
             await safeWithTraceSpan(
               this.#traceService,
               "response",
@@ -447,7 +446,7 @@ export class ChatCoordinator {
         }
         throw error;
       }
-      if (stopFollowUp !== undefined) {
+      if (stopFollowUp !== undefined && stopGeneration === this.#generation) {
         await this.handleChat(username, stopFollowUp);
       }
       return true;
@@ -641,28 +640,30 @@ export class ChatCoordinator {
         status === undefined
           ? "現在のMinecraft状態を確認できません。再観測が必要です。"
           : renderReadOnlyStatus(status);
-      const delivery = safeWithTraceSpan(
-        this.#traceService,
-        "response",
-        "状態質問への応答",
-        {
-          summary: "確認済み状態を送信",
-          resultKind: "final_response",
-          summarizeResult: () => "確認済み状態を送信",
-        },
-        async () => {
-          if (questionGeneration !== this.#generation) return false;
-          await this.#game.say(reply);
-          return true;
-        },
-      );
-      this.#readOnlyStatusDeliveries.add(delivery);
-      try {
-        const delivered = await delivery;
-        if (delivered && questionGeneration === this.#generation) {
+      const delivery = (async (): Promise<boolean> => {
+        const delivered = await safeWithTraceSpan(
+          this.#traceService,
+          "response",
+          "状態質問への応答",
+          {
+            summary: "確認済み状態を送信",
+            resultKind: "final_response",
+            summarizeResult: () => "確認済み状態を送信",
+          },
+          async () => {
+            if (questionGeneration !== this.#generation) return false;
+            await this.#game.say(reply);
+            return true;
+          },
+        );
+        if (delivered) {
           recorder.recordDeliveredOwnerExchange?.(username, message, reply);
         }
         return delivered;
+      })();
+      this.#readOnlyStatusDeliveries.add(delivery);
+      try {
+        return await delivery;
       } finally {
         this.#readOnlyStatusDeliveries.delete(delivery);
       }
