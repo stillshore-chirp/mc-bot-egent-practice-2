@@ -1359,7 +1359,8 @@ export class MineflayerClient implements MinecraftPort {
           count: number,
         ): Promise<void>;
         takeOutput(): Promise<void>;
-        close(): Promise<void>;
+        close(): void;
+        outputItem?: () => unknown;
       }>;
     };
     const inputItem = bot.registry.itemsByName[target.input];
@@ -1395,10 +1396,17 @@ export class MineflayerClient implements MinecraftPort {
           before.inventory.find((entry) => entry.name === target.output)
             ?.count ?? 0;
         if (count - baseline >= target.count) return count - baseline;
-        await furnace.takeOutput();
+        if (furnace.outputItem?.() !== undefined) {
+          await furnace.takeOutput();
+        }
       }
     } finally {
-      await furnace.close().catch(() => undefined);
+      try {
+        furnace.close();
+      } catch {
+        // Mineflayer's runtime close() is synchronous; closing is best effort
+        // after the authoritative inventory observation.
+      }
     }
     const after = await this.observe();
     const baseline =
