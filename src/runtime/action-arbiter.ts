@@ -28,8 +28,7 @@ export class ActionArbiter {
     priority: number,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (signal?.aborted)
-      throw signal.reason ?? new Error("Action wait aborted");
+    if (signal?.aborted) throw actionWaitAbortError(signal.reason);
     if (this.active === undefined || this.active.priority < priority) return;
 
     await new Promise<void>((resolve, reject) => {
@@ -50,7 +49,7 @@ export class ActionArbiter {
         settled = true;
         this.availabilityWaiters.delete(check);
         signal?.removeEventListener("abort", onAbort);
-        reject(signal?.reason ?? new Error("Action wait aborted"));
+        reject(actionWaitAbortError(signal?.reason));
       };
       this.availabilityWaiters.add(check);
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -101,4 +100,8 @@ export class ActionArbiter {
   private notifyAvailabilityWaiters(): void {
     for (const check of [...this.availabilityWaiters]) check();
   }
+}
+
+function actionWaitAbortError(reason: unknown): Error {
+  return reason instanceof Error ? reason : new Error("Action wait aborted");
 }
