@@ -598,14 +598,15 @@ interface SuspendedTaskRecovery {
 
 function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
   const reason = task.checkpoint?.suspendReason;
+  const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
   if (reason === "reflex:stuck") {
+    const nextInstruction =
+      task.kind === "follow_player"
+        ? "もう一度「こっちおいで」と指示する"
+        : "もう一度作業を指示する";
     return {
-      summary:
-        "移動が進まなかったため、追従を安全に一時停止しました。周囲の障害物を避けてから、もう一度「こっちおいで」と指示してください。",
-      nextActions: [
-        "周囲の障害物を避ける",
-        "もう一度「こっちおいで」と指示する",
-      ],
+      summary: `移動が進まなかったため、${actionLabel}を安全に一時停止しました。周囲の障害物を避けてから、${nextInstruction}。`,
+      nextActions: ["周囲の障害物を避ける", nextInstruction],
     };
   }
   if (reason === "reflex:hazard") {
