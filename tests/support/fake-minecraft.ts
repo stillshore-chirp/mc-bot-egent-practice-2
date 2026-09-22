@@ -23,6 +23,7 @@ import type {
   PlaceBlockInput,
   SmeltItemInput,
 } from "../../src/minecraft/general-actions.js";
+import { goalMetadataForBlock } from "../../src/minecraft/general-actions.js";
 
 const now = (): string => new Date().toISOString();
 
@@ -267,6 +268,10 @@ export class FakeMinecraft implements MinecraftPort {
     for (const resource of this.resources.slice(0, input.maxCandidates)) {
       const key = `${resource.name}:${resource.position.x}:${resource.position.y}:${resource.position.z}`;
       const permission = this.actionGuardDecisions.get(key) ?? "allowed";
+      const goalMetadata = goalMetadataForBlock(
+        resource.name,
+        new Set(input.requestedItems),
+      );
       candidates.push({
         id: `mine_block:${key}`,
         label: `${resource.name}を採掘`,
@@ -279,9 +284,11 @@ export class FakeMinecraft implements MinecraftPort {
           },
         ],
         observed: true,
-        purposeFit: input.requestedItems.includes(resource.name)
-          ? "direct"
-          : "unknown",
+        purposeFit:
+          input.requestedItems.includes(resource.name) ||
+          goalMetadata.goalItem !== undefined
+            ? "direct"
+            : "unknown",
         permission,
         safety:
           permission === "allowed"
@@ -294,6 +301,7 @@ export class FakeMinecraft implements MinecraftPort {
         operationClass: "natural_resource",
         requestedCount: 1,
         resourceName: resource.name,
+        ...goalMetadata,
         distance: 1,
         order: candidates.length,
       });

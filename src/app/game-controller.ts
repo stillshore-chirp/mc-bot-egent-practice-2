@@ -23,6 +23,7 @@ import type {
   PlaceBlockInput,
   SmeltItemInput,
 } from "../minecraft/general-actions.js";
+import { knownBlockDrops } from "../minecraft/general-actions.js";
 import type { MemoryStore } from "../memory/store.js";
 import {
   actionPriorities,
@@ -876,28 +877,7 @@ function isGatherableLog(resource: string): resource is GatherableLog {
 }
 
 function minedItemName(blockName: string): string {
-  const drops: Record<string, string> = {
-    stone: "cobblestone",
-    deepslate: "cobbled_deepslate",
-    clay: "clay_ball",
-    coal_ore: "coal",
-    deepslate_coal_ore: "coal",
-    iron_ore: "raw_iron",
-    deepslate_iron_ore: "raw_iron",
-    gold_ore: "raw_gold",
-    deepslate_gold_ore: "raw_gold",
-    copper_ore: "raw_copper",
-    deepslate_copper_ore: "raw_copper",
-    diamond_ore: "diamond",
-    deepslate_diamond_ore: "diamond",
-    emerald_ore: "emerald",
-    deepslate_emerald_ore: "emerald",
-    redstone_ore: "redstone",
-    deepslate_redstone_ore: "redstone",
-    lapis_ore: "lapis_lazuli",
-    deepslate_lapis_ore: "lapis_lazuli",
-  };
-  return drops[blockName] ?? blockName;
+  return knownBlockDrops[blockName] ?? blockName;
 }
 
 function mapFailureCategory(

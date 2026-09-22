@@ -42,8 +42,93 @@ export interface GeneralActionCandidate {
   readonly scopeId?: string;
   readonly requestedCount?: number;
   readonly resourceName?: string;
+  /** Canonical inventory item delivered by this observed operation. */
+  readonly goalItem?: string;
+  /** Verified item(s) that may advance preparation for goalItem. */
+  readonly intermediateItems?: readonly string[];
   readonly distance: number;
   readonly order: number;
+}
+
+export interface ActionGoalMetadata {
+  readonly goalItem?: string;
+  readonly intermediateItems?: readonly string[];
+}
+
+/**
+ * Conservative block-drop facts used at the observation boundary. A missing
+ * entry is intentionally unknown; callers must not infer an inventory result
+ * from a block name alone.
+ */
+export const knownBlockDrops: Readonly<Record<string, string>> = {
+  stone: "cobblestone",
+  deepslate: "cobbled_deepslate",
+  clay: "clay_ball",
+  gravel: "gravel",
+  sand: "sand",
+  red_sand: "red_sand",
+  dirt: "dirt",
+  coarse_dirt: "coarse_dirt",
+  rooted_dirt: "rooted_dirt",
+  coal_ore: "coal",
+  deepslate_coal_ore: "coal",
+  iron_ore: "raw_iron",
+  deepslate_iron_ore: "raw_iron",
+  gold_ore: "raw_gold",
+  deepslate_gold_ore: "raw_gold",
+  copper_ore: "raw_copper",
+  deepslate_copper_ore: "raw_copper",
+  diamond_ore: "diamond",
+  deepslate_diamond_ore: "diamond",
+  emerald_ore: "emerald",
+  deepslate_emerald_ore: "emerald",
+  redstone_ore: "redstone",
+  deepslate_redstone_ore: "redstone",
+  lapis_ore: "lapis_lazuli",
+  deepslate_lapis_ore: "lapis_lazuli",
+  ancient_debris: "netherite_scrap",
+  oak_log: "oak_log",
+  spruce_log: "spruce_log",
+  birch_log: "birch_log",
+  jungle_log: "jungle_log",
+  acacia_log: "acacia_log",
+  dark_oak_log: "dark_oak_log",
+  mangrove_log: "mangrove_log",
+  cherry_log: "cherry_log",
+  pale_oak_log: "pale_oak_log",
+  crimson_stem: "crimson_stem",
+  warped_stem: "warped_stem",
+};
+
+export const knownSmeltInputs: Readonly<Record<string, string>> = {
+  iron_ingot: "raw_iron",
+  gold_ingot: "raw_gold",
+  copper_ingot: "raw_copper",
+};
+
+export function goalMetadataForOutput(
+  output: string,
+  requestedItems: ReadonlySet<string>,
+): ActionGoalMetadata {
+  if (requestedItems.has(output)) return { goalItem: output };
+  const goalItem = Object.entries(knownSmeltInputs).find(
+    ([goal, input]) => input === output && requestedItems.has(goal),
+  )?.[0];
+  return goalItem === undefined
+    ? {}
+    : { goalItem, intermediateItems: [output] };
+}
+
+export function goalMetadataForBlock(
+  blockName: string,
+  requestedItems: ReadonlySet<string>,
+): ActionGoalMetadata {
+  const output = knownBlockDrops[blockName];
+  if (output === undefined) return {};
+  if (requestedItems.has(blockName) && !requestedItems.has(output)) {
+    return { goalItem: output };
+  }
+  return goalMetadataForOutput(output, requestedItems);
 }
 
 export interface GeneralActionObservationInput {

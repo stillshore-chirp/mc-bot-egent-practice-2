@@ -67,9 +67,29 @@ describe("general safe actions", () => {
     expect(candidates[0]).toMatchObject({
       action: "mine_block",
       purposeFit: "direct",
+      goalItem: "raw_iron",
       permission: "denied",
       safety: "blocked",
       steps: [{ tool: "mine_block" }],
+    });
+    close();
+  });
+
+  it("keeps a known smelting output as the goal and raw ore as an intermediate", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "iron_ore",
+      position: { x: 2, y: 63, z: 0 },
+    });
+    const { game, close } = controller(minecraft);
+    const candidates = await game.observeActionCandidates(
+      { radius: 8, requestedItems: ["iron_ingot"], maxCandidates: 8 },
+      new AbortController().signal,
+    );
+    expect(candidates[0]).toMatchObject({
+      action: "mine_block",
+      goalItem: "iron_ingot",
+      intermediateItems: ["raw_iron"],
     });
     close();
   });

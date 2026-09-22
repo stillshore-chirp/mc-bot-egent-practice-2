@@ -35,6 +35,10 @@ import type {
   PlaceBlockInput,
   SmeltItemInput,
 } from "./general-actions.js";
+import {
+  goalMetadataForBlock,
+  goalMetadataForOutput,
+} from "./general-actions.js";
 
 import {
   queryTreeProtection,
@@ -707,6 +711,7 @@ export class MineflayerClient implements MinecraftPort {
         name: block.name,
         position: block.position,
       };
+      const goalMetadata = goalMetadataForBlock(block.name, requested);
       let permission: GeneralActionCandidate["permission"];
       try {
         permission = normalizePermission(
@@ -737,7 +742,10 @@ export class MineflayerClient implements MinecraftPort {
           },
         ],
         observed: true,
-        purposeFit: requested.has(block.name) ? "direct" : "unknown",
+        purposeFit:
+          requested.has(block.name) || goalMetadata.goalItem !== undefined
+            ? "direct"
+            : "unknown",
         permission,
         safety: generalPermissionSafety(permission, surrounding.hazards),
         reversible: false,
@@ -745,6 +753,7 @@ export class MineflayerClient implements MinecraftPort {
         operationClass: "natural_resource",
         requestedCount: 1,
         resourceName: block.name,
+        ...goalMetadata,
         distance: block.distance,
       });
     }
@@ -771,6 +780,7 @@ export class MineflayerClient implements MinecraftPort {
       }
       if (recipe === undefined) continue;
       const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(itemName, requested);
       add({
         id: `craft_item:${itemName}`,
         label: `${itemName}を所持品からクラフト`,
@@ -786,6 +796,7 @@ export class MineflayerClient implements MinecraftPort {
         operationClass: "world_change",
         requestedCount: 1,
         scopeId: "inventory",
+        ...goalMetadata,
         distance: 0,
       });
     }
@@ -824,6 +835,7 @@ export class MineflayerClient implements MinecraftPort {
         } catch {
           permission = "unknown";
         }
+        const goalMetadata = goalMetadataForOutput(itemName, requested);
         add({
           id: generalCandidateId("place_block", itemName, position),
           label: `${itemName}を観測位置へ設置`,
@@ -836,7 +848,8 @@ export class MineflayerClient implements MinecraftPort {
             },
           ],
           observed: true,
-          purposeFit: requested.has(itemName) ? "direct" : "unknown",
+          purposeFit:
+            goalMetadata.goalItem !== undefined ? "direct" : "unknown",
           permission,
           safety: generalPermissionSafety(permission, surrounding.hazards),
           reversible: false,
@@ -844,6 +857,7 @@ export class MineflayerClient implements MinecraftPort {
           operationClass: "world_change",
           requestedCount: 1,
           scopeId: "observed-placement",
+          ...goalMetadata,
           distance: bot.entity.position.distanceTo(placePosition),
         });
       }
@@ -856,6 +870,7 @@ export class MineflayerClient implements MinecraftPort {
       );
       if (itemName === undefined) continue;
       const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(itemName, requested);
       add({
         id: generalCandidateId("collect_item", itemName, entity.position),
         label: `${itemName}を回収`,
@@ -868,7 +883,7 @@ export class MineflayerClient implements MinecraftPort {
           },
         ],
         observed: true,
-        purposeFit: requested.has(itemName) ? "direct" : "unknown",
+        purposeFit: goalMetadata.goalItem !== undefined ? "direct" : "unknown",
         permission,
         safety: generalPermissionSafety(permission, surrounding.hazards),
         reversible: true,
@@ -876,6 +891,7 @@ export class MineflayerClient implements MinecraftPort {
         operationClass: "natural_resource",
         requestedCount: 1,
         resourceName: itemName,
+        ...goalMetadata,
         distance: entity.distance,
       });
     }
@@ -899,6 +915,7 @@ export class MineflayerClient implements MinecraftPort {
         continue;
       const position = positionOf(furnace.position);
       const permission: GeneralActionCandidate["permission"] = "allowed";
+      const goalMetadata = goalMetadataForOutput(output, requested);
       add({
         id: generalCandidateId("smelt_item", output, position),
         label: `${inputName}を${output}へ精錬`,
@@ -919,6 +936,7 @@ export class MineflayerClient implements MinecraftPort {
         operationClass: "world_change",
         requestedCount: 1,
         scopeId: "inventory",
+        ...goalMetadata,
         distance: bot.entity.position.distanceTo(furnace.position),
       });
     }
