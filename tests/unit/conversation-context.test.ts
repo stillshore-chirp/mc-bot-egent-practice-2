@@ -146,6 +146,12 @@ describe("conversation context", () => {
 
   it("requires an explicit action before lifting a stop boundary", () => {
     expect(isExplicitGoalResumeMessage("もっと短く。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("専門用語を使って説明して。")).toBe(
+      false,
+    );
+    expect(isExplicitGoalResumeMessage("例を使って説明して。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("例を作って説明して。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("例を作って、木を集めて。")).toBe(true);
     expect(isExplicitGoalResumeMessage("集めていい？")).toBe(false);
     expect(
       isExplicitGoalResumeMessage("採取は再開しないで、拠点に戻って。"),

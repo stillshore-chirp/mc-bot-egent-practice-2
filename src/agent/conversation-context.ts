@@ -53,11 +53,11 @@ function permitsJargon(message: string): boolean {
 }
 
 const GOAL_ACTION_PATTERN =
-  /(?:続け|続行|再開|集め|採取|移動|追従|来|戻|行|向か|探|収納|登録|覚え|記録|記憶|帰|ついて|始め|使|置|掘|作|建築|攻撃|戦|食べ|飲み|拾|捨て|もう一度|もう一回)/u;
+  /(?:続け|続行|再開|集め|採取|移動|追従|来|戻|行|向か|探|収納|登録|覚え|記録|記憶|帰|ついて|始め|置|掘|作|建築|攻撃|戦|食べ|飲み|拾|捨て|もう一度|もう一回)/u;
 const NON_AUTHORIZING_PATTERN =
   /(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|(?:して|て|って|で)(?:も)?(?:いい|よい|大丈夫|はいけない|はならない|ほしくない|ほしくありません))[?？]?/u;
 const AFFIRMATIVE_GOAL_ACTION_PATTERN =
-  /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|ついてきて|ついて来て|来て|戻って|帰って|帰還して|行って|向かって|探して|収納して|登録して|覚えて|記録して|記憶して|始めて|使って|置いて|掘って|作って|建築して|攻撃して|食べて|飲んで|拾って|捨てて)/u;
+  /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|ついてきて|ついて来て|来て|戻って|帰って|帰還して|行って|向かって|探して|収納して|登録して|覚えて|記録して|記憶して|始めて|置いて|掘って|作って|建築して|攻撃して|食べて|飲んで|拾って|捨てて)/u;
 
 function goalActionClauses(message: string): string[] {
   return message
@@ -73,9 +73,15 @@ function isNonAuthorizingActionClause(clause: string): boolean {
 }
 
 function isAffirmativeActionClause(clause: string): boolean {
-  const affirmativeIndex = clause.search(AFFIRMATIVE_GOAL_ACTION_PATTERN);
+  const actionableClause = clause.replace(
+    /(?:例|たとえ|比喩|図|表|文章|文|説明|答え)を(?:使って|作って)/gu,
+    "",
+  );
+  const affirmativeIndex = actionableClause.search(
+    AFFIRMATIVE_GOAL_ACTION_PATTERN,
+  );
   if (affirmativeIndex < 0) return false;
-  const nonAuthorizingIndex = clause.search(NON_AUTHORIZING_PATTERN);
+  const nonAuthorizingIndex = actionableClause.search(NON_AUTHORIZING_PATTERN);
   return nonAuthorizingIndex < 0 || affirmativeIndex > nonAuthorizingIndex;
 }
 

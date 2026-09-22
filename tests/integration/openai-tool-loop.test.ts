@@ -358,63 +358,73 @@ describe("OpenAI tool loop", () => {
     );
   });
 
-  it("does not expose or execute action tools for a stopped-goal permission question", async () => {
-    const fake = new ScriptedOpenAI([
-      response([], "木を探します。"),
-      response([
-        {
-          type: "function_call",
-          call_id: "call-follow-after-stop",
-          name: "follow_player",
-          arguments: JSON.stringify({
-            safeDistance: 3,
-            maxDurationSeconds: 60,
-          }),
-          status: "completed",
+  it.each([
+    "再開していい？",
+    "専門用語を使って説明して",
+    "例を使って説明して",
+    "例を作って説明して",
+  ])(
+    "does not expose or execute action tools after a stop for %s",
+    async (message) => {
+      const fake = new ScriptedOpenAI([
+        response([], "木を探します。"),
+        response([
+          {
+            type: "function_call",
+            call_id: "call-follow-after-stop",
+            name: "follow_player",
+            arguments: JSON.stringify({
+              safeDistance: 3,
+              maxDurationSeconds: 60,
+            }),
+            status: "completed",
+          },
+        ]),
+        response([], "停止中です。明示的な再開指示を待ちます。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const context = toolContext();
+
+      const firstReply = await agent.deliberate({
+        message: "木を集めて",
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+      agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+      agent.recordCancelledRequest("owner", "owner_message");
+      const permissionReply = await agent.deliberate({
+        message,
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+
+      expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+        "follow_player",
+      );
+      expect(
+        permissionReply.toolResults.find(
+          ({ name }) => name === "follow_player",
+        ),
+      ).toMatchObject({
+        result: {
+          success: false,
+          error: { code: "STOPPED_GOAL_ACTION_NOT_ALLOWED" },
         },
-      ]),
-      response([], "停止中です。明示的な再開指示を待ちます。"),
-    ]);
-    const agent = new OpenAIDeliberationAgent({
-      apiKey: "test-only",
-      model: "test-model",
-      client: fake.asClient(),
-      logger: pino({ level: "silent" }),
-    });
-    const context = toolContext();
-
-    const firstReply = await agent.deliberate({
-      message: "木を集めて",
-      personaContext: "テスト人格",
-      memoryContext: "なし",
-      worldContext: "原点",
-      toolContext: context,
-    });
-    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
-    agent.recordCancelledRequest("owner", "owner_message");
-    const permissionReply = await agent.deliberate({
-      message: "再開していい？",
-      personaContext: "テスト人格",
-      memoryContext: "なし",
-      worldContext: "原点",
-      toolContext: context,
-    });
-
-    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
-      "follow_player",
-    );
-    expect(
-      permissionReply.toolResults.find(({ name }) => name === "follow_player"),
-    ).toMatchObject({
-      result: {
-        success: false,
-        error: { code: "STOPPED_GOAL_ACTION_NOT_ALLOWED" },
-      },
-    });
-    expect(permissionReply.text).toBe(
-      "停止済みの作業は、明示的に再開するまで動かしません。",
-    );
-  });
+      });
+      expect(permissionReply.text).toBe(
+        "停止済みの作業は、明示的に再開するまで動かしません。",
+      );
+    },
+  );
 
   it("does not let an older cancellation remove a newer pending owner turn", async () => {
     const fake = new ScriptedOpenAI([response([], "次の返答です。")]);

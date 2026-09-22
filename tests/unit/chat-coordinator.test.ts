@@ -53,6 +53,10 @@ describe("immediate stop command", () => {
     "今の作業をやめて",
     "追従を停止して",
     "止めてください",
+    "追従を停止",
+    "採取を中止",
+    "そこで止まってください",
+    "採取をやめてほしい",
   ])("accepts a targeted affirmative safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -66,6 +70,8 @@ describe("immediate stop command", () => {
     "停止方法を教えて",
     "どうして採取が止まった？",
     "「採取を止めて」と言った？",
+    "追従を停止しないで",
+    "『追従を停止』と表示して",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
@@ -209,6 +215,8 @@ describe("immediate stop command", () => {
     "なぜ建築できない？",
     "なぜ止まった？ もう一度来て",
     "なぜ失敗？木を集めて",
+    "なぜ失敗した、再開して",
+    "どうして止まった、拠点に戻って",
   ])(
     "keeps a mixed status and action request on the normal path: %s",
     (message) => {

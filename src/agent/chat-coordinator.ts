@@ -30,7 +30,7 @@ const STOP_COMMANDS = new Set([
   "中断",
 ]);
 const TARGETED_STOP_COMMAND_PATTERN =
-  /(?:止めて|停止して|やめて|中止して|中断して)(?:ください|下さい)?$/u;
+  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい)?$|(?:停止|中止|中断)$/u;
 const STOP_FAILURE_MESSAGE =
   "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
 
@@ -108,7 +108,12 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
   const isReasonForStoppedWork =
     !isCapabilityWhy &&
     /^(?:なぜ|どうして).*(?:止ま|失敗|できな)/u.test(normalized);
-  if (includesAction && !isReasonForStoppedWork) return false;
+  if (
+    includesAction &&
+    (!isReasonForStoppedWork || isExplicitGoalResumeMessage(normalized))
+  ) {
+    return false;
+  }
   return (
     isReasonForStoppedWork ||
     /(?:今|現在|いま).*(?:どうな|何して|状態|状況|進捗|止ま)/u.test(
