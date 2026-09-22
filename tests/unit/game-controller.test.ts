@@ -112,6 +112,7 @@ describe("CompanionGameController", () => {
     const followResult = await follow;
 
     expect(stop.outcome).toBe("completed");
+    expect(stop.summary).toBe("進行中のMinecraft作業を停止しました。");
     expect(followResult.outcome).toBe("cancelled");
     expect(tasks.current?.status).toBe("cancelled");
     expect(minecraft.stopCount).toBeGreaterThan(0);
