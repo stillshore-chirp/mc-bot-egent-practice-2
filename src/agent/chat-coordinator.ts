@@ -19,11 +19,12 @@ import type {
 import { isExplicitGoalResumeMessage } from "./conversation-context.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
 
-const stopTeForms = "(?:止めて|停止して|やめて|中止して|中断して|止まって)";
+const stopTeForms =
+  "(?:止めて|停止して|やめて|中止して|中断して|止まって|ストップして)";
 const stopTeSuffix =
   "(?:ください|下さい|ほしい(?:です)?|くれ(?![てた])|ちょうだい|お願い(?:します)?)?(?:ね|よ)?";
 const stopImperatives =
-  "(?:止まれ|止めろ|やめろ|停止しろ|中止しろ|中断しろ|止まりなさい|止めなさい|やめなさい|停止しなさい|中止しなさい|中断しなさい)";
+  "(?:止まれ|止めろ|やめろ|停止しろ|中止しろ|中断しろ|ストップしろ|止まりなさい|止めなさい|やめなさい|停止しなさい|中止しなさい|中断しなさい)";
 const TARGETED_STOP_COMMAND_PATTERN = new RegExp(
   `${stopTeForms}${stopTeSuffix}$|${stopImperatives}$|(?:停止|中止|中断|ストップ)$`,
   "u",
@@ -110,6 +111,9 @@ function isStopClause(clause: string): boolean {
 
 function isSafeReadOnlyFollowUp(message: string): boolean {
   return (
+    /(?:周囲|周り|辺り|足元|近く|状態|状況|現状|所持品|インベントリ)(?:を|の)?(?:確認して|見て|観測して|調べて)(?:ください|下さい)?[。！!]?$/u.test(
+      message,
+    ) ||
     /(?:説明して|教えて|答えて|話して|要約して)(?:ください|下さい)?[。！!]?$/u.test(
       message,
     ) ||
@@ -400,6 +404,7 @@ export class ChatCoordinator {
     const stopFollowUp = immediateStopFollowUp(normalized);
     if (isImmediateStopCommand(normalized)) {
       this.#runtimeGeneration += 1;
+      const ownerMessageGeneration = this.#runtimeGeneration;
       this.#generation += 1;
       const stopGeneration = this.#generation;
       this.#notifyImmediateStop();
@@ -476,7 +481,11 @@ export class ChatCoordinator {
         }
         throw error;
       }
-      if (stopFollowUp !== undefined && stopGeneration === this.#generation) {
+      if (
+        stopFollowUp !== undefined &&
+        stopGeneration === this.#generation &&
+        ownerMessageGeneration === this.#runtimeGeneration
+      ) {
         await this.handleChat(username, stopFollowUp);
       }
       return true;
