@@ -70,7 +70,6 @@ export class ReflexCoordinator {
 
     this.handling = true;
     this.currentState = { state: "intervening", incident };
-    await this.tasks.suspend(`reflex:${incident.kind}`);
     let lease: ActionLease | undefined;
     try {
       const acquiredLease = this.arbiter.acquire(
@@ -78,6 +77,7 @@ export class ReflexCoordinator {
         actionPriorities.reflex,
       );
       lease = acquiredLease;
+      await this.tasks.suspend(`reflex:${incident.kind}`);
       await withTimeout(
         async (timeoutSignal) => {
           const signal = AbortSignal.any([acquiredLease.signal, timeoutSignal]);

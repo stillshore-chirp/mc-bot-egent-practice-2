@@ -71,6 +71,24 @@ describe("ActionArbiter", () => {
     expect(arbiter.currentOwner).toBe("reflex");
     reflex.release();
   });
+
+  it("waits for a reflex lease to release before a task resumes", async () => {
+    const arbiter = new ActionArbiter();
+    const reflex = arbiter.acquire("reflex:stuck", actionPriorities.reflex);
+    let resumed = false;
+    const waiting = (async () => {
+      await arbiter.waitForAvailable(actionPriorities.task);
+      const task = arbiter.acquire("task:replacement", actionPriorities.task);
+      resumed = true;
+      task.release();
+    })();
+
+    await Promise.resolve();
+    expect(resumed).toBe(false);
+    reflex.release();
+    await waiting;
+    expect(resumed).toBe(true);
+  });
 });
 
 describe("TaskRuntime", () => {
@@ -112,6 +130,96 @@ describe("TaskRuntime", () => {
     });
     await runtime.cancel("test cleanup");
     await first;
+  });
+
+  it("replaces a suspended task for a new instruction without stale overwrite", async () => {
+    const store = new InMemoryTaskStore();
+    let stopCount = 0;
+    let taskStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      taskStarted = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const runtime = new TaskRuntime(store, async () => {
+      stopCount += 1;
+    });
+    const first = runtime.run("follow_player", {}, async ({ signal }) => {
+      taskStarted();
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await firstCanFinish;
+      throw signal.reason;
+    });
+    await started;
+    await runtime.suspend("reflex:stuck");
+
+    let replacementStarted!: () => void;
+    const replacementReady = new Promise<void>((resolve) => {
+      replacementStarted = resolve;
+    });
+    const replacement = runtime.run("move_to", { retry: true }, async () => {
+      replacementStarted();
+      return { restarted: true };
+    });
+    await replacementReady;
+    releaseFirst();
+
+    const [firstResult, replacementResult] = await Promise.all([
+      first,
+      replacement,
+    ]);
+    expect(firstResult).toMatchObject({
+      status: "cancelled",
+      failure: { code: "TASK_REPLACED_AFTER_SUSPENSION" },
+    });
+    expect(replacementResult).toMatchObject({
+      status: "completed",
+      output: { restarted: true },
+    });
+    expect(runtime.current).toMatchObject({
+      kind: "move_to",
+      status: "completed",
+    });
+    expect(stopCount).toBe(1);
+    expect(
+      store.records.some(
+        (record) => record.failure?.code === "TASK_REPLACED_AFTER_SUSPENSION",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not retain an interrupted record after the suspended run has ended", async () => {
+    const runtime = new TaskRuntime(
+      new InMemoryTaskStore(),
+      async () => undefined,
+    );
+    let started!: () => void;
+    const taskStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const first = runtime.run("follow_player", {}, async ({ signal }) => {
+      started();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      throw signal.reason;
+    });
+    await taskStarted;
+    await runtime.suspend("reflex:stuck");
+    await first;
+
+    await runtime.run("move_to", {}, async () => ({ restarted: true }));
+
+    const interruptedRecords = (
+      runtime as unknown as {
+        interruptedRecords: Map<string, TaskRecord>;
+      }
+    ).interruptedRecords;
+    expect(interruptedRecords.size).toBe(0);
   });
 });
 
