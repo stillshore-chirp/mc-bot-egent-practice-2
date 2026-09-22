@@ -229,6 +229,9 @@ describe("OpenAI tool loop", () => {
     expect(secondInput).toContain("20個");
     expect(fake.requests[1]?.instructions).toContain("提供していない操作");
     expect(fake.requests[1]?.instructions).toContain("実行済みと扱わず");
+    expect(fake.requests[1]?.instructions).toContain(
+      "同じ質問を繰り返さないでください",
+    );
   });
 
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {
