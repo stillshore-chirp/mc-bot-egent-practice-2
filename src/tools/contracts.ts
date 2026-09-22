@@ -187,6 +187,7 @@ export interface BehaviorMemoryPort {
     readonly slot: string;
     readonly value: string;
     readonly summary: string;
+    readonly idempotencyKey?: string;
   }): BehaviorMemoryRecord;
   list(
     playerId: string,

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { behaviorMemoryTools } from "../../src/tools/behavior-memory-tools.js";
 import type { ToolContext } from "../../src/tools/contracts.js";
@@ -36,10 +36,12 @@ describe("behavior memory tool contract", () => {
   });
 
   it("rejects non-owner requests before the optional persistence adapter", async () => {
+    const remember = vi.fn();
     const context = {
       ...ownerContext,
       requesterUsername: "other",
-    };
+      behaviorMemory: { remember } as unknown as ToolContext["behaviorMemory"],
+    } as unknown as ToolContext;
     const result = await behaviorMemoryTools[0].execute(
       {
         category: "communication",
@@ -53,6 +55,7 @@ describe("behavior memory tool contract", () => {
       success: false,
       error: { code: "REQUESTER_NOT_AUTHORIZED" },
     });
+    expect(remember).not.toHaveBeenCalled();
   });
 
   it("does not allow runtime reassessment to write behavior memory", async () => {

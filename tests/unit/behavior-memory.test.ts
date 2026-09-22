@@ -146,6 +146,104 @@ describe("durable behavior memory", () => {
     restarted.close();
   });
 
+  it("does not count an accepted owner message twice when its processing is retried", () => {
+    const path = databasePath();
+    const first = MemoryStore.open(path);
+    const player = first.getOrCreatePlayer("owner");
+    const feedback = extractBehaviorMemory("また同じ質問を何度も聞かないで")[0];
+    if (feedback === undefined) throw new Error("feedback was not extracted");
+
+    const firstRecord = first.rememberBehaviorMemory({
+      playerId: player.id,
+      ...feedback,
+      idempotencyKey: "event-0001",
+    });
+    const retried = first.rememberBehaviorMemory({
+      playerId: player.id,
+      ...feedback,
+      idempotencyKey: "event-0001",
+      summary: "同じ確認を繰り返さないという別要約",
+    });
+    expect(retried).toEqual(firstRecord);
+    expect(first.listBehaviorMemories(player.id)).toHaveLength(1);
+
+    const secondTurn = first.rememberBehaviorMemory({
+      playerId: player.id,
+      ...feedback,
+      idempotencyKey: "event-0002",
+    });
+    expect(secondTurn).toMatchObject({
+      id: firstRecord.id,
+      confidence: "corroborated",
+      supportCount: 2,
+    });
+    first.close();
+
+    const restarted = MemoryStore.open(path);
+    const afterRestartRetry = restarted.rememberBehaviorMemory({
+      playerId: player.id,
+      ...feedback,
+      idempotencyKey: "event-0001",
+    });
+    expect(afterRestartRetry).toMatchObject({
+      id: firstRecord.id,
+      confidence: "corroborated",
+      supportCount: 2,
+    });
+    expect(restarted.listBehaviorMemories(player.id)).toHaveLength(1);
+
+    const database = new Database(path);
+    const eventColumns = database
+      .prepare<[], { readonly name: string }>(
+        "SELECT name FROM pragma_table_info('behavior_memory_events') ORDER BY cid",
+      )
+      .all()
+      .map(({ name }) => name);
+    const eventCount = database
+      .prepare<[], { readonly count: number }>(
+        "SELECT COUNT(*) AS count FROM behavior_memory_events",
+      )
+      .get()?.count;
+    database.close();
+    expect(eventColumns).toEqual([
+      "player_id",
+      "idempotency_key",
+      "memory_id",
+      "created_at",
+    ]);
+    expect(eventColumns).not.toContain("message");
+    expect(eventColumns).not.toContain("transcript");
+    expect(eventCount).toBe(2);
+    restarted.close();
+  });
+
+  it("rejects event keys that could carry raw chat or credentials", () => {
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("owner");
+    const input = {
+      playerId: player.id,
+      category: "communication" as const,
+      slot: "length",
+      value: "brief",
+      summary: "説明を短くする",
+      source: "owner_explicit" as const,
+      confidence: "explicit" as const,
+    };
+    expect(() =>
+      store.rememberBehaviorMemory({
+        ...input,
+        idempotencyKey: "raw chat message",
+      }),
+    ).toThrow(/event key/i);
+    expect(() =>
+      store.rememberBehaviorMemory({
+        ...input,
+        idempotencyKey: "sk-project-secret-token-1234",
+      }),
+    ).toThrow(/event key/i);
+    store.close();
+  });
+
   it("supersedes corrections and retracts forgotten preferences", () => {
     const store = MemoryStore.open(databasePath());
     const player = store.getOrCreatePlayer("owner");

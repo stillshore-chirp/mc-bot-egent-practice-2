@@ -81,6 +81,7 @@ describe("MemoryStore", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
+      { version: 5 },
     ]);
   });
 
@@ -117,6 +118,7 @@ describe("MemoryStore", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
+      { version: 5 },
     ]);
     expect(
       migrated.recall({

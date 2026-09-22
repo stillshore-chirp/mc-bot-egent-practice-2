@@ -58,6 +58,7 @@ import {
   type DeliveryTargetKind,
 } from "./delivery-targets.js";
 import {
+  behaviorMemoryEventMigration,
   behaviorMemoryMigration,
   BehaviorMemoryRepository,
 } from "./behavior-memory.js";
@@ -67,7 +68,7 @@ import type {
   RememberBehaviorMemoryInput,
 } from "./types.js";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DEFAULT_RECALL_LIMIT = 8;
 const MAX_RECALL_LIMIT = 30;
 const MAX_TEXT_LENGTH = 1_000;
@@ -305,6 +306,7 @@ export class MemoryStore {
     readonly slot: string;
     readonly value: string;
     readonly summary: string;
+    readonly idempotencyKey?: string;
   }): BehaviorMemoryRecord {
     return this.behaviorMemory.correct(input);
   }
@@ -1403,6 +1405,7 @@ export class MemoryStore {
         sql: "CREATE TABLE delivery_targets (player_id TEXT NOT NULL REFERENCES players(id), kind TEXT NOT NULL CHECK(kind IN ('home','chest')), value_json TEXT NOT NULL, PRIMARY KEY(player_id, kind))",
       },
       { version: 4, sql: behaviorMemoryMigration },
+      { version: 5, sql: behaviorMemoryEventMigration },
     ];
     for (const migration of migrations) {
       if (appliedVersions.has(migration.version)) {

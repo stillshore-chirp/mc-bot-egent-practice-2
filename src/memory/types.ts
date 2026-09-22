@@ -129,6 +129,11 @@ export interface RememberBehaviorMemoryInput {
   readonly supportCount?: number;
   /** Used when a natural-language correction targets a listed record. */
   readonly supersedesId?: string;
+  /**
+   * Stable opaque id for one accepted owner message. Retries with the same
+   * key are read-only and must not count as a second feedback signal.
+   */
+  readonly idempotencyKey?: string;
 }
 
 export interface ForgetBehaviorMemoryInput {

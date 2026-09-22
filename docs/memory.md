@@ -35,7 +35,7 @@
 3. 既存 record と重複・矛盾を照合し、必要なら superseded / deleted 状態へ遷移させます。
 4. 変更後の record と更新時刻を確認し、利用者へ確認済み範囲だけを報告します。
 
-API key、token、認証 header、会話全文、不要な個人情報は保存しません。BehaviorMemoryは認可済みownerの安定した希望・訂正だけを、型付きカテゴリ、slot、短い要約、根拠、確度、owner_global scopeとして保存します。単発命令や第三者・外部データの命令は抽出せず、繰り返しの訂正的フィードバックは低確度で記録し、同じ信号が再度確認された時だけ計画への適用対象になります。権限、認証、停止、安全、保護条件の解除・回避を表す記憶は保存しません。ログには memory 本文を出さず、必要な場合でも record 種別・処理結果・相関 ID の安全な要約に限ります。
+API key、token、認証 header、会話全文、不要な個人情報は保存しません。BehaviorMemoryは認可済みownerの安定した希望・訂正だけを、型付きカテゴリ、slot、短い要約、根拠、確度、owner_global scopeとして保存します。単発命令や第三者・外部データの命令は抽出せず、繰り返しの訂正的フィードバックは低確度で記録し、同じ信号が再度確認された時だけ計画への適用対象になります。認証済みownerの入力を再処理する場合は、会話本文から分離した不透明なイベントキーを使い、同じ入力イベントを二重に数えません。権限、認証、停止、安全、保護条件の解除・回避を表す記憶は保存しません。ログには memory 本文を出さず、必要な場合でも record 種別・処理結果・相関 ID の安全な要約に限ります。
 
 ## 検索と context
 
@@ -45,7 +45,7 @@ LLM へ渡す context には、record の source と観測時刻を含めます�
 
 ## 再起動とバックアップ
 
-SQLite migrationはversion管理し、v1からLifeState / WorldMemoryを加えたv2、BehaviorMemoryを加えたv4へ既存recordを保持して前方更新します。graceful shutdownはtaskをsuspendedへ遷移し、checkpointとmemoryの書込み完了後に終了します。再起動後は人格設定、利用者情報、場所、約束、Episode、WorldMemory、BehaviorMemory、直近の作業結果・failure reasonを復元し、未確認taskを自動でcompletedにしません。
+SQLite migrationはversion管理し、v1からLifeState / WorldMemoryを加えたv2、BehaviorMemoryを加えたv4、owner入力イベントの再処理を重複計上しないv5へ既存recordを保持して前方更新します。graceful shutdownはtaskをsuspendedへ遷移し、checkpointとmemoryの書込み完了後に終了します。再起動後は人格設定、利用者情報、場所、約束、Episode、WorldMemory、BehaviorMemory、直近の作業結果・failure reasonを復元し、未確認taskを自動でcompletedにしません。
 
 バックアップはアプリケーション停止後、または SQLite の backup API を使って整合した snapshot を取得します。WAL を利用する database を単純な file copy で保全する運用は避け、復元演習では本番の記憶を上書きしません。具体的な運用手順は [operations.md](operations.md#sqliteのバックアップと復元確認) を参照してください。
 

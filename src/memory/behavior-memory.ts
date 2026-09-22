@@ -24,6 +24,7 @@ const MAX_SLOT_LENGTH = 80;
 const MAX_VALUE_LENGTH = 240;
 const MAX_SUMMARY_LENGTH = 240;
 const MAX_RETRACTION_REASON_LENGTH = 300;
+const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 const MAX_LIST_LIMIT = 30;
 const DEFAULT_LIST_LIMIT = 12;
 
@@ -42,6 +43,12 @@ export const behaviorMemoryMigration = [
   "CREATE UNIQUE INDEX behavior_memories_active_slot_idx ON behavior_memories(player_id, category, slot) WHERE status = 'active'",
 ].join(";\n");
 
+/** Stores only an opaque accepted-message key and its resulting record id. */
+export const behaviorMemoryEventMigration = [
+  "CREATE TABLE behavior_memory_events (player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE, idempotency_key TEXT NOT NULL, memory_id TEXT NOT NULL REFERENCES behavior_memories(id) ON DELETE CASCADE, created_at TEXT NOT NULL, PRIMARY KEY (player_id, idempotency_key))",
+  "CREATE INDEX behavior_memory_events_memory_idx ON behavior_memory_events(memory_id)",
+].join(";\n");
+
 interface BehaviorMemoryRow {
   readonly id: string;
   readonly player_id: string;
@@ -58,6 +65,10 @@ interface BehaviorMemoryRow {
   readonly retraction_reason: string | null;
   readonly created_at: string;
   readonly updated_at: string;
+}
+
+interface BehaviorMemoryEventRow {
+  readonly memory_id: string;
 }
 
 export interface BehaviorMemoryExtraction {
@@ -92,11 +103,18 @@ export class BehaviorMemoryRepository {
     const now = timestamp();
 
     return this.database.transaction(() => {
+      const previous =
+        normalized.idempotencyKey === undefined
+          ? undefined
+          : this.findEvent(normalized.playerId, normalized.idempotencyKey);
+      if (previous !== undefined) return previous;
+
       const active = this.findActive(
         normalized.playerId,
         normalized.category,
         normalized.slot,
       );
+      let record: BehaviorMemoryRecord;
       if (
         active?.value === normalized.value &&
         active.summary === normalized.summary
@@ -105,103 +123,113 @@ export class BehaviorMemoryRepository {
           normalized.source === "owner_feedback" &&
           active.source !== "owner_feedback"
         ) {
-          return behaviorMemory(active);
+          record = behaviorMemory(active);
+        } else {
+          const supportCount =
+            normalized.source === "owner_feedback"
+              ? Math.min(20, active.support_count + 1)
+              : Math.max(active.support_count, normalized.supportCount);
+          const confidence =
+            normalized.source === "owner_feedback"
+              ? supportCount >= 2
+                ? "corroborated"
+                : "repeated_feedback"
+              : normalized.confidence;
+          this.database
+            .prepare<
+              [
+                BehaviorMemorySource,
+                BehaviorMemoryConfidence,
+                number,
+                string,
+                string,
+              ]
+            >(
+              "UPDATE behavior_memories SET source = ?, confidence = ?, support_count = ?, updated_at = ? WHERE id = ?",
+            )
+            .run(normalized.source, confidence, supportCount, now, active.id);
+          record = behaviorMemory({
+            ...active,
+            source: normalized.source,
+            confidence,
+            support_count: supportCount,
+            updated_at: now,
+          });
         }
-        const supportCount =
-          normalized.source === "owner_feedback"
-            ? Math.min(20, active.support_count + 1)
-            : Math.max(active.support_count, normalized.supportCount);
-        const confidence =
-          normalized.source === "owner_feedback"
-            ? supportCount >= 2
-              ? "corroborated"
-              : "repeated_feedback"
-            : normalized.confidence;
+      } else {
+        const superseded = this.resolveSuperseded(
+          normalized.playerId,
+          normalized.supersedesId,
+          active,
+        );
+        const id = randomUUID();
+        if (superseded !== undefined) {
+          this.database
+            .prepare<[string, string, string]>(
+              "UPDATE behavior_memories SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+            )
+            .run(id, now, superseded.id);
+        }
         this.database
           .prepare<
             [
+              string,
+              string,
+              BehaviorMemoryCategory,
+              string,
+              string,
+              string,
               BehaviorMemorySource,
               BehaviorMemoryConfidence,
+              BehaviorMemoryScope,
               number,
               string,
               string,
             ]
           >(
-            "UPDATE behavior_memories SET source = ?, confidence = ?, support_count = ?, updated_at = ? WHERE id = ?",
+            "INSERT INTO behavior_memories (id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
           )
-          .run(normalized.source, confidence, supportCount, now, active.id);
-        return behaviorMemory({
-          ...active,
+          .run(
+            id,
+            normalized.playerId,
+            normalized.category,
+            normalized.slot,
+            normalized.value,
+            normalized.summary,
+            normalized.source,
+            normalized.confidence,
+            normalized.scope,
+            normalized.supportCount,
+            now,
+            now,
+          );
+        record = behaviorMemory({
+          id,
+          player_id: normalized.playerId,
+          category: normalized.category,
+          slot: normalized.slot,
+          value: normalized.value,
+          summary: normalized.summary,
           source: normalized.source,
-          confidence,
-          support_count: supportCount,
+          confidence: normalized.confidence,
+          scope: normalized.scope,
+          support_count: normalized.supportCount,
+          status: "active",
+          superseded_by_id: null,
+          retraction_reason: null,
+          created_at: now,
           updated_at: now,
         });
       }
-
-      const superseded = this.resolveSuperseded(
-        normalized.playerId,
-        normalized.supersedesId,
-        active,
-      );
-      const id = randomUUID();
-      if (superseded !== undefined) {
-        this.database
-          .prepare<[string, string, string]>(
-            "UPDATE behavior_memories SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ? AND status = 'active'",
-          )
-          .run(id, now, superseded.id);
-      }
-      this.database
-        .prepare<
-          [
-            string,
-            string,
-            BehaviorMemoryCategory,
-            string,
-            string,
-            string,
-            BehaviorMemorySource,
-            BehaviorMemoryConfidence,
-            BehaviorMemoryScope,
-            number,
-            string,
-            string,
-          ]
-        >(
-          "INSERT INTO behavior_memories (id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
-        )
-        .run(
-          id,
+      if (normalized.idempotencyKey !== undefined) {
+        this.recordEvent(
           normalized.playerId,
-          normalized.category,
-          normalized.slot,
-          normalized.value,
-          normalized.summary,
-          normalized.source,
-          normalized.confidence,
-          normalized.scope,
-          normalized.supportCount,
-          now,
+          normalized.idempotencyKey,
+          record.id,
           now,
         );
-      return behaviorMemory({
-        id,
-        player_id: normalized.playerId,
-        category: normalized.category,
-        slot: normalized.slot,
-        value: normalized.value,
-        summary: normalized.summary,
-        source: normalized.source,
-        confidence: normalized.confidence,
-        scope: normalized.scope,
-        support_count: normalized.supportCount,
-        status: "active",
-        superseded_by_id: null,
-        retraction_reason: null,
-        created_at: now,
-        updated_at: now,
-      });
+      }
+      return record;
     })();
   }
 
@@ -212,6 +240,7 @@ export class BehaviorMemoryRepository {
     readonly slot: string;
     readonly value: string;
     readonly summary: string;
+    readonly idempotencyKey?: string;
   }): BehaviorMemoryRecord {
     const memoryId =
       input.memoryId === undefined && input.slot.startsWith("owner_preference_")
@@ -227,6 +256,9 @@ export class BehaviorMemoryRepository {
       confidence: "corrected",
       scope: "owner_global",
       ...(memoryId === undefined ? {} : { supersedesId: memoryId }),
+      ...(input.idempotencyKey === undefined
+        ? {}
+        : { idempotencyKey: input.idempotencyKey }),
     });
   }
 
@@ -333,6 +365,42 @@ export class BehaviorMemoryRepository {
         "SELECT id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, superseded_by_id, retraction_reason, created_at, updated_at FROM behavior_memories WHERE player_id = ? AND category = ? AND slot = ? AND status = 'active'",
       )
       .get(playerId, category, slot);
+  }
+
+  private findEvent(
+    playerId: string,
+    idempotencyKey: string,
+  ): BehaviorMemoryRecord | undefined {
+    const event = this.database
+      .prepare<[string, string], BehaviorMemoryEventRow>(
+        "SELECT memory_id FROM behavior_memory_events WHERE player_id = ? AND idempotency_key = ?",
+      )
+      .get(playerId, idempotencyKey);
+    if (event === undefined) return undefined;
+    const row = this.database
+      .prepare<[string, string], BehaviorMemoryRow>(
+        "SELECT id, player_id, category, slot, value, summary, source, confidence, scope, support_count, status, superseded_by_id, retraction_reason, created_at, updated_at FROM behavior_memories WHERE player_id = ? AND id = ?",
+      )
+      .get(playerId, event.memory_id);
+    if (row === undefined) {
+      throw new BehaviorMemoryError(
+        "Behavior memory event refers to a missing record.",
+      );
+    }
+    return behaviorMemory(row);
+  }
+
+  private recordEvent(
+    playerId: string,
+    idempotencyKey: string,
+    memoryId: string,
+    createdAt: string,
+  ): void {
+    this.database
+      .prepare<[string, string, string, string]>(
+        "INSERT INTO behavior_memory_events (player_id, idempotency_key, memory_id, created_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(playerId, idempotencyKey, memoryId, createdAt);
   }
 
   private resolveSuperseded(
@@ -693,6 +761,7 @@ function normalizeInput(
   const source = behaviorSource(input.source);
   const confidence = behaviorConfidence(input.confidence);
   const scope = behaviorScope(input.scope ?? "owner_global");
+  const idempotencyKey = cleanIdempotencyKey(input.idempotencyKey);
   const supportCount = integer(
     input.supportCount ?? 1,
     "behavior memory support count",
@@ -732,6 +801,7 @@ function normalizeInput(
     confidence,
     scope,
     supportCount,
+    ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
   };
 }
 
@@ -820,6 +890,21 @@ function cleanId(value: string): string {
     throw new BehaviorMemoryError("Behavior memory id is invalid.");
   }
   return id;
+}
+
+function cleanIdempotencyKey(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string" ||
+    value.length < 8 ||
+    value.length > MAX_IDEMPOTENCY_KEY_LENGTH ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(value) ||
+    secretLabel.test(value) ||
+    secretValue.test(value)
+  ) {
+    throw new BehaviorMemoryError("Behavior memory event key is invalid.");
+  }
+  return value;
 }
 
 function cleanText(value: string, label: string, maxLength: number): string {

@@ -19,7 +19,7 @@
 
 | #   | owner の操作                                                                                               | ゲーム内で確認すること                                                                       | 自動観測点・受入条件                                                                                                                                                                |
 | --- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | 「今後は専門用語を避け、短く理由を一言添えて説明して」と送る                                               | bot が保存完了を返し、依頼に含まれない移動・採取を開始しない                                 | owner_message の bounded extraction が `owner_explicit` / `explicit` の active record を1件作る。raw message の列・全文は保存されない                                               |
+| 1   | 「今後は専門用語を避け、短く理由を一言添えて説明して」と送る                                               | bot が保存完了を返し、依頼に含まれない移動・採取を開始しない                                 | owner_message の bounded extraction が `owner_explicit` / `explicit` の active record を1件作る。raw message の列・全文は保存されず、同じ受理イベントの再処理でも record は増えない |
 | 2   | 話題を unrelated なゲーム内依頼へ変更し、説明を求める                                                      | 話題をまたいで平易な説明と短い理由が反映される。元の好みを安全条件として扱わない             | context に `behavior_memory` の構造化 summary が入り、`memory_read → response` が記録される。同じ active record が検索され、新しい transcript record は増えない                     |
 | 3   | 一時的な依頼（「今回はこの場所だけ」「今だけ詳しく」）と単なる質問（「専門用語って何？」）を送る           | 一時的な依頼や質問だけでは継続的な好みとして扱われない                                       | `extractBehaviorMemory` が空を返し、active record 数・対象 slot が変わらない                                                                                                        |
 | 4   | 「また同じ確認をしないで」と送り、別の話題で同じ不満をもう一度伝える                                       | 1回目の不満だけで強制的な行動変更をせず、2回目の同じ傾向後に返答方針へ反映する               | 1回目は `owner_feedback` / `repeated_feedback`、2回目で `supportCount >= 2` / `corroborated`。安全・認証・停止判断には影響しない                                                    |
@@ -53,6 +53,7 @@
 trace では次の stage と request kind を確認します。
 
 - owner の確定 chat からの自動学習: `memory_write`、`requestKind=owner_message`
+- 同じ owner chat の retry: 同じ不透明な event key を使い、support count と active record 数が増えない
 - 次の通常依頼・話題変更・自動通知: `memory_read`、該当する `response`
 - runtime 再評価、停止、非 owner chat: 行動記憶の write span が存在しない
 - 訂正・忘却: 旧 record の status 変更と新しい active record の生成が同じ transaction の結果として確認できる
