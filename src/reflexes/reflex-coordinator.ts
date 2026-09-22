@@ -14,19 +14,36 @@ import type { TaskRuntime } from "../runtime/task-service.js";
 import { withTimeout } from "../runtime/timeout.js";
 import {
   isStableAfterIncident,
+  reflexObservation,
   type ReflexIncident,
+  type ReflexObservation,
   type ReflexDetector,
   type ReflexThresholds,
 } from "./detectors.js";
 
 export type ReflexState =
   | { readonly state: "safe" }
-  | { readonly state: "intervening"; readonly incident: ReflexIncident }
-  | { readonly state: "stabilizing"; readonly incident: ReflexIncident }
+  | {
+      readonly state: "intervening";
+      readonly incident: ReflexIncident;
+      readonly startedAt?: string;
+      readonly endedAt?: string;
+      readonly after?: ReflexObservation;
+    }
+  | {
+      readonly state: "stabilizing";
+      readonly incident: ReflexIncident;
+      readonly startedAt?: string;
+      readonly endedAt?: string;
+      readonly after?: ReflexObservation;
+    }
   | {
       readonly state: "failed";
       readonly incident: ReflexIncident;
       readonly failure: FailureDetail;
+      readonly startedAt?: string;
+      readonly endedAt?: string;
+      readonly after?: ReflexObservation;
     };
 
 export class ReflexCoordinator {
@@ -69,8 +86,13 @@ export class ReflexCoordinator {
     }
 
     this.handling = true;
-    this.currentState = { state: "intervening", incident };
+    this.currentState = {
+      state: "intervening",
+      incident,
+      startedAt: incident.observation.observedAt,
+    };
     let lease: ActionLease | undefined;
+    let after: ReflexObservation | undefined;
     try {
       const acquiredLease = this.arbiter.acquire(
         `reflex:${incident.kind}`,
@@ -107,8 +129,11 @@ export class ReflexCoordinator {
         undefined,
         `reflex:${incident.kind}`,
       );
-      const after = await this.minecraft.observe();
-      if (!isStableAfterIncident(incident.kind, after, this.thresholds)) {
+      const afterSnapshot = await this.minecraft.observe();
+      after = reflexObservation(afterSnapshot);
+      if (
+        !isStableAfterIncident(incident.kind, afterSnapshot, this.thresholds)
+      ) {
         throw new AppError({
           category: "safety",
           code: "REFLEX_NOT_STABLE",
@@ -118,7 +143,13 @@ export class ReflexCoordinator {
           failedAt: `reflex:${incident.kind}`,
         });
       }
-      this.currentState = { state: "stabilizing", incident };
+      this.currentState = {
+        state: "stabilizing",
+        incident,
+        startedAt: incident.observation.observedAt,
+        endedAt: after.observedAt,
+        after,
+      };
       this.retryNotBefore = 0;
     } catch (error) {
       this.currentState = {
@@ -132,6 +163,9 @@ export class ReflexCoordinator {
           retryable: false,
           failedAt: `reflex:${incident.kind}`,
         }),
+        startedAt: incident.observation.observedAt,
+        endedAt: after?.observedAt ?? new Date().toISOString(),
+        ...(after === undefined ? {} : { after }),
       };
       this.retryNotBefore = Date.now() + 5_000;
     } finally {

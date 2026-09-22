@@ -8,6 +8,7 @@ import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import {
   distance,
+  oxygenObservationState,
   type EntityObservation,
   type Position,
   type SurroundingsObservation,
@@ -119,6 +120,74 @@ const positionOf = (position: {
   z: position.z,
 });
 
+export interface EntityMetadataEntry {
+  readonly key: number;
+  readonly value: unknown;
+}
+
+export interface EntityMetadataPacket {
+  readonly entityId: number;
+  readonly metadata: readonly EntityMetadataEntry[];
+}
+
+function parseEntityMetadataPacket(
+  packet: unknown,
+): EntityMetadataPacket | undefined {
+  if (typeof packet !== "object" || packet === null) return undefined;
+  const candidate = packet as {
+    readonly entityId?: unknown;
+    readonly metadata?: unknown;
+  };
+  const entityId = candidate.entityId;
+  if (
+    typeof entityId !== "number" ||
+    !Number.isInteger(entityId) ||
+    !Array.isArray(candidate.metadata)
+  )
+    return undefined;
+  const metadata = candidate.metadata.filter(
+    (entry): entry is EntityMetadataEntry => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const metadataEntry = entry as { readonly key?: unknown };
+      return (
+        typeof metadataEntry.key === "number" &&
+        Number.isInteger(metadataEntry.key)
+      );
+    },
+  );
+  return { entityId, metadata };
+}
+
+/**
+ * Mineflayer's named-metadata path can receive air supply for another entity
+ * and overwrite bot.oxygenLevel. Only accept an air-supply field from the
+ * bot's own entity packet; an invalid own value is explicitly unknown.
+ */
+export function oxygenFromEntityMetadata(
+  packet: EntityMetadataPacket,
+  botEntityId: number,
+  metadataKeys: readonly string[] | undefined,
+  legacyMetadata = false,
+): number | null | undefined {
+  if (packet.entityId !== botEntityId) return undefined;
+  const airSupply = packet.metadata.find(
+    (entry) =>
+      metadataKeys?.[entry.key] === "air_supply" ||
+      (legacyMetadata && entry.key === 1),
+  );
+  if (airSupply === undefined) return undefined;
+  if (
+    typeof airSupply.value !== "number" ||
+    !Number.isFinite(airSupply.value)
+  ) {
+    return null;
+  }
+  // The safety threshold is expressed in 15-tick oxygen units. Ceil keeps
+  // raw values above the five-unit cutoff from being reported as low.
+  const oxygen = Math.ceil(airSupply.value / 15);
+  return Number.isFinite(oxygen) && oxygen >= 0 && oxygen <= 20 ? oxygen : null;
+}
+
 export function escapeTarget(
   origin: Position,
   threats: readonly Position[],
@@ -222,6 +291,7 @@ export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
   private spawned = false;
   private intentionalDisconnect = false;
+  private authoritativeOxygen: number | null | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
   >();
@@ -238,6 +308,24 @@ export class MineflayerClient implements MinecraftPort {
     const bot = mineflayer.createBot(this.options.bot);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
+    this.authoritativeOxygen = undefined;
+    const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
+    bot._client.on("entity_metadata", (packet) => {
+      const botEntity = bot.entity;
+      const metadataPacket = parseEntityMetadataPacket(packet as unknown);
+      if (metadataPacket === undefined) return;
+      const metadataKeys =
+        usesNamedMetadata && botEntity.name !== undefined
+          ? bot.registry.entitiesByName[botEntity.name]?.metadataKeys
+          : undefined;
+      const oxygen = oxygenFromEntityMetadata(
+        metadataPacket,
+        botEntity.id,
+        metadataKeys,
+        !usesNamedMetadata,
+      );
+      if (oxygen !== undefined) this.authoritativeOxygen = oxygen;
+    });
     bot.on("chat", (username, message) => {
       for (const listener of this.chatListeners) listener(username, message);
     });
@@ -334,6 +422,7 @@ export class MineflayerClient implements MinecraftPort {
 
   public async observe(): Promise<WorldSnapshot> {
     const bot = this.requireBot();
+    const observedAt = new Date().toISOString();
     const botPosition = positionOf(bot.entity.position);
     const inventory = new Map<string, number>();
     for (const item of bot.inventory.items())
@@ -374,8 +463,13 @@ export class MineflayerClient implements MinecraftPort {
       isInLava?: boolean;
       onFire?: boolean;
     };
+    const inWater =
+      physicsState.isInWater ?? blockNames.some((name) => name === "water");
+    const oxygen = this.authoritativeOxygen ?? null;
     return {
-      observedAt: new Date().toISOString(),
+      observedAt,
+      subject: "bot",
+      source: "minecraft",
       connected: true,
       spawned: this.spawned,
       dimension: bot.game.dimension,
@@ -383,10 +477,10 @@ export class MineflayerClient implements MinecraftPort {
       velocityY: bot.entity.velocity.y,
       health: bot.health,
       food: bot.food,
-      oxygen: bot.oxygenLevel,
+      oxygen,
+      oxygenState: oxygenObservationState(oxygen, inWater),
       onFire: physicsState.onFire ?? false,
-      inWater:
-        physicsState.isInWater ?? blockNames.some((name) => name === "water"),
+      inWater,
       inLava:
         physicsState.isInLava ?? blockNames.some((name) => name === "lava"),
       suffocating:
@@ -455,10 +549,25 @@ export class MineflayerClient implements MinecraftPort {
     const hazards = [
       ...(snapshot.inLava ? ["lava"] : []),
       ...(snapshot.onFire ? ["fire"] : []),
-      ...(snapshot.oxygen <= 5 ? ["low_oxygen"] : []),
+      ...(snapshot.inWater && snapshot.oxygenState === "low"
+        ? ["low_oxygen"]
+        : []),
+      ...(snapshot.inWater && snapshot.oxygenState === "unknown"
+        ? ["oxygen_unconfirmed"]
+        : []),
       ...(entities.some((entity) => entity.hostile) ? ["hostile_entity"] : []),
     ];
-    return { observedAt: snapshot.observedAt, blocks, entities, hazards };
+    return {
+      observedAt: snapshot.observedAt,
+      subject: snapshot.subject,
+      source: snapshot.source,
+      oxygen: snapshot.oxygen,
+      oxygenState: snapshot.oxygenState,
+      inWater: snapshot.inWater,
+      blocks,
+      entities,
+      hazards,
+    };
   }
 
   public async say(message: string): Promise<void> {

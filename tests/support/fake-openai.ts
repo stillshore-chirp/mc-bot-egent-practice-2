@@ -4,6 +4,8 @@ export interface RecordedOpenAIRequest {
   parallel_tool_calls?: boolean | null;
   store?: boolean | null;
   input?: unknown;
+  instructions?: string;
+  tools?: { name: string }[];
 }
 
 export class ScriptedOpenAI {

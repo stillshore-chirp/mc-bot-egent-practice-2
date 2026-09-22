@@ -12,7 +12,7 @@ import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
 import { MoveToSkill } from "../../src/skills/move-to.js";
 import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
-import { FakeMinecraft } from "../support/fake-minecraft.js";
+import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
 function createController(minecraft: FakeMinecraft) {
@@ -54,6 +54,36 @@ function createController(minecraft: FakeMinecraft) {
 }
 
 describe("CompanionGameController", () => {
+  it("attributes vitals to the Bot and keeps requester vitals unobserved", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+    const { game, close } = createController(minecraft);
+
+    const status = await game.observeStatus();
+    const surroundings = await game.observeSurroundings(8, false);
+
+    expect(status).toMatchObject({
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      oxygen: 5,
+      oxygenState: "low",
+      inWater: true,
+    });
+    expect(surroundings).toMatchObject({
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      oxygen: 5,
+      oxygenState: "low",
+      inWater: true,
+    });
+    expect(status.observedAt).toBeTruthy();
+    expect(surroundings.observedAt).toBeTruthy();
+    close();
+  });
+
   it("maps observed movement into a verified action report", async () => {
     const minecraft = new FakeMinecraft();
     const { game, close } = createController(minecraft);
