@@ -520,7 +520,12 @@ export const toolDefinitions = [
                 planRounds,
                 completedSteps:
                   completedSteps.length + (result.success ? 1 : 0),
-                ...(result.success ? {} : { stepCode: result.error.code }),
+                ...(result.success
+                  ? {
+                      partialProgress: result.progress ?? null,
+                      partialStepSummary: result.userSummary,
+                    }
+                  : { stepCode: result.error.code }),
               },
               ["必要なら安全状態を確認して新しい目的として再依頼する"],
               `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,

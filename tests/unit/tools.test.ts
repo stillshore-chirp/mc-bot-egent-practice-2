@@ -431,6 +431,81 @@ describe("ToolExecutor", () => {
     expect(laterSteps).toEqual([]);
   });
 
+  it("returns only confirmed partial progress after an owner stop", async () => {
+    const stopController = new AbortController();
+    const toolContext = context();
+    toolContext.signal = stopController.signal;
+    const laterSteps: string[] = [];
+    let receivedSignal: AbortSignal | undefined;
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "cancelled-plan",
+        label: "停止された採取",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "oak_log",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+          { tool: "say", input: { message: "後続" } },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async (_resource, _count, signal) => {
+      receivedSignal = signal;
+      stopController.abort(new Error("OWNER_STOP_REQUESTED"));
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource: "oak_log",
+          requestedCount: 1,
+          collectedCount: 1,
+        },
+        summary: "停止直前に採取結果を確認しました。",
+      };
+    };
+    toolContext.game.say = async (message) => {
+      laterSteps.push(message);
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        category: "cancelled",
+        code: "SAFE_ACTION_PLAN_CANCELLED",
+        confirmedState: {
+          completedCount: 0,
+          completedSteps: 1,
+          partialProgress: { completedCount: 1, requestedCount: 1 },
+        },
+      },
+    });
+    expect(laterSteps).toEqual([]);
+  });
+
   it("stops a plan at the first failed step and does not run later steps", async () => {
     const calls: string[] = [];
     const toolContext = context();
