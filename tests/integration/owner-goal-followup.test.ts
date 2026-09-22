@@ -76,7 +76,7 @@ function createFactory(calls: string[]): CompanionContextFactory {
     listRecentTaskRuns: () => [],
     recall: () => [],
   } as unknown as MemoryStore;
-  const game: GameController = {
+  const game = {
     observeStatus: async () => status,
     observeSurroundings: async () => ({
       blocks: [],
@@ -118,7 +118,7 @@ function createFactory(calls: string[]): CompanionContextFactory {
       summary: "戻りました。",
     }),
     currentPosition: async () => status.position,
-  };
+  } as unknown as GameController;
   const memory: MemoryPort = {
     rememberPlayerFact: () => ({}),
     rememberLocation: () => ({}),
