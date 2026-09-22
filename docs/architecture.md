@@ -37,6 +37,8 @@ all execution boundaries -> observability (correlation ID, redacted logs)
 
 依存は高水準の会話・tool から低水準の runtime・Minecraft adapter へ向けます。`memory` と `persona` は agent が読む状態であり、Minecraft adapter に依存しません。`verification` は action 前後の snapshot を比較して結果を返し、LLM の自己申告を成功根拠にしません。
 
+Minecraft の体力・空腹・酸素・水中状態は、`observedAt`、`subject: "bot"`、`source: "minecraft"` を持つ同一のBot観測として扱います。`observe_status` と `observe_surroundings` は `requesterVitals: "unobserved"` を返し、利用者の体調をBotの値から推測しません。酸素の低下は同じ観測の `inWater` と `oxygenState` を使って判定し、範囲外または取得できない値は `unknown` として発話や低酸素の断定に使いません。安全介入の記録には開始観測、終了観測、介入結果、失敗分類を含めます。
+
 ## 責務
 
 | 領域            | 責務                                                                 | 境界                                                                       |

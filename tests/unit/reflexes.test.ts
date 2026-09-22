@@ -53,6 +53,82 @@ describe("reflex loop", () => {
     expect(minecraft.actions).toContain("escape:environment");
   });
 
+  it("treats low oxygen as a hazard only when the Bot is underwater", () => {
+    const detector = new ReflexDetector(thresholds);
+    const land = detector.detect(
+      createSnapshot({ oxygen: 5, inWater: false }),
+      false,
+    );
+    expect(land).toBeUndefined();
+
+    const underwater = detector.detect(
+      createSnapshot({ oxygen: 5, inWater: true }),
+      false,
+    );
+    expect(underwater).toMatchObject({
+      kind: "hazard",
+      reason: "Bot oxygen is low while underwater",
+      observation: {
+        subject: "bot",
+        source: "minecraft",
+        oxygen: 5,
+        oxygenState: "low",
+        inWater: true,
+      },
+    });
+
+    const recovered = detector.detect(
+      createSnapshot({ oxygen: 20, inWater: true }),
+      false,
+    );
+    expect(recovered).toBeUndefined();
+  });
+
+  it("uses an explicit unknown observation for underwater oxygen it cannot confirm", () => {
+    const detector = new ReflexDetector(thresholds);
+    const incident = detector.detect(
+      createSnapshot({ oxygen: null, inWater: true }),
+      false,
+    );
+
+    expect(incident).toMatchObject({
+      kind: "hazard",
+      reason: "Bot oxygen cannot be confirmed while underwater",
+      observation: { oxygen: null, oxygenState: "unknown", inWater: true },
+    });
+  });
+
+  it("keeps the intervention timeline and reports an unstable oxygen state as failure", async () => {
+    class UnstableMinecraft extends FakeMinecraft {
+      public override async escapeDanger(
+        _mode: "environment" | "hostile",
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (signal.aborted) throw signal.reason;
+        this.actions.push("escape:unstable");
+      }
+    }
+
+    const minecraft = new UnstableMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+    const coordinator = coordinatorFor(minecraft);
+    const failed = await coordinator.tick(await minecraft.observe(), false);
+
+    expect(failed).toMatchObject({
+      state: "failed",
+      failure: { code: "REFLEX_NOT_STABLE" },
+      incident: {
+        observation: { oxygen: 5, oxygenState: "low", inWater: true },
+      },
+      after: { oxygen: 5, oxygenState: "low", inWater: true },
+    });
+    if (failed.state !== "failed") throw new Error("expected failed reflex");
+    expect(failed.startedAt).toBe(failed.incident.observation.observedAt);
+    expect(failed.endedAt).toBe(failed.after?.observedAt);
+    expect(minecraft.actions).toContain("escape:unstable");
+  });
+
   it("uses the environmental escape when lava and a hostile coexist", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({

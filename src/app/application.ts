@@ -135,6 +135,9 @@ export interface LiveEvidence {
         | "health"
         | "food"
         | "oxygen"
+        | "oxygenState"
+        | "inWater"
+        | "observedAt"
         | "activeTaskState"
       > & { readonly inventoryTotal: number });
   readonly task: null | {
@@ -289,6 +292,9 @@ class DefaultCompanionApplication implements CompanionApplication {
               health: status.health,
               food: status.food,
               oxygen: status.oxygen,
+              oxygenState: status.oxygenState,
+              inWater: status.inWater,
+              observedAt: status.observedAt,
               activeTaskState: status.activeTaskState,
               inventoryTotal: Object.values(status.inventory).reduce(
                 (total, count) => total + count,
@@ -650,7 +656,42 @@ class DefaultCompanionApplication implements CompanionApplication {
             currentState: current.state,
             ...(current.state === "safe"
               ? {}
-              : { incidentKind: current.incident.kind }),
+              : {
+                  incidentKind: current.incident.kind,
+                  incidentReason: current.incident.reason,
+                  observationSubject: current.incident.observation.subject,
+                  observationSource: current.incident.observation.source,
+                  observationAt: current.incident.observation.observedAt,
+                  observationDimension: current.incident.observation.dimension,
+                  observationX: current.incident.observation.position.x,
+                  observationY: current.incident.observation.position.y,
+                  observationZ: current.incident.observation.position.z,
+                  observationInWater: current.incident.observation.inWater,
+                  observationOxygen: current.incident.observation.oxygen,
+                  observationOxygenState:
+                    current.incident.observation.oxygenState,
+                  ...(current.state === "failed" &&
+                  current.failure.code === "REFLEX_NOT_STABLE"
+                    ? { failureCode: current.failure.code }
+                    : {}),
+                  ...(current.after === undefined
+                    ? {}
+                    : {
+                        afterObservationAt: current.after.observedAt,
+                        afterObservationInWater: current.after.inWater,
+                        afterObservationOxygen: current.after.oxygen,
+                        afterObservationOxygenState: current.after.oxygenState,
+                        afterObservationX: current.after.position.x,
+                        afterObservationY: current.after.position.y,
+                        afterObservationZ: current.after.position.z,
+                      }),
+                  ...(current.startedAt === undefined
+                    ? {}
+                    : { interventionStartedAt: current.startedAt }),
+                  ...(current.endedAt === undefined
+                    ? {}
+                    : { interventionEndedAt: current.endedAt }),
+                }),
           },
           summarizeResult: () => "安全状態の変化を記録",
         },

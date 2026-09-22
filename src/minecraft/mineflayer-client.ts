@@ -8,6 +8,7 @@ import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import {
   distance,
+  oxygenObservationState,
   type EntityObservation,
   type Position,
   type SurroundingsObservation,
@@ -277,6 +278,7 @@ export class MineflayerClient implements MinecraftPort {
 
   public async observe(): Promise<WorldSnapshot> {
     const bot = this.requireBot();
+    const observedAt = new Date().toISOString();
     const botPosition = positionOf(bot.entity.position);
     const inventory = new Map<string, number>();
     for (const item of bot.inventory.items())
@@ -317,8 +319,20 @@ export class MineflayerClient implements MinecraftPort {
       isInLava?: boolean;
       onFire?: boolean;
     };
+    const inWater =
+      physicsState.isInWater ?? blockNames.some((name) => name === "water");
+    const rawOxygen = bot.oxygenLevel;
+    const oxygen =
+      typeof rawOxygen === "number" &&
+      Number.isFinite(rawOxygen) &&
+      rawOxygen >= 0 &&
+      rawOxygen <= 20
+        ? rawOxygen
+        : null;
     return {
-      observedAt: new Date().toISOString(),
+      observedAt,
+      subject: "bot",
+      source: "minecraft",
       connected: true,
       spawned: this.spawned,
       dimension: bot.game.dimension,
@@ -326,10 +340,10 @@ export class MineflayerClient implements MinecraftPort {
       velocityY: bot.entity.velocity.y,
       health: bot.health,
       food: bot.food,
-      oxygen: bot.oxygenLevel,
+      oxygen,
+      oxygenState: oxygenObservationState(oxygen, inWater),
       onFire: physicsState.onFire ?? false,
-      inWater:
-        physicsState.isInWater ?? blockNames.some((name) => name === "water"),
+      inWater,
       inLava:
         physicsState.isInLava ?? blockNames.some((name) => name === "lava"),
       suffocating:
@@ -398,10 +412,25 @@ export class MineflayerClient implements MinecraftPort {
     const hazards = [
       ...(snapshot.inLava ? ["lava"] : []),
       ...(snapshot.onFire ? ["fire"] : []),
-      ...(snapshot.oxygen <= 5 ? ["low_oxygen"] : []),
+      ...(snapshot.inWater && snapshot.oxygenState === "low"
+        ? ["low_oxygen"]
+        : []),
+      ...(snapshot.inWater && snapshot.oxygenState === "unknown"
+        ? ["oxygen_unconfirmed"]
+        : []),
       ...(entities.some((entity) => entity.hostile) ? ["hostile_entity"] : []),
     ];
-    return { observedAt: snapshot.observedAt, blocks, entities, hazards };
+    return {
+      observedAt: snapshot.observedAt,
+      subject: snapshot.subject,
+      source: snapshot.source,
+      oxygen: snapshot.oxygen,
+      oxygenState: snapshot.oxygenState,
+      inWater: snapshot.inWater,
+      blocks,
+      entities,
+      hazards,
+    };
   }
 
   public async say(message: string): Promise<void> {

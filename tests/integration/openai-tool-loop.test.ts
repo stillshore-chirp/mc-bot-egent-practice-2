@@ -10,11 +10,19 @@ import type {
 import { ScriptedOpenAI } from "../support/fake-openai.js";
 
 const status = {
+  observedAt: "2026-09-22T00:00:00.000Z",
+  subject: "bot" as const,
+  source: "minecraft" as const,
+  requesterVitals: "unobserved" as const,
   connected: true,
   spawned: true,
   health: 20,
   food: 20,
   oxygen: 20,
+  oxygenState: "not_applicable" as const,
+  inWater: false,
+  inLava: false,
+  suffocating: false,
   position: { x: 0, y: 64, z: 0, dimension: "overworld" },
   inventory: {},
   activeTaskState: null,
@@ -24,6 +32,13 @@ function toolContext(): ToolContext {
   const game: GameController = {
     observeStatus: async () => status,
     observeSurroundings: async () => ({
+      observedAt: status.observedAt,
+      subject: status.subject,
+      source: status.source,
+      requesterVitals: status.requesterVitals,
+      oxygen: status.oxygen,
+      oxygenState: status.oxygenState,
+      inWater: status.inWater,
       blocks: [],
       entities: [],
       hazards: [],
@@ -155,6 +170,12 @@ describe("OpenAI tool loop", () => {
       parallel_tool_calls: false,
       store: false,
     });
+    expect(fake.requests[0]?.instructions).toContain(
+      "requesterVitalsがunobserved",
+    );
+    expect(fake.requests[0]?.instructions).toContain(
+      "利用者の体力・空腹・酸素・水中状態をBotの値から推測せず",
+    );
     expect(JSON.stringify(fake.requests[1]?.input)).toContain(
       "MOVE_DISTANCE_EXCEEDED",
     );

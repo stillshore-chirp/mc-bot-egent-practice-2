@@ -54,17 +54,32 @@ export interface Position {
 }
 
 export interface GameStatus {
+  readonly observedAt: string;
+  readonly subject: "bot";
+  readonly source: "minecraft";
+  readonly requesterVitals: "unobserved";
   connected: boolean;
   spawned: boolean;
   health: number;
   food: number;
-  oxygen: number;
+  oxygen: number | null;
+  oxygenState: "normal" | "low" | "not_applicable" | "unknown";
+  inWater: boolean;
+  inLava: boolean;
+  suffocating: boolean;
   position: Position | null;
   inventory: Readonly<Record<string, number>>;
   activeTaskState: string | null;
 }
 
 export interface Surroundings {
+  readonly observedAt: string;
+  readonly subject: "bot";
+  readonly source: "minecraft";
+  readonly requesterVitals: "unobserved";
+  readonly oxygen: number | null;
+  readonly oxygenState: "normal" | "low" | "not_applicable" | "unknown";
+  readonly inWater: boolean;
   blocks: readonly { name: string; distance: number }[];
   entities: readonly { kind: string; distance: number }[];
   hazards: readonly string[];

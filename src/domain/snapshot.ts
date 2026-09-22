@@ -4,6 +4,35 @@ export interface Position {
   readonly z: number;
 }
 
+export type ObservationSubject = "bot";
+export type ObservationSource = "minecraft";
+
+export interface ObservationAttribution {
+  readonly subject: ObservationSubject;
+  readonly source: ObservationSource;
+  readonly observedAt: string;
+}
+
+export type OxygenObservationState =
+  "normal" | "low" | "not_applicable" | "unknown";
+
+export const oxygenObservationState = (
+  oxygen: number | null,
+  inWater: boolean,
+  lowOxygenThreshold = 5,
+): OxygenObservationState => {
+  if (
+    oxygen === null ||
+    !Number.isFinite(oxygen) ||
+    oxygen < 0 ||
+    oxygen > 20
+  ) {
+    return "unknown";
+  }
+  if (!inWater) return "not_applicable";
+  return oxygen <= lowOxygenThreshold ? "low" : "normal";
+};
+
 export interface InventoryEntry {
   readonly name: string;
   readonly count: number;
@@ -30,15 +59,16 @@ export interface BlockObservation {
   readonly distance: number;
 }
 
-export interface SurroundingsObservation {
-  readonly observedAt: string;
+export interface SurroundingsObservation extends ObservationAttribution {
+  readonly oxygen: number | null;
+  readonly oxygenState: OxygenObservationState;
+  readonly inWater: boolean;
   readonly blocks: readonly BlockObservation[];
   readonly entities: readonly EntityObservation[];
   readonly hazards: readonly string[];
 }
 
-export interface WorldSnapshot {
-  readonly observedAt: string;
+export interface WorldSnapshot extends ObservationAttribution {
   readonly connected: boolean;
   readonly spawned: boolean;
   readonly dimension: string;
@@ -46,7 +76,8 @@ export interface WorldSnapshot {
   readonly velocityY: number;
   readonly health: number;
   readonly food: number;
-  readonly oxygen: number;
+  readonly oxygen: number | null;
+  readonly oxygenState: OxygenObservationState;
   readonly onFire: boolean;
   readonly inWater: boolean;
   readonly inLava: boolean;
