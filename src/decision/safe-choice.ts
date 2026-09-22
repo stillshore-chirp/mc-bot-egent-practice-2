@@ -23,6 +23,10 @@ export type SafeChoiceAuthorization =
       readonly goal: string;
       /** Canonical resource IDs authorized by that owner goal. */
       readonly allowedResources: readonly string[];
+      /** Canonical inventory item the owner asked to obtain. */
+      readonly targetItem: string;
+      /** Exact quantity extracted from the owner message. */
+      readonly targetCount: number;
       readonly maxCount: number;
     }
   | {
@@ -49,6 +53,10 @@ export interface SafeChoiceCandidate {
   readonly requestedCount?: number;
   /** Canonical provider resource ID for resource authorization matching. */
   readonly resourceName?: string;
+  /** Canonical inventory item delivered by the whole candidate plan. */
+  readonly goalItem?: string;
+  /** Verified intermediate inventory items that may advance preparation only. */
+  readonly intermediateItems?: readonly string[];
   readonly distance?: number;
   readonly order?: number;
 }
@@ -169,8 +177,13 @@ function isEligible(
     trustedAuthorization.allowedResources.length > 0 &&
     candidate.resourceName !== undefined &&
     trustedAuthorization.allowedResources.includes(candidate.resourceName) &&
+    candidate.goalItem === trustedAuthorization.targetItem &&
     candidate.operationClass === "natural_resource" &&
-    candidate.impact === "medium"
+    candidate.impact === "medium" &&
+    Number.isInteger(trustedAuthorization.targetCount) &&
+    trustedAuthorization.targetCount > 0 &&
+    Number.isInteger(trustedAuthorization.maxCount) &&
+    trustedAuthorization.targetCount <= trustedAuthorization.maxCount
   ) {
     return (
       Number.isInteger(trustedAuthorization.maxCount) &&

@@ -239,6 +239,7 @@ export class CompanionGameController implements GameController {
         operationClass: "natural_resource",
         requestedCount: request.count,
         resourceName: resource.resource,
+        goalItem: resource.resource,
         distance: resource.distance,
         order: index,
         steps: [

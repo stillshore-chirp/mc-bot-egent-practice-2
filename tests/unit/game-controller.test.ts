@@ -149,6 +149,7 @@ describe("CompanionGameController", () => {
         operationClass: "natural_resource",
         requestedCount: 2,
         resourceName: "birch_log",
+        goalItem: "birch_log",
         steps: [
           {
             tool: "gather_resource",

@@ -11,6 +11,7 @@ import type {
   ToolContext,
 } from "../tools/contracts.js";
 import type { ChatContextFactory } from "../agent/chat-coordinator.js";
+import { deriveOwnerGoalAuthorization } from "../decision/owner-goal-authorization.js";
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
@@ -180,6 +181,19 @@ export class CompanionContextFactory implements ChatContextFactory {
           { summary: "Minecraft状態を観測" },
           () => this.game.observeStatus(),
         );
+        const ownerGoal = deriveOwnerGoalAuthorization({
+          message,
+          requesterUsername,
+          authorizedOwnerUsername: this.config.ownerUsername,
+          requestKind,
+          maxCount: this.config.limits.maxGatherCount,
+        });
+        const ownerGoalFields =
+          ownerGoal.outcome === "authorized"
+            ? { safeActionAuthorization: ownerGoal.authorization }
+            : ownerGoal.outcome === "clarify"
+              ? { safeActionClarification: ownerGoal.question }
+              : {};
         return {
           personaContext: buildPersonaContext(this.persona, {
             playerName: requesterUsername,
@@ -206,6 +220,7 @@ export class CompanionContextFactory implements ChatContextFactory {
             playerId: this.playerId,
             signal,
             requestKind,
+            ...ownerGoalFields,
             executionEvidence: { verifiedActionReceipts: [] },
             game: this.game,
             memory: this.toolMemory,

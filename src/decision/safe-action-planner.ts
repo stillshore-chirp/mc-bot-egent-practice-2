@@ -27,6 +27,8 @@ export interface SafeActionPlanRequest {
   readonly candidates: readonly SafeActionCandidate[];
   readonly requestedId?: string | undefined;
   readonly maxSteps: number;
+  /** Remaining quantity for a bounded replan loop, when applicable. */
+  readonly remainingCount?: number;
   /** Must come from the trusted owner/request boundary, never the model. */
   readonly authorization?: SafeChoiceAuthorization;
 }
@@ -83,7 +85,9 @@ export function planSafeAction(
     );
   }
 
-  if (!isAuthorizedBound(candidate, request.authorization)) {
+  if (
+    !isAuthorizedBound(candidate, request.authorization, request.remainingCount)
+  ) {
     return clarify(
       request.candidates,
       "候補の影響範囲または数量上限を確認できないため、操作を開始しません。",
@@ -115,6 +119,7 @@ function hasBoundedSteps(
 function isAuthorizedBound(
   candidate: SafeActionCandidate,
   authorization: SafeChoiceAuthorization | undefined,
+  remainingCount: number | undefined,
 ): boolean {
   if (authorization?.kind !== "owner_bounded_resource") return true;
   if (candidate.operationClass !== "natural_resource") return false;
@@ -124,10 +129,28 @@ function isAuthorizedBound(
     !authorization.allowedResources.includes(candidate.resourceName)
   )
     return false;
+  if (candidate.goalItem !== authorization.targetItem) return false;
+  if (
+    !Number.isInteger(authorization.targetCount) ||
+    authorization.targetCount < 1 ||
+    authorization.targetCount > authorization.maxCount
+  )
+    return false;
   const requestedCount = candidate.requestedCount;
   if (typeof requestedCount !== "number" || !Number.isInteger(requestedCount))
     return false;
-  return requestedCount > 0 && requestedCount <= authorization.maxCount;
+  if (
+    remainingCount !== undefined &&
+    (!Number.isInteger(remainingCount) ||
+      remainingCount < 1 ||
+      requestedCount > remainingCount)
+  )
+    return false;
+  return (
+    requestedCount > 0 &&
+    requestedCount <= authorization.targetCount &&
+    requestedCount <= authorization.maxCount
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

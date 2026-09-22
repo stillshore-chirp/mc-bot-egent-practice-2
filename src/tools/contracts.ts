@@ -38,12 +38,20 @@ export interface ToolFailure {
   userSummary: string;
 }
 
+export interface ActionProgress {
+  readonly completedCount: number;
+  readonly requestedCount: number;
+  /** Canonical inventory item represented by the verified progress delta. */
+  readonly item?: string;
+}
+
 export type ToolResult<T> =
   | {
       success: true;
       data: T;
       evidence: EvidenceReference[];
       userSummary: string;
+      progress?: ActionProgress;
       verificationReceipt?: {
         receiptId: string;
         commitmentId: string;
@@ -214,6 +222,8 @@ export interface ToolContext {
    * manufacture this value. Omitted means delegated low-impact only.
    */
   safeActionAuthorization?: SafeChoiceAuthorization;
+  /** One concrete owner-goal clarification produced at the request boundary. */
+  safeActionClarification?: string;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;
@@ -233,6 +243,8 @@ export interface ToolContext {
   limits: {
     maxMoveDistance: number;
     maxGatherCount: number;
+    /** Optional generic-plan wall-clock cap; the planner applies its own hard cap. */
+    maxSafeActionDurationMs?: number;
     followDistance: number;
     memoryContextLimit: number;
   };
@@ -243,6 +255,7 @@ export function actionReportResult(
 ): ToolResult<ActionReport> {
   const observedAt = new Date().toISOString();
   if (report.outcome === "completed") {
+    const progress = actionProgress(report.confirmedState);
     return {
       success: true,
       data: report,
@@ -254,6 +267,7 @@ export function actionReportResult(
         },
       ],
       userSummary: report.summary,
+      ...(progress === undefined ? {} : { progress }),
     };
   }
   return {
@@ -273,4 +287,53 @@ export function actionReportResult(
       userSummary: report.summary,
     },
   };
+}
+
+function actionProgress(
+  confirmedState: Readonly<Record<string, unknown>> | undefined,
+): ActionProgress | undefined {
+  if (confirmedState === undefined) return undefined;
+  const requestedCount = firstInteger(confirmedState, [
+    "requestedCount",
+    "targetCount",
+  ]);
+  const completedCount = firstInteger(confirmedState, [
+    "collectedCount",
+    "minedCount",
+    "craftedCount",
+    "placedCount",
+    "smeltedCount",
+  ]);
+  if (
+    requestedCount === undefined ||
+    completedCount === undefined ||
+    requestedCount < 1 ||
+    completedCount < 0
+  ) {
+    return undefined;
+  }
+  const item =
+    typeof confirmedState.item === "string"
+      ? confirmedState.item
+      : typeof confirmedState.resource === "string"
+        ? confirmedState.resource
+        : undefined;
+  return {
+    completedCount,
+    requestedCount,
+    ...(item === undefined ? {} : { item }),
+  };
+}
+
+function firstInteger(
+  value: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): number | undefined {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isInteger(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
 }

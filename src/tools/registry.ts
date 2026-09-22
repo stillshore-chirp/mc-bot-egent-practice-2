@@ -6,7 +6,10 @@ import { chooseSafeCandidate } from "../decision/safe-choice.js";
 
 import {
   actionReportResult,
+  type ActionProgress,
+  type ErrorCategory,
   type EvidenceReference,
+  type ToolContext,
   type ToolResult,
 } from "./contracts.js";
 import type { ToolDefinition } from "./definition.js";
@@ -43,11 +46,65 @@ const resourceLabels: Readonly<Record<string, string>> = {
 const memoryKinds = ["fact", "location", "commitment", "episode"] as const;
 const safeActionModes = z.enum(["delegated", "explicit"]);
 const maxSafeActionSteps = 8;
+const maxSafeActionPlanRounds = 64;
+const maxSafeActionDurationMs = 120_000;
 function nowEvidence(
   kind: EvidenceReference["kind"],
   summary: string,
 ): EvidenceReference[] {
   return [{ kind, observedAt: new Date().toISOString(), summary }];
+}
+
+function safeActionFailure(
+  category: ErrorCategory,
+  code: string,
+  retryable: boolean,
+  failedAt: string,
+  confirmedState: Record<string, unknown>,
+  nextActions: readonly string[],
+  userSummary: string,
+): ToolResult<unknown> {
+  return {
+    success: false,
+    error: {
+      category,
+      code,
+      retryable,
+      failedAt,
+      confirmedState,
+      nextActions: [...nextActions],
+      userSummary,
+    },
+  };
+}
+
+function latestActionProgress(
+  results: readonly Extract<ToolResult<unknown>, { success: true }>[],
+): ActionProgress | undefined {
+  for (let index = results.length - 1; index >= 0; index -= 1) {
+    const progress = results[index]?.progress;
+    if (progress !== undefined) return progress;
+  }
+  return undefined;
+}
+
+function isSignalAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+function trustedSafeActionCount(
+  inputCount: number,
+  authorization: ToolContext["safeActionAuthorization"],
+): number | undefined {
+  if (authorization?.kind !== "owner_bounded_resource") return inputCount;
+  if (
+    !Number.isInteger(authorization.targetCount) ||
+    authorization.targetCount < 1 ||
+    !Number.isInteger(authorization.maxCount) ||
+    authorization.targetCount > authorization.maxCount
+  )
+    return undefined;
+  return authorization.targetCount;
 }
 
 function defineTool<Name extends string, Input extends z.ZodType, Output>(
@@ -134,6 +191,41 @@ export const toolDefinitions = [
     },
     action: true,
     execute: async (input, context) => {
+      const startedAt = Date.now();
+      const configuredDuration = context.limits.maxSafeActionDurationMs;
+      const durationMs =
+        typeof configuredDuration === "number" &&
+        Number.isFinite(configuredDuration)
+          ? Math.min(Math.max(1, configuredDuration), maxSafeActionDurationMs)
+          : maxSafeActionDurationMs;
+      const deadline = startedAt + durationMs;
+      const timedOut = (): boolean => Date.now() >= deadline;
+      if (context.safeActionClarification !== undefined) {
+        return safeActionFailure(
+          "authorization",
+          "OWNER_GOAL_CLARIFICATION_REQUIRED",
+          false,
+          "owner_goal_boundary",
+          { goal: input.goal, ownerGoal: "clarification_required" },
+          [context.safeActionClarification],
+          context.safeActionClarification,
+        );
+      }
+      const actionCount = trustedSafeActionCount(
+        input.count,
+        context.safeActionAuthorization,
+      );
+      if (actionCount === undefined) {
+        return safeActionFailure(
+          "authorization",
+          "SAFE_ACTION_AUTHORIZATION_INVALID",
+          false,
+          "owner_goal_boundary",
+          { goal: input.goal, modelRequestedCount: input.count },
+          ["所有者の目的と数量上限を確認してから再依頼する"],
+          "所有者の目的または数量上限を確認できないため、操作を開始しません。",
+        );
+      }
       if (context.game.findSafeActionCandidates === undefined) {
         return {
           success: false,
@@ -152,40 +244,6 @@ export const toolDefinitions = [
         };
       }
 
-      const observed = await context.game.findSafeActionCandidates(
-        {
-          goal: input.goal,
-          count: input.count,
-          maxCandidates: 8,
-        },
-        context.signal,
-      );
-      const planned = planSafeAction({
-        mode: input.mode,
-        requestedId: input.candidateId ?? undefined,
-        candidates: observed,
-        maxSteps: maxSafeActionSteps,
-        ...(context.safeActionAuthorization === undefined
-          ? {}
-          : { authorization: context.safeActionAuthorization }),
-      });
-      if (planned.outcome === "clarify") {
-        return {
-          success: false,
-          error: {
-            category: planned.code === "CHOICE_BLOCKED" ? "safety" : "resource",
-            code: planned.code,
-            retryable: false,
-            failedAt: "plan_safe_action",
-            confirmedState: {
-              goal: input.goal,
-              observedCandidateCount: observed.length,
-            },
-            nextActions: [planned.question],
-            userSummary: planned.question,
-          },
-        };
-      }
       const executeStep = context.executeSafeActionStep;
       if (executeStep === undefined) {
         return {
@@ -197,7 +255,6 @@ export const toolDefinitions = [
             failedAt: "execute_safe_action_plan",
             confirmedState: {
               goal: input.goal,
-              candidateId: planned.candidate.id,
             },
             nextActions: ["計画実行境界を初期化してから再試行する"],
             userSummary:
@@ -210,84 +267,300 @@ export const toolDefinitions = [
         readonly tool: string;
         readonly summary: string;
       }[] = [];
-      for (const [index, step] of planned.steps.entries()) {
+      const completedCandidateIds: string[] = [];
+      const planReasons: string[] = [];
+      let completedCount = 0;
+      let remainingCount = actionCount;
+      let planRounds = 0;
+      const intermediateProgress: ActionProgress[] = [];
+      while (remainingCount > 0) {
         if (context.signal.aborted) {
-          return {
-            success: false,
-            error: {
-              category: "cancelled",
-              code: "SAFE_ACTION_PLAN_CANCELLED",
-              retryable: false,
-              failedAt: step.tool,
-              confirmedState: {
+          return safeActionFailure(
+            "cancelled",
+            "SAFE_ACTION_PLAN_CANCELLED",
+            false,
+            "plan_safe_action",
+            {
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+            },
+            ["必要なら安全状態を確認して新しい目的として再依頼する"],
+            `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,
+          );
+        }
+        if (timedOut()) {
+          return safeActionFailure(
+            "timeout",
+            "SAFE_ACTION_PLAN_TIMEOUT",
+            true,
+            "plan_safe_action",
+            {
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+              elapsedMs: Date.now() - startedAt,
+            },
+            ["現在状態と数量を再観測してから新しい目的として再依頼する"],
+            `安全計画を${String(completedCount)}個分まで実行し、制限時間を超えたため停止しました。`,
+          );
+        }
+        planRounds += 1;
+        if (planRounds > maxSafeActionPlanRounds) {
+          return safeActionFailure(
+            "safety",
+            "SAFE_ACTION_REPLAN_LIMIT",
+            false,
+            "plan_safe_action",
+            {
+              completedCount,
+              remainingCount,
+              planRounds: maxSafeActionPlanRounds,
+              completedSteps: completedSteps.length,
+            },
+            ["残量と安全状態を確認してから、新しい目的として再依頼する"],
+            `安全計画を上限の${String(maxSafeActionPlanRounds)}回まで実行しましたが、残りを安全に確認できないため停止しました。`,
+          );
+        }
+
+        const observed = await context.game.findSafeActionCandidates(
+          {
+            goal: input.goal,
+            count: remainingCount,
+            maxCandidates: 8,
+          },
+          context.signal,
+        );
+        const planned = planSafeAction({
+          mode: input.mode,
+          requestedId: input.candidateId ?? undefined,
+          candidates: observed,
+          maxSteps: maxSafeActionSteps,
+          remainingCount,
+          ...(context.safeActionAuthorization === undefined
+            ? {}
+            : { authorization: context.safeActionAuthorization }),
+        });
+        if (planned.outcome === "clarify") {
+          return safeActionFailure(
+            planned.code === "CHOICE_BLOCKED" ? "safety" : "resource",
+            planned.code,
+            false,
+            "plan_safe_action",
+            {
+              goal: input.goal,
+              observedCandidateCount: observed.length,
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+            },
+            [planned.question],
+            planned.question,
+          );
+        }
+        completedCandidateIds.push(planned.candidate.id);
+        planReasons.push(planned.reason);
+        const successfulResults: Extract<
+          ToolResult<unknown>,
+          { success: true }
+        >[] = [];
+        let actionStepCompleted = false;
+        for (const [index, step] of planned.steps.entries()) {
+          if (isSignalAborted(context.signal)) {
+            return safeActionFailure(
+              "cancelled",
+              "SAFE_ACTION_PLAN_CANCELLED",
+              false,
+              step.tool,
+              {
                 candidateId: planned.candidate.id,
+                completedCount,
+                remainingCount,
+                planRounds,
                 completedSteps: completedSteps.length,
               },
-              nextActions: [
-                "必要なら安全状態を確認して新しい目的として再依頼する",
-              ],
-              userSummary: `安全計画を${String(completedSteps.length)}段階まで実行し、停止しました。`,
-            },
-          };
-        }
-        try {
-          await context.game.observeStatus();
-        } catch {
-          return {
-            success: false,
-            error: {
-              category: "observation",
-              code: "SAFE_ACTION_REOBSERVATION_FAILED",
-              retryable: true,
-              failedAt: step.tool,
-              confirmedState: {
+              ["必要なら安全状態を確認して新しい目的として再依頼する"],
+              `安全計画を${String(completedCount)}個分まで実行し、停止しました。`,
+            );
+          }
+          if (timedOut()) {
+            return safeActionFailure(
+              "timeout",
+              "SAFE_ACTION_PLAN_TIMEOUT",
+              true,
+              step.tool,
+              {
                 candidateId: planned.candidate.id,
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps: completedSteps.length,
+                elapsedMs: Date.now() - startedAt,
+              },
+              ["現在状態と数量を再観測してから新しい目的として再依頼する"],
+              `安全計画の${String(index + 1)}段階目の前に制限時間を超えたため停止しました。`,
+            );
+          }
+          try {
+            await context.game.observeStatus();
+          } catch {
+            return safeActionFailure(
+              "observation",
+              "SAFE_ACTION_REOBSERVATION_FAILED",
+              true,
+              step.tool,
+              {
+                candidateId: planned.candidate.id,
+                completedCount,
+                remainingCount,
+                planRounds,
                 completedSteps: completedSteps.length,
               },
-              nextActions: ["Minecraft状態を再観測してから計画を再試行する"],
-              userSummary: `安全計画の${String(index + 1)}段階目の前に現在状態を再観測できず、停止しました。`,
-            },
-          };
-        }
-        const result = await executeStep(step, context);
-        if (!result.success) {
-          return {
-            success: false,
-            error: {
-              category: result.error.category,
-              code: "SAFE_ACTION_STEP_FAILED",
-              retryable: result.error.retryable,
-              failedAt: step.tool,
-              confirmedState: {
+              ["Minecraft状態を再観測してから計画を再試行する"],
+              `安全計画の${String(index + 1)}段階目の前に現在状態を再観測できず、停止しました。`,
+            );
+          }
+          const result = await executeStep(step, context);
+          if (!result.success) {
+            return safeActionFailure(
+              result.error.category,
+              "SAFE_ACTION_STEP_FAILED",
+              result.error.retryable,
+              step.tool,
+              {
                 ...result.error.confirmedState,
                 candidateId: planned.candidate.id,
                 failedStep: index + 1,
+                completedCount,
+                remainingCount,
+                planRounds,
                 completedSteps: completedSteps.length,
                 stepCode: result.error.code,
               },
-              nextActions: result.error.nextActions,
-              userSummary: `${planned.reason}計画の${String(index + 1)}段階目で停止しました。${result.error.userSummary}`,
-            },
-          };
+              result.error.nextActions,
+              `${planned.reason}計画の${String(index + 1)}段階目で停止しました。${result.error.userSummary}`,
+            );
+          }
+          successfulResults.push(result);
+          if (getToolDefinition(step.tool)?.action === true) {
+            actionStepCompleted = true;
+          }
+          completedSteps.push({
+            tool: step.tool,
+            summary: result.userSummary,
+          });
         }
-        completedSteps.push({
-          tool: step.tool,
-          summary: result.userSummary,
-        });
+
+        const progress = latestActionProgress(successfulResults);
+        if (
+          progress !== undefined &&
+          (progress.completedCount < 1 ||
+            progress.completedCount > progress.requestedCount)
+        ) {
+          return safeActionFailure(
+            "observation",
+            "SAFE_ACTION_PROGRESS_INVALID",
+            false,
+            planned.candidate.id,
+            {
+              candidateId: planned.candidate.id,
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+              progress,
+            },
+            ["実行結果の数量と対象を再観測してから計画を再試行する"],
+            "操作は完了したものの、対象または数量の結果を安全に確認できないため停止しました。",
+          );
+        }
+        const goalItem = planned.candidate.goalItem;
+        const isIntermediateProgress =
+          progress !== undefined &&
+          goalItem !== undefined &&
+          progress.item !== goalItem;
+        if (isIntermediateProgress) {
+          if (
+            progress.item === undefined ||
+            !planned.candidate.intermediateItems?.includes(progress.item)
+          ) {
+            return safeActionFailure(
+              "observation",
+              "SAFE_ACTION_PROGRESS_INVALID",
+              false,
+              planned.candidate.id,
+              {
+                candidateId: planned.candidate.id,
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps: completedSteps.length,
+                progress,
+              },
+              ["実行結果の数量と対象を再観測してから計画を再試行する"],
+              "中間素材の結果は確認しましたが、最終目標の数量へ変換する計画を確認できないため停止しました。",
+            );
+          }
+          intermediateProgress.push(progress);
+          continue;
+        }
+        const expectedCount = planned.candidate.requestedCount;
+        const requiresProgress =
+          planned.candidate.goalItem !== undefined ||
+          (remainingCount > 1 &&
+            (expectedCount === undefined || expectedCount < remainingCount));
+        if (
+          progress === undefined &&
+          (!actionStepCompleted || requiresProgress)
+        ) {
+          return safeActionFailure(
+            "observation",
+            "SAFE_ACTION_PROGRESS_UNCONFIRMED",
+            true,
+            planned.candidate.id,
+            {
+              candidateId: planned.candidate.id,
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+            },
+            ["実行結果の数量を再観測してから残りを再計画する"],
+            "操作結果の数量を確認できないため、残りの計画を開始せず停止しました。",
+          );
+        }
+        const advanced = Math.min(
+          remainingCount,
+          progress?.completedCount ?? remainingCount,
+        );
+        completedCount += advanced;
+        remainingCount -= advanced;
       }
+
+      const lastCandidateId =
+        completedCandidateIds[completedCandidateIds.length - 1];
+      const firstReason = planReasons[0] ?? "安全条件を確認した計画";
       return {
         success: true,
         data: {
           goal: input.goal,
-          candidateId: planned.candidate.id,
-          reason: planned.reason,
+          candidateId: lastCandidateId,
+          candidateIds: completedCandidateIds,
+          reason: firstReason,
+          completedCount,
+          targetCount: actionCount,
+          planRounds,
+          intermediateProgress,
           completedSteps,
         },
         evidence: nowEvidence(
           "minecraft_snapshot",
-          `安全計画を${String(completedSteps.length)}段階で実行し、各段階の結果を確認した`,
+          `安全計画を${String(planRounds)}回、${String(completedCount)}個分実行し、各段階の結果を確認した`,
         ),
-        userSummary: `${planned.reason}計画した${String(completedSteps.length)}段階を実行し、結果を確認しました。${completedSteps.map(({ summary }) => summary).join(" ")}`,
+        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${completedSteps.map(({ summary }) => summary).join(" ")}`,
       };
     },
   }),

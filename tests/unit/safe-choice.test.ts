@@ -113,6 +113,7 @@ describe("safe choice policy", () => {
       action: "mine_resource",
       operationClass: "natural_resource",
       resourceName: "iron_ore",
+      goalItem: "raw_iron",
       reversible: false,
       impact: "medium",
     });
@@ -129,6 +130,8 @@ describe("safe choice policy", () => {
           kind: "owner_bounded_resource",
           goal: "ironを集める",
           allowedResources: ["iron_ore"],
+          targetItem: "raw_iron",
+          targetCount: 1,
           maxCount: 8,
         },
       }),
