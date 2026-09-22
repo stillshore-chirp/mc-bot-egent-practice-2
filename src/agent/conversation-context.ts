@@ -57,13 +57,15 @@ const GOAL_ACTION_PATTERN =
 const NON_AUTHORIZING_PATTERN =
   /(?:ないで|なくていい|なくてもいい|ないほうがいい|不要|いらない|ほしくない|ほしくありません|(?:して|て|って|で)(?:も)?(?:いい|よい|大丈夫|はいけない|はならない|ほしくない|ほしくありません))[?？]?/u;
 const AFFIRMATIVE_GOAL_ACTION_PATTERN =
-  /(?:続けて|続行して|再開して|再開しよう|再開を|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|ついてきて|ついて来て|来て|戻って|帰って|帰還して|行って|向かって|収納して|登録して|覚えて|記録して|記憶して)/u;
+  /(?:続けて|続行して|再開して|再開しよう|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|集めて|採取して|移動して|追従して|ついてきて|ついて来て|戻ってきて|戻って来て|来て|戻って|帰って|帰還して|行って|向かって|収納して|登録して|覚えて|記録して|記憶して|おいで|(?:追従|採取|収集|移動|帰還|収納)を始めて)(?:ください|下さい|ほしい(?:です)?|ね|よ)?$/u;
 const NON_GAME_ACTION_PATTERN =
-  /(?:要約|手順|説明|解説|話|会話|文章|文|返答|回答|例|たとえ|比喩|図|表|リスト|計画|理由|質問|答え|言い方|表現|続きを)(?:を|は|について|で|に)?(?:.{0,8}?)(?:使って|作って|続けて|続行して|再開して|始めて|探して)/gu;
+  /(?:要約|手順|説明|解説|話|会話|文章|文|返答|回答|例|たとえ|比喩|図|表|リスト|計画|理由|質問|答え|言い方|表現|続きを)(?:を|は|について|で|に)?(?:.{0,8}?)(?:使って|作って|続けて|続行して|再開して|再開しよう|やり直して|もう一度(?:やって|試して)|もう一回(?:やって|試して)|始めて|探して)/gu;
 
 function goalActionClauses(message: string): string[] {
-  return message
-    .split(/[、，,。！？!?]|(?=代わりに|その代わり)/u)
+  const punctuationClauses =
+    message.match(/[^、，,。！？!?]+(?:[、，,。！？!?]|$)/gu) ?? [];
+  return punctuationClauses
+    .flatMap((clause) => clause.split(/(?=代わりに|その代わり)/u))
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
 }
@@ -75,7 +77,11 @@ function isNonAuthorizingActionClause(clause: string): boolean {
 }
 
 function isAffirmativeActionClause(clause: string): boolean {
-  const actionableClause = clause.replace(NON_GAME_ACTION_PATTERN, "");
+  if (/[?？]/u.test(clause)) return false;
+  const actionableClause = clause
+    .replace(NON_GAME_ACTION_PATTERN, "")
+    .replace(/[、，,。！!]+$/u, "")
+    .trim();
   const affirmativeIndex = actionableClause.search(
     AFFIRMATIVE_GOAL_ACTION_PATTERN,
   );

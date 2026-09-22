@@ -58,8 +58,12 @@ describe("immediate stop command", () => {
     "そこで止まってください",
     "採取をやめてほしい",
     "採取をやめてほしいです",
+    "採取を止めてね",
     "採取を止めて拠点へ戻って",
     "採取を止めて説明して",
+    "採取を止めてもういい",
+    "採取を止めてから説明して",
+    "採取を止めて今何してる",
   ])("accepts a targeted affirmative safety command %s", (message) =>
     expect(isImmediateStopCommand(message)).toBe(true),
   );
@@ -79,6 +83,18 @@ describe("immediate stop command", () => {
     "「採取を止めて」拠点へ戻って",
     "なぜ採取を止めてしまった？",
     "採取を止めて拠点へ戻っていい？",
+    "採取は止まっていない",
+    "採取が止まっていないか確認して",
+    "採取を止めてほしいわけではない",
+    "採取を止めてしまった",
+    "採取を止めてない",
+    "採取は止まっていた",
+    "採取を止めてくれてありがとう",
+    "採取を止めてほしい気持ちはないけど拠点へ戻って",
+    "採取を停止していない",
+    "採取を中断していません",
+    "採取を止めてくださいとは言っていない",
+    "採取を止めてほしいわけじゃない",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
@@ -181,6 +197,54 @@ describe("immediate stop command", () => {
     ).rejects.toThrow("STOP_FAILED");
     expect(deliberate).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["採取を止めて説明して", "説明して"],
+    ["追従を停止、その理由を教えて", "その理由を教えて"],
+    ["採取を止めて要約を作って", "要約を作って"],
+    ["採取を止めて、もっと短く", "もっと短く"],
+  ])(
+    "dispatches a read-only follow-up after stopping: %s",
+    async (message, followUp) => {
+      const events: string[] = [];
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          stopCurrentAction: vi.fn(async () => {
+            events.push("stop");
+            return { outcome: "completed", summary: "停止しました。" };
+          }),
+          say: vi.fn(async (text: string) => {
+            events.push(`say:${text}`);
+          }),
+        } as unknown as GameController,
+        agent: {
+          deliberate: vi.fn(async ({ message: text }: { message: string }) => {
+            events.push(`deliberate:${text}`);
+            return { text: "停止理由を説明します。", toolResults: [] };
+          }),
+        } as unknown as OpenAIDeliberationAgent,
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: minimalToolContext,
+          })),
+        },
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
+
+      await coordinator.handleChat("owner", message);
+
+      expect(events).toEqual([
+        "stop",
+        "say:停止しました。",
+        `deliberate:${followUp}`,
+        "say:停止理由を説明します。",
+      ]);
+    },
+  );
 
   it.each(["採取を止めて、もういい", "採取を止めて、拠点へ戻っていい？"])(
     "does not treat a non-action tail as a replacement: %s",

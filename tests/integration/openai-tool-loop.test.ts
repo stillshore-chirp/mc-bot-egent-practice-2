@@ -366,6 +366,10 @@ describe("OpenAI tool loop", () => {
     "要約を作って",
     "手順を作って説明して",
     "説明を続けて",
+    "もう戻ってきた？",
+    "木を集めてくれた？",
+    "拠点へ移動してくれた？",
+    "説明を始めて",
   ])(
     "does not expose or execute action tools after a stop for %s",
     async (message) => {

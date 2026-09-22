@@ -155,6 +155,15 @@ describe("conversation context", () => {
     expect(isExplicitGoalResumeMessage("手順を作って説明して。")).toBe(false);
     expect(isExplicitGoalResumeMessage("説明を続けて。")).toBe(false);
     expect(isExplicitGoalResumeMessage("説明を再開して。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("説明を始めて。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("話をもう一度やって。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("もう戻ってきた？")).toBe(false);
+    expect(isExplicitGoalResumeMessage("木を集めてくれた？")).toBe(false);
+    expect(isExplicitGoalResumeMessage("拠点へ移動してくれた？")).toBe(false);
+    expect(isExplicitGoalResumeMessage("木を集めてくれた")).toBe(false);
+    expect(isExplicitGoalResumeMessage("戻ってきた。")).toBe(false);
+    expect(isExplicitGoalResumeMessage("採取を始めていい？")).toBe(false);
+    expect(isExplicitGoalResumeMessage("説明を続けてください。")).toBe(false);
     expect(isExplicitGoalResumeMessage("理由を探して。")).toBe(false);
     expect(isExplicitGoalResumeMessage("鉄の剣を作って。")).toBe(false);
     expect(isExplicitGoalResumeMessage("例を作って、木を集めて。")).toBe(true);
@@ -168,6 +177,12 @@ describe("conversation context", () => {
     expect(isExplicitGoalResumeMessage("座標10,64,10へ行って。")).toBe(true);
     expect(isExplicitGoalResumeMessage("この場所を覚えて。")).toBe(true);
     expect(isExplicitGoalResumeMessage("採取を再開して。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("追従を始めて。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("採取を始めてください。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("こっちおいで。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("木を集めてください。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("追従を始めてほしいです。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("戻ってきて。")).toBe(true);
   });
 
   it("honors requests to stop being concise", () => {

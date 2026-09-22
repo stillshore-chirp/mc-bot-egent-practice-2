@@ -30,7 +30,7 @@ const STOP_COMMANDS = new Set([
   "中断",
 ]);
 const TARGETED_STOP_COMMAND_PATTERN =
-  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?$|(?:停止|中止|中断)$/u;
+  /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?(?:ね|よ)?$|(?:停止|中止|中断)$/u;
 const STOP_FAILURE_MESSAGE =
   "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
 
@@ -48,7 +48,7 @@ function splitInlineStopClause(clause: string): string[] {
   if (/[?？]/u.test(clause)) return [clause];
   const normalized = normalizedStopClause(clause);
   const commands =
-    /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?/gu;
+    /(?:止めて|停止して|やめて|中止して|中断して|止まって)(?:ください|下さい|ほしい(?:です)?)?(?:ね|よ)?/gu;
   for (const match of normalized.matchAll(commands)) {
     const end = match.index + match[0].length;
     const stop = normalized.slice(0, end).trim();
@@ -56,7 +56,7 @@ function splitInlineStopClause(clause: string): string[] {
     if (
       rest.length > 0 &&
       isStopClause(stop) &&
-      !/^(?:[?？]|ほしくない|ほしくありません|いい|よい|良い|かどうか|と|って|は)/u.test(
+      !/(?:ない|ません|ではない|じゃない|不要|しまった|かどうか|^い(?:る|た|ました)|^みた|^もら|^くれた|^くれて|^いい|^よい|^良い|^と|^って|^は)/u.test(
         rest,
       )
     ) {
@@ -78,6 +78,24 @@ function isStopClause(clause: string): boolean {
   return TARGETED_STOP_COMMAND_PATTERN.test(normalized);
 }
 
+function isSafeReadOnlyFollowUp(message: string): boolean {
+  return (
+    /(?:説明して|教えて|答えて|話して|要約して)(?:ください|下さい)?[。！!]?$/u.test(
+      message,
+    ) ||
+    /(?:要約|説明|手順|例|文章|返答|回答)を(?:作って|書いて)(?:ください|下さい)?[。！!]?$/u.test(
+      message,
+    ) ||
+    /^(?:もっと)?(?:短く|詳しく|簡潔に)[。！!]?$/u.test(message) ||
+    /(?:短く|簡潔に|詳しく|専門用語).*(?:話して|説明して|答えて|使わないで)(?:ください|下さい)?[。！!]?$/u.test(
+      message,
+    ) ||
+    /^(?:今|現在|いま|なぜ|どうして|状態|状況|進捗|何してる|何をしてる)/u.test(
+      message,
+    )
+  );
+}
+
 function immediateStopFollowUp(message: string): string | undefined {
   const clauses = splitStopClauses(message);
   const stopIndex = clauses.findIndex(isStopClause);
@@ -88,9 +106,9 @@ function immediateStopFollowUp(message: string): string | undefined {
     .replace(/^(?:代わりに|その代わり)\s*/u, "")
     .trim();
   return followUp.length > 0 &&
-    !/[?？]/u.test(followUp) &&
-    !isReadOnlyStatusQuestion(followUp) &&
-    isExplicitGoalResumeMessage(followUp)
+    ((isExplicitGoalResumeMessage(followUp) && !/[?？]/u.test(followUp)) ||
+      isReadOnlyStatusQuestion(followUp) ||
+      isSafeReadOnlyFollowUp(followUp))
     ? followUp
     : undefined;
 }
