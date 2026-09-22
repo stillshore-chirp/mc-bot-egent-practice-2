@@ -56,6 +56,10 @@ function splitInlineStopClause(clause: string): string[] {
     if (
       rest.length > 0 &&
       isStopClause(stop) &&
+      !(
+        /ほしい(?:です)?$/u.test(match[0]) &&
+        /^(?:理由|意味|気持ち|わけ|とは|という|のか|かどうか)/u.test(rest)
+      ) &&
       !/(?:ない|ません|ではない|じゃない|不要|しまった|かどうか|^い(?:る|た|ました)|^みた|^もら|^くれた|^くれて|^いい|^よい|^良い|^と|^って|^は)/u.test(
         rest,
       )

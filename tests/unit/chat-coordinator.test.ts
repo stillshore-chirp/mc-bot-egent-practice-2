@@ -58,6 +58,7 @@ describe("immediate stop command", () => {
     "そこで止まってください",
     "採取をやめてほしい",
     "採取をやめてほしいです",
+    "採取を止めてほしい今すぐ",
     "採取を止めてね",
     "採取を止めて拠点へ戻って",
     "採取を止めて説明して",
@@ -95,6 +96,8 @@ describe("immediate stop command", () => {
     "採取を中断していません",
     "採取を止めてくださいとは言っていない",
     "採取を止めてほしいわけじゃない",
+    "採取を止めてほしい理由を教えて",
+    "採取を停止してほしい意味を説明して",
   ])(
     "does not stop for a question, negation, quote, or explanation %s",
     (message) => expect(isImmediateStopCommand(message)).toBe(false),
