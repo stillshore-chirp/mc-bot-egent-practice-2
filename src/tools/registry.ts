@@ -4,6 +4,7 @@ import { deliveryRegistrationTools } from "./delivery-tools.js";
 import {
   planSafeAction,
   type SafeActionCandidate,
+  type SafeActionStep,
 } from "../decision/safe-action-planner.js";
 import { chooseSafeCandidate } from "../decision/safe-choice.js";
 
@@ -89,6 +90,43 @@ function latestActionProgress(
     if (progress !== undefined) return progress;
   }
   return undefined;
+}
+
+function actionProgresses(
+  results: readonly Extract<ToolResult<unknown>, { success: true }>[],
+): ActionProgress[] {
+  return results.flatMap(({ progress }) =>
+    progress === undefined ? [] : [progress],
+  );
+}
+
+function progressItemKey(progress: ActionProgress): string {
+  return progress.item ?? "__unidentified_item__";
+}
+
+function positiveIntegerInput(
+  input: Readonly<Record<string, unknown>>,
+): number | undefined {
+  for (const key of ["count", "requestedCount", "targetCount", "quantity"]) {
+    const value = input[key];
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function actionStepBoundKey(step: SafeActionStep): string {
+  const identity = [
+    "resource",
+    "resourceName",
+    "block",
+    "blockName",
+    "item",
+    "itemName",
+    "targetItem",
+  ].find((key) => typeof step.input[key] === "string");
+  return `${step.tool}:${identity === undefined ? "" : String(step.input[identity])}`;
 }
 
 function isSignalAborted(signal: AbortSignal): boolean {
@@ -468,7 +506,43 @@ export const toolDefinitions = [
           { success: true }
         >[] = [];
         let actionStepCompleted = false;
+        const expectedCount = planned.candidate.requestedCount;
+        const declaredActionCounts = new Map<string, number>();
         for (const [index, step] of planned.steps.entries()) {
+          const stepCount = getToolDefinition(step.tool)?.action
+            ? positiveIntegerInput(step.input)
+            : undefined;
+          if (stepCount !== undefined) {
+            const bound = Math.min(
+              remainingCount,
+              expectedCount ?? remainingCount,
+            );
+            const key = actionStepBoundKey(step);
+            const declared = (declaredActionCounts.get(key) ?? 0) + stepCount;
+            if (declared > bound) {
+              return safeActionFailure(
+                "safety",
+                "SAFE_ACTION_STEP_COUNT_LIMIT",
+                false,
+                step.tool,
+                {
+                  candidateId: planned.candidate.id,
+                  completedCount,
+                  remainingCount,
+                  planRounds,
+                  completedSteps: completedSteps.length,
+                  step: index + 1,
+                  declaredCount: declared,
+                  stepCountLimit: bound,
+                },
+                [
+                  "手順ごとの数量を目標上限以内に分割してから新しい依頼として再計画する",
+                ],
+                "同じ操作の手順数が目標上限を超えるため、後続操作を開始せず停止しました。",
+              );
+            }
+            declaredActionCounts.set(key, declared);
+          }
           if (isSignalAborted(context.signal)) {
             return safeActionFailure(
               "cancelled",
@@ -608,16 +682,35 @@ export const toolDefinitions = [
           });
         }
 
+        const progresses = actionProgresses(successfulResults);
         const progress = latestActionProgress(successfulResults);
-        const expectedCount = planned.candidate.requestedCount;
-        if (
-          progress !== undefined &&
-          (progress.completedCount < 1 ||
-            progress.completedCount > progress.requestedCount ||
-            progress.requestedCount > remainingCount ||
+        const progressByItem = new Map<string, number>();
+        let invalidProgress: ActionProgress | undefined;
+        for (const candidateProgress of progresses) {
+          if (
+            candidateProgress.completedCount < 1 ||
+            candidateProgress.completedCount >
+              candidateProgress.requestedCount ||
+            candidateProgress.requestedCount < 1 ||
+            candidateProgress.requestedCount > remainingCount ||
             (expectedCount !== undefined &&
-              progress.requestedCount !== expectedCount))
-        ) {
+              candidateProgress.requestedCount > expectedCount)
+          ) {
+            invalidProgress = candidateProgress;
+            break;
+          }
+          const key = progressItemKey(candidateProgress);
+          const total =
+            (progressByItem.get(key) ?? 0) + candidateProgress.completedCount;
+          progressByItem.set(key, total);
+          if (
+            total > Math.min(remainingCount, expectedCount ?? remainingCount)
+          ) {
+            invalidProgress = candidateProgress;
+            break;
+          }
+        }
+        if (invalidProgress !== undefined) {
           return safeActionFailure(
             "observation",
             "SAFE_ACTION_PROGRESS_INVALID",
@@ -629,21 +722,25 @@ export const toolDefinitions = [
               remainingCount,
               planRounds,
               completedSteps: completedSteps.length,
-              progress,
+              progress: invalidProgress,
+              reportedProgress: progresses,
             },
             ["実行結果の数量と対象を再観測してから計画を再試行する"],
             "操作は完了したものの、対象または数量の結果を安全に確認できないため停止しました。",
           );
         }
         const goalItem = planned.candidate.goalItem;
-        const isIntermediateProgress =
-          progress !== undefined &&
-          goalItem !== undefined &&
-          progress.item !== goalItem;
-        if (isIntermediateProgress) {
+        const intermediateResults = progresses.filter(
+          (candidateProgress) =>
+            goalItem !== undefined &&
+            candidateProgress.item !== undefined &&
+            candidateProgress.item !== goalItem,
+        );
+        for (const intermediate of intermediateResults) {
+          const intermediateItem = intermediate.item;
           if (
-            progress.item === undefined ||
-            !planned.candidate.intermediateItems?.includes(progress.item)
+            intermediateItem === undefined ||
+            !planned.candidate.intermediateItems?.includes(intermediateItem)
           ) {
             return safeActionFailure(
               "observation",
@@ -656,39 +753,53 @@ export const toolDefinitions = [
                 remainingCount,
                 planRounds,
                 completedSteps: completedSteps.length,
-                progress,
+                progress: intermediate,
               },
               ["実行結果の数量と対象を再観測してから計画を再試行する"],
               "中間素材の結果は確認しましたが、最終目標の数量へ変換する計画を確認できないため停止しました。",
             );
           }
-          const intermediateCount = intermediateProgress.reduce(
-            (total, previous) => total + previous.completedCount,
-            progress.completedCount,
+          intermediateProgress.push(intermediate);
+        }
+        const intermediateCount = intermediateProgress.reduce(
+          (total, previous) => total + previous.completedCount,
+          0,
+        );
+        if (intermediateCount > actionCount) {
+          return safeActionFailure(
+            "safety",
+            "SAFE_ACTION_INTERMEDIATE_LIMIT",
+            false,
+            planned.candidate.id,
+            {
+              candidateId: planned.candidate.id,
+              completedCount,
+              remainingCount,
+              planRounds,
+              completedSteps: completedSteps.length,
+              intermediateCount,
+              intermediateLimit: actionCount,
+              progress,
+            },
+            [
+              "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
+            ],
+            "中間素材の累積量が目標数の上限に達したため、追加操作を停止しました。",
           );
-          if (intermediateCount > actionCount) {
-            return safeActionFailure(
-              "safety",
-              "SAFE_ACTION_INTERMEDIATE_LIMIT",
-              false,
-              planned.candidate.id,
-              {
-                candidateId: planned.candidate.id,
-                completedCount,
-                remainingCount,
-                planRounds,
-                completedSteps: completedSteps.length,
-                intermediateCount,
-                intermediateLimit: actionCount,
-                progress,
-              },
-              [
-                "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
-              ],
-              "中間素材の累積量が目標数の上限に達したため、追加操作を停止しました。",
-            );
-          }
-          intermediateProgress.push(progress);
+        }
+        const finalProgressCount = progresses
+          .filter(
+            (candidateProgress) =>
+              goalItem === undefined ||
+              candidateProgress.item === undefined ||
+              candidateProgress.item === goalItem,
+          )
+          .reduce(
+            (total, candidateProgress) =>
+              total + candidateProgress.completedCount,
+            0,
+          );
+        if (intermediateResults.length > 0 && finalProgressCount === 0) {
           continue;
         }
         const requiresProgress =
@@ -717,7 +828,7 @@ export const toolDefinitions = [
         }
         const advanced = Math.min(
           remainingCount,
-          progress?.completedCount ?? remainingCount,
+          finalProgressCount > 0 ? finalProgressCount : remainingCount,
         );
         completedCount += advanced;
         remainingCount -= advanced;

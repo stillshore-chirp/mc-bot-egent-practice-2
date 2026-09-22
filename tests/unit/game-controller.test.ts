@@ -247,6 +247,8 @@ describe("CompanionGameController", () => {
     expect(candidates).toMatchObject([
       {
         id: "gather_resource:birch_log",
+        reversible: false,
+        impact: "medium",
         action: "gather_resource",
         operationClass: "natural_resource",
         requestedCount: 2,

@@ -231,6 +231,66 @@ describe("ToolExecutor", () => {
     expect(calls).toEqual(["say:安全な候補を選びました。", "gather_resource"]);
   });
 
+  it("rejects repeated action steps before their cumulative quantity exceeds the candidate bound", async () => {
+    const toolContext = context();
+    let gatherCalls = 0;
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "repeated-gather",
+        label: "同じ原木を二重に採取する計画",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        requestedCount: 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+        ],
+      },
+    ];
+    toolContext.game.gatherResource = async () => {
+      gatherCalls += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource: "oak_log",
+          requestedCount: 1,
+          collectedCount: 1,
+        },
+        summary: "原木を収集しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_STEP_COUNT_LIMIT" },
+    });
+    expect(gatherCalls).toBe(1);
+  });
+
   it("consumes an owner bounded authorization after one plan invocation", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {

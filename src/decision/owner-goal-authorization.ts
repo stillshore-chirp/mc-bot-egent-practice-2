@@ -176,6 +176,8 @@ const resourceGoals: readonly ResourceGoal[] = [
 
 const collectionIntentPattern =
   /(集め|集めたい|採掘|掘る|掘って|採取|持ってき|取ってき|作る|作って|精錬|mine|collect|gather|obtain|fetch|harvest|craft|smelt)/iu;
+const negatedCollectionIntentPattern =
+  /(?:集め|採掘|掘|採取|持ってき|取ってき|作|精錬)(?:ない|ません|ず|ないで|しないで|するな)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)(?:\s+)?(?:not|never|don't|do not|cancel)/iu;
 const operationWords = new Set([
   "collect_resource",
   "gather_resource",
@@ -231,6 +233,8 @@ export function deriveOwnerGoalAuthorization(
       : undefined;
   const count = parseCount(message);
   const hasCollectionIntent = collectionIntentPattern.test(message);
+  const hasNegatedCollectionIntent =
+    negatedCollectionIntentPattern.test(message);
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -260,6 +264,14 @@ export function deriveOwnerGoalAuthorization(
       outcome: "clarify",
       question:
         "前の資源収集の数量回答は、数量だけで指定してください（例: 20個で）。",
+    };
+  }
+
+  if (hasNegatedCollectionIntent) {
+    return {
+      outcome: "clarify",
+      question:
+        "収集しない依頼として扱い、採取・採掘・作成・精錬は開始しません。実行する依頼なら操作を明示してください。",
     };
   }
 

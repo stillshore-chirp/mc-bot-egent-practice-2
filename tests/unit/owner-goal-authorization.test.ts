@@ -62,6 +62,18 @@ describe("owner goal authorization", () => {
     });
   });
 
+  it("does not authorize a negated collection request", () => {
+    const result = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "オークの原木を1本集めないで",
+    });
+
+    expect(result).toMatchObject({ outcome: "clarify" });
+    if (result.outcome === "clarify") {
+      expect(result.question).toContain("開始しません");
+    }
+  });
+
   it.each(["oak_logを20個持っている", "鉄を10秒採掘して"])(
     "does not authorize a named resource without an explicit item goal: %s",
     (message) => {
