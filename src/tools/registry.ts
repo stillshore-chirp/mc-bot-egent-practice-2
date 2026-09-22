@@ -1017,12 +1017,18 @@ export const toolDefinitions = [
       "認可済み利用者を安全な距離で追従する。距離・時間を省略した場合は設定済み安全距離と最大60秒（作業上限が短ければその上限）を使い、無期限にはしない。",
     input: z
       .object({
-        safeDistance: z.number().min(2).max(16).optional(),
-        maxDurationSeconds: z.number().int().min(1).max(900).optional(),
+        // Responses API strict function schemas require every property to be
+        // present. `null` keeps these values optional to the executor while
+        // preserving a required, schema-compatible tool input.
+        safeDistance: z.number().min(2).max(16).nullable(),
+        maxDurationSeconds: z.number().int().min(1).max(900).nullable(),
       })
       .strict(),
     fixtures: {
-      valid: [{}, { safeDistance: 3, maxDurationSeconds: 60 }],
+      valid: [
+        { safeDistance: null, maxDurationSeconds: null },
+        { safeDistance: 3, maxDurationSeconds: 60 },
+      ],
       invalid: [{ safeDistance: 0, maxDurationSeconds: 60 }],
     },
     action: true,

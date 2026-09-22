@@ -191,6 +191,27 @@ describe("tool schema registry", () => {
       }
       expect(toOpenAIFunctionTool(definition).strict).toBe(true);
     }
+
+    const followDefinition = toolDefinitions.find(
+      ({ name }) => name === "follow_player",
+    );
+    if (!followDefinition) throw new Error("follow_player definition missing");
+    const followSchema = toOpenAIFunctionTool(followDefinition).parameters as {
+      required?: string[];
+      properties?: Record<string, { anyOf?: { type?: unknown }[] }>;
+    };
+    expect(followSchema.required).toEqual([
+      "safeDistance",
+      "maxDurationSeconds",
+    ]);
+    expect(followSchema.properties?.safeDistance?.anyOf).toEqual([
+      { type: "number", minimum: 2, maximum: 16 },
+      { type: "null" },
+    ]);
+    expect(followSchema.properties?.maxDurationSeconds?.anyOf).toEqual([
+      { type: "integer", minimum: 1, maximum: 900 },
+      { type: "null" },
+    ]);
   });
 });
 
@@ -1239,7 +1260,7 @@ describe("ToolExecutor", () => {
 
     const result = await new ToolExecutor().execute(
       "follow_player",
-      "{}",
+      JSON.stringify({ safeDistance: null, maxDurationSeconds: null }),
       toolContext,
     );
 

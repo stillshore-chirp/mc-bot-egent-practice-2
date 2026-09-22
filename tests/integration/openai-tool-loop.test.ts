@@ -152,7 +152,10 @@ describe("OpenAI tool loop", () => {
           type: "function_call",
           call_id: "call-follow-defaults",
           name: "follow_player",
-          arguments: "{}",
+          arguments: JSON.stringify({
+            safeDistance: null,
+            maxDurationSeconds: null,
+          }),
           status: "completed",
         },
       ]),
