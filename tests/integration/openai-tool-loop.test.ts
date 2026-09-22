@@ -145,6 +145,9 @@ describe("OpenAI tool loop", () => {
     );
     expect(fake.requests[1]?.instructions).toContain("同じ対象として扱って");
     expect(fake.requests[1]?.instructions).toContain(
+      "公開toolを安全な順序で組み合わせれば目的を達成できる場合",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
       "利用者の説明方法の希望: 短く要点だけ話す。",
     );
     expect(fake.requests[1]?.instructions).toContain(
@@ -231,6 +234,9 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[1]?.instructions).toContain("実行済みと扱わず");
     expect(fake.requests[1]?.instructions).toContain(
       "同じ質問を繰り返さないでください",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "内部のkind、phase、status、error codeはそのまま利用者へ出さず",
     );
   });
 
