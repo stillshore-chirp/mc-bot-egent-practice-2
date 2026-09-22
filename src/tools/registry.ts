@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { deliveryRegistrationTools } from "./delivery-tools.js";
 
+import { planSafeAction } from "../decision/safe-action-planner.js";
+import { chooseSafeCandidate } from "../decision/safe-choice.js";
+
 import {
   actionReportResult,
   type EvidenceReference,
@@ -23,7 +26,23 @@ const resourceNames = [
   "warped_stem",
 ] as const;
 
+const resourceLabels: Readonly<Record<string, string>> = {
+  oak_log: "オークの原木",
+  spruce_log: "トウヒの原木",
+  birch_log: "シラカバの原木",
+  jungle_log: "ジャングルの原木",
+  acacia_log: "アカシアの原木",
+  dark_oak_log: "ダークオークの原木",
+  mangrove_log: "マングローブの原木",
+  cherry_log: "サクラの原木",
+  pale_oak_log: "ペールオークの原木",
+  crimson_stem: "真紅の幹",
+  warped_stem: "歪んだ幹",
+};
+
 const memoryKinds = ["fact", "location", "commitment", "episode"] as const;
+const safeActionModes = z.enum(["delegated", "explicit"]);
+const maxSafeActionSteps = 8;
 function nowEvidence(
   kind: EvidenceReference["kind"],
   summary: string,
@@ -80,6 +99,299 @@ export const toolDefinitions = [
         data: surroundings,
         evidence: nowEvidence("minecraft_snapshot", "周囲を観測した"),
         userSummary: "周囲のMinecraft状態を確認しました。",
+      };
+    },
+  }),
+  defineTool({
+    name: "plan_safe_action",
+    description:
+      "利用者の目的を一度の計画にまとめ、実際に観測した候補から安全な複数手順を選んでその場で順に実行する。利用者へ個々のtool引数を再入力させない。候補不足・未対応の目的・保護対象・危険・権限不明では実行せず、理由と必要な確認を返す。",
+    input: z
+      .object({
+        goal: z.string().trim().min(1).max(240),
+        count: z.number().int().min(1).max(64),
+        mode: safeActionModes,
+        candidateId: z.string().trim().min(1).max(160).nullable(),
+      })
+      .strict(),
+    fixtures: {
+      valid: [
+        {
+          goal: "collect_resource",
+          count: 1,
+          mode: "delegated",
+          candidateId: null,
+        },
+      ],
+      invalid: [
+        {
+          goal: "",
+          count: 1,
+          mode: "delegated",
+          candidateId: null,
+        },
+      ],
+    },
+    action: true,
+    execute: async (input, context) => {
+      if (context.game.findSafeActionCandidates === undefined) {
+        return {
+          success: false,
+          error: {
+            category: "observation",
+            code: "SAFE_ACTION_OBSERVATION_UNAVAILABLE",
+            retryable: true,
+            failedAt: "observe_safe_action_candidates",
+            confirmedState: { candidateObservation: "unavailable" },
+            nextActions: [
+              "目的に対応する観測プロバイダを追加してから計画を再試行する",
+            ],
+            userSummary:
+              "目的に対応する安全な候補を観測できないため、操作を推測して開始しません。",
+          },
+        };
+      }
+
+      const observed = await context.game.findSafeActionCandidates(
+        {
+          goal: input.goal,
+          count: input.count,
+          maxCandidates: 8,
+        },
+        context.signal,
+      );
+      const planned = planSafeAction({
+        mode: input.mode,
+        requestedId: input.candidateId ?? undefined,
+        candidates: observed,
+        maxSteps: maxSafeActionSteps,
+        ...(context.safeActionAuthorization === undefined
+          ? {}
+          : { authorization: context.safeActionAuthorization }),
+      });
+      if (planned.outcome === "clarify") {
+        return {
+          success: false,
+          error: {
+            category: planned.code === "CHOICE_BLOCKED" ? "safety" : "resource",
+            code: planned.code,
+            retryable: false,
+            failedAt: "plan_safe_action",
+            confirmedState: {
+              goal: input.goal,
+              observedCandidateCount: observed.length,
+            },
+            nextActions: [planned.question],
+            userSummary: planned.question,
+          },
+        };
+      }
+      const executeStep = context.executeSafeActionStep;
+      if (executeStep === undefined) {
+        return {
+          success: false,
+          error: {
+            category: "internal",
+            code: "SAFE_ACTION_EXECUTION_UNAVAILABLE",
+            retryable: true,
+            failedAt: "execute_safe_action_plan",
+            confirmedState: {
+              goal: input.goal,
+              candidateId: planned.candidate.id,
+            },
+            nextActions: ["計画実行境界を初期化してから再試行する"],
+            userSummary:
+              "安全な計画は作成できましたが、実行境界を利用できないため開始しません。",
+          },
+        };
+      }
+
+      const completedSteps: {
+        readonly tool: string;
+        readonly summary: string;
+      }[] = [];
+      for (const [index, step] of planned.steps.entries()) {
+        if (context.signal.aborted) {
+          return {
+            success: false,
+            error: {
+              category: "cancelled",
+              code: "SAFE_ACTION_PLAN_CANCELLED",
+              retryable: false,
+              failedAt: step.tool,
+              confirmedState: {
+                candidateId: planned.candidate.id,
+                completedSteps: completedSteps.length,
+              },
+              nextActions: [
+                "必要なら安全状態を確認して新しい目的として再依頼する",
+              ],
+              userSummary: `安全計画を${String(completedSteps.length)}段階まで実行し、停止しました。`,
+            },
+          };
+        }
+        try {
+          await context.game.observeStatus();
+        } catch {
+          return {
+            success: false,
+            error: {
+              category: "observation",
+              code: "SAFE_ACTION_REOBSERVATION_FAILED",
+              retryable: true,
+              failedAt: step.tool,
+              confirmedState: {
+                candidateId: planned.candidate.id,
+                completedSteps: completedSteps.length,
+              },
+              nextActions: ["Minecraft状態を再観測してから計画を再試行する"],
+              userSummary: `安全計画の${String(index + 1)}段階目の前に現在状態を再観測できず、停止しました。`,
+            },
+          };
+        }
+        const result = await executeStep(step, context);
+        if (!result.success) {
+          return {
+            success: false,
+            error: {
+              category: result.error.category,
+              code: "SAFE_ACTION_STEP_FAILED",
+              retryable: result.error.retryable,
+              failedAt: step.tool,
+              confirmedState: {
+                ...result.error.confirmedState,
+                candidateId: planned.candidate.id,
+                failedStep: index + 1,
+                completedSteps: completedSteps.length,
+                stepCode: result.error.code,
+              },
+              nextActions: result.error.nextActions,
+              userSummary: `${planned.reason}計画の${String(index + 1)}段階目で停止しました。${result.error.userSummary}`,
+            },
+          };
+        }
+        completedSteps.push({
+          tool: step.tool,
+          summary: result.userSummary,
+        });
+      }
+      return {
+        success: true,
+        data: {
+          goal: input.goal,
+          candidateId: planned.candidate.id,
+          reason: planned.reason,
+          completedSteps,
+        },
+        evidence: nowEvidence(
+          "minecraft_snapshot",
+          `安全計画を${String(completedSteps.length)}段階で実行し、各段階の結果を確認した`,
+        ),
+        userSummary: `${planned.reason}計画した${String(completedSteps.length)}段階を実行し、結果を確認しました。${completedSteps.map(({ summary }) => summary).join(" ")}`,
+      };
+    },
+  }),
+  defineTool({
+    name: "select_safe_resource",
+    description:
+      "利用者が原木の種類の選択を任せた時だけ使う。サーバーの保護判定を通った観測済み候補から最も近い原木を一つ選び、結果のresourceを同じ会話処理内でgather_resourceへ渡す。候補がない・保護対象・権限不明なら実行対象を推測せず具体的に確認する。",
+    input: z
+      .object({
+        count: z.number().int().min(1).max(64),
+      })
+      .strict(),
+    fixtures: {
+      valid: [{ count: 1 }],
+      invalid: [{ count: 0 }],
+    },
+    action: true,
+    execute: async (input, context) => {
+      if (input.count > context.limits.maxGatherCount) {
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "GATHER_COUNT_EXCEEDED",
+            retryable: false,
+            failedAt: "precondition",
+            confirmedState: {
+              requested: input.count,
+              maximum: context.limits.maxGatherCount,
+            },
+            nextActions: ["数量を減らして依頼する"],
+            userSummary: "許可された採取数を超えるため候補を選びませんでした。",
+          },
+        };
+      }
+      if (context.game.findSafeResourceCandidates === undefined) {
+        return {
+          success: false,
+          error: {
+            category: "observation",
+            code: "SAFE_RESOURCE_OBSERVATION_UNAVAILABLE",
+            retryable: true,
+            failedAt: "observe_resource_candidates",
+            confirmedState: { candidateObservation: "unavailable" },
+            nextActions: [
+              "対象の原木種類を指定するか、保護判定を含む候補観測を再試行する",
+            ],
+            userSummary:
+              "安全な候補を観測できないため、原木の種類を推測して採取しません。",
+          },
+        };
+      }
+
+      const observed = await context.game.findSafeResourceCandidates(
+        Math.min(32, context.limits.maxMoveDistance),
+        Math.min(8, input.count),
+        context.signal,
+      );
+      const decision = chooseSafeCandidate({
+        mode: "delegated",
+        candidates: observed.map((candidate, index) => ({
+          id: candidate.resource,
+          label: resourceLabels[candidate.resource] ?? "観測した原木",
+          action: "gather_resource",
+          observed: true,
+          purposeFit: "direct",
+          permission: "allowed",
+          safety: "allowed",
+          reversible: true,
+          impact: "low",
+          distance: candidate.distance,
+          order: index,
+        })),
+      });
+      if (decision.outcome === "clarify") {
+        return {
+          success: false,
+          error: {
+            category:
+              decision.code === "CHOICE_BLOCKED" ? "safety" : "resource",
+            code: decision.code,
+            retryable: false,
+            failedAt: "choose_safe_resource",
+            confirmedState: {
+              observedCandidateCount: observed.length,
+            },
+            nextActions: [decision.question],
+            userSummary: decision.question,
+          },
+        };
+      }
+      return {
+        success: true,
+        data: {
+          resource: decision.candidate.id,
+          count: input.count,
+          selectedDistance: decision.candidate.distance ?? null,
+          reason: decision.reason,
+        },
+        evidence: nowEvidence(
+          "minecraft_snapshot",
+          "保護判定済みの観測候補から安全な原木を選択した",
+        ),
+        userSummary: `${decision.reason}この原木を${String(input.count)}個集めます。`,
       };
     },
   }),

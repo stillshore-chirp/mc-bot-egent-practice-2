@@ -108,6 +108,58 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("returns only server protection-checked resource candidates in distance order", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push(
+      { name: "oak_log", position: { x: 6, y: 64, z: 0 } },
+      { name: "birch_log", position: { x: 3, y: 64, z: 0 } },
+    );
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeResourceCandidates(
+      16,
+      8,
+      new AbortController().signal,
+    );
+
+    expect(candidates).toEqual([
+      { resource: "birch_log", distance: 3 },
+      { resource: "oak_log", distance: 6 },
+    ]);
+    close();
+  });
+
+  it("turns an observed resource into a reusable safe action plan candidate", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "birch_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeActionCandidates(
+      { goal: "collect_resource", count: 2, maxCandidates: 4 },
+      new AbortController().signal,
+    );
+
+    expect(candidates).toMatchObject([
+      {
+        id: "gather_resource:birch_log",
+        action: "gather_resource",
+        operationClass: "natural_resource",
+        requestedCount: 2,
+        resourceName: "birch_log",
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "birch_log", count: 2, commitmentId: null },
+          },
+        ],
+      },
+    ]);
+    close();
+  });
+
   it("reports acquired and held counts when gathering is stopped after pickup", async () => {
     const signal = new AbortController();
     class StopAfterPickup extends FakeMinecraft {

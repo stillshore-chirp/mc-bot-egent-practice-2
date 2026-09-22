@@ -1,4 +1,8 @@
 import { DeliverLogsSkill } from "../skills/deliver-logs.js";
+import type {
+  SafeActionCandidate,
+  SafeActionObservationRequest,
+} from "../decision/safe-action-planner.js";
 import type { DepositResult } from "../minecraft/port.js";
 import { DeliveryController } from "./delivery-controller.js";
 import type { Logger } from "pino";
@@ -27,6 +31,7 @@ import type {
   GameController,
   GameStatus,
   Position,
+  SafeResourceCandidate,
   Surroundings,
 } from "../tools/contracts.js";
 
@@ -48,6 +53,20 @@ interface CompanionGameControllerInput {
 
 const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
 
+const resourceLabels: Readonly<Record<string, string>> = {
+  oak_log: "オークの原木",
+  spruce_log: "トウヒの原木",
+  birch_log: "シラカバの原木",
+  jungle_log: "ジャングルの原木",
+  acacia_log: "アカシアの原木",
+  dark_oak_log: "ダークオークの原木",
+  mangrove_log: "マングローブの原木",
+  cherry_log: "サクラの原木",
+  pale_oak_log: "ペールオークの原木",
+  crimson_stem: "真紅の幹",
+  warped_stem: "歪んだ幹",
+};
+
 export class CompanionGameController implements GameController {
   public readonly delivery: DeliveryController;
   readonly #deliverySkill: DeliverLogsSkill;
@@ -61,6 +80,7 @@ export class CompanionGameController implements GameController {
   readonly #ownerUsername: string;
   readonly #taskTimeoutMs: number;
   readonly #retryLimit: number;
+  readonly #maxMoveDistance: number;
   readonly #logger: Logger;
   readonly #memory: MemoryStore;
 
@@ -90,6 +110,7 @@ export class CompanionGameController implements GameController {
     this.#ownerUsername = input.ownerUsername;
     this.#taskTimeoutMs = input.taskTimeoutMs;
     this.#retryLimit = input.retryLimit;
+    this.#maxMoveDistance = input.maxMoveDistance ?? 128;
     this.#logger = input.logger;
     this.#memory = input.memory;
   }
@@ -114,6 +135,123 @@ export class CompanionGameController implements GameController {
       })),
       hazards: observed.hazards,
     };
+  }
+
+  public async findSafeResourceCandidates(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+  ): Promise<readonly SafeResourceCandidate[]> {
+    if (!Number.isFinite(maxDistance) || maxDistance < 1) {
+      throw new AppError({
+        category: "validation",
+        code: "INVALID_RESOURCE_OBSERVATION_DISTANCE",
+        message: "Resource observation distance must be positive",
+        retryable: false,
+      });
+    }
+    if (!Number.isInteger(count) || count < 1) {
+      throw new AppError({
+        category: "validation",
+        code: "INVALID_RESOURCE_OBSERVATION_COUNT",
+        message: "Resource observation count must be positive",
+        retryable: false,
+      });
+    }
+    const current = await this.#minecraft.observe();
+    const targets = await this.#minecraft.findResources(
+      [...gatherableLogs],
+      Math.min(maxDistance, this.#maxMoveDistance),
+      count,
+      signal,
+    );
+    return targets
+      .filter((target) =>
+        (gatherableLogs as readonly string[]).includes(target.name),
+      )
+      .map((target) => ({
+        resource: target.name,
+        distance: Math.hypot(
+          target.position.x - current.position.x,
+          target.position.y - current.position.y,
+          target.position.z - current.position.z,
+        ),
+      }))
+      .filter(({ distance }) => Number.isFinite(distance))
+      .sort((left, right) => left.distance - right.distance);
+  }
+
+  public async findSafeActionCandidates(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<readonly SafeActionCandidate[]> {
+    if (request.goal.trim().length === 0) {
+      throw new AppError({
+        category: "validation",
+        code: "EMPTY_SAFE_ACTION_GOAL",
+        message: "Safe action goal must not be empty",
+        retryable: false,
+      });
+    }
+    if (!Number.isInteger(request.count) || request.count < 1) {
+      throw new AppError({
+        category: "validation",
+        code: "INVALID_SAFE_ACTION_COUNT",
+        message: "Safe action count must be positive",
+        retryable: false,
+      });
+    }
+    if (!Number.isInteger(request.maxCandidates) || request.maxCandidates < 1) {
+      throw new AppError({
+        category: "validation",
+        code: "INVALID_SAFE_ACTION_CANDIDATE_LIMIT",
+        message: "Safe action candidate limit must be positive",
+        retryable: false,
+      });
+    }
+    if (request.goal !== "collect_resource") return [];
+
+    const resources = await this.findSafeResourceCandidates(
+      Math.min(32, this.#maxMoveDistance),
+      Math.min(8, request.maxCandidates),
+      signal,
+    );
+    const nearestByResource = new Map<string, SafeResourceCandidate>();
+    for (const resource of resources) {
+      const previous = nearestByResource.get(resource.resource);
+      if (previous === undefined || resource.distance < previous.distance) {
+        nearestByResource.set(resource.resource, resource);
+      }
+    }
+    return [...nearestByResource.values()]
+      .sort((left, right) => left.distance - right.distance)
+      .slice(0, request.maxCandidates)
+      .map((resource, index) => ({
+        id: `gather_resource:${resource.resource}`,
+        label: resourceLabels[resource.resource] ?? "観測した原木",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        requestedCount: request.count,
+        resourceName: resource.resource,
+        distance: resource.distance,
+        order: index,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: {
+              resource: resource.resource,
+              count: request.count,
+              commitmentId: null,
+            },
+          },
+        ],
+      }));
   }
 
   public async say(message: string): Promise<void> {

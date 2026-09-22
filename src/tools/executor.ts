@@ -80,6 +80,11 @@ export class ToolExecutor {
     serializedArguments: string,
     context: ToolContext,
   ): Promise<ToolResult<unknown>> {
+    const executionContext: ToolContext = {
+      ...context,
+      executeSafeActionStep: (step, stepContext) =>
+        this.execute(step.tool, JSON.stringify(step.input), stepContext),
+    };
     const definition = getToolDefinition(name);
     const traceName =
       definition === undefined ? "未登録tool" : `tool:${definition.name}`;
@@ -93,7 +98,7 @@ export class ToolExecutor {
         summarizeResult: (result) =>
           result.success ? "tool実行を完了" : "tool実行を拒否または失敗",
       },
-      () => this.#executeCore(name, serializedArguments, context),
+      () => this.#executeCore(name, serializedArguments, executionContext),
     );
   }
 

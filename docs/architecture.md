@@ -80,7 +80,7 @@ LLM を呼ぶ契機は、新しい利用者発話、tool内の作業完了、起
 
 ## Tool と skill
 
-初期版で公開する tool は `observe_status`、`observe_surroundings`、`say`、`follow_player`、`stop_current_action`、`move_to`、`gather_resource`、`return_to_player`、`remember_player_fact`、`remember_location`、`recall_memory`、`set_commitment`、`complete_commitment` です。
+初期版で公開する tool は `observe_status`、`observe_surroundings`、`plan_safe_action`、`select_safe_resource`、`say`、`follow_player`、`stop_current_action`、`move_to`、`gather_resource`、`return_to_player`、`remember_player_fact`、`remember_location`、`recall_memory`、`set_commitment`、`complete_commitment` です。`plan_safe_action` は利用者の目的に対して観測プロバイダが返した安全候補を選び、候補に含まれる上限付き手順を順に実行します。各段階のtool検証または再観測が失敗した場合は後続手順を開始しません。`select_safe_resource` は互換用に残し、原木の保護判定済み候補から一つを選びます。候補観測ができない場合は推測せず停止し、具体的な確認を返します。低影響で可逆な候補は委任された選択で実行できます。中影響で不可逆な自然資源操作は、サーバー保護を通過した観測候補、数量上限、信頼できる所有者側の認可をすべて満たす場合だけ実行できます。建築・設置などの世界変更は、対象範囲と影響上限を含む専用認可がない限り実行しません。tool入力の`mode`や`candidateId`は認可根拠になりません。
 
 各 tool は単一 schema から TypeScript 型、runtime validation、OpenAI function schema、test fixture、統一 failure detail を得ます。登録だけで実処理を持たない tool は置きません。原木収集による約束の完了は、同じ利用者のactiveな型付きfulfillment、resource / count、inventory差分、帰還距離、同一correlationを照合した一度限りのreceiptを必要とし、停止・失敗・cancelled作業からは発行しません。
 

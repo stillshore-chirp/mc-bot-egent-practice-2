@@ -1,4 +1,10 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
+import type {
+  SafeActionCandidate,
+  SafeActionObservationRequest,
+  SafeActionStep,
+} from "../decision/safe-action-planner.js";
+import type { SafeChoiceAuthorization } from "../decision/safe-choice.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -70,6 +76,11 @@ export interface Surroundings {
   hazards: readonly string[];
 }
 
+export interface SafeResourceCandidate {
+  readonly resource: string;
+  readonly distance: number;
+}
+
 export interface ActionReport {
   before: GameStatus | null;
   after: GameStatus | null;
@@ -94,6 +105,24 @@ export interface GameController {
     radius: number,
     includeEntities: boolean,
   ): Promise<Surroundings>;
+  /**
+   * Returns candidates that passed the server-side protection boundary.
+   * Adapters without this observation must make callers stop safely.
+   */
+  findSafeResourceCandidates?(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+  ): Promise<readonly SafeResourceCandidate[]>;
+  /**
+   * Observes provider-backed candidates for a high-level goal. The goal is
+   * descriptive only; returned candidates still need the safe planner and
+   * each step needs normal tool validation before execution.
+   */
+  findSafeActionCandidates?(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<readonly SafeActionCandidate[]>;
   say(message: string): Promise<void>;
   followOwner(
     safeDistance: number,
@@ -180,6 +209,11 @@ export interface ToolContext {
   playerId: string;
   signal: AbortSignal;
   requestKind: "owner_message" | "runtime_reassessment";
+  /**
+   * A trusted request-boundary decision. Tool/model arguments must never
+   * manufacture this value. Omitted means delegated low-impact only.
+   */
+  safeActionAuthorization?: SafeChoiceAuthorization;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;
@@ -190,6 +224,10 @@ export interface ToolContext {
       used: boolean;
     }[];
   };
+  executeSafeActionStep?: (
+    step: SafeActionStep,
+    context: ToolContext,
+  ) => Promise<ToolResult<unknown>>;
   game: GameController;
   memory: MemoryPort;
   limits: {

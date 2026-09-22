@@ -28,6 +28,36 @@ function context(requesterUsername = "owner"): ToolContext {
       entities: [],
       hazards: [],
     }),
+    findSafeResourceCandidates: async () => [
+      { resource: "birch_log", distance: 2 },
+      { resource: "oak_log", distance: 5 },
+    ],
+    findSafeActionCandidates: async ({ count }) => [
+      {
+        id: "collect-birch",
+        label: "近くのシラカバを集める",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        distance: 2,
+        order: 0,
+        steps: [
+          { tool: "say", input: { message: "安全な候補を選びました。" } },
+          {
+            tool: "gather_resource",
+            input: {
+              resource: "birch_log",
+              count,
+              commitmentId: null,
+            },
+          },
+        ],
+      },
+    ],
     say: async () => undefined,
     followOwner: async () => ({
       before: status,
@@ -116,6 +146,8 @@ describe("tool schema registry", () => {
       "forget_delivery_target",
       "observe_status",
       "observe_surroundings",
+      "plan_safe_action",
+      "select_safe_resource",
       "say",
       "follow_player",
       "stop_current_action",
@@ -148,6 +180,101 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("executes every bounded plan step without a second owner prompt", async () => {
+    const calls: string[] = [];
+    const toolContext = context();
+    toolContext.game.say = async (message) => {
+      calls.push(`say:${message}`);
+    };
+    toolContext.game.gatherResource = async () => {
+      calls.push("gather_resource");
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "原木を収集して戻りました。",
+      };
+    };
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        candidateId: "collect-birch",
+        completedSteps: [{ tool: "say" }, { tool: "gather_resource" }],
+      },
+    });
+    expect(calls).toEqual(["say:安全な候補を選びました。", "gather_resource"]);
+  });
+
+  it("stops a plan at the first failed step and does not run later steps", async () => {
+    const calls: string[] = [];
+    const toolContext = context();
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "two-step",
+        label: "二段階の作業",
+        action: "say",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        steps: [
+          { tool: "say", input: { message: "開始" } },
+          {
+            tool: "gather_resource",
+            input: { resource: "oak_log", count: 1, commitmentId: null },
+          },
+          { tool: "say", input: { message: "後続" } },
+        ],
+      },
+    ];
+    toolContext.game.say = async (message) => {
+      calls.push(message);
+    };
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: status,
+      outcome: "failed",
+      failureCategory: "resource",
+      failureCode: "RESOURCE_NOT_FOUND",
+      failureRetryable: false,
+      summary: "安全に採取できる対象を確認できませんでした。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        code: "SAFE_ACTION_STEP_FAILED",
+        failedAt: "gather_resource",
+        confirmedState: { completedSteps: 1, stepCode: "RESOURCE_NOT_FOUND" },
+      },
+    });
+    expect(calls).toEqual(["開始"]);
+  });
+
   it("rejects an unauthorized requester before executing", async () => {
     const result = await new ToolExecutor().execute(
       "observe_status",
@@ -178,6 +305,62 @@ describe("ToolExecutor", () => {
     expect(result.success).toBe(false);
     if (!result.success)
       expect(result.error.code).toBe("GATHER_COUNT_EXCEEDED");
+  });
+
+  it("selects the nearest observed and protection-checked resource without asking again", async () => {
+    const toolContext = context();
+    const result = await new ToolExecutor().execute(
+      "select_safe_resource",
+      JSON.stringify({ count: 1 }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        resource: "birch_log",
+        count: 1,
+        selectedDistance: 2,
+      },
+    });
+    expect(result.success && result.userSummary).toContain("最も近い");
+  });
+
+  it("returns a concrete question when delegated selection has no observed candidate", async () => {
+    const toolContext = context();
+    toolContext.game.findSafeResourceCandidates = async () => [];
+    const result = await new ToolExecutor().execute(
+      "select_safe_resource",
+      JSON.stringify({ count: 1 }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        code: "CHOICE_NOT_OBSERVED",
+        category: "resource",
+      },
+    });
+    if (!result.success) {
+      expect(result.error.userSummary).toContain("観測");
+      expect(result.error.userSummary).not.toContain("MAIN_TASK_BUSY");
+    }
+  });
+
+  it("fails closed when the adapter cannot provide the protected candidate observation", async () => {
+    const toolContext = context();
+    delete toolContext.game.findSafeResourceCandidates;
+    const result = await new ToolExecutor().execute(
+      "select_safe_resource",
+      JSON.stringify({ count: 1 }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "SAFE_RESOURCE_OBSERVATION_UNAVAILABLE" },
+    });
   });
 
   it("allows only read operations during a runtime reassessment", async () => {

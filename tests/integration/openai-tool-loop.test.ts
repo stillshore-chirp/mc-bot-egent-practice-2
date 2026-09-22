@@ -28,6 +28,35 @@ function toolContext(): ToolContext {
       entities: [],
       hazards: [],
     }),
+    findSafeResourceCandidates: async () => [
+      { resource: "birch_log", distance: 2 },
+    ],
+    findSafeActionCandidates: async ({ count }) => [
+      {
+        id: "collect-birch",
+        label: "近くのシラカバを集める",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        distance: 2,
+        order: 0,
+        steps: [
+          { tool: "say", input: { message: "安全な候補を選びました。" } },
+          {
+            tool: "gather_resource",
+            input: {
+              resource: "birch_log",
+              count,
+              commitmentId: null,
+            },
+          },
+        ],
+      },
+    ],
     say: async () => undefined,
     followOwner: async () => ({
       before: status,
@@ -101,6 +130,203 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("executes a bounded multi-step goal plan inside one delegated tool call", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-plan",
+          name: "plan_safe_action",
+          arguments: JSON.stringify({
+            goal: "collect_resource",
+            count: 1,
+            mode: "delegated",
+            candidateId: null,
+          }),
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-plan-final",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "目的の作業が完了しました。",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        "目的の作業が完了しました。",
+      ),
+    ]);
+    const context = toolContext();
+    const actions: string[] = [];
+    context.game.say = async (message) => {
+      actions.push(`say:${message}`);
+    };
+    context.game.gatherResource = async () => {
+      actions.push("gather_resource");
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "シラカバを収集して戻りました。",
+      };
+    };
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const reply = await agent.deliberate({
+      message: "必要な作業を安全に組み立てて実行して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: JSON.stringify(status),
+      toolContext: context,
+    });
+
+    expect(reply.text).toContain("計画した2段階を実行");
+    expect(reply.toolResults.map(({ name }) => name)).toEqual([
+      "plan_safe_action",
+    ]);
+    expect(fake.requests).toHaveLength(2);
+    expect(actions).toEqual([
+      "say:安全な候補を選びました。",
+      "gather_resource",
+    ]);
+  });
+
+  it("hands a delegated safe selection to the observed action without a second confirmation", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-select",
+          name: "select_safe_resource",
+          arguments: JSON.stringify({ count: 1 }),
+          status: "completed",
+        },
+      ]),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-gather",
+          name: "gather_resource",
+          arguments: JSON.stringify({
+            resource: "birch_log",
+            count: 1,
+            commitmentId: null,
+          }),
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-final",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "近くで安全を確認できたシラカバの原木を1個集めました。",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        "近くで安全を確認できたシラカバの原木を1個集めました。",
+      ),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const reply = await agent.deliberate({
+      message: "目の前の安全な原木を1個、種類は任せる",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: JSON.stringify(status),
+      toolContext: toolContext(),
+    });
+
+    expect(reply.text).toContain("安全条件を確認できた");
+    expect(reply.toolResults.map(({ name }) => name)).toEqual([
+      "select_safe_resource",
+      "gather_resource",
+    ]);
+    expect(fake.requests).toHaveLength(3);
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain("birch_log");
+  });
+
+  it("turns a missing candidate into one concrete clarification and performs no action", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-select-empty",
+          name: "select_safe_resource",
+          arguments: JSON.stringify({ count: 1 }),
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-clarify",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "安全な原木を観測できません。種類を指定してください。",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        "安全な原木を観測できません。種類を指定してください。",
+      ),
+    ]);
+    const context = toolContext();
+    context.game.findSafeResourceCandidates = async () => [];
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const reply = await agent.deliberate({
+      message: "安全な原木を1個、選ぶのは任せる",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: JSON.stringify(status),
+      toolContext: context,
+    });
+
+    expect(reply.text).toContain("観測できません");
+    expect(reply.toolResults).toHaveLength(1);
+    expect(reply.toolResults[0]?.result).toMatchObject({
+      success: false,
+      error: { code: "CHOICE_NOT_OBSERVED" },
+    });
+  });
+
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {
     const fake = new ScriptedOpenAI([
       response([
