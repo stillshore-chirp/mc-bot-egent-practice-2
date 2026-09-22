@@ -7,7 +7,10 @@ import {
 } from "../../src/agent/chat-coordinator.js";
 import type { OpenAIDeliberationAgent } from "../../src/agent/openai-agent.js";
 import { CompanionGameController } from "../../src/app/game-controller.js";
-import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
+import {
+  actionPriorities,
+  ActionArbiter,
+} from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
@@ -69,7 +72,7 @@ function createScenario() {
     logger: pino({ level: "silent" }),
     memory: {} as never,
   });
-  return { game, minecraft, tasks };
+  return { game, minecraft, tasks, arbiter };
 }
 
 function createContextFactory(game: GameController): ChatContextFactory {
@@ -135,7 +138,7 @@ function createScenarioAgent(executor: ToolExecutor) {
 
 describe("follow recovery conversation", () => {
   it("explains a stuck follow and resumes after the next follow instruction", async () => {
-    const { game, minecraft, tasks } = createScenario();
+    const { game, minecraft, tasks, arbiter } = createScenario();
     const executor = new ToolExecutor();
     const replies: string[] = [];
     const coordinatorGame: GameController = {
@@ -176,7 +179,18 @@ describe("follow recovery conversation", () => {
     expect(replies[1]).toContain("次の操作");
     expect(replies[1]).not.toContain("suspended");
 
-    await coordinator.handleChat("owner", "来て");
+    const reflexLease = arbiter.acquire(
+      "reflex:stuck",
+      actionPriorities.reflex,
+    );
+    const replacement = coordinator.handleChat("owner", "来て");
+    try {
+      await waitUntil(() => tasks.current?.status === "running");
+      expect(replies).toHaveLength(2);
+    } finally {
+      reflexLease.release();
+    }
+    await replacement;
     expect(replies[2]).toContain("追従し");
     expect(replies[2]).not.toContain("MAIN_TASK_BUSY");
     expect(tasks.current?.status).toBe("completed");

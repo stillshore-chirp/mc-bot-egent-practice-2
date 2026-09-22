@@ -41,6 +41,10 @@ export class DeliverLogsSkill {
       input.gather ? "gather_and_store" : "store_logs",
       input,
       async (context) => {
+        await this.arbiter.waitForAvailable(
+          actionPriorities.task,
+          context.signal,
+        );
         const lease = this.arbiter.acquire(
           `task:${context.taskId}`,
           actionPriorities.task,

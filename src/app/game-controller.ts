@@ -619,13 +619,23 @@ function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
       ],
     };
   }
-  if (reason === "reflex:hostile" || reason === "reflex:damage") {
+  if (reason === "reflex:hostile") {
     return {
       summary:
-        "危険な相手または被害を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。相手から離れて安全を確かめてから、もう一度指示してください。",
+        "危険な相手を確認したため、安全のため作業を一時停止しました。現在も相手が近くにいるかは再確認が必要です。相手から離れて安全を確かめてから、もう一度指示してください。",
       nextActions: [
         "危険な相手から離れる",
         "周囲の安全を再確認してからもう一度指示する",
+      ],
+    };
+  }
+  if (reason === "reflex:damage") {
+    return {
+      summary:
+        "被害を確認したため、安全のため作業を一時停止しました。現在も危険があるかは再確認が必要です。周囲の安全と被害の原因を確かめてから、もう一度指示してください。",
+      nextActions: [
+        "周囲の安全と被害の原因を再確認する",
+        "安全を確かめてからもう一度指示する",
       ],
     };
   }

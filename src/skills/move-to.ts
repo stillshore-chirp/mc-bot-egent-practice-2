@@ -32,6 +32,10 @@ export class MoveToSkill implements Skill<MoveToInput, MoveToOutput> {
     input: MoveToInput,
   ): Promise<TaskRecord<MoveToInput, MoveToOutput>> {
     return this.tasks.run(this.name, input, async (context) => {
+      await this.arbiter.waitForAvailable(
+        actionPriorities.task,
+        context.signal,
+      );
       const lease = this.arbiter.acquire(
         `task:${context.taskId}`,
         actionPriorities.task,

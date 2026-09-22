@@ -124,15 +124,15 @@ describe("CompanionGameController", () => {
     },
     {
       reason: "reflex:hostile",
-      observed: "危険な相手または被害を確認したため",
-      currentCheck: "現在も危険があるかは再確認が必要",
+      observed: "危険な相手を確認したため",
+      currentCheck: "現在も相手が近くにいるかは再確認が必要",
       nextAction: "周囲の安全を再確認してからもう一度指示する",
     },
     {
       reason: "reflex:damage",
-      observed: "危険な相手または被害を確認したため",
+      observed: "被害を確認したため",
       currentCheck: "現在も危険があるかは再確認が必要",
-      nextAction: "周囲の安全を再確認してからもう一度指示する",
+      nextAction: "周囲の安全と被害の原因を再確認する",
     },
     {
       reason: "reflex:hunger",

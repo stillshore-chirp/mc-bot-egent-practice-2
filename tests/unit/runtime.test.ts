@@ -71,6 +71,24 @@ describe("ActionArbiter", () => {
     expect(arbiter.currentOwner).toBe("reflex");
     reflex.release();
   });
+
+  it("waits for a reflex lease to release before a task resumes", async () => {
+    const arbiter = new ActionArbiter();
+    const reflex = arbiter.acquire("reflex:stuck", actionPriorities.reflex);
+    let resumed = false;
+    const waiting = (async () => {
+      await arbiter.waitForAvailable(actionPriorities.task);
+      const task = arbiter.acquire("task:replacement", actionPriorities.task);
+      resumed = true;
+      task.release();
+    })();
+
+    await Promise.resolve();
+    expect(resumed).toBe(false);
+    reflex.release();
+    await waiting;
+    expect(resumed).toBe(true);
+  });
 });
 
 describe("TaskRuntime", () => {
