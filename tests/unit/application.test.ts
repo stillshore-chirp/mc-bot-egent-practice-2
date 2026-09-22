@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   reflexReassessmentForTransition,
+  runtimeReassessmentState,
   taskExpectsMovement,
 } from "../../src/app/application.js";
 import type { ReflexState } from "../../src/reflexes/reflex-coordinator.js";
@@ -78,5 +79,37 @@ describe("application reflex policy", () => {
       "safety_stabilized",
     );
     expect(reflexReassessmentForTransition(safe, safe)).toBeUndefined();
+  });
+
+  it("builds stable safe keys for causes and state changes", () => {
+    const failedState = failed("REFLEX_NOT_STABLE");
+    const safe: ReflexState = { state: "safe" };
+    const stabilizing: ReflexState = {
+      state: "stabilizing",
+      incident: {
+        kind: "stuck",
+        reason: "movement stopped",
+        priority: 100,
+      },
+    };
+
+    expect(
+      runtimeReassessmentState("safety_failed", safe, failedState),
+    ).toEqual({
+      stateKey: "safety:failed:stuck:REFLEX_NOT_STABLE",
+      causeKey: "reflex:stuck",
+    });
+    expect(
+      runtimeReassessmentState("safety_stabilized", stabilizing, safe),
+    ).toEqual({
+      stateKey: "safety:stabilized:stuck",
+      causeKey: "reflex:stuck",
+    });
+    expect(
+      runtimeReassessmentState("connection_recovered", safe, safe),
+    ).toEqual({
+      stateKey: "connection:recovered",
+      causeKey: "connection",
+    });
   });
 });

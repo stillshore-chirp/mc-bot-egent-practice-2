@@ -7,6 +7,70 @@ afterEach(() => {
 });
 
 describe("RuntimeReassessmentGate", () => {
+  it("suppresses an unchanged state and exposes safe aggregate counts", async () => {
+    const decisions: string[] = [];
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ outcome, reason, stats }) => {
+        decisions.push(
+          `${outcome}:${reason ?? "none"}:${String(stats.requested)}:${String(stats.suppressed)}`,
+        );
+      },
+    });
+
+    gate.request({
+      event: "safety_failed",
+      stateKey: "failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+    gate.request({
+      event: "safety_failed",
+      stateKey: "failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+    await gate.stop();
+
+    expect(seen).toEqual(["safety_failed"]);
+    expect(gate.stats).toMatchObject({
+      requested: 2,
+      started: 1,
+      completed: 1,
+      failed: 0,
+      suppressed: 1,
+    });
+    expect(decisions).toContain("suppressed:unchanged_state:2:1");
+  });
+
+  it("runs a changed explicit state immediately despite the legacy cooldown", async () => {
+    const releases: (() => void)[] = [];
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: (event: string) => {
+        seen.push(event);
+        return new Promise<void>((resolve) => releases.push(resolve));
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:new" });
+    releases.shift()?.();
+    gate.request({ event: "safety_stabilized", stateKey: "danger:cleared" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(seen).toEqual(["safety_failed", "safety_stabilized"]);
+    const stopped = gate.stop();
+    releases.shift()?.();
+    await stopped;
+  });
+
   it("serializes requests and coalesces a burst by priority after cooldown", async () => {
     vi.useFakeTimers();
     const releases: (() => void)[] = [];

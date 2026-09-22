@@ -45,6 +45,12 @@ export type RuntimeReassessmentEvent =
   | "safety_failed"
   | "connection_recovered";
 
+export interface RuntimeReassessmentContext {
+  readonly event: RuntimeReassessmentEvent;
+  readonly stateKey: string;
+  readonly causeKey?: string | undefined;
+}
+
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,
@@ -99,11 +105,12 @@ async function safeStartTrace(
   traceService: TraceService | undefined,
   requestSummary: string,
   requestKind: ToolContext["requestKind"],
+  attributes: Readonly<Record<string, unknown>> = {},
 ): Promise<TraceSession | undefined> {
   if (traceService === undefined) return undefined;
   try {
     return await traceService.startTrace(requestSummary, {
-      attributes: { requestKind },
+      attributes: { requestKind, ...attributes },
     });
   } catch {
     return undefined;
@@ -132,9 +139,12 @@ export class ChatCoordinator {
   readonly #logger: Logger;
   readonly #traceService: TraceService | undefined;
   readonly #immediateStopListeners = new Set<() => void>();
+  readonly #ownerMessageListeners = new Set<() => void>();
   #activeController: AbortController | undefined;
+  #activeRequestKind: ToolContext["requestKind"] | undefined;
   #conversationTail: Promise<void> = Promise.resolve();
   #generation = 0;
+  #runtimeGeneration = 0;
 
   public constructor(input: {
     ownerUsername: string;
@@ -155,6 +165,8 @@ export class ChatCoordinator {
   public async handleChat(username: string, message: string): Promise<boolean> {
     if (username !== this.#ownerUsername) return false;
 
+    this.#runtimeGeneration += 1;
+    this.#notifyOwnerMessage();
     const normalized = message.trim();
     if (STOP_COMMANDS.has(normalized)) {
       this.#generation += 1;
@@ -199,6 +211,10 @@ export class ChatCoordinator {
       return true;
     }
 
+    if (this.#activeRequestKind === "runtime_reassessment") {
+      this.#activeController?.abort(new Error("OWNER_MESSAGE_PRIORITIZED"));
+    }
+
     const generation = this.#generation;
     this.#conversationTail = this.#conversationTail
       .catch(() => undefined)
@@ -216,8 +232,16 @@ export class ChatCoordinator {
     return () => this.#immediateStopListeners.delete(listener);
   }
 
+  public onOwnerMessage(listener: () => void): () => void {
+    this.#ownerMessageListeners.add(listener);
+    return () => this.#ownerMessageListeners.delete(listener);
+  }
+
   public async handleRuntimeEvent(
     event: RuntimeReassessmentEvent,
+    context: Omit<RuntimeReassessmentContext, "event"> = {
+      stateKey: event,
+    },
   ): Promise<void> {
     const messages = {
       startup_reassessment:
@@ -230,14 +254,17 @@ export class ChatCoordinator {
         "Minecraft接続復旧後の状態を再評価し、新規行動を開始せず現在状態を短く報告してください。",
     } as const;
     const generation = this.#generation;
+    const runtimeGeneration = this.#runtimeGeneration;
     this.#conversationTail = this.#conversationTail
       .catch(() => undefined)
       .then(() =>
-        generation === this.#generation
+        generation === this.#generation &&
+        runtimeGeneration === this.#runtimeGeneration
           ? this.#deliberate(
               this.#ownerUsername,
               messages[event],
               "runtime_reassessment",
+              { event, ...context },
             )
           : undefined,
       );
@@ -266,19 +293,48 @@ export class ChatCoordinator {
     }
   }
 
+  #notifyOwnerMessage(): void {
+    for (const listener of this.#ownerMessageListeners) {
+      try {
+        listener();
+      } catch (error) {
+        this.#logger.warn(
+          {
+            code: "OWNER_MESSAGE_LISTENER_FAILED",
+            errorType: error instanceof Error ? error.name : "UnknownError",
+          },
+          "owner message listener failed",
+        );
+      }
+    }
+  }
+
   async #deliberate(
     username: string,
     message: string,
     requestKind: ToolContext["requestKind"],
+    reassessment?: RuntimeReassessmentContext,
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeController = controller;
+    this.#activeRequestKind = requestKind;
+    const reassessmentAttributes =
+      reassessment === undefined
+        ? {}
+        : {
+            runtimeEvent: reassessment.event,
+            runtimeStateKey: reassessment.stateKey,
+            ...(reassessment.causeKey === undefined
+              ? {}
+              : { runtimeCauseKey: reassessment.causeKey }),
+          };
     const session = await safeStartTrace(
       this.#traceService,
       requestKind === "runtime_reassessment"
         ? "runtime再評価を受信"
         : "利用者依頼を受信",
       requestKind,
+      reassessmentAttributes,
     );
     const withinSession = <T>(operation: () => Promise<T>): Promise<T> =>
       session === undefined
@@ -295,6 +351,9 @@ export class ChatCoordinator {
           requestKind,
         );
         const reply = await this.#agent.deliberate({ message, ...context });
+        if (controller.signal.aborted) {
+          throw controller.signal.reason ?? new Error("REQUEST_ABORTED");
+        }
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -318,6 +377,7 @@ export class ChatCoordinator {
                 "runtime状態を再評価",
                 {
                   summary: "接続・安全状態を再評価",
+                  attributes: reassessmentAttributes,
                 },
                 process,
               )
@@ -367,8 +427,10 @@ export class ChatCoordinator {
         await safeCompleteTrace(session, "failed", "処理に失敗");
       }
     } finally {
-      if (this.#activeController === controller)
+      if (this.#activeController === controller) {
         this.#activeController = undefined;
+        this.#activeRequestKind = undefined;
+      }
     }
   }
 }

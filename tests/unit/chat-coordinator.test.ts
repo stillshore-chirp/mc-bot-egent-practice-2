@@ -261,13 +261,100 @@ describe("immediate stop command", () => {
       traceService,
     });
 
-    await coordinator.handleRuntimeEvent("connection_recovered");
+    await coordinator.handleRuntimeEvent("connection_recovered", {
+      stateKey: "connection:recovered",
+      causeKey: "connection",
+    });
 
     const run = store.listTraces(1)[0];
     const detail = run === undefined ? undefined : store.getTrace(run.traceId);
     expect(new Set(detail?.spans.map(({ stage }) => stage))).toEqual(
       new Set(["request", "recovery", "response"]),
     );
+    const root = detail?.spans.find(
+      ({ parentSpanId }) => parentSpanId === undefined,
+    );
+    const recovery = detail?.spans.find(({ stage }) => stage === "recovery");
+    expect(root?.attributes).toMatchObject({
+      requestKind: "runtime_reassessment",
+      runtimeEvent: "connection_recovered",
+      runtimeStateKey: "connection:recovered",
+      runtimeCauseKey: "connection",
+    });
+    expect(recovery?.attributes).toMatchObject({
+      runtimeEvent: "connection_recovered",
+      runtimeStateKey: "connection:recovered",
+      runtimeCauseKey: "connection",
+    });
     store.close();
+  });
+
+  it("prioritizes a new owner question over an active automatic reassessment", async () => {
+    let notifyRuntimeStarted!: () => void;
+    const runtimeStarted = new Promise<void>((resolve) => {
+      notifyRuntimeStarted = resolve;
+    });
+    const say = vi.fn(async () => undefined);
+    const deliberate = vi.fn(
+      async (request: {
+        readonly message: string;
+        readonly toolContext: ToolContext;
+      }) => {
+        if (request.toolContext.requestKind === "runtime_reassessment") {
+          notifyRuntimeStarted();
+          await new Promise<void>((_resolve, reject) => {
+            request.toolContext.signal.addEventListener(
+              "abort",
+              () =>
+                reject(
+                  request.toolContext.signal.reason instanceof Error
+                    ? request.toolContext.signal.reason
+                    : new Error("request aborted"),
+                ),
+              { once: true },
+            );
+          });
+        }
+        return { text: `応答:${request.message}`, toolResults: [] };
+      },
+    );
+    const agent = { deliberate } as unknown as OpenAIDeliberationAgent;
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say } as unknown as GameController,
+      agent,
+      contextFactory: {
+        create: vi.fn(
+          async (
+            _username: string,
+            _message: string,
+            signal: AbortSignal,
+            _correlationId: string,
+            requestKind: ToolContext["requestKind"],
+          ) => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "固定観測要約",
+            toolContext: { ...minimalToolContext, signal, requestKind },
+          }),
+        ),
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    const automatic = coordinator.handleRuntimeEvent("safety_failed", {
+      stateKey: "safety:failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+    await runtimeStarted;
+    await coordinator.handleChat("owner", "今どうなっていますか");
+    await automatic;
+
+    expect(deliberate).toHaveBeenCalledTimes(2);
+    expect(say).toHaveBeenCalledTimes(1);
+    expect(say).toHaveBeenCalledWith("応答:今どうなっていますか");
   });
 });
