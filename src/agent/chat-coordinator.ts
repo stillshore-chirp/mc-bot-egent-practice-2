@@ -45,6 +45,14 @@ export type RuntimeReassessmentEvent =
   | "safety_failed"
   | "connection_recovered";
 
+type DeliveredReplyRecorder = {
+  recordDeliveredReply?: (
+    requesterUsername: string,
+    requestKind: ToolContext["requestKind"],
+    text: string,
+  ) => void;
+};
+
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,
@@ -306,7 +314,8 @@ export class ChatCoordinator {
           },
           () => this.#game.say(reply.text),
         );
-        this.#agent.recordDeliveredReply?.(username, requestKind, reply.text);
+        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+        recorder.recordDeliveredReply?.(username, requestKind, reply.text);
       });
     };
     try {
