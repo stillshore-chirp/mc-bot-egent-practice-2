@@ -35,7 +35,7 @@ const secretValue =
 const sensitivePersonalData =
   /(?:住所|電話番号|メールアドレス|本名|生年月日|マイナンバー|パスワード|\b\d{3}[- ]?\d{4}[- ]?\d{4}\b|\b\d{1,3}(?:\.\d{1,3}){3}\b)/iu;
 const protectedOverride =
-  /(?:安全|保護|認証|権限|停止|危険|確認).{0,24}(?:無視|解除|無効|省略|回避|迂回)|(?:無視|解除|無効|省略|回避|迂回).{0,24}(?:安全|保護|認証|権限|停止|危険|確認)/iu;
+  /(?:安全|保護|認証|権限|停止|危険|確認).{0,24}(?:無視|解除|無効|省略|回避|迂回|しなくて(?:いい|よい)|守らなくて(?:いい|よい)|なくて(?:いい|よい)|(?:無|な)しで|(?:無|な)しに|不要|いらない|要らない|必要ない)|(?:無視|解除|無効|省略|回避|迂回|しなくて(?:いい|よい)|守らなくて(?:いい|よい)|なくて(?:いい|よい)|(?:無|な)しで|(?:無|な)しに|不要|いらない|要らない|必要ない).{0,24}(?:安全|保護|認証|権限|停止|危険|確認)/iu;
 
 export const behaviorMemoryMigration = [
   "CREATE TABLE behavior_memories (id TEXT PRIMARY KEY, player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE, category TEXT NOT NULL CHECK (category IN ('communication', 'autonomy', 'workflow', 'planning', 'feedback', 'general')), slot TEXT NOT NULL, value TEXT NOT NULL, summary TEXT NOT NULL, source TEXT NOT NULL CHECK (source IN ('owner_explicit', 'owner_correction', 'owner_feedback')), confidence TEXT NOT NULL CHECK (confidence IN ('explicit', 'corrected', 'repeated_feedback', 'corroborated')), scope TEXT NOT NULL CHECK (scope IN ('owner_global')), support_count INTEGER NOT NULL DEFAULT 1 CHECK (support_count BETWEEN 1 AND 20), status TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'retracted')), superseded_by_id TEXT, retraction_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -114,11 +114,23 @@ export class BehaviorMemoryRepository {
         normalized.category,
         normalized.slot,
       );
+      const superseded = this.resolveSuperseded(
+        normalized.playerId,
+        normalized.supersedesId,
+        active,
+      );
       let record: BehaviorMemoryRecord;
       if (
         active?.value === normalized.value &&
         active.summary === normalized.summary
       ) {
+        if (superseded !== undefined && superseded.id !== active.id) {
+          this.database
+            .prepare<[string, string, string]>(
+              "UPDATE behavior_memories SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+            )
+            .run(active.id, now, superseded.id);
+        }
         if (
           normalized.source === "owner_feedback" &&
           active.source !== "owner_feedback"
@@ -157,11 +169,6 @@ export class BehaviorMemoryRepository {
           });
         }
       } else {
-        const superseded = this.resolveSuperseded(
-          normalized.playerId,
-          normalized.supersedesId,
-          active,
-        );
         const id = randomUUID();
         if (superseded !== undefined) {
           this.database
