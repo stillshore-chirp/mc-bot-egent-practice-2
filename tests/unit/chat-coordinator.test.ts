@@ -48,6 +48,29 @@ describe("immediate stop command", () => {
     expect(isImmediateStopCommand(message)).toBe(true),
   );
 
+  it.each([
+    "採取を止めて",
+    "今の作業をやめて",
+    "追従を停止して",
+    "止めてください",
+  ])("accepts a targeted affirmative safety command %s", (message) =>
+    expect(isImmediateStopCommand(message)).toBe(true),
+  );
+
+  it.each([
+    "採取を止めていい？",
+    "採取を止めて？",
+    "停止？",
+    "採取を止めないで",
+    "今の作業をやめなくていい",
+    "停止方法を教えて",
+    "どうして採取が止まった？",
+    "「採取を止めて」と言った？",
+  ])(
+    "does not stop for a question, negation, quote, or explanation %s",
+    (message) => expect(isImmediateStopCommand(message)).toBe(false),
+  );
+
   it("does not treat an ordinary sentence as a stop command", () => {
     expect(isImmediateStopCommand("停止方法を教えて")).toBe(false);
   });
@@ -77,6 +100,96 @@ describe("immediate stop command", () => {
 
     expect(stopCurrentAction).toHaveBeenCalledWith("利用者の即時停止指示");
   });
+
+  it.each(["採取を止めて、拠点へ戻って", "採取を止めて代わりに拠点へ戻って"])(
+    "starts an explicit replacement only after a targeted stop succeeds: %s",
+    async (message) => {
+      const events: string[] = [];
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          stopCurrentAction: vi.fn(async () => {
+            events.push("stop");
+            return { outcome: "completed", summary: "停止しました。" };
+          }),
+          say: vi.fn(async (message: string) => {
+            events.push(`say:${message}`);
+          }),
+        } as unknown as GameController,
+        agent: {
+          deliberate: vi.fn(async ({ message }: { message: string }) => {
+            events.push(`deliberate:${message}`);
+            return { text: "拠点へ戻ります。", toolResults: [] };
+          }),
+        } as unknown as OpenAIDeliberationAgent,
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: minimalToolContext,
+          })),
+        },
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
+
+      await coordinator.handleChat("owner", message);
+
+      expect(events).toEqual([
+        "stop",
+        "say:停止しました。",
+        "deliberate:拠点へ戻って",
+        "say:拠点へ戻ります。",
+      ]);
+    },
+  );
+
+  it("does not start a replacement when a targeted stop fails", async () => {
+    const deliberate = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => {
+          throw new Error("STOP_FAILED");
+        }),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+
+    await expect(
+      coordinator.handleChat("owner", "採取を止めて、拠点へ戻って"),
+    ).rejects.toThrow("STOP_FAILED");
+    expect(deliberate).not.toHaveBeenCalled();
+  });
+
+  it.each(["採取を止めて、もういい", "採取を止めて、拠点へ戻っていい？"])(
+    "does not treat a non-action tail as a replacement: %s",
+    async (message) => {
+      const deliberate = vi.fn();
+      const say = vi.fn(async () => undefined);
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          stopCurrentAction: vi.fn(async () => ({
+            outcome: "completed",
+            summary: "停止しました。",
+          })),
+          say,
+        } as unknown as GameController,
+        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        contextFactory: {} as ChatContextFactory,
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
+
+      await coordinator.handleChat("owner", message);
+
+      expect(deliberate).not.toHaveBeenCalled();
+      expect(say).toHaveBeenCalledWith("停止しました。");
+    },
+  );
 
   it.each([
     "今どうなってる？",
@@ -313,13 +426,14 @@ describe("immediate stop command", () => {
 
   it("does not mark cancellation when stopping the action fails", async () => {
     const recordCancelledRequest = vi.fn();
+    const say = vi.fn(async () => undefined);
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: {
         stopCurrentAction: vi.fn(async () => {
           throw new Error("STOP_FAILED");
         }),
-        say: vi.fn(async () => undefined),
+        say,
       } as unknown as GameController,
       agent: {
         recordCancelledRequest,
@@ -335,6 +449,9 @@ describe("immediate stop command", () => {
       "STOP_FAILED",
     );
     expect(recordCancelledRequest).not.toHaveBeenCalled();
+    expect(say).toHaveBeenCalledWith(
+      "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。",
+    );
   });
 
   it("does not mark an idle stop as a cancelled conversation", async () => {

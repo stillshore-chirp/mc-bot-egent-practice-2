@@ -16,6 +16,7 @@ import type {
   GameStatus,
   ToolContext,
 } from "../tools/contracts.js";
+import { isExplicitGoalResumeMessage } from "./conversation-context.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
 
 const STOP_COMMANDS = new Set([
@@ -28,6 +29,47 @@ const STOP_COMMANDS = new Set([
   "中止",
   "中断",
 ]);
+const TARGETED_STOP_COMMAND_PATTERN =
+  /(?:止めて|停止して|やめて|中止して|中断して)(?:ください|下さい)?$/u;
+const STOP_FAILURE_MESSAGE =
+  "Minecraftの停止処理を完了できなかったため、新しい作業は開始しません。";
+
+function splitStopClauses(message: string): string[] {
+  const punctuationClauses =
+    message.match(/[^、，,。！？!?]+(?:[、，,。！？!?]|$)/gu) ?? [];
+  return punctuationClauses
+    .flatMap((clause) => clause.split(/(?=代わりに|その代わり)/u))
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+}
+
+function normalizedStopClause(clause: string): string {
+  return clause.replace(/[、，,。！!]$/u, "").trim();
+}
+
+function isStopClause(clause: string): boolean {
+  if (/[?？]/u.test(clause)) return false;
+  const normalized = normalizedStopClause(clause);
+  if (STOP_COMMANDS.has(normalized)) return true;
+  return TARGETED_STOP_COMMAND_PATTERN.test(normalized);
+}
+
+function immediateStopFollowUp(message: string): string | undefined {
+  const clauses = splitStopClauses(message);
+  const stopIndex = clauses.findIndex(isStopClause);
+  if (stopIndex < 0) return undefined;
+  const followUp = clauses
+    .slice(stopIndex + 1)
+    .join(" ")
+    .replace(/^(?:代わりに|その代わり)\s*/u, "")
+    .trim();
+  return followUp.length > 0 &&
+    !/[?？]/u.test(followUp) &&
+    !isReadOnlyStatusQuestion(followUp) &&
+    isExplicitGoalResumeMessage(followUp)
+    ? followUp
+    : undefined;
+}
 
 function isCapabilityWhyQuestion(message: string): boolean {
   return (
@@ -279,6 +321,7 @@ export class ChatCoordinator {
     if (username !== this.#ownerUsername) return false;
 
     const normalized = message.trim();
+    const stopFollowUp = immediateStopFollowUp(normalized);
     if (isImmediateStopCommand(normalized)) {
       this.#runtimeGeneration += 1;
       this.#generation += 1;
@@ -343,7 +386,19 @@ export class ChatCoordinator {
           }
         });
       this.#stopTail = stopRun;
-      await stopRun;
+      try {
+        await stopRun;
+      } catch (error) {
+        try {
+          await this.#game.say(STOP_FAILURE_MESSAGE);
+        } catch {
+          // The stop error remains the primary failure; chat delivery is best effort.
+        }
+        throw error;
+      }
+      if (stopFollowUp !== undefined) {
+        await this.handleChat(username, stopFollowUp);
+      }
       return true;
     }
 
@@ -720,7 +775,5 @@ export class ChatCoordinator {
 
 export function isImmediateStopCommand(message: string): boolean {
   const normalized = message.trim().replace(/\s+/gu, " ");
-  return normalized
-    .split(/[、，,。！？!?]/u)
-    .some((clause) => STOP_COMMANDS.has(clause.trim()));
+  return splitStopClauses(normalized).some(isStopClause);
 }
