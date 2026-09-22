@@ -145,5 +145,11 @@ describe("application reflex policy", () => {
       stateKey: "connection:recovered",
       causeKey: "connection",
     });
+    expect(
+      runtimeReassessmentState("connection_recovered", safe, safe, 2),
+    ).toEqual({
+      stateKey: "connection:recovered:2",
+      causeKey: "connection",
+    });
   });
 });

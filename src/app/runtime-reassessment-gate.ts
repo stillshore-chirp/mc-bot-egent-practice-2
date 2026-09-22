@@ -10,15 +10,21 @@ export type RuntimeReassessmentSuppressionReason =
   | "unchanged_state"
   | "coalesced"
   | "lower_priority"
+  | "superseded"
+  | "stale_state"
   | "stale_generation"
   | "owner_message"
   | "stopped";
+
+export type RuntimeReassessmentRunOutcome =
+  "completed" | "failed" | "cancelled";
 
 export interface RuntimeReassessmentStats {
   readonly requested: number;
   readonly started: number;
   readonly completed: number;
   readonly failed: number;
+  readonly cancelled: number;
   readonly suppressed: number;
 }
 
@@ -27,7 +33,12 @@ export interface RuntimeReassessmentDecision<Event extends string> {
   readonly stateKey: string;
   readonly causeKey?: string | undefined;
   readonly outcome:
-    "accepted" | "started" | "completed" | "failed" | "suppressed";
+    | "accepted"
+    | "started"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "suppressed";
   readonly reason?: RuntimeReassessmentSuppressionReason | undefined;
   readonly stats: RuntimeReassessmentStats;
 }
@@ -43,7 +54,7 @@ export class RuntimeReassessmentGate<Event extends string> {
   readonly #run: (
     event: Event,
     request: RuntimeReassessmentRequest<Event>,
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   readonly #priority: (event: Event) => number;
   readonly #cooldownMs: number;
   readonly #onError: (
@@ -65,6 +76,7 @@ export class RuntimeReassessmentGate<Event extends string> {
     started: 0,
     completed: 0,
     failed: 0,
+    cancelled: 0,
     suppressed: 0,
   };
 
@@ -72,7 +84,7 @@ export class RuntimeReassessmentGate<Event extends string> {
     run: (
       event: Event,
       request: RuntimeReassessmentRequest<Event>,
-    ) => Promise<void>;
+    ) => Promise<unknown>;
     priority: (event: Event) => number;
     cooldownMs: number;
     onError: (
@@ -123,6 +135,15 @@ export class RuntimeReassessmentGate<Event extends string> {
       (request.stateKey === this.#lastCompletedStateKey ||
         request.stateKey === this.#runningRequest?.stateKey)
     ) {
+      const stalePending = this.#pending;
+      if (
+        stalePending !== undefined &&
+        stalePending.stateKey !== request.stateKey
+      ) {
+        this.#pending = undefined;
+        this.#clearTimer();
+        this.#suppress(stalePending, "stale_state");
+      }
       this.#suppress(request, "unchanged_state");
       return;
     }
@@ -130,10 +151,17 @@ export class RuntimeReassessmentGate<Event extends string> {
       this.#suppress(request, "coalesced");
       return;
     }
-    if (
-      this.#pending === undefined ||
-      this.#priority(request.event) > this.#priority(this.#pending.event)
-    ) {
+    if (this.#pending === undefined) {
+      this.#pending = request;
+      this.#decide(request, "accepted");
+      this.#schedule();
+      return;
+    }
+    if (this.#priority(request.event) >= this.#priority(this.#pending.event)) {
+      const superseded = this.#pending;
+      this.#pending = undefined;
+      this.#clearTimer();
+      this.#suppress(superseded, "superseded");
       this.#pending = request;
       this.#decide(request, "accepted");
       this.#schedule();
@@ -192,13 +220,35 @@ export class RuntimeReassessmentGate<Event extends string> {
     };
     this.#decide(request, "started");
     const operation = this.#run(request.event, request)
-      .then(() => {
+      .then((outcome) => {
+        const resolvedOutcome: RuntimeReassessmentRunOutcome =
+          outcome === "failed"
+            ? "failed"
+            : outcome === "cancelled"
+              ? "cancelled"
+              : "completed";
+        if (resolvedOutcome === "completed") {
+          this.#stats = {
+            ...this.#stats,
+            completed: this.#stats.completed + 1,
+          };
+          this.#lastCompletedStateKey = request.stateKey;
+          this.#decide(request, "completed");
+          return;
+        }
+        if (resolvedOutcome === "cancelled") {
+          this.#stats = {
+            ...this.#stats,
+            cancelled: this.#stats.cancelled + 1,
+          };
+          this.#decide(request, "cancelled");
+          return;
+        }
         this.#stats = {
           ...this.#stats,
-          completed: this.#stats.completed + 1,
+          failed: this.#stats.failed + 1,
         };
-        this.#lastCompletedStateKey = request.stateKey;
-        this.#decide(request, "completed");
+        this.#decide(request, "failed");
       })
       .catch((error: unknown) => {
         this.#stats = {
@@ -230,6 +280,13 @@ export class RuntimeReassessmentGate<Event extends string> {
       suppressed: this.#stats.suppressed + 1,
     };
     this.#decide(request, "suppressed", reason);
+  }
+
+  #clearTimer(): void {
+    if (this.#timer !== undefined) {
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
+    }
   }
 
   #decide(

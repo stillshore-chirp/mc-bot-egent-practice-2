@@ -128,6 +128,7 @@ export function runtimeReassessmentState(
   event: RuntimeReassessmentEvent,
   previous: ReflexState,
   current: ReflexState,
+  connectionRecoveryEpisode?: number,
 ): { readonly stateKey: string; readonly causeKey: string } {
   if (event === "safety_failed" && current.state === "failed") {
     return {
@@ -143,7 +144,14 @@ export function runtimeReassessmentState(
     };
   }
   if (event === "connection_recovered") {
-    return { stateKey: "connection:recovered", causeKey: "connection" };
+    const suffix =
+      connectionRecoveryEpisode === undefined
+        ? ""
+        : `:${Math.max(1, Math.floor(connectionRecoveryEpisode))}`;
+    return {
+      stateKey: `connection:recovered${suffix}`,
+      causeKey: "connection",
+    };
   }
   return { stateKey: "startup:reassessment", causeKey: "startup" };
 }
@@ -212,6 +220,7 @@ class DefaultCompanionApplication implements CompanionApplication {
   #reflexTimer: NodeJS.Timeout | undefined;
   #reflexTickPromise: Promise<void> | undefined;
   #observationUnavailable = false;
+  #connectionRecoveryEpisode = 0;
   #lastReflexFailure = "";
   #lastRememberedIncident = "";
   #reconnectFailureLogged = false;
@@ -283,6 +292,7 @@ class DefaultCompanionApplication implements CompanionApplication {
             started: decision.stats.started,
             completed: decision.stats.completed,
             failed: decision.stats.failed,
+            cancelled: decision.stats.cancelled,
             suppressed: decision.stats.suppressed,
           },
           "runtime reassessment gate decision",
@@ -446,7 +456,12 @@ class DefaultCompanionApplication implements CompanionApplication {
         this.#requestRuntimeReassessment(
           "connection_recovered",
           reassessmentGeneration,
-          { stateKey: "connection:recovered", causeKey: "connection" },
+          runtimeReassessmentState(
+            "connection_recovered",
+            { state: "safe" },
+            { state: "safe" },
+            this.#connectionRecoveryEpisode,
+          ),
         );
       }
       const previousReflexState = this.#reflexes.state;
@@ -540,6 +555,7 @@ class DefaultCompanionApplication implements CompanionApplication {
           "Minecraft observation unavailable",
         );
         this.#observationUnavailable = true;
+        this.#connectionRecoveryEpisode += 1;
       }
       if (
         this.#connection.state === "failed" &&

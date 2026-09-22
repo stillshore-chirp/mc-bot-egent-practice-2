@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 
+import type { RuntimeReassessmentRunOutcome } from "../app/runtime-reassessment-gate.js";
 import {
   createCorrelationId,
   runWithCorrelation,
@@ -142,7 +143,8 @@ export class ChatCoordinator {
   readonly #ownerMessageListeners = new Set<() => void>();
   #activeController: AbortController | undefined;
   #activeRequestKind: ToolContext["requestKind"] | undefined;
-  #conversationTail: Promise<void> = Promise.resolve();
+  #conversationTail: Promise<RuntimeReassessmentRunOutcome | undefined> =
+    Promise.resolve(undefined);
   #generation = 0;
   #runtimeGeneration = 0;
 
@@ -165,10 +167,9 @@ export class ChatCoordinator {
   public async handleChat(username: string, message: string): Promise<boolean> {
     if (username !== this.#ownerUsername) return false;
 
-    this.#runtimeGeneration += 1;
-    this.#notifyOwnerMessage();
     const normalized = message.trim();
     if (STOP_COMMANDS.has(normalized)) {
+      this.#runtimeGeneration += 1;
       this.#generation += 1;
       this.#notifyImmediateStop();
       this.#activeController?.abort(new Error("OWNER_STOP_REQUESTED"));
@@ -211,6 +212,9 @@ export class ChatCoordinator {
       return true;
     }
 
+    this.#runtimeGeneration += 1;
+    this.#notifyOwnerMessage();
+
     if (this.#activeRequestKind === "runtime_reassessment") {
       this.#activeController?.abort(new Error("OWNER_MESSAGE_PRIORITIZED"));
     }
@@ -242,7 +246,7 @@ export class ChatCoordinator {
     context: Omit<RuntimeReassessmentContext, "event"> = {
       stateKey: event,
     },
-  ): Promise<void> {
+  ): Promise<RuntimeReassessmentRunOutcome | undefined> {
     const messages = {
       startup_reassessment:
         "再起動後の未完了の約束または中断した作業を確認し、利用者に必要な状態変化だけを2文以内で短く報告してください。内部処理や制約は説明せず、確認できた作業状態を正確に扱ってください。",
@@ -268,7 +272,7 @@ export class ChatCoordinator {
             )
           : undefined,
       );
-    await this.#conversationTail;
+    return this.#conversationTail;
   }
 
   public async shutdown(): Promise<void> {
@@ -314,7 +318,7 @@ export class ChatCoordinator {
     message: string,
     requestKind: ToolContext["requestKind"],
     reassessment?: RuntimeReassessmentContext,
-  ): Promise<void> {
+  ): Promise<RuntimeReassessmentRunOutcome> {
     const controller = new AbortController();
     this.#activeController = controller;
     this.#activeRequestKind = requestKind;
@@ -384,6 +388,7 @@ export class ChatCoordinator {
           : process;
       await withinSession(tracedProcess);
       await safeCompleteTrace(session, "succeeded", "応答を送信");
+      return "completed";
     } catch (error) {
       if (controller.signal.aborted) {
         await withinSession(() =>
@@ -398,7 +403,7 @@ export class ChatCoordinator {
           ),
         );
         await safeCompleteTrace(session, "cancelled", "処理を中断");
-        return;
+        return "cancelled";
       }
       this.#logger.error(
         {
@@ -426,6 +431,7 @@ export class ChatCoordinator {
       } finally {
         await safeCompleteTrace(session, "failed", "処理に失敗");
       }
+      return "failed";
     } finally {
       if (this.#activeController === controller) {
         this.#activeController = undefined;

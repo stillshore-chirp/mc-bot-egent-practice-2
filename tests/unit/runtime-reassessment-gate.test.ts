@@ -71,6 +71,93 @@ describe("RuntimeReassessmentGate", () => {
     await stopped;
   });
 
+  it("does not count an unsuccessful reassessment as completion", async () => {
+    const seen: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+        return "failed" as const;
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(gate.stats).toMatchObject({
+      started: 1,
+      completed: 0,
+      failed: 1,
+      cancelled: 0,
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    await gate.stop();
+    expect(seen).toEqual(["safety_failed", "safety_failed"]);
+    expect(gate.stats.completed).toBe(0);
+  });
+
+  it("drops stale pending work when the active state recurs", async () => {
+    let release!: () => void;
+    const seen: string[] = [];
+    const decisions: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ event, outcome, reason }) =>
+        decisions.push(`${event}:${outcome}:${reason ?? "none"}`),
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    gate.request({ event: "safety_stabilized", stateKey: "danger:pending" });
+    gate.request({ event: "safety_failed", stateKey: "danger:active" });
+    release();
+    await gate.stop();
+
+    expect(seen).toEqual(["safety_failed"]);
+    expect(decisions).toContain("safety_stabilized:suppressed:stale_state");
+    expect(decisions).toContain("safety_failed:suppressed:unchanged_state");
+  });
+
+  it("replaces same-priority pending work with the latest state", async () => {
+    let release!: () => void;
+    const seen: string[] = [];
+    const decisions: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ event, outcome, reason }) =>
+        decisions.push(`${event}:${outcome}:${reason ?? "none"}`),
+    });
+
+    gate.request({ event: "safety_failed", stateKey: "danger:stuck" });
+    gate.request({ event: "safety_failed", stateKey: "danger:drowning" });
+    gate.request({ event: "safety_failed", stateKey: "danger:lava" });
+    release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(seen).toEqual(["safety_failed", "safety_failed"]);
+    expect(decisions).toContain("safety_failed:suppressed:superseded");
+
+    release();
+    await gate.stop();
+  });
+
   it("serializes requests and coalesces a burst by priority after cooldown", async () => {
     vi.useFakeTimers();
     const releases: (() => void)[] = [];

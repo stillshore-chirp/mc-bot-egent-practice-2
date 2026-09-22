@@ -75,6 +75,31 @@ describe("immediate stop command", () => {
     expect(await handled).toBe(true);
   });
 
+  it("keeps an exact stop command on the stopped cancellation path", async () => {
+    const calls: string[] = [];
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => ({
+          outcome: "cancelled",
+          summary: "停止しました。",
+        })),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {} as OpenAIDeliberationAgent,
+      contextFactory: {} as ChatContextFactory,
+      logger: {
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+    coordinator.onOwnerMessage(() => calls.push("owner_message"));
+    coordinator.onImmediateStop(() => calls.push("stopped"));
+
+    await coordinator.handleChat("owner", "停止");
+
+    expect(calls).toEqual(["stopped"]);
+  });
+
   it("records request and response stages without copying prompt or model text", async () => {
     const store = TraceStore.open(":memory:");
     const traceService = new TraceService(store, {
@@ -261,10 +286,14 @@ describe("immediate stop command", () => {
       traceService,
     });
 
-    await coordinator.handleRuntimeEvent("connection_recovered", {
-      stateKey: "connection:recovered",
-      causeKey: "connection",
-    });
+    const outcome = await coordinator.handleRuntimeEvent(
+      "connection_recovered",
+      {
+        stateKey: "connection:recovered",
+        causeKey: "connection",
+      },
+    );
+    expect(outcome).toBe("completed");
 
     const run = store.listTraces(1)[0];
     const detail = run === undefined ? undefined : store.getTrace(run.traceId);
@@ -287,6 +316,38 @@ describe("immediate stop command", () => {
       runtimeCauseKey: "connection",
     });
     store.close();
+  });
+
+  it("returns a failed outcome when runtime deliberation cannot complete", async () => {
+    const say = vi.fn(async () => undefined);
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => {
+          throw new Error("synthetic runtime failure");
+        }),
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "固定観測要約",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const outcome = await coordinator.handleRuntimeEvent("safety_failed", {
+      stateKey: "safety:failed:stuck:REFLEX_FAILED",
+      causeKey: "reflex:stuck",
+    });
+
+    expect(outcome).toBe("failed");
+    expect(say).toHaveBeenCalledWith(
+      "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。",
+    );
   });
 
   it("keeps a post-reinstruction runtime report concise and owner-facing", async () => {
