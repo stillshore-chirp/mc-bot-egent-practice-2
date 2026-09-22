@@ -306,6 +306,7 @@ export class ChatCoordinator {
           },
           () => this.#game.say(reply.text),
         );
+        this.#agent.recordDeliveredReply?.(username, requestKind, reply.text);
       });
     };
     try {

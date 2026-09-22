@@ -42,11 +42,21 @@ function requestsJargon(message: string): boolean {
 }
 
 function requestsConcise(message: string): boolean {
-  return /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(message);
+  return (
+    /(短く|簡潔に|手短に|ひとことで|長くしない|要点だけ)/u.test(message) ||
+    /(詳しく|詳細に|長めに|丁寧に).{0,8}(ないで|なくていい|不要|いらない)/u.test(
+      message,
+    )
+  );
 }
 
 function requestsDetailed(message: string): boolean {
-  return /(詳しく|詳細に|長めに|丁寧に|理由も説明)/u.test(message);
+  return (
+    /(詳しく|詳細に|長めに|丁寧に|理由も説明)/u.test(message) &&
+    !/(詳しく|詳細に|長めに|丁寧に).{0,8}(ないで|なくていい|不要|いらない)/u.test(
+      message,
+    )
+  );
 }
 
 export function updateConversationPreferences(

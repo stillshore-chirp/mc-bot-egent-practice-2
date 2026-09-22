@@ -247,9 +247,6 @@ export class OpenAIDeliberationAgent {
         if (text.length === 0) {
           throw new Error("LLM_RESPONSE_EMPTY");
         }
-        if (shouldRecordConversation) {
-          this.#conversation.recordAssistant(conversationKey, text);
-        }
         return { text, toolResults };
       }
 
@@ -269,5 +266,16 @@ export class OpenAIDeliberationAgent {
     }
 
     throw new Error("LLM_TOOL_ROUND_LIMIT_EXCEEDED");
+  }
+
+  /** Record an assistant turn only after the caller has delivered it. */
+  public recordDeliveredReply(
+    requesterUsername: string,
+    requestKind: ToolContext["requestKind"],
+    text: string,
+  ): void {
+    if (requestKind === "owner_message") {
+      this.#conversation.recordAssistant(requesterUsername, text);
+    }
   }
 }

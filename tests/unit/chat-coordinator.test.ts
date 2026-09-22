@@ -120,6 +120,44 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it("records an assistant turn only after Minecraft chat delivery succeeds", async () => {
+    const recordDeliveredReply = vi.fn();
+    let sayCalls = 0;
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        say: vi.fn(async () => {
+          sayCalls += 1;
+          if (sayCalls === 1) throw new Error("CHAT_DELIVERY_FAILED");
+        }),
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({
+          text: "依頼を受けました。",
+          toolResults: [],
+        })),
+        recordDeliveredReply,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "固定観測要約",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "依頼");
+
+    expect(sayCalls).toBe(2);
+    expect(recordDeliveredReply).not.toHaveBeenCalled();
+  });
+
   it("records a cancellation and response when the owner issues stop", async () => {
     const store = TraceStore.open(":memory:");
     const traceService = new TraceService(store, {

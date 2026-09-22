@@ -119,10 +119,11 @@ describe("OpenAI tool loop", () => {
       toolContext: toolContext(),
     };
 
-    await agent.deliberate({
+    const firstReply = await agent.deliberate({
       ...first,
       message: "目の前の木でいい。専門用語を使わず短く説明して。",
     });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
     await agent.deliberate({
       ...first,
       message: "それでいい。進めて。",
@@ -169,13 +170,14 @@ describe("OpenAI tool loop", () => {
     });
     const context = toolContext();
 
-    await agent.deliberate({
+    const firstReply = await agent.deliberate({
       message: "木を集めて",
       personaContext: "テスト人格",
       memoryContext: "なし",
       worldContext: "原点",
       toolContext: context,
     });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
     await agent.deliberate({
       message: "安全状態を再確認して",
       personaContext: "テスト人格",
@@ -212,13 +214,14 @@ describe("OpenAI tool loop", () => {
     });
     const context = toolContext();
 
-    await agent.deliberate({
+    const firstReply = await agent.deliberate({
       message: "鉄が必要で、数量は20個です。",
       personaContext: "テスト人格",
       memoryContext: "なし",
       worldContext: "原点",
       toolContext: context,
     });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
     await agent.deliberate({
       message: "集めて。",
       personaContext: "テスト人格",

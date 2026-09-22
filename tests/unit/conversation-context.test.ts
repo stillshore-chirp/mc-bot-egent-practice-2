@@ -44,4 +44,19 @@ describe("conversation context", () => {
     );
     expect(updated).toEqual({ concise: false, avoidJargon: false });
   });
+
+  it("keeps concise wording when detail is explicitly negated", () => {
+    expect(
+      updateConversationPreferences(
+        { concise: true, avoidJargon: false },
+        "詳しく説明しないで、要点だけでいい。",
+      ),
+    ).toEqual({ concise: true, avoidJargon: false });
+    expect(
+      updateConversationPreferences(
+        { concise: false, avoidJargon: false },
+        "詳しくなくていい。",
+      ),
+    ).toEqual({ concise: true, avoidJargon: false });
+  });
 });
