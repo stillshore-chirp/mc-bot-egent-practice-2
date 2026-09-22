@@ -11,6 +11,7 @@ export type RuntimeReassessmentSuppressionReason =
   | "coalesced"
   | "lower_priority"
   | "stale_generation"
+  | "owner_message"
   | "stopped";
 
 export interface RuntimeReassessmentStats {
@@ -141,18 +142,20 @@ export class RuntimeReassessmentGate<Event extends string> {
     this.#suppress(request, "lower_priority");
   }
 
-  public cancelPending(): void {
+  public cancelPending(reason: "owner_message" | "stopped" = "stopped"): void {
     this.#generation += 1;
+    const pending = this.#pending;
     this.#pending = undefined;
     if (this.#timer !== undefined) {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
+    if (pending !== undefined) this.#suppress(pending, reason);
   }
 
   public stop(): Promise<void> {
     this.#stopped = true;
-    this.cancelPending();
+    this.cancelPending("stopped");
     return this.#running ?? Promise.resolve();
   }
 

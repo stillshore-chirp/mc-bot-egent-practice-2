@@ -129,6 +129,7 @@ describe("RuntimeReassessmentGate", () => {
     vi.useFakeTimers();
     const releases: (() => void)[] = [];
     const seen: string[] = [];
+    const decisions: string[] = [];
     const gate = new RuntimeReassessmentGate({
       run: (event: string) => {
         seen.push(event);
@@ -137,14 +138,17 @@ describe("RuntimeReassessmentGate", () => {
       priority: () => 1,
       cooldownMs: 30_000,
       onError: () => undefined,
+      onDecision: ({ outcome, reason }) =>
+        decisions.push(`${outcome}:${reason ?? "none"}`),
     });
 
     gate.request("active");
     gate.request("cancelled-pending");
-    gate.cancelPending();
+    gate.cancelPending("owner_message");
     releases.shift()?.();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(seen).toEqual(["active"]);
+    expect(decisions).toContain("suppressed:owner_message");
 
     gate.request("later");
     expect(seen).toEqual(["active", "later"]);

@@ -287,10 +287,10 @@ class DefaultCompanionApplication implements CompanionApplication {
       },
     });
     this.#unsubscribeImmediateStop = this.#coordinator.onImmediateStop(() =>
-      this.#runtimeReassessments.cancelPending(),
+      this.#runtimeReassessments.cancelPending("stopped"),
     );
     this.#unsubscribeOwnerMessage = this.#coordinator.onOwnerMessage(() =>
-      this.#runtimeReassessments.cancelPending(),
+      this.#runtimeReassessments.cancelPending("owner_message"),
     );
   }
 
