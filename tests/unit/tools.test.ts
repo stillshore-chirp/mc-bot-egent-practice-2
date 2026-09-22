@@ -1282,6 +1282,77 @@ describe("ToolExecutor", () => {
     expect(gatherCalls).toBe(1);
   });
 
+  it.each([
+    [
+      "different item",
+      { item: "spruce_log", requestedCount: 1, collectedCount: 1 },
+      "SAFE_ACTION_PROGRESS_INVALID",
+    ],
+    [
+      "changed request",
+      { item: "oak_log", requestedCount: 2, collectedCount: 1 },
+      "SAFE_ACTION_PROGRESS_INVALID",
+    ],
+    [
+      "excess pickup",
+      { item: "oak_log", requestedCount: 1, collectedCount: 2 },
+      "SAFE_ACTION_PROGRESS_INVALID",
+    ],
+    [
+      "missing progress",
+      { item: "oak_log" },
+      "SAFE_ACTION_PROGRESS_UNCONFIRMED",
+    ],
+  ])("stops a direct gather after %s", async (_case, confirmedState, code) => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を1本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let calls = 0;
+    toolContext.game.gatherResource = async () => {
+      calls += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState,
+        summary: "採取結果を観測しました。",
+      };
+    };
+    const request = JSON.stringify({
+      resource: "oak_log",
+      count: 1,
+      commitmentId: null,
+    });
+
+    const result = await new ToolExecutor().execute(
+      "gather_resource",
+      request,
+      toolContext,
+    );
+    const replay = await new ToolExecutor().execute(
+      "gather_resource",
+      request,
+      toolContext,
+    );
+    expect(result).toMatchObject({ success: false, error: { code } });
+    expect(replay).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(toolContext.safeActionAuthorizationUsage.consumed).toBe(true);
+    expect(calls).toBe(1);
+  });
+
   it("consumes a confirmed partial direct gather before allowing the remainder", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
@@ -1482,6 +1553,18 @@ describe("ToolExecutor", () => {
 
   it("completes a commitment only with its bound one-time action receipt", async () => {
     const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を1本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
     const action = await new ToolExecutor().execute(
       "gather_resource",
       JSON.stringify({
@@ -1584,8 +1667,43 @@ describe("ToolExecutor", () => {
     expect(toolContext.executionEvidence.verifiedActionReceipts).toEqual([]);
   });
 
+  it("does not treat an active commitment as an owner gather grant", async () => {
+    const toolContext = context();
+    let gatherCalls = 0;
+    toolContext.game.gatherResource = async () => {
+      gatherCalls += 1;
+      throw new Error("unexpected gather");
+    };
+    const result = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({
+        resource: "oak_log",
+        count: 1,
+        commitmentId: "commitment",
+      }),
+      toolContext,
+    );
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(gatherCalls).toBe(0);
+  });
+
   it("does not issue a receipt when gather input differs from typed fulfillment", async () => {
     const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "シラカバの原木を1本集めて",
+      allowedResources: ["birch_log"],
+      targetItem: "birch_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
     const unrelated = await new ToolExecutor().execute(
       "gather_resource",
       JSON.stringify({

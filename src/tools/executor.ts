@@ -202,15 +202,35 @@ export class ToolExecutor {
           name === "gather_resource" &&
           !context.safeActionStepExecution &&
           context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
-          actionResult.success &&
-          actionResult.progress === undefined
+          actionResult.success
         ) {
-          return failure(
-            "SAFE_ACTION_PROGRESS_UNCONFIRMED",
-            "observation",
-            "採取結果の所持品差分を確認できないため、完了として扱いませんでした。",
-            true,
-          );
+          const resource = firstStringField(parsed.data, ["resource"]);
+          const requestedCount = firstPositiveIntegerField(parsed.data, [
+            "count",
+          ]);
+          const progress = actionResult.progress;
+          const remainingCount =
+            context.safeActionAuthorizationUsage?.remainingCount;
+          if (
+            progress === undefined ||
+            progress.item !== resource ||
+            progress.requestedCount !== requestedCount ||
+            progress.completedCount < 1 ||
+            progress.completedCount > progress.requestedCount ||
+            remainingCount === undefined ||
+            progress.completedCount > remainingCount
+          ) {
+            if (context.safeActionAuthorizationUsage !== undefined) {
+              context.safeActionAuthorizationUsage.consumed = true;
+            }
+            return failure(
+              progress === undefined
+                ? "SAFE_ACTION_PROGRESS_UNCONFIRMED"
+                : "SAFE_ACTION_PROGRESS_INVALID",
+              "observation",
+              "採取後の種類または数量が依頼の範囲と一致しないため、完了として扱わず停止しました。",
+            );
+          }
         }
         if (
           actionResult.success ||
@@ -413,12 +433,6 @@ function isDirectActionAuthorized(
           "quantity",
         ])
       : undefined;
-  if (
-    kind === "owner_bounded_resource" &&
-    isBoundCommitmentGather(input, resource, count, context)
-  ) {
-    return true;
-  }
   const authorization = context.safeActionAuthorization;
   const usage = context.safeActionAuthorizationUsage;
   if (usage === undefined || usage.consumed || authorization === undefined) {
@@ -427,13 +441,18 @@ function isDirectActionAuthorized(
   if (kind === "owner_bounded_resource") {
     if (authorization.kind !== "owner_bounded_resource") return false;
     if (authorization.selectionRequired === true) return false;
-    return (
+    const withinGrant =
       resource !== undefined &&
       authorization.allowedResources.includes(resource) &&
       count !== undefined &&
       count <= usage.remainingCount &&
       count <= authorization.targetCount &&
-      count <= authorization.maxCount
+      count <= authorization.maxCount;
+    if (!withinGrant) return false;
+    return (
+      isRecord(input) &&
+      (typeof input.commitmentId !== "string" ||
+        isBoundCommitmentGather(input, resource, count, context))
     );
   }
   if (authorization.kind !== "owner_scoped_change") return false;
