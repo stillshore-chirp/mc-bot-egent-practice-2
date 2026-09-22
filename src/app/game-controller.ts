@@ -25,6 +25,7 @@ import type {
 } from "../minecraft/general-actions.js";
 import { knownBlockDrops } from "../minecraft/general-actions.js";
 import type { MemoryStore } from "../memory/store.js";
+import type { TaskRunRecord } from "../memory/types.js";
 import {
   actionPriorities,
   type ActionArbiter,
@@ -56,6 +57,7 @@ interface CompanionGameControllerInput {
   readonly gatherLogs: GatherLogsSkill;
   readonly returnToPlayer: ReturnToPlayerSkill;
   readonly ownerUsername: string;
+  readonly playerId?: string;
   readonly taskTimeoutMs: number;
   readonly retryLimit: number;
   readonly maxMoveDistance?: number;
@@ -64,6 +66,17 @@ interface CompanionGameControllerInput {
 }
 
 const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
+
+interface TaskStateForSummary {
+  readonly kind: string;
+  readonly status: TaskRecord["status"];
+  readonly phase: string;
+  readonly updatedAt: string;
+  readonly failureCategory?: string;
+  readonly failureCode?: string;
+  readonly checkpoint?: Readonly<Record<string, unknown>>;
+  readonly persistedWithoutRuntime?: boolean;
+}
 
 export class CompanionGameController implements GameController {
   public readonly delivery: DeliveryController;
@@ -76,6 +89,7 @@ export class CompanionGameController implements GameController {
   readonly #gatherLogs: GatherLogsSkill;
   readonly #returnToPlayer: ReturnToPlayerSkill;
   readonly #ownerUsername: string;
+  readonly #playerId: string | undefined;
   readonly #taskTimeoutMs: number;
   readonly #retryLimit: number;
   readonly #maxMoveDistance: number;
@@ -106,6 +120,7 @@ export class CompanionGameController implements GameController {
     this.#gatherLogs = input.gatherLogs;
     this.#returnToPlayer = input.returnToPlayer;
     this.#ownerUsername = input.ownerUsername;
+    this.#playerId = input.playerId;
     this.#taskTimeoutMs = input.taskTimeoutMs;
     this.#retryLimit = input.retryLimit;
     this.#maxMoveDistance = input.maxMoveDistance ?? 128;
@@ -758,12 +773,16 @@ export class CompanionGameController implements GameController {
       const reason = timeoutSignal.aborted
         ? "設定された作業時間を超過"
         : "利用者または上位処理による停止";
-      cancellation = this.#tasks.cancel(reason).catch((error: unknown) => {
-        this.#logger.error(
-          { errorType: error instanceof Error ? error.name : "UnknownError" },
-          "task cancellation persistence failed",
-        );
-      });
+      cancellation = this.#tasks
+        .cancel(reason, timeoutSignal.aborted ? "TASK_TIMEOUT" : undefined)
+        .catch((error: unknown) => {
+          this.#logger.error(
+            {
+              errorType: error instanceof Error ? error.name : "UnknownError",
+            },
+            "task cancellation persistence failed",
+          );
+        });
     };
     cancellationSignal.addEventListener("abort", cancel, { once: true });
 
@@ -850,7 +869,7 @@ export class CompanionGameController implements GameController {
     for (const item of snapshot.inventory) {
       inventory[item.name] = (inventory[item.name] ?? 0) + item.count;
     }
-    const task = this.#tasks.current;
+    const task = this.#latestTaskForStatus();
     return {
       observedAt: snapshot.observedAt,
       subject: snapshot.subject,
@@ -868,7 +887,46 @@ export class CompanionGameController implements GameController {
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
       activeTaskState: activeTaskState(task),
+      activeTaskSummary: activeTaskSummary(task),
+      latestTaskState: latestTaskState(task),
     };
+  }
+
+  #latestTaskForStatus(): TaskStateForSummary | undefined {
+    const active = this.#tasks.current;
+    const activeSummary =
+      active === undefined
+        ? undefined
+        : {
+            kind: active.kind,
+            status: active.status,
+            phase: active.phase,
+            updatedAt: active.updatedAt,
+            ...(active.failure === undefined
+              ? {}
+              : { failureCategory: active.failure.category }),
+            ...(active.failure === undefined
+              ? {}
+              : { failureCode: active.failure.code }),
+            ...(active.checkpoint === undefined
+              ? {}
+              : { checkpoint: active.checkpoint }),
+          };
+    let persisted: TaskStateForSummary | undefined;
+    if (this.#playerId !== undefined) {
+      try {
+        const latest = this.#memory.listRecentTaskRuns(this.#playerId, 1)[0];
+        if (latest !== undefined) persisted = persistedTaskState(latest);
+      } catch {
+        // A status question remains useful when the durable task read is
+        // temporarily unavailable; the live task state is still authoritative.
+      }
+    }
+    if (activeSummary !== undefined) return activeSummary;
+    if (persisted === undefined) return undefined;
+    return terminalTaskStatuses.has(persisted.status)
+      ? persisted
+      : { ...persisted, persistedWithoutRuntime: true };
   }
 
   #syncLifeState(snapshot: WorldSnapshot): void {
@@ -943,7 +1001,9 @@ interface SuspendedTaskRecovery {
   readonly nextActions: readonly string[];
 }
 
-function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
+function suspendedTaskRecovery(
+  task: TaskStateForSummary,
+): SuspendedTaskRecovery {
   const reason = task.checkpoint?.suspendReason;
   const actionLabel = task.kind === "follow_player" ? "追従" : "作業";
   if (reason === "reflex:stuck") {
@@ -1003,13 +1063,126 @@ function suspendedTaskRecovery(task: TaskRecord): SuspendedTaskRecovery {
   };
 }
 
-function activeTaskState(task: TaskRecord | undefined): string | null {
-  if (task === undefined || terminalTaskStatuses.has(task.status)) return null;
+function activeTaskState(task: TaskStateForSummary | undefined): string | null {
+  if (
+    task === undefined ||
+    task.persistedWithoutRuntime === true ||
+    terminalTaskStatuses.has(task.status)
+  )
+    return null;
   if (task.status === "suspended") {
     const recovery = suspendedTaskRecovery(task);
     return `作業を一時停止中。${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
   }
   return `${task.kind}:${task.phase}:${task.status}`;
+}
+
+function activeTaskSummary(
+  task: TaskStateForSummary | undefined,
+): string | null {
+  if (
+    task === undefined ||
+    task.persistedWithoutRuntime === true ||
+    terminalTaskStatuses.has(task.status)
+  )
+    return null;
+  if (task.status === "suspended") {
+    const recovery = suspendedTaskRecovery(task);
+    return `${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
+  }
+  if (task.status === "queued") {
+    return "Minecraft作業の開始を待っています。";
+  }
+  switch (task.kind) {
+    case "follow_player":
+      return "利用者への追従を続けています。";
+    case "gather_resource":
+      return "資源の収集を続けています。";
+    case "move_to":
+      return "指定場所への移動を続けています。";
+    case "return_to_player":
+      return "利用者の場所への帰還を続けています。";
+    default:
+      return "Minecraft作業を続けています。";
+  }
+}
+
+function latestTaskState(task: TaskStateForSummary | undefined): string | null {
+  if (task === undefined) return null;
+  if (task.persistedWithoutRuntime === true) {
+    return "前回のMinecraft作業は途中と記録されていますが、現在その作業が続いていることは確認できません。状態を確認してから、必要ならもう一度指示してください。";
+  }
+  if (task.status === "completed") return "直前のMinecraft作業は完了しました。";
+  if (task.status === "failed") {
+    const reason = taskFailureReason(task.failureCategory, task.failureCode);
+    return reason === undefined
+      ? "直前のMinecraft作業は完了を確認できませんでした。"
+      : "直前のMinecraft作業は完了を確認できませんでした。" + reason;
+  }
+  if (task.status === "cancelled") {
+    const reason = taskFailureReason(task.failureCategory, task.failureCode);
+    return reason === undefined
+      ? "直前のMinecraft作業は停止しました。"
+      : "直前のMinecraft作業は停止しました。" + reason;
+  }
+  if (task.status === "suspended") return suspendedTaskRecovery(task).summary;
+  if (task.status === "queued") return "Minecraft作業の開始を待っています。";
+  return activeTaskSummary(task);
+}
+
+function persistedTaskState(task: TaskRunRecord): TaskStateForSummary {
+  const suspendReason = task.checkpoint?.data.suspendReason;
+  return {
+    kind: task.kind,
+    status: task.status,
+    phase: task.phase,
+    updatedAt: task.updatedAt,
+    ...(task.failure === undefined
+      ? {}
+      : { failureCategory: task.failure.category }),
+    ...(task.failure === undefined ? {} : { failureCode: task.failure.code }),
+    ...(typeof suspendReason === "string"
+      ? { checkpoint: { suspendReason } }
+      : {}),
+  };
+}
+
+function taskFailureReason(
+  category: string | undefined,
+  code: string | undefined,
+): string | undefined {
+  switch (category) {
+    case "connection":
+      return "Minecraftへの接続を確認できませんでした。";
+    case "observation":
+      return "Minecraftの状態を確認できませんでした。";
+    case "path":
+      return "経路を確認できませんでした。";
+    case "resource":
+      return "必要な資源を確認できませんでした。";
+    case "inventory":
+      return "所持品の状態を確認できませんでした。";
+    case "timeout":
+      return "設定時間内に完了しませんでした。";
+    case "cancelled":
+      if (code === "TASK_TIMEOUT") {
+        return "設定時間内に完了しませんでした。";
+      }
+      if (code === "TASK_REPLACED_AFTER_SUSPENSION") {
+        return "安全待機中に別の依頼へ切り替えました。";
+      }
+      return "停止指示で中断しました。";
+    case "safety":
+      return "安全確認のため停止しました。";
+    case "permission":
+    case "validation":
+    case "llm":
+    case "persistence":
+    case undefined:
+      return undefined;
+    default:
+      return undefined;
+  }
 }
 
 function formatCoordinates(position: {

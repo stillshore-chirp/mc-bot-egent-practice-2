@@ -277,6 +277,7 @@ export const toolDefinitions = [
     action: false,
     execute: async (input, context) => {
       await context.game.say(input.message);
+      context.recordDeliveredAssistantMessage?.(input.message);
       return {
         success: true,
         data: { delivered: true },
@@ -758,6 +759,16 @@ export const toolDefinitions = [
     },
   }),
 ] as const;
+
+/** Persistent writes need owner scope even when not marked as game actions. */
+export const ownerScopedMutationToolNames: ReadonlySet<string> = new Set([
+  "register_delivery_target",
+  "forget_delivery_target",
+  "remember_player_fact",
+  "remember_location",
+  "set_commitment",
+  "complete_commitment",
+]);
 
 function receiptEvidence(receipt: {
   receiptId: string;

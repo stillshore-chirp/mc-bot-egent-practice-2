@@ -409,7 +409,7 @@ export class TaskRuntime {
     await this.store.save(replaced);
   }
 
-  public async cancel(reason: string): Promise<void> {
+  public async cancel(reason: string, code = "TASK_CANCELLED"): Promise<void> {
     if (
       this.active === undefined ||
       !["queued", "running", "suspended"].includes(this.active.status)
@@ -420,7 +420,7 @@ export class TaskRuntime {
       phase: this.active.phase,
       failure: {
         category: "cancelled",
-        code: "TASK_CANCELLED",
+        code,
         message: reason,
         retryable: false,
         failedAt: this.active.phase,

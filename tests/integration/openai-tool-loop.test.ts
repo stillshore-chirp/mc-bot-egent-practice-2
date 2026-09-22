@@ -1,5 +1,5 @@
 import pino from "pino";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { OpenAIDeliberationAgent } from "../../src/agent/openai-agent.js";
 import type {
@@ -149,6 +149,853 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("carries the previous subject and explanation preferences into the next turn", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "目の前の木を対象にします。短く伝えます。"),
+      response([], "同じ木を対象に収集を始めます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const first = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    const firstReply = await agent.deliberate({
+      ...first,
+      message: "目の前の木でいい。専門用語を使わず短く説明して。",
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    await agent.deliberate({
+      ...first,
+      message: "それでいい。進めて。",
+    });
+
+    expect(fake.requests).toHaveLength(2);
+    expect(fake.requests[0]?.instructions).toContain(
+      "利用者の説明方法の希望: 短く要点だけ話す。",
+    );
+    expect(fake.requests[0]?.instructions).toContain(
+      "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
+    );
+    expect(fake.requests[0]?.instructions).toContain("提供していない操作");
+    expect(fake.requests[0]?.instructions).toContain(
+      "許可済み原木収集の対象原木だけは収集toolで扱います",
+    );
+    expect(fake.requests[0]?.instructions).toContain("実行した工程");
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain(
+      "目の前の木でいい。専門用語を使わず短く説明して。",
+    );
+    expect(JSON.stringify(fake.requests[1]?.input)).toContain(
+      "目の前の木を対象にします。短く伝えます。",
+    );
+    expect(fake.requests[1]?.instructions).toContain("同じ対象として扱って");
+    expect(fake.requests[1]?.instructions).toContain(
+      "公開toolを安全な順序で組み合わせれば目的を達成できる場合",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "利用者の説明方法の希望: 短く要点だけ話す。",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
+    );
+  });
+
+  it("does not add an automatic reassessment prompt to the user conversation", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "依頼を受けました。"),
+      response([], "現在の状態を確認しました。"),
+      response([], "続きます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    const firstReply = await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    await agent.deliberate({
+      message: "安全状態を再確認して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: { ...context, requestKind: "runtime_reassessment" },
+    });
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    const thirdInput = JSON.stringify(fake.requests[2]?.input);
+    expect(thirdInput).toContain("木を集めて");
+    expect(thirdInput).toContain("依頼を受けました。");
+    expect(thirdInput).toContain("続けて");
+    expect(thirdInput).not.toContain("安全状態を再確認して");
+    expect(thirdInput).not.toContain("現在の状態を確認しました。");
+    expect(fake.requests[1]?.instructions).toContain(
+      "観測とtool結果を最優先し",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "体力・空腹・座標・記憶の列挙は省き",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "開始済みの行動があれば、その事実を優先して報告",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "JSONキーやtrue/false表記",
+    );
+  });
+
+  it("does not retain an owner request until a reply is delivered", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "送信前に中断されました。"),
+      response([], "要点だけで返します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "中断された依頼",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    await agent.deliberate({
+      message: "もっと短く",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(JSON.stringify(fake.requests[1]?.input)).not.toContain(
+      "中断された依頼",
+    );
+  });
+
+  it("records a say tool message after Minecraft chat delivery", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-say",
+          name: "say",
+          arguments: JSON.stringify({ message: "木の位置を確認しました。" }),
+          status: "completed",
+        },
+      ]),
+      response([], "送信処理を終えました。"),
+      response([], "続けます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const say = vi.fn(async () => undefined);
+    context.game.say = say;
+
+    const reply = await agent.deliberate({
+      message: "木の位置を教えて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", reply.text);
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(say).toHaveBeenCalledWith("木の位置を確認しました。");
+    expect(JSON.stringify(fake.requests[2]?.input)).toContain(
+      "木の位置を確認しました。",
+    );
+  });
+
+  it("keeps a cancellation boundary after a delivered progress message", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-progress",
+          name: "say",
+          arguments: JSON.stringify({ message: "木を探しています。" }),
+          status: "completed",
+        },
+      ]),
+      response([], "採取を続けます。"),
+      response([], "停止済みなので再開の指示を待ちます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({
+      message: "もっと短く",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests[2]?.instructions).toContain(
+      "直前の作業は停止済みです",
+    );
+    expect(JSON.stringify(fake.requests[2]?.input)).toContain(
+      "明示的に再開するまで自動で続けません。",
+    );
+  });
+
+  it.each([
+    "再開していい？",
+    "専門用語を使って説明して",
+    "例を使って説明して",
+    "例を作って説明して",
+    "要約を作って",
+    "手順を作って説明して",
+    "説明を続けて",
+    "もう戻ってきた？",
+    "木を集めてくれた？",
+    "拠点へ移動してくれた？",
+    "説明を始めて",
+  ])(
+    "does not expose or execute action tools after a stop for %s",
+    async (message) => {
+      const fake = new ScriptedOpenAI([
+        response([], "木を探します。"),
+        response([
+          {
+            type: "function_call",
+            call_id: "call-follow-after-stop",
+            name: "follow_player",
+            arguments: JSON.stringify({
+              safeDistance: 3,
+              maxDurationSeconds: 60,
+            }),
+            status: "completed",
+          },
+        ]),
+        response([], "停止中です。明示的な再開指示を待ちます。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const context = toolContext();
+
+      const firstReply = await agent.deliberate({
+        message: "木を集めて",
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+      agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+      agent.recordCancelledRequest("owner", "owner_message");
+      const permissionReply = await agent.deliberate({
+        message,
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+
+      expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+        "follow_player",
+      );
+      expect(
+        permissionReply.toolResults.find(
+          ({ name }) => name === "follow_player",
+        ),
+      ).toMatchObject({
+        result: {
+          success: false,
+          error: { code: "STOPPED_GOAL_ACTION_NOT_ALLOWED" },
+        },
+      });
+      expect(permissionReply.text).toBe(
+        "停止済みの作業は、明示的に再開するまで動かしません。",
+      );
+    },
+  );
+
+  it("allows a replacement return but rejects gathering prohibited in that turn and the next", async () => {
+    const gatherCall = (callId: string) => ({
+      type: "function_call",
+      call_id: callId,
+      name: "gather_resource",
+      arguments: JSON.stringify({
+        resource: "oak_log",
+        count: 1,
+        commitmentId: null,
+      }),
+      status: "completed",
+    });
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([
+        gatherCall("call-prohibited"),
+        {
+          type: "function_call",
+          call_id: "call-return",
+          name: "return_to_player",
+          arguments: JSON.stringify({ safeDistance: 3 }),
+          status: "completed",
+        },
+      ]),
+      response([], "拠点への帰還を確認しました。"),
+      response([gatherCall("call-still-prohibited")]),
+      response([], "採取は再開しません。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    const replacement = await agent.deliberate({
+      ...request,
+      message: "採取は再開しないで、拠点に戻って",
+    });
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "return_to_player",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+    expect(replacement.toolResults).toMatchObject([
+      {
+        name: "gather_resource",
+        result: {
+          success: false,
+          error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+        },
+      },
+      { name: "return_to_player", result: { success: true } },
+    ]);
+    agent.recordDeliveredReply("owner", "owner_message", replacement.text);
+
+    const next = await agent.deliberate({ ...request, message: "続けて" });
+    expect(fake.requests[3]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+    expect(next.toolResults[0]?.result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+  });
+
+  it("keeps memory writes outside a replacement movement request", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "採取を始めます。"),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-memory-write",
+          name: "remember_player_fact",
+          arguments: JSON.stringify({
+            subject: "利用者",
+            predicate: "希望",
+            value: "帰還",
+          }),
+          status: "completed",
+        },
+      ]),
+      response([], "記憶の更新は行いません。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    const replacement = await agent.deliberate({
+      ...request,
+      message: "記憶しないで、拠点に戻って",
+    });
+
+    const advertised = fake.requests[1]?.tools?.map((tool) => tool.name);
+    expect(advertised).toContain("return_to_player");
+    expect(advertised).not.toContain("remember_player_fact");
+    expect(advertised).not.toContain("forget_delivery_target");
+    expect(replacement.toolResults[0]?.result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+  });
+
+  it("keeps an explicitly requested delivery registration available after a stop", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([
+        {
+          type: "function_call",
+          call_id: "call-unrelated-forget",
+          name: "forget_delivery_target",
+          arguments: JSON.stringify({ kind: "chest" }),
+          status: "completed",
+        },
+        {
+          type: "function_call",
+          call_id: "call-unrelated-completion",
+          name: "complete_commitment",
+          arguments: JSON.stringify({
+            commitmentId: "unrelated",
+            outcome: "完了",
+            basis: "owner_confirmation",
+            receiptId: null,
+            evidenceSummary: "未確認",
+          }),
+          status: "completed",
+        },
+        {
+          type: "function_call",
+          call_id: "call-wrong-target-kind",
+          name: "register_delivery_target",
+          arguments: JSON.stringify({ kind: "chest", position: null }),
+          status: "completed",
+        },
+      ]),
+      response([], "登録する対象を確認します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    const registration = await agent.deliberate({
+      ...request,
+      message: "拠点を登録して",
+    });
+
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "register_delivery_target",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "gather_resource",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "forget_delivery_target",
+    );
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "complete_commitment",
+    );
+    expect(registration.toolResults.map(({ result }) => result)).toMatchObject([
+      {
+        success: false,
+        error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+      },
+      {
+        success: false,
+        error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+      },
+      {
+        success: false,
+        error: { code: "OWNER_ACTION_TARGET_NOT_ALLOWED" },
+      },
+    ]);
+  });
+
+  it.each([
+    ["拠点を忘れて", "forget_delivery_target"],
+    ["この場所を覚えて", "remember_location"],
+    ["この約束を完了として記録して", "complete_commitment"],
+  ])("scopes a stopped memory request %s to %s", async (message, allowed) => {
+    const fake = new ScriptedOpenAI([
+      response([], "前の作業を始めます。"),
+      response([], "依頼を確認しました。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({ ...request, message });
+
+    const advertised = fake.requests[1]?.tools?.map((tool) => tool.name) ?? [];
+    expect(advertised).toContain(allowed);
+    expect(
+      advertised.filter((name) =>
+        [
+          "register_delivery_target",
+          "forget_delivery_target",
+          "remember_player_fact",
+          "remember_location",
+          "set_commitment",
+          "complete_commitment",
+        ].includes(name),
+      ),
+    ).toEqual([allowed]);
+  });
+
+  it.each([
+    ["拠点ではなくチェストを登録して", "home"],
+    ["チェストじゃなく拠点を登録して", "chest"],
+    ["拠点でなくチェストを忘れて", "home"],
+  ] as const)(
+    "does not mutate a contrasted delivery target in %s",
+    async (message, rejectedKind) => {
+      const toolName = message.includes("忘れて")
+        ? "forget_delivery_target"
+        : "register_delivery_target";
+      const fake = new ScriptedOpenAI([
+        response([], "停止しました。"),
+        response([
+          {
+            type: "function_call",
+            call_id: "call-contrasted-target",
+            name: toolName,
+            arguments: JSON.stringify(
+              toolName === "forget_delivery_target"
+                ? { kind: rejectedKind }
+                : { kind: rejectedKind, position: null },
+            ),
+            status: "completed",
+          },
+        ]),
+        response([], "対象を確認しました。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const request = {
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: toolContext(),
+      };
+      const first = await agent.deliberate({
+        ...request,
+        message: "木を集めて",
+      });
+      agent.recordDeliveredReply("owner", "owner_message", first.text);
+      agent.recordCancelledRequest("owner", "owner_message");
+      const result = await agent.deliberate({ ...request, message });
+
+      expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+        toolName,
+      );
+      expect(result.toolResults[0]?.result).toMatchObject({
+        success: false,
+        error: { code: "OWNER_ACTION_TARGET_NOT_ALLOWED" },
+      });
+    },
+  );
+
+  it.each([
+    "この約束はまだ未完了だと記録して",
+    "この約束は完了していないと記録して",
+    "この約束はまだ済んでいないと記録して",
+  ])("does not complete a negated commitment in %s", async (message) => {
+    const fake = new ScriptedOpenAI([
+      response([], "停止しました。"),
+      response([], "未完了として受け取りました。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+    const first = await agent.deliberate({ ...request, message: "木を集めて" });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({ ...request, message });
+
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
+      "complete_commitment",
+    );
+  });
+
+  it("does not turn a generic restart into authorization for every memory write", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "登録を始めます。"),
+      response([], "登録する内容をもう一度指定してください。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const request = {
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    };
+    const first = await agent.deliberate({
+      ...request,
+      message: "拠点を登録して",
+    });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+    await agent.deliberate({ ...request, message: "続けて" });
+
+    const advertised = fake.requests[1]?.tools?.map((tool) => tool.name) ?? [];
+    expect(advertised).toContain("recall_memory");
+    expect(advertised).not.toContain("register_delivery_target");
+    expect(advertised).not.toContain("forget_delivery_target");
+    expect(advertised).not.toContain("complete_commitment");
+  });
+
+  it("does not let an older cancellation remove a newer pending owner turn", async () => {
+    const fake = new ScriptedOpenAI([response([], "次の返答です。")]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const oldRequestId = agent.beginOwnerRequest("owner", "古い依頼");
+    const newRequestId = agent.beginOwnerRequest("owner", "新しい依頼");
+    expect(newRequestId).not.toBe(oldRequestId);
+
+    agent.recordCancelledRequest("owner", "owner_message", oldRequestId);
+    agent.recordDeliveredReply(
+      "owner",
+      "owner_message",
+      "新しい返答です。",
+      newRequestId,
+    );
+    await agent.deliberate({
+      message: "続けて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const input = JSON.stringify(fake.requests[0]?.input);
+    expect(input).toContain("新しい依頼");
+    expect(input).toContain("新しい返答です。");
+    expect(input).not.toContain("古い依頼");
+    expect(fake.requests[0]?.instructions).not.toContain(
+      "直前の作業は停止済みです",
+    );
+  });
+
+  it("keeps a concurrent status exchange between the earlier action request and its reply", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "木を集めました。"),
+      response([], "確認しました。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const requestId = agent.beginOwnerRequest("owner", "木を集めて");
+    agent.recordDeliveredOwnerExchange(
+      "owner",
+      "今何してる",
+      "木を探しています。",
+    );
+    await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+      conversationRequestId: requestId,
+    });
+    agent.recordDeliveredReply(
+      "owner",
+      "owner_message",
+      "木を集めました。",
+      requestId,
+    );
+    await agent.deliberate({
+      message: "それはどうなった",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const history = JSON.stringify(fake.requests[1]?.input);
+    expect(history.indexOf("木を集めて")).toBeLessThan(
+      history.indexOf("今何してる"),
+    );
+    expect(history.indexOf("今何してる")).toBeLessThan(
+      history.indexOf("木を探しています。"),
+    );
+    expect(history.indexOf("木を探しています。")).toBeLessThan(
+      history.indexOf("木を集めました。"),
+    );
+  });
+
+  it("retains a delivered status exchange when the earlier action is cancelled", async () => {
+    const fake = new ScriptedOpenAI([response([], "確認しました。")]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const requestId = agent.beginOwnerRequest("owner", "木を集めて");
+    agent.recordDeliveredOwnerExchange(
+      "owner",
+      "今何してる",
+      "木を探しています。",
+    );
+    agent.recordCancelledRequest("owner", "owner_message", requestId);
+    await agent.deliberate({
+      message: "なぜ止まった",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+
+    const history = JSON.stringify(fake.requests[0]?.input);
+    expect(history).not.toContain("木を集めて");
+    expect(history).toContain("今何してる");
+    expect(history).toContain("木を探しています。");
+  });
+
+  it("retains an unsupported resource and quantity when the next turn says to gather it", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "鉄を20個ですね。確認しました。"),
+      response([], "鉄の収集操作は提供していません。原木なら収集できます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+
+    const firstReply = await agent.deliberate({
+      message: "鉄が必要で、数量は20個です。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    await agent.deliberate({
+      message: "集めて。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    const secondInput = JSON.stringify(fake.requests[1]?.input);
+    expect(secondInput).toContain("鉄");
+    expect(secondInput).toContain("20個");
+    expect(fake.requests[1]?.instructions).toContain("提供していない操作");
+    expect(fake.requests[1]?.instructions).toContain("実行済みと扱わず");
+    expect(fake.requests[1]?.instructions).toContain(
+      "同じ質問を繰り返さないでください",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
+      "内部のkind、phase、status、error codeはそのまま利用者へ出さず",
+    );
+  });
+
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {
     const fake = new ScriptedOpenAI([
       response([
