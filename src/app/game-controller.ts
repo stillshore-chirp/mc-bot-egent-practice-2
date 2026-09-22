@@ -758,6 +758,9 @@ function activeTaskSummary(
     const recovery = suspendedTaskRecovery(task);
     return `${recovery.summary} 次の操作: ${recovery.nextActions.join("、")}。`;
   }
+  if (task.status === "queued") {
+    return "Minecraft作業の開始を待っています。";
+  }
   switch (task.kind) {
     case "follow_player":
       return "利用者への追従を続けています。";

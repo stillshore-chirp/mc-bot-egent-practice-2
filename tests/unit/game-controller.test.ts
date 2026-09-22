@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { CompanionGameController } from "../../src/app/game-controller.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
-import { TaskRuntime } from "../../src/runtime/task-service.js";
+import { TaskRuntime, type TaskStore } from "../../src/runtime/task-service.js";
 import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
 import { GatherLogsSkill } from "../../src/skills/gather-logs/gather-logs-skill.js";
 import { MoveToSkill } from "../../src/skills/move-to.js";
@@ -15,15 +15,17 @@ import { ReturnToPlayerSkill } from "../../src/skills/return-to-player.js";
 import { FakeMinecraft, createSnapshot } from "../support/fake-minecraft.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
-function createController(minecraft: FakeMinecraft, withPlayer = false) {
+function createController(
+  minecraft: FakeMinecraft,
+  withPlayer = false,
+  taskStore: TaskStore = new InMemoryTaskStore(),
+) {
   const directory = mkdtempSync(join(tmpdir(), "mc-game-controller-"));
   const memory = MemoryStore.open(join(directory, "memory.sqlite"));
   const playerId = withPlayer
     ? memory.getOrCreatePlayer("owner").id
     : undefined;
-  const tasks = new TaskRuntime(new InMemoryTaskStore(), () =>
-    minecraft.stopCurrentAction(),
-  );
+  const tasks = new TaskRuntime(taskStore, () => minecraft.stopCurrentAction());
   const arbiter = new ActionArbiter();
   return {
     tasks,
@@ -259,6 +261,44 @@ describe("CompanionGameController", () => {
       close();
     },
   );
+
+  it("reports a live queued task as waiting until its first save completes", async () => {
+    let releaseSave!: () => void;
+    let notifySaveStarted!: () => void;
+    const saveStarted = new Promise<void>((resolve) => {
+      notifySaveStarted = resolve;
+    });
+    const saveHeld = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    let firstSave = true;
+    const taskStore: TaskStore = {
+      save: async () => {
+        if (firstSave) {
+          firstSave = false;
+          notifySaveStarted();
+          await saveHeld;
+        }
+      },
+    };
+    const { game, tasks, close } = createController(
+      new FakeMinecraft(),
+      false,
+      taskStore,
+    );
+    const task = tasks.run("follow_player", {}, async () => undefined);
+    await saveStarted;
+
+    const status = await game.observeStatus();
+    expect(status.activeTaskSummary).toBe(
+      "Minecraft作業の開始を待っています。",
+    );
+    expect(status.latestTaskState).toBe("Minecraft作業の開始を待っています。");
+
+    releaseSave();
+    await task;
+    close();
+  });
 
   it("keeps a safe persisted failure reason for direct status questions", async () => {
     const minecraft = new FakeMinecraft();
