@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 
 import type { RuntimeReassessmentRunOutcome } from "../app/runtime-reassessment-gate.js";
+import type { HostileGoal } from "../decision/hostile-response.js";
 import {
   createCorrelationId,
   runWithCorrelation,
@@ -197,6 +198,68 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
       normalized,
     )
   );
+}
+
+export function hostileResponseIntent(message: string): HostileGoal | null {
+  const normalized = message.trim().replace(/[。！!]+$/gu, "");
+  if (/[?？「」『』“”]/u.test(normalized)) return null;
+
+  const negatedEvade =
+    /(?:逃げ(?:ないで|るな|なくていい|てはいけない)|退避(?:しないで|するな|は不要|不要|してはいけない)|距離を取(?:らないで|るな|ってはいけない)|離れ(?:ないで|るな|てはいけない))/gu;
+  const negatedAttack =
+    /(?:倒|攻撃|戦|撃滅|討伐|退治|やっつけ)[^、，,。]{0,8}(?:ないで|なくていい|不要|するな|すな|はいけない|必要はない|ほしくない|やめて)/gu;
+  const hasNegatedEvade = negatedEvade.test(normalized);
+  const hasNegatedAttack = negatedAttack.test(normalized);
+  const affirmativeEvade = normalized.replace(negatedEvade, "");
+  const affirmativeAttack = normalized.replace(negatedAttack, "");
+  const evadeCommand =
+    /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u;
+  if (
+    affirmativeEvade
+      .split(/[、，,。]/u)
+      .some((clause) => evadeCommand.test(clause.trim()))
+  ) {
+    return "evade";
+  }
+
+  const clauses = affirmativeAttack.split(/[、，,。]/u);
+  const distress = clauses.some((clause) =>
+    /(?:敵|モンスター|襲われ).*(?:対処して|どうにかして|何とかして|助けて)(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+      clause.trim(),
+    ),
+  );
+  if (hasNegatedAttack) return distress ? "evade" : null;
+  const combat = clauses.some((clause) => {
+    const hostileTarget =
+      /(?:敵|モンスター|ゾンビ|スケルトン|クリーパー|そいつら?|あいつら?|やつら|奴ら)/u.test(
+        clause,
+      );
+    const nonHostileTarget =
+      /(?:木|樹|原木|竹|草|ブロック).{0,5}(?:倒|攻撃|撃滅|討伐|退治)/u.test(
+        clause,
+      );
+    const explicitCombat =
+      /(?:撃滅(?:して|せよ|しろ|しなさい)|討伐(?:して|しろ|せよ)|退治(?:して|しろ|せよ)|やっつけ(?:て|ろ))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        clause.trim(),
+      );
+    const genericCombat =
+      /(?:倒(?:して|せ|しろ|しなさい)|攻撃(?:して|しろ|せよ))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        clause.trim(),
+      );
+    return (
+      (explicitCombat && hostileTarget && !nonHostileTarget) ||
+      (genericCombat && !nonHostileTarget && (hostileTarget || hasNegatedEvade))
+    );
+  });
+  return combat || distress ? "eliminate" : null;
+}
+
+export function isHostileResponseCommand(message: string): boolean {
+  return hostileResponseIntent(message) !== null;
+}
+
+export function isHostileEvadeIntent(message: string): boolean {
+  return hostileResponseIntent(message) === "evade";
 }
 
 function renderReadOnlyStatus(status: GameStatus): string {
@@ -535,6 +598,13 @@ export class ChatCoordinator {
       }
     }
 
+    const hostileResponse = isHostileResponseCommand(normalized);
+    if (hostileResponse) {
+      this.#contextFactory.clearPendingOwnerGoal?.();
+      this.#activeController?.abort(
+        new Error("OWNER_HOSTILE_RESPONSE_PRIORITIZED"),
+      );
+    }
     const generation = this.#generation;
     const stopBoundary = this.#stopTail;
     this.#conversationTail = this.#conversationTail
@@ -548,9 +618,14 @@ export class ChatCoordinator {
           );
           return undefined;
         }
-        return generation === this.#generation
-          ? this.#deliberate(username, normalized, "owner_message")
-          : undefined;
+        if (generation !== this.#generation) return undefined;
+        if (hostileResponse) {
+          await this.#game.stopCurrentAction(
+            "所有者の敵対対象への新しい対処依頼",
+          );
+          return this.#respondToHostiles(username, normalized);
+        }
+        return this.#deliberate(username, normalized, "owner_message");
       });
     await this.#conversationTail;
     return true;
@@ -729,6 +804,71 @@ export class ChatCoordinator {
       );
       await safeCompleteTrace(session, "failed", "状態質問への応答に失敗");
       throw error;
+    }
+  }
+
+  async #respondToHostiles(
+    username: string,
+    message: string,
+  ): Promise<RuntimeReassessmentRunOutcome> {
+    const controller = new AbortController();
+    this.#activeController = controller;
+    this.#activeRequestKind = "owner_message";
+    const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+    recorder.beginOwnerRequest?.(username, message);
+    const session = await safeStartTrace(
+      this.#traceService,
+      "敵対対象への対処依頼を受信",
+      "owner_message",
+    );
+    try {
+      const report = await safeWithTraceSpan(
+        this.#traceService,
+        "minecraft_action",
+        "敵対対象への対処",
+        { summary: "観測に応じた攻撃または退避" },
+        () =>
+          this.#game.respondToHostiles(
+            isHostileEvadeIntent(message) ? "evade" : "eliminate",
+            controller.signal,
+          ),
+      );
+      if (controller.signal.aborted) {
+        await safeCompleteTrace(session, "cancelled", "停止を優先");
+        return "cancelled";
+      }
+      await this.#game.say(report.summary);
+      recorder.recordDeliveredOwnerExchange?.(
+        username,
+        message,
+        report.summary,
+      );
+      await safeCompleteTrace(
+        session,
+        report.outcome === "completed" ? "succeeded" : "failed",
+        "ゲーム内で観測した対処結果を送信",
+      );
+      return report.outcome === "completed" ? "completed" : "failed";
+    } catch (error) {
+      if (controller.signal.aborted) {
+        await safeCompleteTrace(session, "cancelled", "停止を優先");
+        return "cancelled";
+      }
+      this.#logger.error(
+        { errorType: error instanceof Error ? error.name : "UnknownError" },
+        "hostile response failed",
+      );
+      const summary =
+        "敵への対処中に操作を完了できませんでした。現在位置と周囲の危険を再確認してください。";
+      await this.#game.say(summary);
+      recorder.recordDeliveredOwnerExchange?.(username, message, summary);
+      await safeCompleteTrace(session, "failed", "敵への対処に失敗");
+      return "failed";
+    } finally {
+      if (this.#activeController === controller) {
+        this.#activeController = undefined;
+        this.#activeRequestKind = undefined;
+      }
     }
   }
 

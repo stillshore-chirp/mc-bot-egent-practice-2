@@ -38,6 +38,15 @@ export interface InventoryEntry {
   readonly count: number;
 }
 
+export interface ArmorEquipment {
+  readonly head: string | null;
+  readonly torso: string | null;
+  readonly legs: string | null;
+  readonly feet: string | null;
+}
+
+export type ArmorSlot = keyof ArmorEquipment;
+
 export interface PlayerObservation {
   readonly username: string;
   readonly position: Position;
@@ -83,6 +92,8 @@ export interface WorldSnapshot extends ObservationAttribution {
   readonly inLava: boolean;
   readonly suffocating: boolean;
   readonly inventory: readonly InventoryEntry[];
+  /** Null means equipment slots could not be observed. */
+  readonly armor: ArmorEquipment | null;
   readonly players: readonly PlayerObservation[];
   readonly nearbyEntities: readonly EntityObservation[];
 }

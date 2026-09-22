@@ -1,4 +1,6 @@
 import type { DeliveryController } from "../app/delivery-controller.js";
+import type { HostileGoal } from "../decision/hostile-response.js";
+import type { ArmorEquipment } from "../domain/snapshot.js";
 import type {
   SafeActionCandidate,
   SafeActionObservationRequest,
@@ -97,6 +99,8 @@ export interface GameStatus {
   suffocating: boolean;
   position: Position | null;
   inventory: Readonly<Record<string, number>>;
+  /** Null means equipment slots could not be observed. */
+  readonly armor?: ArmorEquipment | null;
   activeTaskState: string | null;
   /** Plain-language summary of the currently running task, when any. */
   readonly activeTaskSummary?: string | null;
@@ -172,6 +176,10 @@ export interface GameController {
   followOwner(
     safeDistance: number,
     maxDurationSeconds: number,
+    signal: AbortSignal,
+  ): Promise<ActionReport>;
+  respondToHostiles(
+    goal: HostileGoal,
     signal: AbortSignal,
   ): Promise<ActionReport>;
   stopCurrentAction(reason: string): Promise<ActionReport>;

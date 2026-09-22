@@ -30,6 +30,12 @@ const status = {
 
 function context(requesterUsername = "owner"): ToolContext {
   const game: GameController = {
+    respondToHostiles: async () => ({
+      before: null,
+      after: null,
+      outcome: "failed",
+      summary: "対象なし",
+    }),
     observeStatus: async () => status,
     observeSurroundings: async () => ({
       observedAt: status.observedAt,

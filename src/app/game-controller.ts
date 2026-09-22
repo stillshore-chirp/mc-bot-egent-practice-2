@@ -4,6 +4,13 @@ import type {
   SafeActionObservationRequest,
 } from "../decision/safe-action-planner.js";
 import type { DepositResult } from "../minecraft/port.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
+import type { ArmorSlot } from "../domain/snapshot.js";
+import {
+  closestHostileDistance,
+  decideHostileResponse,
+  type HostileGoal,
+} from "../decision/hostile-response.js";
 import { DeliveryController } from "./delivery-controller.js";
 import type { Logger } from "pino";
 
@@ -409,6 +416,195 @@ export class CompanionGameController implements GameController {
         };
       },
     );
+  }
+
+  public async respondToHostiles(
+    goal: HostileGoal,
+    signal: AbortSignal,
+  ): Promise<ActionReport> {
+    const initial = await this.#minecraft.observe();
+    if (decideHostileResponse(initial).mode === "none") {
+      const status = this.#statusFromSnapshot(initial);
+      return {
+        before: status,
+        after: status,
+        outcome: "failed",
+        failureCategory: "observation",
+        failureCode: "HOSTILE_TARGET_NOT_OBSERVED",
+        summary:
+          "現在の観測範囲に敵対的な相手はいません。攻撃や退避は始めませんでした。",
+      };
+    }
+
+    const report = await this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "respond_to_hostiles",
+          {
+            goal,
+            observedHostiles: initial.nearbyEntities.filter((e) => e.hostile)
+              .length,
+          },
+          signal,
+          async (actionSignal) => {
+            let current = await this.#minecraft.observe();
+            const equippedArmor: ArmorSlot[] = [];
+            let armorEquipFailed = false;
+            const equipWhenSafe = async (snapshot: WorldSnapshot) => {
+              const hostileDistance = closestHostileDistance(snapshot);
+              if (
+                (hostileDistance !== null && hostileDistance < 6) ||
+                snapshot.onFire ||
+                snapshot.inLava ||
+                snapshot.inWater ||
+                snapshot.suffocating ||
+                recommendArmor(snapshot).length === 0
+              ) {
+                return;
+              }
+              const result =
+                await this.#minecraft.equipAvailableArmor(actionSignal);
+              equippedArmor.push(...result.equipped);
+              armorEquipFailed ||= result.failed;
+            };
+            await equipWhenSafe(current);
+            if (equippedArmor.length > 0)
+              current = await this.#minecraft.observe();
+            const choice =
+              goal === "evade"
+                ? closestHostileDistance(current) === null
+                  ? ({ mode: "none" } as const)
+                  : ({
+                      mode: "retreat",
+                      reason: "退避を指示されたため",
+                    } as const)
+                : decideHostileResponse(current);
+            if (choice.mode === "none")
+              return { mode: "none" as const, equippedArmor };
+            let attackedEntityId: number | undefined;
+            let reason = choice.mode === "retreat" ? choice.reason : "";
+            if (choice.mode === "attack") {
+              attackedEntityId = choice.entityId;
+              try {
+                if (
+                  await this.#minecraft.attackHostile(
+                    choice.entityId,
+                    actionSignal,
+                  )
+                ) {
+                  return {
+                    mode: "attack" as const,
+                    entityId: choice.entityId,
+                    equippedArmor,
+                  };
+                }
+                reason = "攻撃しましたが撃破を確認できないため";
+              } catch (error) {
+                if (actionSignal.aborted) throw error;
+                if (
+                  !(error instanceof AppError) ||
+                  error.detail.category !== "safety"
+                ) {
+                  throw error;
+                }
+                reason = "攻撃条件が変わったため";
+              }
+            }
+            const distanceBefore = closestHostileDistance(current);
+            try {
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            } catch (error) {
+              if (
+                actionSignal.aborted ||
+                !(error instanceof AppError) ||
+                error.detail.category !== "path"
+              ) {
+                throw error;
+              }
+              await this.#minecraft.recoverFromStuck(2, actionSignal);
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            }
+            const first = await this.#minecraft.observe();
+            if (
+              distance(current.position, first.position) < 1.5 &&
+              closestHostileDistance(first) !== null
+            ) {
+              await this.#minecraft.recoverFromStuck(2, actionSignal);
+              await this.#minecraft.retreatFromHostiles(actionSignal);
+            }
+            await equipWhenSafe(await this.#minecraft.observe());
+            return {
+              mode: "retreat" as const,
+              reason,
+              distanceBefore,
+              equippedArmor,
+              armorEquipFailed,
+              ...(attackedEntityId === undefined ? {} : { attackedEntityId }),
+            };
+          },
+        ),
+      (result, after) => {
+        const armorSummary =
+          result.equippedArmor.length > 0
+            ? `所持防具を${result.equippedArmor.length}箇所装着し、`
+            : result.mode === "retreat" && result.armorEquipFailed
+              ? "防具の装着を確認できず、"
+              : "";
+        if (result.mode === "none") {
+          return {
+            outcome: "failed",
+            failureCategory: "observation",
+            failureCode: "HOSTILE_TARGET_CHANGED",
+            summary: `${armorSummary}対象が観測範囲からいなくなったため、攻撃や退避は始めませんでした。`,
+          };
+        }
+        if (result.mode === "attack") {
+          // attackHostile returns true only after Mineflayer's entityDead event.
+          // A dead entity can remain visible during its death animation.
+          return {
+            outcome: "completed",
+            evidenceKind: "minecraft_snapshot",
+            summary: `${armorSummary}敵対的な相手1体の死亡を確認しました。周囲の危険は引き続き観測が必要です。`,
+          };
+        }
+        const moved =
+          after === null ? 0 : distance(initial.position, after.position);
+        const distanceAfter =
+          after === null ? null : closestHostileDistance(after);
+        const safer =
+          moved >= 1.5 &&
+          (distanceAfter === null ||
+            (result.distanceBefore !== null &&
+              distanceAfter >= result.distanceBefore + 1));
+        return safer
+          ? {
+              outcome: goal === "evade" ? "completed" : "failed",
+              ...(goal === "evade"
+                ? {}
+                : {
+                    failureCategory: "safety" as const,
+                    failureCode: "HOSTILE_ELIMINATION_NOT_CONFIRMED",
+                  }),
+              evidenceKind: "minecraft_snapshot",
+              summary: `${armorSummary}${result.reason}攻撃は続けず、実際に${moved.toFixed(1)}ブロック移動して距離を取りました。敵の撃破は未確認です。`,
+            }
+          : {
+              outcome: "failed",
+              failureCategory: "safety",
+              failureCode: "HOSTILE_RETREAT_NOT_VERIFIED",
+              summary: `${armorSummary}退避を試みましたが、敵との距離が広がったことを確認できませんでした。撃破や安全確保は未確認です。`,
+            };
+      },
+      initial,
+    );
+    return report.failureCategory === "path"
+      ? {
+          ...report,
+          summary:
+            "安全な退避経路を見つけられず、敵との距離を広げられたか確認できません。撃破や安全確保は未確認です。",
+        }
+      : report;
   }
 
   public async stopCurrentAction(reason: string): Promise<ActionReport> {
@@ -1083,6 +1279,7 @@ export class CompanionGameController implements GameController {
       suffocating: snapshot.suffocating,
       position: { ...snapshot.position, dimension: snapshot.dimension },
       inventory,
+      armor: snapshot.armor,
       activeTaskState: activeTaskState(task),
       activeTaskSummary: activeTaskSummary(task),
       latestTaskState: latestTaskState(task),

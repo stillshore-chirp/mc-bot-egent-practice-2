@@ -9,6 +9,7 @@ import type {
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
 import { oxygenObservationState } from "../../src/domain/snapshot.js";
+import { recommendArmor } from "../../src/decision/armor-equipment.js";
 import type {
   EscapeMode,
   MinecraftPort,
@@ -53,6 +54,7 @@ export function createSnapshot(
     inLava: false,
     suffocating: false,
     inventory: [],
+    armor: { head: null, torso: null, legs: null, feet: null },
     players: [
       { username: "owner", position: { x: 0, y: 64, z: 0 }, distance: 0 },
     ],
@@ -77,6 +79,7 @@ export class FakeMinecraft implements MinecraftPort {
     "allowed" | "unknown" | "denied"
   >();
   public availableFurnace = false;
+  public attackSucceeds = true;
   public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
   public placedBlocks = new Map<string, string>();
   private pendingDrop: ResourceTarget | undefined;
@@ -509,6 +512,59 @@ export class FakeMinecraft implements MinecraftPort {
     return "bread";
   }
 
+  public async attackHostile(
+    entityId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    signal.throwIfAborted();
+    const target = this.snapshot.nearbyEntities.find(
+      (entity) => entity.id === entityId && entity.hostile,
+    );
+    if (target === undefined) throw new Error("HOSTILE_TARGET_CHANGED");
+    this.actions.push(`attack:${entityId}`);
+    if (this.attackSucceeds) {
+      this.snapshot = {
+        ...this.snapshot,
+        nearbyEntities: this.snapshot.nearbyEntities.filter(
+          (entity) => entity.id !== entityId,
+        ),
+      };
+    }
+    return this.attackSucceeds;
+  }
+
+  public async equipAvailableArmor(signal: AbortSignal) {
+    signal.throwIfAborted();
+    const choices = recommendArmor(this.snapshot);
+    if (choices.length === 0 || this.snapshot.armor === null)
+      return { equipped: [], failed: false };
+    const inventory = this.snapshot.inventory.map((item) => ({ ...item }));
+    const armor = { ...this.snapshot.armor };
+    for (const choice of choices) {
+      const item = inventory.find((entry) => entry.name === choice.itemName);
+      if (item === undefined || item.count < 1) continue;
+      item.count -= 1;
+      armor[choice.slot] = choice.itemName;
+      this.actions.push(`equip:${choice.slot}:${choice.itemName}`);
+    }
+    this.snapshot = {
+      ...this.snapshot,
+      inventory: inventory.filter((item) => item.count > 0),
+      armor,
+    };
+    return { equipped: choices.map(({ slot }) => slot), failed: false };
+  }
+
+  public async retreatFromHostiles(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    this.snapshot = {
+      ...this.snapshot,
+      position: { ...this.snapshot.position, x: this.snapshot.position.x - 4 },
+      nearbyEntities: [],
+    };
+    this.actions.push("retreat:hostile");
+  }
+
   public async escapeDanger(
     mode: EscapeMode,
     signal: AbortSignal,
@@ -522,6 +578,10 @@ export class FakeMinecraft implements MinecraftPort {
       suffocating: false,
       oxygen: 20,
       oxygenState: oxygenObservationState(20, false),
+      position:
+        mode === "hostile"
+          ? { ...this.snapshot.position, x: this.snapshot.position.x - 4 }
+          : this.snapshot.position,
       nearbyEntities: [],
     };
     this.actions.push(`escape:${mode}`);

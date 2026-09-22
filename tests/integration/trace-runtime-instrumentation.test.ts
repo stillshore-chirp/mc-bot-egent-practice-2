@@ -44,6 +44,12 @@ const status = {
 
 function game(): GameController {
   return {
+    respondToHostiles: async () => ({
+      before: null,
+      after: null,
+      outcome: "failed",
+      summary: "対象なし",
+    }),
     observeStatus: async () => status,
     observeSurroundings: async () => ({
       observedAt: status.observedAt,
