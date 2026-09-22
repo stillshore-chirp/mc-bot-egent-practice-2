@@ -46,7 +46,14 @@ function requestsJargon(message: string): boolean {
 }
 
 function permitsJargon(message: string): boolean {
-  return /(避けなくていい|避けなくてもいい|使っていい|使ってもいい)/u.test(
+  return (
+    /(専門用語|内部用語|エラーコード|コード名)/u.test(message) &&
+    /(避けなくていい|避けなくてもいい|使っていい|使ってもいい)/u.test(message)
+  );
+}
+
+function explicitlyResumesGoal(message: string): boolean {
+  return /(続けて|続行|再開|やり直|もう一度|集め|採取|移動|追従|来て|戻|探|確認|収納|登録|始め)/u.test(
     message,
   );
 }
@@ -128,6 +135,9 @@ export class ConversationContextStore {
       state.preferences,
       message,
     );
+    if (state.cancelledGoal && explicitlyResumesGoal(compactText(message))) {
+      state.cancelledGoal = false;
+    }
     this.#append(state, { role: "user", text: message });
   }
 

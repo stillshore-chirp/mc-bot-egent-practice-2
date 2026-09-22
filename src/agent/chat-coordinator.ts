@@ -365,6 +365,8 @@ export class ChatCoordinator {
         "deliberation failed",
       );
       try {
+        const errorText =
+          "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。";
         await withinSession(() =>
           safeWithTraceSpan(
             this.#traceService,
@@ -375,12 +377,11 @@ export class ChatCoordinator {
               resultKind: "final_response",
               summarizeResult: () => "処理失敗を通知",
             },
-            () =>
-              this.#game.say(
-                "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。",
-              ),
+            () => this.#game.say(errorText),
           ),
         );
+        const recorder = this.#agent as unknown as DeliveredReplyRecorder;
+        recorder.recordDeliveredReply?.(username, requestKind, errorText);
       } finally {
         await safeCompleteTrace(session, "failed", "処理に失敗");
       }

@@ -120,7 +120,7 @@ describe("immediate stop command", () => {
     store.close();
   });
 
-  it("records an assistant turn only after Minecraft chat delivery succeeds", async () => {
+  it("records only the assistant response that reaches Minecraft chat", async () => {
     const recordDeliveredReply = vi.fn();
     let sayCalls = 0;
     const coordinator = new ChatCoordinator({
@@ -155,7 +155,48 @@ describe("immediate stop command", () => {
     await coordinator.handleChat("owner", "依頼");
 
     expect(sayCalls).toBe(2);
-    expect(recordDeliveredReply).not.toHaveBeenCalled();
+    expect(recordDeliveredReply).toHaveBeenCalledTimes(1);
+    expect(recordDeliveredReply).toHaveBeenCalledWith(
+      "owner",
+      "owner_message",
+      "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。",
+    );
+  });
+
+  it("records a delivered error response", async () => {
+    const recordDeliveredReply = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => {
+          throw new Error("DELIBERATION_FAILED");
+        }),
+        recordDeliveredReply,
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "固定観測要約",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "依頼");
+
+    expect(recordDeliveredReply).toHaveBeenCalledWith(
+      "owner",
+      "owner_message",
+      "会話処理に失敗しました。直前のMinecraft状態と作業結果を再確認してください。",
+    );
   });
 
   it("records a cancellation and response when the owner issues stop", async () => {

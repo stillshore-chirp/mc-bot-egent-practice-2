@@ -98,5 +98,19 @@ describe("conversation context", () => {
         "専門用語を避けなくていい。",
       ),
     ).toEqual({ concise: false, avoidJargon: false });
+    expect(
+      updateConversationPreferences(
+        { concise: false, avoidJargon: true },
+        "斧を使っていい。",
+      ),
+    ).toEqual({ concise: false, avoidJargon: true });
+  });
+
+  it("clears the cancellation boundary after an explicit restart", () => {
+    const store = new ConversationContextStore();
+    store.recordCancellation("owner");
+    store.recordUser("owner", "再開して。");
+
+    expect(store.snapshot("owner").cancelledGoal).toBe(false);
   });
 });
