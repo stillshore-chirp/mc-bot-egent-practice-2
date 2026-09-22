@@ -1013,20 +1013,48 @@ export const toolDefinitions = [
   }),
   defineTool({
     name: "follow_player",
-    description: "認可済み利用者を安全な距離で、指定時間を上限に追従する。",
+    description:
+      "認可済み利用者を安全な距離で追従する。距離・時間を省略した場合は設定済み安全距離と最大60秒（作業上限が短ければその上限）を使い、無期限にはしない。",
     input: z
       .object({
-        safeDistance: z.number().min(2).max(16),
-        maxDurationSeconds: z.number().int().min(1).max(900),
+        safeDistance: z.number().min(2).max(16).optional(),
+        maxDurationSeconds: z.number().int().min(1).max(900).optional(),
       })
       .strict(),
     fixtures: {
-      valid: [{ safeDistance: 3, maxDurationSeconds: 60 }],
+      valid: [{}, { safeDistance: 3, maxDurationSeconds: 60 }],
       invalid: [{ safeDistance: 0, maxDurationSeconds: 60 }],
     },
     action: true,
     execute: async (input, context) => {
-      if (input.safeDistance < context.limits.followDistance) {
+      const safeDistance = input.safeDistance ?? context.limits.followDistance;
+      const maxDurationSeconds =
+        input.maxDurationSeconds ??
+        Math.min(
+          60,
+          Math.max(
+            1,
+            Math.floor(
+              (context.limits.maxSafeActionDurationMs ?? 60_000) / 1_000,
+            ),
+          ),
+        );
+      if (safeDistance < 2 || safeDistance > 16) {
+        return {
+          success: false,
+          error: {
+            category: "validation",
+            code: "FOLLOW_DISTANCE_DEFAULT_INVALID",
+            retryable: false,
+            failedAt: "precondition",
+            confirmedState: { requested: safeDistance },
+            nextActions: ["安全距離を2〜16ブロックで指定する"],
+            userSummary:
+              "設定済みの安全距離を利用できないため、追従を開始しませんでした。",
+          },
+        };
+      }
+      if (safeDistance < context.limits.followDistance) {
         return {
           success: false,
           error: {
@@ -1035,7 +1063,7 @@ export const toolDefinitions = [
             retryable: false,
             failedAt: "precondition",
             confirmedState: {
-              requested: input.safeDistance,
+              requested: safeDistance,
               minimum: context.limits.followDistance,
             },
             nextActions: ["設定された安全距離以上を指定する"],
@@ -1046,8 +1074,8 @@ export const toolDefinitions = [
       }
       return actionReportResult(
         await context.game.followOwner(
-          input.safeDistance,
-          input.maxDurationSeconds,
+          safeDistance,
+          maxDurationSeconds,
           context.signal,
         ),
       );

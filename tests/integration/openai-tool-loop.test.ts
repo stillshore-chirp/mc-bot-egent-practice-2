@@ -145,6 +145,66 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("starts follow with bounded defaults when the owner omits distance and duration", async () => {
+    const fake = new ScriptedOpenAI([
+      response([
+        {
+          type: "function_call",
+          call_id: "call-follow-defaults",
+          name: "follow_player",
+          arguments: "{}",
+          status: "completed",
+        },
+      ]),
+      response(
+        [
+          {
+            type: "message",
+            id: "message-follow-defaults",
+            role: "assistant",
+            status: "completed",
+            content: [
+              {
+                type: "output_text",
+                text: "設定済みの安全距離で追従を開始しました。",
+                annotations: [],
+              },
+            ],
+          },
+        ],
+        "設定済みの安全距離で追従を開始しました。",
+      ),
+    ]);
+    const context = toolContext();
+    let received: { distance: number; duration: number } | undefined;
+    context.game.followOwner = async (distance, duration) => {
+      received = { distance, duration };
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "追従を開始しました。",
+      };
+    };
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+
+    const reply = await agent.deliberate({
+      message: "ついてきて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: JSON.stringify(status),
+      toolContext: context,
+    });
+
+    expect(reply.text).toContain("追従を開始");
+    expect(received).toEqual({ distance: 3, duration: 60 });
+  });
+
   it("executes a bounded multi-step goal plan inside one delegated tool call", async () => {
     const fake = new ScriptedOpenAI([
       response([

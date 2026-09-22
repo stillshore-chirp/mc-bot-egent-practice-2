@@ -1224,6 +1224,29 @@ describe("ToolExecutor", () => {
     expect(gatherCalls).toBe(1);
   });
 
+  it("uses bounded defaults when follow distance and duration are omitted", async () => {
+    const toolContext = context();
+    let received: { distance: number; duration: number } | undefined;
+    toolContext.game.followOwner = async (distance, duration) => {
+      received = { distance, duration };
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "追従しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "follow_player",
+      "{}",
+      toolContext,
+    );
+
+    expect(result).toMatchObject({ success: true });
+    expect(received).toEqual({ distance: 3, duration: 60 });
+  });
+
   it("selects the nearest observed and protection-checked resource without asking again", async () => {
     const toolContext = context();
     const result = await new ToolExecutor().execute(
