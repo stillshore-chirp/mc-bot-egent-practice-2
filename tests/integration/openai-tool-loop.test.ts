@@ -154,6 +154,9 @@ describe("OpenAI tool loop", () => {
       "利用者の説明方法の希望: 内部名や専門用語を使わず、平易に話す。",
     );
     expect(fake.requests[0]?.instructions).toContain("提供していない操作");
+    expect(fake.requests[0]?.instructions).toContain(
+      "許可済み原木収集の対象原木だけは収集toolで扱います",
+    );
     expect(fake.requests[0]?.instructions).toContain("実行した工程");
     expect(JSON.stringify(fake.requests[1]?.input)).toContain(
       "目の前の木でいい。専門用語を使わず短く説明して。",
