@@ -153,6 +153,8 @@ describe("conversation context", () => {
     expect(
       isExplicitGoalResumeMessage("採取は再開しないで代わりに拠点へ戻って。"),
     ).toBe(true);
+    expect(isExplicitGoalResumeMessage("座標10,64,10へ行って。")).toBe(true);
+    expect(isExplicitGoalResumeMessage("この場所を覚えて。")).toBe(true);
   });
 
   it("honors requests to stop being concise", () => {
