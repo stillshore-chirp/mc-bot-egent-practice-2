@@ -250,6 +250,45 @@ describe("RuntimeReassessmentGate", () => {
     await gate.stop();
   });
 
+  it("lets a newer stabilization replace a pending failure in the same stream", async () => {
+    let release!: () => void;
+    const seen: string[] = [];
+    const decisions: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        seen.push(event);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      priority: (event) =>
+        ({ active: 4, safety_failed: 4, safety_stabilized: 1 })[event] ?? 0,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ event, outcome, reason }) =>
+        decisions.push(`${event}:${outcome}:${reason ?? "none"}`),
+    });
+
+    gate.request({ event: "active", stateKey: "active", causeKey: "other" });
+    gate.request({
+      event: "safety_failed",
+      stateKey: "danger:failed",
+      causeKey: "reflex:stuck",
+    });
+    gate.request({
+      event: "safety_stabilized",
+      stateKey: "danger:stable",
+      causeKey: "reflex:stuck",
+    });
+    release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(seen).toEqual(["active", "safety_stabilized"]);
+    expect(decisions).toContain("safety_failed:suppressed:superseded");
+    release();
+    await gate.stop();
+  });
+
   it("serializes requests and coalesces a burst by priority after cooldown", async () => {
     vi.useFakeTimers();
     const releases: (() => void)[] = [];

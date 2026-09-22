@@ -7,7 +7,9 @@ import {
 } from "../../src/app/application.js";
 import type { ReflexState } from "../../src/reflexes/reflex-coordinator.js";
 
-const failed = (code = "REFLEX_FAILED"): ReflexState => ({
+const failed = (
+  code = "REFLEX_FAILED",
+): Extract<ReflexState, { state: "failed" }> => ({
   state: "failed",
   incident: {
     kind: "stuck",
@@ -137,6 +139,17 @@ describe("application reflex policy", () => {
       runtimeReassessmentState("safety_stabilized", stabilizing, safe),
     ).toEqual({
       stateKey: "safety:stabilized:stuck",
+      causeKey: "reflex:stuck",
+    });
+    const retriedFailure: ReflexState = {
+      ...failedState,
+      startedAt: "2026-09-22T00:05:00.000Z",
+    };
+    expect(
+      runtimeReassessmentState("safety_failed", stabilizing, retriedFailure),
+    ).toEqual({
+      stateKey:
+        "safety:failed:stuck:REFLEX_NOT_STABLE:attempt:2026-09-22T00:05:00_000Z",
       causeKey: "reflex:stuck",
     });
     expect(

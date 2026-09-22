@@ -156,7 +156,13 @@ export class RuntimeReassessmentGate<Event extends string> {
       this.#schedule();
       return;
     }
-    if (this.#priority(request.event) >= this.#priority(this.#pending.event)) {
+    const sameCause =
+      request.causeKey !== undefined &&
+      request.causeKey === this.#pending.causeKey;
+    if (
+      sameCause ||
+      this.#priority(request.event) >= this.#priority(this.#pending.event)
+    ) {
       const superseded = this.#pending;
       this.#pending = undefined;
       this.#clearTimer();

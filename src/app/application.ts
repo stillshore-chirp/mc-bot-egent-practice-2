@@ -131,8 +131,12 @@ export function runtimeReassessmentState(
   connectionRecoveryEpisode?: number,
 ): { readonly stateKey: string; readonly causeKey: string } {
   if (event === "safety_failed" && current.state === "failed") {
+    const attemptSuffix =
+      previous.state === "stabilizing"
+        ? `:attempt:${safeRuntimeKey(current.startedAt ?? current.endedAt ?? "unknown")}`
+        : "";
     return {
-      stateKey: `safety:failed:${current.incident.kind}:${safeRuntimeKey(current.failure.code)}`,
+      stateKey: `safety:failed:${current.incident.kind}:${safeRuntimeKey(current.failure.code)}${attemptSuffix}`,
       causeKey: `reflex:${current.incident.kind}`,
     };
   }
