@@ -46,6 +46,34 @@ describe("owner goal authorization", () => {
     });
   });
 
+  it("accepts supported Japanese log names when collection intent is explicit", () => {
+    const result = deriveOwnerGoalAuthorization({
+      ...ownerInput,
+      message: "オークの原木を2本集めて",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: ["oak_log"],
+        targetItem: "oak_log",
+        targetCount: 2,
+      },
+    });
+  });
+
+  it.each(["oak_logを20個持っている", "鉄を10秒採掘して"])(
+    "does not authorize a named resource without an explicit item goal: %s",
+    (message) => {
+      const result = deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message,
+      });
+
+      expect(result).toMatchObject({ outcome: "clarify" });
+    },
+  );
+
   it("accepts an arbitrary canonical resource id with a bounded quantity", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,

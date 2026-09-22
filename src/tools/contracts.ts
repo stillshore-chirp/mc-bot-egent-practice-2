@@ -224,6 +224,15 @@ export interface ToolContext {
   safeActionAuthorization?: SafeChoiceAuthorization;
   /** One concrete owner-goal clarification produced at the request boundary. */
   safeActionClarification?: string;
+  /**
+   * Mutable, request-scoped accounting for the owner authorization. It is
+   * created only by the authenticated request boundary and prevents another
+   * model tool call from replaying the same bounded goal.
+   */
+  safeActionAuthorizationUsage?: {
+    remainingCount: number;
+    consumed: boolean;
+  };
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;

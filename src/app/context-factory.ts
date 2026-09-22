@@ -212,7 +212,13 @@ export class CompanionContextFactory implements ChatContextFactory {
         }
         const ownerGoalFields =
           ownerGoal.outcome === "authorized"
-            ? { safeActionAuthorization: ownerGoal.authorization }
+            ? {
+                safeActionAuthorization: ownerGoal.authorization,
+                safeActionAuthorizationUsage: {
+                  remainingCount: ownerGoal.authorization.targetCount,
+                  consumed: false,
+                },
+              }
             : ownerGoal.outcome === "clarify"
               ? { safeActionClarification: ownerGoal.question }
               : {};

@@ -77,10 +77,105 @@ const resourceGoals: readonly ResourceGoal[] = [
     allowedResources: ["copper_ore", "deepslate_copper_ore"],
     targetItem: "raw_copper",
   },
+  {
+    label: "オークの原木",
+    aliases: ["オークの原木", "オーク", "oak_log", "oak log"],
+    allowedResources: ["oak_log"],
+    targetItem: "oak_log",
+  },
+  {
+    label: "トウヒの原木",
+    aliases: ["トウヒの原木", "トウヒ", "spruce_log", "spruce log"],
+    allowedResources: ["spruce_log"],
+    targetItem: "spruce_log",
+  },
+  {
+    label: "シラカバの原木",
+    aliases: [
+      "シラカバの原木",
+      "シラカバ",
+      "白樺の原木",
+      "白樺",
+      "birch_log",
+      "birch log",
+    ],
+    allowedResources: ["birch_log"],
+    targetItem: "birch_log",
+  },
+  {
+    label: "ジャングルの原木",
+    aliases: ["ジャングルの原木", "ジャングル", "jungle_log", "jungle log"],
+    allowedResources: ["jungle_log"],
+    targetItem: "jungle_log",
+  },
+  {
+    label: "アカシアの原木",
+    aliases: ["アカシアの原木", "アカシア", "acacia_log", "acacia log"],
+    allowedResources: ["acacia_log"],
+    targetItem: "acacia_log",
+  },
+  {
+    label: "ダークオークの原木",
+    aliases: [
+      "ダークオークの原木",
+      "ダークオーク",
+      "dark_oak_log",
+      "dark oak log",
+    ],
+    allowedResources: ["dark_oak_log"],
+    targetItem: "dark_oak_log",
+  },
+  {
+    label: "マングローブの原木",
+    aliases: [
+      "マングローブの原木",
+      "マングローブ",
+      "mangrove_log",
+      "mangrove log",
+    ],
+    allowedResources: ["mangrove_log"],
+    targetItem: "mangrove_log",
+  },
+  {
+    label: "サクラの原木",
+    aliases: [
+      "サクラの原木",
+      "桜の原木",
+      "サクラ",
+      "桜",
+      "cherry_log",
+      "cherry log",
+    ],
+    allowedResources: ["cherry_log"],
+    targetItem: "cherry_log",
+  },
+  {
+    label: "ペールオークの原木",
+    aliases: [
+      "ペールオークの原木",
+      "ペールオーク",
+      "pale_oak_log",
+      "pale oak log",
+    ],
+    allowedResources: ["pale_oak_log"],
+    targetItem: "pale_oak_log",
+  },
+  {
+    label: "真紅の幹",
+    aliases: ["真紅の幹", "crimson_stem", "crimson stem"],
+    allowedResources: ["crimson_stem"],
+    targetItem: "crimson_stem",
+  },
+  {
+    label: "歪んだ幹",
+    aliases: ["歪んだ幹", "warped_stem", "warped stem"],
+    allowedResources: ["warped_stem"],
+    targetItem: "warped_stem",
+  },
 ];
 
-const resourceIntentPattern =
-  /(集め|集めたい|採掘|掘る|掘って|採取|持ってき|mine|collect|gather|obtain|fetch|resource|ore|ingot|鉱石)/iu;
+const collectionIntentPattern =
+  /(集め|集めたい|採掘|掘る|掘って|採取|持ってき|取ってき|作る|作って|精錬|mine|collect|gather|obtain|fetch|harvest|craft|smelt)/iu;
 const operationWords = new Set([
   "collect_resource",
   "gather_resource",
@@ -135,10 +230,7 @@ export function deriveOwnerGoalAuthorization(
       ? canonicalResourceId(message)
       : undefined;
   const count = parseCount(message);
-  const hasResourceIntent =
-    resource !== undefined ||
-    unresolvedCanonicalResource !== undefined ||
-    resourceIntentPattern.test(message);
+  const hasCollectionIntent = collectionIntentPattern.test(message);
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -171,7 +263,14 @@ export function deriveOwnerGoalAuthorization(
     };
   }
 
-  if (!hasResourceIntent) {
+  if (!hasCollectionIntent) {
+    if (resource !== undefined || unresolvedCanonicalResource !== undefined) {
+      return {
+        outcome: "clarify",
+        question:
+          "資源名と数量は確認しました。収集する依頼なら「集めて」「掘って」などの操作を明示してください。",
+      };
+    }
     return { outcome: "none" };
   }
   if (resource === undefined) {
@@ -323,7 +422,7 @@ function containsAlias(message: string, alias: string): boolean {
 
 function parseCount(message: string): number | undefined {
   const match =
-    /(?:^|[^0-9])([0-9]{1,3})(?=\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)?(?:\s|$|[^0-9]))/iu.exec(
+    /(?:^|[^0-9])([0-9]{1,3})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
       message,
     );
   if (match === null) return undefined;

@@ -215,6 +215,7 @@ export class ToolExecutor {
             async () => undefined,
           );
         }
+        consumeSafeActionAuthorization(name, actionResult, context);
         return actionResult;
       };
       const result =
@@ -251,6 +252,9 @@ export class ToolExecutor {
                 ? executeAction
                 : () => definition.execute(parsed.data, context),
             );
+      if (name === "plan_safe_action" && stage === undefined) {
+        consumeSafeActionAuthorization(name, result, context);
+      }
       if (definition.action && result.success) {
         const commitmentId = verifiedFulfillmentCommitmentId(
           name,
@@ -318,6 +322,41 @@ export class ToolExecutor {
       };
     }
   }
+}
+
+function consumeSafeActionAuthorization(
+  toolName: string,
+  result: ToolResult<unknown>,
+  context: ToolContext,
+): void {
+  if (
+    toolName !== "plan_safe_action" ||
+    context.safeActionAuthorization?.kind !== "owner_bounded_resource" ||
+    context.safeActionAuthorizationUsage === undefined
+  ) {
+    return;
+  }
+  const completedCount =
+    result.success && isRecord(result.data)
+      ? integerField(result.data.completedCount)
+      : !result.success
+        ? integerField(result.error.confirmedState.completedCount)
+        : undefined;
+  if (completedCount === undefined || completedCount < 0) return;
+  const remaining = context.safeActionAuthorizationUsage.remainingCount;
+  if (completedCount > remaining) return;
+  context.safeActionAuthorizationUsage.remainingCount =
+    remaining - completedCount;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function integerField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value)
+    ? value
+    : undefined;
 }
 
 function verifiedFulfillmentCommitmentId(

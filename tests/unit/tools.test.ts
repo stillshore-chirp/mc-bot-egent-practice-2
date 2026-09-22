@@ -216,6 +216,88 @@ describe("ToolExecutor", () => {
     expect(calls).toEqual(["say:安全な候補を選びました。", "gather_resource"]);
   });
 
+  it("consumes an owner bounded authorization after one plan invocation", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "シラカバの原木を2個集めて",
+      allowedResources: ["birch_log"],
+      targetItem: "birch_log",
+      targetCount: 2,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 2,
+      consumed: false,
+    };
+    toolContext.game.findSafeActionCandidates = async ({ count }) => [
+      {
+        id: "authorized-birch",
+        label: "観測済みのシラカバ",
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: true,
+        impact: "low",
+        operationClass: "natural_resource",
+        resourceName: "birch_log",
+        goalItem: "birch_log",
+        requestedCount: count,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: "birch_log", count, commitmentId: null },
+          },
+        ],
+      },
+    ];
+    let gatherCalls = 0;
+    toolContext.game.gatherResource = async (resource, count) => {
+      gatherCalls += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource,
+          requestedCount: count,
+          collectedCount: count,
+        },
+        summary: "シラカバを収集しました。",
+      };
+    };
+
+    const request = JSON.stringify({
+      goal: "collect_resource",
+      count: 1,
+      mode: "delegated",
+      candidateId: null,
+    });
+    const first = await new ToolExecutor().execute(
+      "plan_safe_action",
+      request,
+      toolContext,
+    );
+    const second = await new ToolExecutor().execute(
+      "plan_safe_action",
+      request,
+      toolContext,
+    );
+
+    expect(first).toMatchObject({ success: true, data: { completedCount: 2 } });
+    expect(second).toMatchObject({
+      success: false,
+      error: { code: "SAFE_ACTION_AUTHORIZATION_INVALID" },
+    });
+    expect(toolContext.safeActionAuthorizationUsage).toEqual({
+      remainingCount: 0,
+      consumed: true,
+    });
+    expect(gatherCalls).toBe(1);
+  });
+
   it("reobserves and replans a bounded multi-block goal without another prompt", async () => {
     const observedCounts: number[] = [];
     const mined: string[] = [];
@@ -783,6 +865,69 @@ describe("ToolExecutor", () => {
       success: true,
       data: { completedCount: 1, targetCount: 1, planRounds: 2 },
     });
+  });
+
+  it("stops repeated intermediate progress at the bounded target count", async () => {
+    let round = 0;
+    const toolContext = context();
+    toolContext.game.findSafeActionCandidates = async () => {
+      round += 1;
+      return [
+        {
+          id: `repeated-intermediate-${String(round)}`,
+          label: "繰り返し報告された中間素材",
+          action: "gather_resource",
+          observed: true,
+          purposeFit: "direct",
+          permission: "allowed",
+          safety: "allowed",
+          reversible: true,
+          impact: "low",
+          operationClass: "natural_resource",
+          resourceName: "iron_ore",
+          goalItem: "iron_ingot",
+          intermediateItems: ["raw_iron"],
+          requestedCount: 1,
+          steps: [
+            {
+              tool: "gather_resource",
+              input: { resource: "oak_log", count: 1, commitmentId: null },
+            },
+          ],
+        },
+      ];
+    };
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: status,
+      outcome: "completed",
+      confirmedState: {
+        item: "raw_iron",
+        requestedCount: 1,
+        collectedCount: 1,
+      },
+      summary: "raw_ironを確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "make_iron_ingot",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        code: "SAFE_ACTION_INTERMEDIATE_LIMIT",
+        confirmedState: { intermediateCount: 2, intermediateLimit: 1 },
+      },
+    });
+    expect(round).toBe(2);
   });
 
   it("stops once at the owner boundary for an unverified output", async () => {

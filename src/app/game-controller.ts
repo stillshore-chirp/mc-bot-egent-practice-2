@@ -67,6 +67,23 @@ const resourceLabels: Readonly<Record<string, string>> = {
   warped_stem: "歪んだ幹",
 };
 
+const resourceCollectionIntent =
+  /(集め|集める|集めて|採取|採掘|掘る|掘って|持ってき|取ってき|collect|gather|mine|obtain|fetch|harvest)/iu;
+
+function isResourceCollectionGoal(goal: string): boolean {
+  const normalized = goal.trim().toLocaleLowerCase("ja-JP");
+  if (normalized === "collect_resource") return true;
+  if (!resourceCollectionIntent.test(normalized)) return false;
+  return Object.entries(resourceLabels).some(([resource, label]) => {
+    const canonical = resource.replaceAll("_", " ");
+    return (
+      normalized.includes(resource) ||
+      normalized.includes(canonical) ||
+      normalized.includes(label.toLocaleLowerCase("ja-JP"))
+    );
+  });
+}
+
 export class CompanionGameController implements GameController {
   public readonly delivery: DeliveryController;
   readonly #deliverySkill: DeliverLogsSkill;
@@ -209,7 +226,7 @@ export class CompanionGameController implements GameController {
         retryable: false,
       });
     }
-    if (request.goal !== "collect_resource") return [];
+    if (!isResourceCollectionGoal(request.goal)) return [];
 
     const resources = await this.findSafeResourceCandidates(
       Math.min(32, this.#maxMoveDistance),

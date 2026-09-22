@@ -161,6 +161,29 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("normalizes a descriptive log collection goal", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+
+    const candidates = await game.findSafeActionCandidates(
+      { goal: "オークの原木を集める", count: 2, maxCandidates: 4 },
+      new AbortController().signal,
+    );
+
+    expect(candidates).toMatchObject([
+      {
+        resourceName: "oak_log",
+        goalItem: "oak_log",
+        requestedCount: 2,
+      },
+    ]);
+    close();
+  });
+
   it("reports acquired and held counts when gathering is stopped after pickup", async () => {
     const signal = new AbortController();
     class StopAfterPickup extends FakeMinecraft {

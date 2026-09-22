@@ -96,18 +96,20 @@ function isSignalAborted(signal: AbortSignal): boolean {
 }
 
 function trustedSafeActionCount(
-  inputCount: number,
+  _inputCount: number,
   authorization: ToolContext["safeActionAuthorization"],
+  usage: ToolContext["safeActionAuthorizationUsage"],
 ): number | undefined {
-  if (authorization?.kind !== "owner_bounded_resource") return inputCount;
+  if (authorization?.kind !== "owner_bounded_resource") return _inputCount;
+  if (usage === undefined || usage.consumed) return undefined;
   if (
-    !Number.isInteger(authorization.targetCount) ||
-    authorization.targetCount < 1 ||
+    !Number.isInteger(usage.remainingCount) ||
+    usage.remainingCount < 1 ||
     !Number.isInteger(authorization.maxCount) ||
-    authorization.targetCount > authorization.maxCount
+    usage.remainingCount > authorization.maxCount
   )
     return undefined;
-  return authorization.targetCount;
+  return usage.remainingCount;
 }
 
 function defineTool<Name extends string, Input extends z.ZodType, Output>(
@@ -224,6 +226,7 @@ export const toolDefinitions = [
       const actionCount = trustedSafeActionCount(
         input.count,
         context.safeActionAuthorization,
+        context.safeActionAuthorizationUsage,
       );
       if (actionCount === undefined) {
         return safeActionFailure(
@@ -235,6 +238,21 @@ export const toolDefinitions = [
           ["所有者の目的と数量上限を確認してから再依頼する"],
           "所有者の目的または数量上限を確認できないため、操作を開始しません。",
         );
+      }
+      if (context.safeActionAuthorization?.kind === "owner_bounded_resource") {
+        const usage = context.safeActionAuthorizationUsage;
+        if (usage === undefined) {
+          return safeActionFailure(
+            "authorization",
+            "SAFE_ACTION_AUTHORIZATION_INVALID",
+            false,
+            "owner_goal_boundary",
+            { goal: input.goal, ownerGoal: "usage_state_missing" },
+            ["所有者の目的を新しい依頼として再指定する"],
+            "所有者の目的の実行状態を確認できないため、操作を開始しません。",
+          );
+        }
+        usage.consumed = true;
       }
       if (context.game.findSafeActionCandidates === undefined) {
         return {
@@ -641,6 +659,32 @@ export const toolDefinitions = [
               },
               ["実行結果の数量と対象を再観測してから計画を再試行する"],
               "中間素材の結果は確認しましたが、最終目標の数量へ変換する計画を確認できないため停止しました。",
+            );
+          }
+          const intermediateCount = intermediateProgress.reduce(
+            (total, previous) => total + previous.completedCount,
+            progress.completedCount,
+          );
+          if (intermediateCount > actionCount) {
+            return safeActionFailure(
+              "safety",
+              "SAFE_ACTION_INTERMEDIATE_LIMIT",
+              false,
+              planned.candidate.id,
+              {
+                candidateId: planned.candidate.id,
+                completedCount,
+                remainingCount,
+                planRounds,
+                completedSteps: completedSteps.length,
+                intermediateCount,
+                intermediateLimit: actionCount,
+                progress,
+              },
+              [
+                "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
+              ],
+              "中間素材の累積量が目標数の上限に達したため、追加操作を停止しました。",
             );
           }
           intermediateProgress.push(progress);
