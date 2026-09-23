@@ -232,7 +232,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     const first = await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-pending-1",
       "owner_message",
@@ -275,7 +275,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-clear-1",
       "owner_message",
@@ -301,7 +301,7 @@ describe("CompanionContextFactory owner action boundary", () => {
 
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-clear-4",
       "owner_message",
@@ -321,7 +321,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-third-party-1",
       "owner_message",
