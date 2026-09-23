@@ -786,6 +786,70 @@ describe("immediate stop command", () => {
     expect(deliberate).not.toHaveBeenCalled();
   });
 
+  it("reports carried, equipped and removed armor from each new observation", async () => {
+    const baseStatus = {
+      observedAt: "2026-09-23T00:00:00.000Z",
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      connected: true,
+      spawned: true,
+      health: 20,
+      food: 20,
+      oxygen: 20,
+      oxygenState: "not_applicable",
+      inWater: false,
+      inLava: false,
+      suffocating: false,
+      position: null,
+      activeTaskState: null,
+    } satisfies Partial<GameStatus>;
+    const emptyArmor = { head: null, torso: null, legs: null, feet: null };
+    const observations: GameStatus[] = [
+      {
+        ...baseStatus,
+        inventory: { iron_helmet: 1 },
+        armor: emptyArmor,
+      },
+      {
+        ...baseStatus,
+        inventory: {},
+        armor: { ...emptyArmor, head: "iron_helmet" },
+      },
+      {
+        ...baseStatus,
+        inventory: { iron_helmet: 1 },
+        armor: emptyArmor,
+      },
+    ];
+    const game = {
+      observeStatus: vi.fn(async () => {
+        const next = observations.shift();
+        if (next === undefined) throw new Error("missing observation");
+        return next;
+      }),
+      say: vi.fn(async (_message: string) => undefined),
+    };
+    const deliberate = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: game as unknown as GameController,
+      agent: { deliberate },
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "防具は装備してる？");
+    await coordinator.handleChat("owner", "今の防具は？");
+    await coordinator.handleChat("owner", "防具を外した後は？");
+
+    expect(game.observeStatus).toHaveBeenCalledTimes(3);
+    expect(game.say.mock.calls[0]?.[0]).toContain("頭は未装備");
+    expect(game.say.mock.calls[1]?.[0]).toContain("頭は鉄のヘルメット");
+    expect(game.say.mock.calls[2]?.[0]).toContain("頭は未装備");
+    expect(deliberate).not.toHaveBeenCalled();
+  });
+
   it("preserves an action before a vital question for normal deliberation", async () => {
     const deliberate = vi.fn(async () => ({
       text: "依頼内容を確認しました。",

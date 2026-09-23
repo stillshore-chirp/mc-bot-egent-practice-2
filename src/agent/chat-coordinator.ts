@@ -17,6 +17,11 @@ import type {
   GameStatus,
   ToolContext,
 } from "../tools/contracts.js";
+import {
+  classifyArmorQuestion,
+  renderArmorAnswer,
+  type ArmorQuestionSubject,
+} from "./armor-answer.js";
 import { isExplicitGoalResumeMessage } from "./conversation-context.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
 import {
@@ -168,6 +173,7 @@ function isCapabilityWhyQuestion(message: string): boolean {
 export function isReadOnlyStatusQuestion(message: string): boolean {
   const normalized = message.trim().replace(/\s+/gu, " ");
   if (isImmediateStopCommand(normalized)) return false;
+  if (classifyArmorQuestion(normalized) !== null) return true;
   if (normalized === "なぜ") return true;
   if (/^(?:状態|状況|進捗)(?:を教えて|を説明して)?[?？]?$/u.test(normalized)) {
     return true;
@@ -670,7 +676,12 @@ export class ChatCoordinator {
     }
 
     const vitalsQuestion = classifyVitalsQuestion(normalized);
-    if (vitalsQuestion !== null || isReadOnlyStatusQuestion(normalized)) {
+    const armorQuestion = classifyArmorQuestion(normalized);
+    if (
+      vitalsQuestion !== null ||
+      armorQuestion !== null ||
+      isReadOnlyStatusQuestion(normalized)
+    ) {
       const questionGeneration = this.#generation;
       let prefetchedStatus: GameStatus | undefined;
       if (normalized === "なぜ") {
@@ -699,6 +710,7 @@ export class ChatCoordinator {
           questionGeneration,
           prefetchedStatus,
           vitalsQuestion,
+          armorQuestion,
         );
         this.#readOnlyStatusQuestions.add(statusQuestion);
         try {
@@ -847,6 +859,7 @@ export class ChatCoordinator {
     questionGeneration: number,
     prefetchedStatus?: GameStatus,
     vitalsQuestion: VitalsQuestion | null = null,
+    armorQuestion: ArmorQuestionSubject | null = null,
   ): Promise<void> {
     const recorder = this.#agent as unknown as DeliveredReplyRecorder;
     const session = await safeStartTrace(
@@ -858,7 +871,10 @@ export class ChatCoordinator {
     const process = async (): Promise<boolean> => {
       if (questionGeneration !== this.#generation) return false;
       let status: GameStatus | undefined = prefetchedStatus;
-      if (status === undefined && (vitalsQuestion?.bot ?? true)) {
+      if (
+        status === undefined &&
+        (vitalsQuestion?.bot ?? armorQuestion !== "requester")
+      ) {
         try {
           status = await safeWithTraceSpan(
             this.#traceService,
@@ -887,11 +903,13 @@ export class ChatCoordinator {
       }
       if (questionGeneration !== this.#generation) return false;
       const reply =
-        vitalsQuestion === null
-          ? status === undefined
-            ? "現在のMinecraft状態を確認できません。再観測が必要です。"
-            : renderReadOnlyStatus(status, preferences)
-          : renderVitalsAnswer(vitalsQuestion, status);
+        armorQuestion !== null
+          ? `${vitalsQuestion === null ? "" : renderVitalsAnswer(vitalsQuestion, status)}${renderArmorAnswer(armorQuestion, status)}`
+          : vitalsQuestion === null
+            ? status === undefined
+              ? "現在のMinecraft状態を確認できません。再観測が必要です。"
+              : renderReadOnlyStatus(status, preferences)
+            : renderVitalsAnswer(vitalsQuestion, status);
       const delivery = (async (): Promise<boolean> => {
         const delivered = await safeWithTraceSpan(
           this.#traceService,
