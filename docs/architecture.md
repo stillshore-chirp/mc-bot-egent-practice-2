@@ -8,11 +8,11 @@
 
 ## 技術選定
 
-2026-08-25時点の一次情報とpackage metadataを確認し、次を固定しています。
+一次情報とpackage metadataを確認し、次を固定しています。
 
 - Node.jsは24 LTSを推奨し、依存packageが対応する22 / 24をCI matrixにする。[Node.js Releases](https://nodejs.org/en/about/previous-releases)
 - 本リポジトリで固定するMineflayer 4.37.1はMinecraft 1.21.11対応をreleaseで明記しているため、既定のBot接続先を1.21.11にする。[PrismarineJS/mineflayer 4.37.1](https://github.com/PrismarineJS/mineflayer/releases/tag/4.37.1) 26.1クライアントを使う検証では、[サーバー側の互換構成](minecraft-26-1.md)を別に指定する。Botの`MINECRAFT_VERSION`をクライアント版に合わせて変更しない。
-- LLMは公式`openai` TypeScript SDKのResponses APIとstrict function callingを使い、既定modelは公式model catalogに掲載された`gpt-5.6-luna`とする。[OpenAI Responses API](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create)、[gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+- LLMは公式`openai` TypeScript SDKのResponses APIとstrict function callingを使い、既定modelは`gpt-6-luna`とする。[OpenAI Responses API](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create)、[gpt-6-luna](https://developers.openai.com/api/docs/models/gpt-6-luna)
 - 永続化は埋め込み型SQLiteとFTS5を使う。初期版でnetwork database、vector database、provider抽象化を追加しない。
 
 依存versionは`package.json`と`package-lock.json`へ完全固定します。Mineflayerの認証推移から入るmoderate advisoryは実装成功と分けて追跡し、脆弱な旧Mineflayerへのdowngradeを自動修正として採用しません。
