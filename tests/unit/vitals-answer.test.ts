@@ -59,6 +59,17 @@ describe("vital observation attribution", () => {
     expect(answer).toContain("あなたの水中状態は観測できていません");
   });
 
+  it("labels the Bot's health and food and does not treat land oxygen as a danger reading", () => {
+    const question = classifyVitalsQuestion("あなたの体力、空腹、酸素は？");
+    expect(question).not.toBeNull();
+    if (question === null) throw new Error("vitals question not classified");
+    const answer = renderVitalsAnswer(question, dryBot);
+    expect(answer).toContain("体力は20/20");
+    expect(answer).toContain("満腹度は18/20");
+    expect(answer).toContain("地上にいて酸素低下は観測していません");
+    expect(answer).not.toContain("酸素は20/20");
+  });
+
   it("does not consume an action that follows a vital question", () => {
     expect(classifyVitalsQuestion("私は水中？それから来て")).toBeNull();
   });
