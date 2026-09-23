@@ -24,6 +24,7 @@ function makeClient(returnConfirmed: boolean) {
       movements: object;
     };
     clearControlStates: ReturnType<typeof vi.fn>;
+    blockAt: ReturnType<typeof vi.fn>;
   };
   bot.entity = { position: new Vec3(0, 64, 0) };
   let goalActive = true;
@@ -50,6 +51,7 @@ function makeClient(returnConfirmed: boolean) {
     movements: {},
   };
   bot.clearControlStates = vi.fn();
+  bot.blockAt = vi.fn(() => null);
   Object.assign(client, {
     spawned: true,
     botInstance: bot,

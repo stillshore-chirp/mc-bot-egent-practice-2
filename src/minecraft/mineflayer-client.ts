@@ -33,6 +33,8 @@ import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay, withTimeout } from "../runtime/timeout.js";
 import { buildGroundNames } from "./port.js";
 import {
+  closedDoorAt,
+  handOperableDoorAt,
   isHandOperableDoor,
   NavigationMovements,
 } from "./navigation-movements.js";
@@ -1006,10 +1008,61 @@ export class MineflayerClient implements MinecraftPort {
       // A partial path is useful: take a few observed steps and plan again
       // instead of requiring a complete route before leaving the start.
       let waypoint: Move | undefined;
-      for (const node of planned.path.slice(0, 4)) {
+      let crossedDoor = false;
+      for (const [index, node] of planned.path.slice(0, 4).entries()) {
+        const nodePosition = new Vec3(
+          Math.floor(node.x),
+          Math.floor(node.y),
+          Math.floor(node.z),
+        );
+        const door = handOperableDoorAt(bot, nodePosition);
+        if (door !== null) {
+          // Walk to the door first when it is out of reach. The pathfinder's
+          // optimized path can mistake the leaf for a floor one block higher.
+          if (
+            bot.entity.position.distanceTo(
+              door.position.offset(0.5, 0.5, 0.5),
+            ) > 2.5
+          )
+            break;
+          const beyond = planned.path[index + 1] ?? node;
+          if (!confirmReturn(node) || !confirmReturn(beyond)) break;
+          throwIfAborted(signal, "move_to");
+          if (closedDoorAt(bot, nodePosition) !== null) {
+            try {
+              await bot.activateBlock(door);
+              await bot.waitForTicks(2);
+            } catch (error) {
+              throw new AppError(
+                {
+                  category: "path",
+                  code: "DOOR_OPEN_FAILED",
+                  message: "The nearby door could not be opened",
+                  retryable: true,
+                  failedAt: "move_to",
+                },
+                { cause: error },
+              );
+            }
+            throwIfAborted(signal, "move_to");
+            if (closedDoorAt(bot, nodePosition) !== null) {
+              throw new AppError({
+                category: "path",
+                code: "DOOR_OPEN_UNCONFIRMED",
+                message: "The nearby door did not open in the world",
+                retryable: true,
+                failedAt: "move_to",
+              });
+            }
+          }
+          await this.crossObservedDoor(bot, beyond, signal);
+          crossedDoor = true;
+          break;
+        }
         if (!confirmReturn(node)) break;
         waypoint = node;
       }
+      if (crossedDoor) continue;
       if (waypoint === undefined) {
         throw new AppError({
           category: "safety",
@@ -1076,6 +1129,57 @@ export class MineflayerClient implements MinecraftPort {
       retryable: false,
       failedAt: "move_to",
     });
+  }
+
+  private async crossObservedDoor(
+    bot: Bot,
+    beyond: Move,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const destination = new Vec3(
+      Math.floor(beyond.x) + 0.5,
+      beyond.y,
+      Math.floor(beyond.z) + 0.5,
+    );
+    const before = bot.entity.position.clone();
+    const deadline = Date.now() + 2500;
+    bot.pathfinder.setGoal(null);
+    try {
+      while (Date.now() < deadline) {
+        throwIfAborted(signal, "move_to");
+        const current = bot.entity.position;
+        if (
+          Math.hypot(current.x - destination.x, current.z - destination.z) <
+            0.65 &&
+          Math.abs(current.y - destination.y) < 1
+        )
+          break;
+        await bot.lookAt(
+          new Vec3(destination.x, current.y + 1.5, destination.z),
+          true,
+        );
+        bot.setControlState("forward", true);
+        await delay(100, signal);
+      }
+    } finally {
+      bot.clearControlStates();
+    }
+    const after = await this.observe();
+    if (
+      distance(positionOf(before), after.position) < 0.75 ||
+      Math.hypot(
+        after.position.x - destination.x,
+        after.position.z - destination.z,
+      ) >= 1
+    ) {
+      throw new AppError({
+        category: "path",
+        code: "DOOR_PASSAGE_STALLED",
+        message: "The open doorway could not be crossed",
+        retryable: true,
+        failedAt: "move_to",
+      });
+    }
   }
 
   private hasObservedReturnRoute(

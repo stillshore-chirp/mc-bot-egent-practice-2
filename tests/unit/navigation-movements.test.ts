@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import minecraftData from "minecraft-data";
 import prismarineBlock from "prismarine-block";
 import type { Bot } from "mineflayer";
-import type { Vec3 } from "vec3";
-import { NavigationMovements } from "../../src/minecraft/navigation-movements.js";
+import { Vec3 } from "vec3";
+import {
+  closedDoorAt,
+  handOperableDoorAt,
+  NavigationMovements,
+} from "../../src/minecraft/navigation-movements.js";
 
 const registry = minecraftData("1.21.11");
 // The pathfinder uses this block factory; fixtures must use its real state table.
@@ -56,12 +60,12 @@ function passage(doorName: "oak_door" | "iron_door", open: boolean) {
     entity: { effects: {} },
     game: { minY: -64 },
   } as unknown as Bot;
-  return new NavigationMovements(bot);
+  return { movements: new NavigationMovements(bot), bot };
 }
 
 describe("navigation through doors", () => {
   it("plans an interaction through a closed wooden door without digging or placing", () => {
-    const movements = passage("oak_door", false);
+    const { movements } = passage("oak_door", false);
     const neighbors = movements.getNeighbors({
       x: 0,
       y: 64,
@@ -82,10 +86,11 @@ describe("navigation through doors", () => {
     expect(door?.toPlace).toHaveLength(1);
     expect(door?.toPlace[0]).toMatchObject({ useOne: true });
     expect(movements.scafoldingBlocks).toEqual([]);
+    expect(movements.getBlock(new Vec3(0, 64, 0), 1, 0, 0).height).toBe(64);
   });
 
   it("walks through an already open wooden door without closing it", () => {
-    const movements = passage("oak_door", true);
+    const { movements } = passage("oak_door", true);
     const neighbors = movements.getNeighbors({
       x: 0,
       y: 64,
@@ -103,10 +108,11 @@ describe("navigation through doors", () => {
 
     expect(door).toBeDefined();
     expect(door?.toPlace).toEqual([]);
+    expect(movements.getBlock(new Vec3(0, 64, 0), 1, 0, 0).height).toBe(64);
   });
 
   it("does not treat an iron door as hand operable", () => {
-    const movements = passage("iron_door", false);
+    const { movements } = passage("iron_door", false);
     const neighbors = movements.getNeighbors({
       x: 0,
       y: 64,
@@ -122,5 +128,25 @@ describe("navigation through doors", () => {
     expect(
       neighbors.some((move) => move.x === 1 && move.y === 64 && move.z === 0),
     ).toBe(false);
+  });
+
+  it("uses the lower half for a closed door and ignores open or iron doors", () => {
+    const closed = passage("oak_door", false);
+    expect(closedDoorAt(closed.bot, new Vec3(1, 65, 0))?.position).toEqual(
+      new Vec3(1, 64, 0),
+    );
+    expect(closedDoorAt(closed.bot, new Vec3(1, 64, 0))?.position).toEqual(
+      new Vec3(1, 64, 0),
+    );
+    expect(
+      closedDoorAt(passage("oak_door", true).bot, new Vec3(1, 64, 0)),
+    ).toBeNull();
+    expect(
+      handOperableDoorAt(passage("oak_door", true).bot, new Vec3(1, 65, 0))
+        ?.name,
+    ).toBe("oak_door");
+    expect(
+      closedDoorAt(passage("iron_door", false).bot, new Vec3(1, 64, 0)),
+    ).toBeNull();
   });
 });
