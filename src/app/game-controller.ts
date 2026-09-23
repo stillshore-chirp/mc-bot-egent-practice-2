@@ -1617,10 +1617,16 @@ export class CompanionGameController implements GameController {
       ...(record.failure?.confirmedState === undefined
         ? {}
         : { confirmedState: record.failure.confirmedState }),
-      nextActions: failureNextActions(record.failure?.category),
-      summary: record.failure?.code
-        ? `Minecraft作業の完了を確認できませんでした（${record.failure.code}）。`
-        : "Minecraft作業の完了を確認できませんでした。",
+      nextActions:
+        record.failure?.code === "ASCENT_RETURN_UNCONFIRMED"
+          ? ["歩いて戻れる道や安全な退避先を確保できたら再確認する"]
+          : failureNextActions(record.failure?.category),
+      summary:
+        record.failure?.code === "ASCENT_RETURN_UNCONFIRMED"
+          ? "高所へ進む経路から安全に戻れる道を確認できなかったため、移動を止めました。歩いて戻れる道や安全な退避先ができれば再確認します。"
+          : record.failure?.code
+            ? `Minecraft作業の完了を確認できませんでした（${record.failure.code}）。`
+            : "Minecraft作業の完了を確認できませんでした。",
     };
   }
 

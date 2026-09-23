@@ -404,6 +404,33 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("explains an unconfirmed high-place return route without exposing its code", async () => {
+    class UnsafeAscentMinecraft extends FakeMinecraft {
+      public override async moveTo(): Promise<void> {
+        throw new AppError({
+          category: "safety",
+          code: "ASCENT_RETURN_UNCONFIRMED",
+          message: "Return route unconfirmed",
+          retryable: false,
+        });
+      }
+    }
+    const { game, close } = createController(new UnsafeAscentMinecraft());
+    try {
+      const report = await game.moveTo(
+        { x: 4, y: 69, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+      expect(report.outcome).toBe("failed");
+      expect(report.summary).toContain("安全に戻れる道");
+      expect(report.summary).toContain("退避先");
+      expect(report.summary).not.toContain("ASCENT_RETURN_UNCONFIRMED");
+    } finally {
+      close();
+    }
+  });
+
   it("stops a running follow task without waiting for the LLM", async () => {
     const minecraft = new FakeMinecraft();
     const { game, tasks, close } = createController(minecraft);
