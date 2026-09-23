@@ -432,6 +432,108 @@ describe("ToolExecutor", () => {
     expect(gathered).toEqual(["birch_log", "oak_log"]);
   });
 
+  it.each([true, false])(
+    "reconciles an uncertain mining pickup only when the goal item increased: %s",
+    async (firstDropReachedInventory) => {
+      const toolContext = context();
+      toolContext.safeActionAuthorization = {
+        kind: "owner_bounded_resource",
+        goal: "石炭を2個集めて",
+        allowedResources: ["coal_ore"],
+        targetItem: "coal",
+        targetCount: 2,
+        maxCount: 8,
+      };
+      toolContext.safeActionAuthorizationUsage = {
+        remainingCount: 2,
+        consumed: false,
+      };
+      let held = 0;
+      let attempts = 0;
+      toolContext.game.observeStatus = async () => ({
+        ...status,
+        inventory: { coal: held },
+      });
+      toolContext.game.findSafeActionCandidates = async () =>
+        [1, 2].map((index) => ({
+          id: `coal-${String(index)}`,
+          label: `石炭鉱石${String(index)}`,
+          action: "mine_block" as const,
+          observed: true as const,
+          purposeFit: "direct" as const,
+          permission: "allowed" as const,
+          safety: "allowed" as const,
+          reversible: false,
+          impact: "medium" as const,
+          operationClass: "natural_resource" as const,
+          requestedCount: 1,
+          resourceName: "coal_ore",
+          goalItem: "coal",
+          distance: index,
+          order: index - 1,
+          steps: [
+            {
+              tool: "mine_block",
+              input: { name: "coal_ore", position: { x: index, y: 64, z: 0 } },
+            },
+          ],
+        }));
+      toolContext.game.mineBlock = async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          if (firstDropReachedInventory) held += 1;
+          return {
+            before: status,
+            after: { ...status, inventory: { coal: held } },
+            outcome: "failed",
+            failureCategory: "inventory",
+            failureCode: "DROP_NOT_COLLECTED",
+            failureRetryable: true,
+            summary: "回収の完了判定ができませんでした。",
+          };
+        }
+        held += 1;
+        return {
+          before: status,
+          after: { ...status, inventory: { coal: held } },
+          outcome: "completed",
+          confirmedState: {
+            item: "coal",
+            requestedCount: 1,
+            collectedCount: 1,
+            heldCount: held,
+          },
+          summary: "所持品の増加を確認しました。",
+        };
+      };
+
+      const result = await new ToolExecutor().execute(
+        "plan_safe_action",
+        JSON.stringify({
+          goal: "石炭を2個集めて",
+          count: 2,
+          mode: "delegated",
+          candidateId: null,
+        }),
+        toolContext,
+      );
+
+      if (firstDropReachedInventory) {
+        expect(result).toMatchObject({
+          success: true,
+          data: { completedCount: 2, inventoryReconciledCount: 1 },
+        });
+        expect(attempts).toBe(2);
+      } else {
+        expect(result).toMatchObject({
+          success: false,
+          error: { code: "SAFE_ACTION_STEP_FAILED" },
+        });
+        expect(attempts).toBe(1);
+      }
+    },
+  );
+
   it("executes every bounded plan step without a second owner prompt", async () => {
     const calls: string[] = [];
     const toolContext = context();

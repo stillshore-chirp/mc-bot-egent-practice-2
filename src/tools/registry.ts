@@ -282,6 +282,30 @@ export const toolDefinitions = [
           "所有者の目的または数量上限を確認できないため、操作を開始しません。",
         );
       }
+      const authorizedGoalItem =
+        context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
+        context.safeActionAuthorization.targetItem !== "*"
+          ? context.safeActionAuthorization.targetItem
+          : undefined;
+      let initialGoalHeld: number | undefined;
+      if (authorizedGoalItem !== undefined) {
+        try {
+          initialGoalHeld =
+            (await context.game.observeStatus()).inventory[
+              authorizedGoalItem
+            ] ?? 0;
+        } catch {
+          return safeActionFailure(
+            "observation",
+            "SAFE_ACTION_BASELINE_UNAVAILABLE",
+            true,
+            "observe_status",
+            { goal: input.goal },
+            ["所持品を観測できる状態で目的を再依頼する"],
+            "開始前の所持数を確認できないため、資源操作を開始しませんでした。",
+          );
+        }
+      }
       if (
         context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
         knownSmeltInputs[context.safeActionAuthorization.targetItem] !==
@@ -361,6 +385,7 @@ export const toolDefinitions = [
       let completedCount = 0;
       let remainingCount = actionCount;
       let planRounds = 0;
+      let inventoryReconciledCount = 0;
       const intermediateProgress: ActionProgress[] = [];
       while (remainingCount > 0) {
         if (context.signal.aborted) {
@@ -826,6 +851,42 @@ export const toolDefinitions = [
             if (
               input.mode === "delegated" &&
               input.candidateId === null &&
+              planned.candidate.action === "mine_block" &&
+              step.tool === "mine_block" &&
+              !actionStepCompleted &&
+              authorizedGoalItem !== undefined &&
+              initialGoalHeld !== undefined &&
+              (result.error.code === "DROP_NOT_COLLECTED" ||
+                result.error.code === "MINE_OUTPUT_NOT_VERIFIED")
+            ) {
+              let observedGoalHeld: number | undefined;
+              try {
+                observedGoalHeld =
+                  (await context.game.observeStatus()).inventory[
+                    authorizedGoalItem
+                  ] ?? 0;
+              } catch {
+                // The uncertain mining result must retain its original failure.
+              }
+              const observedIncrease =
+                observedGoalHeld === undefined
+                  ? 0
+                  : Math.max(0, observedGoalHeld - initialGoalHeld);
+              const boundedIncrease = Math.min(actionCount, observedIncrease);
+              if (boundedIncrease > completedCount) {
+                inventoryReconciledCount += boundedIncrease - completedCount;
+                completedCount = boundedIncrease;
+                remainingCount = actionCount - completedCount;
+                failedCandidateIds.add(planned.candidate.id);
+                completedCandidateIds.pop();
+                planReasons.pop();
+                replanAfterCandidateFailure = true;
+                break;
+              }
+            }
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
               planned.candidate.action === "gather_resource" &&
               step.tool === "gather_resource" &&
               !actionStepCompleted &&
@@ -1035,6 +1096,7 @@ export const toolDefinitions = [
           completedCount,
           targetCount: actionCount,
           planRounds,
+          inventoryReconciledCount,
           intermediateProgress,
           completedSteps,
         },
@@ -1042,7 +1104,7 @@ export const toolDefinitions = [
           "minecraft_snapshot",
           `安全計画を${String(planRounds)}回、${String(completedCount)}個分実行し、各段階の結果を確認した`,
         ),
-        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${completedSteps.map(({ summary }) => summary).join(" ")}`,
+        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${inventoryReconciledCount > 0 ? `途中の採掘は完了判定できませんでしたが、目標品${String(inventoryReconciledCount)}個の所持増加を再観測しました。` : ""}${completedSteps.map(({ summary }) => summary).join(" ")}`,
       };
     },
   }),
