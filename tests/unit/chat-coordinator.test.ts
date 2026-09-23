@@ -50,6 +50,8 @@ describe("hostile response command", () => {
     ["ゾンビを倒して、危険なら逃げて", "eliminate"],
     ["ゾンビに対処して", "eliminate"],
     ["ゾンビから助けて", "eliminate"],
+    ["ファントム接近！危ない！応戦しろ", "eliminate"],
+    ["応戦しろ", "eliminate"],
     ["ゾンビが危険なら、退避して", "evade"],
     ["退避しないで倒して", "eliminate"],
     ["距離を取らないで攻撃して", "eliminate"],
@@ -72,6 +74,9 @@ describe("hostile response command", () => {
     ["原木を攻撃して", null],
     ["木を倒して、敵は近い", null],
     ["敵を倒せる？", null],
+    ["応戦できる？", null],
+    ["応戦してくれてありがとう", null],
+    ["応戦しないで", null],
     ["敵を倒さないで", null],
     ["撃滅は不要", null],
     ["討伐しなくていい", null],
@@ -148,47 +153,46 @@ describe("hostile response command", () => {
     },
   );
 
-  it("preempts the prior task and acts without waiting for an LLM refusal", async () => {
-    const events: string[] = [];
-    const deliberate = vi.fn();
-    const coordinator = new ChatCoordinator({
-      ownerUsername: "owner",
-      game: {
-        stopCurrentAction: vi.fn(async () => {
-          events.push("stop");
-          return { outcome: "completed", summary: "停止しました。" };
-        }),
-        respondToHostiles: vi.fn(async () => {
-          events.push("respond");
-          return {
-            before: null,
-            after: null,
-            outcome: "completed",
-            summary: "危険な相手から距離を取りました。",
-          };
-        }),
-        say: vi.fn(async (message: string) => {
-          events.push(`say:${message}`);
-        }),
-      } as unknown as GameController,
-      agent: { deliberate },
-      contextFactory: {} as ChatContextFactory,
-      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
-    });
+  it.each(["そいつらを撃滅せよ", "ファントム接近！危ない！応戦しろ"])(
+    "preempts the prior task for %s without waiting for an LLM refusal",
+    async (message) => {
+      const events: string[] = [];
+      const deliberate = vi.fn();
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: {
+          stopCurrentAction: vi.fn(async () => {
+            events.push("stop");
+            return { outcome: "completed", summary: "停止しました。" };
+          }),
+          respondToHostiles: vi.fn(async () => {
+            events.push("respond");
+            return {
+              before: null,
+              after: null,
+              outcome: "completed",
+              summary: "危険な相手から距離を取りました。",
+            };
+          }),
+          say: vi.fn(async (message: string) => {
+            events.push(`say:${message}`);
+          }),
+        } as unknown as GameController,
+        agent: { deliberate },
+        contextFactory: {} as ChatContextFactory,
+        logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      });
 
-    expect(await coordinator.handleChat("visitor", "そいつらを撃滅せよ")).toBe(
-      false,
-    );
-    expect(await coordinator.handleChat("owner", "そいつらを撃滅せよ")).toBe(
-      true,
-    );
-    expect(events).toEqual([
-      "stop",
-      "respond",
-      "say:危険な相手から距離を取りました。",
-    ]);
-    expect(deliberate).not.toHaveBeenCalled();
-  });
+      expect(await coordinator.handleChat("visitor", message)).toBe(false);
+      expect(await coordinator.handleChat("owner", message)).toBe(true);
+      expect(events).toEqual([
+        "stop",
+        "respond",
+        "say:危険な相手から距離を取りました。",
+      ]);
+      expect(deliberate).not.toHaveBeenCalled();
+    },
+  );
 
   it("lets an immediate stop cancel hostile response before its result is sent", async () => {
     let started!: () => void;
