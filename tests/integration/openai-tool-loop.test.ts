@@ -1756,7 +1756,7 @@ describe("OpenAI tool loop", () => {
       toolContext: context,
     });
     agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
-    await agent.deliberate({
+    const secondReply = await agent.deliberate({
       message: "集めて。",
       personaContext: "テスト人格",
       memoryContext: "なし",
@@ -1772,9 +1772,177 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[1]?.instructions).toContain(
       "同じ質問を繰り返さないでください",
     );
+    expect(secondReply.text).toContain("鉄を集める操作がないという説明は誤り");
     expect(fake.requests[1]?.instructions).toContain(
       "内部のkind、phase、status、error codeはそのまま利用者へ出さず",
     );
+  });
+
+  it("preserves the stopped action boundary in a capability explanation", async () => {
+    const stoppedExplanation =
+      "停止中なので今は鉄を集める操作を使えません。明示的な再開を待ちます。";
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([], stoppedExplanation),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const firstReply = await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+
+    const stoppedReply = await agent.deliberate({
+      message: "なぜ？",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(stoppedReply.text).toBe(stoppedExplanation);
+  });
+
+  it("starts a bounded safe plan when the model answers instead of acting on an authorized goal", async () => {
+    const fake = new ScriptedOpenAI([response([], "数量を指定してください。")]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "原木を適量集めて",
+      allowedResources: ["birch_log"],
+      targetItem: "*",
+      targetCount: 4,
+      maxCount: 16,
+      selectionRequired: true,
+    };
+    context.safeActionAuthorizationUsage = {
+      remainingCount: 4,
+      consumed: false,
+    };
+    const reply = await agent.deliberate({
+      message: "原木を適量集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(
+      reply.toolResults.some(({ name }) => name === "plan_safe_action"),
+    ).toBe(true);
+    expect(reply.text).not.toContain("数量を指定してください");
+    expect(fake.requests[0]?.instructions).toContain("今回実行してよい数量4個");
+  });
+
+  it("starts only the first bounded stage of a much larger goal", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "大量なので実行できません。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "鉄を2万個集めて",
+      allowedResources: ["iron_ore", "deepslate_iron_ore"],
+      targetItem: "raw_iron",
+      targetCount: 16,
+      maxCount: 16,
+      totalGoalCount: 20_000,
+    };
+    context.safeActionAuthorizationUsage = {
+      remainingCount: 16,
+      consumed: false,
+    };
+    const reply = await agent.deliberate({
+      message: "鉄を2万個集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(
+      reply.toolResults.some(({ name }) => name === "plan_safe_action"),
+    ).toBe(true);
+    expect(reply.text).toContain("全体目標20000個はまだ完了していません");
+    expect(fake.requests[0]?.instructions).toContain("今回は最初の16個");
+  });
+
+  it.each(["防具を装備して", "それを着れば？"])(
+    "equips armor for an authorized owner suggestion even when the model refuses: %s",
+    async (message) => {
+      const fake = new ScriptedOpenAI([
+        response([], "装備する操作はありません。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const context = toolContext();
+      context.armorEquipAuthorized = true;
+      context.armorEquipAuthorizationUsage = { consumed: false };
+      context.game.equipArmor = async () => ({
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "装備欄の変化を確認しました。",
+      });
+      const reply = await agent.deliberate({
+        message,
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+      expect(reply.toolResults).toMatchObject([{ name: "equip_armor" }]);
+      expect(reply.text).toContain("装備欄の変化を確認しました");
+      expect(reply.text).not.toContain("操作はありません");
+    },
+  );
+
+  it("does not turn a per-operation limit into a claim that the whole goal is impossible", async () => {
+    const fake = new ScriptedOpenAI([
+      response(
+        [],
+        "64個という上限を小分けで繰り返せば2万個には届くとは言えません。",
+      ),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const reply = await agent.deliberate({
+      message: "大量に集めることはできる？",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: toolContext(),
+    });
+    expect(reply.text).toContain("1回の資源操作は最大16個");
+    expect(reply.text).toContain("目標全体が不可能になるわけではありません");
   });
 
   it("revalidates function arguments and uses deterministic action failure reporting", async () => {

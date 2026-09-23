@@ -836,6 +836,16 @@ export class MemoryStore {
     return saved;
   }
 
+  public latestBotDeath(playerId: string): string | undefined {
+    this.requirePlayer(playerId);
+    const row = this.database
+      .prepare<[string], { observed_at: string }>(
+        "SELECT observed_at FROM episodes WHERE player_id = ? AND json_extract(details_json, '$.event') = 'bot_death' ORDER BY observed_at DESC LIMIT 1",
+      )
+      .get(playerId);
+    return row?.observed_at;
+  }
+
   public createTaskRun(input: CreateTaskRunInput): TaskRunRecord {
     if (input.playerId !== undefined) {
       this.requirePlayer(input.playerId);

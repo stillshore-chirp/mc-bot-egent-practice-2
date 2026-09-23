@@ -211,7 +211,9 @@ const resourceGoals: readonly ResourceGoal[] = [
 ];
 
 const affirmativeCollectionIntentPattern =
-  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|切(?:って|りたい|ろう)|伐採(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
+  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|切(?:って|りたい|ろう)|伐採(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう))(?:みて|ください|下さい|くれ|ほしい(?:です)?|欲しい(?:です)?|ね|よ|なさい|です)?[。！!]?$/iu;
+const englishCollectionIntentPattern =
+  /^(?:please\s+)?(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b/iu;
 const negatedCollectionIntentPattern =
   /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:切ら(?:ない|ず)|切るな|伐採しない|伐採するな)|(?:採ら|取ら)(?:ない|ず)|(?:集め|採掘し|掘っ|採取し|切っ|伐採し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const collectionPermissionQuestionPattern =
@@ -260,6 +262,16 @@ export function deriveOwnerGoalAuthorization(
   }
 
   const message = normalize(input.message);
+  const collectionRequest = (clause: string): boolean =>
+    affirmativeCollectionIntentPattern.test(clause) ||
+    englishCollectionIntentPattern.test(clause);
+  if (
+    /(?:やっぱり|やはり|訂正|撤回).{0,12}(?:やめ|中止|しないで|なし)|(?:とは|って)(?:言って(?:い)?ない|言ったわけではない)/u.test(
+      message,
+    )
+  ) {
+    return { outcome: "none" };
+  }
   const nowMs = input.nowMs ?? Date.now();
   const clauses = message
     .split(/[、，,。；;]+/u)
@@ -267,7 +279,7 @@ export function deriveOwnerGoalAuthorization(
     .filter((clause) => clause.length > 0);
   const affirmativeClauses = clauses.filter(
     (clause) =>
-      affirmativeCollectionIntentPattern.test(clause) &&
+      collectionRequest(clause) &&
       !negatedCollectionIntentPattern.test(clause) &&
       !collectionPermissionQuestionPattern.test(clause) &&
       !/[?？]/u.test(clause),
@@ -288,13 +300,16 @@ export function deriveOwnerGoalAuthorization(
       ? canonicalResourceId(goalClause)
       : undefined;
   const count = parseCount(goalClause);
-  const hasCollectionIntent =
-    affirmativeCollectionIntentPattern.test(goalClause);
+  const hasCollectionIntent = collectionRequest(goalClause);
+  const mentionsCollectionAction =
+    /(?:集めて|採掘して|掘って|採取して|切って|伐採して|持ってきて|取ってきて|作って|作成して|精錬して|\b(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu.test(
+      goalClause,
+    );
   const hasNegatedCollectionIntent =
     negatedCollectionIntentPattern.test(goalClause);
   const asksCollectionPermission =
     collectionPermissionQuestionPattern.test(goalClause) ||
-    (hasCollectionIntent && /[?？]/u.test(goalClause));
+    (mentionsCollectionAction && /[?？]/u.test(goalClause));
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
@@ -312,6 +327,18 @@ export function deriveOwnerGoalAuthorization(
       };
     }
     return authorizePendingGoal(pendingGoal, count, input.maxCount);
+  }
+
+  if (
+    pendingGoalValid &&
+    resource === undefined &&
+    isStandaloneDelegationReply(message)
+  ) {
+    return authorizePendingGoal(
+      pendingGoal,
+      delegatedCount(message, input.maxCount),
+      input.maxCount,
+    );
   }
 
   if (
@@ -374,7 +401,12 @@ export function deriveOwnerGoalAuthorization(
         "集める資源を具体的に指定してください（鉄、鉄インゴット、石炭、銅など）。",
     };
   }
-  if (count === undefined) {
+  const requestedCount =
+    count ??
+    (/[0-9]+\s*(?:秒|分|時間)/u.test(goalClause)
+      ? undefined
+      : delegatedCount(goalClause, input.maxCount));
+  if (requestedCount === undefined) {
     return {
       outcome: "clarify",
       question: `目的は${resource.label}の収集として理解しました。数量を指定してください（上限${String(input.maxCount)}個）。`,
@@ -392,13 +424,6 @@ export function deriveOwnerGoalAuthorization(
         "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
     };
   }
-  if (count > input.maxCount) {
-    return {
-      outcome: "clarify",
-      question: `指定数が上限を超えています。${resource.label}は${String(input.maxCount)}個以下で指定してください。`,
-    };
-  }
-
   return {
     outcome: "authorized",
     authorization: {
@@ -406,8 +431,11 @@ export function deriveOwnerGoalAuthorization(
       goal: goalClause,
       allowedResources: resource.allowedResources,
       targetItem: resource.targetItem,
-      targetCount: count,
+      targetCount: Math.min(requestedCount, input.maxCount),
       maxCount: input.maxCount,
+      ...(requestedCount > input.maxCount
+        ? { totalGoalCount: requestedCount }
+        : {}),
       ...(resource.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
@@ -425,12 +453,6 @@ function authorizePendingGoal(
         "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
     };
   }
-  if (count > maxCount) {
-    return {
-      outcome: "clarify",
-      question: `指定数が上限を超えています。${pendingGoal.label}は${String(maxCount)}個以下で指定してください。`,
-    };
-  }
   return {
     outcome: "authorized",
     authorization: {
@@ -438,8 +460,9 @@ function authorizePendingGoal(
       goal: pendingGoal.goal,
       allowedResources: pendingGoal.allowedResources,
       targetItem: pendingGoal.targetItem,
-      targetCount: count,
+      targetCount: Math.min(count, maxCount),
       maxCount,
+      ...(count > maxCount ? { totalGoalCount: count } : {}),
       ...(pendingGoal.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
@@ -478,13 +501,24 @@ function isPendingGoalValid(
 }
 
 function isStandaloneQuantityReply(message: string): boolean {
-  return /^(?:あと\s*)?(?:[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
+  return /^(?:あと\s*)?(?:(?:[0-9]{1,7}|[0-9]{1,3}\s*万)\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
     message,
   );
 }
 
+function isStandaloneDelegationReply(message: string): boolean {
+  return /^(?:少し(?:だけ)?|ちょっと(?:だけ)?|適量(?:で|だよ)?|いい感じに|任せる|任せた|お任せ|自分で考え(?:て|ろよ|てよ))(?:お願いします|お願い|ね)?[。！!]?$/u.test(
+    message,
+  );
+}
+
+function delegatedCount(message: string, maxCount: number): number {
+  const modestCount = /(?:少し|ちょっと)/u.test(message) ? 2 : 4;
+  return Math.min(modestCount, maxCount);
+}
+
 function hasCollectionQuantityUnit(message: string): boolean {
-  return /(?:[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
+  return /(?:(?:[0-9]|万)\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
     message,
   );
 }
@@ -523,7 +557,11 @@ function findNamedResource(
         normalize(right.alias).length - normalize(left.alias).length,
     )[0];
   if (named !== undefined) return named;
-  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(message)) {
+  if (
+    /木を(?:少し|ちょっと)?\s*(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(
+      message,
+    )
+  ) {
     const goal = resourceGoals[0];
     if (goal !== undefined) return { alias: "木", goal };
   }
@@ -559,15 +597,20 @@ function hasMultipleResourceMentions(
 function countMentions(message: string): number {
   const numeric = [
     ...message.matchAll(
-      /[0-9]{1,3}\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
+      /(?:[0-9]{1,7}|[0-9]{1,3}\s*万)\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
     ),
   ].length;
   return numeric + [...message.matchAll(/一\s*本/gu)].length;
 }
 
 function parseCount(message: string): number | undefined {
+  const tenThousands =
+    /(?:^|[^0-9])([0-9]{1,3})\s*万\s*(?:個|つ|本|枚|ブロック)(?=\s|$|[^0-9])/u.exec(
+      message,
+    );
+  if (tenThousands !== null) return Number(tenThousands[1]) * 10_000;
   const match =
-    /(?:^|[^0-9])([0-9]{1,3})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
+    /(?:^|[^0-9])([0-9]{1,7})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
       message,
     );
   if (match === null) return /一\s*本/u.test(message) ? 1 : undefined;

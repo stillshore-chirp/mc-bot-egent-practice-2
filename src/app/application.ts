@@ -254,6 +254,7 @@ class DefaultCompanionApplication implements CompanionApplication {
   readonly #traceService: TraceService | undefined;
   readonly #dashboard: DashboardHttpServer | undefined;
   #unsubscribeChat: (() => void) | undefined;
+  #unsubscribeDeath: (() => void) | undefined;
   #unsubscribeImmediateStop: (() => void) | undefined;
   #unsubscribeOwnerMessage: (() => void) | undefined;
   #reflexTimer: NodeJS.Timeout | undefined;
@@ -349,6 +350,27 @@ class DefaultCompanionApplication implements CompanionApplication {
   public async start(): Promise<void> {
     if (this.#started) return;
     await this.#startDashboard();
+    this.#unsubscribeDeath ??= this.#minecraft.onDeath((observedAt) => {
+      try {
+        this.#memory.recordEpisode({
+          playerId: this.#playerId,
+          summary:
+            "Bot自身が死亡した。復帰状態は現在のMinecraft観測で確認する。",
+          importance: 5,
+          source: "minecraft_observed",
+          details: { event: "bot_death" },
+          observedAt,
+        });
+      } catch (error) {
+        this.#logger.error(
+          {
+            code: "BOT_DEATH_MEMORY_SAVE_FAILED",
+            errorType: error instanceof Error ? error.name : "UnknownError",
+          },
+          "bot death memory persistence failed",
+        );
+      }
+    });
     await this.#connectMinecraft();
     this.#unsubscribeChat = this.#minecraft.onChat((username, message) => {
       void this.#coordinator
@@ -434,6 +456,8 @@ class DefaultCompanionApplication implements CompanionApplication {
     }
     this.#unsubscribeChat?.();
     this.#unsubscribeChat = undefined;
+    this.#unsubscribeDeath?.();
+    this.#unsubscribeDeath = undefined;
     const runtimeReassessmentsStopped = this.#runtimeReassessments.stop();
     const coordinatorStopped = this.#coordinator.shutdown();
     await Promise.all([

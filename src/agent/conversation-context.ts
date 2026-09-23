@@ -20,7 +20,8 @@ export type GoalActionFamily =
   | "craft"
   | "place"
   | "build"
-  | "smelt";
+  | "smelt"
+  | "equip";
 
 export interface ConversationSnapshot {
   readonly turns: readonly ConversationTurn[];

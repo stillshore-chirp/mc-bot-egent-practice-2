@@ -202,7 +202,7 @@ describe("owner goal quantity follow-up boundary", () => {
     const contextFactory = createFactory(calls);
     const first = await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "integration-pending-1",
       "owner_message",
@@ -240,7 +240,7 @@ describe("owner goal quantity follow-up boundary", () => {
     const contextFactory = createFactory([]);
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "integration-held-1",
       "owner_message",
@@ -255,5 +255,31 @@ describe("owner goal quantity follow-up boundary", () => {
 
     expect(held.toolContext.safeActionAuthorization).toBeUndefined();
     expect(held.toolContext.safeActionClarification).toContain("数量");
+  });
+
+  it("carries a delegated small quantity into the next owner request", async () => {
+    const contextFactory = createFactory([]);
+    await contextFactory.create(
+      "owner",
+      "原木を10秒集めて",
+      new AbortController().signal,
+      "integration-delegated-1",
+      "owner_message",
+    );
+    const delegated = await contextFactory.create(
+      "owner",
+      "適量だよ",
+      new AbortController().signal,
+      "integration-delegated-2",
+      "owner_message",
+    );
+
+    expect(delegated.toolContext.safeActionAuthorization).toMatchObject({
+      kind: "owner_bounded_resource",
+      targetItem: "*",
+      targetCount: 4,
+      maxCount: 64,
+      selectionRequired: true,
+    });
   });
 });

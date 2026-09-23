@@ -273,6 +273,26 @@ export const toolDefinitions = [
     },
   }),
   defineTool({
+    name: "equip_armor",
+    description:
+      "Bot自身の所持防具を、観測できた空き装備欄だけに着ける。既存装備は置換せず、装着後の状態を再観測する。",
+    input: noInput,
+    fixtures: { valid: [{}], invalid: [{ slot: "head" }] },
+    action: true,
+    execute: async (_input, context) =>
+      context.game.equipArmor === undefined
+        ? safeActionFailure(
+            "observation",
+            "ARMOR_EQUIP_UNAVAILABLE",
+            false,
+            "equip_armor",
+            {},
+            ["Bot自身の装備状態を確認する"],
+            "防具を着ける操作をこの接続で利用できません。",
+          )
+        : actionReportResult(await context.game.equipArmor(context.signal)),
+  }),
+  defineTool({
     name: "plan_safe_action",
     description:
       "利用者の目的を一度の計画にまとめ、実際に観測した候補から安全な複数手順を選んでその場で順に実行する。利用者へ個々のtool引数を再入力させない。候補不足・未対応の目的・保護対象・危険・権限不明では実行せず、理由と必要な確認を返す。",

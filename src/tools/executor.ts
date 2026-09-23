@@ -201,6 +201,19 @@ export class ToolExecutor {
         "操作引数がschemaに一致しないため実行しませんでした。",
       );
     }
+    if (name === "equip_armor") {
+      if (
+        context.armorEquipAuthorized !== true ||
+        context.armorEquipAuthorizationUsage?.consumed !== false
+      ) {
+        return failure(
+          "ARMOR_EQUIP_NOT_AUTHORIZED",
+          "authorization",
+          "防具を着ける明示依頼を確認できないため、装備は変えませんでした。",
+        );
+      }
+      context.armorEquipAuthorizationUsage.consumed = true;
+    }
     if (
       (name === "register_delivery_target" ||
         name === "forget_delivery_target") &&

@@ -212,6 +212,78 @@ describe("CompanionGameController", () => {
     }
   });
 
+  it("equips only empty slots after a direct request and verifies the slots", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        inventory: [
+          { name: "iron_helmet", count: 1 },
+          { name: "iron_chestplate", count: 1 },
+        ],
+        armor: {
+          head: null,
+          torso: "diamond_chestplate",
+          legs: null,
+          feet: null,
+        },
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.equipArmor(new AbortController().signal);
+      expect(report.outcome).toBe("completed");
+      expect(report.confirmedState).toMatchObject({ equippedSlots: ["head"] });
+      expect(minecraft.actions).toContain("equip:head:iron_helmet");
+      expect(minecraft.snapshot.armor).toMatchObject({
+        head: "iron_helmet",
+        torso: "diamond_chestplate",
+      });
+    } finally {
+      close();
+    }
+  });
+
+  it("does not equip armor while a hostile is nearby", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        inventory: [{ name: "iron_helmet", count: 1 }],
+        nearbyEntities: [hostile(1, 3)],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.equipArmor(new AbortController().signal);
+      expect(report).toMatchObject({
+        outcome: "failed",
+        failureCode: "ARMOR_EQUIP_UNSAFE",
+      });
+      expect(minecraft.actions).not.toContain("equip:head:iron_helmet");
+    } finally {
+      close();
+    }
+  });
+
+  it("does not report success from an unverified equip result", async () => {
+    class UnverifiedEquipMinecraft extends FakeMinecraft {
+      public override async equipAvailableArmor(signal: AbortSignal) {
+        signal.throwIfAborted();
+        return { equipped: ["head" as const], failed: false };
+      }
+    }
+    const minecraft = new UnverifiedEquipMinecraft(
+      createSnapshot({ inventory: [{ name: "iron_helmet", count: 1 }] }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.equipArmor(new AbortController().signal);
+      expect(report).toMatchObject({
+        outcome: "failed",
+        failureCode: "ARMOR_EQUIP_NOT_VERIFIED",
+      });
+    } finally {
+      close();
+    }
+  });
+
   it("retreats before equipping when a hostile is too close", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({
@@ -1019,7 +1091,10 @@ describe("CompanionGameController", () => {
     close();
   });
 
-  it("observes log candidates for a natural one-tree cutting request", async () => {
+  it.each([
+    ["木を一本切って持ってきて", 1],
+    ["近くの木を少し切って", 2],
+  ])("observes log candidates for %s", async (goal, count) => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push({
       name: "oak_log",
@@ -1028,11 +1103,11 @@ describe("CompanionGameController", () => {
     const { game, close } = createController(minecraft);
     try {
       const candidates = await game.findSafeActionCandidates(
-        { goal: "木を一本切って持ってきて", count: 1, maxCandidates: 4 },
+        { goal, count, maxCandidates: 4 },
         new AbortController().signal,
       );
       expect(candidates).toMatchObject([
-        { resourceName: "oak_log", requestedCount: 1 },
+        { resourceName: "oak_log", requestedCount: count },
       ]);
     } finally {
       close();

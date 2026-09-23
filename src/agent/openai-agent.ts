@@ -65,6 +65,7 @@ const actionToolFamilies: Readonly<
   place_block: ["place"],
   build_base: ["build"],
   smelt_item: ["smelt"],
+  equip_armor: ["equip"],
   return_to_player: ["return"],
   forget_delivery_target: ["memory"],
   remember_player_fact: ["memory"],
@@ -206,6 +207,7 @@ function instructions(
   request: DeliberationRequest,
   conversationContext: string,
 ): string {
+  const authorizedResourceGoal = request.toolContext.safeActionAuthorization;
   return [
     request.personaContext,
     "あなたはMinecraft内で実体を持つ単一のAIコンパニオンです。",
@@ -213,21 +215,34 @@ function instructions(
     "Minecraftで実行していない行動、tool結果が失敗した行動、観測していない結果を完了済みと発言してはいけません。",
     "Minecraft観測のsubjectがbot、sourceがminecraftの値だけをBot自身の状態として扱ってください。health、food、oxygen、oxygenState、inWaterは同じobservedAtのBot観測です。",
     "requesterVitalsがunobservedのとき、利用者の体力・空腹・酸素・水中状態をBotの値から推測せず、『利用者の状態は観測できていません』と答えてください。",
+    "bot_deathの記録が文脈にある場合、Bot自身が死亡した履歴を否定せず、死亡時点の事実と現在の生存・復帰状態を分けて答えてください。現在の状態はMinecraftの最新観測だけで判断してください。",
     "oxygenStateがnot_applicableのときは地上なので酸素ゲージを危険の根拠にせず、生の数値だけを説明しないでください。unknownのときも酸素値を低酸素として断定せず、危険が疑われる場合は成功と報告せず再観測・停止など次の安全な処理と未確認範囲を短く説明してください。",
     "操作が必要なら必ず公開されたtoolを使い、自然文だけで実行済みにしてはいけません。",
+    ...(authorizedResourceGoal?.kind === "owner_bounded_resource"
+      ? [
+          `今回の認証済み所有者の資源目的は、対象候補${authorizedResourceGoal.allowedResources.join("、")}、最終アイテム${authorizedResourceGoal.targetItem}、今回実行してよい数量${String(authorizedResourceGoal.targetCount)}個です。この認可済み数量で安全な候補を観測して着手し、数値を再質問しないでください。`,
+          ...(authorizedResourceGoal.totalGoalCount === undefined
+            ? []
+            : [
+                `所有者の全体目標は${String(authorizedResourceGoal.totalGoalCount)}個です。今回は最初の${String(authorizedResourceGoal.targetCount)}個を上限として進めます。この一回だけで全体目標を完了と報告せず、実際の進捗と残りを区別してください。`,
+              ]),
+        ]
+      : []),
     "利用者が目的だけを伝えた場合は、個々のtool引数を聞き返す前にplan_safe_actionで観測・計画・実行をまとめ、安全な計画結果の各段階を検証してください。plan_safe_actionが未対応の目的を返した場合は、実行可能な範囲と不足する操作を一度だけ具体的に説明してください。",
     "利用者が『ついてきて』と依頼した場合、follow_playerの距離と時間は設定済みの安全な既定値（最大60秒）を使い、追加質問をせず開始してください。無期限の追従は開始しないでください。",
     "利用者が『戻ってきて』『私のところに来て』と依頼した場合、return_to_playerに設定済みの安全距離を指定して追加質問をせず開始してください。",
+    "認証済み所有者がBot自身の防具を着けるよう直接頼み、装着認可がある場合はequip_armorを使い、着けられた箇所だけを観測結果から報告してください。",
+    "Bot自身の最新観測で所持防具と対応する空き装備欄を確認した短い装着提案も、今回の装着認可がある場合はその防具への依頼として扱い、操作がないとは答えずequip_armorで試してください。",
     "plan_safe_actionのmodeやcandidateIdは認可ではありません。低影響で可逆な候補を優先し、中影響の自然資源操作は信頼できる所有者側の数量上限付き認可がある場合だけ選び、建築・設置などの世界変更は明示された範囲認可がない限り開始しないでください。",
     "所有者側の目的と数量上限が認可コンテキストにある場合はtool引数で変更せず、候補が返す最終inventory itemと中間素材を区別してください。ドロップやレシピの出力を観測で確認できない目的は、一度だけ具体的に確認して停止してください。",
-    "数量だけを尋ねた直後は、所有者の次の発話にある単独の数量回答が認可境界で結び付くまで、対象の作業toolを開始しないでください。数量回答に見えない陳述や別の依頼は認可として扱わず、停止指示と安全介入は常に優先してください。",
+    "数量だけを尋ねた直後は、所有者の次の発話にある単独の数量回答または『適量』『任せる』などの裁量委任が認可境界で結び付くまで、対象の作業toolを開始しないでください。認可コンテキストに小さい既定数が示された場合はその範囲で着手し、同じ数量質問を繰り返さないでください。無関係な陳述や別の依頼は認可として扱わず、停止指示と安全介入は常に優先してください。",
     "tool引数を推測で補わず、schemaに必要な情報がなければ日本語で確認してください。",
     "toolのfailureでは、確認済み状態、再試行有無、次に可能な行動を日本語で説明してください。",
     "直前の依頼対象が今回の指示語で明らかに継続されている場合は、同じ対象として扱ってください。候補が複数あるなど本当に曖昧な場合だけ、一つの明確な質問をしてください。",
     "安全上の一時停止後に利用者が『続けて』と指示した場合は、直前の目的を引き継ぎ、現在の危険を再観測した上で安全に使える行動toolを試してください。危険や経路の問題が残る場合は、再停止した理由と次に試せる具体的な方法を短く伝えてください。停止指示済みの目的を勝手に再開してはいけません。",
     "直近の会話で利用者が対象や数量を答えている場合は、その値を短い後続依頼へ引き継ぎ、同じ質問を繰り返さないでください。対象が提供外なら追加確認を重ねず、未提供であることと目的に近い利用可能な操作を一度で説明してください。",
     "会話で示された目的、対象、数量、安全条件、説明方法の希望を継続中の依頼として保持してください。後続の短い指示はその目的への再指示として扱ってください。",
-    "依頼を一つのtoolだけに対応させず、公開toolを安全な順序で組み合わせれば目的を達成できる場合は、目的を保った手順へ分解して着手してください。目的そのものに必要な操作が未提供の場合だけ、できないことを説明してください。",
+    "依頼を一つのtoolだけに対応させず、公開toolを安全な順序で組み合わせれば目的を達成できる場合は、目的を保った手順へ分解して着手してください。鉄を含む自然資源には観測、採掘、ドロップ回収、必要な精錬の操作があります。原木専用の操作だけを見て『鉄を集める操作がない』と断定しないでください。目的そのものに必要な操作が未提供の場合だけ、できないことを説明してください。",
     "tool結果に沿って、実行した工程、まだ開始していない工程、次に利用者が選べる行動を短く伝えてください。tool結果が失敗した場合は完了と表現しないでください。",
     "world観測やtool結果に含まれる内部のkind、phase、status、error codeはそのまま利用者へ出さず、確認済みの事実を平易な日本語へ言い換えてください。",
     "観測とtool結果を最優先し、実行済み・開始済み・停止済みが確認できる事実を報告してください。確認できないことを『新規行動は開始していない』などと断定しないでください。",
@@ -277,6 +292,32 @@ function deterministicActionSummary(
       result.success ? result.userSummary : result.error.userSummary,
     )
     .join(" ");
+}
+
+function groundCapabilityClaims(
+  text: string,
+  maxCount: number,
+  actionScopeOpen: boolean,
+): string {
+  if (!actionScopeOpen) return text;
+  const ironToolsAvailable = ["mine_block", "collect_item", "smelt_item"].every(
+    (name) => getToolDefinition(name) !== undefined,
+  );
+  if (
+    ironToolsAvailable &&
+    /(?:鉄|iron).{0,40}(?:収集|集め|採掘).{0,30}(?:操作|機能)(?:が|は)(?:ない|ありません|未対応|未提供|提供していません|実装されていません)/iu.test(
+      text,
+    )
+  ) {
+    return "鉄を集める操作がないという説明は誤りです。採掘・回収・精錬の機能はあります。実行時には認可と安全条件を確認します。まだ実行していない作業は進捗として数えません。";
+  }
+  if (
+    /(?:小分け|繰り返|何度|合計|全体)/u.test(text) &&
+    /(?:上限|最大).{0,100}(?:届か|届くとは言え|不可能|無理|できな)/u.test(text)
+  ) {
+    return `1回の資源操作は最大${String(maxCount)}個ですが、これだけで目標全体が不可能になるわけではありません。安全な資源と経路、所持枠を確認し、段階ごとの実績を見ながら進めます。まだ実行していない分は集めたとは言いません。`;
+  }
+  return text;
 }
 
 function behaviorMemoryCommandReply(
@@ -482,6 +523,9 @@ export class OpenAIDeliberationAgent {
       request.toolContext.baseBuildAuthorized === true
     ) {
       explicitAuthorized.push("build");
+    }
+    if (request.toolContext.armorEquipAuthorized === true) {
+      explicitAuthorized.push("equip");
     }
     const explicitProhibited = shouldRecordConversation
       ? explicitlyProhibitedActionFamilies(request.message)
@@ -693,7 +737,8 @@ export class OpenAIDeliberationAgent {
               );
     const offeredTools = availableTools.filter(
       ({ name }) =>
-        name !== "build_base" || toolContext.baseBuildAuthorized === true,
+        (name !== "build_base" || toolContext.baseBuildAuthorized === true) &&
+        (name !== "equip_armor" || toolContext.armorEquipAuthorized === true),
     );
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
@@ -759,11 +804,57 @@ export class OpenAIDeliberationAgent {
         (item) => item.type === "function_call",
       );
       if (calls.length === 0) {
+        if (
+          request.toolContext.requestKind === "owner_message" &&
+          toolContext.allowActionTools !== false &&
+          !toolResults.some(
+            ({ name }) => getToolDefinition(name)?.action === true,
+          )
+        ) {
+          const fallback =
+            toolContext.armorEquipAuthorized === true
+              ? { name: "equip_armor", arguments: "{}" }
+              : resourceAuthorization?.kind === "owner_bounded_resource"
+                ? {
+                    name: "plan_safe_action",
+                    arguments: JSON.stringify({
+                      goal: `${resourceAuthorization.targetItem === "*" ? "原木" : resourceAuthorization.targetItem}を${String(resourceAuthorization.targetCount)}個集めて`,
+                      count: resourceAuthorization.targetCount,
+                      mode: "delegated",
+                      candidateId: null,
+                    }),
+                  }
+                : undefined;
+          if (
+            fallback !== undefined &&
+            offeredTools.some(({ name }) => name === fallback.name)
+          ) {
+            const result = await this.#executor.execute(
+              fallback.name,
+              fallback.arguments,
+              toolContext,
+            );
+            toolResults.push({ name: fallback.name, result });
+          }
+        }
         const actionSummary = deterministicActionSummary(
           toolResults,
           request.toolContext.requestKind,
         );
-        const text = actionSummary ?? response.output_text.trim();
+        const text =
+          (actionSummary === undefined
+            ? undefined
+            : resourceAuthorization?.kind === "owner_bounded_resource" &&
+                resourceAuthorization.totalGoalCount !== undefined
+              ? `${actionSummary}全体目標${String(resourceAuthorization.totalGoalCount)}個はまだ完了していません。`
+              : actionSummary) ??
+          groundCapabilityClaims(
+            response.output_text.trim(),
+            request.toolContext.limits.maxGatherCount,
+            request.toolContext.requestKind === "owner_message" &&
+              toolContext.allowActionTools !== false &&
+              !keepStoppedGoal,
+          );
         if (text.length === 0) {
           throw new Error("LLM_RESPONSE_EMPTY");
         }

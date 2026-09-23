@@ -5,6 +5,65 @@ export type ArmorQuestionSubject = "bot" | "requester";
 const armorName =
   /(?:防具|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ|兜|鎧)/u;
 const armorItem = /(?:_helmet|_chestplate|_leggings|_boots)$/u;
+
+export function hasWearableCarriedArmor(
+  status: GameStatus | undefined,
+): boolean {
+  if (
+    status === undefined ||
+    !status.connected ||
+    !status.spawned ||
+    status.armor === null ||
+    status.armor === undefined
+  )
+    return false;
+  const slots = [
+    ["head", "_helmet"],
+    ["torso", "_chestplate"],
+    ["legs", "_leggings"],
+    ["feet", "_boots"],
+  ] as const;
+  return slots.some(
+    ([slot, suffix]) =>
+      status.armor?.[slot] === null &&
+      Object.entries(status.inventory).some(
+        ([item, count]) => item.endsWith(suffix) && count > 0,
+      ),
+  );
+}
+
+/** A short suggestion can refer to the armor in the immediately prior reply. */
+export function isContextualArmorEquipSuggestion(message: string): boolean {
+  const text = message.trim();
+  if (
+    text.length > 40 ||
+    /[「」『』“”]|(?:ないで|なくていい|やめて|脱いで|外して|私|わたし|俺|僕|村人|他のプレイヤー|もし|仮に|どうなる|どう思う|着られる|できる)/u.test(
+      text,
+    )
+  )
+    return false;
+  return /^(?:(?:じゃあ|なら)[、，,\s]*)?(?:(?:それ(?:を)?|その防具(?:を)?|手持ちの防具(?:を)?)[、，,\s]*)?(?:(?:身に)?着(?:たら|れば|てみたら|てみて|よう|て)|(?:身に)?着け(?:たら|れば|てみたら|てみて|よう|て)|装備し(?:たら|てみたら|てみて|よう|て)|(?:つけ|付け)(?:たら|てみたら|てみて|よう|て))(?:どう)?[?？。！!]*$/u.test(
+    text,
+  );
+}
+
+/** A direct request to equip the bot's own carried armor, never a question. */
+export function isArmorEquipRequest(message: string): boolean {
+  const text = message.trim();
+  return (
+    armorName.test(text) &&
+    !/[?？]/u.test(text) &&
+    !/(?:ないで|なくていい|いらない|禁止|やめて|脱いで|外して|取り外して|してもいい|していい|着てもいい)/u.test(
+      text,
+    ) &&
+    !/(?:私|わたし|俺|僕|プレイヤー|利用者|村人|他のプレイヤー)(?:の|は|が|に|へ)/u.test(
+      text,
+    ) &&
+    /(?:装備し(?:て|ろ|なさい)|着用し(?:て|ろ)|(?:つけ|付け)(?:て|ろ)(?:みて|みな)?|着て)(?:ください|下さい|くれ|みて|みな|ね|よ)?[。！!]*$/u.test(
+      text,
+    )
+  );
+}
 const materialNames: Readonly<Record<string, string>> = {
   leather: "革",
   chainmail: "チェーン",

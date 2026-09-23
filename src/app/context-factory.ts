@@ -7,6 +7,11 @@ import type { TaskRuntime } from "../runtime/task-service.js";
 import type { CognitiveStage } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import { OwnerBehaviorMemoryLearner } from "../agent/behavior-memory-learning.js";
+import {
+  hasWearableCarriedArmor,
+  isArmorEquipRequest,
+  isContextualArmorEquipSuggestion,
+} from "../agent/armor-answer.js";
 import type {
   BehaviorMemoryPort,
   GameController,
@@ -190,6 +195,21 @@ export class CompanionContextFactory implements ChatContextFactory {
         );
         if (lifeState !== undefined) {
           contextLines.push(`[life_state] ${JSON.stringify(lifeState)}`);
+        }
+        const latestDeath =
+          typeof this.memoryStore.latestBotDeath === "function"
+            ? this.memoryStore.latestBotDeath(this.playerId)
+            : undefined;
+        if (latestDeath !== undefined) {
+          const ageMs = Date.now() - Date.parse(latestDeath);
+          if (
+            (ageMs >= 0 && ageMs <= 5 * 60_000) ||
+            /(?:死|死亡|亡くな|やられ|倒れ|リスポーン)/u.test(message)
+          ) {
+            contextLines.push(
+              `[bot_death] Bot自身が${latestDeath}に死亡した記録がある。現在の生存・復帰状態は最新のMinecraft観測で判断する。`,
+            );
+          }
         }
         let worldMemories = await safeWithTraceSpan(
           this.traceService,
@@ -441,6 +461,14 @@ export class CompanionContextFactory implements ChatContextFactory {
               ? {
                   behaviorMemoryCandidates: learned.candidates,
                   behaviorMemoryEventId: correlationId,
+                  ...(isArmorEquipRequest(message) ||
+                  (hasWearableCarriedArmor(status) &&
+                    isContextualArmorEquipSuggestion(message))
+                    ? {
+                        armorEquipAuthorized: true,
+                        armorEquipAuthorizationUsage: { consumed: false },
+                      }
+                    : {}),
                 }
               : {}),
             limits: {

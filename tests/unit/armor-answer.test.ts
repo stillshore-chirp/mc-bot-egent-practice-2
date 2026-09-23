@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyArmorQuestion,
+  hasWearableCarriedArmor,
+  isArmorEquipRequest,
+  isContextualArmorEquipSuggestion,
   renderArmorAnswer,
 } from "../../src/agent/armor-answer.js";
 import type { GameStatus } from "../../src/tools/contracts.js";
@@ -26,6 +29,58 @@ const status: GameStatus = {
 };
 
 describe("armor status answer", () => {
+  it("offers a short follow-up only when carried armor fits an empty observed slot", () => {
+    expect(hasWearableCarriedArmor(status)).toBe(true);
+    expect(
+      hasWearableCarriedArmor({
+        ...status,
+        armor: { head: "iron_helmet", torso: null, legs: null, feet: null },
+      }),
+    ).toBe(false);
+    expect(hasWearableCarriedArmor({ ...status, armor: null })).toBe(false);
+    expect(hasWearableCarriedArmor({ ...status, inventory: {} })).toBe(false);
+  });
+
+  it.each([
+    "それを着れば？",
+    "じゃあ、その防具を身に着けてみたら？",
+    "なら装備してみて",
+  ])("recognizes a contextual equipment suggestion: %s", (message) =>
+    expect(isContextualArmorEquipSuggestion(message)).toBe(true),
+  );
+  it.each([
+    "着たらどうなる？",
+    "私が着れば？",
+    "着なくていい",
+    "さっきの話を説明して",
+  ])(
+    "does not treat a hypothetical or unrelated phrase as equipment: %s",
+    (message) => {
+      expect(isContextualArmorEquipSuggestion(message)).toBe(false);
+    },
+  );
+
+  it.each([
+    "渡した防具、つけてみな",
+    "持っている防具を装備して",
+    "鉄のヘルメットを着て",
+  ])("recognizes a direct bot armor request: %s", (message) => {
+    expect(isArmorEquipRequest(message)).toBe(true);
+  });
+
+  it.each([
+    "防具を装備してる？",
+    "防具を装備してもいい？",
+    "防具を装備しないで",
+    "私の防具を装備して",
+    "村人の防具を装備して",
+    "防具を脱いで",
+    "防具着てないよ",
+    "防具を着てくれてありがとう",
+    "その防具を着ている姿いいね",
+  ])("does not turn non-requests into armor actions: %s", (message) => {
+    expect(isArmorEquipRequest(message)).toBe(false);
+  });
   it("routes status questions but leaves equipment commands and permission questions alone", () => {
     expect(classifyArmorQuestion("防具を装備してる？")).toBe("bot");
     expect(classifyArmorQuestion("今の防具の装備状態を教えて")).toBe("bot");

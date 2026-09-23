@@ -553,6 +553,7 @@ export class MineflayerClient implements MinecraftPort {
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
   >();
+  private readonly deathListeners = new Set<(observedAt: string) => void>();
   private readonly disconnectListeners = new Set<(reason: string) => void>();
 
   public constructor(
@@ -605,6 +606,11 @@ export class MineflayerClient implements MinecraftPort {
       )
         return;
       for (const listener of this.chatListeners) listener(username, message);
+    });
+    bot.on("death", () => {
+      if (this.botInstance !== bot || this.intentionalDisconnect) return;
+      const observedAt = new Date().toISOString();
+      for (const listener of this.deathListeners) listener(observedAt);
     });
     bot.on("end", (reason) => {
       this.spawned = false;
@@ -708,6 +714,11 @@ export class MineflayerClient implements MinecraftPort {
   ): () => void {
     this.chatListeners.add(listener);
     return () => this.chatListeners.delete(listener);
+  }
+
+  public onDeath(listener: (observedAt: string) => void): () => void {
+    this.deathListeners.add(listener);
+    return () => this.deathListeners.delete(listener);
   }
 
   public onDisconnected(listener: (reason: string) => void): () => void {

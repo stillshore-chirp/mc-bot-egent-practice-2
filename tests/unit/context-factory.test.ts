@@ -6,7 +6,11 @@ import type { MemoryStore } from "../../src/memory/store.js";
 import type { PersonaCore } from "../../src/persona/persona.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
-import type { GameController, MemoryPort } from "../../src/tools/contracts.js";
+import type {
+  GameController,
+  GameStatus,
+  MemoryPort,
+} from "../../src/tools/contracts.js";
 
 const status = {
   connected: true,
@@ -61,7 +65,10 @@ const persona: PersonaCore = {
   prohibitions: ["未確認の成功を断定しない"],
 };
 
-function factory(): CompanionContextFactory {
+function factory(
+  latestBotDeath?: string,
+  statusOverride: Partial<GameStatus> = {},
+): CompanionContextFactory {
   const memoryStore = {
     getRelationship: () => ({
       playerId: "player",
@@ -71,12 +78,13 @@ function factory(): CompanionContextFactory {
       updatedAt: new Date().toISOString(),
     }),
     getLifeState: () => undefined,
+    latestBotDeath: () => latestBotDeath,
     searchWorldMemories: () => [],
     listRecentTaskRuns: () => [],
     recall: () => [],
   } as unknown as MemoryStore;
   const game = {
-    observeStatus: async () => status,
+    observeStatus: async () => ({ ...status, ...statusOverride }),
   } as unknown as GameController;
   return new CompanionContextFactory(
     config,
@@ -90,6 +98,91 @@ function factory(): CompanionContextFactory {
 }
 
 describe("CompanionContextFactory owner action boundary", () => {
+  it("includes an observed death for a recent event or an explicit death reference", async () => {
+    const recent = await factory(new Date().toISOString()).create(
+      "owner",
+      "何が起きた？",
+      new AbortController().signal,
+      "recent-death",
+      "owner_message",
+    );
+    expect(recent.memoryContext).toContain("[bot_death]");
+
+    const olderDeath = "2026-01-01T00:00:00.000Z";
+    const recalled = await factory(olderDeath).create(
+      "owner",
+      "前に死んだことを覚えてる？",
+      new AbortController().signal,
+      "death-history",
+      "owner_message",
+    );
+    expect(recalled.memoryContext).toContain(olderDeath);
+    const unrelated = await factory(olderDeath).create(
+      "owner",
+      "木を見てきて",
+      new AbortController().signal,
+      "old-death-unrelated",
+      "owner_message",
+    );
+    expect(unrelated.memoryContext).not.toContain("[bot_death]");
+  });
+
+  it("authorizes only a direct owner request to equip carried armor", async () => {
+    const contextFactory = factory();
+    const allowed = await contextFactory.create(
+      "owner",
+      "渡した防具、つけてみな",
+      new AbortController().signal,
+      "armor-direct",
+      "owner_message",
+    );
+    expect(allowed.toolContext.armorEquipAuthorized).toBe(true);
+    expect(allowed.toolContext.armorEquipAuthorizationUsage).toEqual({
+      consumed: false,
+    });
+    for (const [username, message] of [
+      ["owner", "防具を装備してもいい？"],
+      ["owner", "防具を装備しないで"],
+      ["other", "防具を装備して"],
+    ] as const) {
+      const rejected = await factory().create(
+        username,
+        message,
+        new AbortController().signal,
+        "armor-rejected",
+        "owner_message",
+      );
+      expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
+    }
+  });
+  it("uses freshly observed wearable armor for a short owner suggestion only", async () => {
+    const message = "それを着れば？";
+    const wearable = {
+      inventory: { iron_helmet: 1 },
+      armor: { head: null, torso: null, legs: null, feet: null },
+    };
+    const allowed = await factory(undefined, wearable).create(
+      "owner",
+      message,
+      new AbortController().signal,
+      "armor-followup",
+      "owner_message",
+    );
+    expect(allowed.toolContext.armorEquipAuthorized).toBe(true);
+    for (const [username, observed] of [
+      ["owner", {}],
+      ["other", wearable],
+    ] as const) {
+      const rejected = await factory(undefined, observed).create(
+        username,
+        message,
+        new AbortController().signal,
+        "armor-followup-rejected",
+        "owner_message",
+      );
+      expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
+    }
+  });
   it("binds a house request to the dedicated build scope without resource-goal clarification", async () => {
     const allowed = await factory().create(
       "owner",
@@ -204,7 +297,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     const first = await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-pending-1",
       "owner_message",
@@ -247,7 +340,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-clear-1",
       "owner_message",
@@ -273,7 +366,7 @@ describe("CompanionContextFactory owner action boundary", () => {
 
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-clear-4",
       "owner_message",
@@ -293,7 +386,7 @@ describe("CompanionContextFactory owner action boundary", () => {
     const contextFactory = factory();
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "correlation-third-party-1",
       "owner_message",

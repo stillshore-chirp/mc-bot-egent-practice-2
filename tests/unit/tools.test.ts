@@ -208,6 +208,7 @@ describe("tool schema registry", () => {
       "forget_behavior_memory",
       "observe_status",
       "observe_surroundings",
+      "equip_armor",
       "plan_safe_action",
       "select_safe_resource",
       "observe_action_candidates",
@@ -270,6 +271,40 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("requires one direct owner authorization to equip armor", async () => {
+    const executor = new ToolExecutor();
+    const toolContext = context();
+    let calls = 0;
+    toolContext.game.equipArmor = async () => {
+      calls += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "装備欄の変化を確認しました。",
+      };
+    };
+    expect(
+      await executor.execute("equip_armor", "{}", toolContext),
+    ).toMatchObject({
+      success: false,
+      error: { code: "ARMOR_EQUIP_NOT_AUTHORIZED" },
+    });
+    toolContext.armorEquipAuthorized = true;
+    toolContext.armorEquipAuthorizationUsage = { consumed: false };
+    expect(
+      await executor.execute("equip_armor", "{}", toolContext),
+    ).toMatchObject({
+      success: true,
+    });
+    expect(
+      await executor.execute("equip_armor", "{}", toolContext),
+    ).toMatchObject({
+      success: false,
+      error: { code: "ARMOR_EQUIP_NOT_AUTHORIZED" },
+    });
+    expect(calls).toBe(1);
+  });
   it("requires a trusted owner-message grant for base construction", async () => {
     const executor = new ToolExecutor();
     const denied = await executor.execute("build_base", "{}", context());
