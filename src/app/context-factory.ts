@@ -195,7 +195,11 @@ export class CompanionContextFactory implements ChatContextFactory {
             `[latest_task] 最新の作業結果: ${task.kind} ${task.status}/${task.phase}${task.failure === undefined ? "" : ` failure=${task.failure.code}`} (${task.updatedAt})`,
           );
         }
+        const canReadBehaviorMemory =
+          requestKind === "runtime_reassessment" ||
+          requesterUsername === this.config.ownerUsername;
         const behaviorMemories =
+          canReadBehaviorMemory &&
           typeof this.memoryStore.listBehaviorMemories === "function"
             ? await safeWithTraceSpan(
                 this.traceService,

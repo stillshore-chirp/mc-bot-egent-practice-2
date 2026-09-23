@@ -276,6 +276,36 @@ describe("behavior memory runtime integration", () => {
     }
   });
 
+  it("keeps owner behavior memory out of a non-owner context", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "mc-behavior-owner-boundary-"),
+    );
+    const path = join(directory, "memory.sqlite");
+    const store = SqliteMemoryStore.open(path);
+    try {
+      const player = store.getOrCreatePlayer("owner");
+      await factory(store, player.id).create(
+        "owner",
+        "今後は短く説明して",
+        new AbortController().signal,
+        "owner-boundary-event-0001",
+        "owner_message",
+      );
+      const otherContext = await factory(store, player.id).create(
+        "other",
+        "状態を確認して",
+        new AbortController().signal,
+        "owner-boundary-event-0002",
+        "owner_message",
+      );
+      expect(otherContext.memoryContext).not.toContain("[behavior_preference:");
+      expect(store.listBehaviorMemories(player.id)).toHaveLength(1);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("supports owner list, correction, and forgetting through the registered tools", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mc-behavior-tools-"));
     const path = join(directory, "memory.sqlite");
