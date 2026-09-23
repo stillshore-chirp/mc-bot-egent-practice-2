@@ -837,6 +837,26 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("observes log candidates for a natural one-tree cutting request", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const candidates = await game.findSafeActionCandidates(
+        { goal: "木を一本切って持ってきて", count: 1, maxCandidates: 4 },
+        new AbortController().signal,
+      );
+      expect(candidates).toMatchObject([
+        { resourceName: "oak_log", requestedCount: 1 },
+      ]);
+    } finally {
+      close();
+    }
+  });
+
   it("finds the authorized log species behind other nearby logs", async () => {
     const minecraft = new FakeMinecraft();
     for (let index = 0; index < 8; index += 1) {

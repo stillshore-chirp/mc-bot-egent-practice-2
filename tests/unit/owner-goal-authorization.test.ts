@@ -82,6 +82,34 @@ describe("owner goal authorization", () => {
     }
   });
 
+  it.each([
+    "木を一本切って持ってきて。種類は任せる。",
+    "木を1本切って、種類は任せる",
+  ])(
+    "treats a one-tree cutting request as one bounded log goal: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+      ).toMatchObject({
+        outcome: "authorized",
+        authorization: {
+          targetItem: "*",
+          targetCount: 1,
+          selectionRequired: true,
+        },
+      });
+    },
+  );
+
+  it.each(["木を一本切らないで", "木を1本切ってもいい？", "木の家を1つ作って"])(
+    "does not authorize a non-command tree mention: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }).outcome,
+      ).not.toBe("authorized");
+    },
+  );
+
   it("keeps a specific wood alias ahead of its generic substring", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,

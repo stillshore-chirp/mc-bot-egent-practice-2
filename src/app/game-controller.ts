@@ -100,12 +100,15 @@ const resourceLabels: Readonly<Record<string, string>> = {
 };
 
 const resourceCollectionIntent =
-  /(集め|集める|集めて|採取|採掘|掘る|掘って|持ってき|取ってき|collect|gather|mine|obtain|fetch|harvest)/iu;
+  /(集め|集める|集めて|採取|採掘|掘る|掘って|切る|切って|伐採|持ってき|取ってき|collect|gather|mine|obtain|fetch|harvest)/iu;
 
 function isResourceCollectionGoal(goal: string): boolean {
   const normalized = goal.trim().toLocaleLowerCase("ja-JP");
   if (normalized === "collect_resource") return true;
   if (!resourceCollectionIntent.test(normalized)) return false;
+  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(normalized)) {
+    return true;
+  }
   return Object.entries(resourceLabels).some(([resource, label]) => {
     const canonical = resource.replaceAll("_", " ");
     return (
