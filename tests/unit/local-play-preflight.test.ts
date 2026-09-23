@@ -15,6 +15,7 @@ async function fixture(
     mode?: string;
     difficulty?: string;
     bind?: string;
+    port?: string;
     ownerMode?: number;
     opLevel?: number;
   } = {},
@@ -27,7 +28,7 @@ async function fixture(
       `gamemode=${options.mode ?? "survival"}`,
       `difficulty=${options.difficulty ?? "normal"}`,
       `server-ip=${options.bind ?? "127.0.0.1"}`,
-      "server-port=25565",
+      `server-port=${options.port ?? "25565"}`,
       "force-gamemode=false",
       "level-name=world",
     ].join("\n"),
@@ -106,5 +107,39 @@ describe("local play preflight", () => {
       savedOwnerModeMatches: true,
       ownerOpLevel: null,
     });
+  });
+
+  it("accepts equivalent loopback addresses and numeric port spellings", async () => {
+    const directory = await fixture({ bind: "0:0:0:0:0:0:0:1" });
+    const report = await inspectLocalPlay(
+      directory,
+      "OWNER_USERNAME=ExampleOwner\nMINECRAFT_HOST=::1\nMINECRAFT_PORT=025565\n",
+      "survival",
+      "normal",
+    );
+    expect(report.localOnly).toBe(true);
+    expect(report.portMatches).toBe(true);
+
+    const ipv4Directory = await fixture({ bind: "127.0.0.2" });
+    const ipv4Report = await inspectLocalPlay(
+      ipv4Directory,
+      "OWNER_USERNAME=ExampleOwner\nMINECRAFT_HOST=127.0.0.3\nMINECRAFT_PORT=25565.0\n",
+      "survival",
+      "normal",
+    );
+    expect(ipv4Report.localOnly).toBe(true);
+    expect(ipv4Report.portMatches).toBe(true);
+  });
+
+  it("explains peaceful when the actual default is survival despite another expected mode", async () => {
+    const directory = await fixture({ difficulty: "peaceful" });
+    const report = await inspectLocalPlay(
+      directory,
+      "OWNER_USERNAME=ExampleOwner\nMINECRAFT_HOST=localhost\n",
+      "creative",
+      "peaceful",
+    );
+    expect(report.peacefulSurvival).toBe(true);
+    expect(report.modeMatches).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 import { parse as parseEnvironment } from "dotenv";
@@ -72,6 +73,19 @@ function sameName(value: unknown, ownerName: string): boolean {
   return typeof value === "string" && value.toLowerCase() === ownerName.toLowerCase();
 }
 
+function isLoopback(host: string): boolean {
+  if (host.toLowerCase() === "localhost") return true;
+  if (isIP(host) === 4) return host.startsWith("127.");
+  if (isIP(host) !== 6) return false;
+  const normalized = new URL(`http://[${host}]/`).hostname;
+  return normalized === "[::1]" || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+}
+
+function normalizePort(value: string): number | null {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65_535 ? port : null;
+}
+
 export async function inspectLocalPlay(
   serverDir: string,
   environmentContents: string,
@@ -87,12 +101,12 @@ export async function inspectLocalPlay(
   );
   const defaultMode = gameMode(properties.gamemode);
   const serverDifficulty = difficulty(properties.difficulty);
-  const localHosts = new Set(["localhost", "127.0.0.1", "::1"]);
   const localOnly =
-    localHosts.has((env.MINECRAFT_HOST ?? "").toLowerCase()) &&
-    localHosts.has((properties["server-ip"] ?? "").toLowerCase());
-  const portMatches =
-    (env.MINECRAFT_PORT ?? "25565") === (properties["server-port"] ?? "25565");
+    isLoopback(env.MINECRAFT_HOST ?? "") &&
+    isLoopback(properties["server-ip"] ?? "");
+  const clientPort = normalizePort(env.MINECRAFT_PORT ?? "25565");
+  const serverPort = normalizePort(properties["server-port"] ?? "25565");
+  const portMatches = clientPort !== null && clientPort === serverPort;
 
   const cache = await readJsonListIfPresent(join(serverDir, "usercache.json"));
   const owner = cache.find((entry) => sameName(entry.name, ownerName));
@@ -134,7 +148,11 @@ export async function inspectLocalPlay(
       savedOwnerMode === expectedMode ||
       properties["force-gamemode"] === "true",
     difficultyMatches: serverDifficulty === expectedDifficulty,
-    peacefulSurvival: expectedMode === "survival" && serverDifficulty === "peaceful",
+    peacefulSurvival:
+      serverDifficulty === "peaceful" &&
+      (expectedMode === "survival" ||
+        defaultMode === "survival" ||
+        savedOwnerMode === "survival"),
   };
 }
 
