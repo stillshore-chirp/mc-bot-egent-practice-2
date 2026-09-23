@@ -333,9 +333,10 @@ function behaviorMemoryCommandArguments(
   };
 }
 
-function confirmedBehaviorCorrection(
+function confirmedBehaviorPreference(
   result: ToolResult<unknown>,
   candidates: readonly BehaviorMemoryExtraction[],
+  correction: boolean,
 ): string {
   if (!result.success) {
     return "訂正内容の保存を確認できませんでした。次回も反映されるとはまだ言えません。";
@@ -359,7 +360,7 @@ function confirmedBehaviorCorrection(
     ),
   );
   return confirmed
-    ? `好みを訂正して記憶しました。${candidates.map((candidate) => candidate.summary).join("、")}。`
+    ? `好みを${correction ? "訂正して" : ""}記憶しました。${candidates.map((candidate) => candidate.summary).join("、")}。`
     : "訂正内容の保存を確認できませんでした。次回も反映されるとはまだ言えません。";
 }
 
@@ -569,16 +570,20 @@ export class OpenAIDeliberationAgent {
     ];
     const toolResults: { name: string; result: ToolResult<unknown> }[] = [];
     if (request.toolContext.requestKind === "owner_message") {
-      const correctionCandidates =
-        request.toolContext.behaviorMemoryCandidates?.filter(
-          (candidate) => candidate.source === "owner_correction",
-        ) ?? [];
-      if (
-        correctionCandidates.length > 0 &&
-        /^(?:訂正|修正)(?:します|して|したい)?[。,:：\s]*/u.test(
+      const preferenceCandidates =
+        request.toolContext.behaviorMemoryCandidates ?? [];
+      const explicitPreference =
+        /^(?:今後|これから|次から|いつも|覚えて|記憶して)/u.test(
           request.message.trim(),
-        ) &&
-        !/(?:次に|それから|その後|ついでに)/u.test(request.message)
+        );
+      const correction = /^(?:訂正|修正)/u.test(request.message.trim());
+      if (
+        preferenceCandidates.length > 0 &&
+        (explicitPreference || correction) &&
+        request.toolContext.safeActionAuthorization === undefined &&
+        !/(?:次に|それから|その後|ついでに|採掘|伐採|木を切|木を倒|集めて|持ってきて|クラフト|作って|移動|ついてきて|来て|戻って|倒して|攻撃|装備|建て|設置|置いて|回収)/u.test(
+          request.message,
+        )
       ) {
         const result = await this.#executor.execute(
           "list_behavior_memory",
@@ -590,7 +595,11 @@ export class OpenAIDeliberationAgent {
         );
         toolResults.push({ name: "list_behavior_memory", result });
         return {
-          text: confirmedBehaviorCorrection(result, correctionCandidates),
+          text: confirmedBehaviorPreference(
+            result,
+            preferenceCandidates,
+            correction,
+          ),
           toolResults,
           ...(conversationRequestId === undefined
             ? {}

@@ -247,6 +247,23 @@ describe("OpenAI tool loop", () => {
     expect(remember).not.toHaveBeenCalled();
     expect(correct).not.toHaveBeenCalled();
 
+    const candidate = context.behaviorMemoryCandidates[0];
+    if (candidate === undefined)
+      throw new Error("missing correction candidate");
+    context.behaviorMemoryCandidates = [
+      { ...candidate, source: "owner_explicit" },
+    ];
+    const preference = await agent.deliberate({
+      message: "今後は説明を詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(preference.text).toContain("好みを記憶しました");
+    expect(preference.text).not.toContain("保存を確認できませんでした");
+    expect(fake.requests).toHaveLength(0);
+
     list.mockReturnValueOnce([]);
     const unconfirmed = await agent.deliberate({
       message: "訂正します。説明は短くじゃなくて詳しくしてください。",
