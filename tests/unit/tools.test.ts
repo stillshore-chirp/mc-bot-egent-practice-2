@@ -610,6 +610,95 @@ describe("ToolExecutor", () => {
     expect(attempts).toBe(1);
   });
 
+  it("tries another observed ore after a verified pre-dig path failure", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    const attempted: number[] = [];
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal: attempted.includes(2) ? 1 : 0 },
+    });
+    toolContext.game.findSafeActionCandidates = async () =>
+      [1, 2].map((index) => ({
+        id: `ore-${String(index)}`,
+        label: `石炭鉱石${String(index)}`,
+        action: "mine_block" as const,
+        observed: true as const,
+        purposeFit: "direct" as const,
+        permission: "allowed" as const,
+        safety: "allowed" as const,
+        reversible: false,
+        impact: "medium" as const,
+        operationClass: "natural_resource" as const,
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: index,
+        steps: [
+          {
+            tool: "mine_block",
+            input: {
+              name: "coal_ore",
+              position: { x: index, y: 64, z: 0 },
+            },
+          },
+        ],
+      }));
+    toolContext.game.mineBlock = async (input) => {
+      attempted.push(input.position.x);
+      return input.position.x === 1
+        ? {
+            before: status,
+            after: status,
+            outcome: "failed",
+            failureCategory: "path",
+            failureCode: "MINE_APPROACH_PATH_BLOCKED",
+            confirmedState: { blockMutationStarted: false },
+            summary: "到達できませんでした。",
+          }
+        : {
+            before: status,
+            after: { ...status, inventory: { coal: 1 } },
+            outcome: "completed",
+            confirmedState: {
+              item: "coal",
+              requestedCount: 1,
+              collectedCount: 1,
+              heldCount: 1,
+            },
+            summary: "所持品の増加を確認しました。",
+          };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1, candidateId: "ore-2" },
+    });
+    expect(attempted).toEqual([1, 2]);
+  });
+
   it("executes every bounded plan step without a second owner prompt", async () => {
     const calls: string[] = [];
     const toolContext = context();

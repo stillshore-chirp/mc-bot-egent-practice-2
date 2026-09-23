@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CompanionGameController } from "../../src/app/game-controller.js";
+import { AppError } from "../../src/domain/errors.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { FollowPlayerSkill } from "../../src/skills/follow-player.js";
@@ -289,6 +290,52 @@ describe("general safe actions", () => {
     ).rejects.toMatchObject({ detail: { code: "UNSUPPORTED_BLOCK_DROP" } });
     expect(minecraft.actions).toEqual([]);
     close();
+  });
+
+  it("distinguishes a blocked approach from a path failure after digging", async () => {
+    const target = { name: "iron_ore", position: { x: 2, y: 63, z: 0 } };
+    const pathFailure = () =>
+      new AppError({
+        category: "path",
+        code: "PATHFINDER_FAILED",
+        message: "path blocked",
+        retryable: true,
+        failedAt: "pathfinder",
+      });
+    const beforeDig = new FakeMinecraft();
+    beforeDig.resources.push(target);
+    beforeDig.moveTo = async () => {
+      throw pathFailure();
+    };
+    const first = controller(beforeDig);
+    const blocked = await first.game.mineBlock(
+      target,
+      new AbortController().signal,
+    );
+    expect(blocked).toMatchObject({
+      outcome: "failed",
+      failureCode: "MINE_APPROACH_PATH_BLOCKED",
+      confirmedState: { blockMutationStarted: false },
+    });
+    expect(beforeDig.resources).toContainEqual(target);
+    first.close();
+
+    const afterDig = new FakeMinecraft();
+    afterDig.resources.push(target);
+    afterDig.collectDropsNear = async () => {
+      throw pathFailure();
+    };
+    const second = controller(afterDig);
+    const pickupBlocked = await second.game.mineBlock(
+      target,
+      new AbortController().signal,
+    );
+    expect(pickupBlocked).toMatchObject({
+      outcome: "failed",
+      failureCode: "PATHFINDER_FAILED",
+    });
+    expect(afterDig.resources).not.toContainEqual(target);
+    second.close();
   });
 
   it("verifies craft, place, and smelt outputs through observed state", async () => {

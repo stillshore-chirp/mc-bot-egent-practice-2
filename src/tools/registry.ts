@@ -979,6 +979,21 @@ export const toolDefinitions = [
               replanAfterCandidateFailure = true;
               break;
             }
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
+              planned.candidate.action === "mine_block" &&
+              step.tool === "mine_block" &&
+              !actionStepCompleted &&
+              result.error.code === "MINE_APPROACH_PATH_BLOCKED" &&
+              result.error.confirmedState.blockMutationStarted === false
+            ) {
+              failedCandidateIds.add(planned.candidate.id);
+              completedCandidateIds.pop();
+              planReasons.pop();
+              replanAfterCandidateFailure = true;
+              break;
+            }
             return safeActionFailure(
               result.error.category,
               "SAFE_ACTION_STEP_FAILED",

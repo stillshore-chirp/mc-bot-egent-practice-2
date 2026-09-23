@@ -1058,8 +1058,25 @@ export class CompanionGameController implements GameController {
           input,
           signal,
           async (actionSignal) => {
-            await this.#minecraft.moveTo(input.position, 3, actionSignal);
-            await this.#minecraft.mineBlock(input, actionSignal);
+            try {
+              await this.#minecraft.moveTo(input.position, 3, actionSignal);
+              await this.#minecraft.mineBlock(input, actionSignal);
+            } catch (error) {
+              if (
+                error instanceof AppError &&
+                error.detail.category === "path"
+              ) {
+                throw new AppError(
+                  {
+                    ...error.detail,
+                    code: "MINE_APPROACH_PATH_BLOCKED",
+                    confirmedState: { blockMutationStarted: false },
+                  },
+                  { cause: error },
+                );
+              }
+              throw error;
+            }
             await this.#minecraft.collectDropsNear(
               input.position,
               itemName,
