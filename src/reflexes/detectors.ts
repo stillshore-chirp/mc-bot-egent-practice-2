@@ -150,16 +150,20 @@ export class ReflexDetector {
 }
 
 export function isStableAfterIncident(
-  kind: ReflexKind,
+  incident: ReflexIncident,
   snapshot: WorldSnapshot,
   thresholds: ReflexThresholds,
 ): boolean {
-  switch (kind) {
+  switch (incident.kind) {
     case "hazard":
       return (
         !snapshot.inLava &&
         !snapshot.onFire &&
         !snapshot.suffocating &&
+        (incident.observation.inWater &&
+        incident.observation.oxygenState !== "normal"
+          ? !snapshot.inWater
+          : true) &&
         (!snapshot.inWater ||
           (snapshot.oxygenState !== "low" &&
             snapshot.oxygenState !== "unknown" &&

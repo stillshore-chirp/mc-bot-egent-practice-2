@@ -136,9 +136,7 @@ export class ReflexCoordinator {
       );
       const afterSnapshot = await this.minecraft.observe();
       after = reflexObservation(afterSnapshot);
-      if (
-        !isStableAfterIncident(incident.kind, afterSnapshot, this.thresholds)
-      ) {
+      if (!isStableAfterIncident(incident, afterSnapshot, this.thresholds)) {
         throw new AppError({
           category: "safety",
           code: "REFLEX_NOT_STABLE",

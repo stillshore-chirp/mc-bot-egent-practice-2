@@ -507,6 +507,130 @@ describe("Mineflayer player observation", () => {
     });
   });
 
+  it("keeps swimming until it leaves water and then releases controls", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      const low = { inWater: true, oxygenState: "low" } as Awaited<
+        ReturnType<MineflayerClient["observe"]>
+      >;
+      const dry = { inWater: false, oxygenState: "not_applicable" } as Awaited<
+        ReturnType<MineflayerClient["observe"]>
+      >;
+      const observe = vi
+        .spyOn(client, "observe")
+        .mockResolvedValueOnce(low)
+        .mockResolvedValueOnce(low)
+        .mockResolvedValueOnce(dry)
+        .mockResolvedValueOnce(dry);
+
+      const escape = client.escapeDanger(
+        "environment",
+        new AbortController().signal,
+      );
+      await vi.advanceTimersByTimeAsync(1_500);
+      await escape;
+
+      expect(observe).toHaveBeenCalledTimes(4);
+      expect(bot.setControlState).toHaveBeenCalledExactlyOnceWith("jump", true);
+      expect(bot.clearControlStates).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a water escape that cannot reach air and releases controls", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      const observe = vi.spyOn(client, "observe").mockResolvedValue({
+        inWater: true,
+        oxygenState: "low",
+      } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+
+      const escape = client.escapeDanger(
+        "environment",
+        new AbortController().signal,
+      );
+      await vi.advanceTimersByTimeAsync(4_000);
+      await escape;
+
+      expect(observe).toHaveBeenCalledTimes(17);
+      expect(bot.clearControlStates).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts repeated resurfacing confirmations toward the escape deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      let observations = 0;
+      vi.spyOn(client, "observe").mockImplementation(async () => {
+        observations += 1;
+        return {
+          inWater: observations % 2 === 1,
+          oxygenState: "low",
+        } as Awaited<ReturnType<MineflayerClient["observe"]>>;
+      });
+
+      const escape = client.escapeDanger(
+        "environment",
+        new AbortController().signal,
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+      await escape;
+
+      expect(observations).toBeGreaterThan(4);
+      expect(bot.clearControlStates).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ignores distant unloaded players while preserving visible observations", async () => {
     const client = new MineflayerClient(
       {
