@@ -350,6 +350,88 @@ describe("ToolExecutor", () => {
     });
   });
 
+  it("switches to another observed tree after a verified zero-progress path failure", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "木の原木を1個集めて",
+      allowedResources: ["birch_log", "oak_log"],
+      targetItem: "*",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    toolContext.game.findSafeActionCandidates = async () =>
+      ["birch_log", "oak_log"].map((resourceName, order) => ({
+        id: `gather_resource:${resourceName}`,
+        label: resourceName,
+        action: "gather_resource",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName,
+        goalItem: resourceName,
+        distance: order + 1,
+        steps: [
+          {
+            tool: "gather_resource",
+            input: { resource: resourceName, count: 1, commitmentId: null },
+          },
+        ],
+      }));
+    const gathered: string[] = [];
+    toolContext.game.gatherResource = async (resource) => {
+      gathered.push(resource);
+      return resource === "birch_log"
+        ? {
+            before: status,
+            after: status,
+            outcome: "failed",
+            failureCategory: "path",
+            failureCode: "RESOURCE_PATHS_BLOCKED",
+            failureRetryable: false,
+            confirmedState: { collectedCount: 0, heldCount: 0 },
+            summary: "安全な経路がありません。",
+          }
+        : {
+            before: status,
+            after: status,
+            outcome: "completed",
+            confirmedState: {
+              resource: "oak_log",
+              requestedCount: 1,
+              collectedCount: 1,
+              heldCount: 1,
+            },
+            summary: "オークの原木を1個確認しました。",
+          };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+    expect(result).toMatchObject({
+      success: true,
+      data: { candidateId: "gather_resource:oak_log", completedCount: 1 },
+    });
+    expect(gathered).toEqual(["birch_log", "oak_log"]);
+  });
+
   it("executes every bounded plan step without a second owner prompt", async () => {
     const calls: string[] = [];
     const toolContext = context();

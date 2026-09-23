@@ -356,6 +356,7 @@ export const toolDefinitions = [
         readonly summary: string;
       }[] = [];
       const completedCandidateIds: string[] = [];
+      const failedCandidateIds = new Set<string>();
       const planReasons: string[] = [];
       let completedCount = 0;
       let remainingCount = actionCount;
@@ -496,11 +497,17 @@ export const toolDefinitions = [
           );
         }
         const resourceAuthorization = context.safeActionAuthorization;
+        const availableObserved = observed.filter(
+          (candidate) => !failedCandidateIds.has(candidate.id),
+        );
         if (
-          observed.length === 0 &&
+          availableObserved.length === 0 &&
           resourceAuthorization?.kind === "owner_bounded_resource" &&
-          resourceAuthorization.allowedResources.some((resource) =>
-            resourceNames.includes(resource as (typeof resourceNames)[number]),
+          resourceAuthorization.allowedResources.some(
+            (resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ) && !failedCandidateIds.has(`gather_resource:${resource}`),
           ) &&
           context.game.searchSafeResourceCandidates !== undefined
         ) {
@@ -508,7 +515,7 @@ export const toolDefinitions = [
             (resource) =>
               resourceNames.includes(
                 resource as (typeof resourceNames)[number],
-              ),
+              ) && !failedCandidateIds.has(`gather_resource:${resource}`),
           );
           const search = await context.game.searchSafeResourceCandidates(
             Math.min(32, context.limits.maxMoveDistance),
@@ -556,6 +563,24 @@ export const toolDefinitions = [
               authorization: resourceAuthorization,
             },
             planSignal,
+          );
+        }
+        observed = observed.filter(
+          (candidate) => !failedCandidateIds.has(candidate.id),
+        );
+        if (observed.length === 0 && failedCandidateIds.size > 0) {
+          return safeActionFailure(
+            "path",
+            "SAFE_ACTION_ALTERNATIVES_EXHAUSTED",
+            false,
+            "plan_safe_action",
+            {
+              completedCount,
+              remainingCount,
+              attemptedCandidates: failedCandidateIds.size,
+            },
+            ["安全に到達できる別の候補が観測できる場所で残りを依頼する"],
+            `候補を${String(failedCandidateIds.size)}種類試しましたが、残りに安全に到達できる候補を確認できませんでした。`,
           );
         }
         const planned = planSafeAction({
@@ -650,6 +675,7 @@ export const toolDefinitions = [
           { success: true }
         >[] = [];
         let actionStepCompleted = false;
+        let replanAfterCandidateFailure = false;
         const expectedCount = planned.candidate.requestedCount;
         const declaredActionCounts = new Map<string, number>();
         for (const [index, step] of planned.steps.entries()) {
@@ -797,6 +823,22 @@ export const toolDefinitions = [
             );
           }
           if (!result.success) {
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
+              planned.candidate.action === "gather_resource" &&
+              step.tool === "gather_resource" &&
+              !actionStepCompleted &&
+              (result.error.code === "RESOURCE_PATHS_BLOCKED" ||
+                result.error.code === "RESOURCE_NOT_FOUND") &&
+              result.error.confirmedState.collectedCount === 0
+            ) {
+              failedCandidateIds.add(planned.candidate.id);
+              completedCandidateIds.pop();
+              planReasons.pop();
+              replanAfterCandidateFailure = true;
+              break;
+            }
             return safeActionFailure(
               result.error.category,
               "SAFE_ACTION_STEP_FAILED",
@@ -825,6 +867,7 @@ export const toolDefinitions = [
             summary: result.userSummary,
           });
         }
+        if (replanAfterCandidateFailure) continue;
 
         const progresses = actionProgresses(successfulResults);
         const progress = latestActionProgress(successfulResults);
