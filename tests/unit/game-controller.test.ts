@@ -136,8 +136,9 @@ describe("CompanionGameController", () => {
       const report = await game.returnToOwner(3, new AbortController().signal);
       expect(report.outcome).toBe("failed");
       expect(report.summary).toContain("足場または通り道");
+      expect(report.summary).toContain("安全な通路や着地点");
       expect(report.summary).not.toContain("SAFE_DESCENT_BLOCKED");
-      expect(report.nextActions?.[0]).toContain("安全な足場");
+      expect(report.nextActions?.[0]).toContain("安全な通路や着地点");
     } finally {
       close();
     }

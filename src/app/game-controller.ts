@@ -1405,12 +1405,16 @@ export class CompanionGameController implements GameController {
               : reason === "no_descent"
                 ? "歩ける道も安全な降り道も見つかっていません。"
                 : "降りる先までの地形を十分に確認できません。";
+    const nextAction =
+      reason === "health_too_low"
+        ? "体力が回復したら周囲を再確認して帰還を試します。"
+        : reason === "hostile_nearby"
+          ? "敵が離れたら周囲を再確認して帰還を試します。"
+          : "利用者が近くに来るか、安全な通路や着地点ができれば再確認して帰還を試します。";
     return {
       ...report,
-      summary: `高所からの帰還を試しましたが、${explanation} いまはその場で待機しています。`,
-      nextActions: [
-        "利用者が近くに来るか、降りる先に安全な足場と経路を確保してください。状況が変わればBotが再観測して帰還を試せます。",
-      ],
+      summary: `高所からの帰還を試しましたが、${explanation} いまはその場で待機しています。${nextAction}`,
+      nextActions: [nextAction],
     };
   }
 
