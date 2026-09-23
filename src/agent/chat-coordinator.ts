@@ -238,10 +238,28 @@ export function hostileResponseIntent(message: string): HostileGoal | null {
     /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u;
   if (
     directEvade
-      .split(/[、，,。]/u)
+      .split(/[、，,。！!]/u)
       .some((clause) => evadeCommand.test(clause.trim()))
   ) {
     return "evade";
+  }
+
+  const latestCombatCommand = [
+    ...normalized.matchAll(
+      /(?:倒(?:して|せ|しろ|しなさい)|攻撃(?:して|しろ|せよ)|撃滅(?:して|せよ|しろ|しなさい)|討伐(?:して|しろ|せよ)|退治(?:して|しろ|せよ)|やっつけ(?:て|ろ)|応戦(?:して|しろ|せよ)|反撃(?:して|しろ|せよ))/gu,
+    ),
+  ].at(-1);
+  if (latestCombatCommand !== undefined) {
+    const followingText = normalized.slice(
+      latestCombatCommand.index + latestCombatCommand[0].length,
+    );
+    if (
+      /(?:とは|って)(?:言って(?:い)?ない|言ったわけではない)|(?:やっぱり|やはり).{0,12}(?:やめ|中止|撤回|しないで)|(?:やめて|中止|撤回|取り消し)/u.test(
+        followingText,
+      )
+    ) {
+      return null;
+    }
   }
 
   const clauses = affirmativeAttack.split(/[、，,。！!]/u);
