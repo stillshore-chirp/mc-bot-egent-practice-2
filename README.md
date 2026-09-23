@@ -66,6 +66,8 @@ cp .env.example .env.local
 
 `.env.local` の必須値を、その環境で許可された実値に設定します。`OPENAI_API_KEY`、Minecraft 接続情報、`OWNER_USERNAME` が不足または不正な場合、アプリケーションは接続や tool 実行の前に設定エラーとして停止する必要があります。
 
+ローカルで遊ぶ前に、[ゲームモード・難易度・個人権限の起動前チェック](docs/operations.md#起動前の確認)を実施します。サーバー既定と本人の保存済み状態は別に確認し、接続後の現在値もゲーム内で確かめます。
+
 ```bash
 npm run dev
 ```
