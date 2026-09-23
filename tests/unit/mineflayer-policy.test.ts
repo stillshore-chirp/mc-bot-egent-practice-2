@@ -3,9 +3,38 @@ import { describe, expect, it } from "vitest";
 import {
   escapeTarget,
   nearestItemDropPosition,
+  observedShoreCandidates,
 } from "../../src/minecraft/mineflayer-client.js";
 
 describe("Mineflayer deterministic safety policy", () => {
+  it("selects a nearby observed dry shore and rejects unsafe or unobserved footing", () => {
+    const blocks = new Map<string, { name: string; boundingBox: string }>();
+    const set = (
+      x: number,
+      y: number,
+      z: number,
+      name: string,
+      boundingBox = "empty",
+    ) => blocks.set(`${x},${y},${z}`, { name, boundingBox });
+    const blockAt = ({ x, y, z }: { x: number; y: number; z: number }) =>
+      blocks.get(`${x},${y},${z}`) ?? null;
+    set(1, 63, 0, "water");
+    set(2, 63, 0, "stone", "block");
+    set(2, 64, 0, "air");
+    set(2, 65, 0, "air");
+    const origin = { x: 0, y: 63, z: 0 };
+
+    expect(observedShoreCandidates(origin, blockAt, [])).toEqual([
+      { x: 2, y: 64, z: 0 },
+    ]);
+    expect(
+      observedShoreCandidates(origin, blockAt, [{ x: 2, y: 64, z: 0 }]),
+    ).toEqual([]);
+    set(2, 63, 0, "magma_block", "block");
+    expect(observedShoreCandidates(origin, blockAt, [])).toEqual([]);
+    blocks.delete("2,63,0");
+    expect(observedShoreCandidates(origin, blockAt, [])).toEqual([]);
+  });
   it("chooses a normalized escape target away from nearby hostiles", () => {
     const target = escapeTarget(
       { x: 0, y: 64, z: 0 },

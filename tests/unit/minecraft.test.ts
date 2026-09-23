@@ -523,6 +523,7 @@ describe("Mineflayer player observation", () => {
         pathfinder: { setGoal: vi.fn() },
         clearControlStates: vi.fn(),
         setControlState: vi.fn(),
+        blockAt: vi.fn(() => null),
       };
       Object.assign(client, { spawned: true, botInstance: bot });
       const low = { inWater: true, oxygenState: "low" } as Awaited<
@@ -569,21 +570,27 @@ describe("Mineflayer player observation", () => {
         pathfinder: { setGoal: vi.fn() },
         clearControlStates: vi.fn(),
         setControlState: vi.fn(),
+        blockAt: vi.fn(() => null),
       };
       Object.assign(client, { spawned: true, botInstance: bot });
       const observe = vi.spyOn(client, "observe").mockResolvedValue({
         inWater: true,
         oxygenState: "low",
-      } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+        position: { x: 0, y: 63, z: 0 },
+        nearbyEntities: [],
+      } as unknown as Awaited<ReturnType<MineflayerClient["observe"]>>);
 
       const escape = client.escapeDanger(
         "environment",
         new AbortController().signal,
       );
+      const rejected = expect(escape).rejects.toMatchObject({
+        detail: { code: "SHORE_NOT_OBSERVED" },
+      });
       await vi.advanceTimersByTimeAsync(4_000);
-      await escape;
+      await rejected;
 
-      expect(observe).toHaveBeenCalledTimes(17);
+      expect(observe).toHaveBeenCalledTimes(18);
       expect(bot.clearControlStates).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();

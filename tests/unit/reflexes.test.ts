@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AppError } from "../../src/domain/errors.js";
 import {
   ReflexDetector,
   reflexObservation,
@@ -156,6 +157,54 @@ describe("reflex loop", () => {
       state: "failed",
       failure: { code: "REFLEX_NOT_STABLE" },
       after: { oxygen: 20, oxygenState: "normal", inWater: true },
+    });
+  });
+
+  it("keeps the observed state and shore failure reason when no dry route exists", async () => {
+    class ShorelessMinecraft extends FakeMinecraft {
+      public override async escapeDanger(): Promise<void> {
+        this.snapshot = createSnapshot({ oxygen: 20, inWater: true });
+        throw new AppError({
+          category: "safety",
+          code: "SHORE_NOT_OBSERVED",
+          message: "No dry shore was observed",
+          retryable: true,
+        });
+      }
+    }
+    const minecraft = new ShorelessMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+
+    const result = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(result).toMatchObject({
+      state: "failed",
+      failure: { code: "SHORE_NOT_OBSERVED" },
+      after: { inWater: true, oxygen: 20, oxygenState: "normal" },
+    });
+  });
+
+  it("requires confirmed oxygen recovery even after leaving the water", async () => {
+    class UnconfirmedOxygenMinecraft extends FakeMinecraft {
+      public override async escapeDanger(): Promise<void> {
+        this.snapshot = createSnapshot({ oxygen: null, inWater: false });
+      }
+    }
+    const minecraft = new UnconfirmedOxygenMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+    const result = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+    expect(result).toMatchObject({
+      state: "failed",
+      failure: { code: "REFLEX_NOT_STABLE" },
+      after: { inWater: false, oxygen: null },
     });
   });
 

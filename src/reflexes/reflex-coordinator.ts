@@ -155,6 +155,13 @@ export class ReflexCoordinator {
       };
       this.retryNotBefore = 0;
     } catch (error) {
+      if (after === undefined) {
+        try {
+          after = reflexObservation(await this.minecraft.observe());
+        } catch {
+          // A failed observation must not replace the original escape failure.
+        }
+      }
       this.currentState = {
         state: "failed",
         incident,
