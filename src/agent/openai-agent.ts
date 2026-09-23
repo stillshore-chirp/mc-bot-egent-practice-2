@@ -477,6 +477,12 @@ export class OpenAIDeliberationAgent {
     const explicitAuthorized = shouldRecordConversation
       ? explicitlyAuthorizedActionFamilies(request.message)
       : [];
+    if (
+      request.toolContext.requestKind === "owner_message" &&
+      request.toolContext.baseBuildAuthorized === true
+    ) {
+      explicitAuthorized.push("build");
+    }
     const explicitProhibited = shouldRecordConversation
       ? explicitlyProhibitedActionFamilies(request.message)
       : [];
