@@ -41,6 +41,10 @@ export interface GatherLogsLimits {
   readonly maxPathAttempts: number;
 }
 
+function positionKey(position: Position): string {
+  return `${position.x}:${position.y}:${position.z}`;
+}
+
 export class GatherLogsSkill implements Skill<
   GatherLogsInput,
   GatherLogsOutput
@@ -122,6 +126,8 @@ export class GatherLogsSkill implements Skill<
     if (requireRequester) this.requireRequester(before, input.requester);
     const baseline = countInventory(before, itemName);
     let frontierIndex = 0;
+    let blockedFrontiers = 0;
+    const blockedTargets = new Set<string>();
     // 回収対象は原木から8ブロック以内。到達半径と座標丸めも内側に確保する。
     const reserve = Math.max(10, this.limits.moveRange + 0.75);
     const withinReturnRange = (position: Position) =>
@@ -154,29 +160,52 @@ export class GatherLogsSkill implements Skill<
         await this.minecraft.findResources(
           [itemName],
           this.limits.localSearchDistance,
-          Math.min(input.count - acquired, 8),
+          16,
           signal,
         )
-      ).filter((target) => withinReturnRange(target.position));
+      ).filter(
+        (target) =>
+          withinReturnRange(target.position) &&
+          !blockedTargets.has(positionKey(target.position)),
+      );
       if (targets.length === 0) {
         const searchPoint = frontier[frontierIndex];
         if (searchPoint === undefined) {
+          const blocked = blockedTargets.size + blockedFrontiers;
           throw new AppError({
-            category: "resource",
-            code: "RESOURCE_NOT_FOUND",
+            category: blocked > 0 ? "path" : "resource",
+            code: blocked > 0 ? "RESOURCE_PATHS_BLOCKED" : "RESOURCE_NOT_FOUND",
             message:
-              "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
+              blockedTargets.size > 0
+                ? "保護条件を満たす原木は確認しましたが、探索した経路からは安全に近づけませんでした。"
+                : blockedFrontiers > 0
+                  ? "一部の探索経路が塞がれており、範囲内に採取可能な原木があるか確認できませんでした。"
+                  : "保護条件を満たす原木が探索範囲にありません。成長履歴のない木や建築に接する木は残しています。補助の稼働中に育った木を用意してください。",
             retryable: false,
             failedAt: "locate_resource",
             confirmedState: {
               acquired,
               maxSearchDistance: this.limits.maxSearchDistance,
+              blockedTargets: blockedTargets.size,
+              blockedFrontiers,
             },
           });
         }
         frontierIndex += 1;
         await context.advance("explore", { frontierIndex, searchPoint });
-        await this.minecraft.moveTo(searchPoint, this.limits.moveRange, signal);
+        try {
+          await this.minecraft.moveTo(
+            searchPoint,
+            this.limits.moveRange,
+            signal,
+          );
+        } catch (error) {
+          if (error instanceof AppError && error.detail.category === "path") {
+            blockedFrontiers += 1;
+            continue;
+          }
+          throw error;
+        }
         continue;
       }
 
@@ -209,6 +238,14 @@ export class GatherLogsSkill implements Skill<
             resourceChanged = true;
             break;
           }
+          if (
+            error instanceof AppError &&
+            error.detail.category === "path" &&
+            error.detail.failedAt === "move_to_resource"
+          ) {
+            blockedTargets.add(positionKey(target.position));
+            continue;
+          }
           throw error;
         }
       }
@@ -231,19 +268,29 @@ export class GatherLogsSkill implements Skill<
     returnBoundary?: { center: Position; radius: number },
   ): Promise<void> {
     await advance("move_to_resource", { target: target.position });
-    await retryOperation(
-      "move_to_resource",
-      async () =>
-        this.minecraft.moveTo(target.position, this.limits.moveRange, signal),
-      {
-        maxAttempts: this.limits.maxPathAttempts,
-        initialDelayMs: 100,
-        maxDelayMs: 500,
-        multiplier: 2,
-      },
-      (error) => error instanceof AppError && error.detail.retryable,
-      signal,
-    );
+    try {
+      await retryOperation(
+        "move_to_resource",
+        async () =>
+          this.minecraft.moveTo(target.position, this.limits.moveRange, signal),
+        {
+          maxAttempts: this.limits.maxPathAttempts,
+          initialDelayMs: 100,
+          maxDelayMs: 500,
+          multiplier: 2,
+        },
+        (error) => error instanceof AppError && error.detail.retryable,
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof AppError && error.detail.category === "path") {
+        throw new AppError(
+          { ...error.detail, failedAt: "move_to_resource" },
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     const beforeDig = await this.minecraft.observe();
     if (
       returnBoundary &&

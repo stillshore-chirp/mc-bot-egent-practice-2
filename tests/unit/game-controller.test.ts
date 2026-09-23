@@ -631,6 +631,48 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("explains blocked gathering paths and the verified collected count", async () => {
+    class BlockedTreeMinecraft extends FakeMinecraft {
+      public override async moveTo(
+        position: { x: number; y: number; z: number },
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x === 5) {
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "Tree unreachable",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+    const minecraft = new BlockedTreeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 5, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.gatherResource(
+        "oak_log",
+        1,
+        new AbortController().signal,
+      );
+      expect(report).toMatchObject({
+        outcome: "failed",
+        failureCode: "RESOURCE_PATHS_BLOCKED",
+        confirmedState: { collectedCount: 0, heldCount: 0 },
+      });
+      expect(report.summary).toContain("経路");
+      expect(report.summary).toContain("今回の取得は0個");
+    } finally {
+      close();
+    }
+  });
+
   it("returns only server protection-checked resource candidates in distance order", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push(

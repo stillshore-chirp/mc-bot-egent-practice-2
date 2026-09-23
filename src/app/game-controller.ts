@@ -809,6 +809,29 @@ export class CompanionGameController implements GameController {
         summary: `安全に採取できる原木を確認できず、収集を停止しました。${acquired === undefined ? "取得数は未確認です。" : `今回の取得は${String(acquired)}個、現在の所持数は${String(held)}個です。`}履歴不足・建築保護・照会失敗の対象は採取しません。`,
       };
     }
+    if (
+      report.outcome !== "completed" &&
+      report.failureCode === "RESOURCE_PATHS_BLOCKED"
+    ) {
+      const held =
+        report.after?.inventory[resource] ?? (report.after ? 0 : undefined);
+      const before =
+        report.before?.inventory[resource] ?? (report.before ? 0 : undefined);
+      const acquired =
+        held === undefined || before === undefined
+          ? undefined
+          : Math.max(0, held - before);
+      return {
+        ...report,
+        confirmedState: {
+          ...report.confirmedState,
+          collectedCount: acquired ?? null,
+          heldCount: held ?? null,
+        },
+        nextActions: ["安全に到達できる別の木や経路がある場所で再依頼する"],
+        summary: `保護条件を満たす木を探しましたが、試した経路では安全に近づけず、採取を停止しました。${acquired === undefined ? "取得数は未確認です。" : `今回の取得は${String(acquired)}個です。`}`,
+      };
+    }
     if (report.outcome !== "completed") {
       const held =
         report.after?.inventory[resource] ?? (report.after ? 0 : undefined);

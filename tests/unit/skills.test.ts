@@ -161,6 +161,115 @@ describe("gather logs skill", () => {
     expect(minecraft.digAttempts).toBe(2);
   });
 
+  it("tries another protected tree after one target path is blocked", async () => {
+    class OneBlockedPathMinecraft extends FakeMinecraft {
+      public attemptedTargets: number[] = [];
+
+      public override async moveTo(
+        position: ResourceTarget["position"],
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x === 5) {
+          this.attemptedTargets.push(position.x);
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "First tree unreachable",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+    const minecraft = new OneBlockedPathMinecraft();
+    minecraft.resources.push(
+      { name: "oak_log", position: { x: 5, y: 64, z: 0 } },
+      { name: "oak_log", position: { x: 6, y: 64, z: 0 } },
+    );
+    const skill = new GatherLogsSkill(
+      minecraft,
+      new TaskRuntime(new InMemoryTaskStore(), () =>
+        minecraft.stopCurrentAction(),
+      ),
+      new ActionArbiter(),
+      {
+        maxCount: 64,
+        localSearchDistance: 32,
+        maxSearchDistance: 32,
+        searchStep: 16,
+        moveRange: 3,
+        returnRange: 3,
+        maxPathAttempts: 1,
+      },
+    );
+
+    const result = await skill.run({
+      resource: "oak_log",
+      count: 1,
+      requester: "owner",
+    });
+    expect(result.status).toBe("completed");
+    expect(minecraft.attemptedTargets).toEqual([5]);
+    expect(minecraft.actions).toContain("move:6,64,0");
+    expect(result.output?.collectedCount).toBe(1);
+  });
+
+  it("reports exhausted paths without mining when every protected target is unreachable", async () => {
+    class BlockedTreeMinecraft extends FakeMinecraft {
+      public override async moveTo(
+        position: ResourceTarget["position"],
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x === 5) {
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "Tree unreachable",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+    const minecraft = new BlockedTreeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 5, y: 64, z: 0 },
+    });
+    const skill = new GatherLogsSkill(
+      minecraft,
+      new TaskRuntime(new InMemoryTaskStore(), () =>
+        minecraft.stopCurrentAction(),
+      ),
+      new ActionArbiter(),
+      {
+        maxCount: 64,
+        localSearchDistance: 16,
+        maxSearchDistance: 16,
+        searchStep: 16,
+        moveRange: 3,
+        returnRange: 3,
+        maxPathAttempts: 1,
+      },
+    );
+
+    const result = await skill.run({
+      resource: "oak_log",
+      count: 1,
+      requester: "owner",
+    });
+    expect(result.status).toBe("failed");
+    expect(result.failure).toMatchObject({
+      code: "RESOURCE_PATHS_BLOCKED",
+      confirmedState: { blockedTargets: 1 },
+    });
+    expect(minecraft.actions.some((action) => action.startsWith("dig:"))).toBe(
+      false,
+    );
+  });
+
   it("re-scans when the selected resource changes before digging", async () => {
     class ChangedResourceMinecraft extends FakeMinecraft {
       public digAttempts = 0;
