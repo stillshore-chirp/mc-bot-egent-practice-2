@@ -51,6 +51,7 @@ export class ReflexCoordinator {
   private currentState: ReflexState = { state: "safe" };
   private handling = false;
   private retryNotBefore = 0;
+  private noSafeFoodInventory: string | undefined;
 
   public constructor(
     private readonly detector: ReflexDetector,
@@ -60,6 +61,7 @@ export class ReflexCoordinator {
     private readonly arbiter: ActionArbiter,
     private readonly actionTimeoutMs: number,
     private readonly stuckRecoveryAttempts = 3,
+    private readonly ownerUsername?: string,
   ) {}
 
   public get state(): ReflexState {
@@ -71,18 +73,22 @@ export class ReflexCoordinator {
     movementExpected: boolean,
   ): Promise<ReflexState> {
     if (this.handling) return this.currentState;
-    if (
-      this.currentState.state === "failed" &&
-      Date.now() < this.retryNotBefore
-    ) {
-      return this.currentState;
-    }
     const incident = this.detector.detect(
       snapshot,
       movementExpected,
       (previous, current) =>
         this.minecraft.isExpectedDescentDamage(previous, current),
     );
+    if (
+      this.currentState.state === "failed" &&
+      incident?.kind === this.currentState.incident.kind &&
+      incident.reason === this.currentState.incident.reason &&
+      (this.currentState.failure.code === "NO_SAFE_FOOD"
+        ? this.noSafeFoodInventory === inventorySignature(snapshot)
+        : Date.now() < this.retryNotBefore)
+    ) {
+      return this.currentState;
+    }
     if (incident === undefined) {
       if (this.currentState.state !== "safe") {
         this.currentState = { state: "safe" };
@@ -140,7 +146,32 @@ export class ReflexCoordinator {
                 });
               }
             } else if (snapshot.food < 18) {
-              await this.minecraft.eatBestFood(signal);
+              try {
+                await this.minecraft.eatBestFood(signal);
+              } catch (error) {
+                const owner = snapshot.players.find(
+                  (player) =>
+                    player.username === this.ownerUsername &&
+                    player.distance > 3 &&
+                    player.distance <= 12,
+                );
+                if (
+                  !(error instanceof AppError) ||
+                  error.detail.code !== "NO_SAFE_FOOD" ||
+                  owner === undefined ||
+                  snapshot.inWater ||
+                  snapshot.nearbyEntities.some(
+                    (entity) => entity.hostile && entity.distance <= 12,
+                  )
+                ) {
+                  throw error;
+                }
+                await this.minecraft.moveToWithSafeDescent(
+                  owner.position,
+                  2,
+                  signal,
+                );
+              }
             } else {
               throw new AppError({
                 category: "safety",
@@ -196,6 +227,7 @@ export class ReflexCoordinator {
         after,
       };
       this.retryNotBefore = 0;
+      this.noSafeFoodInventory = undefined;
     } catch (error) {
       if (after === undefined) {
         try {
@@ -220,10 +252,21 @@ export class ReflexCoordinator {
         ...(after === undefined ? {} : { after }),
       };
       this.retryNotBefore = Date.now() + 5_000;
+      this.noSafeFoodInventory =
+        this.currentState.failure.code === "NO_SAFE_FOOD"
+          ? inventorySignature(snapshot)
+          : undefined;
     } finally {
       lease?.release();
       this.handling = false;
     }
     return this.currentState;
   }
+}
+
+function inventorySignature(snapshot: WorldSnapshot): string {
+  return snapshot.inventory
+    .map((item) => `${item.name}:${String(item.count)}`)
+    .sort()
+    .join("|");
 }

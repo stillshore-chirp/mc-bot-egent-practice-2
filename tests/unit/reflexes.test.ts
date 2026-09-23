@@ -33,6 +33,8 @@ const coordinatorFor = (minecraft: FakeMinecraft): ReflexCoordinator =>
     ),
     new ActionArbiter(),
     1_000,
+    3,
+    "owner",
   );
 
 describe("reflex loop", () => {
@@ -94,6 +96,39 @@ describe("reflex loop", () => {
 
     expect(state.state).toBe("stabilizing");
     expect(minecraft.actions).toContain("eat:bread");
+  });
+
+  it("moves toward the nearby owner on a safe route when critical and out of food", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        players: [
+          {
+            username: "owner",
+            position: { x: 8, y: 64, z: 0 },
+            distance: 8,
+          },
+        ],
+      }),
+    );
+    const response = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("move:8,64,0");
   });
 
   it("retreats before equipping when a critically injured Bot sees a hostile", async () => {
@@ -411,6 +446,80 @@ describe("reflex loop", () => {
     vi.advanceTimersByTime(5_001);
     const recovered = await coordinator.tick(await minecraft.observe(), false);
     expect(recovered.state).toBe("safe");
+  });
+
+  it("reacts to a new hostile immediately after a no-food failure", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(createSnapshot({ food: 10 }));
+    const coordinator = coordinatorFor(minecraft);
+    const failed = await coordinator.tick(await minecraft.observe(), false);
+    expect(failed).toMatchObject({
+      state: "failed",
+      failure: { code: "NO_SAFE_FOOD" },
+    });
+
+    minecraft.snapshot = createSnapshot({
+      food: 10,
+      nearbyEntities: [
+        {
+          id: 2,
+          name: "zombie",
+          kind: "mob",
+          position: { x: 2, y: 64, z: 0 },
+          distance: 2,
+          hostile: true,
+        },
+      ],
+    });
+    const response = await coordinator.tick(await minecraft.observe(), false);
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("escape:hostile");
+  });
+
+  it("does not retry unavailable food until the observed inventory changes", async () => {
+    class InventoryAwareMinecraft extends FakeMinecraft {
+      public eatAttempts = 0;
+
+      public override async eatBestFood(signal: AbortSignal): Promise<string> {
+        this.eatAttempts += 1;
+        if (
+          !this.snapshot.inventory.some(
+            (item) => item.name === "bread" && item.count > 0,
+          )
+        ) {
+          throw new AppError({
+            category: "inventory",
+            code: "NO_SAFE_FOOD",
+            message: "No safe food is carried",
+            retryable: false,
+          });
+        }
+        return super.eatBestFood(signal);
+      }
+    }
+    const minecraft = new InventoryAwareMinecraft(createSnapshot({ food: 10 }));
+    const coordinator = coordinatorFor(minecraft);
+    await coordinator.tick(await minecraft.observe(), false);
+    await coordinator.tick(await minecraft.observe(), false);
+    expect(minecraft.eatAttempts).toBe(1);
+
+    minecraft.snapshot = createSnapshot({
+      food: 10,
+      inventory: [{ name: "bread", count: 1 }],
+    });
+    const response = await coordinator.tick(await minecraft.observe(), false);
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.eatAttempts).toBe(2);
+    expect(minecraft.actions).toContain("eat:bread");
   });
 
   it("uses bounded stuck recovery after the movement window expires", async () => {

@@ -978,6 +978,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     arbiter,
     Math.min(config.limits.taskTimeoutMs, 10_000),
     config.limits.skillRetryLimit + 1,
+    config.ownerUsername,
   );
   const toolMemory = new ToolMemoryAdapter(memory);
   const toolBehaviorMemory = new ToolBehaviorMemoryAdapter(memory);
