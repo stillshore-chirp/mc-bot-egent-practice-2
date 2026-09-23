@@ -205,11 +205,11 @@ const resourceGoals: readonly ResourceGoal[] = [
 ];
 
 const affirmativeCollectionIntentPattern =
-  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
+  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|切(?:って|りたい|ろう)|伐採(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
 const negatedCollectionIntentPattern =
-  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:採ら|取ら)(?:ない|ず)|(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
+  /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:切ら(?:ない|ず)|切るな|伐採しない|伐採するな)|(?:採ら|取ら)(?:ない|ず)|(?:集め|採掘し|掘っ|採取し|切っ|伐採し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const collectionPermissionQuestionPattern =
-  /(?:集め|採掘し|掘っ|採取し|持ってき|取ってき|作っ|作成し|精錬し)て(?:も)?(?:いい|よい|良い|大丈夫|問題ない|はいけない)/iu;
+  /(?:集め|採掘し|掘っ|採取し|切っ|伐採し|持ってき|取ってき|作っ|作成し|精錬し)て(?:も)?(?:いい|よい|良い|大丈夫|問題ない|はいけない)/iu;
 const operationWords = new Set([
   "collect_resource",
   "gather_resource",
@@ -472,13 +472,15 @@ function isPendingGoalValid(
 }
 
 function isStandaloneQuantityReply(message: string): boolean {
-  return /^(?:あと\s*)?[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
+  return /^(?:あと\s*)?(?:[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
     message,
   );
 }
 
 function hasCollectionQuantityUnit(message: string): boolean {
-  return /[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)/iu.test(message);
+  return /(?:[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
+    message,
+  );
 }
 
 function normalize(value: string): string {
@@ -507,13 +509,19 @@ function containsAlias(message: string, alias: string): boolean {
 function findNamedResource(
   message: string,
 ): { readonly alias: string; readonly goal: ResourceGoal } | undefined {
-  return resourceGoals
+  const named = resourceGoals
     .flatMap((goal) => goal.aliases.map((alias) => ({ alias, goal })))
     .filter(({ alias }) => containsAlias(message, alias))
     .sort(
       (left, right) =>
         normalize(right.alias).length - normalize(left.alias).length,
     )[0];
+  if (named !== undefined) return named;
+  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(message)) {
+    const goal = resourceGoals[0];
+    if (goal !== undefined) return { alias: "木", goal };
+  }
+  return undefined;
 }
 
 function hasMultipleResourceMentions(
@@ -526,10 +534,16 @@ function hasMultipleResourceMentions(
   if (primary.length === 0) return false;
   const index = message.indexOf(primary);
   if (index < 0) return false;
+  const suffix = message.slice(index + primary.length);
+  const qualifiedTreeSuffix =
+    namedMatch !== undefined && namedMatch.goal.targetItem !== "*"
+      ? (/^\s*の\s*木(?=\s*を)/u.exec(suffix)?.[0] ?? "")
+      : "";
+  const mentionLength = primary.length + qualifiedTreeSuffix.length;
   const remainder =
     message.slice(0, index) +
-    " ".repeat(primary.length) +
-    message.slice(index + primary.length);
+    " ".repeat(mentionLength) +
+    message.slice(index + mentionLength);
   return (
     findNamedResource(remainder) !== undefined ||
     canonicalResourceId(remainder) !== undefined
@@ -537,11 +551,12 @@ function hasMultipleResourceMentions(
 }
 
 function countMentions(message: string): number {
-  return [
+  const numeric = [
     ...message.matchAll(
       /[0-9]{1,3}\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
     ),
   ].length;
+  return numeric + [...message.matchAll(/一\s*本/gu)].length;
 }
 
 function parseCount(message: string): number | undefined {
@@ -549,7 +564,7 @@ function parseCount(message: string): number | undefined {
     /(?:^|[^0-9])([0-9]{1,3})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
       message,
     );
-  if (match === null) return undefined;
+  if (match === null) return /一\s*本/u.test(message) ? 1 : undefined;
   const count = Number(match[1]);
   return Number.isInteger(count) && count > 0 ? count : undefined;
 }

@@ -263,10 +263,7 @@ export class CompanionContextFactory implements ChatContextFactory {
             limits: {
               maxMoveDistance: this.config.limits.maxMoveDistance,
               maxGatherCount: this.config.limits.maxGatherCount,
-              maxSafeActionDurationMs: Math.min(
-                this.config.limits.taskTimeoutMs,
-                60_000,
-              ),
+              maxSafeActionDurationMs: this.config.limits.taskTimeoutMs,
               followDistance: this.config.limits.followDistance,
               memoryContextLimit: this.config.limits.memoryContextLimit,
             },

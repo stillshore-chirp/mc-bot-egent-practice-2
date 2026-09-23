@@ -631,6 +631,48 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("explains blocked gathering paths and the verified collected count", async () => {
+    class BlockedTreeMinecraft extends FakeMinecraft {
+      public override async moveTo(
+        position: { x: number; y: number; z: number },
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x === 5) {
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "Tree unreachable",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+    const minecraft = new BlockedTreeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 5, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.gatherResource(
+        "oak_log",
+        1,
+        new AbortController().signal,
+      );
+      expect(report).toMatchObject({
+        outcome: "failed",
+        failureCode: "RESOURCE_PATHS_BLOCKED",
+        confirmedState: { collectedCount: 0, heldCount: 0 },
+      });
+      expect(report.summary).toContain("経路");
+      expect(report.summary).toContain("今回の取得は0個");
+    } finally {
+      close();
+    }
+  });
+
   it("returns only server protection-checked resource candidates in distance order", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push(
@@ -686,6 +728,167 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("approaches a distant observed ore before rechecking server permission", async () => {
+    class ReachAwareMinecraft extends FakeMinecraft {
+      public override async observeActionCandidates(
+        input: Parameters<FakeMinecraft["observeActionCandidates"]>[0],
+        signal: AbortSignal,
+      ) {
+        const candidates = await super.observeActionCandidates(input, signal);
+        return candidates.map((candidate) => {
+          if (candidate.action !== "mine_block") return candidate;
+          const target = candidate.args.position as {
+            x: number;
+            y: number;
+            z: number;
+          };
+          const observedDistance = Math.hypot(
+            target.x - this.snapshot.position.x,
+            target.y - this.snapshot.position.y,
+            target.z - this.snapshot.position.z,
+          );
+          return observedDistance > 6
+            ? {
+                ...candidate,
+                distance: observedDistance,
+                permission: "unknown" as const,
+                safety: "unknown" as const,
+              }
+            : { ...candidate, distance: observedDistance };
+        });
+      }
+    }
+    const minecraft = new ReachAwareMinecraft();
+    minecraft.resources.push({
+      name: "iron_ore",
+      position: { x: 15, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    const request = {
+      goal: "鉄を1個集めて",
+      count: 1,
+      maxCandidates: 8,
+      authorization: {
+        kind: "owner_bounded_resource" as const,
+        goal: "鉄を1個集めて",
+        allowedResources: ["iron_ore"],
+        targetItem: "raw_iron",
+        targetCount: 1,
+        maxCount: 8,
+      },
+    };
+    try {
+      const initial = await game.findSafeActionCandidates(
+        request,
+        new AbortController().signal,
+      );
+      expect(initial[0]?.permission).toBe("unknown");
+      const result = await game.searchSafeActionCandidates(
+        request,
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({
+        blockedWaypoints: 0,
+        candidates: [{ action: "mine_block", permission: "allowed" }],
+      });
+      expect(result.attemptedWaypoints).toBeGreaterThan(1);
+      expect(
+        minecraft.actions.filter((action) => action.startsWith("move:")),
+      ).toHaveLength(result.attemptedWaypoints);
+      expect(
+        minecraft.actions.some((action) => action.startsWith("dig:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
+  it("searches a bounded alternate route before selecting a protected log", async () => {
+    class RangeAwareMinecraft extends FakeMinecraft {
+      public override async findResources(
+        names: readonly string[],
+        maxDistance: number,
+        count: number,
+      ) {
+        return this.resources
+          .filter(
+            ({ name, position }) =>
+              names.includes(name) &&
+              Math.hypot(
+                position.x - this.snapshot.position.x,
+                position.y - this.snapshot.position.y,
+                position.z - this.snapshot.position.z,
+              ) <= maxDistance,
+          )
+          .slice(0, count);
+      }
+
+      public override async moveTo(
+        position: { x: number; y: number; z: number },
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x > 0) {
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "Path blocked",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+
+    const minecraft = new RangeAwareMinecraft();
+    minecraft.resources.push({
+      name: "birch_log",
+      position: { x: 0, y: 64, z: 45 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const search = await game.searchSafeResourceCandidates(
+        32,
+        1,
+        new AbortController().signal,
+        ["birch_log"],
+      );
+      expect(search).toMatchObject({
+        candidates: [{ resource: "birch_log" }],
+        attemptedWaypoints: 2,
+        blockedWaypoints: 1,
+      });
+      expect(minecraft.actions).toContain("move:0,64,16");
+      expect(
+        minecraft.actions.some((action) => action.startsWith("dig:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
+  it("stops resource search before movement when the current state is unsafe", async () => {
+    const minecraft = new FakeMinecraft(createSnapshot({ food: 10 }));
+    const { game, close } = createController(minecraft);
+    try {
+      const search = await game.searchSafeResourceCandidates(
+        32,
+        1,
+        new AbortController().signal,
+        ["oak_log"],
+      );
+      expect(search).toMatchObject({
+        attemptedWaypoints: 0,
+        stop: { code: "SAFE_RESOURCE_SEARCH_UNSAFE" },
+      });
+      expect(
+        minecraft.actions.some((action) => action.startsWith("move:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
   it("normalizes a descriptive log collection goal", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push({
@@ -707,6 +910,26 @@ describe("CompanionGameController", () => {
       },
     ]);
     close();
+  });
+
+  it("observes log candidates for a natural one-tree cutting request", async () => {
+    const minecraft = new FakeMinecraft();
+    minecraft.resources.push({
+      name: "oak_log",
+      position: { x: 3, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const candidates = await game.findSafeActionCandidates(
+        { goal: "木を一本切って持ってきて", count: 1, maxCandidates: 4 },
+        new AbortController().signal,
+      );
+      expect(candidates).toMatchObject([
+        { resourceName: "oak_log", requestedCount: 1 },
+      ]);
+    } finally {
+      close();
+    }
   });
 
   it("finds the authorized log species behind other nearby logs", async () => {
@@ -748,24 +971,27 @@ describe("CompanionGameController", () => {
   });
 
   it.each([
-    ["鉄", "iron_ore", "iron_ingot", "raw_iron"],
-    ["銅", "copper_ore", "copper_ingot", "raw_copper"],
+    ["鉄", "iron_ore", "iron_ingot", "raw_iron", 1],
+    ["銅", "copper_ore", "copper_ingot", "raw_copper", 1],
+    ["複数の鉄", "iron_ore", "iron_ingot", "raw_iron", 6],
   ])(
     "executes one bounded %s goal across mining and smelting from provider observations",
-    async (_label, ore, ingot, raw) => {
+    async (_label, ore, ingot, raw, count) => {
       const minecraft = new FakeMinecraft();
       minecraft.availableFurnace = true;
       minecraft.resources.push(
-        { name: ore, position: { x: 2, y: 63, z: 0 } },
-        { name: ore, position: { x: 3, y: 63, z: 0 } },
+        ...Array.from({ length: Math.max(2, count) }, (_, index) => ({
+          name: ore,
+          position: { x: 2 + index, y: 63, z: 0 },
+        })),
       );
       const { game, close } = createController(minecraft);
       const authorization = {
         kind: "owner_bounded_resource" as const,
-        goal: `${ingot}を1個作って`,
+        goal: `${ingot}を${String(count)}個作って`,
         allowedResources: [ore],
         targetItem: ingot,
-        targetCount: 1,
+        targetCount: count,
         maxCount: 8,
       };
       const context: ToolContext = {
@@ -782,7 +1008,7 @@ describe("CompanionGameController", () => {
           "smelt_item",
         ],
         safeActionAuthorizationUsage: {
-          remainingCount: 1,
+          remainingCount: count,
           consumed: false,
         },
         executionEvidence: { verifiedActionReceipts: [] },
@@ -808,7 +1034,7 @@ describe("CompanionGameController", () => {
           "plan_safe_action",
           JSON.stringify({
             goal: `${ingot}を作る`,
-            count: 1,
+            count,
             mode: "delegated",
             candidateId: null,
           }),
@@ -817,16 +1043,17 @@ describe("CompanionGameController", () => {
         expect(result).toMatchObject({
           success: true,
           data: {
-            completedCount: 1,
-            completedSteps: [{ tool: "mine_block" }, { tool: "smelt_item" }],
+            completedCount: count,
           },
         });
         expect(
           minecraft.actions.filter((action) => action === `dig:${ore}`),
-        ).toHaveLength(1);
+        ).toHaveLength(count);
         expect(minecraft.actions).toContain(`collect:${raw}`);
-        expect(minecraft.actions).toContain(`smelt:${raw}:${ingot}:1`);
-        expect((await game.observeStatus()).inventory[ingot]).toBe(1);
+        expect(minecraft.actions).toContain(
+          `smelt:${raw}:${ingot}:${String(count)}`,
+        );
+        expect((await game.observeStatus()).inventory[ingot]).toBe(count);
       } finally {
         close();
       }

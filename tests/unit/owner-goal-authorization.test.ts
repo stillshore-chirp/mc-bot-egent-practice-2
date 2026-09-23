@@ -82,6 +82,34 @@ describe("owner goal authorization", () => {
     }
   });
 
+  it.each([
+    "木を一本切って持ってきて。種類は任せる。",
+    "木を1本切って、種類は任せる",
+  ])(
+    "treats a one-tree cutting request as one bounded log goal: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+      ).toMatchObject({
+        outcome: "authorized",
+        authorization: {
+          targetItem: "*",
+          targetCount: 1,
+          selectionRequired: true,
+        },
+      });
+    },
+  );
+
+  it.each(["木を一本切らないで", "木を1本切ってもいい？", "木の家を1つ作って"])(
+    "does not authorize a non-command tree mention: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }).outcome,
+      ).not.toBe("authorized");
+    },
+  );
+
   it("keeps a specific wood alias ahead of its generic substring", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,
@@ -95,6 +123,31 @@ describe("owner goal authorization", () => {
         targetItem: "dark_oak_log",
       },
     });
+  });
+
+  it.each([
+    ["オークの木を一本切って", "oak_log"],
+    ["シラカバの木を1本切って", "birch_log"],
+  ])("treats a species-qualified tree as one resource: %s", (message, item) => {
+    expect(
+      deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: [item],
+        targetItem: item,
+        targetCount: 1,
+      },
+    });
+  });
+
+  it("still asks when two different tree species are named", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "オークの木とシラカバの木を一本切って",
+      }),
+    ).toMatchObject({ outcome: "clarify" });
   });
 
   it.each([

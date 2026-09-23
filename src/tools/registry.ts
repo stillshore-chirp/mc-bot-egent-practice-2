@@ -55,7 +55,7 @@ const memoryKinds = ["fact", "location", "commitment", "episode"] as const;
 const safeActionModes = z.enum(["delegated", "explicit"]);
 const maxSafeActionSteps = 8;
 const maxSafeActionPlanRounds = 64;
-const maxSafeActionDurationMs = 120_000;
+const maxSafeActionDurationMs = 900_000;
 function nowEvidence(
   kind: EvidenceReference["kind"],
   summary: string,
@@ -240,12 +240,25 @@ export const toolDefinitions = [
     action: true,
     execute: async (input, context) => {
       const startedAt = Date.now();
+      const authorization = context.safeActionAuthorization;
+      const smeltQuantity =
+        authorization?.kind === "owner_bounded_resource" &&
+        knownSmeltInputs[authorization.targetItem] !== undefined
+          ? (context.safeActionAuthorizationUsage?.remainingCount ??
+            authorization.targetCount)
+          : 0;
+      const desiredDurationMs =
+        smeltQuantity > 0 ? 30_000 + smeltQuantity * 13_000 : 60_000;
       const configuredDuration = context.limits.maxSafeActionDurationMs;
       const durationMs =
         typeof configuredDuration === "number" &&
         Number.isFinite(configuredDuration)
-          ? Math.min(Math.max(1, configuredDuration), maxSafeActionDurationMs)
-          : maxSafeActionDurationMs;
+          ? Math.min(
+              Math.max(1, configuredDuration),
+              desiredDurationMs,
+              maxSafeActionDurationMs,
+            )
+          : Math.min(desiredDurationMs, maxSafeActionDurationMs);
       const deadline = startedAt + durationMs;
       const deadlineSignal = AbortSignal.timeout(durationMs);
       const planSignal = AbortSignal.any([context.signal, deadlineSignal]);
@@ -281,6 +294,30 @@ export const toolDefinitions = [
           ["所有者の目的と数量上限を確認してから再依頼する"],
           "所有者の目的または数量上限を確認できないため、操作を開始しません。",
         );
+      }
+      const authorizedGoalItem =
+        context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
+        context.safeActionAuthorization.targetItem !== "*"
+          ? context.safeActionAuthorization.targetItem
+          : undefined;
+      let initialGoalHeld: number | undefined;
+      if (authorizedGoalItem !== undefined) {
+        try {
+          initialGoalHeld =
+            (await context.game.observeStatus()).inventory[
+              authorizedGoalItem
+            ] ?? 0;
+        } catch {
+          return safeActionFailure(
+            "observation",
+            "SAFE_ACTION_BASELINE_UNAVAILABLE",
+            true,
+            "observe_status",
+            { goal: input.goal },
+            ["所持品を観測できる状態で目的を再依頼する"],
+            "開始前の所持数を確認できないため、資源操作を開始しませんでした。",
+          );
+        }
       }
       if (
         context.safeActionAuthorization?.kind === "owner_bounded_resource" &&
@@ -356,10 +393,12 @@ export const toolDefinitions = [
         readonly summary: string;
       }[] = [];
       const completedCandidateIds: string[] = [];
+      const failedCandidateIds = new Set<string>();
       const planReasons: string[] = [];
       let completedCount = 0;
       let remainingCount = actionCount;
       let planRounds = 0;
+      let inventoryReconciledCount = 0;
       const intermediateProgress: ActionProgress[] = [];
       while (remainingCount > 0) {
         if (context.signal.aborted) {
@@ -495,6 +534,142 @@ export const toolDefinitions = [
             `安全計画を${String(completedCount)}個分まで実行し、制限時間を超えたため停止しました。`,
           );
         }
+        const resourceAuthorization = context.safeActionAuthorization;
+        const availableObserved = observed.filter(
+          (candidate) => !failedCandidateIds.has(candidate.id),
+        );
+        if (
+          input.mode === "delegated" &&
+          input.candidateId === null &&
+          resourceAuthorization?.kind === "owner_bounded_resource" &&
+          resourceAuthorization.targetItem !== "*" &&
+          !resourceNames.includes(
+            resourceAuthorization.targetItem as (typeof resourceNames)[number],
+          ) &&
+          !availableObserved.some(
+            (candidate) =>
+              candidate.permission === "allowed" &&
+              candidate.safety === "allowed",
+          ) &&
+          context.game.searchSafeActionCandidates !== undefined
+        ) {
+          const search = await context.game.searchSafeActionCandidates(
+            {
+              goal: input.goal,
+              count: remainingCount,
+              maxCandidates: 8,
+              authorization: resourceAuthorization,
+            },
+            planSignal,
+          );
+          if (search.stop !== undefined || search.candidates.length === 0) {
+            return safeActionFailure(
+              search.stop === undefined ||
+                search.stop.code === "SMELT_STATION_NOT_OBSERVED"
+                ? "resource"
+                : "safety",
+              search.stop?.code ?? "SAFE_ACTION_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_action_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [
+                search.stop?.reason ??
+                  "許可された範囲で安全な資源候補を確認できる場所へ移動する",
+              ],
+              search.stop?.reason ??
+                `許可された範囲で${String(search.attemptedWaypoints)}地点を調べましたが、安全な資源候補を確認できませんでした。`,
+            );
+          }
+          observed = search.candidates;
+        }
+        if (
+          availableObserved.length === 0 &&
+          resourceAuthorization?.kind === "owner_bounded_resource" &&
+          resourceAuthorization.allowedResources.some(
+            (resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ) && !failedCandidateIds.has(`gather_resource:${resource}`),
+          ) &&
+          context.game.searchSafeResourceCandidates !== undefined
+        ) {
+          const allowedLogs = resourceAuthorization.allowedResources.filter(
+            (resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ) && !failedCandidateIds.has(`gather_resource:${resource}`),
+          );
+          const search = await context.game.searchSafeResourceCandidates(
+            Math.min(32, context.limits.maxMoveDistance),
+            8,
+            planSignal,
+            allowedLogs,
+          );
+          if (search.stop !== undefined) {
+            return safeActionFailure(
+              "safety",
+              search.stop.code,
+              false,
+              "search_safe_resource_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [search.stop.reason],
+              `安全な候補を探す途中で停止しました。${search.stop.reason}`,
+            );
+          }
+          if (search.candidates.length === 0) {
+            return safeActionFailure(
+              "resource",
+              "SAFE_RESOURCE_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_resource_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              ["保護条件を満たす木が探索範囲に現れたら、残りを依頼する"],
+              `許可された範囲で${String(search.attemptedWaypoints)}方向を調べましたが、保護条件を満たす木を確認できませんでした。`,
+            );
+          }
+          observed = await context.game.findSafeActionCandidates(
+            {
+              goal: input.goal,
+              count: remainingCount,
+              maxCandidates: 8,
+              authorization: resourceAuthorization,
+            },
+            planSignal,
+          );
+        }
+        observed = observed.filter(
+          (candidate) => !failedCandidateIds.has(candidate.id),
+        );
+        if (observed.length === 0 && failedCandidateIds.size > 0) {
+          return safeActionFailure(
+            "path",
+            "SAFE_ACTION_ALTERNATIVES_EXHAUSTED",
+            false,
+            "plan_safe_action",
+            {
+              completedCount,
+              remainingCount,
+              attemptedCandidates: failedCandidateIds.size,
+            },
+            ["安全に到達できる別の候補が観測できる場所で残りを依頼する"],
+            `候補を${String(failedCandidateIds.size)}種類試しましたが、残りに安全に到達できる候補を確認できませんでした。`,
+          );
+        }
         const planned = planSafeAction({
           mode: input.mode,
           requestedId: input.candidateId ?? undefined,
@@ -587,6 +762,7 @@ export const toolDefinitions = [
           { success: true }
         >[] = [];
         let actionStepCompleted = false;
+        let replanAfterCandidateFailure = false;
         const expectedCount = planned.candidate.requestedCount;
         const declaredActionCounts = new Map<string, number>();
         for (const [index, step] of planned.steps.entries()) {
@@ -734,6 +910,90 @@ export const toolDefinitions = [
             );
           }
           if (!result.success) {
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
+              planned.candidate.action === "mine_block" &&
+              step.tool === "mine_block" &&
+              !actionStepCompleted &&
+              authorizedGoalItem !== undefined &&
+              initialGoalHeld !== undefined &&
+              (result.error.code === "DROP_NOT_COLLECTED" ||
+                result.error.code === "MINE_OUTPUT_NOT_VERIFIED")
+            ) {
+              let observedGoalHeld: number | undefined;
+              try {
+                observedGoalHeld =
+                  (await context.game.observeStatus()).inventory[
+                    authorizedGoalItem
+                  ] ?? 0;
+              } catch {
+                // The uncertain mining result must retain its original failure.
+              }
+              const observedIncrease =
+                observedGoalHeld === undefined
+                  ? 0
+                  : Math.max(0, observedGoalHeld - initialGoalHeld);
+              if (observedIncrease > actionCount) {
+                return safeActionFailure(
+                  "safety",
+                  "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
+                  false,
+                  step.tool,
+                  {
+                    goalItem: authorizedGoalItem,
+                    observedIncrease,
+                    authorizedCount: actionCount,
+                    completedCount,
+                  },
+                  [
+                    "所持品の増加と依頼数量を確認してから新しい目的として依頼する",
+                  ],
+                  `所持品の増加が許可された${String(actionCount)}個を超えたため、追加の採掘を停止しました。実測の増加は${String(observedIncrease)}個です。`,
+                );
+              }
+              if (observedIncrease > completedCount) {
+                inventoryReconciledCount += observedIncrease - completedCount;
+                completedCount = observedIncrease;
+                remainingCount = actionCount - completedCount;
+                failedCandidateIds.add(planned.candidate.id);
+                completedCandidateIds.pop();
+                planReasons.pop();
+                replanAfterCandidateFailure = true;
+                break;
+              }
+            }
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
+              planned.candidate.action === "gather_resource" &&
+              step.tool === "gather_resource" &&
+              !actionStepCompleted &&
+              (result.error.code === "RESOURCE_PATHS_BLOCKED" ||
+                result.error.code === "RESOURCE_NOT_FOUND") &&
+              result.error.confirmedState.collectedCount === 0
+            ) {
+              failedCandidateIds.add(planned.candidate.id);
+              completedCandidateIds.pop();
+              planReasons.pop();
+              replanAfterCandidateFailure = true;
+              break;
+            }
+            if (
+              input.mode === "delegated" &&
+              input.candidateId === null &&
+              planned.candidate.action === "mine_block" &&
+              step.tool === "mine_block" &&
+              !actionStepCompleted &&
+              result.error.code === "MINE_APPROACH_PATH_BLOCKED" &&
+              result.error.confirmedState.blockMutationStarted === false
+            ) {
+              failedCandidateIds.add(planned.candidate.id);
+              completedCandidateIds.pop();
+              planReasons.pop();
+              replanAfterCandidateFailure = true;
+              break;
+            }
             return safeActionFailure(
               result.error.category,
               "SAFE_ACTION_STEP_FAILED",
@@ -762,6 +1022,7 @@ export const toolDefinitions = [
             summary: result.userSummary,
           });
         }
+        if (replanAfterCandidateFailure) continue;
 
         const progresses = actionProgresses(successfulResults);
         const progress = latestActionProgress(successfulResults);
@@ -929,6 +1190,7 @@ export const toolDefinitions = [
           completedCount,
           targetCount: actionCount,
           planRounds,
+          inventoryReconciledCount,
           intermediateProgress,
           completedSteps,
         },
@@ -936,7 +1198,7 @@ export const toolDefinitions = [
           "minecraft_snapshot",
           `安全計画を${String(planRounds)}回、${String(completedCount)}個分実行し、各段階の結果を確認した`,
         ),
-        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${completedSteps.map(({ summary }) => summary).join(" ")}`,
+        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${inventoryReconciledCount > 0 ? `途中の採掘は完了判定できませんでしたが、目標品${String(inventoryReconciledCount)}個の所持増加を再観測しました。` : ""}${completedSteps.map(({ summary }) => summary).join(" ")}`,
       };
     },
   }),
@@ -990,11 +1252,68 @@ export const toolDefinitions = [
         };
       }
 
-      const observed = await context.game.findSafeResourceCandidates(
+      const ownerAuthorization = context.safeActionAuthorization;
+      const allowedLogNames =
+        ownerAuthorization?.kind === "owner_bounded_resource"
+          ? ownerAuthorization.allowedResources.filter((resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ),
+            )
+          : undefined;
+      let observed = await context.game.findSafeResourceCandidates(
         Math.min(32, context.limits.maxMoveDistance),
         Math.min(8, input.count),
         context.signal,
+        allowedLogNames,
       );
+      const usage = context.safeActionAuthorizationUsage;
+      if (
+        observed.length === 0 &&
+        ownerAuthorization?.kind === "owner_bounded_resource" &&
+        usage !== undefined &&
+        !usage.consumed &&
+        input.count <= usage.remainingCount &&
+        context.game.searchSafeResourceCandidates !== undefined
+      ) {
+        if (allowedLogNames !== undefined && allowedLogNames.length > 0) {
+          const search = await context.game.searchSafeResourceCandidates(
+            Math.min(32, context.limits.maxMoveDistance),
+            Math.min(8, input.count),
+            AbortSignal.any([context.signal, AbortSignal.timeout(120_000)]),
+            allowedLogNames,
+          );
+          if (search.stop !== undefined) {
+            return safeActionFailure(
+              "safety",
+              search.stop.code,
+              false,
+              "search_safe_resource_candidates",
+              {
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [search.stop.reason],
+              `安全な候補を探す途中で停止しました。${search.stop.reason}`,
+            );
+          }
+          observed = search.candidates;
+          if (observed.length === 0) {
+            return safeActionFailure(
+              "resource",
+              "SAFE_RESOURCE_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_resource_candidates",
+              {
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              ["保護条件を満たす木が探索範囲に現れたら再依頼する"],
+              `許可された範囲で${String(search.attemptedWaypoints)}方向を調べましたが、保護条件を満たす木を確認できませんでした。`,
+            );
+          }
+        }
+      }
       const decision = chooseSafeCandidate({
         mode: "delegated",
         candidates: observed.map((candidate, index) => ({

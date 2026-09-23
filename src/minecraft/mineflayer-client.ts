@@ -823,11 +823,25 @@ export class MineflayerClient implements MinecraftPort {
       candidates.push({ ...candidate, order: candidates.length });
     };
 
-    for (const block of surrounding.blocks) {
-      if (knownBlockDrops[block.name] === undefined) continue;
+    // The general surroundings scan is capped at 128 solid blocks. On flat
+    // terrain those slots can all be ground, hiding the requested resource.
+    const resourcePositions = bot.findBlocks({
+      matching: (block) =>
+        knownBlockDrops[block.name] !== undefined &&
+        (requested.size === 0 ||
+          requested.has(block.name) ||
+          goalMetadataForBlock(block.name, requested).goalItem !== undefined),
+      maxDistance: input.radius,
+      count: Math.min(64, Math.max(16, input.maxCandidates * 4)),
+    });
+    for (const position of resourcePositions) {
+      throwIfAborted(signal, "observe_actions");
+      const block = bot.blockAt(position);
+      if (block === null || knownBlockDrops[block.name] === undefined) continue;
+      const blockPosition = positionOf(block.position);
       const target: ResourceTarget = {
         name: block.name,
-        position: block.position,
+        position: blockPosition,
       };
       const goalMetadata = goalMetadataForBlock(block.name, requested);
       let permission: GeneralActionCandidate["permission"];
@@ -840,7 +854,7 @@ export class MineflayerClient implements MinecraftPort {
                 {
                   operation: "mine",
                   name: block.name,
-                  position: block.position,
+                  position: blockPosition,
                 },
                 signal,
               ),
@@ -849,14 +863,14 @@ export class MineflayerClient implements MinecraftPort {
         permission = "unknown";
       }
       add({
-        id: generalCandidateId("mine_block", block.name, block.position),
+        id: generalCandidateId("mine_block", block.name, blockPosition),
         label: `${block.name}を採掘`,
         action: "mine_block",
-        args: { name: block.name, position: block.position },
+        args: { name: block.name, position: blockPosition },
         steps: [
           {
             tool: "mine_block",
-            input: { name: block.name, position: block.position },
+            input: { name: block.name, position: blockPosition },
           },
         ],
         observed: true,
@@ -872,7 +886,7 @@ export class MineflayerClient implements MinecraftPort {
         requestedCount: 1,
         resourceName: block.name,
         ...goalMetadata,
-        distance: block.distance,
+        distance: bot.entity.position.distanceTo(block.position),
       });
     }
 
@@ -1519,6 +1533,8 @@ export class MineflayerClient implements MinecraftPort {
           metadata: unknown,
           count: number,
         ): Promise<void>;
+        takeInput(): Promise<unknown>;
+        takeFuel(): Promise<unknown>;
         takeOutput(): Promise<void>;
         close(): void;
         inputItem?: () => {
@@ -1536,24 +1552,42 @@ export class MineflayerClient implements MinecraftPort {
       }>;
     };
     const inputItem = bot.registry.itemsByName[target.input];
-    const fuelItem =
-      bot.registry.itemsByName.coal ?? bot.registry.itemsByName.charcoal;
-    if (
-      typedBot.openFurnace === undefined ||
-      inputItem === undefined ||
-      fuelItem === undefined
-    ) {
+    if (typedBot.openFurnace === undefined || inputItem === undefined) {
       throw new AppError({
         category: "resource",
         code: "SMELT_UNAVAILABLE",
-        message: "The furnace or safe fuel contract is unavailable",
+        message: "The furnace or smelting input is unavailable",
         retryable: false,
         failedAt: "smelt_item",
       });
     }
     const before = await this.observe();
+    const fuelCount = Math.ceil(target.count / 8);
+    const fuelName = ["coal", "charcoal"].find(
+      (name) =>
+        (before.inventory.find((item) => item.name === name)?.count ?? 0) >=
+        fuelCount,
+    );
+    const fuelItem =
+      fuelName === undefined ? undefined : bot.registry.itemsByName[fuelName];
+    if (fuelItem === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "SMELT_FUEL_MISSING",
+        message: "Not enough known fuel is held for this bounded batch",
+        retryable: false,
+        failedAt: "smelt_item",
+        confirmedState: { requested: target.count, fuelNeeded: fuelCount },
+      });
+    }
     const furnace = await typedBot.openFurnace(furnaceBlock);
+    let batchStarted = false;
+    let batchCompleted = false;
+    let operationFailed = false;
+    let operationError: unknown;
+    let cleanupError: unknown;
     try {
+      throwIfAborted(signal, "smelt_item");
       const initialSlots = furnaceBatchReadiness({
         input: readFurnaceSlot(furnace.inputItem?.bind(furnace)),
         fuel: readFurnaceSlot(furnace.fuelItem?.bind(furnace)),
@@ -1578,8 +1612,12 @@ export class MineflayerClient implements MinecraftPort {
           },
         });
       }
+      throwIfAborted(signal, "smelt_item");
+      batchStarted = true;
       await furnace.putInput(inputItem.id, null, target.count);
-      await furnace.putFuel(fuelItem.id, null, target.count);
+      throwIfAborted(signal, "smelt_item");
+      await furnace.putFuel(fuelItem.id, null, fuelCount);
+      throwIfAborted(signal, "smelt_item");
       const boundInput = readFurnaceSlot(furnace.inputItem?.bind(furnace));
       const boundFuel = readFurnaceSlot(furnace.fuelItem?.bind(furnace));
       if (
@@ -1601,7 +1639,13 @@ export class MineflayerClient implements MinecraftPort {
         });
       }
       const boundInputCount = boundInput.count ?? target.count;
-      const deadline = Date.now() + this.options.collectTimeoutMs;
+      // A vanilla furnace needs about 10 seconds per item at 20 TPS. The
+      // generic pickup timeout can expire before its first output appears.
+      const smeltWaitMs = Math.max(
+        this.options.collectTimeoutMs,
+        20_000 + Math.max(0, target.count - 1) * 10_000,
+      );
+      const deadline = Date.now() + smeltWaitMs;
       while (Date.now() < deadline) {
         throwIfAborted(signal, "smelt_item");
         await delay(250, signal);
@@ -1612,7 +1656,36 @@ export class MineflayerClient implements MinecraftPort {
         const baseline =
           before.inventory.find((entry) => entry.name === target.output)
             ?.count ?? 0;
-        if (count - baseline >= target.count) return count - baseline;
+        if (count - baseline > target.count) {
+          throw new AppError({
+            category: "safety",
+            code: "SMELT_OUTPUT_EXCEEDS_BOUND",
+            message: "The observed output exceeds the authorized batch",
+            retryable: false,
+            failedAt: "smelt_item",
+            confirmedState: {
+              requested: target.count,
+              observed: count - baseline,
+            },
+          });
+        }
+        if (count - baseline === target.count) {
+          const remainingInput = readFurnaceSlot(
+            furnace.inputItem?.bind(furnace),
+          );
+          const remainingOutput = readFurnaceSlot(
+            furnace.outputItem?.bind(furnace),
+          );
+          if (
+            remainingInput.known &&
+            remainingInput.itemName === undefined &&
+            remainingOutput.known &&
+            remainingOutput.itemName === undefined
+          ) {
+            batchCompleted = true;
+            break;
+          }
+        }
         const outputSlot = readFurnaceSlot(furnace.outputItem?.bind(furnace));
         if (!outputSlot.known) {
           throw new AppError({
@@ -1654,14 +1727,45 @@ export class MineflayerClient implements MinecraftPort {
           await furnace.takeOutput();
         }
       }
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
     } finally {
       try {
-        furnace.close();
-      } catch {
-        // Mineflayer's runtime close() is synchronous; closing is best effort
-        // after the authoritative inventory observation.
+        if (batchStarted && !batchCompleted) {
+          await reclaimOwnedFurnaceBatch(furnace, {
+            input: target.input,
+            fuel: fuelItem.name,
+            output: target.output,
+          });
+        }
+      } catch (error) {
+        cleanupError = error;
+        this.logger.error(
+          { code: "SMELT_BATCH_CLEANUP_UNVERIFIED" },
+          "bot-owned furnace batch could not be reclaimed",
+        );
+      } finally {
+        try {
+          furnace.close();
+        } catch {
+          // Mineflayer's close() is synchronous; cleanup already checked slots.
+        }
       }
     }
+    if (cleanupError !== undefined) {
+      throw new AppError(
+        {
+          category: "safety",
+          code: "SMELT_BATCH_CLEANUP_UNVERIFIED",
+          message: "The bot-owned furnace batch could not be verified empty",
+          retryable: false,
+          failedAt: "smelt_item",
+        },
+        { cause: cleanupError },
+      );
+    }
+    if (operationFailed) throw operationError;
     const after = await this.observe();
     const baseline =
       before.inventory.find((entry) => entry.name === target.output)?.count ??
@@ -1671,6 +1775,16 @@ export class MineflayerClient implements MinecraftPort {
       (after.inventory.find((entry) => entry.name === target.output)?.count ??
         0) - baseline,
     );
+    if (produced > target.count) {
+      throw new AppError({
+        category: "safety",
+        code: "SMELT_OUTPUT_EXCEEDS_BOUND",
+        message: "The observed output exceeds the authorized batch",
+        retryable: false,
+        failedAt: "smelt_item",
+        confirmedState: { requested: target.count, observed: produced },
+      });
+    }
     if (produced < target.count) {
       throw new AppError({
         category: "inventory",
@@ -2088,6 +2202,58 @@ function readFurnaceSlot(
   } catch {
     return { known: false };
   }
+}
+
+async function reclaimOwnedFurnaceBatch(
+  furnace: {
+    inputItem?(): { readonly name: string; readonly count: number } | null;
+    fuelItem?(): { readonly name: string; readonly count: number } | null;
+    outputItem?(): { readonly name: string; readonly count: number } | null;
+    takeInput(): Promise<unknown>;
+    takeFuel(): Promise<unknown>;
+    takeOutput(): Promise<unknown>;
+  },
+  expected: {
+    readonly input: string;
+    readonly fuel: string;
+    readonly output: string;
+  },
+): Promise<void> {
+  // This window was observed empty before depositing. Remove the input first so
+  // an aborted task cannot keep smelting while the remaining slots are drained.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (const [name, reader, take] of [
+      ["input", furnace.inputItem?.bind(furnace), () => furnace.takeInput()],
+      ["output", furnace.outputItem?.bind(furnace), () => furnace.takeOutput()],
+      ["fuel", furnace.fuelItem?.bind(furnace), () => furnace.takeFuel()],
+    ] as const) {
+      const slot = readFurnaceSlot(reader);
+      if (
+        !slot.known ||
+        (slot.itemName !== undefined && slot.itemName !== expected[name])
+      ) {
+        throw new Error(`Furnace ${name} slot is not the bot-owned batch`);
+      }
+      if (slot.itemName !== undefined) {
+        try {
+          await take();
+        } catch {
+          // A slot can change as the server finishes an in-flight smelt.
+          // Re-read it before deciding that cleanup failed.
+        }
+      }
+    }
+    await delay(50);
+    if (
+      furnaceBatchReadiness({
+        input: readFurnaceSlot(furnace.inputItem?.bind(furnace)),
+        fuel: readFurnaceSlot(furnace.fuelItem?.bind(furnace)),
+        output: readFurnaceSlot(furnace.outputItem?.bind(furnace)),
+      }).allowed
+    )
+      return;
+  }
+  throw new Error("The bot-owned furnace batch remains in a slot");
 }
 
 function droppedItemName(entity: {

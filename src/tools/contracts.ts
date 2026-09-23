@@ -126,6 +126,20 @@ export interface SafeResourceCandidate {
   readonly distance: number;
 }
 
+export interface SafeResourceSearchResult {
+  readonly candidates: readonly SafeResourceCandidate[];
+  readonly attemptedWaypoints: number;
+  readonly blockedWaypoints: number;
+  readonly stop?: { readonly code: string; readonly reason: string };
+}
+
+export interface SafeActionSearchResult {
+  readonly candidates: readonly SafeActionCandidate[];
+  readonly attemptedWaypoints: number;
+  readonly blockedWaypoints: number;
+  readonly stop?: { readonly code: string; readonly reason: string };
+}
+
 export interface ActionReport {
   before: GameStatus | null;
   after: GameStatus | null;
@@ -158,7 +172,15 @@ export interface GameController {
     maxDistance: number,
     count: number,
     signal: AbortSignal,
+    allowedNames?: readonly string[],
   ): Promise<readonly SafeResourceCandidate[]>;
+  /** Bounded movement to observe protected resources when the first view is empty. */
+  searchSafeResourceCandidates?(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+    allowedNames?: readonly string[],
+  ): Promise<SafeResourceSearchResult>;
   /**
    * Observes provider-backed candidates for a high-level goal. The goal is
    * descriptive only; returned candidates still need the safe planner and
@@ -168,6 +190,11 @@ export interface GameController {
     request: SafeActionObservationRequest,
     signal: AbortSignal,
   ): Promise<readonly SafeActionCandidate[]>;
+  /** Moves only to bounded observation points, then rechecks server permission. */
+  searchSafeActionCandidates?(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<SafeActionSearchResult>;
   observeActionCandidates(
     input: GeneralActionObservationInput,
     signal: AbortSignal,

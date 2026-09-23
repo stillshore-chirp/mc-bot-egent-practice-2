@@ -47,6 +47,7 @@ import {
 import type { TaskRuntime } from "../runtime/task-service.js";
 import type { FollowPlayerSkill } from "../skills/follow-player.js";
 import type { GatherLogsSkill } from "../skills/gather-logs/gather-logs-skill.js";
+import { createSearchFrontier } from "../skills/gather-logs/search-strategy.js";
 import {
   gatherableLogs,
   type GatherableLog,
@@ -60,6 +61,8 @@ import type {
   GameStatus,
   Position,
   SafeResourceCandidate,
+  SafeResourceSearchResult,
+  SafeActionSearchResult,
   Surroundings,
 } from "../tools/contracts.js";
 
@@ -98,12 +101,15 @@ const resourceLabels: Readonly<Record<string, string>> = {
 };
 
 const resourceCollectionIntent =
-  /(集め|集める|集めて|採取|採掘|掘る|掘って|持ってき|取ってき|collect|gather|mine|obtain|fetch|harvest)/iu;
+  /(集め|集める|集めて|採取|採掘|掘る|掘って|切る|切って|伐採|持ってき|取ってき|collect|gather|mine|obtain|fetch|harvest)/iu;
 
 function isResourceCollectionGoal(goal: string): boolean {
   const normalized = goal.trim().toLocaleLowerCase("ja-JP");
   if (normalized === "collect_resource") return true;
   if (!resourceCollectionIntent.test(normalized)) return false;
+  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(normalized)) {
+    return true;
+  }
   return Object.entries(resourceLabels).some(([resource, label]) => {
     const canonical = resource.replaceAll("_", " ");
     return (
@@ -255,6 +261,97 @@ export class CompanionGameController implements GameController {
       .sort((left, right) => left.distance - right.distance);
   }
 
+  public async searchSafeResourceCandidates(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+    allowedNames?: readonly string[],
+  ): Promise<SafeResourceSearchResult> {
+    const searchDistance = Math.min(maxDistance, this.#maxMoveDistance, 32);
+    const initial = await this.findSafeResourceCandidates(
+      Math.min(32, searchDistance),
+      count,
+      signal,
+      allowedNames,
+    );
+    if (initial.length > 0) {
+      return {
+        candidates: initial,
+        attemptedWaypoints: 0,
+        blockedWaypoints: 0,
+      };
+    }
+    const origin = await this.#minecraft.observe();
+    const frontier = createSearchFrontier(
+      origin.position,
+      Math.min(16, searchDistance),
+      searchDistance,
+    ).slice(0, 4);
+    let attemptedWaypoints = 0;
+    let blockedWaypoints = 0;
+    let moved = false;
+    for (const point of frontier) {
+      signal.throwIfAborted();
+      const beforeMove = await this.#minecraft.observe();
+      const danger = observedCurrentDanger(beforeMove, this.#hungerThreshold);
+      if (!beforeMove.connected || !beforeMove.spawned || danger !== null) {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: "SAFE_RESOURCE_SEARCH_UNSAFE",
+            reason: danger ?? "Minecraftへの接続と現在位置を確認できません。",
+          },
+        };
+      }
+      attemptedWaypoints += 1;
+      const movement = await this.moveTo(point, 3, signal);
+      if (movement.outcome !== "completed") {
+        if (movement.failureCategory === "path") {
+          blockedWaypoints += 1;
+          continue;
+        }
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: movement.failureCode ?? "SAFE_RESOURCE_SEARCH_STOPPED",
+            reason: movement.summary,
+          },
+        };
+      }
+      moved = true;
+      const candidates = await this.findSafeResourceCandidates(
+        Math.min(32, searchDistance),
+        count,
+        signal,
+        allowedNames,
+      );
+      if (candidates.length > 0) {
+        return { candidates, attemptedWaypoints, blockedWaypoints };
+      }
+    }
+    if (moved && !signal.aborted) {
+      const returnMove = await this.moveTo(origin.position, 3, signal);
+      if (returnMove.outcome !== "completed") {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code:
+              returnMove.failureCode ?? "SAFE_RESOURCE_SEARCH_RETURN_FAILED",
+            reason:
+              "候補がなく、探索前の位置へ戻る移動も完了できませんでした。",
+          },
+        };
+      }
+    }
+    return { candidates: [], attemptedWaypoints, blockedWaypoints };
+  }
+
   public async findSafeActionCandidates(
     request: SafeActionObservationRequest,
     signal: AbortSignal,
@@ -294,7 +391,7 @@ export class CompanionGameController implements GameController {
       const current = await this.#minecraft.observe();
       const readyToSmelt =
         intermediateItem !== undefined &&
-        countInventory(current, intermediateItem) > 0;
+        countInventory(current, intermediateItem) >= request.count;
       const candidates = await this.observeActionCandidates(
         {
           radius: Math.min(32, this.#maxMoveDistance),
@@ -309,6 +406,19 @@ export class CompanionGameController implements GameController {
             candidate.goalItem === targetItem &&
             candidate.purposeFit === "direct" &&
             candidate.action === (readyToSmelt ? "smelt_item" : "mine_block"),
+        )
+        .map((candidate) =>
+          candidate.action !== "smelt_item"
+            ? candidate
+            : {
+                ...candidate,
+                requestedCount: request.count,
+                args: { ...candidate.args, count: request.count },
+                steps: candidate.steps.map((step) => ({
+                  ...step,
+                  input: { ...step.input, count: request.count },
+                })),
+              },
         )
         .slice(0, request.maxCandidates);
     }
@@ -361,6 +471,162 @@ export class CompanionGameController implements GameController {
           },
         ],
       }));
+  }
+
+  public async searchSafeActionCandidates(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<SafeActionSearchResult> {
+    const authorization = request.authorization;
+    if (
+      authorization?.kind !== "owner_bounded_resource" ||
+      authorization.targetItem === "*" ||
+      isGatherableLog(authorization.targetItem)
+    ) {
+      return { candidates: [], attemptedWaypoints: 0, blockedWaypoints: 0 };
+    }
+    const origin = await this.#minecraft.observe();
+    const searchDistance = Math.min(32, this.#maxMoveDistance);
+    const readyInput = knownSmeltInputs[authorization.targetItem];
+    if (
+      readyInput !== undefined &&
+      countInventory(origin, readyInput) >= request.count
+    ) {
+      return {
+        candidates: [],
+        attemptedWaypoints: 0,
+        blockedWaypoints: 0,
+        stop: {
+          code: "SMELT_STATION_NOT_OBSERVED",
+          reason:
+            "原料は揃っていますが、安全に使える精錬設備を観測できません。",
+        },
+      };
+    }
+    const initial = await this.findSafeActionCandidates(request, signal);
+    if (initial.some((candidate) => candidate.safety === "allowed")) {
+      return {
+        candidates: initial,
+        attemptedWaypoints: 0,
+        blockedWaypoints: 0,
+      };
+    }
+    const observed = await this.observeActionCandidates(
+      {
+        radius: searchDistance,
+        requestedItems: [authorization.targetItem],
+        maxCandidates: 16,
+      },
+      signal,
+    );
+    const allowedResources = new Set(authorization.allowedResources);
+    const queued = observed
+      .filter(
+        (candidate) =>
+          candidate.action === "mine_block" &&
+          candidate.goalItem === authorization.targetItem &&
+          candidate.resourceName !== undefined &&
+          allowedResources.has(candidate.resourceName) &&
+          candidate.permission === "unknown" &&
+          candidate.distance > 6,
+      )
+      .map(candidateBlockPosition)
+      .filter(
+        (position): position is { x: number; y: number; z: number } =>
+          position !== undefined,
+      );
+    queued.push(
+      ...createSearchFrontier(
+        origin.position,
+        Math.min(16, searchDistance),
+        searchDistance,
+      ).slice(0, 4),
+    );
+    const seen = new Set<string>();
+    let attemptedWaypoints = 0;
+    let blockedWaypoints = 0;
+    let moved = false;
+    while (queued.length > 0 && attemptedWaypoints < 4) {
+      signal.throwIfAborted();
+      const point = queued.shift();
+      if (point === undefined) break;
+      if (distance(origin.position, point) > searchDistance) continue;
+      const beforeMove = await this.#minecraft.observe();
+      const waypoint = boundedApproachPoint(beforeMove.position, point, 8);
+      const key = `${waypoint.x}:${waypoint.y}:${waypoint.z}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const danger = observedCurrentDanger(beforeMove, this.#hungerThreshold);
+      if (!beforeMove.connected || !beforeMove.spawned || danger !== null) {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: "SAFE_ACTION_SEARCH_UNSAFE",
+            reason: danger ?? "Minecraftへの接続と現在位置を確認できません。",
+          },
+        };
+      }
+      attemptedWaypoints += 1;
+      const movement = await this.moveTo(waypoint, 3, signal);
+      if (movement.outcome !== "completed") {
+        if (movement.failureCategory === "path") {
+          blockedWaypoints += 1;
+          continue;
+        }
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: movement.failureCode ?? "SAFE_ACTION_SEARCH_STOPPED",
+            reason: movement.summary,
+          },
+        };
+      }
+      moved = true;
+      const candidates = await this.findSafeActionCandidates(request, signal);
+      if (candidates.some((candidate) => candidate.safety === "allowed")) {
+        return { candidates, attemptedWaypoints, blockedWaypoints };
+      }
+      const newlyObserved = await this.observeActionCandidates(
+        {
+          radius: searchDistance,
+          requestedItems: [authorization.targetItem],
+          maxCandidates: 16,
+        },
+        signal,
+      );
+      for (const candidate of newlyObserved) {
+        if (
+          candidate.action !== "mine_block" ||
+          candidate.goalItem !== authorization.targetItem ||
+          candidate.resourceName === undefined ||
+          !allowedResources.has(candidate.resourceName) ||
+          candidate.permission !== "unknown" ||
+          candidate.distance <= 6
+        )
+          continue;
+        const position = candidateBlockPosition(candidate);
+        if (position !== undefined) queued.unshift(position);
+      }
+    }
+    if (moved && !signal.aborted) {
+      const returnMove = await this.moveTo(origin.position, 3, signal);
+      if (returnMove.outcome !== "completed") {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: returnMove.failureCode ?? "SAFE_ACTION_SEARCH_RETURN_FAILED",
+            reason: "安全な候補がなく、探索前の位置へ戻れませんでした。",
+          },
+        };
+      }
+    }
+    return { candidates: [], attemptedWaypoints, blockedWaypoints };
   }
 
   public async observeActionCandidates(
@@ -716,6 +982,29 @@ export class CompanionGameController implements GameController {
         summary: `安全に採取できる原木を確認できず、収集を停止しました。${acquired === undefined ? "取得数は未確認です。" : `今回の取得は${String(acquired)}個、現在の所持数は${String(held)}個です。`}履歴不足・建築保護・照会失敗の対象は採取しません。`,
       };
     }
+    if (
+      report.outcome !== "completed" &&
+      report.failureCode === "RESOURCE_PATHS_BLOCKED"
+    ) {
+      const held =
+        report.after?.inventory[resource] ?? (report.after ? 0 : undefined);
+      const before =
+        report.before?.inventory[resource] ?? (report.before ? 0 : undefined);
+      const acquired =
+        held === undefined || before === undefined
+          ? undefined
+          : Math.max(0, held - before);
+      return {
+        ...report,
+        confirmedState: {
+          ...report.confirmedState,
+          collectedCount: acquired ?? null,
+          heldCount: held ?? null,
+        },
+        nextActions: ["安全に到達できる別の木や経路がある場所で再依頼する"],
+        summary: `保護条件を満たす木を探しましたが、試した経路では安全に近づけず、採取を停止しました。${acquired === undefined ? "取得数は未確認です。" : `今回の取得は${String(acquired)}個です。`}`,
+      };
+    }
     if (report.outcome !== "completed") {
       const held =
         report.after?.inventory[resource] ?? (report.after ? 0 : undefined);
@@ -769,8 +1058,25 @@ export class CompanionGameController implements GameController {
           input,
           signal,
           async (actionSignal) => {
-            await this.#minecraft.moveTo(input.position, 3, actionSignal);
-            await this.#minecraft.mineBlock(input, actionSignal);
+            try {
+              await this.#minecraft.moveTo(input.position, 3, actionSignal);
+              await this.#minecraft.mineBlock(input, actionSignal);
+            } catch (error) {
+              if (
+                error instanceof AppError &&
+                error.detail.category === "path"
+              ) {
+                throw new AppError(
+                  {
+                    ...error.detail,
+                    code: "MINE_APPROACH_PATH_BLOCKED",
+                    confirmedState: { blockMutationStarted: false },
+                  },
+                  { cause: error },
+                );
+              }
+              throw error;
+            }
             await this.#minecraft.collectDropsNear(
               input.position,
               itemName,
@@ -1688,6 +1994,44 @@ function formatCoordinates(position: {
   readonly z: number;
 }): string {
   return `(${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)})`;
+}
+
+function candidateBlockPosition(
+  candidate: GeneralActionCandidate,
+): { x: number; y: number; z: number } | undefined {
+  const position = candidate.args.position;
+  if (
+    position === null ||
+    typeof position !== "object" ||
+    Array.isArray(position)
+  )
+    return undefined;
+  const { x, y, z } = position as Record<string, unknown>;
+  if (
+    typeof x !== "number" ||
+    typeof y !== "number" ||
+    typeof z !== "number" ||
+    !Number.isInteger(x) ||
+    !Number.isInteger(y) ||
+    !Number.isInteger(z)
+  )
+    return undefined;
+  return { x, y, z };
+}
+
+function boundedApproachPoint(
+  origin: { x: number; y: number; z: number },
+  target: { x: number; y: number; z: number },
+  maxStep: number,
+): { x: number; y: number; z: number } {
+  const span = distance(origin, target);
+  if (span <= maxStep) return target;
+  const fraction = maxStep / span;
+  return {
+    x: Math.round(origin.x + (target.x - origin.x) * fraction),
+    y: Math.round(origin.y + (target.y - origin.y) * fraction),
+    z: Math.round(origin.z + (target.z - origin.z) * fraction),
+  };
 }
 
 function splitMinecraftChat(message: string): string[] {
