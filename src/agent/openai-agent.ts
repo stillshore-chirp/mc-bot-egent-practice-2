@@ -292,17 +292,22 @@ function deterministicActionSummary(
     .join(" ");
 }
 
-function groundCapabilityClaims(text: string, maxCount: number): string {
+function groundCapabilityClaims(
+  text: string,
+  maxCount: number,
+  actionScopeOpen: boolean,
+): string {
+  if (!actionScopeOpen) return text;
   const ironToolsAvailable = ["mine_block", "collect_item", "smelt_item"].every(
     (name) => getToolDefinition(name) !== undefined,
   );
   if (
     ironToolsAvailable &&
-    /(?:鉄|iron).{0,40}(?:収集|集め|採掘).{0,30}(?:操作|機能).{0,20}(?:ない|ありません|未対応|できません|提供していません|使えません)/iu.test(
+    /(?:鉄|iron).{0,40}(?:収集|集め|採掘).{0,30}(?:操作|機能)(?:が|は)(?:ない|ありません|未対応|未提供|提供していません|実装されていません)/iu.test(
       text,
     )
   ) {
-    return "鉄を集める操作がないという説明は誤りです。安全な鉄鉱石を観測できれば採掘し、落ちた素材を回収できます。必要なら精錬もできます。まだ実行していない作業は進捗として数えません。";
+    return "鉄を集める操作がないという説明は誤りです。採掘・回収・精錬の機能はあります。実行時には認可と安全条件を確認します。まだ実行していない作業は進捗として数えません。";
   }
   if (
     /(?:小分け|繰り返|何度|合計|全体)/u.test(text) &&
@@ -844,6 +849,9 @@ export class OpenAIDeliberationAgent {
           groundCapabilityClaims(
             response.output_text.trim(),
             request.toolContext.limits.maxGatherCount,
+            request.toolContext.requestKind === "owner_message" &&
+              toolContext.allowActionTools !== false &&
+              !keepStoppedGoal,
           );
         if (text.length === 0) {
           throw new Error("LLM_RESPONSE_EMPTY");

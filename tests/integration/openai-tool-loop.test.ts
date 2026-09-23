@@ -1778,6 +1778,41 @@ describe("OpenAI tool loop", () => {
     );
   });
 
+  it("preserves the stopped action boundary in a capability explanation", async () => {
+    const stoppedExplanation =
+      "停止中なので今は鉄を集める操作を使えません。明示的な再開を待ちます。";
+    const fake = new ScriptedOpenAI([
+      response([], "木を探します。"),
+      response([], stoppedExplanation),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const firstReply = await agent.deliberate({
+      message: "木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    agent.recordDeliveredReply("owner", "owner_message", firstReply.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+
+    const stoppedReply = await agent.deliberate({
+      message: "なぜ？",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(stoppedReply.text).toBe(stoppedExplanation);
+  });
+
   it("starts a bounded safe plan when the model answers instead of acting on an authorized goal", async () => {
     const fake = new ScriptedOpenAI([response([], "数量を指定してください。")]);
     const agent = new OpenAIDeliberationAgent({
