@@ -295,6 +295,12 @@ function renderReadOnlyStatus(status: GameStatus): string {
 
 export interface ChatContextFactory {
   clearPendingOwnerGoal?(): void;
+  /** Persist owner behavior candidates when the chat message is accepted. */
+  acceptOwnerMessage?(
+    requesterUsername: string,
+    message: string,
+    eventId: string,
+  ): void;
   create(
     requesterUsername: string,
     message: string,
@@ -339,6 +345,9 @@ interface DeliveredReplyRecorder {
     conversationRequestId?: number,
   ) => void;
 }
+
+type ConversationAgent = Pick<OpenAIDeliberationAgent, "deliberate"> &
+  DeliveredReplyRecorder;
 
 export interface RuntimeReassessmentContext {
   readonly event: RuntimeReassessmentEvent;
@@ -429,7 +438,7 @@ async function safeCompleteTrace(
 export class ChatCoordinator {
   readonly #ownerUsername: string;
   readonly #game: GameController;
-  readonly #agent: OpenAIDeliberationAgent;
+  readonly #agent: ConversationAgent;
   readonly #contextFactory: ChatContextFactory;
   readonly #logger: Logger;
   readonly #traceService: TraceService | undefined;
@@ -448,7 +457,7 @@ export class ChatCoordinator {
   public constructor(input: {
     ownerUsername: string;
     game: GameController;
-    agent: OpenAIDeliberationAgent;
+    agent: ConversationAgent;
     contextFactory: ChatContextFactory;
     logger: Logger;
     traceService?: TraceService;
@@ -556,6 +565,22 @@ export class ChatCoordinator {
       return true;
     }
 
+    const acceptedCorrelationId = createCorrelationId();
+    try {
+      this.#contextFactory.acceptOwnerMessage?.(
+        username,
+        normalized,
+        acceptedCorrelationId,
+      );
+    } catch (error) {
+      this.#logger.warn(
+        {
+          code: "OWNER_BEHAVIOR_MEMORY_ACCEPT_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "owner behavior memory acceptance failed",
+      );
+    }
     this.#runtimeGeneration += 1;
     this.#notifyOwnerMessage();
 
@@ -625,7 +650,13 @@ export class ChatCoordinator {
           );
           return this.#respondToHostiles(username, normalized);
         }
-        return this.#deliberate(username, normalized, "owner_message");
+        return this.#deliberate(
+          username,
+          normalized,
+          "owner_message",
+          undefined,
+          acceptedCorrelationId,
+        );
       });
     await this.#conversationTail;
     return true;
@@ -877,6 +908,7 @@ export class ChatCoordinator {
     message: string,
     requestKind: ToolContext["requestKind"],
     reassessment?: RuntimeReassessmentContext,
+    acceptedCorrelationId?: string,
   ): Promise<RuntimeReassessmentRunOutcome> {
     const controller = new AbortController();
     this.#activeController = controller;
@@ -909,7 +941,7 @@ export class ChatCoordinator {
         ? operation()
         : safeWithTrace(this.#traceService, session, operation);
     const process = async (): Promise<void> => {
-      const correlationId = createCorrelationId();
+      const correlationId = acceptedCorrelationId ?? createCorrelationId();
       await runWithCorrelation(correlationId, async () => {
         const context = await this.#contextFactory.create(
           username,

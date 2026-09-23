@@ -872,7 +872,7 @@ describe("immediate stop command", () => {
         beginOwnerRequest,
         deliberate: vi.fn(),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => {
           throw new Error("CONTEXT_FAILED");
@@ -1172,7 +1172,7 @@ describe("immediate stop command", () => {
         deliberate: vi.fn(async () => {
           throw new Error("synthetic runtime failure");
         }),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1222,7 +1222,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { say } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(
           async (
@@ -1679,7 +1679,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { say: vi.fn(async () => undefined) } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(
           async (
@@ -1712,5 +1712,73 @@ describe("immediate stop command", () => {
     expect(await runtimeRequest).toBe("cancelled");
     await followup;
     expect(deliberate).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts owner behavior memory before queued work can be cancelled", async () => {
+    let releaseFirst!: () => void;
+    let notifyFirstCreate!: () => void;
+    const firstCreateStarted = new Promise<void>((resolve) => {
+      notifyFirstCreate = resolve;
+    });
+    const accepted: { message: string; eventId: string }[] = [];
+    const created: { message: string; correlationId: string }[] = [];
+    const contextFactory: ChatContextFactory = {
+      acceptOwnerMessage: vi.fn(
+        (requesterUsername: string, message: string, eventId: string) => {
+          expect(requesterUsername).toBe("owner");
+          accepted.push({ message, eventId });
+        },
+      ),
+      create: vi.fn(
+        async (
+          _username: string,
+          message: string,
+          signal: AbortSignal,
+          correlationId: string,
+          requestKind: ToolContext["requestKind"],
+        ) => {
+          created.push({ message, correlationId });
+          if (message === "first") {
+            notifyFirstCreate();
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          return {
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "固定観測要約",
+            toolContext: { ...minimalToolContext, signal, requestKind },
+          };
+        },
+      ),
+    };
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => ({
+          outcome: "cancelled" as const,
+          summary: "停止しました。",
+        })),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({ text: "応答", toolResults: [] })),
+      },
+      contextFactory,
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const first = coordinator.handleChat("owner", "first");
+    await firstCreateStarted;
+    const queued = coordinator.handleChat("owner", "queued");
+    await coordinator.handleChat("owner", "停止");
+    releaseFirst();
+    await first;
+    await queued;
+
+    expect(accepted.map(({ message }) => message)).toEqual(["first", "queued"]);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.correlationId).toBe(accepted[0]?.eventId);
   });
 });

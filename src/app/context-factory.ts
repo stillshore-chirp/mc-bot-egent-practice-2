@@ -66,6 +66,22 @@ export class CompanionContextFactory implements ChatContextFactory {
     this.#pendingOwnerGoal = undefined;
   }
 
+  public acceptOwnerMessage(
+    requesterUsername: string,
+    message: string,
+    eventId: string,
+  ): void {
+    if (requesterUsername !== this.config.ownerUsername) return;
+    this.#behaviorLearner.learn({
+      ownerUsername: this.config.ownerUsername,
+      requesterUsername,
+      playerId: this.playerId,
+      message,
+      requestKind: "owner_message",
+      eventId,
+    });
+  }
+
   public async create(
     requesterUsername: string,
     message: string,
