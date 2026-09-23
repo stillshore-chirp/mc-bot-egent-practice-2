@@ -398,7 +398,7 @@ export class CompanionGameController implements GameController {
         knownBlockDrops[targetItem] === undefined;
       const candidates = await this.observeActionCandidates(
         {
-          radius: Math.min(32, this.#maxMoveDistance),
+          radius: Math.min(craftFromInventory ? 8 : 32, this.#maxMoveDistance),
           requestedItems: [targetItem],
           maxCandidates: Math.min(16, request.maxCandidates),
         },
