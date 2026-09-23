@@ -28,11 +28,20 @@ const status: GameStatus = {
 describe("armor status answer", () => {
   it("routes status questions but leaves equipment commands and permission questions alone", () => {
     expect(classifyArmorQuestion("防具を装備してる？")).toBe("bot");
-    expect(classifyArmorQuestion("今の装備状態を教えて")).toBe("bot");
+    expect(classifyArmorQuestion("今の防具の装備状態を教えて")).toBe("bot");
     expect(classifyArmorQuestion("私の防具は？")).toBe("requester");
+    expect(classifyArmorQuestion("私は防具を装備してる？")).toBe("requester");
+    expect(classifyArmorQuestion("村人の防具は？")).toBeNull();
+    expect(classifyArmorQuestion("村人は防具を装備してる？")).toBeNull();
+    expect(classifyArmorQuestion("Steveの防具は？")).toBeNull();
+    expect(classifyArmorQuestion("剣を装備してる？")).toBeNull();
+    expect(classifyArmorQuestion("盾は装備してる？")).toBeNull();
     expect(classifyArmorQuestion("防具を装備して")).toBeNull();
     expect(classifyArmorQuestion("防具を装備してもいい？")).toBeNull();
     expect(classifyArmorQuestion("防具を装備して？")).toBeNull();
+    expect(classifyArmorQuestion("防具を着て？")).toBeNull();
+    expect(classifyArmorQuestion("防具を脱いで？")).toBeNull();
+    expect(classifyArmorQuestion("防具を装備しないで？")).toBeNull();
     expect(classifyArmorQuestion("木を集めて、防具は？")).toBeNull();
   });
 

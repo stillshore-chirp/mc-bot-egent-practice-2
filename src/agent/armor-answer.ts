@@ -3,7 +3,7 @@ import type { GameStatus } from "../tools/contracts.js";
 export type ArmorQuestionSubject = "bot" | "requester";
 
 const armorName =
-  /(?:防具|装備|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ|兜|鎧)/u;
+  /(?:防具|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ|兜|鎧)/u;
 const armorItem = /(?:_helmet|_chestplate|_leggings|_boots)$/u;
 const materialNames: Readonly<Record<string, string>> = {
   leather: "革",
@@ -32,7 +32,13 @@ export function classifyArmorQuestion(
     )
   )
     return null;
-  if (/(?:装備|着用|外|脱|着)して[?？]?$/u.test(text)) return null;
+  if (
+    /(?:(?:装備|着用)し(?:て|ないで|ろ|なさい)|(?:着て|着ないで|脱いで|外して|取り外して))(?:ください|下さい|くれ)?[?？。！!]*$/u.test(
+      text,
+    ) ||
+    /(?:(?:装備|着用)して|着て|脱いで|外して|取り外して)[、，]/u.test(text)
+  )
+    return null;
   if (
     /(?:装備|着用|外|脱|着)(?:し|して|せ)て?(?:も)?(?:いい|よい|大丈夫)/u.test(
       text,
@@ -41,8 +47,33 @@ export function classifyArmorQuestion(
     return null;
   if (!/(?:[?？]|ですか|ますか|教えて|どう|確認して|状態)/u.test(text))
     return null;
-  if (/(?:私|わたし|俺|僕|自分|プレイヤー|利用者)の(?:防具|装備)/u.test(text))
+  if (
+    /(?:私|わたし|俺|僕|自分|プレイヤー|利用者)(?:の|は|が|って|には)/u.test(
+      text,
+    )
+  )
     return "requester";
+  if (
+    /(?:村人|他人|友達|敵|他のプレイヤー|ほかのプレイヤー|彼|彼女)(?:の|は|が|って|には)/u.test(
+      text,
+    ) ||
+    (/[A-Za-z][A-Za-z0-9_]{0,31}(?:の|は|が)(?:防具|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ)/u.test(
+      text,
+    ) &&
+      !/(?:Bot|bot)(?:の|は|が)/u.test(text))
+  )
+    return null;
+  const possessive =
+    /([^\s、。？！?]{1,24})の(?:防具|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ|兜|鎧)/u.exec(
+      text,
+    )?.[1];
+  if (
+    possessive !== undefined &&
+    !/^(?:今|現在|Bot|bot|ボット|あなた|君|きみ|そっち|手持ち|所持品)$/u.test(
+      possessive,
+    )
+  )
+    return null;
   return "bot";
 }
 
