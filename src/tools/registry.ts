@@ -539,6 +539,55 @@ export const toolDefinitions = [
           (candidate) => !failedCandidateIds.has(candidate.id),
         );
         if (
+          input.mode === "delegated" &&
+          input.candidateId === null &&
+          resourceAuthorization?.kind === "owner_bounded_resource" &&
+          resourceAuthorization.targetItem !== "*" &&
+          !resourceNames.includes(
+            resourceAuthorization.targetItem as (typeof resourceNames)[number],
+          ) &&
+          !availableObserved.some(
+            (candidate) =>
+              candidate.permission === "allowed" &&
+              candidate.safety === "allowed",
+          ) &&
+          context.game.searchSafeActionCandidates !== undefined
+        ) {
+          const search = await context.game.searchSafeActionCandidates(
+            {
+              goal: input.goal,
+              count: remainingCount,
+              maxCandidates: 8,
+              authorization: resourceAuthorization,
+            },
+            planSignal,
+          );
+          if (search.stop !== undefined || search.candidates.length === 0) {
+            return safeActionFailure(
+              search.stop === undefined ||
+                search.stop.code === "SMELT_STATION_NOT_OBSERVED"
+                ? "resource"
+                : "safety",
+              search.stop?.code ?? "SAFE_ACTION_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_action_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [
+                search.stop?.reason ??
+                  "許可された範囲で安全な資源候補を確認できる場所へ移動する",
+              ],
+              search.stop?.reason ??
+                `許可された範囲で${String(search.attemptedWaypoints)}地点を調べましたが、安全な資源候補を確認できませんでした。`,
+            );
+          }
+          observed = search.candidates;
+        }
+        if (
           availableObserved.length === 0 &&
           resourceAuthorization?.kind === "owner_bounded_resource" &&
           resourceAuthorization.allowedResources.some(

@@ -728,6 +728,81 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("approaches a distant observed ore before rechecking server permission", async () => {
+    class ReachAwareMinecraft extends FakeMinecraft {
+      public override async observeActionCandidates(
+        input: Parameters<FakeMinecraft["observeActionCandidates"]>[0],
+        signal: AbortSignal,
+      ) {
+        const candidates = await super.observeActionCandidates(input, signal);
+        return candidates.map((candidate) => {
+          if (candidate.action !== "mine_block") return candidate;
+          const target = candidate.args.position as {
+            x: number;
+            y: number;
+            z: number;
+          };
+          const observedDistance = Math.hypot(
+            target.x - this.snapshot.position.x,
+            target.y - this.snapshot.position.y,
+            target.z - this.snapshot.position.z,
+          );
+          return observedDistance > 6
+            ? {
+                ...candidate,
+                distance: observedDistance,
+                permission: "unknown" as const,
+                safety: "unknown" as const,
+              }
+            : { ...candidate, distance: observedDistance };
+        });
+      }
+    }
+    const minecraft = new ReachAwareMinecraft();
+    minecraft.resources.push({
+      name: "iron_ore",
+      position: { x: 15, y: 64, z: 0 },
+    });
+    const { game, close } = createController(minecraft);
+    const request = {
+      goal: "鉄を1個集めて",
+      count: 1,
+      maxCandidates: 8,
+      authorization: {
+        kind: "owner_bounded_resource" as const,
+        goal: "鉄を1個集めて",
+        allowedResources: ["iron_ore"],
+        targetItem: "raw_iron",
+        targetCount: 1,
+        maxCount: 8,
+      },
+    };
+    try {
+      const initial = await game.findSafeActionCandidates(
+        request,
+        new AbortController().signal,
+      );
+      expect(initial[0]?.permission).toBe("unknown");
+      const result = await game.searchSafeActionCandidates(
+        request,
+        new AbortController().signal,
+      );
+      expect(result).toMatchObject({
+        blockedWaypoints: 0,
+        candidates: [{ action: "mine_block", permission: "allowed" }],
+      });
+      expect(result.attemptedWaypoints).toBeGreaterThan(1);
+      expect(
+        minecraft.actions.filter((action) => action.startsWith("move:")),
+      ).toHaveLength(result.attemptedWaypoints);
+      expect(
+        minecraft.actions.some((action) => action.startsWith("dig:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
   it("searches a bounded alternate route before selecting a protected log", async () => {
     class RangeAwareMinecraft extends FakeMinecraft {
       public override async findResources(

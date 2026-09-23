@@ -133,6 +133,13 @@ export interface SafeResourceSearchResult {
   readonly stop?: { readonly code: string; readonly reason: string };
 }
 
+export interface SafeActionSearchResult {
+  readonly candidates: readonly SafeActionCandidate[];
+  readonly attemptedWaypoints: number;
+  readonly blockedWaypoints: number;
+  readonly stop?: { readonly code: string; readonly reason: string };
+}
+
 export interface ActionReport {
   before: GameStatus | null;
   after: GameStatus | null;
@@ -183,6 +190,11 @@ export interface GameController {
     request: SafeActionObservationRequest,
     signal: AbortSignal,
   ): Promise<readonly SafeActionCandidate[]>;
+  /** Moves only to bounded observation points, then rechecks server permission. */
+  searchSafeActionCandidates?(
+    request: SafeActionObservationRequest,
+    signal: AbortSignal,
+  ): Promise<SafeActionSearchResult>;
   observeActionCandidates(
     input: GeneralActionObservationInput,
     signal: AbortSignal,
