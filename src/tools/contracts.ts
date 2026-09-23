@@ -238,6 +238,8 @@ export interface GameController {
     safeDistance: number,
     signal: AbortSignal,
   ): Promise<ActionReport>;
+  /** Fill only empty armor slots and verify the resulting equipment state. */
+  equipArmor?(signal: AbortSignal): Promise<ActionReport>;
   currentPosition(): Promise<Position>;
 }
 
@@ -336,6 +338,9 @@ export interface ToolContext {
   /** Shared by the tool-call loop so one owner message authorizes one hut. */
   baseBuildAuthorizationUsage?: { consumed: boolean };
   baseBuildClarification?: string;
+  /** Set only for a direct armor request from the authenticated owner. */
+  armorEquipAuthorized?: boolean;
+  armorEquipAuthorizationUsage?: { consumed: boolean };
   /**
    * Mutable, request-scoped accounting for the owner authorization. It is
    * created only by the authenticated request boundary and prevents another

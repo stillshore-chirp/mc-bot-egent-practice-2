@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyArmorQuestion,
+  isArmorEquipRequest,
   renderArmorAnswer,
 } from "../../src/agent/armor-answer.js";
 import type { GameStatus } from "../../src/tools/contracts.js";
@@ -26,6 +27,24 @@ const status: GameStatus = {
 };
 
 describe("armor status answer", () => {
+  it.each([
+    "渡した防具、つけてみな",
+    "持っている防具を装備して",
+    "鉄のヘルメットを着て",
+  ])("recognizes a direct bot armor request: %s", (message) => {
+    expect(isArmorEquipRequest(message)).toBe(true);
+  });
+
+  it.each([
+    "防具を装備してる？",
+    "防具を装備してもいい？",
+    "防具を装備しないで",
+    "私の防具を装備して",
+    "村人の防具を装備して",
+    "防具を脱いで",
+  ])("does not turn non-requests into armor actions: %s", (message) => {
+    expect(isArmorEquipRequest(message)).toBe(false);
+  });
   it("routes status questions but leaves equipment commands and permission questions alone", () => {
     expect(classifyArmorQuestion("防具を装備してる？")).toBe("bot");
     expect(classifyArmorQuestion("今の防具の装備状態を教えて")).toBe("bot");

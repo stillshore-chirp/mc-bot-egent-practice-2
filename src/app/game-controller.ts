@@ -725,6 +725,85 @@ export class CompanionGameController implements GameController {
     );
   }
 
+  public async equipArmor(signal: AbortSignal): Promise<ActionReport> {
+    const initial = await this.#minecraft.observe();
+    const before = this.#statusFromSnapshot(initial);
+    const choices = recommendArmor(initial);
+    if (choices.length === 0) {
+      return {
+        before,
+        after: before,
+        outcome: "failed",
+        failureCategory: "inventory",
+        failureCode: "NO_AVAILABLE_ARMOR_SLOT",
+        summary:
+          initial.armor === null
+            ? "装備欄を確認できないため、防具を着けませんでした。"
+            : "所持品から着けられる防具と空き装備欄の組合せがありません。",
+      };
+    }
+    if (
+      initial.onFire ||
+      initial.inLava ||
+      initial.inWater ||
+      initial.suffocating ||
+      (closestHostileDistance(initial) ?? Infinity) < 6
+    ) {
+      return {
+        before,
+        after: before,
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "ARMOR_EQUIP_UNSAFE",
+        summary:
+          "周囲の危険が近いため、防具の着替えを始めませんでした。安全な場所で再度試せます。",
+      };
+    }
+
+    return this.#executeTask(
+      signal,
+      () =>
+        this.#runGeneralTask(
+          "equip_armor",
+          { slots: choices.map((choice) => choice.slot) },
+          signal,
+          (actionSignal) => this.#minecraft.equipAvailableArmor(actionSignal),
+        ),
+      (result, after) => {
+        const confirmed = choices.filter(
+          (choice) => after?.armor?.[choice.slot] === choice.itemName,
+        );
+        if (
+          result.failed ||
+          confirmed.length !== choices.length ||
+          confirmed.length !== result.equipped.length
+        ) {
+          return {
+            outcome: "failed",
+            failureCategory: "observation",
+            failureCode: "ARMOR_EQUIP_NOT_VERIFIED",
+            confirmedState: {
+              equippedSlots: confirmed.map((choice) => choice.slot),
+            },
+            summary:
+              confirmed.length === 0
+                ? "防具の装着を確認できませんでした。"
+                : `${String(confirmed.length)}か所の装着は確認しましたが、残りは確認できませんでした。`,
+          };
+        }
+        return {
+          outcome: "completed",
+          evidenceKind: "minecraft_snapshot",
+          confirmedState: {
+            equippedSlots: confirmed.map((choice) => choice.slot),
+          },
+          summary: `防具を${String(confirmed.length)}か所に着け、装備欄の変化を確認しました。`,
+        };
+      },
+      initial,
+    );
+  }
+
   public async respondToHostiles(
     goal: HostileGoal,
     signal: AbortSignal,

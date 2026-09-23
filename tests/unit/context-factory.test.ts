@@ -90,6 +90,34 @@ function factory(): CompanionContextFactory {
 }
 
 describe("CompanionContextFactory owner action boundary", () => {
+  it("authorizes only a direct owner request to equip carried armor", async () => {
+    const contextFactory = factory();
+    const allowed = await contextFactory.create(
+      "owner",
+      "渡した防具、つけてみな",
+      new AbortController().signal,
+      "armor-direct",
+      "owner_message",
+    );
+    expect(allowed.toolContext.armorEquipAuthorized).toBe(true);
+    expect(allowed.toolContext.armorEquipAuthorizationUsage).toEqual({
+      consumed: false,
+    });
+    for (const [username, message] of [
+      ["owner", "防具を装備してもいい？"],
+      ["owner", "防具を装備しないで"],
+      ["other", "防具を装備して"],
+    ] as const) {
+      const rejected = await factory().create(
+        username,
+        message,
+        new AbortController().signal,
+        "armor-rejected",
+        "owner_message",
+      );
+      expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
+    }
+  });
   it("binds a house request to the dedicated build scope without resource-goal clarification", async () => {
     const allowed = await factory().create(
       "owner",

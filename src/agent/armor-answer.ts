@@ -5,6 +5,24 @@ export type ArmorQuestionSubject = "bot" | "requester";
 const armorName =
   /(?:防具|ヘルメット|胸当て|チェストプレート|レギンス|ブーツ|兜|鎧)/u;
 const armorItem = /(?:_helmet|_chestplate|_leggings|_boots)$/u;
+
+/** A direct request to equip the bot's own carried armor, never a question. */
+export function isArmorEquipRequest(message: string): boolean {
+  const text = message.trim();
+  return (
+    armorName.test(text) &&
+    !/[?？]/u.test(text) &&
+    !/(?:ないで|なくていい|いらない|禁止|やめて|脱いで|外して|取り外して|してもいい|していい|着てもいい)/u.test(
+      text,
+    ) &&
+    !/(?:私|わたし|俺|僕|プレイヤー|利用者|村人|他のプレイヤー)(?:の|は|が|に|へ)/u.test(
+      text,
+    ) &&
+    /(?:装備し(?:て|ろ|なさい)|着用し(?:て|ろ)|(?:つけ|付け)(?:て|ろ)|着て)/u.test(
+      text,
+    )
+  );
+}
 const materialNames: Readonly<Record<string, string>> = {
   leather: "革",
   chainmail: "チェーン",
