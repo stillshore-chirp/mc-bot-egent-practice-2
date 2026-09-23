@@ -259,6 +259,82 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("chooses an observed ore when the model guesses an explicit candidate for the owner's goal", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let held = 0;
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal: held },
+    });
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "mine_block:coal_ore:1:64:0",
+        label: "観測した石炭鉱石",
+        action: "mine_block",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: 1,
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: "coal_ore", position: { x: 1, y: 64, z: 0 } },
+          },
+        ],
+      },
+    ];
+    toolContext.game.mineBlock = async () => {
+      held = 1;
+      return {
+        before: status,
+        after: { ...status, inventory: { coal: held } },
+        outcome: "completed",
+        confirmedState: {
+          item: "coal",
+          requestedCount: 1,
+          collectedCount: 1,
+          heldCount: held,
+        },
+        summary: "所持品の増加を確認しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "explicit",
+        candidateId: "coal_ore",
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1, candidateId: "mine_block:coal_ore:1:64:0" },
+    });
+  });
+
   it("searches once under an owner quantity contract and executes the newly observed log", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {

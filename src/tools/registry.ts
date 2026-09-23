@@ -241,6 +241,15 @@ export const toolDefinitions = [
     execute: async (input, context) => {
       const startedAt = Date.now();
       const authorization = context.safeActionAuthorization;
+      // The model may invent a candidateId before observing the world. The
+      // authenticated owner's bounded goal authorizes a resource and count,
+      // not a model-selected block ID; select from fresh observed candidates.
+      const selectionMode =
+        authorization?.kind === "owner_bounded_resource"
+          ? "delegated"
+          : input.mode;
+      const requestedCandidateId =
+        selectionMode === "delegated" ? null : input.candidateId;
       const smeltQuantity =
         authorization?.kind === "owner_bounded_resource" &&
         knownSmeltInputs[authorization.targetItem] !== undefined
@@ -539,8 +548,8 @@ export const toolDefinitions = [
           (candidate) => !failedCandidateIds.has(candidate.id),
         );
         if (
-          input.mode === "delegated" &&
-          input.candidateId === null &&
+          selectionMode === "delegated" &&
+          requestedCandidateId === null &&
           resourceAuthorization?.kind === "owner_bounded_resource" &&
           resourceAuthorization.targetItem !== "*" &&
           !resourceNames.includes(
@@ -671,8 +680,8 @@ export const toolDefinitions = [
           );
         }
         const planned = planSafeAction({
-          mode: input.mode,
-          requestedId: input.candidateId ?? undefined,
+          mode: selectionMode,
+          requestedId: requestedCandidateId ?? undefined,
           candidates: observed,
           maxSteps: maxSafeActionSteps,
           remainingCount,
@@ -911,8 +920,8 @@ export const toolDefinitions = [
           }
           if (!result.success) {
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "mine_block" &&
               step.tool === "mine_block" &&
               !actionStepCompleted &&
@@ -964,8 +973,8 @@ export const toolDefinitions = [
               }
             }
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "gather_resource" &&
               step.tool === "gather_resource" &&
               !actionStepCompleted &&
@@ -980,8 +989,8 @@ export const toolDefinitions = [
               break;
             }
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "mine_block" &&
               step.tool === "mine_block" &&
               !actionStepCompleted &&
