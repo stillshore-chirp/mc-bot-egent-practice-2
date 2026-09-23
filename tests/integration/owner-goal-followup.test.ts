@@ -157,6 +157,12 @@ function createFactory(calls: string[]): CompanionContextFactory {
       outcome: "completed",
       summary: "設置しました。",
     }),
+    buildBase: async () => ({
+      before: status,
+      after: status,
+      outcome: "failed",
+      summary: "テスト用",
+    }),
     smeltItem: async () => ({
       before: status,
       after: status,

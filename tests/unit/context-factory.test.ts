@@ -90,6 +90,38 @@ function factory(): CompanionContextFactory {
 }
 
 describe("CompanionContextFactory owner action boundary", () => {
+  it("binds a house request to the dedicated build scope without resource-goal clarification", async () => {
+    const allowed = await factory().create(
+      "owner",
+      "近くに家を作って",
+      new AbortController().signal,
+      "base-request",
+      "owner_message",
+    );
+    expect(allowed.toolContext.baseBuildAuthorized).toBe(true);
+    expect(allowed.toolContext.safeActionClarification).toBeUndefined();
+    expect(allowed.toolContext.safeActionAuthorization).toBeUndefined();
+
+    const question = await factory().create(
+      "owner",
+      "5×5の家を建てて",
+      new AbortController().signal,
+      "base-clarify",
+      "owner_message",
+    );
+    expect(question.toolContext.baseBuildAuthorized).toBeUndefined();
+    expect(question.toolContext.baseBuildClarification).toContain("3×3");
+
+    const thirdParty = await factory().create(
+      "other",
+      "近くに家を作って",
+      new AbortController().signal,
+      "base-other",
+      "owner_message",
+    );
+    expect(thirdParty.toolContext.baseBuildAuthorized).toBeUndefined();
+  });
+
   it("attaches only the current authenticated owner goal", async () => {
     const first = await factory().create(
       "owner",

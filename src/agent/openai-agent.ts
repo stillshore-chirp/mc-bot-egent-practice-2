@@ -63,6 +63,7 @@ const actionToolFamilies: Readonly<
   collect_item: ["gather"],
   craft_item: ["craft"],
   place_block: ["place"],
+  build_base: ["build"],
   smelt_item: ["smelt"],
   return_to_player: ["return"],
   forget_delivery_target: ["memory"],
@@ -233,6 +234,16 @@ function instructions(
     "状態名や英語の内部語（例: suspended）は『安全上の理由で一時停止中』などの平易な表現へ言い換えてください。利用者が尋ねていない体力・空腹・座標・記憶の列挙は省き、依頼の判断に必要な事実だけを説明してください。",
     "観測データのJSONキーやtrue/false表記（例: inWater:false）はそのまま利用者へ出さず、『水中ではない』のような平易な事実へ変換してください。",
     buildCapabilityContext(request.toolContext.limits),
+    ...(request.toolContext.baseBuildAuthorized === true
+      ? [
+          "近くの家・拠点の設営を任された依頼にはbuild_baseを一度呼び、資材調達から完成照合まで任せてください。途中結果は設置済み箇所と残りを区別してください。",
+        ]
+      : []),
+    ...(request.toolContext.baseBuildClarification === undefined
+      ? []
+      : [
+          `拠点設営を始める前に確認してください: ${request.toolContext.baseBuildClarification}`,
+        ]),
     conversationContext,
     ...(request.toolContext.allowActionTools === false
       ? [
@@ -674,6 +685,10 @@ export class OpenAIDeliberationAgent {
                   (!action && !ownerScopedMutationToolNames.has(name)) ||
                   effectiveActionToolNames.includes(name),
               );
+    const offeredTools = availableTools.filter(
+      ({ name }) =>
+        name !== "build_base" || toolContext.baseBuildAuthorized === true,
+    );
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const startedAt = performance.now();
@@ -699,7 +714,7 @@ export class OpenAIDeliberationAgent {
                 renderConversationContext(instructionSnapshot),
               ),
               input: inputItems,
-              tools: availableTools.map(toOpenAIFunctionTool),
+              tools: offeredTools.map(toOpenAIFunctionTool),
               tool_choice: "auto",
               parallel_tool_calls: false,
               store: false,

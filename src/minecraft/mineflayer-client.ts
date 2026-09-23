@@ -30,7 +30,7 @@ import {
   type WorldSnapshot,
 } from "../domain/snapshot.js";
 import { throwIfAborted } from "../runtime/cancellation.js";
-import { delay } from "../runtime/timeout.js";
+import { delay, withTimeout } from "../runtime/timeout.js";
 import type {
   ArmorEquipResult,
   BuildBlockObservation,
@@ -2098,7 +2098,17 @@ export class MineflayerClient implements MinecraftPort {
   ): Promise<BuildBlockObservation> {
     throwIfAborted(signal, "inspect_build_block");
     const bot = this.requireBot();
-    const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
+    const location = new Vec3(position.x, position.y, position.z);
+    let block = bot.blockAt(location);
+    if (block === null) {
+      await withTimeout(
+        () => bot.waitForChunksToLoad(),
+        5_000,
+        signal,
+        "inspect_build_block",
+      );
+      block = bot.blockAt(location);
+    }
     if (block === null) {
       return { name: null, serverConfirmed: false, placementAllowed: false };
     }

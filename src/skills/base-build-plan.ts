@@ -8,6 +8,7 @@ export const baseBuildMaxLogs = 6;
 
 export interface BaseBuildPlan {
   readonly dimension: string;
+  readonly worldId: string;
   readonly center: Position;
   readonly material: typeof baseBuildMaterial;
   readonly blocks: readonly Position[];
@@ -38,6 +39,7 @@ export function buildPlan(
   center: Position,
   dimension: string,
   origin: Position,
+  worldId: string,
 ): BaseBuildPlan {
   const doorX =
     Math.abs(center.x - origin.x) >= Math.abs(center.z - origin.z)
@@ -66,6 +68,7 @@ export function buildPlan(
   roof.push({ x: center.x, y: center.y + 2, z: center.z });
   return {
     dimension,
+    worldId,
     center,
     material: baseBuildMaterial,
     blocks: [...walls, ...roof],

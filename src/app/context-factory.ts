@@ -21,6 +21,7 @@ import {
   deriveOwnerGoalAuthorization,
   type PendingOwnerGoal,
 } from "../decision/owner-goal-authorization.js";
+import { decideBaseBuildRequest } from "../decision/base-build-authorization.js";
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
@@ -300,16 +301,32 @@ export class CompanionContextFactory implements ChatContextFactory {
           { summary: "Minecraft状態を観測" },
           () => this.game.observeStatus(),
         );
-        const ownerGoal = deriveOwnerGoalAuthorization({
-          message,
-          requesterUsername,
-          authorizedOwnerUsername: this.config.ownerUsername,
-          requestKind,
-          maxCount: this.config.limits.maxGatherCount,
-          ...(this.#pendingOwnerGoal === undefined
-            ? {}
-            : { pendingGoal: this.#pendingOwnerGoal }),
-        });
+        const baseBuild =
+          requestKind === "owner_message" &&
+          requesterUsername === this.config.ownerUsername
+            ? decideBaseBuildRequest(
+                message,
+                recentTasks.some(
+                  (task) =>
+                    task.kind === "build_base" &&
+                    task.status !== "completed" &&
+                    task.checkpoint?.data.center !== undefined,
+                ),
+              )
+            : { kind: "none" as const };
+        const ownerGoal =
+          baseBuild.kind === "none"
+            ? deriveOwnerGoalAuthorization({
+                message,
+                requesterUsername,
+                authorizedOwnerUsername: this.config.ownerUsername,
+                requestKind,
+                maxCount: this.config.limits.maxGatherCount,
+                ...(this.#pendingOwnerGoal === undefined
+                  ? {}
+                  : { pendingGoal: this.#pendingOwnerGoal }),
+              })
+            : { outcome: "none" as const };
         if (
           requestKind !== "runtime_reassessment" &&
           requesterUsername === this.config.ownerUsername
@@ -361,6 +378,19 @@ export class CompanionContextFactory implements ChatContextFactory {
             signal,
             requestKind,
             ...ownerGoalFields,
+            ...(baseBuild.kind === "authorized"
+              ? {
+                  baseBuildAuthorized: true,
+                  baseBuildResume: baseBuild.resume,
+                  baseBuildAuthorizationUsage: { consumed: false },
+                }
+              : {}),
+            ...(baseBuild.kind === "clarify"
+              ? {
+                  baseBuildClarification: baseBuild.question,
+                  safeActionClarification: baseBuild.question,
+                }
+              : {}),
             executionEvidence: { verifiedActionReceipts: [] },
             game: this.game,
             memory: this.toolMemory,

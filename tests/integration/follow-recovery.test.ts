@@ -161,6 +161,7 @@ describe("follow recovery conversation", () => {
       collectItem: (...args) => game.collectItem(...args),
       craftItem: (...args) => game.craftItem(...args),
       placeBlock: (...args) => game.placeBlock(...args),
+      buildBase: (...args) => game.buildBase(...args),
       smeltItem: (...args) => game.smeltItem(...args),
       returnToOwner: (...args) => game.returnToOwner(...args),
       currentPosition: () => game.currentPosition(),

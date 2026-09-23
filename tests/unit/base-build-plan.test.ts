@@ -12,11 +12,16 @@ import { createSnapshot } from "../support/fake-minecraft.js";
 
 describe("bounded base plan", () => {
   it("makes one supported shelter with an open entrance", () => {
-    const plan = buildPlan({ x: 4, y: 64, z: 0 }, "overworld", {
-      x: 0,
-      y: 64,
-      z: 0,
-    });
+    const plan = buildPlan(
+      { x: 4, y: 64, z: 0 },
+      "overworld",
+      {
+        x: 0,
+        y: 64,
+        z: 0,
+      },
+      "00000000-0000-4000-8000-000000000001",
+    );
     expect(plan.blocks).toHaveLength(baseBuildMaxBlocks);
     expect(new Set(plan.blocks.map(buildBlockKey)).size).toBe(
       baseBuildMaxBlocks,
@@ -33,8 +38,10 @@ describe("bounded base plan", () => {
   it("avoids building around an observed player", () => {
     const snapshot = createSnapshot();
     const [current, nearby] = buildSiteCandidates(snapshot);
-    expect(siteClearOfPlayers(snapshot, current!)).toBe(false);
-    expect(siteClearOfPlayers(snapshot, nearby!)).toBe(true);
+    if (current === undefined || nearby === undefined)
+      throw new Error("missing candidate");
+    expect(siteClearOfPlayers(snapshot, current)).toBe(false);
+    expect(siteClearOfPlayers(snapshot, nearby)).toBe(true);
   });
 
   it("counts only previously verified matching blocks on resume", () => {

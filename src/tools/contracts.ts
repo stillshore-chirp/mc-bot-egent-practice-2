@@ -232,6 +232,7 @@ export interface GameController {
     input: PlaceBlockInput,
     signal: AbortSignal,
   ): Promise<ActionReport>;
+  buildBase(signal: AbortSignal, resume: boolean): Promise<ActionReport>;
   smeltItem(input: SmeltItemInput, signal: AbortSignal): Promise<ActionReport>;
   returnToOwner(
     safeDistance: number,
@@ -328,6 +329,13 @@ export interface ToolContext {
   safeActionAuthorization?: SafeChoiceAuthorization;
   /** One concrete owner-goal clarification produced at the request boundary. */
   safeActionClarification?: string;
+  /** Set only at the authenticated owner-message boundary for one bounded hut. */
+  baseBuildAuthorized?: boolean;
+  /** A trusted distinction between a new build and an explicit resume. */
+  baseBuildResume?: boolean;
+  /** Shared by the tool-call loop so one owner message authorizes one hut. */
+  baseBuildAuthorizationUsage?: { consumed: boolean };
+  baseBuildClarification?: string;
   /**
    * Mutable, request-scoped accounting for the owner authorization. It is
    * created only by the authenticated request boundary and prevents another

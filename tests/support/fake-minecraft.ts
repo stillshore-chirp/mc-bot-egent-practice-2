@@ -70,6 +70,7 @@ export function createSnapshot(
 }
 
 export class FakeMinecraft implements MinecraftPort {
+  public worldId = "00000000-0000-4000-8000-000000000001";
   public snapshot: WorldSnapshot;
   public resources: ResourceTarget[] = [];
   public readonly actions: string[] = [];
@@ -102,7 +103,7 @@ export class FakeMinecraft implements MinecraftPort {
     signal.throwIfAborted();
     return {
       position: { ...this.snapshot.position },
-      worldId: "00000000-0000-4000-8000-000000000001",
+      worldId: this.worldId,
       identity:
         position === null
           ? null

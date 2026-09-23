@@ -137,6 +137,12 @@ function context(requesterUsername = "owner"): ToolContext {
       outcome: "completed",
       summary: "設置しました。",
     }),
+    buildBase: async () => ({
+      before: status,
+      after: status,
+      outcome: "failed",
+      summary: "テスト用",
+    }),
     smeltItem: async () => ({
       before: status,
       after: status,
@@ -207,6 +213,7 @@ describe("tool schema registry", () => {
       "observe_action_candidates",
       "mine_block",
       "collect_item",
+      "build_base",
       "craft_item",
       "place_block",
       "smelt_item",
@@ -263,6 +270,35 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("requires a trusted owner-message grant for base construction", async () => {
+    const executor = new ToolExecutor();
+    const denied = await executor.execute("build_base", "{}", context());
+    expect(denied).toMatchObject({
+      success: false,
+      error: { code: "BASE_BUILD_NOT_AUTHORIZED" },
+    });
+    const authorized = context();
+    authorized.baseBuildAuthorized = true;
+    expect(
+      await executor.execute("build_base", "{}", authorized),
+    ).toMatchObject({ success: false, error: { code: "FAILED" } });
+    expect(
+      await executor.execute("build_base", "{}", authorized),
+    ).toMatchObject({
+      success: false,
+      error: { code: "BASE_BUILD_SCOPE_EXHAUSTED" },
+    });
+    const reassessment = context();
+    reassessment.baseBuildAuthorized = true;
+    reassessment.requestKind = "runtime_reassessment";
+    expect(
+      await executor.execute("build_base", "{}", reassessment),
+    ).toMatchObject({
+      success: false,
+      error: { code: "RUNTIME_REASSESSMENT_TOOL_NOT_ALLOWED" },
+    });
+  });
+
   it("chooses an observed ore when the model guesses an explicit candidate for the owner's goal", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
