@@ -823,11 +823,25 @@ export class MineflayerClient implements MinecraftPort {
       candidates.push({ ...candidate, order: candidates.length });
     };
 
-    for (const block of surrounding.blocks) {
-      if (knownBlockDrops[block.name] === undefined) continue;
+    // The general surroundings scan is capped at 128 solid blocks. On flat
+    // terrain those slots can all be ground, hiding the requested resource.
+    const resourcePositions = bot.findBlocks({
+      matching: (block) =>
+        knownBlockDrops[block.name] !== undefined &&
+        (requested.size === 0 ||
+          requested.has(block.name) ||
+          goalMetadataForBlock(block.name, requested).goalItem !== undefined),
+      maxDistance: input.radius,
+      count: Math.min(64, Math.max(16, input.maxCandidates * 4)),
+    });
+    for (const position of resourcePositions) {
+      throwIfAborted(signal, "observe_actions");
+      const block = bot.blockAt(position);
+      if (block === null || knownBlockDrops[block.name] === undefined) continue;
+      const blockPosition = positionOf(block.position);
       const target: ResourceTarget = {
         name: block.name,
-        position: block.position,
+        position: blockPosition,
       };
       const goalMetadata = goalMetadataForBlock(block.name, requested);
       let permission: GeneralActionCandidate["permission"];
@@ -840,7 +854,7 @@ export class MineflayerClient implements MinecraftPort {
                 {
                   operation: "mine",
                   name: block.name,
-                  position: block.position,
+                  position: blockPosition,
                 },
                 signal,
               ),
@@ -849,14 +863,14 @@ export class MineflayerClient implements MinecraftPort {
         permission = "unknown";
       }
       add({
-        id: generalCandidateId("mine_block", block.name, block.position),
+        id: generalCandidateId("mine_block", block.name, blockPosition),
         label: `${block.name}を採掘`,
         action: "mine_block",
-        args: { name: block.name, position: block.position },
+        args: { name: block.name, position: blockPosition },
         steps: [
           {
             tool: "mine_block",
-            input: { name: block.name, position: block.position },
+            input: { name: block.name, position: blockPosition },
           },
         ],
         observed: true,
@@ -872,7 +886,7 @@ export class MineflayerClient implements MinecraftPort {
         requestedCount: 1,
         resourceName: block.name,
         ...goalMetadata,
-        distance: block.distance,
+        distance: bot.entity.position.distanceTo(block.position),
       });
     }
 

@@ -37,6 +37,76 @@ describe("Minecraft boundary", () => {
     expect(surroundings.entities).toEqual([]);
   });
 
+  it("observes requested ore even when nearby ground fills the general scan", async () => {
+    const client = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    const ground = Array.from(
+      { length: 128 },
+      (_, index) => new Vec3((index % 16) + 1, 63, Math.floor(index / 16) + 1),
+    );
+    const ore = new Vec3(2, 64, 0);
+    const blocks = [
+      ...ground.map((position) => ({ name: "dirt", position })),
+      { name: "iron_ore", position: ore },
+    ];
+    const bot = {
+      username: "fixture_bot",
+      entity: {
+        id: 1,
+        position: new Vec3(0, 64, 0),
+        velocity: new Vec3(0, 0, 0),
+      },
+      inventory: { items: () => [] },
+      players: {},
+      entities: {},
+      registry: { itemsByName: {}, blocksByName: {} },
+      findBlocks: ({
+        matching,
+        count,
+      }: {
+        matching: (block: { name: string }) => boolean;
+        count: number;
+      }) =>
+        blocks
+          .filter((block) => matching(block))
+          .slice(0, count)
+          .map((block) => block.position),
+      findBlock: () => null,
+      blockAt: (position: Vec3) =>
+        blocks.find((block) => block.position.equals(position)) ?? null,
+      game: { dimension: "overworld" },
+      health: 20,
+      food: 20,
+    };
+    Object.assign(client, { spawned: true, botInstance: bot });
+
+    const general = await client.observeSurroundings(32, true);
+    expect(general.blocks).toHaveLength(128);
+    expect(general.blocks.some((block) => block.name === "iron_ore")).toBe(
+      false,
+    );
+
+    const candidates = await client.observeActionCandidates(
+      { radius: 32, requestedItems: ["iron_ingot"], maxCandidates: 8 },
+      new AbortController().signal,
+    );
+    expect(candidates).toMatchObject([
+      {
+        action: "mine_block",
+        resourceName: "iron_ore",
+        goalItem: "iron_ingot",
+        intermediateItems: ["raw_iron"],
+      },
+    ]);
+  });
+
   it("subscribes and unsubscribes chat listeners", () => {
     const minecraft = new FakeMinecraft();
     const messages: string[] = [];
