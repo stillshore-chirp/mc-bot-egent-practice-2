@@ -776,6 +776,30 @@ describe("immediate stop command", () => {
     expect(deliberate).not.toHaveBeenCalled();
   });
 
+  it("preserves an action before a vital question for normal deliberation", async () => {
+    const deliberate = vi.fn(async () => ({
+      text: "依頼内容を確認しました。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say: vi.fn(async () => undefined) } as unknown as GameController,
+      agent: { deliberate },
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "確認済み状態",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "来て。あなたの体力は？");
+    expect(deliberate).toHaveBeenCalledOnce();
+  });
+
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
     const clearPendingOwnerGoal = vi.fn();

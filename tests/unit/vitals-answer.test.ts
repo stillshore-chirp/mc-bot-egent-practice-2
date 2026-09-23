@@ -70,7 +70,30 @@ describe("vital observation attribution", () => {
     expect(answer).not.toContain("酸素は20/20");
   });
 
-  it("does not consume an action that follows a vital question", () => {
-    expect(classifyVitalsQuestion("私は水中？それから来て")).toBeNull();
+  it.each([
+    "私は水中？それから来て",
+    "来て。あなたの体力は？",
+    "あなたの体力を回復して？",
+    "水中の木を採取できる？",
+  ])("does not consume an action inside a vital question: %s", (message) => {
+    expect(classifyVitalsQuestion(message)).toBeNull();
+  });
+
+  it.each([
+    "ゾンビの体力は？",
+    "私の息子の体力は？",
+    "息子はどう？",
+    "あの人は水中？",
+  ])(
+    "keeps third-party subjects on the ordinary conversation path: %s",
+    (message) => {
+      expect(classifyVitalsQuestion(message)).toBeNull();
+    },
+  );
+
+  it("still recognizes a direct question about the Bot's breathing", () => {
+    expect(classifyVitalsQuestion("あなたの息は大丈夫？")?.vitals).toContain(
+      "oxygen",
+    );
   });
 });

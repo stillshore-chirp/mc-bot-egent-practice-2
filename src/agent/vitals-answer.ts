@@ -2,6 +2,12 @@ import type { GameStatus } from "../tools/contracts.js";
 
 type Vital = "health" | "food" | "oxygen" | "water";
 
+const requesterWords =
+  /(?:私|わたし|僕|ぼく|俺|自分|こっち|プレイヤー|利用者|ユーザー)/u;
+const botWords = /(?:あなた|君|きみ|Bot|ボット|そっち|お前)/iu;
+const actionWords =
+  /(?:集め|採取|掘|移動|来て|追従|戻|探|収納|建築|作っ|始め|続け|再開|使っ|置い|取っ|倒|攻撃|助け|回復|食べ|飲ん|治し|守っ)/u;
+
 export interface VitalsQuestion {
   readonly bot: boolean;
   readonly requester: boolean;
@@ -24,20 +30,33 @@ export function classifyVitalsQuestion(message: string): VitalsQuestion | null {
     )
   )
     return null;
+  if (actionWords.test(normalized)) return null;
+  const genitiveSubject =
+    /([^\s、。？！?]+)の(?:体力|HP|ヘルス|空腹|満腹|食料ゲージ|酸素|呼吸|水中状態)/iu.exec(
+      normalized,
+    )?.[1];
+  if (genitiveSubject !== undefined) {
+    const nearestSubject = genitiveSubject.split("の").at(-1) ?? "";
+    if (!requesterWords.test(nearestSubject) && !botWords.test(nearestSubject))
+      return null;
+  }
   const vitals: Vital[] = [];
   if (/(?:体力|HP|ヘルス)/iu.test(normalized)) vitals.push("health");
   if (/(?:空腹|満腹|食料ゲージ)/u.test(normalized)) vitals.push("food");
-  if (/(?:酸素|息|呼吸|溺れ)/u.test(normalized)) vitals.push("oxygen");
+  if (
+    /(?:酸素|呼吸|溺れ|息(?=[はがをも、。？！?\s]|切れ|でき|苦し))/u.test(
+      normalized,
+    )
+  )
+    vitals.push("oxygen");
   if (/(?:水中|水の中|泳い|溺れ)/u.test(normalized)) vitals.push("water");
   if (vitals.length === 0) return null;
-  const requester =
-    /(?:私|わたし|僕|ぼく|俺|自分|こっち|プレイヤー|利用者|ユーザー)/u.test(
-      normalized,
-    );
-  const bot = /(?:あなた|君|きみ|Bot|ボット|そっち|お前)/iu.test(normalized);
+  const requester = requesterWords.test(normalized);
+  const bot = botWords.test(normalized);
+  if (!requester && !bot) return null;
   return {
-    requester: requester || !bot,
-    bot: bot || !requester,
+    requester,
+    bot,
     vitals,
   };
 }
