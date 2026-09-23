@@ -209,6 +209,12 @@ export function isReadOnlyStatusQuestion(message: string): boolean {
 export function hostileResponseIntent(message: string): HostileGoal | null {
   const normalized = message.trim().replace(/[。！!]+$/gu, "");
   if (/[?？「」『』“”]/u.test(normalized)) return null;
+  if (
+    /(?:敵|モンスター|ゾンビ村人|ゾンビ|スケルトン|クリーパー)(?:を|のことを)助けて/u.test(
+      normalized,
+    )
+  )
+    return null;
 
   const negatedEvade =
     /(?:逃げ(?:ないで|るな|なくていい|てはいけない)|退避(?:しないで|するな|は不要|不要|してはいけない)|距離を取(?:らないで|るな|ってはいけない)|離れ(?:ないで|るな|てはいけない))/gu;
@@ -219,26 +225,34 @@ export function hostileResponseIntent(message: string): HostileGoal | null {
   const affirmativeEvade = normalized.replace(negatedEvade, "");
   const affirmativeAttack = normalized.replace(negatedAttack, "");
   const conditionalEvade =
-    /(?:無理|危険|倒せな|攻撃できな).{0,8}(?:なら|場合|とき|たら).{0,12}(?:退避|逃げ|距離を取)/u;
+    /(?:無理|危険|倒せな|攻撃できな).{0,8}(?:なら|場合|とき|たら)[、，,\s]{0,3}.{0,12}(?:退避|逃げ|距離を取)/gu;
+  const hasConditionalEvade = affirmativeEvade.match(conditionalEvade) !== null;
+  const directEvade = affirmativeEvade.replace(conditionalEvade, "");
   const evadeCommand =
     /(?:逃げ(?:て|ろ|なさい|たい|るのを助けて)|逃走(?:して|しろ)|退避(?:して|しろ|しなさい)|距離を取(?:って|れ|りたい)|(?:敵|モンスター).{0,8}離れ(?:て|ろ)|安全な場所へ(?:移動|行って))(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u;
   if (
-    affirmativeEvade
+    directEvade
       .split(/[、，,。]/u)
-      .some(
-        (clause) =>
-          !conditionalEvade.test(clause) && evadeCommand.test(clause.trim()),
-      )
+      .some((clause) => evadeCommand.test(clause.trim()))
   ) {
     return "evade";
   }
 
   const clauses = affirmativeAttack.split(/[、，,。]/u);
-  const distress = clauses.some((clause) =>
-    /(?:敵|モンスター|襲われ|ゾンビ|スケルトン|クリーパー).*(?:対処して|どうにかして|何とかして|助けて)(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
-      clause.trim(),
-    ),
-  );
+  const distress = clauses.some((clause) => {
+    const text = clause.trim();
+    return (
+      /(?:敵|モンスター|襲われ|ゾンビ|スケルトン|クリーパー).*(?:対処して|どうにかして|何とかして)(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        text,
+      ) ||
+      /(?:敵|モンスター|ゾンビ|スケルトン|クリーパー)(?:から|に襲われ).{0,12}助けて(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        text,
+      ) ||
+      /襲われ.{0,12}助けて(?:ください|下さい|くれ|ほしい(?:です)?|ね|よ)?$/u.test(
+        text,
+      )
+    );
+  });
   if (hasNegatedAttack) return distress ? "evade" : null;
   const combat = clauses.some((clause) => {
     const hostileTarget =
@@ -262,7 +276,11 @@ export function hostileResponseIntent(message: string): HostileGoal | null {
       (genericCombat && !nonHostileTarget && (hostileTarget || hasNegatedEvade))
     );
   });
-  return combat || distress ? "eliminate" : null;
+  if (combat || distress) return "eliminate";
+  return hasConditionalEvade &&
+    /(?:敵|モンスター|ゾンビ|スケルトン|クリーパー)/u.test(normalized)
+    ? "evade"
+    : null;
 }
 
 export function isHostileResponseCommand(message: string): boolean {
