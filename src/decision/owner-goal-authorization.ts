@@ -534,10 +534,16 @@ function hasMultipleResourceMentions(
   if (primary.length === 0) return false;
   const index = message.indexOf(primary);
   if (index < 0) return false;
+  const suffix = message.slice(index + primary.length);
+  const qualifiedTreeSuffix =
+    namedMatch !== undefined && namedMatch.goal.targetItem !== "*"
+      ? (/^\s*の\s*木(?=\s*を)/u.exec(suffix)?.[0] ?? "")
+      : "";
+  const mentionLength = primary.length + qualifiedTreeSuffix.length;
   const remainder =
     message.slice(0, index) +
-    " ".repeat(primary.length) +
-    message.slice(index + primary.length);
+    " ".repeat(mentionLength) +
+    message.slice(index + mentionLength);
   return (
     findNamedResource(remainder) !== undefined ||
     canonicalResourceId(remainder) !== undefined

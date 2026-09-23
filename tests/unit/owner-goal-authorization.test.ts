@@ -126,6 +126,31 @@ describe("owner goal authorization", () => {
   });
 
   it.each([
+    ["オークの木を一本切って", "oak_log"],
+    ["シラカバの木を1本切って", "birch_log"],
+  ])("treats a species-qualified tree as one resource: %s", (message, item) => {
+    expect(
+      deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: [item],
+        targetItem: item,
+        targetCount: 1,
+      },
+    });
+  });
+
+  it("still asks when two different tree species are named", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "オークの木とシラカバの木を一本切って",
+      }),
+    ).toMatchObject({ outcome: "clarify" });
+  });
+
+  it.each([
     "オークの原木を1本集めないで",
     "オークの原木を1本集めるな",
     "鉄は採らないで",
