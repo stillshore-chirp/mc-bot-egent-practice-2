@@ -70,7 +70,7 @@ export class RuntimeReassessmentGate<Event extends string> {
   #nextAllowedAt = 0;
   #generation = 0;
   #stopped = false;
-  #lastCompletedStateKey: string | undefined;
+  #lastCompletedStateKeys = new Map<string | undefined, string>();
   #stats: RuntimeReassessmentStats = {
     requested: 0,
     started: 0,
@@ -132,7 +132,8 @@ export class RuntimeReassessmentGate<Event extends string> {
     }
     if (
       request.explicitStateKey &&
-      (request.stateKey === this.#lastCompletedStateKey ||
+      (request.stateKey ===
+        this.#lastCompletedStateKeys.get(request.causeKey) ||
         request.stateKey === this.#runningRequest?.stateKey)
     ) {
       const stalePending = this.#pending;
@@ -236,11 +237,16 @@ export class RuntimeReassessmentGate<Event extends string> {
             ...this.#stats,
             completed: this.#stats.completed + 1,
           };
-          this.#lastCompletedStateKey =
+          if (
             this.#pending === undefined ||
+            this.#pending.causeKey !== request.causeKey ||
             this.#pending.stateKey === request.stateKey
-              ? request.stateKey
-              : undefined;
+          ) {
+            this.#lastCompletedStateKeys.set(
+              request.causeKey,
+              request.stateKey,
+            );
+          }
           this.#decide(request, "completed");
           return;
         }
@@ -298,8 +304,10 @@ export class RuntimeReassessmentGate<Event extends string> {
   }
 
   #accept(request: NormalizedRequest<Event>): void {
-    if (request.stateKey !== this.#lastCompletedStateKey) {
-      this.#lastCompletedStateKey = undefined;
+    if (
+      request.stateKey !== this.#lastCompletedStateKeys.get(request.causeKey)
+    ) {
+      this.#lastCompletedStateKeys.delete(request.causeKey);
     }
     this.#pending = request;
     this.#decide(request, "accepted");

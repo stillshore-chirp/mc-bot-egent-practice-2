@@ -7,6 +7,42 @@ afterEach(() => {
 });
 
 describe("RuntimeReassessmentGate", () => {
+  it("retains completed episodes when another hazard cause interleaves", async () => {
+    const seen: string[] = [];
+    const reasons: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (_event: string, request) => {
+        seen.push(request.stateKey);
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ outcome, reason }) => {
+        if (outcome === "suppressed") reasons.push(reason ?? "none");
+      },
+    });
+    const damage = {
+      event: "safety_stabilized",
+      stateKey: "safety:stabilized:damage:episode:1",
+      causeKey: "reflex:damage",
+    };
+    const hostile = {
+      event: "safety_stabilized",
+      stateKey: "safety:stabilized:hostile:episode:2",
+      causeKey: "reflex:hostile",
+    };
+
+    gate.request(damage);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.request(hostile);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.request(damage);
+    await gate.stop();
+
+    expect(seen).toEqual([damage.stateKey, hostile.stateKey]);
+    expect(reasons).toContain("unchanged_state");
+  });
+
   it("suppresses an unchanged state and exposes safe aggregate counts", async () => {
     const decisions: string[] = [];
     const seen: string[] = [];
