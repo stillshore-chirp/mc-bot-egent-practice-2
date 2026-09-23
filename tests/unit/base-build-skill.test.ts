@@ -114,6 +114,19 @@ describe("base-build task", () => {
     expect(minecraft.placedBlocks.size).toBe(0);
   });
 
+  it("rejects player-made ground without server safe-area evidence", async () => {
+    const { minecraft, skill } = fixture();
+    for (const center of buildSiteCandidates(minecraft.snapshot)) {
+      minecraft.unverifiedGround.add(
+        buildBlockKey({ ...center, y: center.y - 1 }),
+      );
+    }
+    const result = await skill.run();
+    expect(result.status).toBe("failed");
+    expect(result.failure?.code).toBe("BASE_SITE_UNAVAILABLE");
+    expect(minecraft.placedBlocks.size).toBe(0);
+  });
+
   it("resumes only confirmed partial work after an explicit stop", async () => {
     const { minecraft, records, tasks, skill } = fixture();
     let stopped = false;
@@ -161,5 +174,52 @@ describe("base-build task", () => {
     expect(resumed.status).toBe("failed");
     expect(resumed.failure?.code).toBe("BASE_WORLD_CHANGED");
     expect(minecraft.placedBlocks.size).toBe(0);
+  });
+
+  it("recounts a removed checkpoint block before resuming materials", async () => {
+    const { minecraft, records, tasks, skill } = fixture();
+    let stopped = false;
+    const originalSave = records.push.bind(records);
+    records.push = (...items) => {
+      const length = originalSave(...items);
+      const latest = items.at(-1);
+      if (
+        !stopped &&
+        latest?.kind === "build_base" &&
+        Array.isArray(latest.checkpoint?.verified) &&
+        latest.checkpoint.verified.length === 5
+      ) {
+        stopped = true;
+        queueMicrotask(() => {
+          void tasks.cancel("owner stop");
+        });
+      }
+      return length;
+    };
+    const partial = await skill.run();
+    expect(partial.status).toBe("cancelled");
+    const removed = (partial.checkpoint?.verified as string[] | undefined)?.[0];
+    if (removed === undefined) throw new Error("missing placed block");
+    minecraft.buildBlocks.delete(removed);
+    minecraft.placedBlocks.delete(removed);
+    minecraft.snapshot = {
+      ...minecraft.snapshot,
+      inventory: [{ name: "oak_planks", count: 18 }],
+    };
+
+    const shortage = await skill.run(stored(partial));
+    expect(shortage.status).toBe("suspended");
+    expect(shortage.checkpoint?.verified).toHaveLength(4);
+    expect(minecraft.placedBlocks.size).toBe(4);
+    minecraft.snapshot = {
+      ...minecraft.snapshot,
+      inventory: [{ name: "oak_planks", count: 19 }],
+    };
+    const resumed = await skill.run(stored(shortage));
+    expect(resumed.status).toBe("completed");
+    expect(minecraft.placedBlocks.size).toBe(23);
+    expect(
+      minecraft.actions.filter((action) => action.startsWith("place:")),
+    ).toHaveLength(24);
   });
 });

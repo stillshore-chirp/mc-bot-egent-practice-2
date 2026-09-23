@@ -9,6 +9,7 @@ import type {
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
 import { oxygenObservationState } from "../../src/domain/snapshot.js";
+import { buildGroundNames } from "../../src/minecraft/port.js";
 import { recommendArmor } from "../../src/decision/armor-equipment.js";
 import type {
   EscapeMode,
@@ -84,6 +85,7 @@ export class FakeMinecraft implements MinecraftPort {
   public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
   public placedBlocks = new Map<string, string>();
   public buildBlocks = new Map<string, string>();
+  public unverifiedGround = new Set<string>();
   private pendingDrop: ResourceTarget | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
@@ -501,6 +503,11 @@ export class FakeMinecraft implements MinecraftPort {
         decision !== "protected" &&
         decision !== "denied" &&
         decision !== "unknown",
+      safeGround:
+        buildGroundNames.has(name) &&
+        !this.unverifiedGround.has(key) &&
+        decision !== "unknown" &&
+        decision !== "protected",
     };
   }
 

@@ -31,6 +31,7 @@ import {
 } from "../domain/snapshot.js";
 import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay, withTimeout } from "../runtime/timeout.js";
+import { buildGroundNames } from "./port.js";
 import type {
   ArmorEquipResult,
   BuildBlockObservation,
@@ -2110,7 +2111,12 @@ export class MineflayerClient implements MinecraftPort {
       block = bot.blockAt(location);
     }
     if (block === null) {
-      return { name: null, serverConfirmed: false, placementAllowed: false };
+      return {
+        name: null,
+        serverConfirmed: false,
+        placementAllowed: false,
+        safeGround: false,
+      };
     }
     if (isAirName(block.name)) {
       const decision = await queryActionGuard(
@@ -2122,6 +2128,7 @@ export class MineflayerClient implements MinecraftPort {
         name: "air",
         serverConfirmed: decision === "allowed" || decision === "protected",
         placementAllowed: decision === "allowed",
+        safeGround: false,
       };
     }
     const decision = await queryActionGuard(
@@ -2129,10 +2136,18 @@ export class MineflayerClient implements MinecraftPort {
       { operation: "inspect", name: block.name, position },
       signal,
     );
+    const siteDecision = buildGroundNames.has(block.name)
+      ? await queryActionGuard(
+          bot._client,
+          { operation: "site", name: block.name, position },
+          signal,
+        )
+      : "unknown";
     return {
       name: block.name,
       serverConfirmed: decision === "allowed",
       placementAllowed: false,
+      safeGround: decision === "allowed" && siteDecision === "allowed",
     };
   }
 

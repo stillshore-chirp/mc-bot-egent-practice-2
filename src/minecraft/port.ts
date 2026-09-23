@@ -20,6 +20,15 @@ export interface ResourceTarget {
   readonly position: Position;
 }
 
+export const buildGroundNames = new Set([
+  "grass_block",
+  "dirt",
+  "coarse_dirt",
+  "stone",
+  "sand",
+  "sandstone",
+]);
+
 export interface BuildBlockObservation {
   /** Null means the chunk or block could not be observed. */
   readonly name: string | null;
@@ -27,6 +36,8 @@ export interface BuildBlockObservation {
   readonly serverConfirmed: boolean;
   /** A fresh permit would be possible now; placement rechecks before mutation. */
   readonly placementAllowed: boolean;
+  /** Server-confirmed ground inside an operator-verified safe area. */
+  readonly safeGround: boolean;
 }
 
 export type EscapeMode = "environment" | "hostile";

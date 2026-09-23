@@ -49,12 +49,18 @@ describe("bounded base plan", () => {
       name: "oak_planks",
       serverConfirmed: true,
       placementAllowed: false,
+      safeGround: false,
     };
     expect(placementState(matching, "oak_planks", false)).toBe("blocked");
     expect(placementState(matching, "oak_planks", true)).toBe("verified");
     expect(
       placementState(
-        { name: "air", serverConfirmed: true, placementAllowed: false },
+        {
+          name: "air",
+          serverConfirmed: true,
+          placementAllowed: false,
+          safeGround: false,
+        },
         "oak_planks",
         false,
       ),
@@ -64,13 +70,23 @@ describe("bounded base plan", () => {
         name: "grass_block",
         serverConfirmed: true,
         placementAllowed: false,
+        safeGround: true,
       }),
     ).toBe(true);
+    expect(
+      groundSuitable({
+        name: "grass_block",
+        serverConfirmed: true,
+        placementAllowed: false,
+        safeGround: false,
+      }),
+    ).toBe(false);
     expect(
       groundSuitable({
         name: "oak_planks",
         serverConfirmed: true,
         placementAllowed: false,
+        safeGround: false,
       }),
     ).toBe(false);
   });

@@ -1,5 +1,8 @@
 import type { Position, WorldSnapshot } from "../domain/snapshot.js";
-import type { BuildBlockObservation } from "../minecraft/port.js";
+import {
+  buildGroundNames,
+  type BuildBlockObservation,
+} from "../minecraft/port.js";
 
 export const baseBuildMaterial = "oak_planks";
 export const baseBuildLog = "oak_log";
@@ -108,14 +111,8 @@ export function buildStateSafe(snapshot: WorldSnapshot): boolean {
 export function groundSuitable(observation: BuildBlockObservation): boolean {
   return (
     observation.serverConfirmed &&
-    [
-      "grass_block",
-      "dirt",
-      "coarse_dirt",
-      "stone",
-      "sand",
-      "sandstone",
-    ].includes(observation.name ?? "")
+    observation.safeGround &&
+    buildGroundNames.has(observation.name ?? "")
   );
 }
 

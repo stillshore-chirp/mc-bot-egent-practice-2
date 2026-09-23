@@ -200,7 +200,9 @@ export class BaseBuildSkill {
             failedAt: "site_selection",
           });
         await this.moveToConfirmedSite(plan.center, plan.worldId, signal);
-        await this.verifySite(plan, verified, signal);
+        const confirmed = await this.verifySite(plan, verified, signal);
+        verified.clear();
+        for (const key of confirmed) verified.add(key);
         await context.advance(
           "material_estimate",
           checkpoint(plan, origin, verified),
@@ -463,7 +465,8 @@ export class BaseBuildSkill {
     plan: BaseBuildPlan,
     verified: ReadonlySet<string>,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<Set<string>> {
+    const confirmed = new Set<string>();
     const blocked = (): never => {
       throw new AppError({
         category: "safety",
@@ -521,8 +524,10 @@ export class BaseBuildSkill {
           );
           if (planned.has(key) ? state === "blocked" : state !== "empty")
             blocked();
+          if (planned.has(key) && state === "verified") confirmed.add(key);
         }
       }
     }
+    return confirmed;
   }
 }
