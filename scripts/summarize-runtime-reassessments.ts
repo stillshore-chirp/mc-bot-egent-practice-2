@@ -27,7 +27,7 @@ function main(): void {
         `SELECT json_extract(root.span_json, '$.attributes.runtimeEvent') AS event,
                 json_extract(root.span_json, '$.attributes.runtimeCauseKey') AS cause,
                 SUM(CASE WHEN span.stage = 'deliberation' AND json_extract(span.span_json, '$.name') = 'LLM判断を実行' THEN 1 ELSE 0 END) AS apiCalls,
-                SUM(CASE WHEN span.stage = 'response' AND json_extract(span.span_json, '$.name') = '利用者向け応答' AND span.status = 'succeeded' THEN 1 ELSE 0 END) AS speeches
+                SUM(CASE WHEN span.stage = 'response' AND json_extract(span.span_json, '$.name') IN ('利用者向け応答', 'エラー応答') AND span.status = 'succeeded' THEN 1 ELSE 0 END) AS speeches
          FROM trace_runs AS run
          JOIN trace_spans AS root ON root.trace_id = run.trace_id AND root.span_id = run.root_span_id
          JOIN trace_spans AS span ON span.trace_id = run.trace_id
