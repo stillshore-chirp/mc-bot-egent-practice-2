@@ -162,7 +162,10 @@ export function isStableAfterIncident(
         !snapshot.suffocating &&
         (incident.observation.inWater &&
         incident.observation.oxygenState !== "normal"
-          ? !snapshot.inWater
+          ? !snapshot.inWater &&
+            snapshot.oxygen !== null &&
+            snapshot.oxygen > thresholds.lowOxygen &&
+            snapshot.health > 0
           : true) &&
         (!snapshot.inWater ||
           (snapshot.oxygenState !== "low" &&

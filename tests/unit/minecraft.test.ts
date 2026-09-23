@@ -1,4 +1,5 @@
 import { Vec3 } from "vec3";
+import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
 import {
   MineflayerClient,
   oxygenFromEntityMetadata,
@@ -523,6 +524,7 @@ describe("Mineflayer player observation", () => {
         pathfinder: { setGoal: vi.fn() },
         clearControlStates: vi.fn(),
         setControlState: vi.fn(),
+        blockAt: vi.fn(() => null),
       };
       Object.assign(client, { spawned: true, botInstance: bot });
       const low = { inWater: true, oxygenState: "low" } as Awaited<
@@ -569,26 +571,125 @@ describe("Mineflayer player observation", () => {
         pathfinder: { setGoal: vi.fn() },
         clearControlStates: vi.fn(),
         setControlState: vi.fn(),
+        blockAt: vi.fn(() => null),
       };
       Object.assign(client, { spawned: true, botInstance: bot });
       const observe = vi.spyOn(client, "observe").mockResolvedValue({
         inWater: true,
         oxygenState: "low",
-      } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+        position: { x: 0, y: 63, z: 0 },
+        nearbyEntities: [],
+      } as unknown as Awaited<ReturnType<MineflayerClient["observe"]>>);
 
       const escape = client.escapeDanger(
         "environment",
         new AbortController().signal,
       );
+      const rejected = expect(escape).rejects.toMatchObject({
+        detail: { code: "SHORE_NOT_OBSERVED" },
+      });
       await vi.advanceTimersByTimeAsync(4_000);
-      await escape;
+      await rejected;
 
-      expect(observe).toHaveBeenCalledTimes(17);
+      expect(observe).toHaveBeenCalledTimes(18);
       expect(bot.clearControlStates).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
   });
+
+  it("releases swimming controls immediately when the owner stops the escape", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      vi.spyOn(client, "observe").mockResolvedValue({
+        inWater: true,
+        oxygenState: "low",
+      } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+      const controller = new AbortController();
+      const escape = client.escapeDanger("environment", controller.signal);
+      const rejected = expect(escape).rejects.toThrow("owner stop");
+      await vi.advanceTimersByTimeAsync(500);
+      controller.abort(new Error("owner stop"));
+      await rejected;
+      expect(bot.clearControlStates).toHaveBeenCalled();
+      expect(bot.setControlState).toHaveBeenCalledWith("jump", true);
+      expect(bot.pathfinder.setGoal).toHaveBeenCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { reason: "oxygen falls", health: 20, oxygenState: "low" },
+    { reason: "health falls", health: 19, oxygenState: "normal" },
+  ])(
+    "stops shore traversal as soon as $reason",
+    async ({ health, oxygenState }) => {
+      vi.useFakeTimers();
+      try {
+        const client = new MineflayerClient(
+          {
+            bot: { username: "fixture_bot" },
+            pathfinderThinkTimeoutMs: 100,
+            pathfinderTickTimeoutMs: 10,
+            collectTimeoutMs: 100,
+          },
+          { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        );
+        const bot = {
+          pathfinder: {
+            goto: vi.fn(() => new Promise<void>(() => undefined)),
+            setGoal: vi.fn(),
+          },
+          clearControlStates: vi.fn(),
+        };
+        Object.assign(client, { spawned: true, botInstance: bot });
+        vi.spyOn(client, "observe").mockResolvedValue({
+          health,
+          inWater: true,
+          oxygenState,
+        } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+        const runShorePathfinder = client as unknown as {
+          runShorePathfinder: (
+            goal: PathfinderGoals.Goal,
+            signal: AbortSignal,
+            deadline: number,
+            baselineHealth: number,
+          ) => Promise<void>;
+        };
+        const traversal = runShorePathfinder.runShorePathfinder(
+          {} as PathfinderGoals.Goal,
+          new AbortController().signal,
+          Date.now() + 5_000,
+          20,
+        );
+        const rejected = expect(traversal).rejects.toMatchObject({
+          detail: { code: "SHORE_NOT_REACHED" },
+        });
+        await vi.advanceTimersByTimeAsync(250);
+        await rejected;
+        expect(bot.pathfinder.setGoal).toHaveBeenCalledWith(null);
+        expect(bot.clearControlStates).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("counts repeated resurfacing confirmations toward the escape deadline", async () => {
     vi.useFakeTimers();

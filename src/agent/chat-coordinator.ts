@@ -740,6 +740,11 @@ export class ChatCoordinator {
       connection_recovered:
         "Minecraft接続復旧後の状態を確認し、開始済みの行動が確認できればその事実を含め、利用者に必要な状態変化だけを2文以内で短く報告してください。内部処理や制約は説明せず、確認できた作業状態を正確に扱い、新しい行動を開始しないでください。",
     } as const;
+    const message =
+      event === "safety_failed" &&
+      /SHORE_NOT_OBSERVED|SHORE_NOT_REACHED/u.test(context.stateKey)
+        ? `Botは乾いた岸へまだ到達していません。${context.stateKey.includes("SHORE_NOT_OBSERVED") ? "観測範囲に安全な乾いた岸を確認できませんでした。" : "岸の候補は見えましたが、安全な経路での到達を確認できませんでした。"}今のBot自身の水中状態・酸素・体力を再観測して、一時的な呼吸回復を帰還完了と扱わず、浮上して呼吸を確保することと次に安全に観測できる方向を具体的に伝えてください。未観測の岸への移動や採取は開始しないでください。`
+        : messages[event];
     const generation = this.#generation;
     const runtimeGeneration = this.#runtimeGeneration;
     this.#conversationTail = this.#conversationTail
@@ -749,7 +754,7 @@ export class ChatCoordinator {
         runtimeGeneration === this.#runtimeGeneration
           ? this.#deliberate(
               this.#ownerUsername,
-              messages[event],
+              message,
               "runtime_reassessment",
               { event, ...context },
             )

@@ -1201,6 +1201,37 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it("reports an unconfirmed shore escape with the observed breathing state and next safe step", async () => {
+    const deliberate = vi.fn(async (_request: { message: string }) => ({
+      text: "岸へは到達していません。呼吸を確保して周囲を再観測します。",
+      toolResults: [],
+    }));
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say: vi.fn(async () => undefined) } as unknown as GameController,
+      agent: { deliberate },
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "固定人格要約",
+          memoryContext: "固定記憶要約",
+          worldContext: "Botは水中、呼吸状態は再観測中",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleRuntimeEvent("safety_failed", {
+      stateKey: "safety:failed:hazard:SHORE_NOT_OBSERVED",
+      causeKey: "reflex:hazard",
+    });
+
+    const request = deliberate.mock.calls[0]?.[0];
+    expect(request?.message).toContain("乾いた岸");
+    expect(request?.message).toContain("一時的な呼吸回復を帰還完了と扱わず");
+    expect(request?.message).toContain("次に安全に観測できる方向");
+  });
+
   it.each([
     ["危険です！作業を停止しました。", "危険です、作業を停止しました。"],
     [

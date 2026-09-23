@@ -220,6 +220,69 @@ export function escapeTarget(
   return candidates[0]?.candidate;
 }
 
+/** Select only observed, dry footholds beside water; path reachability is checked separately. */
+export function observedShoreCandidates(
+  origin: Position,
+  blockAt: (
+    position: Position,
+  ) => { readonly name: string; readonly boundingBox: string } | null,
+  hostiles: readonly Position[],
+  radius = 7,
+): Position[] {
+  const baseX = Math.floor(origin.x);
+  const baseY = Math.floor(origin.y);
+  const baseZ = Math.floor(origin.z);
+  const candidates: { position: Position; cost: number }[] = [];
+  for (let dx = -radius; dx <= radius; dx += 1) {
+    for (let dz = -radius; dz <= radius; dz += 1) {
+      const horizontalDistance = Math.hypot(dx, dz);
+      if (horizontalDistance < 1 || horizontalDistance > radius) continue;
+      const x = baseX + dx;
+      const z = baseZ + dz;
+      for (let y = baseY - 1; y <= baseY + 5; y += 1) {
+        const position = { x, y, z };
+        const feet = blockAt(position);
+        const head = blockAt({ x, y: y + 1, z });
+        const ground = blockAt({ x, y: y - 1, z });
+        if (
+          feet === null ||
+          head === null ||
+          ground === null ||
+          !isAirName(feet.name) ||
+          !isAirName(head.name) ||
+          ground.boundingBox !== "block" ||
+          unsafeDescentSurfaces.has(ground.name) ||
+          hostiles.some((hostile) => distance(hostile, position) < 4)
+        )
+          continue;
+        const waterAdjacent = (
+          [
+            [1, 0],
+            [-1, 0],
+            [0, 1],
+            [0, -1],
+          ] as const
+        ).some(([sideX, sideZ]) =>
+          [y, y - 1].some(
+            (level) =>
+              blockAt({ x: x + sideX, y: level, z: z + sideZ })?.name ===
+              "water",
+          ),
+        );
+        if (!waterAdjacent) continue;
+        candidates.push({
+          position,
+          cost: horizontalDistance + Math.abs(y - baseY) * 0.4,
+        });
+      }
+    }
+  }
+  return candidates
+    .sort((left, right) => left.cost - right.cost)
+    .slice(0, 12)
+    .map(({ position }) => position);
+}
+
 export function nearestItemDropPosition(
   origin: Position,
   expectedItemName: string,
@@ -284,6 +347,63 @@ const unsafeDescentSurfaces = new Set([
 
 const descentNodeKey = (position: Position): string =>
   `${position.x},${position.y},${position.z}`;
+
+class ObservedShoreMovements extends Movements {
+  public constructor(
+    private readonly minecraftBot: Bot,
+    private readonly origin: Position,
+    private readonly radius: number,
+    private readonly approvedNodes?: ReadonlySet<string>,
+  ) {
+    super(minecraftBot);
+    this.canDig = false;
+    this.allow1by1towers = false;
+    this.allowParkour = false;
+    this.allowSprinting = false;
+    this.maxDropDown = 2;
+    this.infiniteLiquidDropdownDistance = false;
+    this.exclusionAreasStep = [() => 0];
+  }
+
+  public override getNeighbors(node: Move): Move[] {
+    return super.getNeighbors(node).filter((move) => {
+      if (
+        move.toBreak.length > 0 ||
+        move.toPlace.length > 0 ||
+        (this.approvedNodes !== undefined &&
+          !this.approvedNodes.has(descentNodeKey(move))) ||
+        Math.hypot(move.x - this.origin.x, move.z - this.origin.z) >
+          this.radius + 1 ||
+        Math.abs(move.y - this.origin.y) > 5
+      )
+        return false;
+      const bot = this.minecraftBot;
+      const feet = bot.blockAt(new Vec3(move.x, move.y, move.z));
+      const head = bot.blockAt(new Vec3(move.x, move.y + 1, move.z));
+      const ground = bot.blockAt(new Vec3(move.x, move.y - 1, move.z));
+      if (
+        feet === null ||
+        head === null ||
+        ground === null ||
+        !["water", "air", "cave_air", "void_air"].includes(feet.name) ||
+        !["water", "air", "cave_air", "void_air"].includes(head.name) ||
+        (ground.name !== "water" && unsafeDescentSurfaces.has(ground.name)) ||
+        (isAirName(feet.name) &&
+          ground.name !== "water" &&
+          ground.boundingBox !== "block")
+      )
+        return false;
+      return !Object.values(bot.entities).some((entity) => {
+        if (entity.id === bot.entity.id) return false;
+        const name = entity.name ?? entity.displayName ?? entity.type;
+        return (
+          isHostileEntity(name, entity.type, bot.registry) &&
+          entity.position.distanceTo(new Vec3(move.x, move.y, move.z)) < 3
+        );
+      });
+    });
+  }
+}
 
 class ObservedDescentMovements extends Movements {
   public constructor(
@@ -2494,18 +2614,125 @@ export class MineflayerClient implements MinecraftPort {
         try {
           while (Date.now() < ascentDeadline) {
             await delay(Math.min(250, ascentDeadline - Date.now()), signal);
-            if (!(await this.observe()).inWater) {
+            const surfaced = await this.observe();
+            if (!surfaced.inWater) {
               bot.clearControlStates();
               await delay(1_000, signal);
               if (!(await this.observe()).inWater) return;
               if (Date.now() < ascentDeadline)
                 bot.setControlState("jump", true);
             }
+            if (surfaced.oxygenState === "normal") break;
           }
         } finally {
           bot.clearControlStates();
         }
-        return;
+        const afterAscent = await this.observe();
+        if (!afterAscent.inWater) return;
+        const origin = afterAscent.position;
+        const hostiles = afterAscent.nearbyEntities
+          .filter((entity) => entity.hostile && entity.distance <= 12)
+          .map((entity) => entity.position);
+        const radius = afterAscent.oxygenState === "normal" ? 7 : 3;
+        const candidates = observedShoreCandidates(
+          origin,
+          (position) =>
+            bot.blockAt(new Vec3(position.x, position.y, position.z)),
+          hostiles,
+          radius,
+        );
+        if (candidates.length === 0) {
+          throw new AppError({
+            category: "safety",
+            code: "SHORE_NOT_OBSERVED",
+            message: "No nearby dry shore is observable after surfacing",
+            retryable: true,
+            failedAt: "water_escape",
+          });
+        }
+        const planningMovements = new ObservedShoreMovements(
+          bot,
+          origin,
+          radius,
+        );
+        const shoreDeadline =
+          Date.now() + (afterAscent.oxygenState === "normal" ? 5_000 : 2_000);
+        for (const candidate of candidates) {
+          throwIfAborted(signal, "water_escape");
+          if (Date.now() >= shoreDeadline) break;
+          const beforePlanning = await this.observe();
+          if (
+            beforePlanning.health < afterAscent.health ||
+            (beforePlanning.inWater && beforePlanning.oxygenState !== "normal")
+          ) {
+            throw new AppError({
+              category: "safety",
+              code: "SHORE_NOT_REACHED",
+              message: "Health or air became unsafe before reaching shore",
+              retryable: true,
+              failedAt: "water_escape",
+            });
+          }
+          const goal = new goals.GoalBlock(
+            candidate.x,
+            candidate.y,
+            candidate.z,
+          );
+          const planned = (
+            bot.pathfinder
+              .getPathFromTo(planningMovements, bot.entity.position, goal, {
+                optimizePath: false,
+                timeout: Math.min(this.options.pathfinderThinkTimeoutMs, 700),
+                searchRadius: radius + 2,
+              })
+              .next().value as
+              | {
+                  readonly result: {
+                    readonly status: string;
+                    readonly path: Move[];
+                  };
+                }
+              | undefined
+          )?.result;
+          if (planned?.status !== "success" || planned.path.length === 0)
+            continue;
+          const previousMovements = bot.pathfinder.movements;
+          const approvedNodes = new Set(planned.path.map(descentNodeKey));
+          try {
+            bot.pathfinder.setMovements(
+              new ObservedShoreMovements(bot, origin, radius, approvedNodes),
+            );
+            await this.runShorePathfinder(
+              goal,
+              signal,
+              shoreDeadline,
+              afterAscent.health,
+            );
+          } catch (error) {
+            if (signal.aborted) throw error;
+            if (
+              error instanceof AppError &&
+              error.detail.code === "SHORE_NOT_REACHED"
+            )
+              throw error;
+            continue;
+          } finally {
+            bot.pathfinder.setGoal(null);
+            bot.pathfinder.setMovements(previousMovements);
+            bot.clearControlStates();
+          }
+          await delay(750, signal);
+          const after = await this.observe();
+          // The coordinator separately confirms oxygen and health recovery.
+          if (!after.inWater) return;
+        }
+        throw new AppError({
+          category: "safety",
+          code: "SHORE_NOT_REACHED",
+          message: "No observed dry shore could be reached and confirmed",
+          retryable: true,
+          failedAt: "water_escape",
+        });
       }
     }
     const target =
@@ -2589,6 +2816,57 @@ export class MineflayerClient implements MinecraftPort {
       });
     }
     return this.botInstance;
+  }
+
+  private async runShorePathfinder(
+    goal: PathfinderGoals.Goal,
+    signal: AbortSignal,
+    deadline: number,
+    baselineHealth: number,
+  ): Promise<void> {
+    const unsafeAbort = new AbortController();
+    const traversalSignal = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      unsafeAbort.signal,
+    ]);
+    const unsafeVitals = { detected: false };
+    const vitalsTimer = setInterval(() => {
+      if (traversalSignal.aborted) return;
+      void this.observe()
+        .then((vitals) => {
+          if (traversalSignal.aborted) return;
+          if (
+            vitals.health < baselineHealth ||
+            (vitals.inWater && vitals.oxygenState !== "normal")
+          ) {
+            unsafeVitals.detected = true;
+            unsafeAbort.abort();
+          }
+        })
+        .catch(() => {
+          if (traversalSignal.aborted) return;
+          unsafeVitals.detected = true;
+          unsafeAbort.abort();
+        });
+    }, 250);
+    try {
+      await this.runPathfinder(goal, traversalSignal);
+    } catch (error) {
+      if (unsafeVitals.detected) {
+        throw new AppError({
+          category: "safety",
+          code: "SHORE_NOT_REACHED",
+          message: "Health or air became unsafe while moving to shore",
+          retryable: true,
+          failedAt: "water_escape",
+        });
+      }
+      throw error;
+    } finally {
+      clearInterval(vitalsTimer);
+      unsafeAbort.abort();
+    }
   }
 
   private async runPathfinder(
