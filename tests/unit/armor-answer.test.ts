@@ -42,6 +42,9 @@ describe("armor status answer", () => {
     "私の防具を装備して",
     "村人の防具を装備して",
     "防具を脱いで",
+    "防具着てないよ",
+    "防具を着てくれてありがとう",
+    "その防具を着ている姿いいね",
   ])("does not turn non-requests into armor actions: %s", (message) => {
     expect(isArmorEquipRequest(message)).toBe(false);
   });
