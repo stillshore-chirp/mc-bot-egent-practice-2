@@ -26,6 +26,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     private Set<String> botNames = Set.of();
     private List<Region> protectedRegions = List.of();
     private List<Region> naturalResourceRegions = List.of();
+    private List<Region> baseBuildSafeRegions = List.of();
     private File actionLedgerFile;
     private record Region(String world, int x1, int y1, int z1, int x2, int y2, int z2) {
         boolean contains(Block b) {
@@ -40,6 +41,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         botNames = Set.copyOf(names);
         protectedRegions = readRegions("protected-regions");
         naturalResourceRegions = readRegions("natural-resource-regions");
+        baseBuildSafeRegions = readRegions("base-build-safe-regions");
         actionLedgerFile = new File(getDataFolder(), "action-ledger.yml");
         loadActionLedger();
         getServer().getPluginManager().registerEvents(this, this);
@@ -65,7 +67,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                     if (lo[i]>hi[i]) throw new IllegalArgumentException();
                 }
                 regions.add(new Region(world,lo[0],lo[1],lo[2],hi[0],hi[1],hi[2]));
-            } catch (RuntimeException invalid) { throw new IllegalArgumentException("Invalid protected region configuration"); }
+            } catch (RuntimeException invalid) { throw new IllegalArgumentException("Invalid region configuration: " + key); }
         }
         return List.copyOf(regions);
     }
@@ -195,6 +197,11 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         ).contains(name);
     }
 
+    private static boolean buildGround(Material material) {
+        return Set.of("GRASS_BLOCK", "DIRT", "COARSE_DIRT", "STONE", "SAND", "SANDSTONE")
+            .contains(material.name());
+    }
+
     private String genericMineDecision(Block block) {
         if (protectedArea(block)) return "protected";
         boolean configuredRegion = naturalResourceRegions.stream().anyMatch(r -> r.contains(block));
@@ -225,7 +232,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
             String requestedName = request.get("name").getAsString().toLowerCase(Locale.ROOT);
             JsonObject position = request.getAsJsonObject("position");
             int x = position.get("x").getAsInt(), y = position.get("y").getAsInt(), z = position.get("z").getAsInt();
-            if (!id.matches("[a-f0-9-]{36}") || !Set.of("mine", "place", "inspect").contains(operation)
+            if (!id.matches("[a-f0-9-]{36}") || !Set.of("mine", "place", "inspect", "site").contains(operation)
                 || !requestedName.matches("[a-z0-9_]{1,64}")) return;
             World world = player.getWorld();
             if (Math.abs((long)x) > 30_000_000 || Math.abs((long)z) > 30_000_000
@@ -245,6 +252,11 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
                 if (decision.equals("allowed")) {
                     actionLedger.grant(new ActionLedger.Permit(player.getUniqueId(), operation, actionPoint(block), requestedName), System.currentTimeMillis() + ACTION_PERMIT_TTL_MILLIS);
                 }
+            } else if (operation.equals("site")) {
+                boolean configuredRegion = baseBuildSafeRegions.stream().anyMatch(r -> r.contains(block));
+                decision = !requestedName.equals(name(block)) ? "changed"
+                    : protectedArea(block) || actionLedger.isPlaced(actionPoint(block)) ? "protected"
+                    : buildGround(block.getType()) && configuredRegion ? "allowed" : "unknown";
             } else {
                 // Read-only authoritative state check. It never grants a
                 // permit and is used after a client mutation to distinguish

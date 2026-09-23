@@ -30,9 +30,11 @@ import {
   type WorldSnapshot,
 } from "../domain/snapshot.js";
 import { throwIfAborted } from "../runtime/cancellation.js";
-import { delay } from "../runtime/timeout.js";
+import { delay, withTimeout } from "../runtime/timeout.js";
+import { buildGroundNames } from "./port.js";
 import type {
   ArmorEquipResult,
+  BuildBlockObservation,
   EscapeMode,
   MinecraftLogger,
   MinecraftPort,
@@ -2088,6 +2090,65 @@ export class MineflayerClient implements MinecraftPort {
         failedAt: "place_block",
       });
     }
+  }
+
+  public async inspectBuildBlock(
+    position: Position,
+    material: string,
+    signal: AbortSignal,
+  ): Promise<BuildBlockObservation> {
+    throwIfAborted(signal, "inspect_build_block");
+    const bot = this.requireBot();
+    const location = new Vec3(position.x, position.y, position.z);
+    let block = bot.blockAt(location);
+    if (block === null) {
+      await withTimeout(
+        () => bot.waitForChunksToLoad(),
+        5_000,
+        signal,
+        "inspect_build_block",
+      );
+      block = bot.blockAt(location);
+    }
+    if (block === null) {
+      return {
+        name: null,
+        serverConfirmed: false,
+        placementAllowed: false,
+        safeGround: false,
+      };
+    }
+    if (isAirName(block.name)) {
+      const decision = await queryActionGuard(
+        bot._client,
+        { operation: "place", name: material, position },
+        signal,
+      );
+      return {
+        name: "air",
+        serverConfirmed: decision === "allowed" || decision === "protected",
+        placementAllowed: decision === "allowed",
+        safeGround: false,
+      };
+    }
+    const decision = await queryActionGuard(
+      bot._client,
+      { operation: "inspect", name: block.name, position },
+      signal,
+    );
+    const siteDecision = buildGroundNames.has(block.name)
+      ? await queryActionGuard(
+          bot._client,
+          { operation: "site", name: block.name, position },
+          signal,
+        )
+      : "unknown";
+    return {
+      name: block.name,
+      serverConfirmed: decision === "allowed",
+      placementAllowed: false,
+      safeGround: decision === "allowed" && siteDecision === "allowed",
+    };
   }
 
   public async smeltItem(

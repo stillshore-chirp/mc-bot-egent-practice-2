@@ -76,6 +76,9 @@ export class ToolExecutor {
     serializedArguments: string,
     context: ToolContext,
   ): Promise<ToolResult<unknown>> {
+    if (name === "build_base" && context.baseBuildAuthorized === true) {
+      context.baseBuildAuthorizationUsage ??= { consumed: false };
+    }
     const executionContext: ToolContext = {
       ...context,
       executeSafeActionStep: (step, stepContext) =>
@@ -150,6 +153,14 @@ export class ToolExecutor {
         },
       };
     }
+    if (name === "build_base" && context.baseBuildAuthorized !== true) {
+      return failure(
+        "BASE_BUILD_NOT_AUTHORIZED",
+        "authorization",
+        context.baseBuildClarification ??
+          "拠点設営は利用者の明示依頼と建築条件を確認してから始めます。",
+      );
+    }
     const ownerScopedMutation =
       definition.action || ownerScopedMutationToolNames.has(name);
     if (context.allowActionTools === false && ownerScopedMutation) {
@@ -216,6 +227,18 @@ export class ToolExecutor {
         "authorization",
         "この操作の対象と数量を所有者の認可範囲で確認できないため、開始しませんでした。",
       );
+    }
+
+    if (name === "build_base") {
+      if (context.baseBuildAuthorizationUsage?.consumed === true) {
+        return failure(
+          "BASE_BUILD_SCOPE_EXHAUSTED",
+          "authorization",
+          "この依頼での拠点設営は既に開始しています。続きは新しい明示依頼で確認します。",
+        );
+      }
+      if (context.baseBuildAuthorizationUsage !== undefined)
+        context.baseBuildAuthorizationUsage.consumed = true;
     }
 
     try {

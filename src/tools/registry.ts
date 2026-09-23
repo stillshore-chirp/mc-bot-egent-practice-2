@@ -1587,6 +1587,21 @@ export const toolDefinitions = [
     },
   }),
   defineTool({
+    name: "build_base",
+    description:
+      "利用者が任せた小規模拠点を、安全な候補地選択・必要分の原木調達・板材クラフト・23か所の設置・完成照合まで一つの中断可能な作業として進める。明示された再開依頼なら既設部分を観測して再開する。認証済みの明示依頼だけで実行できる。",
+    input: noInput,
+    fixtures: { valid: [{}], invalid: [{ location: "arbitrary" }] },
+    action: true,
+    execute: async (_input, context) =>
+      actionReportResult(
+        await context.game.buildBase(
+          context.signal,
+          context.baseBuildResume === true,
+        ),
+      ),
+  }),
+  defineTool({
     name: "craft_item",
     description:
       "観測したレシピと所持品を使って指定数をクラフトし、所持品差分を確認する。",

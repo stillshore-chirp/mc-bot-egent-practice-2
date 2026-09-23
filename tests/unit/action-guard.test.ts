@@ -54,6 +54,23 @@ describe("generic action guard protocol", () => {
     });
   });
 
+  it("queries server-verified build ground without a mutation permit", async () => {
+    const client = new FakeClient();
+    await expect(
+      queryActionGuard(client as never, {
+        operation: "site",
+        name: "grass_block",
+        position: { x: 1, y: 63, z: 0 },
+      }),
+    ).resolves.toBe("allowed");
+    expect(
+      JSON.parse(client.writes[0]?.data.toString("utf8") ?? "{}"),
+    ).toMatchObject({
+      operation: "site",
+      name: "grass_block",
+    });
+  });
+
   it("fails closed for a protected decision", () => {
     try {
       requireActionPermission("protected");

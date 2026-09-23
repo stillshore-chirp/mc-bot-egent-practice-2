@@ -131,6 +131,12 @@ function toolContext(
       outcome: "completed",
       summary: "設置しました。",
     }),
+    buildBase: async () => ({
+      before: status,
+      after: status,
+      outcome: "failed",
+      summary: "テスト用",
+    }),
     smeltItem: async () => ({
       before: status,
       after: status,
@@ -1121,6 +1127,44 @@ describe("OpenAI tool loop", () => {
       expect(availableTools).toContain("smelt_item");
     },
   );
+
+  it("offers the bounded build tool for an authenticated resume after a stop", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "一時停止しました。"),
+      response([], "拠点の続きを確認します。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    const first = await agent.deliberate({
+      message: "家を建てて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: { ...context, baseBuildAuthorized: true },
+    });
+    agent.recordDeliveredReply("owner", "owner_message", first.text);
+    agent.recordCancelledRequest("owner", "owner_message");
+
+    await agent.deliberate({
+      message: "家の続きをやって",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: {
+        ...context,
+        baseBuildAuthorized: true,
+        baseBuildResume: true,
+      },
+    });
+    expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
+      "build_base",
+    );
+  });
 
   it("rejects an out-of-scope plan before an earlier harmless step runs", async () => {
     const context = toolContext();

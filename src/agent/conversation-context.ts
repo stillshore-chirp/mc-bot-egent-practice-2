@@ -19,6 +19,7 @@ export type GoalActionFamily =
   | "memory"
   | "craft"
   | "place"
+  | "build"
   | "smelt";
 
 export interface ConversationSnapshot {
@@ -86,6 +87,7 @@ function goalActionFamily(value: string): GoalActionFamily | undefined {
   if (/(?:移動|行|向か)/u.test(value)) return "move";
   if (/(?:収納|拾|捨)/u.test(value)) return "inventory";
   if (/(?:登録|覚え|記録|記憶|忘れ)/u.test(value)) return "memory";
+  if (/(?:建築|建て|設営)/u.test(value)) return "build";
   if (/(?:クラフト|作)/u.test(value)) return "craft";
   if (/(?:置|設置|建築)/u.test(value)) return "place";
   if (/(?:精錬|焼)/u.test(value)) return "smelt";
@@ -122,7 +124,7 @@ export function explicitlyAuthorizedActionFamilies(
   message: string,
 ): GoalActionFamily[] {
   const prohibited = new Set(explicitlyProhibitedActionFamilies(message));
-  return [
+  const families = [
     ...new Set(
       goalActionClauses(compactText(message))
         .filter(isAffirmativeActionClause)
@@ -130,6 +132,15 @@ export function explicitlyAuthorizedActionFamilies(
         .filter((family) => !prohibited.has(family)),
     ),
   ];
+  if (
+    /(?:家|拠点|小屋|シェルター).{0,20}(?:作って|建てて|設営して|建築して)/u.test(
+      message,
+    ) &&
+    !/[?？]/u.test(message) &&
+    !/(?:作らないで|建てないで|設営しないで)/u.test(message)
+  )
+    families.push("build");
+  return [...new Set(families)];
 }
 
 function goalActionClauses(message: string): string[] {

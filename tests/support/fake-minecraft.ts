@@ -9,6 +9,7 @@ import type {
   WorldSnapshot,
 } from "../../src/domain/snapshot.js";
 import { oxygenObservationState } from "../../src/domain/snapshot.js";
+import { buildGroundNames } from "../../src/minecraft/port.js";
 import { recommendArmor } from "../../src/decision/armor-equipment.js";
 import type {
   EscapeMode,
@@ -70,18 +71,21 @@ export function createSnapshot(
 }
 
 export class FakeMinecraft implements MinecraftPort {
+  public worldId = "00000000-0000-4000-8000-000000000001";
   public snapshot: WorldSnapshot;
   public resources: ResourceTarget[] = [];
   public readonly actions: string[] = [];
   public stopCount = 0;
   public actionGuardDecisions = new Map<
     string,
-    "allowed" | "unknown" | "denied"
+    "allowed" | "unknown" | "denied" | "protected"
   >();
   public availableFurnace = false;
   public attackSucceeds = true;
   public craftableItems = new Set<string>(["planks", "stick", "iron_pickaxe"]);
   public placedBlocks = new Map<string, string>();
+  public buildBlocks = new Map<string, string>();
+  public unverifiedGround = new Set<string>();
   private pendingDrop: ResourceTarget | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
@@ -101,7 +105,7 @@ export class FakeMinecraft implements MinecraftPort {
     signal.throwIfAborted();
     return {
       position: { ...this.snapshot.position },
-      worldId: "00000000-0000-4000-8000-000000000001",
+      worldId: this.worldId,
       identity:
         position === null
           ? null
@@ -318,7 +322,8 @@ export class FakeMinecraft implements MinecraftPort {
     for (const resource of this.resources.slice(0, input.maxCandidates)) {
       if (knownBlockDrops[resource.name] === undefined) continue;
       const key = `${resource.name}:${resource.position.x}:${resource.position.y}:${resource.position.z}`;
-      const permission = this.actionGuardDecisions.get(key) ?? "allowed";
+      const guarded = this.actionGuardDecisions.get(key) ?? "allowed";
+      const permission = guarded === "protected" ? "denied" : guarded;
       const goalMetadata = goalMetadataForBlock(
         resource.name,
         new Set(input.requestedItems),
@@ -476,7 +481,34 @@ export class FakeMinecraft implements MinecraftPort {
       });
     }
     this.placedBlocks.set(key, target.name);
+    this.buildBlocks.set(key, target.name);
     this.actions.push(`place:${target.name}:${key}`);
+  }
+
+  public async inspectBuildBlock(
+    position: Position,
+    material: string,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const key = `${position.x}:${position.y}:${position.z}`;
+    const name =
+      this.buildBlocks.get(key) ?? (position.y < 64 ? "grass_block" : "air");
+    const decision = this.actionGuardDecisions.get(`${material}:${key}`);
+    return {
+      name,
+      serverConfirmed: decision !== "unknown",
+      placementAllowed:
+        name === "air" &&
+        decision !== "protected" &&
+        decision !== "denied" &&
+        decision !== "unknown",
+      safeGround:
+        buildGroundNames.has(name) &&
+        !this.unverifiedGround.has(key) &&
+        decision !== "unknown" &&
+        decision !== "protected",
+    };
   }
 
   public async smeltItem(

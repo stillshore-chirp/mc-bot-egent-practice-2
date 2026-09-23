@@ -54,6 +54,7 @@ import {
 } from "../skills/gather-logs/resource-catalog.js";
 import type { MoveToSkill } from "../skills/move-to.js";
 import type { ReturnToPlayerSkill } from "../skills/return-to-player.js";
+import { BaseBuildSkill } from "../skills/base-build-skill.js";
 import type {
   ActionReport,
   ErrorCategory,
@@ -134,6 +135,7 @@ interface TaskStateForSummary {
 export class CompanionGameController implements GameController {
   public readonly delivery: DeliveryController;
   readonly #deliverySkill: DeliverLogsSkill;
+  readonly #baseBuildSkill: BaseBuildSkill;
   readonly #minecraft: MinecraftPort;
   readonly #tasks: TaskRuntime;
   readonly #arbiter: ActionArbiter;
@@ -165,6 +167,14 @@ export class CompanionGameController implements GameController {
       input.arbiter,
       input.gatherLogs,
       input.maxMoveDistance ?? 128,
+    );
+    this.#baseBuildSkill = new BaseBuildSkill(
+      input.minecraft,
+      input.tasks,
+      input.arbiter,
+      input.gatherLogs,
+      input.ownerUsername,
+      () => this.delivery.list().map((target) => target.position),
     );
     this.#minecraft = input.minecraft;
     this.#tasks = input.tasks;
@@ -1272,6 +1282,53 @@ export class CompanionGameController implements GameController {
       }),
       current,
     );
+  }
+
+  public async buildBase(
+    signal: AbortSignal,
+    resume: boolean,
+  ): Promise<ActionReport> {
+    const previous =
+      this.#playerId === undefined || !resume
+        ? undefined
+        : this.#memory
+            .listRecentTaskRuns(this.#playerId, 12)
+            .find(
+              (task) =>
+                task.kind === "build_base" &&
+                task.status !== "completed" &&
+                task.checkpoint?.data.center !== undefined,
+            );
+    const report = await this.#executeTask(
+      signal,
+      () => this.#baseBuildSkill.run(previous),
+      (output) => ({
+        outcome: "completed",
+        evidenceKind: "minecraft_snapshot",
+        confirmedState: {
+          verifiedBlocks: output.verifiedBlocks,
+          totalBlocks: output.totalBlocks,
+        },
+        summary: `小規模拠点を完成させ、${String(output.totalBlocks)}か所すべてのブロックをゲーム内で確認しました。`,
+      }),
+    );
+    if (report.outcome === "completed") return report;
+    const task = this.#tasks.current;
+    const verified =
+      task?.kind === "build_base" && Array.isArray(task.checkpoint?.verified)
+        ? task.checkpoint.verified.length
+        : 0;
+    const reason =
+      task?.kind === "build_base" &&
+      typeof task.checkpoint?.suspendReason === "string"
+        ? task.checkpoint.suspendReason
+        : undefined;
+    return {
+      ...report,
+      confirmedState: { verifiedBlocks: verified, totalBlocks: 23 },
+      nextActions: ["安全状態と資材を確認した後、拠点設営の再開を依頼する"],
+      summary: `拠点は途中です。確認済み${String(verified)}/23か所。${reason ?? report.summary} 安全状態と資材を再確認して続きから再開できます。`,
+    };
   }
 
   public async smeltItem(

@@ -21,6 +21,19 @@ import {
   deriveOwnerGoalAuthorization,
   type PendingOwnerGoal,
 } from "../decision/owner-goal-authorization.js";
+import { decideBaseBuildRequest } from "../decision/base-build-authorization.js";
+
+interface PendingBaseBuild {
+  readonly ownerUsername: string;
+  readonly expiresAtMs: number;
+  readonly resume: boolean;
+}
+
+const baseBuildPendingTtlMs = 5 * 60_000;
+const acceptsBaseBuildDefaults = (message: string): boolean =>
+  /^(?:はい|うん|いいよ|いいです|それで|その条件で|オークの板材で|3×3で)(?:、?(?:お願いします|進めて|作って|建てて|やって))?[。！!]?$/u.test(
+    message.trim(),
+  );
 
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
@@ -49,6 +62,7 @@ async function safeWithTraceSpan<T>(
 
 export class CompanionContextFactory implements ChatContextFactory {
   #pendingOwnerGoal: PendingOwnerGoal | undefined;
+  #pendingBaseBuild: PendingBaseBuild | undefined;
   readonly #behaviorLearner: OwnerBehaviorMemoryLearner;
 
   public constructor(
@@ -67,6 +81,7 @@ export class CompanionContextFactory implements ChatContextFactory {
 
   public clearPendingOwnerGoal(): void {
     this.#pendingOwnerGoal = undefined;
+    this.#pendingBaseBuild = undefined;
   }
 
   public acceptOwnerMessage(
@@ -300,20 +315,52 @@ export class CompanionContextFactory implements ChatContextFactory {
           { summary: "Minecraft状態を観測" },
           () => this.game.observeStatus(),
         );
-        const ownerGoal = deriveOwnerGoalAuthorization({
-          message,
-          requesterUsername,
-          authorizedOwnerUsername: this.config.ownerUsername,
-          requestKind,
-          maxCount: this.config.limits.maxGatherCount,
-          ...(this.#pendingOwnerGoal === undefined
-            ? {}
-            : { pendingGoal: this.#pendingOwnerGoal }),
-        });
+        const baseBuild =
+          requestKind === "owner_message" &&
+          requesterUsername === this.config.ownerUsername
+            ? this.#pendingBaseBuild !== undefined &&
+              this.#pendingBaseBuild.ownerUsername === requesterUsername &&
+              Date.now() <= this.#pendingBaseBuild.expiresAtMs &&
+              acceptsBaseBuildDefaults(message)
+              ? {
+                  kind: "authorized" as const,
+                  resume: this.#pendingBaseBuild.resume,
+                }
+              : decideBaseBuildRequest(
+                  message,
+                  recentTasks.some(
+                    (task) =>
+                      task.kind === "build_base" &&
+                      task.status !== "completed" &&
+                      task.checkpoint?.data.center !== undefined,
+                  ),
+                )
+            : { kind: "none" as const };
+        const ownerGoal =
+          baseBuild.kind === "none"
+            ? deriveOwnerGoalAuthorization({
+                message,
+                requesterUsername,
+                authorizedOwnerUsername: this.config.ownerUsername,
+                requestKind,
+                maxCount: this.config.limits.maxGatherCount,
+                ...(this.#pendingOwnerGoal === undefined
+                  ? {}
+                  : { pendingGoal: this.#pendingOwnerGoal }),
+              })
+            : { outcome: "none" as const };
         if (
           requestKind !== "runtime_reassessment" &&
           requesterUsername === this.config.ownerUsername
         ) {
+          this.#pendingBaseBuild =
+            baseBuild.kind === "clarify"
+              ? {
+                  ownerUsername: requesterUsername,
+                  expiresAtMs: Date.now() + baseBuildPendingTtlMs,
+                  resume: baseBuild.resume,
+                }
+              : undefined;
           this.#pendingOwnerGoal =
             ownerGoal.outcome === "clarify" &&
             ownerGoal.pendingGoal !== undefined
@@ -361,6 +408,19 @@ export class CompanionContextFactory implements ChatContextFactory {
             signal,
             requestKind,
             ...ownerGoalFields,
+            ...(baseBuild.kind === "authorized"
+              ? {
+                  baseBuildAuthorized: true,
+                  baseBuildResume: baseBuild.resume,
+                  baseBuildAuthorizationUsage: { consumed: false },
+                }
+              : {}),
+            ...(baseBuild.kind === "clarify"
+              ? {
+                  baseBuildClarification: baseBuild.question,
+                  safeActionClarification: baseBuild.question,
+                }
+              : {}),
             executionEvidence: { verifiedActionReceipts: [] },
             game: this.game,
             memory: this.toolMemory,
