@@ -45,6 +45,7 @@ import {
   type ActionArbiter,
 } from "../runtime/action-arbiter.js";
 import type { TaskRuntime } from "../runtime/task-service.js";
+import { isCriticalHealth } from "../reflexes/detectors.js";
 import type { FollowPlayerSkill } from "../skills/follow-player.js";
 import type { GatherLogsSkill } from "../skills/gather-logs/gather-logs-skill.js";
 import { createSearchFrontier } from "../skills/gather-logs/search-strategy.js";
@@ -2055,6 +2056,9 @@ function observedCurrentDanger(
     )
   ) {
     return "今もBotの近くに敵を観測しています。";
+  }
+  if (!allowHostileResponse && isCriticalHealth(snapshot)) {
+    return "Botは低体力で、まだ安全に通常作業を再開できません。";
   }
   if (snapshot.food <= hungerThreshold) {
     return "Botは今も空腹で、安全に作業できる状態を確認できません。";

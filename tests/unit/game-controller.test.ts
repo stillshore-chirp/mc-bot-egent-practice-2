@@ -605,7 +605,11 @@ describe("CompanionGameController", () => {
     await waitUntil(() => minecraft.actions.includes("follow:owner"));
     await tasks.suspend("reflex:hostile");
     await follow;
-    minecraft.snapshot = createSnapshot({ nearbyEntities: [hostile(1, 4)] });
+    minecraft.snapshot = createSnapshot({
+      health: 4,
+      food: 16,
+      nearbyEntities: [hostile(1, 4)],
+    });
 
     const response = await game.respondToHostiles(
       "evade",
@@ -754,6 +758,10 @@ describe("CompanionGameController", () => {
       snapshot: createSnapshot({ nearbyEntities: [hostile(1, 4)] }),
     },
     { danger: "hunger", snapshot: createSnapshot({ food: 10 }) },
+    {
+      danger: "critical health above the hunger threshold",
+      snapshot: createSnapshot({ health: 4, food: 16 }),
+    },
   ])(
     "does not start a replacement action while $danger remains",
     async ({ snapshot }) => {

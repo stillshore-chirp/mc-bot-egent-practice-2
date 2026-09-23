@@ -42,6 +42,10 @@ export interface ReflexThresholds {
   readonly stuckDistance: number;
 }
 
+export function isCriticalHealth(snapshot: WorldSnapshot): boolean {
+  return snapshot.health > 0 && snapshot.health <= 6 && snapshot.food < 18;
+}
+
 export class ReflexDetector {
   private previous: WorldSnapshot | undefined;
   private movementAnchor:
@@ -115,7 +119,7 @@ export class ReflexDetector {
         observation,
       };
     }
-    if (current.health > 0 && current.health <= 6 && current.food < 18) {
+    if (isCriticalHealth(current)) {
       return {
         kind: "critical_health",
         reason: "Bot health is critically low",
