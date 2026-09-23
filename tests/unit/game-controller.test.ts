@@ -22,6 +22,7 @@ function createController(
   minecraft: FakeMinecraft,
   withPlayer = false,
   taskStore: TaskStore = new InMemoryTaskStore(),
+  hungerThreshold = 14,
 ) {
   const directory = mkdtempSync(join(tmpdir(), "mc-game-controller-"));
   const memory = MemoryStore.open(join(directory, "memory.sqlite"));
@@ -51,6 +52,7 @@ function createController(
       ownerUsername: "owner",
       ...(playerId === undefined ? {} : { playerId }),
       taskTimeoutMs: 2_000,
+      hungerThreshold,
       retryLimit: 1,
       logger: pino({ level: "silent" }),
       memory,
@@ -350,19 +352,23 @@ describe("CompanionGameController", () => {
     const status = await game.observeStatus();
     const report = await follow;
 
-    expect(status.activeTaskState).toContain("移動が進まなかった");
-    expect(status.activeTaskSummary).toContain("移動が進まなかった");
+    expect(status.activeTaskState).toContain("Botの位置が変わらず");
+    expect(status.activeTaskSummary).toContain("Botの位置が変わらず");
+    expect(status.activeTaskSummary).not.toContain("次の操作:");
     expect(report).toMatchObject({
       outcome: "failed",
       failureCategory: "safety",
       failureCode: "TASK_SUSPENDED_FOR_SAFETY",
       failureRetryable: true,
     });
-    expect(report.summary).toContain("周囲の障害物");
-    expect(report.summary).toContain("もう一度「こっちおいで」");
+    expect(report.summary).toContain(
+      "通れない地形の詳細はまだ確認できていません",
+    );
+    expect(report.summary).toContain("「続けて」");
+    expect(report.summary).not.toContain("もう一度「こっちおいで」");
     expect(report.nextActions).toEqual([
-      "周囲の障害物を避ける",
-      "もう一度「こっちおいで」と指示する",
+      "通れる道と周囲の安全を確認する",
+      "状況が変わったら「続けて」で再開する",
     ]);
     expect(report.summary).not.toContain("reflex:stuck");
     close();
@@ -371,27 +377,27 @@ describe("CompanionGameController", () => {
   it.each([
     {
       reason: "reflex:hazard",
-      observed: "危険を確認したため",
-      currentCheck: "現在も危険があるかは再確認が必要",
-      nextAction: "周囲が安全か再確認する",
+      observed: "直前にBotの周囲で危険を確認",
+      currentCheck: "危険が続いているか確認できません",
+      nextAction: "Botの周囲の安全を再確認する",
     },
     {
       reason: "reflex:hostile",
-      observed: "危険な相手を確認したため",
-      currentCheck: "現在も相手が近くにいるかは再確認が必要",
-      nextAction: "周囲の安全を再確認してからもう一度指示する",
+      observed: "直前にBotの近くで敵を確認",
+      currentCheck: "今回の観測では近くの敵を確認していません",
+      nextAction: "敵から距離を取り周囲の安全を確認する",
     },
     {
       reason: "reflex:damage",
-      observed: "被害を確認したため",
-      currentCheck: "現在も危険があるかは再確認が必要",
-      nextAction: "周囲の安全と被害の原因を再確認する",
+      observed: "直前にBotの体力が減ったため",
+      currentCheck: "被害の原因を特定できません",
+      nextAction: "Botの周囲と被害の原因を確認する",
     },
     {
       reason: "reflex:hunger",
-      observed: "空腹を確認したため",
-      currentCheck: "現在の空腹状態と食料を再確認し",
-      nextAction: "現在の空腹状態と食料を再確認する",
+      observed: "直前にBotの空腹を確認し",
+      currentCheck: "今回の観測では空腹が解消しています",
+      nextAction: "Botの食料と空腹状態を確認する",
     },
   ])(
     "separates a remembered $reason observation from the current state",
@@ -409,6 +415,198 @@ describe("CompanionGameController", () => {
       expect(report.nextActions).toContain(nextAction);
       expect(report.summary).not.toContain("現在の周囲に危険を観測");
       expect(report.summary).not.toContain("近くの危険を確認したため");
+      close();
+    },
+  );
+
+  it("still permits an explicit safety response while a prior task is suspended", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hostile");
+    await follow;
+    minecraft.snapshot = createSnapshot({ nearbyEntities: [hostile(1, 4)] });
+
+    const response = await game.respondToHostiles(
+      "evade",
+      new AbortController().signal,
+    );
+
+    expect(minecraft.actions).toContain("retreat:hostile");
+    expect(response.failureCode).not.toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    close();
+  });
+
+  it.each([
+    {
+      danger: "fire",
+      snapshot: createSnapshot({
+        onFire: true,
+        nearbyEntities: [hostile(1, 4)],
+      }),
+    },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+        nearbyEntities: [hostile(1, 4)],
+      }),
+    },
+    {
+      danger: "hunger",
+      snapshot: createSnapshot({ food: 10, nearbyEntities: [hostile(1, 4)] }),
+    },
+  ])("does not use hostile retreat to bypass $danger", async ({ snapshot }) => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hostile");
+    await follow;
+    minecraft.snapshot = snapshot;
+
+    const response = await game.respondToHostiles(
+      "evade",
+      new AbortController().signal,
+    );
+
+    expect(response).toMatchObject({
+      outcome: "failed",
+      failureCategory: "safety",
+      failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+    });
+    expect(minecraft.actions).not.toContain("retreat:hostile");
+    expect(tasks.current?.status).toBe("suspended");
+    close();
+  });
+
+  it("uses the configured food threshold before replacing a hunger suspension", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(
+      minecraft,
+      false,
+      new InMemoryTaskStore(),
+      16,
+    );
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+    await tasks.suspend("reflex:hunger");
+    await follow;
+    minecraft.snapshot = createSnapshot({ food: 15 });
+
+    const retry = await game.followOwner(3, 60, new AbortController().signal);
+
+    expect(retry.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    expect(tasks.current?.status).toBe("suspended");
+    expect((await game.observeStatus()).activeTaskSummary).toContain(
+      "今も空腹",
+    );
+    close();
+  });
+
+  it("keeps the safety gate after stopping a suspended task until danger clears", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    try {
+      const follow = game.followOwner(3, 60, new AbortController().signal);
+      await waitUntil(() => minecraft.actions.includes("follow:owner"));
+      await tasks.suspend("reflex:hazard");
+      await follow;
+      await game.stopCurrentAction("owner requested stop");
+      expect(tasks.current?.status).toBe("cancelled");
+
+      minecraft.snapshot = createSnapshot({ onFire: true });
+      const blocked = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+      expect(blocked.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+      expect(minecraft.actions).not.toContain("move:5,64,0");
+
+      minecraft.snapshot = createSnapshot();
+      const resumed = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+      expect(resumed.outcome).toBe("completed");
+      expect(minecraft.actions).toContain("move:5,64,0");
+    } finally {
+      close();
+    }
+  });
+
+  it("reports a currently observed threat separately from the reason a task stopped", async () => {
+    const minecraft = new FakeMinecraft();
+    const { game, tasks, close } = createController(minecraft);
+    const follow = game.followOwner(3, 60, new AbortController().signal);
+    await waitUntil(() => minecraft.actions.includes("follow:owner"));
+
+    await tasks.suspend("reflex:damage");
+    minecraft.snapshot = createSnapshot({ nearbyEntities: [hostile(1, 4)] });
+    const status = await game.observeStatus();
+    const report = await follow;
+
+    expect(status.activeTaskSummary).toContain("直前にBotの体力が減った");
+    expect(status.activeTaskSummary).toContain("今もBotの近くに敵を観測");
+    expect(report.summary).toContain("今もBotの近くに敵を観測");
+    expect(report.summary).not.toContain(
+      "今回の観測だけでは被害の原因を特定できません",
+    );
+    close();
+  });
+
+  it.each([
+    { danger: "fire", snapshot: createSnapshot({ onFire: true }) },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+      }),
+    },
+    {
+      danger: "hostile",
+      snapshot: createSnapshot({ nearbyEntities: [hostile(1, 4)] }),
+    },
+    { danger: "hunger", snapshot: createSnapshot({ food: 10 }) },
+  ])(
+    "does not start a replacement action while $danger remains",
+    async ({ snapshot }) => {
+      const minecraft = new FakeMinecraft();
+      const { game, tasks, close } = createController(minecraft);
+      const follow = game.followOwner(3, 60, new AbortController().signal);
+      await waitUntil(() => minecraft.actions.includes("follow:owner"));
+      await tasks.suspend("reflex:stuck");
+      await follow;
+      minecraft.snapshot = snapshot;
+      const actionCount = minecraft.actions.length;
+
+      const retry = await game.followOwner(3, 60, new AbortController().signal);
+      const move = await game.moveTo(
+        { x: 3, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+
+      expect(retry).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      expect(move).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      expect(tasks.current?.status).toBe("suspended");
+      expect(minecraft.actions).toHaveLength(actionCount);
+      expect(retry.summary).not.toContain("SUSPENDED_TASK_UNSAFE_TO_RESUME");
       close();
     },
   );
@@ -652,6 +850,80 @@ describe("CompanionGameController", () => {
     expect(status.activeTaskState).toBeNull();
     expect(status.latestTaskState).toBe("直前のMinecraft作業は完了しました。");
     close();
+  });
+
+  it.each([
+    { danger: "fire", snapshot: createSnapshot({ onFire: true }) },
+    {
+      danger: "oxygen",
+      snapshot: createSnapshot({
+        inWater: true,
+        oxygen: 2,
+        oxygenState: "low",
+      }),
+    },
+    { danger: "falling", snapshot: createSnapshot({ velocityY: -1.5 }) },
+    { danger: "hunger", snapshot: createSnapshot({ food: 10 }) },
+  ])(
+    "checks a persisted suspension before resuming during $danger",
+    async ({ snapshot }) => {
+      const minecraft = new FakeMinecraft(snapshot);
+      const { game, memory, tasks, close } = createController(minecraft, true);
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status: "suspended",
+        input: { range: 3 },
+      });
+
+      const retry = await game.followOwner(3, 60, new AbortController().signal);
+
+      expect(tasks.current).toBeUndefined();
+      expect(minecraft.actions).not.toContain("follow:owner");
+      expect(retry).toMatchObject({
+        outcome: "failed",
+        failureCategory: "safety",
+        failureCode: "SUSPENDED_TASK_UNSAFE_TO_RESUME",
+      });
+      close();
+    },
+  );
+
+  it("checks a persisted cancelled suspension before moving after restart", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ inWater: true, oxygen: 2, oxygenState: "low" }),
+    );
+    const { game, memory, tasks, close } = createController(minecraft, true);
+    try {
+      const playerId = memory.getOrCreatePlayer("owner").id;
+      const previous = memory.createTaskRun({
+        playerId,
+        kind: "follow_player",
+        phase: "following",
+        status: "suspended",
+        input: { range: 3 },
+      });
+      memory.updateTaskRun({
+        taskRunId: previous.id,
+        status: "cancelled",
+        phase: "following",
+        checkpoint: { suspendReason: "reflex:hazard" },
+      });
+
+      const retry = await game.moveTo(
+        { x: 5, y: 64, z: 0 },
+        1,
+        new AbortController().signal,
+      );
+
+      expect(tasks.current).toBeUndefined();
+      expect(minecraft.actions).not.toContain("move:5,64,0");
+      expect(retry.failureCode).toBe("SUSPENDED_TASK_UNSAFE_TO_RESUME");
+    } finally {
+      close();
+    }
   });
 
   it.each(["queued", "running", "suspended"] as const)(

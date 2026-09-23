@@ -639,6 +639,7 @@ export class MineflayerClient implements MinecraftPort {
         const cleanup = (): void => {
           bot.off("path_update", onPathUpdate);
           bot.off("path_reset", onPathReset);
+          bot.off("physicsTick", onPositionUpdate);
           signal.removeEventListener("abort", onAbort);
         };
         const finish = (error?: AppError): void => {
@@ -683,11 +684,24 @@ export class MineflayerClient implements MinecraftPort {
           if (resetFailures.has(reason)) failedAttempt(reason);
         };
         const onAbort = (): void => finish();
+        const onPositionUpdate = (): void => {
+          const target = bot.players[username]?.entity;
+          if (
+            target !== undefined &&
+            bot.entity.position.distanceTo(target.position) <= range + 1
+          ) {
+            finish();
+          }
+        };
         bot.on("path_update", onPathUpdate);
         bot.on("path_reset", onPathReset);
+        bot.on("physicsTick", onPositionUpdate);
         signal.addEventListener("abort", onAbort, { once: true });
         if (signal.aborted) finish();
-        else bot.pathfinder.setGoal(goal, true);
+        else {
+          bot.pathfinder.setGoal(goal, true);
+          onPositionUpdate();
+        }
       });
     } finally {
       await this.stopCurrentAction();

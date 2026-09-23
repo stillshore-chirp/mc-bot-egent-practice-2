@@ -114,7 +114,7 @@ function createScenarioAgent(executor: ToolExecutor) {
       readonly message: string;
       readonly toolContext: ToolContext;
     }) => {
-      if (request.message === "来て") {
+      if (request.message === "来て" || request.message === "続けて") {
         const result = await executor.execute(
           "follow_player",
           JSON.stringify({ safeDistance: 3, maxDurationSeconds: 60 }),
@@ -137,7 +137,7 @@ function createScenarioAgent(executor: ToolExecutor) {
 }
 
 describe("follow recovery conversation", () => {
-  it("explains a stuck follow and resumes after the next follow instruction", async () => {
+  it("explains a stuck follow and accepts a short continuation without repeating the goal", async () => {
     const { game, minecraft, tasks, arbiter } = createScenario();
     const executor = new ToolExecutor();
     const replies: string[] = [];
@@ -178,20 +178,21 @@ describe("follow recovery conversation", () => {
     await tasks.suspend("reflex:stuck");
     await first;
 
-    expect(replies[0]).toContain("移動が進まなかった");
-    expect(replies[0]).toContain("もう一度「こっちおいで」");
+    expect(replies[0]).toContain("Botの位置が変わらず");
+    expect(replies[0]).toContain("「続けて」");
+    expect(replies[0]).not.toContain("もう一度「こっちおいで」");
     expect(replies[0]).not.toContain("MAIN_TASK_BUSY");
 
     await coordinator.handleChat("owner", "なぜ");
-    expect(replies[1]).toContain("移動が進まなかった");
-    expect(replies[1]).toContain("次の操作");
+    expect(replies[1]).toContain("Botの位置が変わらず");
+    expect(replies[1]).toContain("「続けて」");
     expect(replies[1]).not.toContain("suspended");
 
     const reflexLease = arbiter.acquire(
       "reflex:stuck",
       actionPriorities.reflex,
     );
-    const replacement = coordinator.handleChat("owner", "来て");
+    const replacement = coordinator.handleChat("owner", "続けて");
     try {
       await waitUntil(() => tasks.current?.status === "running");
       expect(replies).toHaveLength(2);
