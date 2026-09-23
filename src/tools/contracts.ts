@@ -17,6 +17,7 @@ import type {
   SmeltItemInput,
 } from "../minecraft/general-actions.js";
 import type {
+  BehaviorMemoryCategory,
   BehaviorMemoryRecord,
   ForgetBehaviorMemoryInput,
   RememberBehaviorMemoryInput,
@@ -348,6 +349,11 @@ export interface ToolContext {
   recordDeliveredAssistantMessage?: (message: string) => void;
   /** Candidates extracted from this authenticated owner message only. */
   behaviorMemoryCandidates?: readonly BehaviorMemoryExtraction[];
+  /** The exact preference the authenticated owner asked to forget this turn. */
+  behaviorMemoryForgetTarget?: {
+    readonly category: BehaviorMemoryCategory;
+    readonly slot: string;
+  };
   /** Owner-only presentation preference; never changes safety facts or actions. */
   behaviorNotificationOneSentence?: boolean;
   /** Opaque accepted-message id used to make behavior writes idempotent. */

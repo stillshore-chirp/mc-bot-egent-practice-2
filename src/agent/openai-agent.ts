@@ -8,6 +8,7 @@ import {
   knownSmeltInputs,
 } from "../minecraft/general-actions.js";
 import {
+  isStandaloneBehaviorMemoryCommand,
   parseBehaviorMemoryCommand,
   type BehaviorMemoryCommand,
   type BehaviorMemoryExtraction,
@@ -52,6 +53,9 @@ const actionToolFamilies: Readonly<
   gather_and_store: ["gather", "inventory"],
   store_logs: ["inventory"],
   register_delivery_target: ["memory"],
+  remember_behavior_memory: ["memory"],
+  correct_behavior_memory: ["memory"],
+  forget_behavior_memory: ["memory"],
   follow_player: ["follow"],
   move_to: ["move"],
   gather_resource: ["gather"],
@@ -524,6 +528,19 @@ export class OpenAIDeliberationAgent {
     const requestedMemoryTools = explicitlyRequestedMemoryTools(
       request.message,
     );
+    const behaviorCommand =
+      request.toolContext.requestKind === "owner_message"
+        ? parseBehaviorMemoryCommand(request.message)
+        : undefined;
+    const behaviorForgetTarget =
+      behaviorCommand?.kind === "forget" &&
+      behaviorCommand.category !== undefined &&
+      behaviorCommand.slot !== undefined
+        ? { category: behaviorCommand.category, slot: behaviorCommand.slot }
+        : undefined;
+    if (behaviorForgetTarget !== undefined) {
+      requestedMemoryTools.add("forget_behavior_memory");
+    }
     const allowedActionToolNames = scopedActionToolNames(
       authorizedFamilies,
       prohibitedFamilies,
@@ -542,6 +559,9 @@ export class OpenAIDeliberationAgent {
       ? {
           ...request.toolContext,
           ...(keepStoppedGoal ? { allowActionTools: false } : {}),
+          ...(behaviorForgetTarget === undefined
+            ? {}
+            : { behaviorMemoryForgetTarget: behaviorForgetTarget }),
           ...(effectiveActionToolNames === undefined
             ? {}
             : { allowedActionToolNames: effectiveActionToolNames }),
@@ -576,7 +596,10 @@ export class OpenAIDeliberationAgent {
         /^(?:今後|これから|次から|いつも|覚えて|記憶して)/u.test(
           request.message.trim(),
         );
-      const correction = /^(?:訂正|修正)/u.test(request.message.trim());
+      const correction =
+        /^(?:訂正|修正|いや)|ではなく|じゃなく|でなく|前に.{0,80}と言った/u.test(
+          request.message.trim(),
+        );
       if (
         preferenceCandidates.length > 0 &&
         (explicitPreference || correction) &&
@@ -614,7 +637,11 @@ export class OpenAIDeliberationAgent {
               command,
               request.toolContext.limits.memoryContextLimit,
             );
-      if (command !== undefined && directCommand !== undefined) {
+      if (
+        command !== undefined &&
+        directCommand !== undefined &&
+        isStandaloneBehaviorMemoryCommand(request.message)
+      ) {
         const result = await this.#executor.execute(
           directCommand.name,
           directCommand.arguments,

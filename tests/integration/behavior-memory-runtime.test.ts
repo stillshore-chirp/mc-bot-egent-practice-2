@@ -432,7 +432,13 @@ describe("behavior memory runtime integration", () => {
           slot: "length",
           reason: "この説明の好みを忘れて",
         }),
-        correction.toolContext,
+        {
+          ...correction.toolContext,
+          behaviorMemoryForgetTarget: {
+            category: "communication",
+            slot: "length",
+          },
+        },
       );
       expect(forgotten).toMatchObject({
         success: true,

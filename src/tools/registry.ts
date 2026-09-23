@@ -2216,6 +2216,9 @@ export const toolDefinitions = [
 
 /** Persistent writes need owner scope even when not marked as game actions. */
 export const ownerScopedMutationToolNames: ReadonlySet<string> = new Set([
+  "remember_behavior_memory",
+  "correct_behavior_memory",
+  "forget_behavior_memory",
   "register_delivery_target",
   "forget_delivery_target",
   "remember_player_fact",

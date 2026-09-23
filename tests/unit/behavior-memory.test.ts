@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   behaviorMemoryDescription,
   extractBehaviorMemory,
+  isStandaloneBehaviorMemoryCommand,
   parseBehaviorMemoryCommand,
 } from "../../src/memory/behavior-memory.js";
 import { MemoryStore } from "../../src/memory/store.js";
@@ -171,6 +172,23 @@ describe("behavior memory extraction", () => {
         confidence: "corrected",
       }),
     ]);
+    for (const message of [
+      "前に短くしてと言ったけど、今後は詳しく説明して",
+      "いや、短くじゃなくて詳しく説明して",
+      "説明は短くではなく詳しくして",
+    ]) {
+      expect(extractBehaviorMemory(message)).toEqual([
+        expect.objectContaining({
+          category: "communication",
+          slot: "length",
+          value: "detailed",
+          source: "owner_correction",
+        }),
+      ]);
+    }
+    expect(
+      extractBehaviorMemory("他人が前に短くと言ったけど今後は詳しく説明して"),
+    ).toEqual([]);
   });
 
   it("learns cautious feedback without treating a momentary command as memory", () => {
@@ -219,6 +237,15 @@ describe("behavior memory extraction", () => {
       slot: "terminology",
     });
     expect(parseBehaviorMemoryCommand("この木を集めて")).toBeUndefined();
+    expect(
+      isStandaloneBehaviorMemoryCommand("好みの一覧を見てから木を集めて"),
+    ).toBe(false);
+    expect(isStandaloneBehaviorMemoryCommand("覚えている好みを一覧して")).toBe(
+      true,
+    );
+    expect(
+      parseBehaviorMemoryCommand("自動通知を一文にする好みを忘れて"),
+    ).toMatchObject({ category: "communication", slot: "notification_length" });
   });
 });
 

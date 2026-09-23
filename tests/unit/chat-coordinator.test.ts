@@ -1201,6 +1201,44 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it.each([
+    ["危険です！作業を停止しました。", "危険です、作業を停止しました。"],
+    [
+      "危険を確認しました？\n安全な場所へ移動しました。",
+      "危険を確認しました、安全な場所へ移動しました。",
+    ],
+  ])(
+    "keeps all facts in a one-sentence notification",
+    async (reply, expected) => {
+      const say = vi.fn(async () => undefined);
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: { say } as unknown as GameController,
+        agent: {
+          deliberate: vi.fn(async () => ({ text: reply, toolResults: [] })),
+        },
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: {
+              ...minimalToolContext,
+              behaviorNotificationOneSentence: true,
+            },
+          })),
+        },
+        logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+      });
+
+      await coordinator.handleRuntimeEvent("connection_recovered", {
+        stateKey: "connection:recovered",
+        causeKey: "connection",
+      });
+      expect(say).toHaveBeenCalledWith(expected);
+    },
+  );
+
   it("joins a preferred one-sentence automatic notice without dropping safety facts", async () => {
     const say = vi.fn(async (_message: string) => undefined);
     const recordDeliveredReply = vi.fn();

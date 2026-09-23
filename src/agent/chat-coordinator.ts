@@ -336,7 +336,9 @@ function oneSentenceNotification(text: string): string {
     .replace(/されません。\s*(?=\S)/gu, "されず、")
     .replace(/ありません。\s*(?=\S)/gu, "なく、")
     .replace(/できません。\s*(?=\S)/gu, "できず、")
-    .replace(/。\s*(?=\S)/gu, "、");
+    .replace(/[。！？!?]\s*(?=\S)/gu, "、")
+    .replace(/\s*\n+\s*/gu, "、")
+    .replace(/、{2,}/gu, "、");
 }
 
 export interface ChatContextFactory {

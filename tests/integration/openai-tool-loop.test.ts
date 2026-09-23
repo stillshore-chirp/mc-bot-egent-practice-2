@@ -247,6 +247,16 @@ describe("OpenAI tool loop", () => {
     expect(remember).not.toHaveBeenCalled();
     expect(correct).not.toHaveBeenCalled();
 
+    const naturalCorrection = await agent.deliberate({
+      message: "前に短くしてと言ったけど、今後は詳しく説明して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(naturalCorrection.text).toContain("訂正して記憶しました");
+    expect(fake.requests).toHaveLength(0);
+
     const candidate = context.behaviorMemoryCandidates[0];
     if (candidate === undefined)
       throw new Error("missing correction candidate");
@@ -335,6 +345,38 @@ describe("OpenAI tool loop", () => {
       slot: "length",
     });
     expect(forgetReply.text).toContain("忘れました");
+  });
+
+  it("keeps both steps of a mixed memory and gathering request", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "好みを確認して木を集めます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = {
+      remember: vi.fn(),
+      correct: vi.fn(),
+      list: vi.fn(() => []),
+      isApplicable: vi.fn(() => true),
+      forget: vi.fn(),
+    };
+
+    const reply = await agent.deliberate({
+      message: "好みの一覧を見てから木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(1);
+    expect(reply.toolResults).toEqual([]);
+    expect(reply.text).toContain("木を集めます");
   });
 
   it("starts follow with bounded defaults when the owner omits distance and duration", async () => {

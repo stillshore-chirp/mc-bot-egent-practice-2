@@ -357,12 +357,24 @@ export const behaviorMemoryTools = [
       const ownerFailure = ownerWriteOnly(context);
       if (ownerFailure !== undefined) return ownerFailure;
       if (context.behaviorMemory === undefined) return unavailable();
+      const target = context.behaviorMemoryForgetTarget;
+      if (
+        target === undefined ||
+        input.memoryId !== null ||
+        input.category !== target.category ||
+        input.slot !== target.slot
+      ) {
+        return invalidMemory(
+          new BehaviorMemoryError(
+            "Forgetting must match the authenticated owner's selected preference.",
+          ),
+        );
+      }
       try {
         const records = context.behaviorMemory.forget({
           playerId: context.playerId,
-          ...(input.memoryId === null ? {} : { memoryId: input.memoryId }),
-          ...(input.category === null ? {} : { category: input.category }),
-          ...(input.slot === null ? {} : { slot: input.slot }),
+          category: target.category,
+          slot: target.slot,
           ...(input.reason === null ? {} : { reason: input.reason }),
         });
         return {

@@ -7,6 +7,7 @@ import type {
   ToolContext,
 } from "../../src/tools/contracts.js";
 import { toOpenAIFunctionTool } from "../../src/tools/definition.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 
 const ownerContext = {
   requesterUsername: "owner",
@@ -202,5 +203,74 @@ describe("behavior memory tool contract", () => {
     expect(correctedInput?.idempotencyKey).toMatch(
       /^owner-message:[0-9a-f]{32}:length$/u,
     );
+  });
+
+  it("forgets only the exact preference selected by the owner", async () => {
+    const forget = vi.fn(() => []);
+    const input = {
+      memoryId: null,
+      category: "communication" as const,
+      slot: "length",
+      reason: null,
+    };
+    const base = {
+      ...ownerContext,
+      playerId: "player",
+      behaviorMemory: { forget } as unknown as BehaviorMemoryPort,
+    } as ToolContext;
+    expect(await behaviorMemoryTools[3].execute(input, base)).toMatchObject({
+      success: false,
+      error: { code: "BEHAVIOR_MEMORY_REJECTED" },
+    });
+    expect(
+      await behaviorMemoryTools[3].execute(input, {
+        ...base,
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "terminology",
+        },
+      }),
+    ).toMatchObject({
+      success: false,
+      error: { code: "BEHAVIOR_MEMORY_REJECTED" },
+    });
+    expect(forget).not.toHaveBeenCalled();
+    expect(
+      await behaviorMemoryTools[3].execute(input, {
+        ...base,
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "length",
+        },
+      }),
+    ).toMatchObject({ success: true });
+    expect(forget).toHaveBeenCalledOnce();
+  });
+
+  it("blocks behavior-memory deletion outside the current action scope", async () => {
+    const forget = vi.fn();
+    const result = await new ToolExecutor().execute(
+      "forget_behavior_memory",
+      JSON.stringify({
+        memoryId: null,
+        category: "communication",
+        slot: "length",
+        reason: null,
+      }),
+      {
+        ...ownerContext,
+        allowedActionToolNames: ["move_to"],
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "length",
+        },
+        behaviorMemory: { forget } as unknown as BehaviorMemoryPort,
+      },
+    );
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+    expect(forget).not.toHaveBeenCalled();
   });
 });
