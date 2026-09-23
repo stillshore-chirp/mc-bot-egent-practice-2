@@ -597,6 +597,42 @@ describe("Mineflayer player observation", () => {
     }
   });
 
+  it("releases swimming controls immediately when the owner stops the escape", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      vi.spyOn(client, "observe").mockResolvedValue({
+        inWater: true,
+        oxygenState: "low",
+      } as Awaited<ReturnType<MineflayerClient["observe"]>>);
+      const controller = new AbortController();
+      const escape = client.escapeDanger("environment", controller.signal);
+      const rejected = expect(escape).rejects.toThrow("owner stop");
+      await vi.advanceTimersByTimeAsync(500);
+      controller.abort(new Error("owner stop"));
+      await rejected;
+      expect(bot.clearControlStates).toHaveBeenCalled();
+      expect(bot.setControlState).toHaveBeenCalledWith("jump", true);
+      expect(bot.pathfinder.setGoal).toHaveBeenCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("counts repeated resurfacing confirmations toward the escape deadline", async () => {
     vi.useFakeTimers();
     try {
