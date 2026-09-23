@@ -49,6 +49,7 @@ import {
 
 const REFLEX_INTERVAL_MS = 250;
 const RUNTIME_REASSESSMENT_COOLDOWN_MS = 30_000;
+const SAFETY_REASSESSMENT_QUIET_MS = 60_000;
 const MOVEMENT_PHASES = new Set([
   "move_to",
   "move_to_resource",
@@ -142,14 +143,8 @@ export function runtimeReassessmentState(
   }
   if (event === "safety_stabilized") {
     const kind = previous.state === "safe" ? "unknown" : previous.incident.kind;
-    const episode =
-      previous.state === "safe"
-        ? undefined
-        : (previous.startedAt ?? previous.endedAt);
-    const episodeSuffix =
-      episode === undefined ? "" : `:episode:${safeRuntimeKey(episode)}`;
     return {
-      stateKey: `safety:stabilized:${kind}${episodeSuffix}`,
+      stateKey: `safety:stabilized:${kind}`,
       causeKey: `reflex:${kind}`,
     };
   }
@@ -164,6 +159,35 @@ export function runtimeReassessmentState(
     };
   }
   return { stateKey: "startup:reassessment", causeKey: "startup" };
+}
+
+/** Repeated short recoveries from one hazard are one user-visible episode. */
+export class SafetyReassessmentEpisodes {
+  readonly #recent = new Map<string, { episode: number; lastSeenAt: number }>();
+  #nextEpisode = 0;
+
+  public constructor(private readonly quietMs = SAFETY_REASSESSMENT_QUIET_MS) {}
+
+  public state(
+    event: RuntimeReassessmentEvent,
+    state: { readonly stateKey: string; readonly causeKey: string },
+    nowMs = Date.now(),
+  ): { readonly stateKey: string; readonly causeKey: string } {
+    if (event === "safety_failed") {
+      this.#recent.delete(state.causeKey);
+      return state;
+    }
+    if (event !== "safety_stabilized") return state;
+    const previous = this.#recent.get(state.causeKey);
+    const episode =
+      previous !== undefined &&
+      nowMs - previous.lastSeenAt < this.quietMs &&
+      nowMs >= previous.lastSeenAt
+        ? previous.episode
+        : ++this.#nextEpisode;
+    this.#recent.set(state.causeKey, { episode, lastSeenAt: nowMs });
+    return { ...state, stateKey: `${state.stateKey}:episode:${episode}` };
+  }
 }
 
 export interface CompanionApplication {
@@ -216,6 +240,7 @@ class DefaultCompanionApplication implements CompanionApplication {
   readonly #reflexes: ReflexCoordinator;
   readonly #coordinator: ChatCoordinator;
   readonly #runtimeReassessments: RuntimeReassessmentGate<RuntimeReassessmentEvent>;
+  readonly #safetyReassessmentEpisodes = new SafetyReassessmentEpisodes();
   readonly #game: CompanionGameController;
   readonly #playerId: string;
   readonly #ownerUsername: string;
@@ -527,7 +552,10 @@ class DefaultCompanionApplication implements CompanionApplication {
       if (reassessment !== undefined) {
         this.#requestRuntimeReassessment(
           reassessment,
-          runtimeReassessmentState(reassessment, previousReflexState, state),
+          this.#safetyReassessmentEpisodes.state(
+            reassessment,
+            runtimeReassessmentState(reassessment, previousReflexState, state),
+          ),
         );
       }
       if (state.state === "failed") {
