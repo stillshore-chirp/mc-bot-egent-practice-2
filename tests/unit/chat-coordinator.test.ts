@@ -45,6 +45,9 @@ describe("hostile response command", () => {
     ["敵をどうにかして", "eliminate"],
     ["敵を倒して", "eliminate"],
     ["敵を倒して！", "eliminate"],
+    ["近くのゾンビに対処して。安全なら倒して、無理なら退避して。", "eliminate"],
+    ["ゾンビを倒して、危険なら逃げて", "eliminate"],
+    ["ゾンビに対処して", "eliminate"],
     ["退避しないで倒して", "eliminate"],
     ["距離を取らないで攻撃して", "eliminate"],
     ["逃げないで倒して", "eliminate"],
@@ -71,6 +74,7 @@ describe("hostile response command", () => {
     ["敵を倒す必要はない", null],
     ["敵を倒してほしくない", null],
     ["木を倒して、退避しないで", null],
+    ["木を倒して、無理なら退避して", null],
   ] as const)("classifies %s as %s", (message, expected) => {
     expect(hostileResponseIntent(message)).toBe(expected);
     expect(isHostileResponseCommand(message)).toBe(expected !== null);
