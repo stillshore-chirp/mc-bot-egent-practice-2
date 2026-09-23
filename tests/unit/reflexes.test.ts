@@ -167,6 +167,120 @@ describe("reflex loop", () => {
     expect(minecraft.actions).not.toContain("move:8,64,0");
   });
 
+  it.each([
+    {
+      situation: "the owner comes into range",
+      before: () => createSnapshot({ health: 4, food: 10, players: [] }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+    {
+      situation: "the Bot leaves water",
+      before: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          inWater: true,
+          oxygen: 20,
+          oxygenState: "normal",
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+    {
+      situation: "a distant hostile leaves the route",
+      before: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+          nearbyEntities: [
+            {
+              id: 1,
+              name: "zombie",
+              kind: "mob",
+              position: { x: 10, y: 64, z: 0 },
+              distance: 10,
+              hostile: true,
+            },
+          ],
+        }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+  ])(
+    "reevaluates a safe fallback when $situation",
+    async ({ before, after }) => {
+      class NoFoodMinecraft extends FakeMinecraft {
+        public override async eatBestFood(): Promise<string> {
+          throw new AppError({
+            category: "inventory",
+            code: "NO_SAFE_FOOD",
+            message: "No safe food is carried",
+            retryable: false,
+          });
+        }
+      }
+      const minecraft = new NoFoodMinecraft(before());
+      const coordinator = coordinatorFor(minecraft);
+
+      expect(
+        await coordinator.tick(await minecraft.observe(), false),
+      ).toMatchObject({
+        state: "failed",
+        failure: { code: "NO_SAFE_FOOD" },
+      });
+      minecraft.snapshot = after();
+      expect(
+        (await coordinator.tick(await minecraft.observe(), false)).state,
+      ).toBe("stabilizing");
+      expect(minecraft.actions).toContain("move:8,64,0");
+    },
+  );
+
   it("retreats before equipping when a critically injured Bot sees a hostile", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({

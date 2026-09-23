@@ -51,7 +51,7 @@ export class ReflexCoordinator {
   private currentState: ReflexState = { state: "safe" };
   private handling = false;
   private retryNotBefore = 0;
-  private noSafeFoodInventory: string | undefined;
+  private noSafeFoodContext: string | undefined;
 
   public constructor(
     private readonly detector: ReflexDetector,
@@ -84,7 +84,8 @@ export class ReflexCoordinator {
       incident?.kind === this.currentState.incident.kind &&
       incident.reason === this.currentState.incident.reason &&
       (this.currentState.failure.code === "NO_SAFE_FOOD"
-        ? this.noSafeFoodInventory === inventorySignature(snapshot)
+        ? this.noSafeFoodContext ===
+          noSafeFoodContext(snapshot, this.ownerUsername)
         : Date.now() < this.retryNotBefore)
     ) {
       return this.currentState;
@@ -149,20 +150,14 @@ export class ReflexCoordinator {
               try {
                 await this.minecraft.eatBestFood(signal);
               } catch (error) {
-                const owner = snapshot.players.find(
-                  (player) =>
-                    player.username === this.ownerUsername &&
-                    player.distance > 3 &&
-                    player.distance <= 12,
+                const owner = safeOwnerForRecovery(
+                  snapshot,
+                  this.ownerUsername,
                 );
                 if (
                   !(error instanceof AppError) ||
                   error.detail.code !== "NO_SAFE_FOOD" ||
-                  owner === undefined ||
-                  snapshot.inWater ||
-                  snapshot.nearbyEntities.some(
-                    (entity) => entity.hostile && entity.distance <= 12,
-                  )
+                  owner === undefined
                 ) {
                   throw error;
                 }
@@ -227,7 +222,7 @@ export class ReflexCoordinator {
         after,
       };
       this.retryNotBefore = 0;
-      this.noSafeFoodInventory = undefined;
+      this.noSafeFoodContext = undefined;
     } catch (error) {
       if (after === undefined) {
         try {
@@ -252,9 +247,9 @@ export class ReflexCoordinator {
         ...(after === undefined ? {} : { after }),
       };
       this.retryNotBefore = Date.now() + 5_000;
-      this.noSafeFoodInventory =
+      this.noSafeFoodContext =
         this.currentState.failure.code === "NO_SAFE_FOOD"
-          ? inventorySignature(snapshot)
+          ? noSafeFoodContext(snapshot, this.ownerUsername)
           : undefined;
     } finally {
       lease?.release();
@@ -269,4 +264,32 @@ function inventorySignature(snapshot: WorldSnapshot): string {
     .map((item) => `${item.name}:${String(item.count)}`)
     .sort()
     .join("|");
+}
+
+function safeOwnerForRecovery(
+  snapshot: WorldSnapshot,
+  ownerUsername: string | undefined,
+): WorldSnapshot["players"][number] | undefined {
+  if (
+    ownerUsername === undefined ||
+    snapshot.inWater ||
+    snapshot.nearbyEntities.some(
+      (entity) => entity.hostile && entity.distance <= 12,
+    )
+  ) {
+    return undefined;
+  }
+  return snapshot.players.find(
+    (player) =>
+      player.username === ownerUsername &&
+      player.distance > 3 &&
+      player.distance <= 12,
+  );
+}
+
+function noSafeFoodContext(
+  snapshot: WorldSnapshot,
+  ownerUsername: string | undefined,
+): string {
+  return `${inventorySignature(snapshot)}:${safeOwnerForRecovery(snapshot, ownerUsername) === undefined ? "no_fallback" : "owner_available"}`;
 }
