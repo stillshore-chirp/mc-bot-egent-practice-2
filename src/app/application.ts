@@ -884,6 +884,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
         auth: config.minecraft.auth,
         version: config.minecraft.version,
       },
+      ownerUsername: config.ownerUsername,
       pathfinderThinkTimeoutMs: 5_000,
       pathfinderTickTimeoutMs: 40,
       collectTimeoutMs: 10_000,

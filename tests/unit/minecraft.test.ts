@@ -1,4 +1,6 @@
 import { Vec3 } from "vec3";
+import { EventEmitter } from "node:events";
+import mineflayer from "mineflayer";
 import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
 import {
   MineflayerClient,
@@ -9,6 +11,90 @@ import { ConnectionManager } from "../../src/minecraft/connection-manager.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
 
 describe("Minecraft boundary", () => {
+  it("ends a login whose effective Bot name collides with the owner without reconnecting", async () => {
+    const bot = Object.assign(new EventEmitter(), {
+      _client: new EventEmitter(),
+      username: "fixture_owner",
+      loadPlugin: vi.fn(),
+      supportFeature: vi.fn(() => false),
+      end: vi.fn(),
+    });
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "login@example.invalid" },
+          ownerUsername: "fixture_owner",
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const manager = new ConnectionManager(
+        client,
+        { maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0, multiplier: 1 },
+        1_000,
+      );
+      const connection = manager.connect();
+      const rejected = expect(connection).rejects.toMatchObject({
+        detail: { code: "MINECRAFT_IDENTITY_CONFLICT", retryable: false },
+      });
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(1));
+      bot.emit("login");
+      await rejected;
+      expect(bot.end).toHaveBeenCalledExactlyOnceWith("identity conflict");
+      expect(createBot).toHaveBeenCalledTimes(1);
+      expect(manager.state).toBe("failed");
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("does not forward Bot chat while still forwarding owner chat", async () => {
+    const bot = Object.assign(new EventEmitter(), {
+      _client: new EventEmitter(),
+      username: "server_bot",
+      loadPlugin: vi.fn(),
+      supportFeature: vi.fn(() => false),
+      end: vi.fn(),
+    });
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "login@example.invalid" },
+          ownerUsername: "fixture_owner",
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const received = vi.fn();
+      client.onChat(received);
+      const controller = new AbortController();
+      const connection = client.connect(controller.signal);
+      const rejected = expect(connection).rejects.toThrow("test complete");
+      bot.emit("chat", "server_bot", "self message");
+      bot.emit("chat", "LOGIN@example.invalid", "self alias");
+      bot.emit("chat", "fixture_owner", "停止");
+      expect(received).toHaveBeenCalledExactlyOnceWith("fixture_owner", "停止");
+      controller.abort(new Error("test complete"));
+      await rejected;
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
   it("connects through the bounded connection manager", async () => {
     const minecraft = new FakeMinecraft();
     const manager = new ConnectionManager(
@@ -42,6 +128,7 @@ describe("Minecraft boundary", () => {
     const client = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,
@@ -113,6 +200,7 @@ describe("Minecraft boundary", () => {
     const client = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,
@@ -217,6 +305,7 @@ describe("Minecraft boundary", () => {
       const client = new MineflayerClient(
         {
           bot: { username: "fixture_bot" },
+          ownerUsername: "fixture_owner",
           pathfinderThinkTimeoutMs: 100,
           pathfinderTickTimeoutMs: 10,
           collectTimeoutMs: 100,
@@ -408,6 +497,7 @@ describe("Mineflayer player observation", () => {
     const client = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,
@@ -462,6 +552,7 @@ describe("Mineflayer player observation", () => {
     const client = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,
@@ -514,6 +605,7 @@ describe("Mineflayer player observation", () => {
       const client = new MineflayerClient(
         {
           bot: { username: "fixture_bot" },
+          ownerUsername: "fixture_owner",
           pathfinderThinkTimeoutMs: 100,
           pathfinderTickTimeoutMs: 10,
           collectTimeoutMs: 100,
@@ -561,6 +653,7 @@ describe("Mineflayer player observation", () => {
       const client = new MineflayerClient(
         {
           bot: { username: "fixture_bot" },
+          ownerUsername: "fixture_owner",
           pathfinderThinkTimeoutMs: 100,
           pathfinderTickTimeoutMs: 10,
           collectTimeoutMs: 100,
@@ -604,6 +697,7 @@ describe("Mineflayer player observation", () => {
       const client = new MineflayerClient(
         {
           bot: { username: "fixture_bot" },
+          ownerUsername: "fixture_owner",
           pathfinderThinkTimeoutMs: 100,
           pathfinderTickTimeoutMs: 10,
           collectTimeoutMs: 100,
@@ -645,6 +739,7 @@ describe("Mineflayer player observation", () => {
         const client = new MineflayerClient(
           {
             bot: { username: "fixture_bot" },
+            ownerUsername: "fixture_owner",
             pathfinderThinkTimeoutMs: 100,
             pathfinderTickTimeoutMs: 10,
             collectTimeoutMs: 100,
@@ -697,6 +792,7 @@ describe("Mineflayer player observation", () => {
       const client = new MineflayerClient(
         {
           bot: { username: "fixture_bot" },
+          ownerUsername: "fixture_owner",
           pathfinderThinkTimeoutMs: 100,
           pathfinderTickTimeoutMs: 10,
           collectTimeoutMs: 100,
@@ -736,6 +832,7 @@ describe("Mineflayer player observation", () => {
     const client = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,

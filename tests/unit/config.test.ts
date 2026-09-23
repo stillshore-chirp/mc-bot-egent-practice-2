@@ -35,6 +35,17 @@ describe("loadConfig", () => {
     ).toThrow(ConfigurationError);
   });
 
+  it("rejects a Bot identity that would replace the authorized player", () => {
+    expect(() =>
+      loadConfig({
+        ...requiredEnvironment,
+        MINECRAFT_USERNAME: "OwNeR",
+      }),
+    ).toThrow(
+      /OWNER_USERNAME: owner and Bot must use different Minecraft identities/u,
+    );
+  });
+
   it("reports only field names and validation messages", () => {
     try {
       loadConfig({ ...requiredEnvironment, OPENAI_API_KEY: "" });

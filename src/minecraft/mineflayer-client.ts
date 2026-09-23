@@ -7,6 +7,7 @@ import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
 import type { Move } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
+import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 import { recommendArmor } from "../decision/armor-equipment.js";
 import {
   ExpectedDescentDamage,
@@ -88,6 +89,7 @@ const { goals } = pathfinderPackage;
 
 export interface MineflayerClientOptions {
   readonly bot: BotOptions;
+  readonly ownerUsername: string;
   readonly pathfinderThinkTimeoutMs: number;
   readonly pathfinderTickTimeoutMs: number;
   readonly collectTimeoutMs: number;
@@ -558,6 +560,19 @@ export class MineflayerClient implements MinecraftPort {
 
   public async connect(signal?: AbortSignal): Promise<void> {
     if (this.spawned) return;
+    if (
+      sameMinecraftIdentity(
+        this.options.bot.username,
+        this.options.ownerUsername,
+      )
+    ) {
+      throw new AppError({
+        category: "connection",
+        code: "MINECRAFT_IDENTITY_CONFLICT",
+        message: "Bot and owner Minecraft identities conflict",
+        retryable: false,
+      });
+    }
     this.intentionalDisconnect = false;
     const bot = mineflayer.createBot(this.options.bot);
     bot.loadPlugin(pathfinder);
@@ -582,6 +597,11 @@ export class MineflayerClient implements MinecraftPort {
       if (oxygen !== undefined) this.authoritativeOxygen = oxygen;
     });
     bot.on("chat", (username, message) => {
+      if (
+        sameMinecraftIdentity(username, bot.username) ||
+        sameMinecraftIdentity(username, this.options.bot.username)
+      )
+        return;
       for (const listener of this.chatListeners) listener(username, message);
     });
     bot.on("end", (reason) => {
@@ -594,9 +614,25 @@ export class MineflayerClient implements MinecraftPort {
     });
     await new Promise<void>((resolve, reject) => {
       const cleanup = (): void => {
+        bot.off("login", onLogin);
         bot.off("spawn", onSpawn);
         bot.off("error", onError);
         signal?.removeEventListener("abort", onAbort);
+      };
+      const onLogin = (): void => {
+        if (!sameMinecraftIdentity(bot.username, this.options.ownerUsername))
+          return;
+        cleanup();
+        this.intentionalDisconnect = true;
+        bot.end("identity conflict");
+        reject(
+          new AppError({
+            category: "connection",
+            code: "MINECRAFT_IDENTITY_CONFLICT",
+            message: "Bot and owner Minecraft identities conflict",
+            retryable: false,
+          }),
+        );
       };
       const onSpawn = (): void => {
         cleanup();
@@ -644,6 +680,7 @@ export class MineflayerClient implements MinecraftPort {
             : new Error("Minecraft connection cancelled"),
         );
       };
+      bot.once("login", onLogin);
       bot.once("spawn", onSpawn);
       bot.once("error", onError);
       signal?.addEventListener("abort", onAbort, { once: true });

@@ -119,6 +119,7 @@ describe("Mineflayer mining boundary", () => {
     const adapter = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,
@@ -189,6 +190,7 @@ describe("protected resource candidate paging", () => {
     const adapter = new MineflayerClient(
       {
         bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
         pathfinderThinkTimeoutMs: 100,
         pathfinderTickTimeoutMs: 10,
         collectTimeoutMs: 100,

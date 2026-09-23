@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 
 const integerFromEnvironment = (minimum: number, maximum: number) =>
   z.coerce.number().int().min(minimum).max(maximum);
@@ -47,6 +48,18 @@ export const environmentSchema = z
     TRACE_MAX_RUNS: integerFromEnvironment(1, 100_000).default(500),
   })
   .superRefine((environment, context) => {
+    if (
+      sameMinecraftIdentity(
+        environment.MINECRAFT_USERNAME,
+        environment.OWNER_USERNAME,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["OWNER_USERNAME"],
+        message: "owner and Bot must use different Minecraft identities",
+      });
+    }
     const loopback =
       environment.DASHBOARD_HOST === "127.0.0.1" ||
       environment.DASHBOARD_HOST === "::1" ||

@@ -8,6 +8,7 @@ function makeClient(returnConfirmed: boolean) {
   const client = new MineflayerClient(
     {
       bot: { username: "fixture_bot" },
+      ownerUsername: "fixture_owner",
       pathfinderThinkTimeoutMs: 100,
       pathfinderTickTimeoutMs: 10,
       collectTimeoutMs: 100,
