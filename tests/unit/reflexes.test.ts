@@ -131,6 +131,42 @@ describe("reflex loop", () => {
     expect(minecraft.actions).toContain("move:8,64,0");
   });
 
+  it("does not approach another player as a no-food recovery substitute", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        players: [
+          {
+            username: "visitor",
+            position: { x: 8, y: 64, z: 0 },
+            distance: 8,
+          },
+        ],
+      }),
+    );
+    const response = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(response).toMatchObject({
+      state: "failed",
+      failure: { code: "NO_SAFE_FOOD" },
+    });
+    expect(minecraft.actions).not.toContain("move:8,64,0");
+  });
+
   it("retreats before equipping when a critically injured Bot sees a hostile", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({
