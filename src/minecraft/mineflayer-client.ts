@@ -32,6 +32,10 @@ import {
 import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay, withTimeout } from "../runtime/timeout.js";
 import { buildGroundNames } from "./port.js";
+import {
+  isHandOperableDoor,
+  NavigationMovements,
+} from "./navigation-movements.js";
 import type {
   ArmorEquipResult,
   BuildBlockObservation,
@@ -409,7 +413,7 @@ class ObservedShoreMovements extends Movements {
   }
 }
 
-class ObservedDescentMovements extends Movements {
+class ObservedDescentMovements extends NavigationMovements {
   public constructor(
     private readonly minecraftBot: Bot,
     private readonly approvedNodes?: ReadonlySet<string>,
@@ -432,7 +436,10 @@ class ObservedDescentMovements extends Movements {
     return super.getNeighbors(node).filter((move) => {
       if (
         move.toBreak.length > 0 ||
-        move.toPlace.length > 0 ||
+        move.toPlace.some(
+          (placement) =>
+            (placement as { readonly useOne?: boolean }).useOne !== true,
+        ) ||
         (this.approvedNodes !== undefined &&
           !this.approvedNodes.has(descentNodeKey(move)))
       ) {
@@ -463,8 +470,8 @@ class ObservedDescentMovements extends Movements {
       feet === null ||
       head === null ||
       ground === null ||
-      !isAirName(feet.name) ||
-      !isAirName(head.name) ||
+      (!isAirName(feet.name) && !isHandOperableDoor(feet.name)) ||
+      (!isAirName(head.name) && !isHandOperableDoor(head.name)) ||
       ground.boundingBox !== "block" ||
       unsafeDescentSurfaces.has(ground.name)
     ) {
@@ -651,11 +658,7 @@ export class MineflayerClient implements MinecraftPort {
             `${treeProtectionChannel}\0${storageChannel}\0${actionGuardChannel}`,
           ),
         });
-        const movements = new Movements(bot);
-        movements.canDig = false;
-        movements.allow1by1towers = false;
-        movements.allowParkour = false;
-        movements.maxDropDown = 2;
+        const movements = new NavigationMovements(bot);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.thinkTimeout = this.options.pathfinderThinkTimeoutMs;
         bot.pathfinder.tickTimeout = this.options.pathfinderTickTimeoutMs;
