@@ -2487,17 +2487,19 @@ export class MineflayerClient implements MinecraftPort {
       const observed = await this.observe();
       if (observed.inWater && observed.oxygenState !== "normal") {
         // One second of generic jumping cannot reach air from a shallow
-        // water column. Keep ascending for a bounded interval and let the
-        // reflex verifier report failure if the Bot remains in water.
+        // water column. Stop starting new ascent steps after four seconds;
+        // one final confirmation may take the total to five seconds.
+        const ascentDeadline = Date.now() + 4_000;
         bot.setControlState("jump", true);
         try {
-          for (let elapsed = 0; elapsed < 4_000; elapsed += 250) {
-            await delay(250, signal);
+          while (Date.now() < ascentDeadline) {
+            await delay(Math.min(250, ascentDeadline - Date.now()), signal);
             if (!(await this.observe()).inWater) {
               bot.clearControlStates();
               await delay(1_000, signal);
               if (!(await this.observe()).inWater) return;
-              bot.setControlState("jump", true);
+              if (Date.now() < ascentDeadline)
+                bot.setControlState("jump", true);
             }
           }
         } finally {

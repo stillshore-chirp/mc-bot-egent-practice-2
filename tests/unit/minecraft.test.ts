@@ -590,6 +590,47 @@ describe("Mineflayer player observation", () => {
     }
   });
 
+  it("counts repeated resurfacing confirmations toward the escape deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      const bot = {
+        pathfinder: { setGoal: vi.fn() },
+        clearControlStates: vi.fn(),
+        setControlState: vi.fn(),
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+      let observations = 0;
+      vi.spyOn(client, "observe").mockImplementation(async () => {
+        observations += 1;
+        return {
+          inWater: observations % 2 === 1,
+          oxygenState: "low",
+        } as Awaited<ReturnType<MineflayerClient["observe"]>>;
+      });
+
+      const escape = client.escapeDanger(
+        "environment",
+        new AbortController().signal,
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+      await escape;
+
+      expect(observations).toBeGreaterThan(4);
+      expect(bot.clearControlStates).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ignores distant unloaded players while preserving visible observations", async () => {
     const client = new MineflayerClient(
       {
