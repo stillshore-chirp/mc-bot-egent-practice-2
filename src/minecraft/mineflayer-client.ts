@@ -8,6 +8,10 @@ import type { Move } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import { recommendArmor } from "../decision/armor-equipment.js";
+import {
+  ExpectedDescentDamage,
+  type PlannedLanding,
+} from "../decision/expected-descent-damage.js";
 import { isHostileEntity } from "../decision/hostile-classification.js";
 import {
   assessDescentRoute,
@@ -421,15 +425,7 @@ export class MineflayerClient implements MinecraftPort {
   private spawned = false;
   private intentionalDisconnect = false;
   private authoritativeOxygen: number | null | undefined;
-  private expectedDescentDamage:
-    | {
-        readonly healthAfter: number;
-        readonly healthBefore: number;
-        readonly startY: number;
-        readonly landings: readonly Position[];
-        readonly expiresAt: number;
-      }
-    | undefined;
+  private expectedDescentDamage: ExpectedDescentDamage | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
   >();
@@ -657,25 +653,7 @@ export class MineflayerClient implements MinecraftPort {
     previous: WorldSnapshot,
     current: WorldSnapshot,
   ): boolean {
-    const expected = this.expectedDescentDamage;
-    if (expected === undefined) return false;
-    if (Date.now() > expected.expiresAt) {
-      this.expectedDescentDamage = undefined;
-      return false;
-    }
-    if (
-      current.health < expected.healthAfter ||
-      current.health > expected.healthBefore ||
-      current.health >= previous.health ||
-      current.position.y > expected.startY - 2 ||
-      !expected.landings.some(
-        (landing) => distance(current.position, landing) < 2,
-      )
-    ) {
-      return false;
-    }
-    this.expectedDescentDamage = undefined;
-    return true;
+    return this.expectedDescentDamage?.consume(previous, current) ?? false;
   }
 
   public async observeSurroundings(
@@ -887,14 +865,18 @@ export class MineflayerClient implements MinecraftPort {
     range: number,
     signal: AbortSignal,
   ): Promise<SafeMoveResult> {
+    this.expectedDescentDamage?.clear();
+    this.expectedDescentDamage = undefined;
     const before = await this.observe();
     try {
       await this.moveTo(position, range, signal);
+      const after = await this.observe();
       return {
         usedDescent: false,
         predictedMaxDamage: 0,
         healthBefore: before.health,
-        healthAfter: (await this.observe()).health,
+        minimumObservedHealth: Math.min(before.health, after.health),
+        healthAfter: after.health,
       };
     } catch (error) {
       if (
@@ -939,12 +921,10 @@ export class MineflayerClient implements MinecraftPort {
       );
     }
     const route = nextPath.path;
-    const plannedLandings = route
-      .filter((node, index) => {
-        const previousY = route[index - 1]?.y ?? current.position.y;
-        return previousY - node.y > 2;
-      })
-      .map(positionOf);
+    const plannedLandings: PlannedLanding[] = route.flatMap((node, index) => {
+      const fromY = route[index - 1]?.y ?? current.position.y;
+      return fromY - node.y > 2 ? [{ position: positionOf(node), fromY }] : [];
+    });
     const decision = assessDescentRoute(
       current.position,
       current.health,
@@ -967,25 +947,27 @@ export class MineflayerClient implements MinecraftPort {
     const previousMovements = bot.pathfinder.movements;
     const safetyStop = new AbortController();
     const minimumExpectedHealth = current.health - decision.predictedMaxDamage;
+    const expectedDamage = new ExpectedDescentDamage(
+      plannedLandings,
+      minimumExpectedHealth,
+    );
+    this.expectedDescentDamage = expectedDamage;
     let minimumObservedY = current.position.y;
-    let descentObserved = false;
+    let minimumObservedHealth = current.health;
+    let lastObservedHealth = current.health;
+    let observedDamage = 0;
     const onPhysicsTick = (): void => {
       minimumObservedY = Math.min(minimumObservedY, bot.entity.position.y);
-      if (!descentObserved && minimumObservedY < current.position.y - 2) {
-        descentObserved = true;
-        this.expectedDescentDamage = {
-          healthBefore: current.health,
-          healthAfter: minimumExpectedHealth,
-          startY: current.position.y,
-          landings: plannedLandings,
-          expiresAt: Date.now() + 5_000,
-        };
-      }
+      expectedDamage.observeFall(positionOf(bot.entity.position), bot.health);
     };
     const onHealth = (): void => {
+      minimumObservedHealth = Math.min(minimumObservedHealth, bot.health);
+      observedDamage += Math.max(0, lastObservedHealth - bot.health);
+      lastObservedHealth = bot.health;
       if (
         bot.health < minimumExpectedHealth ||
-        bot.health < safeDescentLimits.minimumRemainingHealth
+        bot.health < safeDescentLimits.minimumRemainingHealth ||
+        observedDamage > decision.predictedMaxDamage
       ) {
         safetyStop.abort(new Error("Descent exceeded the health budget"));
       }
@@ -993,13 +975,34 @@ export class MineflayerClient implements MinecraftPort {
     bot.on("health", onHealth);
     bot.on("physicsTick", onPhysicsTick);
     try {
-      bot.pathfinder.setMovements(constrainedMovements);
-      await this.runPathfinder(
-        goal,
-        AbortSignal.any([signal, safetyStop.signal]),
-      );
-    } catch (error) {
-      if (signal.aborted) throwIfAborted(signal, "safe_descent");
+      try {
+        bot.pathfinder.setMovements(constrainedMovements);
+        await this.runPathfinder(
+          goal,
+          AbortSignal.any([signal, safetyStop.signal]),
+        );
+      } catch (error) {
+        if (signal.aborted) throwIfAborted(signal, "safe_descent");
+        if (safetyStop.signal.aborted) {
+          throw new AppError({
+            category: "safety",
+            code: "DESCENT_HEALTH_BUDGET_EXCEEDED",
+            message:
+              "The observed health loss exceeded the safe descent budget",
+            retryable: false,
+            failedAt: "safe_descent",
+          });
+        }
+        throw error;
+      } finally {
+        bot.off("physicsTick", onPhysicsTick);
+        bot.pathfinder.setGoal(null);
+        bot.pathfinder.setMovements(previousMovements);
+        bot.clearControlStates();
+      }
+      await delay(750, signal);
+      const after = await this.observe();
+      minimumObservedHealth = Math.min(minimumObservedHealth, after.health);
       if (safetyStop.signal.aborted) {
         throw new AppError({
           category: "safety",
@@ -1009,38 +1012,35 @@ export class MineflayerClient implements MinecraftPort {
           failedAt: "safe_descent",
         });
       }
-      throw error;
+      if (
+        distance(after.position, position) > range + 0.75 ||
+        after.velocityY < -0.1 ||
+        minimumObservedHealth < safeDescentLimits.minimumRemainingHealth ||
+        observedDamage > decision.predictedMaxDamage ||
+        current.health - minimumObservedHealth > decision.predictedMaxDamage
+      ) {
+        throw new AppError({
+          category: "observation",
+          code: "DESCENT_RESULT_NOT_VERIFIED",
+          message:
+            "The descent result did not meet the verified position and health limits",
+          retryable: false,
+          failedAt: "safe_descent",
+        });
+      }
+      return {
+        usedDescent:
+          current.position.y - Math.min(minimumObservedY, after.position.y) > 2,
+        predictedMaxDamage: decision.predictedMaxDamage,
+        healthBefore: current.health,
+        minimumObservedHealth,
+        healthAfter: after.health,
+      };
     } finally {
       bot.off("health", onHealth);
-      bot.off("physicsTick", onPhysicsTick);
-      bot.pathfinder.setGoal(null);
-      bot.pathfinder.setMovements(previousMovements);
-      bot.clearControlStates();
+      expectedDamage.clear();
+      this.expectedDescentDamage = undefined;
     }
-    await delay(300, signal);
-    const after = await this.observe();
-    if (
-      distance(after.position, position) > range + 0.75 ||
-      after.velocityY < -0.1 ||
-      after.health < safeDescentLimits.minimumRemainingHealth ||
-      current.health - after.health > decision.predictedMaxDamage
-    ) {
-      throw new AppError({
-        category: "observation",
-        code: "DESCENT_RESULT_NOT_VERIFIED",
-        message:
-          "The descent result did not meet the verified position and health limits",
-        retryable: false,
-        failedAt: "safe_descent",
-      });
-    }
-    return {
-      usedDescent:
-        current.position.y - Math.min(minimumObservedY, after.position.y) > 2,
-      predictedMaxDamage: decision.predictedMaxDamage,
-      healthBefore: current.health,
-      healthAfter: after.health,
-    };
   }
 
   public async followPlayer(

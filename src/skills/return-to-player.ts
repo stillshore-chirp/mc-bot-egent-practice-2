@@ -19,6 +19,7 @@ export interface ReturnToPlayerOutput {
   readonly usedDescent: boolean;
   readonly predictedMaxDamage: number;
   readonly healthBefore: number;
+  readonly minimumObservedHealth: number;
   readonly healthAfter: number;
 }
 
@@ -50,6 +51,7 @@ export class ReturnToPlayerSkill implements Skill<
         const initial = await this.minecraft.observe();
         let usedDescent = false;
         let predictedMaxDamage = 0;
+        let minimumObservedHealth = initial.health;
         await context.retry(
           "return_to_player",
           async (attempt) => {
@@ -78,6 +80,10 @@ export class ReturnToPlayerSkill implements Skill<
               );
               usedDescent ||= movement.usedDescent;
               predictedMaxDamage += movement.predictedMaxDamage;
+              minimumObservedHealth = Math.min(
+                minimumObservedHealth,
+                movement.minimumObservedHealth,
+              );
             }
             const verified = (await this.minecraft.observe()).players.find(
               (candidate) => candidate.username === input.username,
@@ -110,6 +116,7 @@ export class ReturnToPlayerSkill implements Skill<
           usedDescent,
           predictedMaxDamage,
           healthBefore: initial.health,
+          minimumObservedHealth: Math.min(minimumObservedHealth, final.health),
           healthAfter: final.health,
         };
       } finally {

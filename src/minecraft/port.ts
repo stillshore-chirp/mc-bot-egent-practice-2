@@ -31,6 +31,7 @@ export interface SafeMoveResult {
   readonly usedDescent: boolean;
   readonly predictedMaxDamage: number;
   readonly healthBefore: number;
+  readonly minimumObservedHealth: number;
   readonly healthAfter: number;
 }
 

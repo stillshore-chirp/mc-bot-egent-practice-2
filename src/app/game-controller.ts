@@ -1384,10 +1384,11 @@ export class CompanionGameController implements GameController {
           usedDescent: output.usedDescent,
           predictedMaxDamage: output.predictedMaxDamage,
           healthBefore: output.healthBefore,
+          minimumObservedHealth: output.minimumObservedHealth,
           healthAfter: output.healthAfter,
         },
         summary: output.usedDescent
-          ? `安全を確認した降下で利用者の場所へ戻りました。距離${output.distance.toFixed(1)}ブロック、Botの体力${output.healthBefore}→${output.healthAfter}を観測しました。`
+          ? `安全を確認した降下で利用者の場所へ戻りました。距離${output.distance.toFixed(1)}ブロック、Botの体力は降下中に最低${output.minimumObservedHealth}、帰還時${output.healthAfter}を観測しました。`
           : `歩ける経路で指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
       }),
     );

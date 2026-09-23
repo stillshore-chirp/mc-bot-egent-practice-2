@@ -74,12 +74,12 @@ describe("CompanionGameController", () => {
         signal: AbortSignal,
       ) {
         await this.moveTo(position, range, signal);
-        this.snapshot = { ...this.snapshot, health: 18 };
         return {
           usedDescent: true,
           predictedMaxDamage: 2,
           healthBefore: 20,
-          healthAfter: 18,
+          minimumObservedHealth: 18,
+          healthAfter: 20,
         };
       }
     }
@@ -98,9 +98,10 @@ describe("CompanionGameController", () => {
       expect(report.confirmedState).toMatchObject({
         usedDescent: true,
         healthBefore: 20,
-        healthAfter: 18,
+        minimumObservedHealth: 18,
+        healthAfter: 20,
       });
-      expect(report.summary).toContain("体力20→18");
+      expect(report.summary).toContain("降下中に最低18、帰還時20");
       expect(report.summary).toContain("距離0.0");
     } finally {
       close();

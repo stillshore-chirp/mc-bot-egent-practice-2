@@ -253,6 +253,7 @@ export class FakeMinecraft implements MinecraftPort {
       usedDescent: false,
       predictedMaxDamage: 0,
       healthBefore,
+      minimumObservedHealth: Math.min(healthBefore, this.snapshot.health),
       healthAfter: this.snapshot.health,
     };
   }
