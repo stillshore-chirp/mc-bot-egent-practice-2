@@ -162,6 +162,21 @@ function isAuthorizedBound(
     requestedCount > authorization.maxCount
   )
     return false;
+  if (candidate.action === "craft_item") {
+    const step = candidate.steps[0];
+    return (
+      authorization.targetItem !== "*" &&
+      authorization.allowedResources.includes(authorization.targetItem) &&
+      candidate.operationClass === "world_change" &&
+      candidate.scopeId === "inventory" &&
+      candidate.impact === "low" &&
+      !candidate.reversible &&
+      candidate.steps.length === 1 &&
+      step?.tool === "craft_item" &&
+      step.input.name === authorization.targetItem &&
+      step.input.count === requestedCount
+    );
+  }
   if (candidate.action === "smelt_item") {
     if (authorization.targetItem === "*") return false;
     const requiredInput = knownSmeltInputs[authorization.targetItem];

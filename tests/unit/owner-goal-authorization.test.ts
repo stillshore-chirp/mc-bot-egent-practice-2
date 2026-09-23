@@ -13,6 +13,21 @@ const ownerInput = {
 };
 
 describe("owner goal authorization", () => {
+  it("authorizes an observed inventory recipe from one bounded owner goal", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "オークの板材を1個作って",
+      }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: {
+        allowedResources: ["oak_planks"],
+        targetItem: "oak_planks",
+        targetCount: 1,
+      },
+    });
+  });
   it("scopes an iron quantity goal to raw iron source blocks", () => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,

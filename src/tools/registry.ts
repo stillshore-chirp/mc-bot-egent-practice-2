@@ -108,6 +108,69 @@ function progressItemKey(progress: ActionProgress): string {
   return progress.item ?? "__unidentified_item__";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Output may exceed a request when one bounded action yields a whole stack. */
+function verifiedBoundedOutput(
+  candidate: SafeActionCandidate,
+  progress: ActionProgress,
+  results: readonly Extract<ToolResult<unknown>, { success: true }>[],
+): boolean {
+  if (progress.item === undefined) return false;
+  const result = results.find((entry) => entry.progress === progress);
+  const report = result?.data;
+  if (
+    !isRecord(report) ||
+    report.outcome !== "completed" ||
+    !isRecord(report.confirmedState) ||
+    !isRecord(report.before) ||
+    !isRecord(report.after) ||
+    !isRecord(report.before.inventory) ||
+    !isRecord(report.after.inventory)
+  )
+    return false;
+  const state = report.confirmedState;
+  const before = report.before.inventory[progress.item] ?? 0;
+  const after = report.after.inventory[progress.item] ?? 0;
+  if (
+    typeof before !== "number" ||
+    typeof after !== "number" ||
+    !Number.isSafeInteger(before) ||
+    !Number.isSafeInteger(after) ||
+    after - before !== progress.completedCount ||
+    state.requestedCount !== progress.requestedCount
+  )
+    return false;
+  if (candidate.action === "mine_block")
+    return (
+      progress.requestedCount === 1 &&
+      state.minedCount === 1 &&
+      state.block === candidate.resourceName &&
+      state.item === progress.item &&
+      state.collectedCount === progress.completedCount
+    );
+  if (candidate.action === "craft_item")
+    return (
+      state.item === progress.item &&
+      state.craftedCount === progress.completedCount
+    );
+  if (candidate.action === "collect_item")
+    return (
+      candidate.resourceName === progress.item &&
+      state.item === progress.item &&
+      state.collectedCount === progress.completedCount
+    );
+  if (candidate.action === "gather_resource")
+    return (
+      candidate.resourceName === progress.item &&
+      state.resource === progress.item &&
+      state.collectedCount === progress.completedCount
+    );
+  return false;
+}
+
 function positiveIntegerInput(
   input: Readonly<Record<string, unknown>>,
 ): number | undefined {
@@ -241,6 +304,15 @@ export const toolDefinitions = [
     execute: async (input, context) => {
       const startedAt = Date.now();
       const authorization = context.safeActionAuthorization;
+      // The model may invent a candidateId before observing the world. The
+      // authenticated owner's bounded goal authorizes a resource and count,
+      // not a model-selected block ID; select from fresh observed candidates.
+      const selectionMode =
+        authorization?.kind === "owner_bounded_resource"
+          ? "delegated"
+          : input.mode;
+      const requestedCandidateId =
+        selectionMode === "delegated" ? null : input.candidateId;
       const smeltQuantity =
         authorization?.kind === "owner_bounded_resource" &&
         knownSmeltInputs[authorization.targetItem] !== undefined
@@ -400,6 +472,7 @@ export const toolDefinitions = [
       let planRounds = 0;
       let inventoryReconciledCount = 0;
       const intermediateProgress: ActionProgress[] = [];
+      let completedIntermediateBlocks = 0;
       while (remainingCount > 0) {
         if (context.signal.aborted) {
           return safeActionFailure(
@@ -539,8 +612,8 @@ export const toolDefinitions = [
           (candidate) => !failedCandidateIds.has(candidate.id),
         );
         if (
-          input.mode === "delegated" &&
-          input.candidateId === null &&
+          selectionMode === "delegated" &&
+          requestedCandidateId === null &&
           resourceAuthorization?.kind === "owner_bounded_resource" &&
           resourceAuthorization.targetItem !== "*" &&
           !resourceNames.includes(
@@ -671,8 +744,8 @@ export const toolDefinitions = [
           );
         }
         const planned = planSafeAction({
-          mode: input.mode,
-          requestedId: input.candidateId ?? undefined,
+          mode: selectionMode,
+          requestedId: requestedCandidateId ?? undefined,
           candidates: observed,
           maxSteps: maxSafeActionSteps,
           remainingCount,
@@ -733,7 +806,8 @@ export const toolDefinitions = [
           (intermediateRequestedCount === undefined ||
             !Number.isInteger(intermediateRequestedCount) ||
             intermediateRequestedCount < 1 ||
-            intermediateCountBefore + intermediateRequestedCount > actionCount)
+            completedIntermediateBlocks + intermediateRequestedCount >
+              actionCount)
         ) {
           return safeActionFailure(
             "safety",
@@ -747,12 +821,13 @@ export const toolDefinitions = [
               planRounds,
               completedSteps: completedSteps.length,
               intermediateCount: intermediateCountBefore,
+              intermediateBlocks: completedIntermediateBlocks,
               intermediateLimit: actionCount,
             },
             [
               "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
             ],
-            "中間素材の上限に達したため、追加の資源操作を開始せず停止しました。",
+            "認可された資源ブロック数の上限に達したため、追加の採掘を開始せず停止しました。",
           );
         }
         completedCandidateIds.push(planned.candidate.id);
@@ -911,8 +986,8 @@ export const toolDefinitions = [
           }
           if (!result.success) {
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "mine_block" &&
               step.tool === "mine_block" &&
               !actionStepCompleted &&
@@ -934,27 +1009,10 @@ export const toolDefinitions = [
                 observedGoalHeld === undefined
                   ? 0
                   : Math.max(0, observedGoalHeld - initialGoalHeld);
-              if (observedIncrease > actionCount) {
-                return safeActionFailure(
-                  "safety",
-                  "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
-                  false,
-                  step.tool,
-                  {
-                    goalItem: authorizedGoalItem,
-                    observedIncrease,
-                    authorizedCount: actionCount,
-                    completedCount,
-                  },
-                  [
-                    "所持品の増加と依頼数量を確認してから新しい目的として依頼する",
-                  ],
-                  `所持品の増加が許可された${String(actionCount)}個を超えたため、追加の採掘を停止しました。実測の増加は${String(observedIncrease)}個です。`,
-                );
-              }
               if (observedIncrease > completedCount) {
-                inventoryReconciledCount += observedIncrease - completedCount;
-                completedCount = observedIncrease;
+                const credited = Math.min(actionCount, observedIncrease);
+                inventoryReconciledCount += credited - completedCount;
+                completedCount = credited;
                 remainingCount = actionCount - completedCount;
                 failedCandidateIds.add(planned.candidate.id);
                 completedCandidateIds.pop();
@@ -964,8 +1022,8 @@ export const toolDefinitions = [
               }
             }
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "gather_resource" &&
               step.tool === "gather_resource" &&
               !actionStepCompleted &&
@@ -980,8 +1038,8 @@ export const toolDefinitions = [
               break;
             }
             if (
-              input.mode === "delegated" &&
-              input.candidateId === null &&
+              selectionMode === "delegated" &&
+              requestedCandidateId === null &&
               planned.candidate.action === "mine_block" &&
               step.tool === "mine_block" &&
               !actionStepCompleted &&
@@ -1030,10 +1088,21 @@ export const toolDefinitions = [
         const progressByItem = new Map<string, number>();
         let invalidProgress: ActionProgress | undefined;
         for (const candidateProgress of progresses) {
+          const isMinedIntermediate =
+            goalItem !== undefined &&
+            candidateProgress.item !== goalItem &&
+            planned.candidate.action === "mine_block";
+          const verifiedVariableDrop = verifiedBoundedOutput(
+            planned.candidate,
+            candidateProgress,
+            successfulResults,
+          );
           if (
             candidateProgress.completedCount < 1 ||
-            candidateProgress.completedCount >
-              candidateProgress.requestedCount ||
+            (isMinedIntermediate && !verifiedVariableDrop) ||
+            (!verifiedVariableDrop &&
+              candidateProgress.completedCount >
+                candidateProgress.requestedCount) ||
             candidateProgress.requestedCount < 1 ||
             candidateProgress.requestedCount > remainingCount ||
             (expectedCount !== undefined &&
@@ -1048,6 +1117,7 @@ export const toolDefinitions = [
             (progressByItem.get(key) ?? 0) + candidateProgress.completedCount;
           progressByItem.set(key, total);
           if (
+            !verifiedVariableDrop &&
             total > Math.min(remainingCount, expectedCount ?? remainingCount)
           ) {
             invalidProgress = candidateProgress;
@@ -1103,12 +1173,16 @@ export const toolDefinitions = [
             );
           }
           intermediateProgress.push(intermediate);
+          completedIntermediateBlocks +=
+            planned.candidate.action === "mine_block"
+              ? 1
+              : intermediate.completedCount;
         }
         const intermediateCount = intermediateProgress.reduce(
           (total, previous) => total + previous.completedCount,
           0,
         );
-        if (intermediateCount > actionCount) {
+        if (completedIntermediateBlocks > actionCount) {
           return safeActionFailure(
             "safety",
             "SAFE_ACTION_INTERMEDIATE_LIMIT",
@@ -1121,13 +1195,14 @@ export const toolDefinitions = [
               planRounds,
               completedSteps: completedSteps.length,
               intermediateCount,
+              intermediateBlocks: completedIntermediateBlocks,
               intermediateLimit: actionCount,
               progress,
             },
             [
               "中間素材の所持数と最終目標を再観測してから新しい依頼として再計画する",
             ],
-            "中間素材の累積量が目標数の上限に達したため、追加操作を停止しました。",
+            "採掘した資源ブロック数が上限を超えたため、追加操作を停止しました。",
           );
         }
         const finalProgressCount = progresses
@@ -1180,6 +1255,43 @@ export const toolDefinitions = [
       const lastCandidateId =
         completedCandidateIds[completedCandidateIds.length - 1];
       const firstReason = planReasons[0] ?? "安全条件を確認した計画";
+      const intermediateItem =
+        authorizedGoalItem === undefined
+          ? undefined
+          : knownSmeltInputs[authorizedGoalItem];
+      let remainingMaterialSummary = "";
+      let surplusGoalSummary = "";
+      if (
+        (intermediateItem !== undefined &&
+          intermediateProgress.some(
+            (entry) => entry.item === intermediateItem,
+          )) ||
+        (authorizedGoalItem !== undefined && initialGoalHeld !== undefined)
+      ) {
+        try {
+          const inventory = (await context.game.observeStatus()).inventory;
+          if (intermediateItem !== undefined) {
+            const held = inventory[intermediateItem];
+            if (
+              typeof held === "number" &&
+              Number.isSafeInteger(held) &&
+              held > 0
+            )
+              remainingMaterialSummary = `余った${intermediateItem}は${String(held)}個所持しています。`;
+          }
+          if (
+            authorizedGoalItem !== undefined &&
+            initialGoalHeld !== undefined
+          ) {
+            const held = inventory[authorizedGoalItem] ?? 0;
+            const surplus = held - initialGoalHeld - actionCount;
+            if (Number.isSafeInteger(surplus) && surplus > 0)
+              surplusGoalSummary = `依頼数より多く増えた${authorizedGoalItem}${String(surplus)}個も所持しています。`;
+          }
+        } catch {
+          // The goal was already verified; omit an unverified balance.
+        }
+      }
       return {
         success: true,
         data: {
@@ -1198,7 +1310,7 @@ export const toolDefinitions = [
           "minecraft_snapshot",
           `安全計画を${String(planRounds)}回、${String(completedCount)}個分実行し、各段階の結果を確認した`,
         ),
-        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${inventoryReconciledCount > 0 ? `途中の採掘は完了判定できませんでしたが、目標品${String(inventoryReconciledCount)}個の所持増加を再観測しました。` : ""}${completedSteps.map(({ summary }) => summary).join(" ")}`,
+        userSummary: `${firstReason}計画した${String(completedSteps.length)}段階を実行し、${String(completedCount)}個分の結果を確認しました。${inventoryReconciledCount > 0 ? `途中の採掘は完了判定できませんでしたが、目標品${String(inventoryReconciledCount)}個の所持増加を再観測しました。` : ""}${completedSteps.map(({ summary }) => summary).join(" ")}${remainingMaterialSummary === "" ? "" : ` ${remainingMaterialSummary}`}${surplusGoalSummary === "" ? "" : ` ${surplusGoalSummary}`}`,
       };
     },
   }),

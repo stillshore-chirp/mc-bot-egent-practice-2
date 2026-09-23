@@ -259,6 +259,386 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("chooses an observed ore when the model guesses an explicit candidate for the owner's goal", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let held = 0;
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal: held },
+    });
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "mine_block:coal_ore:1:64:0",
+        label: "観測した石炭鉱石",
+        action: "mine_block",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: 1,
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: "coal_ore", position: { x: 1, y: 64, z: 0 } },
+          },
+        ],
+      },
+    ];
+    toolContext.game.mineBlock = async () => {
+      held = 1;
+      return {
+        before: status,
+        after: { ...status, inventory: { coal: held } },
+        outcome: "completed",
+        confirmedState: {
+          item: "coal",
+          requestedCount: 1,
+          collectedCount: 1,
+          heldCount: held,
+        },
+        summary: "所持品の増加を確認しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "explicit",
+        candidateId: "coal_ore",
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1, candidateId: "mine_block:coal_ore:1:64:0" },
+    });
+  });
+
+  it.each([
+    { dropCount: 3, minedCount: 1 },
+    { dropCount: 6, minedCount: 1 },
+    { dropCount: 3, minedCount: 0 },
+  ])(
+    "keeps a copper goal bounded after $dropCount raw copper with $minedCount verified block",
+    async ({ dropCount, minedCount }) => {
+      const toolContext = context();
+      toolContext.safeActionAuthorization = {
+        kind: "owner_bounded_resource",
+        goal: "銅インゴットを1個作って",
+        allowedResources: ["copper_ore"],
+        targetItem: "copper_ingot",
+        targetCount: 1,
+        maxCount: 8,
+      };
+      toolContext.safeActionAuthorizationUsage = {
+        remainingCount: 1,
+        consumed: false,
+      };
+      let rawCopper = 0;
+      let copperIngot = 0;
+      let smeltCalls = 0;
+      toolContext.game.observeStatus = async () => ({
+        ...status,
+        inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+      });
+      toolContext.game.findSafeActionCandidates = async () =>
+        rawCopper === 0
+          ? [
+              {
+                id: "mine-copper",
+                label: "観測した銅鉱石",
+                action: "mine_block" as const,
+                observed: true as const,
+                purposeFit: "direct" as const,
+                permission: "allowed" as const,
+                safety: "allowed" as const,
+                reversible: false,
+                impact: "medium" as const,
+                operationClass: "natural_resource" as const,
+                requestedCount: 1,
+                resourceName: "copper_ore",
+                goalItem: "copper_ingot",
+                intermediateItems: ["raw_copper"],
+                distance: 1,
+                steps: [
+                  {
+                    tool: "mine_block",
+                    input: {
+                      name: "copper_ore",
+                      position: { x: 1, y: 64, z: 0 },
+                    },
+                  },
+                ],
+              },
+            ]
+          : [
+              {
+                id: "smelt-copper",
+                label: "原銅を精錬",
+                action: "smelt_item" as const,
+                observed: true as const,
+                purposeFit: "direct" as const,
+                permission: "allowed" as const,
+                safety: "allowed" as const,
+                reversible: false,
+                impact: "low" as const,
+                operationClass: "world_change" as const,
+                scopeId: "inventory",
+                requestedCount: 1,
+                goalItem: "copper_ingot",
+                distance: 1,
+                steps: [
+                  {
+                    tool: "smelt_item",
+                    input: {
+                      input: "raw_copper",
+                      output: "copper_ingot",
+                      count: 1,
+                      furnace: null,
+                    },
+                  },
+                ],
+              },
+            ];
+      toolContext.game.mineBlock = async () => {
+        rawCopper = dropCount;
+        return {
+          before: status,
+          after: {
+            ...status,
+            inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+          },
+          outcome: "completed",
+          confirmedState: {
+            block: "copper_ore",
+            item: "raw_copper",
+            requestedCount: 1,
+            minedCount,
+            collectedCount: dropCount,
+            heldCount: rawCopper,
+          },
+          summary: "原銅の増加を確認しました。",
+        };
+      };
+      toolContext.game.smeltItem = async () => {
+        smeltCalls += 1;
+        rawCopper -= 1;
+        copperIngot = 1;
+        return {
+          before: status,
+          after: {
+            ...status,
+            inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+          },
+          outcome: "completed",
+          confirmedState: {
+            item: "copper_ingot",
+            requestedCount: 1,
+            smeltedCount: 1,
+            heldCount: 1,
+          },
+          summary: "銅インゴット1個を確認しました。",
+        };
+      };
+
+      const result = await new ToolExecutor().execute(
+        "plan_safe_action",
+        JSON.stringify({
+          goal: "銅インゴットを1個作って",
+          count: 1,
+          mode: "delegated",
+          candidateId: null,
+        }),
+        toolContext,
+      );
+
+      if (minedCount === 1) {
+        expect(result).toMatchObject({
+          success: true,
+          data: {
+            completedCount: 1,
+            intermediateProgress: [
+              { item: "raw_copper", completedCount: dropCount },
+            ],
+          },
+        });
+        expect(smeltCalls).toBe(1);
+        expect(rawCopper).toBe(dropCount - 1);
+        expect(result.success && result.userSummary).toContain(
+          `余ったraw_copperは${String(dropCount - 1)}個所持しています。`,
+        );
+      } else {
+        expect(result).toMatchObject({
+          success: false,
+          error: { code: "SAFE_ACTION_PROGRESS_INVALID" },
+        });
+        expect(smeltCalls).toBe(0);
+      }
+    },
+  );
+
+  it("keeps surplus ore drops while crediting only the owner's requested item", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let coal = 0;
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal },
+    });
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "coal-ore",
+        label: "観測した石炭鉱石",
+        action: "mine_block",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: 1,
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: "coal_ore", position: { x: 1, y: 64, z: 0 } },
+          },
+        ],
+      },
+    ];
+    toolContext.game.mineBlock = async () => {
+      coal = 2;
+      return {
+        before: status,
+        after: { ...status, inventory: { coal } },
+        outcome: "completed",
+        confirmedState: {
+          block: "coal_ore",
+          item: "coal",
+          requestedCount: 1,
+          minedCount: 1,
+          collectedCount: 2,
+          heldCount: 2,
+        },
+        summary: "石炭2個の増加を確認しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1 },
+    });
+    expect(coal).toBe(2);
+    expect(result.success && result.userSummary).toContain(
+      "依頼数より多く増えたcoal1個も所持しています。",
+    );
+  });
+
+  it("accepts a verified crafting batch larger than the requested item count", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_scoped_change",
+      scopeId: "inventory",
+      maxImpact: "medium",
+    };
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "craft-planks",
+        label: "原木から板材をクラフト",
+        action: "craft_item",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "low",
+        operationClass: "world_change",
+        scopeId: "inventory",
+        requestedCount: 1,
+        goalItem: "oak_planks",
+        distance: 0,
+        steps: [
+          { tool: "craft_item", input: { name: "oak_planks", count: 1 } },
+        ],
+      },
+    ];
+    toolContext.game.craftItem = async () => ({
+      before: status,
+      after: { ...status, inventory: { oak_planks: 4 } },
+      outcome: "completed",
+      confirmedState: {
+        item: "oak_planks",
+        requestedCount: 1,
+        craftedCount: 4,
+        heldCount: 4,
+      },
+      summary: "板材を4個クラフトし、所持品で確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "板材を1個作る",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1 },
+    });
+    expect(result.success && result.userSummary).toContain("板材を4個クラフト");
+  });
+
   it("searches once under an owner quantity contract and executes the newly observed log", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
@@ -534,7 +914,7 @@ describe("ToolExecutor", () => {
     },
   );
 
-  it("stops when an uncertain mining pickup exceeds the owner quantity", async () => {
+  it("credits the requested quantity without discarding an uncertain extra pickup", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
       kind: "owner_bounded_resource",
@@ -601,12 +981,12 @@ describe("ToolExecutor", () => {
     );
 
     expect(result).toMatchObject({
-      success: false,
-      error: {
-        code: "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
-        confirmedState: { observedIncrease: 2, authorizedCount: 1 },
-      },
+      success: true,
+      data: { completedCount: 1, inventoryReconciledCount: 1 },
     });
+    expect(result.success && result.userSummary).toContain(
+      "依頼数より多く増えたcoal1個も所持しています。",
+    );
     expect(attempts).toBe(1);
   });
 
@@ -1742,6 +2122,47 @@ describe("ToolExecutor", () => {
     });
     expect(toolContext.safeActionAuthorizationUsage.consumed).toBe(true);
     expect(calls).toBe(1);
+  });
+
+  it("keeps verified surplus logs from a direct gather and credits only the owner goal", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を1本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: { ...status, inventory: { oak_log: 2 } },
+      outcome: "completed",
+      confirmedState: {
+        resource: "oak_log",
+        requestedCount: 1,
+        collectedCount: 2,
+        heldCount: 2,
+      },
+      summary: "オークの原木を2個収集し、所持品で確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      progress: { item: "oak_log", requestedCount: 1, completedCount: 2 },
+    });
+    expect(result.success && result.userSummary).toContain("2個収集");
+    expect(toolContext.safeActionAuthorizationUsage.remainingCount).toBe(0);
   });
 
   it("consumes a confirmed partial direct gather before allowing the remainder", async () => {

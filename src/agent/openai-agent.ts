@@ -3,7 +3,10 @@ import type { ResponseInputItem } from "openai/resources/responses/responses";
 import type { Logger } from "pino";
 
 import { AppError } from "../domain/errors.js";
-import { knownSmeltInputs } from "../minecraft/general-actions.js";
+import {
+  knownBlockDrops,
+  knownSmeltInputs,
+} from "../minecraft/general-actions.js";
 import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
@@ -388,12 +391,29 @@ export class OpenAIDeliberationAgent {
         : undefined;
     const resourceAuthorization = request.toolContext.safeActionAuthorization;
     if (
-      authorizedFamilies?.has("gather") &&
-      resourceAuthorization?.kind === "owner_bounded_resource" &&
-      knownSmeltInputs[resourceAuthorization.targetItem] !== undefined &&
-      !prohibitedFamilies.has("smelt")
+      authorizedFamilies !== undefined &&
+      resourceAuthorization?.kind === "owner_bounded_resource"
     ) {
-      authorizedFamilies.add("smelt");
+      const targetItem = resourceAuthorization.targetItem;
+      const requiredFamilies: GoalActionFamily[] =
+        knownSmeltInputs[targetItem] !== undefined
+          ? ["gather", "smelt"]
+          : resourceAuthorization.allowedResources.includes(targetItem) &&
+              knownBlockDrops[targetItem] === undefined
+            ? ["craft"]
+            : ["gather"];
+      for (const family of requiredFamilies) {
+        if (
+          explicitProhibited.includes(family) ||
+          (conversationSnapshot.explicitProhibitedActionFamilies.includes(
+            family,
+          ) &&
+            !explicitAuthorized.includes(family))
+        )
+          continue;
+        authorizedFamilies.add(family);
+        prohibitedFamilies.delete(family);
+      }
     }
     const requestedMemoryTools = explicitlyRequestedMemoryTools(
       request.message,

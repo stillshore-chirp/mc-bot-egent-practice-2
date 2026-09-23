@@ -241,9 +241,10 @@ export class ToolExecutor {
             progress.item !== resource ||
             progress.requestedCount !== requestedCount ||
             progress.completedCount < 1 ||
-            progress.completedCount > progress.requestedCount ||
+            (progress.completedCount > progress.requestedCount &&
+              !verifiedDirectGatherSurplus(actionResult, resource)) ||
             remainingCount === undefined ||
-            progress.completedCount > remainingCount
+            remainingCount < 1
           ) {
             if (context.safeActionAuthorizationUsage !== undefined) {
               context.safeActionAuthorizationUsage.consumed = true;
@@ -412,7 +413,7 @@ function consumeSafeActionAuthorization(
   ) {
     return;
   }
-  const completedCount =
+  const observedCompletedCount =
     result.success && result.progress !== undefined
       ? result.progress.completedCount
       : result.success && isRecord(result.data)
@@ -421,8 +422,14 @@ function consumeSafeActionAuthorization(
           ? (integerField(result.error.confirmedState.completedCount) ??
             integerField(result.error.confirmedState.collectedCount))
           : undefined;
-  if (completedCount === undefined || completedCount < 0) return;
   const remaining = context.safeActionAuthorizationUsage.remainingCount;
+  const completedCount =
+    toolName === "gather_resource" &&
+    result.success &&
+    observedCompletedCount !== undefined
+      ? Math.min(remaining, observedCompletedCount)
+      : observedCompletedCount;
+  if (completedCount === undefined || completedCount < 0) return;
   context.safeActionAuthorizationUsage.remainingCount = Math.max(
     0,
     remaining - completedCount,
@@ -430,6 +437,38 @@ function consumeSafeActionAuthorization(
   if (completedCount > remaining) {
     context.safeActionAuthorizationUsage.consumed = true;
   }
+}
+
+function verifiedDirectGatherSurplus(
+  result: Extract<ToolResult<unknown>, { success: true }>,
+  resource: string | undefined,
+): boolean {
+  const progress = result.progress;
+  const report = result.data;
+  if (
+    resource === undefined ||
+    progress === undefined ||
+    !isRecord(report) ||
+    report.outcome !== "completed" ||
+    !isRecord(report.confirmedState) ||
+    !isRecord(report.before) ||
+    !isRecord(report.after) ||
+    !isRecord(report.before.inventory) ||
+    !isRecord(report.after.inventory)
+  )
+    return false;
+  const before = report.before.inventory[resource] ?? 0;
+  const after = report.after.inventory[resource] ?? 0;
+  return (
+    typeof before === "number" &&
+    typeof after === "number" &&
+    Number.isSafeInteger(before) &&
+    Number.isSafeInteger(after) &&
+    report.confirmedState.resource === resource &&
+    report.confirmedState.requestedCount === progress.requestedCount &&
+    report.confirmedState.collectedCount === progress.completedCount &&
+    after - before === progress.completedCount
+  );
 }
 
 function isDirectActionAuthorized(

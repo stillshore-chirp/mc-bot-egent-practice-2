@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { CompanionGameController } from "../../src/app/game-controller.js";
 import { AppError } from "../../src/domain/errors.js";
+import type { GeneralActionCandidate } from "../../src/minecraft/general-actions.js";
 import { MemoryStore } from "../../src/memory/store.js";
 import { ActionArbiter } from "../../src/runtime/action-arbiter.js";
 import { TaskRuntime, type TaskStore } from "../../src/runtime/task-service.js";
@@ -1073,6 +1074,76 @@ describe("CompanionGameController", () => {
       ]);
     } finally {
       close();
+    }
+  });
+
+  it("observes inventory crafting tables only within the execution reach", async () => {
+    class CraftTableMinecraft extends FakeMinecraft {
+      public observedRadius = 0;
+      public constructor(private readonly tableDistance: number) {
+        super();
+      }
+      public override async observeActionCandidates(
+        input: Parameters<FakeMinecraft["observeActionCandidates"]>[0],
+        signal: AbortSignal,
+      ): Promise<readonly GeneralActionCandidate[]> {
+        signal.throwIfAborted();
+        this.observedRadius = input.radius;
+        if (this.tableDistance > input.radius) return [];
+        return [
+          {
+            id: "craft-planks",
+            label: "板材をクラフト",
+            action: "craft_item",
+            args: { name: "oak_planks", count: 1 },
+            steps: [
+              { tool: "craft_item", input: { name: "oak_planks", count: 1 } },
+            ],
+            observed: true,
+            purposeFit: "direct",
+            permission: "allowed",
+            safety: "allowed",
+            reversible: false,
+            impact: "low",
+            operationClass: "world_change",
+            requestedCount: 1,
+            scopeId: "inventory",
+            goalItem: "oak_planks",
+            distance: 0,
+            order: 0,
+          },
+        ];
+      }
+    }
+    const authorization = {
+      kind: "owner_bounded_resource" as const,
+      goal: "オークの板材を1個作って",
+      allowedResources: ["oak_planks"],
+      targetItem: "oak_planks",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    for (const [distance, expected] of [
+      [7, 1],
+      [12, 0],
+    ] as const) {
+      const minecraft = new CraftTableMinecraft(distance);
+      const { game, close } = createController(minecraft);
+      try {
+        const candidates = await game.findSafeActionCandidates(
+          {
+            goal: authorization.goal,
+            count: 1,
+            maxCandidates: 4,
+            authorization,
+          },
+          new AbortController().signal,
+        );
+        expect(minecraft.observedRadius).toBe(8);
+        expect(candidates).toHaveLength(expected);
+      } finally {
+        close();
+      }
     }
   });
 
