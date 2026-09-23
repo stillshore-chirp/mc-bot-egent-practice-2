@@ -1042,6 +1042,10 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[1]?.tools?.map((tool) => tool.name)).toContain(
       "return_to_player",
     );
+    expect(fake.requests[1]?.instructions).toContain("安全距離は3ブロック");
+    expect(fake.requests[1]?.instructions).toContain(
+      "return_to_playerに設定済みの安全距離を指定して追加質問をせず開始",
+    );
     expect(fake.requests[1]?.tools?.map((tool) => tool.name)).not.toContain(
       "gather_resource",
     );

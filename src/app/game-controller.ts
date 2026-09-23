@@ -1369,7 +1369,7 @@ export class CompanionGameController implements GameController {
     safeDistance: number,
     signal: AbortSignal,
   ): Promise<ActionReport> {
-    return this.#executeTask(
+    const report = await this.#executeTask(
       signal,
       () =>
         this.#returnToPlayer.run({
@@ -1379,9 +1379,44 @@ export class CompanionGameController implements GameController {
         }),
       (output) => ({
         outcome: "completed",
-        summary: `指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
+        confirmedState: {
+          distance: output.distance,
+          usedDescent: output.usedDescent,
+          predictedMaxDamage: output.predictedMaxDamage,
+          healthBefore: output.healthBefore,
+          minimumObservedHealth: output.minimumObservedHealth,
+          healthAfter: output.healthAfter,
+        },
+        summary: output.usedDescent
+          ? `安全を確認した降下で利用者の場所へ戻りました。距離${output.distance.toFixed(1)}ブロック、Botの体力は降下中に最低${output.minimumObservedHealth}、帰還時${output.healthAfter}を観測しました。`
+          : `歩ける経路で指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
       }),
     );
+    if (report.failureCode !== "SAFE_DESCENT_BLOCKED") return report;
+    const reason = report.confirmedState?.reason;
+    const explanation =
+      reason === "health_too_low"
+        ? "Botの体力に安全余裕が足りません。"
+        : reason === "drop_too_high"
+          ? "確認できた落差が軽微な損傷の上限を超えます。"
+          : reason === "hostile_nearby"
+            ? "降りる先の近くに敵を確認しました。"
+            : reason === "landing_unsafe"
+              ? "降りる先の足場または通り道を安全と確認できません。"
+              : reason === "no_descent"
+                ? "歩ける道も安全な降り道も見つかっていません。"
+                : "降りる先までの地形を十分に確認できません。";
+    const nextAction =
+      reason === "health_too_low"
+        ? "体力が回復したら周囲を再確認して帰還を試します。"
+        : reason === "hostile_nearby"
+          ? "敵が離れたら周囲を再確認して帰還を試します。"
+          : "利用者が近くに来るか、安全な通路や着地点ができれば再確認して帰還を試します。";
+    return {
+      ...report,
+      summary: `高所からの帰還を試しましたが、${explanation} いまはその場で待機しています。${nextAction}`,
+      nextActions: [nextAction],
+    };
   }
 
   public async currentPosition(): Promise<Position> {
@@ -1582,10 +1617,16 @@ export class CompanionGameController implements GameController {
       ...(record.failure?.confirmedState === undefined
         ? {}
         : { confirmedState: record.failure.confirmedState }),
-      nextActions: failureNextActions(record.failure?.category),
-      summary: record.failure?.code
-        ? `Minecraft作業の完了を確認できませんでした（${record.failure.code}）。`
-        : "Minecraft作業の完了を確認できませんでした。",
+      nextActions:
+        record.failure?.code === "ASCENT_RETURN_UNCONFIRMED"
+          ? ["歩いて戻れる道や安全な退避先を確保できたら再確認する"]
+          : failureNextActions(record.failure?.category),
+      summary:
+        record.failure?.code === "ASCENT_RETURN_UNCONFIRMED"
+          ? "高所へ進む経路から安全に戻れる道を確認できなかったため、移動を止めました。歩いて戻れる道や安全な退避先ができれば再確認します。"
+          : record.failure?.code
+            ? `Minecraft作業の完了を確認できませんでした（${record.failure.code}）。`
+            : "Minecraft作業の完了を確認できませんでした。",
     };
   }
 

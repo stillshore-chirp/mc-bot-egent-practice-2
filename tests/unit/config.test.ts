@@ -17,6 +17,7 @@ describe("loadConfig", () => {
     const config = loadConfig(requiredEnvironment);
 
     expect(config.minecraft.version).toBe("1.21.11");
+    expect(config.openai.model).toBe("gpt-6-luna");
     expect(config.limits.maxGatherCount).toBe(64);
     expect(config.reconnect.maxAttempts).toBe(5);
     expect(config.dashboard).toMatchObject({

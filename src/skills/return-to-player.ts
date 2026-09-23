@@ -16,6 +16,11 @@ export interface ReturnToPlayerInput {
 
 export interface ReturnToPlayerOutput {
   readonly distance: number;
+  readonly usedDescent: boolean;
+  readonly predictedMaxDamage: number;
+  readonly healthBefore: number;
+  readonly minimumObservedHealth: number;
+  readonly healthAfter: number;
 }
 
 export class ReturnToPlayerSkill implements Skill<
@@ -43,6 +48,10 @@ export class ReturnToPlayerSkill implements Skill<
         actionPriorities.task,
       );
       try {
+        const initial = await this.minecraft.observe();
+        let usedDescent = false;
+        let predictedMaxDamage = 0;
+        let minimumObservedHealth = initial.health;
         await context.retry(
           "return_to_player",
           async (attempt) => {
@@ -64,10 +73,16 @@ export class ReturnToPlayerSkill implements Skill<
               observedDistance: player.distance,
             });
             if (player.distance > input.range) {
-              await this.minecraft.moveTo(
+              const movement = await this.minecraft.moveToWithSafeDescent(
                 player.position,
                 input.range,
                 AbortSignal.any([context.signal, lease.signal]),
+              );
+              usedDescent ||= movement.usedDescent;
+              predictedMaxDamage += movement.predictedMaxDamage;
+              minimumObservedHealth = Math.min(
+                minimumObservedHealth,
+                movement.minimumObservedHealth,
               );
             }
             const verified = (await this.minecraft.observe()).players.find(
@@ -92,10 +107,18 @@ export class ReturnToPlayerSkill implements Skill<
           (error) => error instanceof AppError && error.detail.retryable,
           context.signal,
         );
-        const player = (await this.minecraft.observe()).players.find(
+        const final = await this.minecraft.observe();
+        const player = final.players.find(
           (candidate) => candidate.username === input.username,
         );
-        return { distance: player?.distance ?? Number.POSITIVE_INFINITY };
+        return {
+          distance: player?.distance ?? Number.POSITIVE_INFINITY,
+          usedDescent,
+          predictedMaxDamage,
+          healthBefore: initial.health,
+          minimumObservedHealth: Math.min(minimumObservedHealth, final.health),
+          healthAfter: final.health,
+        };
       } finally {
         lease.release();
       }

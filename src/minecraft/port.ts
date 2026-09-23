@@ -27,6 +27,14 @@ export interface ArmorEquipResult {
   readonly failed: boolean;
 }
 
+export interface SafeMoveResult {
+  readonly usedDescent: boolean;
+  readonly predictedMaxDamage: number;
+  readonly healthBefore: number;
+  readonly minimumObservedHealth: number;
+  readonly healthAfter: number;
+}
+
 export interface StorageObservation {
   readonly chestCount: number;
   readonly playerCount: number;
@@ -55,6 +63,10 @@ export interface MinecraftPort {
   onChat(listener: (username: string, message: string) => void): () => void;
   onDisconnected(listener: (reason: string) => void): () => void;
   observe(): Promise<WorldSnapshot>;
+  isExpectedDescentDamage(
+    previous: WorldSnapshot,
+    current: WorldSnapshot,
+  ): boolean;
   observeSurroundings(
     radius: number,
     includeEntities: boolean,
@@ -73,6 +85,11 @@ export interface MinecraftPort {
   ): Promise<DepositResult>;
   say(message: string): Promise<void>;
   moveTo(position: Position, range: number, signal: AbortSignal): Promise<void>;
+  moveToWithSafeDescent(
+    position: Position,
+    range: number,
+    signal: AbortSignal,
+  ): Promise<SafeMoveResult>;
   followPlayer(
     username: string,
     range: number,
