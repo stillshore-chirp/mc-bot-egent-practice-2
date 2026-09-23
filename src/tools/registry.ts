@@ -1774,7 +1774,8 @@ export const toolDefinitions = [
   }),
   defineTool({
     name: "return_to_player",
-    description: "認可済み利用者の現在位置を再観測して安全な距離まで戻る。",
+    description:
+      "認可済み利用者の現在位置を再観測して安全な距離まで戻る。依頼に距離がなければ設定済みの安全距離をsafeDistanceへ指定する。",
     input: z
       .object({
         safeDistance: z.number().min(2).max(16),
