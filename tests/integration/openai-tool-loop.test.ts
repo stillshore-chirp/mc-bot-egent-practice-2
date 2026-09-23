@@ -601,6 +601,9 @@ describe("OpenAI tool loop", () => {
     );
     expect(fake.requests[1]?.instructions).toContain("同じ対象として扱って");
     expect(fake.requests[1]?.instructions).toContain(
+      "Botが提案した代案は、利用者が明示的に選ぶまで利用者の元の目的を置き換えません",
+    );
+    expect(fake.requests[1]?.instructions).toContain(
       "公開toolを安全な順序で組み合わせれば目的を達成できる場合",
     );
     expect(fake.requests[1]?.instructions).toContain(
