@@ -48,6 +48,81 @@ describe("reflex loop", () => {
     expect(minecraft.actions).toContain("eat:bread");
   });
 
+  it("equips carried armor on its own when an observed slot is empty", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ inventory: [{ name: "iron_chestplate", count: 1 }] }),
+    );
+    const coordinator = coordinatorFor(minecraft);
+
+    expect(
+      (await coordinator.tick(await minecraft.observe(), false)).state,
+    ).toBe("stabilizing");
+    expect(minecraft.actions).toContain("equip:torso:iron_chestplate");
+    expect((await minecraft.observe()).armor?.torso).toBe("iron_chestplate");
+    expect(
+      (await coordinator.tick(await minecraft.observe(), false)).state,
+    ).toBe("safe");
+  });
+
+  it("prioritizes armor over food at critical health without a visible attacker", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        inventory: [{ name: "iron_helmet", count: 1 }],
+      }),
+    );
+
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("equip:head:iron_helmet");
+    expect(minecraft.actions).not.toContain("eat:bread");
+  });
+
+  it("eats at critical health when no armor or attacker is available", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ health: 4, food: 10 }),
+    );
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("eat:bread");
+  });
+
+  it("retreats before equipping when a critically injured Bot sees a hostile", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        health: 4,
+        inventory: [{ name: "iron_helmet", count: 1 }],
+        nearbyEntities: [
+          {
+            id: 1,
+            name: "zombie",
+            kind: "mob",
+            position: { x: 1, y: 64, z: 0 },
+            distance: 1,
+            hostile: true,
+          },
+        ],
+      }),
+    );
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("escape:hostile");
+    expect(minecraft.actions).not.toContain("equip:head:iron_helmet");
+  });
+
   it("escapes an observed lava hazard", async () => {
     const minecraft = new FakeMinecraft(createSnapshot({ inLava: true }));
     const state = await coordinatorFor(minecraft).tick(

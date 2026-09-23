@@ -4,6 +4,7 @@ import {
   type FailureDetail,
 } from "../domain/errors.js";
 import type { WorldSnapshot } from "../domain/snapshot.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
 import type { MinecraftPort } from "../minecraft/port.js";
 import {
   actionPriorities,
@@ -108,7 +109,48 @@ export class ReflexCoordinator {
       await withTimeout(
         async (timeoutSignal) => {
           const signal = AbortSignal.any([acquiredLease.signal, timeoutSignal]);
-          if (incident.kind === "hunger")
+          if (incident.kind === "equipment") {
+            const result = await this.minecraft.equipAvailableArmor(signal);
+            if (result.failed || result.equipped.length === 0) {
+              throw new AppError({
+                category: "safety",
+                code: "AUTONOMOUS_ARMOR_EQUIP_FAILED",
+                message: "No armor slot was confirmed equipped",
+                retryable: true,
+                failedAt: "reflex:equipment",
+              });
+            }
+          } else if (incident.kind === "critical_health") {
+            const hostile = snapshot.nearbyEntities.some(
+              (entity) =>
+                entity.hostile &&
+                entity.distance <= this.thresholds.hostileDistance,
+            );
+            if (hostile) {
+              await this.minecraft.escapeDanger("hostile", signal);
+            } else if (recommendArmor(snapshot).length > 0) {
+              const result = await this.minecraft.equipAvailableArmor(signal);
+              if (result.failed || result.equipped.length === 0) {
+                throw new AppError({
+                  category: "safety",
+                  code: "AUTONOMOUS_ARMOR_EQUIP_FAILED",
+                  message: "No armor slot was confirmed equipped",
+                  retryable: true,
+                  failedAt: "reflex:critical_health",
+                });
+              }
+            } else if (snapshot.food < 18) {
+              await this.minecraft.eatBestFood(signal);
+            } else {
+              throw new AppError({
+                category: "safety",
+                code: "CRITICAL_HEALTH_NO_SAFE_ACTION",
+                message: "No safe immediate recovery action is available",
+                retryable: true,
+                failedAt: "reflex:critical_health",
+              });
+            }
+          } else if (incident.kind === "hunger")
             await this.minecraft.eatBestFood(signal);
           else if (incident.kind === "stuck") {
             await this.minecraft.recoverFromStuck(
