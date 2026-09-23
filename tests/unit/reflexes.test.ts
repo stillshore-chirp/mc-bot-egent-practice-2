@@ -133,6 +133,32 @@ describe("reflex loop", () => {
     expect(minecraft.actions).toContain("escape:unstable");
   });
 
+  it("does not mark surface breathing as a completed escape while still in water", async () => {
+    class SurfaceOnlyMinecraft extends FakeMinecraft {
+      public override async escapeDanger(
+        _mode: "environment" | "hostile",
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (signal.aborted) throw signal.reason;
+        this.snapshot = createSnapshot({ oxygen: 20, inWater: true });
+      }
+    }
+    const minecraft = new SurfaceOnlyMinecraft(
+      createSnapshot({ oxygen: 5, inWater: true }),
+    );
+
+    const result = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(result).toMatchObject({
+      state: "failed",
+      failure: { code: "REFLEX_NOT_STABLE" },
+      after: { oxygen: 20, oxygenState: "normal", inWater: true },
+    });
+  });
+
   it("uses the environmental escape when lava and a hostile coexist", async () => {
     const minecraft = new FakeMinecraft(
       createSnapshot({

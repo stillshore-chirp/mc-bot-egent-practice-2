@@ -2483,6 +2483,29 @@ export class MineflayerClient implements MinecraftPort {
     const bot = this.requireBot();
     bot.pathfinder.setGoal(null);
     bot.clearControlStates();
+    if (mode === "environment") {
+      const observed = await this.observe();
+      if (observed.inWater && observed.oxygenState !== "normal") {
+        // One second of generic jumping cannot reach air from a shallow
+        // water column. Keep ascending for a bounded interval and let the
+        // reflex verifier report failure if the Bot remains in water.
+        bot.setControlState("jump", true);
+        try {
+          for (let elapsed = 0; elapsed < 4_000; elapsed += 250) {
+            await delay(250, signal);
+            if (!(await this.observe()).inWater) {
+              bot.clearControlStates();
+              await delay(1_000, signal);
+              if (!(await this.observe()).inWater) return;
+              bot.setControlState("jump", true);
+            }
+          }
+        } finally {
+          bot.clearControlStates();
+        }
+        return;
+      }
+    }
     const target =
       mode === "hostile"
         ? escapeTarget(
