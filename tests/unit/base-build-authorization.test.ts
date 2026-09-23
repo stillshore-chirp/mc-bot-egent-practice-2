@@ -21,6 +21,12 @@ describe("authenticated base-build request scope", () => {
     expect(decideBaseBuildRequest("家を建てられる？", false)).toEqual({
       kind: "none",
     });
+    expect(decideBaseBuildRequest("家を建ててもいいですか", false)).toEqual({
+      kind: "none",
+    });
+    expect(decideBaseBuildRequest("家を作ってもいいですか", false)).toEqual({
+      kind: "none",
+    });
     expect(decideBaseBuildRequest("家を建てないで", false)).toEqual({
       kind: "none",
     });

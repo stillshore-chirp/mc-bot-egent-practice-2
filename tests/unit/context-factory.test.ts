@@ -122,6 +122,46 @@ describe("CompanionContextFactory owner action boundary", () => {
     expect(thirdParty.toolContext.baseBuildAuthorized).toBeUndefined();
   });
 
+  it("uses a bounded affirmative answer to a base-build clarification once", async () => {
+    const contextFactory = factory();
+    const question = await contextFactory.create(
+      "owner",
+      "石で家を建てて",
+      new AbortController().signal,
+      "base-pending",
+      "owner_message",
+    );
+    expect(question.toolContext.baseBuildClarification).toContain("オーク");
+
+    const other = await contextFactory.create(
+      "other",
+      "はい",
+      new AbortController().signal,
+      "base-other-answer",
+      "owner_message",
+    );
+    expect(other.toolContext.baseBuildAuthorized).toBeUndefined();
+
+    const accepted = await contextFactory.create(
+      "owner",
+      "はい",
+      new AbortController().signal,
+      "base-accepted",
+      "owner_message",
+    );
+    expect(accepted.toolContext.baseBuildAuthorized).toBe(true);
+    expect(accepted.toolContext.baseBuildResume).toBe(false);
+
+    const replay = await contextFactory.create(
+      "owner",
+      "はい",
+      new AbortController().signal,
+      "base-replay",
+      "owner_message",
+    );
+    expect(replay.toolContext.baseBuildAuthorized).toBeUndefined();
+  });
+
   it("attaches only the current authenticated owner goal", async () => {
     const first = await factory().create(
       "owner",

@@ -1,7 +1,11 @@
 export type BaseBuildDecision =
   | { readonly kind: "none" }
   | { readonly kind: "authorized"; readonly resume: boolean }
-  | { readonly kind: "clarify"; readonly question: string };
+  | {
+      readonly kind: "clarify";
+      readonly question: string;
+      readonly resume: boolean;
+    };
 
 /** The model never grants the world-changing base-build scope to itself. */
 export function decideBaseBuildRequest(
@@ -9,7 +13,14 @@ export function decideBaseBuildRequest(
   previousBaseIsIncomplete: boolean,
 ): BaseBuildDecision {
   const text = message.trim();
-  if (text.length === 0 || /[?？]/u.test(text)) return { kind: "none" };
+  if (
+    text.length === 0 ||
+    /[?？]/u.test(text) ||
+    /(?:建て|作っ|設営し|建築し)て(?:も)?(?:いい|よい|良い|大丈夫|問題ない)(?:ですか|かな|か|でしょうか)?/u.test(
+      text,
+    )
+  )
+    return { kind: "none" };
   if (
     /(?:建て|設営|建築|作)(?:ら|て)?(?:ないで|なくて|ない|るな)|(?:やめて|キャンセル|中止)/u.test(
       text,
@@ -29,18 +40,21 @@ export function decideBaseBuildRequest(
   if (/(?:石|丸石|レンガ|トウヒ|シラカバ|鉄|ネザー|コンクリート)/u.test(text))
     return {
       kind: "clarify",
+      resume,
       question:
         "現在はオークの板材の小屋を設営できます。材料をオークの板材にしてよいですか。",
     };
   if (/(?:[4-9]\s*[×xX]\s*[4-9]|大き|広い|巨大|城|豪邸|二階|2階)/u.test(text))
     return {
       kind: "clarify",
+      resume,
       question:
         "現在の安全な上限は3×3の小屋一つです。この規模で進めてよいですか。",
     };
   if (/(?:座標|遠く|別の場所|村の中|指定した場所)/u.test(text))
     return {
       kind: "clarify",
+      resume,
       question:
         "現在地付近の平坦で保護されていない区画から選びます。その場所で進めてよいですか。",
     };
@@ -49,6 +63,7 @@ export function decideBaseBuildRequest(
   )
     return {
       kind: "clarify",
+      resume,
       question:
         "保護されていない近隣の区画だけを候補にできます。その条件で進めてよいですか。",
     };
@@ -59,6 +74,7 @@ export function decideBaseBuildRequest(
   )
     return {
       kind: "clarify",
+      resume,
       question:
         "既定の上限は設置23ブロック、採取する原木6本です。この範囲で進めてよいですか。",
     };
