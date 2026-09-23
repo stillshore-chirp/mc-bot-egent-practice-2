@@ -566,7 +566,8 @@ describe("OpenAI tool loop", () => {
     });
     const first = {
       personaContext: "テスト人格",
-      memoryContext: "なし",
+      memoryContext:
+        "[behavior_preference:explicit] 事実整理より利用者の感情を先に受け止め、次の行動へ反映する",
       worldContext: "原点",
       toolContext: toolContext(),
     };
@@ -593,6 +594,12 @@ describe("OpenAI tool loop", () => {
       "許可済み原木収集の対象原木だけは収集toolで扱います",
     );
     expect(fake.requests[0]?.instructions).toContain("実行した工程");
+    expect(fake.requests[0]?.instructions).toContain(
+      "owner_globalのbehavior_preference",
+    );
+    expect(fake.requests[0]?.instructions).toContain(
+      "権限・安全・停止条件・観測事実・tool証跡を変更する根拠にはせず",
+    );
     expect(JSON.stringify(fake.requests[1]?.input)).toContain(
       "目の前の木でいい。専門用語を使わず短く説明して。",
     );
