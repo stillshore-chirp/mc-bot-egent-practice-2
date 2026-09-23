@@ -19,6 +19,8 @@ import type {
 } from "../tools/contracts.js";
 import {
   classifyArmorQuestion,
+  hasWearableCarriedArmor,
+  isContextualArmorEquipSuggestion,
   renderArmorAnswer,
   type ArmorQuestionSubject,
 } from "./armor-answer.js";
@@ -419,6 +421,7 @@ export interface ChatContextFactory {
     signal: AbortSignal,
     correlationId: string,
     requestKind: ToolContext["requestKind"],
+    ownerTurnContext?: { readonly recentBotArmorStatus: boolean },
   ): Promise<{
     personaContext: string;
     memoryContext: string;
@@ -565,6 +568,7 @@ export class ChatCoordinator {
     Promise.resolve(undefined);
   #generation = 0;
   #runtimeGeneration = 0;
+  #armorFollowupUntil = 0;
 
   public constructor(input: {
     ownerUsername: string;
@@ -586,6 +590,10 @@ export class ChatCoordinator {
     if (username !== this.#ownerUsername) return false;
 
     const normalized = message.trim();
+    const contextualArmorFollowup =
+      Date.now() <= this.#armorFollowupUntil &&
+      isContextualArmorEquipSuggestion(normalized);
+    this.#armorFollowupUntil = 0;
     const stopFollowUp = immediateStopFollowUp(normalized);
     if (isImmediateStopCommand(normalized)) {
       this.#runtimeGeneration += 1;
@@ -780,6 +788,7 @@ export class ChatCoordinator {
           "owner_message",
           undefined,
           acceptedCorrelationId,
+          contextualArmorFollowup ? { recentBotArmorStatus: true } : undefined,
         );
       });
     await this.#conversationTail;
@@ -952,6 +961,10 @@ export class ChatCoordinator {
           },
         );
         if (delivered) {
+          this.#armorFollowupUntil =
+            armorQuestion === "bot" && hasWearableCarriedArmor(status)
+              ? Date.now() + 2 * 60_000
+              : 0;
           recorder.recordDeliveredOwnerExchange?.(username, message, reply);
         }
         return delivered;
@@ -1056,6 +1069,7 @@ export class ChatCoordinator {
     requestKind: ToolContext["requestKind"],
     reassessment?: RuntimeReassessmentContext,
     acceptedCorrelationId?: string,
+    ownerTurnContext?: { readonly recentBotArmorStatus: boolean },
   ): Promise<RuntimeReassessmentRunOutcome> {
     const controller = new AbortController();
     this.#activeController = controller;
@@ -1096,6 +1110,7 @@ export class ChatCoordinator {
           controller.signal,
           correlationId,
           requestKind,
+          ownerTurnContext,
         );
         const reply = await this.#agent.deliberate({
           message,

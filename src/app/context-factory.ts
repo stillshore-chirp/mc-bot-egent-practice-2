@@ -7,7 +7,10 @@ import type { TaskRuntime } from "../runtime/task-service.js";
 import type { CognitiveStage } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import { OwnerBehaviorMemoryLearner } from "../agent/behavior-memory-learning.js";
-import { isArmorEquipRequest } from "../agent/armor-answer.js";
+import {
+  isArmorEquipRequest,
+  isContextualArmorEquipSuggestion,
+} from "../agent/armor-answer.js";
 import type {
   BehaviorMemoryPort,
   GameController,
@@ -136,6 +139,7 @@ export class CompanionContextFactory implements ChatContextFactory {
     signal: AbortSignal,
     correlationId: string,
     requestKind: ToolContext["requestKind"],
+    ownerTurnContext?: { readonly recentBotArmorStatus: boolean },
   ): Promise<{
     personaContext: string;
     memoryContext: string;
@@ -457,7 +461,9 @@ export class CompanionContextFactory implements ChatContextFactory {
               ? {
                   behaviorMemoryCandidates: learned.candidates,
                   behaviorMemoryEventId: correlationId,
-                  ...(isArmorEquipRequest(message)
+                  ...(isArmorEquipRequest(message) ||
+                  (ownerTurnContext?.recentBotArmorStatus === true &&
+                    isContextualArmorEquipSuggestion(message))
                     ? {
                         armorEquipAuthorized: true,
                         armorEquipAuthorizationUsage: { consumed: false },

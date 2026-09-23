@@ -1887,36 +1887,39 @@ describe("OpenAI tool loop", () => {
     expect(fake.requests[0]?.instructions).toContain("今回は最初の16個");
   });
 
-  it("equips armor after an explicit owner request even when the model refuses", async () => {
-    const fake = new ScriptedOpenAI([
-      response([], "装備する操作はありません。"),
-    ]);
-    const agent = new OpenAIDeliberationAgent({
-      apiKey: "test-only",
-      model: "test-model",
-      client: fake.asClient(),
-      logger: pino({ level: "silent" }),
-    });
-    const context = toolContext();
-    context.armorEquipAuthorized = true;
-    context.armorEquipAuthorizationUsage = { consumed: false };
-    context.game.equipArmor = async () => ({
-      before: status,
-      after: status,
-      outcome: "completed",
-      summary: "装備欄の変化を確認しました。",
-    });
-    const reply = await agent.deliberate({
-      message: "防具を装備して",
-      personaContext: "テスト人格",
-      memoryContext: "なし",
-      worldContext: "原点",
-      toolContext: context,
-    });
-    expect(reply.toolResults).toMatchObject([{ name: "equip_armor" }]);
-    expect(reply.text).toContain("装備欄の変化を確認しました");
-    expect(reply.text).not.toContain("操作はありません");
-  });
+  it.each(["防具を装備して", "それを着れば？"])(
+    "equips armor for an authorized owner suggestion even when the model refuses: %s",
+    async (message) => {
+      const fake = new ScriptedOpenAI([
+        response([], "装備する操作はありません。"),
+      ]);
+      const agent = new OpenAIDeliberationAgent({
+        apiKey: "test-only",
+        model: "test-model",
+        client: fake.asClient(),
+        logger: pino({ level: "silent" }),
+      });
+      const context = toolContext();
+      context.armorEquipAuthorized = true;
+      context.armorEquipAuthorizationUsage = { consumed: false };
+      context.game.equipArmor = async () => ({
+        before: status,
+        after: status,
+        outcome: "completed",
+        summary: "装備欄の変化を確認しました。",
+      });
+      const reply = await agent.deliberate({
+        message,
+        personaContext: "テスト人格",
+        memoryContext: "なし",
+        worldContext: "原点",
+        toolContext: context,
+      });
+      expect(reply.toolResults).toMatchObject([{ name: "equip_armor" }]);
+      expect(reply.text).toContain("装備欄の変化を確認しました");
+      expect(reply.text).not.toContain("操作はありません");
+    },
+  );
 
   it("does not turn a per-operation limit into a claim that the whole goal is impossible", async () => {
     const fake = new ScriptedOpenAI([

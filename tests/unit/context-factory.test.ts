@@ -148,6 +148,32 @@ describe("CompanionContextFactory owner action boundary", () => {
       expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
     }
   });
+  it("uses a recent bot armor-status context for a short owner suggestion only", async () => {
+    const message = "それを着れば？";
+    const allowed = await factory().create(
+      "owner",
+      message,
+      new AbortController().signal,
+      "armor-followup",
+      "owner_message",
+      { recentBotArmorStatus: true },
+    );
+    expect(allowed.toolContext.armorEquipAuthorized).toBe(true);
+    for (const [username, context] of [
+      ["owner", undefined],
+      ["other", { recentBotArmorStatus: true }],
+    ] as const) {
+      const rejected = await factory().create(
+        username,
+        message,
+        new AbortController().signal,
+        "armor-followup-rejected",
+        "owner_message",
+        context,
+      );
+      expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
+    }
+  });
   it("binds a house request to the dedicated build scope without resource-goal clarification", async () => {
     const allowed = await factory().create(
       "owner",

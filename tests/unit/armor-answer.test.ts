@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyArmorQuestion,
+  hasWearableCarriedArmor,
   isArmorEquipRequest,
+  isContextualArmorEquipSuggestion,
   renderArmorAnswer,
 } from "../../src/agent/armor-answer.js";
 import type { GameStatus } from "../../src/tools/contracts.js";
@@ -27,6 +29,37 @@ const status: GameStatus = {
 };
 
 describe("armor status answer", () => {
+  it("offers a short follow-up only when carried armor fits an empty observed slot", () => {
+    expect(hasWearableCarriedArmor(status)).toBe(true);
+    expect(
+      hasWearableCarriedArmor({
+        ...status,
+        armor: { head: "iron_helmet", torso: null, legs: null, feet: null },
+      }),
+    ).toBe(false);
+    expect(hasWearableCarriedArmor({ ...status, armor: null })).toBe(false);
+    expect(hasWearableCarriedArmor({ ...status, inventory: {} })).toBe(false);
+  });
+
+  it.each([
+    "それを着れば？",
+    "じゃあ、その防具を身に着けてみたら？",
+    "なら装備してみて",
+  ])("recognizes a contextual equipment suggestion: %s", (message) =>
+    expect(isContextualArmorEquipSuggestion(message)).toBe(true),
+  );
+  it.each([
+    "着たらどうなる？",
+    "私が着れば？",
+    "着なくていい",
+    "さっきの話を説明して",
+  ])(
+    "does not treat a hypothetical or unrelated phrase as equipment: %s",
+    (message) => {
+      expect(isContextualArmorEquipSuggestion(message)).toBe(false);
+    },
+  );
+
   it.each([
     "渡した防具、つけてみな",
     "持っている防具を装備して",
