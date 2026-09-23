@@ -65,6 +65,7 @@ PRODUCT_PATTERNS = (
     "src/**",
     "scripts/*.ts",
     "server/tree-guard/**",
+    "docs/base-construction.md",
     "docs/building-protection.md",
     "docs/delivery-storage.md",
     "tests/unit/**",
