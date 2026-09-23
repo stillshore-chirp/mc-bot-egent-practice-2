@@ -1019,7 +1019,10 @@ describe("CompanionGameController", () => {
     close();
   });
 
-  it("observes log candidates for a natural one-tree cutting request", async () => {
+  it.each([
+    ["木を一本切って持ってきて", 1],
+    ["近くの木を少し切って", 2],
+  ])("observes log candidates for %s", async (goal, count) => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push({
       name: "oak_log",
@@ -1028,11 +1031,11 @@ describe("CompanionGameController", () => {
     const { game, close } = createController(minecraft);
     try {
       const candidates = await game.findSafeActionCandidates(
-        { goal: "木を一本切って持ってきて", count: 1, maxCandidates: 4 },
+        { goal, count, maxCandidates: 4 },
         new AbortController().signal,
       );
       expect(candidates).toMatchObject([
-        { resourceName: "oak_log", requestedCount: 1 },
+        { resourceName: "oak_log", requestedCount: count },
       ]);
     } finally {
       close();

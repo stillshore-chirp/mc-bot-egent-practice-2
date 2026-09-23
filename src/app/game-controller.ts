@@ -108,7 +108,11 @@ function isResourceCollectionGoal(goal: string): boolean {
   const normalized = goal.trim().toLocaleLowerCase("ja-JP");
   if (normalized === "collect_resource") return true;
   if (!resourceCollectionIntent.test(normalized)) return false;
-  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(normalized)) {
+  if (
+    /木を(?:少し|ちょっと)?\s*(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(
+      normalized,
+    )
+  ) {
     return true;
   }
   return Object.entries(resourceLabels).some(([resource, label]) => {
