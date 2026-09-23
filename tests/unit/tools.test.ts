@@ -335,6 +335,160 @@ describe("ToolExecutor", () => {
     });
   });
 
+  it.each([3, 6])(
+    "keeps a copper goal bounded after one ore yields %i raw copper",
+    async (dropCount) => {
+      const toolContext = context();
+      toolContext.safeActionAuthorization = {
+        kind: "owner_bounded_resource",
+        goal: "銅インゴットを1個作って",
+        allowedResources: ["copper_ore"],
+        targetItem: "copper_ingot",
+        targetCount: 1,
+        maxCount: 8,
+      };
+      toolContext.safeActionAuthorizationUsage = {
+        remainingCount: 1,
+        consumed: false,
+      };
+      let rawCopper = 0;
+      let copperIngot = 0;
+      let smeltCalls = 0;
+      toolContext.game.observeStatus = async () => ({
+        ...status,
+        inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+      });
+      toolContext.game.findSafeActionCandidates = async () =>
+        rawCopper === 0
+          ? [
+              {
+                id: "mine-copper",
+                label: "観測した銅鉱石",
+                action: "mine_block" as const,
+                observed: true as const,
+                purposeFit: "direct" as const,
+                permission: "allowed" as const,
+                safety: "allowed" as const,
+                reversible: false,
+                impact: "medium" as const,
+                operationClass: "natural_resource" as const,
+                requestedCount: 1,
+                resourceName: "copper_ore",
+                goalItem: "copper_ingot",
+                intermediateItems: ["raw_copper"],
+                distance: 1,
+                steps: [
+                  {
+                    tool: "mine_block",
+                    input: {
+                      name: "copper_ore",
+                      position: { x: 1, y: 64, z: 0 },
+                    },
+                  },
+                ],
+              },
+            ]
+          : [
+              {
+                id: "smelt-copper",
+                label: "原銅を精錬",
+                action: "smelt_item" as const,
+                observed: true as const,
+                purposeFit: "direct" as const,
+                permission: "allowed" as const,
+                safety: "allowed" as const,
+                reversible: false,
+                impact: "low" as const,
+                operationClass: "world_change" as const,
+                scopeId: "inventory",
+                requestedCount: 1,
+                goalItem: "copper_ingot",
+                distance: 1,
+                steps: [
+                  {
+                    tool: "smelt_item",
+                    input: {
+                      input: "raw_copper",
+                      output: "copper_ingot",
+                      count: 1,
+                      furnace: null,
+                    },
+                  },
+                ],
+              },
+            ];
+      toolContext.game.mineBlock = async () => {
+        rawCopper = dropCount;
+        return {
+          before: status,
+          after: {
+            ...status,
+            inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+          },
+          outcome: "completed",
+          confirmedState: {
+            block: "copper_ore",
+            item: "raw_copper",
+            requestedCount: 1,
+            minedCount: 1,
+            collectedCount: dropCount,
+            heldCount: rawCopper,
+          },
+          summary: "原銅の増加を確認しました。",
+        };
+      };
+      toolContext.game.smeltItem = async () => {
+        smeltCalls += 1;
+        rawCopper -= 1;
+        copperIngot = 1;
+        return {
+          before: status,
+          after: {
+            ...status,
+            inventory: { raw_copper: rawCopper, copper_ingot: copperIngot },
+          },
+          outcome: "completed",
+          confirmedState: {
+            item: "copper_ingot",
+            requestedCount: 1,
+            smeltedCount: 1,
+            heldCount: 1,
+          },
+          summary: "銅インゴット1個を確認しました。",
+        };
+      };
+
+      const result = await new ToolExecutor().execute(
+        "plan_safe_action",
+        JSON.stringify({
+          goal: "銅インゴットを1個作って",
+          count: 1,
+          mode: "delegated",
+          candidateId: null,
+        }),
+        toolContext,
+      );
+
+      if (dropCount <= 5) {
+        expect(result).toMatchObject({
+          success: true,
+          data: {
+            completedCount: 1,
+            intermediateProgress: [{ item: "raw_copper", completedCount: 3 }],
+          },
+        });
+        expect(smeltCalls).toBe(1);
+        expect(rawCopper).toBe(2);
+      } else {
+        expect(result).toMatchObject({
+          success: false,
+          error: { code: "SAFE_ACTION_PROGRESS_INVALID" },
+        });
+        expect(smeltCalls).toBe(0);
+      }
+    },
+  );
+
   it("searches once under an owner quantity contract and executes the newly observed log", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {

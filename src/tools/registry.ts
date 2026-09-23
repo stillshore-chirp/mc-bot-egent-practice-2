@@ -108,6 +108,20 @@ function progressItemKey(progress: ActionProgress): string {
   return progress.item ?? "__unidentified_item__";
 }
 
+/** An unenchanted copper ore can produce up to five raw copper per block. */
+function intermediateDropMultiplier(
+  candidate: SafeActionCandidate,
+  progress: ActionProgress,
+): number {
+  return candidate.action === "mine_block" &&
+    (candidate.resourceName === "copper_ore" ||
+      candidate.resourceName === "deepslate_copper_ore") &&
+    progress.item === "raw_copper" &&
+    candidate.intermediateItems?.includes("raw_copper")
+    ? 5
+    : 1;
+}
+
 function positiveIntegerInput(
   input: Readonly<Record<string, unknown>>,
 ): number | undefined {
@@ -1039,10 +1053,14 @@ export const toolDefinitions = [
         const progressByItem = new Map<string, number>();
         let invalidProgress: ActionProgress | undefined;
         for (const candidateProgress of progresses) {
+          const dropMultiplier = intermediateDropMultiplier(
+            planned.candidate,
+            candidateProgress,
+          );
           if (
             candidateProgress.completedCount < 1 ||
             candidateProgress.completedCount >
-              candidateProgress.requestedCount ||
+              candidateProgress.requestedCount * dropMultiplier ||
             candidateProgress.requestedCount < 1 ||
             candidateProgress.requestedCount > remainingCount ||
             (expectedCount !== undefined &&
@@ -1057,7 +1075,9 @@ export const toolDefinitions = [
             (progressByItem.get(key) ?? 0) + candidateProgress.completedCount;
           progressByItem.set(key, total);
           if (
-            total > Math.min(remainingCount, expectedCount ?? remainingCount)
+            total >
+            Math.min(remainingCount, expectedCount ?? remainingCount) *
+              dropMultiplier
           ) {
             invalidProgress = candidateProgress;
             break;
@@ -1117,7 +1137,12 @@ export const toolDefinitions = [
           (total, previous) => total + previous.completedCount,
           0,
         );
-        if (intermediateCount > actionCount) {
+        const intermediateLimit =
+          actionCount *
+          (intermediateProgress.some((entry) => entry.item === "raw_copper")
+            ? 5
+            : 1);
+        if (intermediateCount > intermediateLimit) {
           return safeActionFailure(
             "safety",
             "SAFE_ACTION_INTERMEDIATE_LIMIT",
@@ -1130,7 +1155,7 @@ export const toolDefinitions = [
               planRounds,
               completedSteps: completedSteps.length,
               intermediateCount,
-              intermediateLimit: actionCount,
+              intermediateLimit,
               progress,
             },
             [
