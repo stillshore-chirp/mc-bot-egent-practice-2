@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { behaviorMemoryTools } from "./behavior-memory-tools.js";
 import { deliveryRegistrationTools } from "./delivery-tools.js";
 
 import {
@@ -225,6 +226,7 @@ function defineTool<Name extends string, Input extends z.ZodType, Output>(
 
 export const toolDefinitions = [
   ...deliveryRegistrationTools,
+  ...behaviorMemoryTools,
   defineTool({
     name: "observe_status",
     description:

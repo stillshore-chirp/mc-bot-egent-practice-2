@@ -1,11 +1,14 @@
 import type { AppConfig } from "../config/schema.js";
+import { behaviorMemoryDescription } from "../memory/behavior-memory.js";
 import type { MemoryStore } from "../memory/store.js";
 import type { PersonaCore } from "../persona/persona.js";
 import { buildPersonaContext } from "../persona/persona.js";
 import type { TaskRuntime } from "../runtime/task-service.js";
 import type { CognitiveStage } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
+import { OwnerBehaviorMemoryLearner } from "../agent/behavior-memory-learning.js";
 import type {
+  BehaviorMemoryPort,
   GameController,
   MemoryPort,
   ToolContext,
@@ -43,6 +46,7 @@ async function safeWithTraceSpan<T>(
 
 export class CompanionContextFactory implements ChatContextFactory {
   #pendingOwnerGoal: PendingOwnerGoal | undefined;
+  readonly #behaviorLearner: OwnerBehaviorMemoryLearner;
 
   public constructor(
     private readonly config: AppConfig,
@@ -53,7 +57,10 @@ export class CompanionContextFactory implements ChatContextFactory {
     private readonly game: GameController,
     private readonly tasks: TaskRuntime,
     private readonly traceService?: TraceService,
-  ) {}
+    private readonly toolBehaviorMemory?: BehaviorMemoryPort,
+  ) {
+    this.#behaviorLearner = new OwnerBehaviorMemoryLearner(memoryStore);
+  }
 
   public clearPendingOwnerGoal(): void {
     this.#pendingOwnerGoal = undefined;
@@ -80,6 +87,29 @@ export class CompanionContextFactory implements ChatContextFactory {
         attributes: { requestKind },
       },
       async () => {
+        const learned =
+          requestKind === "owner_message" &&
+          requesterUsername === this.config.ownerUsername
+            ? await safeWithTraceSpan(
+                this.traceService,
+                "memory_write",
+                "行動記憶を更新",
+                { summary: "ownerの継続希望を構造化して保存" },
+                async () =>
+                  this.#behaviorLearner.learn({
+                    ownerUsername: this.config.ownerUsername,
+                    requesterUsername,
+                    playerId: this.playerId,
+                    message,
+                    requestKind,
+                    eventId: correlationId,
+                  }),
+              )
+            : {
+                candidates: [],
+                savedCount: 0,
+                failedCount: 0,
+              };
         const relationship = await safeWithTraceSpan(
           this.traceService,
           "memory_read",
@@ -149,6 +179,29 @@ export class CompanionContextFactory implements ChatContextFactory {
             `[latest_task] 最新の作業結果: ${task.kind} ${task.status}/${task.phase}${task.failure === undefined ? "" : ` failure=${task.failure.code}`} (${task.updatedAt})`,
           );
         }
+        const behaviorMemories =
+          typeof this.memoryStore.listBehaviorMemories === "function"
+            ? await safeWithTraceSpan(
+                this.traceService,
+                "memory_read",
+                "行動記憶を参照",
+                { summary: "適用可能な行動記憶を参照" },
+                async () =>
+                  this.memoryStore.listBehaviorMemories(this.playerId, {
+                    limit: this.config.limits.memoryContextLimit,
+                  }),
+              )
+            : [];
+        contextLines.push(
+          ...behaviorMemories
+            .filter((record) =>
+              this.memoryStore.behaviorMemoryIsApplicable(record),
+            )
+            .map(
+              (record) =>
+                `[behavior_preference:${record.confidence}] ${behaviorMemoryDescription(record)}`,
+            ),
+        );
         const remaining = Math.max(
           0,
           this.config.limits.memoryContextLimit - contextLines.length,
@@ -260,6 +313,16 @@ export class CompanionContextFactory implements ChatContextFactory {
             executionEvidence: { verifiedActionReceipts: [] },
             game: this.game,
             memory: this.toolMemory,
+            ...(this.toolBehaviorMemory === undefined
+              ? {}
+              : { behaviorMemory: this.toolBehaviorMemory }),
+            ...(requestKind === "owner_message" &&
+            requesterUsername === this.config.ownerUsername
+              ? {
+                  behaviorMemoryCandidates: learned.candidates,
+                  behaviorMemoryEventId: correlationId,
+                }
+              : {}),
             limits: {
               maxMoveDistance: this.config.limits.maxMoveDistance,
               maxGatherCount: this.config.limits.maxGatherCount,

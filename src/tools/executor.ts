@@ -11,9 +11,25 @@ export const runtimeReassessmentToolNames = new Set([
   "observe_surroundings",
   "recall_memory",
   "get_delivery_targets",
+  "list_behavior_memory",
 ]);
 
-const memoryReadTools = new Set(["recall_memory", "get_delivery_targets"]);
+const memoryReadTools = new Set([
+  "recall_memory",
+  "get_delivery_targets",
+  "list_behavior_memory",
+]);
+const memoryWriteTools = new Set([
+  "remember_player_fact",
+  "remember_location",
+  "register_delivery_target",
+  "forget_delivery_target",
+  "set_commitment",
+  "complete_commitment",
+  "remember_behavior_memory",
+  "correct_behavior_memory",
+  "forget_behavior_memory",
+]);
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,

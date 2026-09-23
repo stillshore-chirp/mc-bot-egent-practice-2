@@ -34,6 +34,8 @@ const secretValue =
   /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/u;
 const sensitivePersonalData =
   /(?:住所|電話番号|メールアドレス|本名|生年月日|マイナンバー|パスワード|\b\d{3}[- ]?\d{4}[- ]?\d{4}\b|\b\d{1,3}(?:\.\d{1,3}){3}\b)/iu;
+const untrustedAttribution =
+  /[「」『』“”"'`]|(?:他人|第三者|別の人|他のプレイヤー|別のプレイヤー|看板|本|書物|ログ|ツール結果|tool結果|引用|引用文|システムメッセージ|と言った|と言っていた|と書いてある|と書かれている|が言った|が書いた)/iu;
 const protectedOverride =
   /(?:安全|保護|認証|権限|停止|危険|確認).{0,24}(?:無視|解除|無効|省略|回避|迂回|しなくて(?:いい|よい)|守らなくて(?:いい|よい)|なくて(?:いい|よい)|(?:無|な)しで|(?:無|な)しに|不要|いらない|要らない|必要ない)|(?:無視|解除|無効|省略|回避|迂回|しなくて(?:いい|よい)|守らなくて(?:いい|よい)|なくて(?:いい|よい)|(?:無|な)しで|(?:無|な)しに|不要|いらない|要らない|必要ない).{0,24}(?:安全|保護|認証|権限|停止|危険|確認)/iu;
 
@@ -485,11 +487,12 @@ export function extractBehaviorMemory(
     sensitivePersonalData.test(normalized)
   )
     return [];
+  if (untrustedAttribution.test(normalized)) return [];
   if (protectedOverride.test(normalized)) return [];
   if (/今だけ|今回は|一旦|この作業だけ/iu.test(normalized)) return [];
 
   const stable =
-    /覚えて(?:おいて)?|記憶して|今後|次から|これから|いつも|継続して|好み|訂正|修正|違う|前の/u.test(
+    /覚えて(?:おいて)?|記憶して|今後|次から|これから|いつも|継続して|好み|訂正|修正|違う|前の|(?:感情|気持ち).{0,16}(?:重視|優先|大事|大切)|(?:重視|優先).{0,16}(?:感情|気持ち)/u.test(
       normalized,
     );
   const correction = /訂正|修正|違う|前の/u.test(normalized);
@@ -567,6 +570,28 @@ function knownPreferences(
     slots.add(candidate.slot);
     results.push(candidate);
   };
+
+  const emotionPreference =
+    /感情|気持ち|不満|苛立|いら立|失望|つら|辛い|悲し|困って|腹立|拒絶/iu.test(
+      message,
+    ) && /重視|優先|大事|大切|受け止|配慮|考慮|汲|寄り添/iu.test(message);
+  const emotionFeedback =
+    feedback &&
+    /不満|苛立|いら立|失望|つら|辛い|悲し|困って|腹立|拒絶/iu.test(message) &&
+    /対応|説明|返答|理由|次|行動|断る/iu.test(message);
+  if (emotionPreference || emotionFeedback) {
+    add(
+      extraction(
+        "feedback",
+        "owner_emotion",
+        "prioritize_owner_emotion",
+        "事実整理より利用者の感情を先に受け止め、次の行動へ反映する",
+        source,
+        confidence,
+        reason,
+      ),
+    );
+  }
 
   if (/専門用語|難しい言葉|分かりにく|わかりにく|平易|かみ砕/iu.test(message)) {
     add(
@@ -738,6 +763,9 @@ function knownSlotFromMessage(
   if (/状況|文脈|会話/iu.test(message)) {
     return { category: "planning", slot: "context" };
   }
+  if (/感情|気持ち|不満|苛立|失望/iu.test(message)) {
+    return { category: "feedback", slot: "owner_emotion" };
+  }
   return undefined;
 }
 
@@ -752,6 +780,8 @@ export function behaviorMemoryDescription(
     avoid_repeated_confirmation: "同じ確認や細かな指示を繰り返し求めない",
     use_conversation_context: "会話と現在状態を踏まえて判断する",
     explain_reason_and_next_step: "停止・失敗時に理由と次の操作を説明する",
+    prioritize_owner_emotion:
+      "事実整理より利用者の感情を先に受け止め、次の行動へ反映する",
   };
   return descriptions[record.value] ?? record.summary;
 }

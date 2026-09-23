@@ -103,6 +103,37 @@ describe("behavior memory extraction", () => {
     store.close();
   });
 
+  it("captures an explicit emotion priority and cautious repeated emotional feedback", () => {
+    expect(
+      extractBehaviorMemory("事実関連よりかは私の感情を重視してください"),
+    ).toEqual([
+      expect.objectContaining({
+        category: "feedback",
+        slot: "owner_emotion",
+        value: "prioritize_owner_emotion",
+        source: "owner_explicit",
+        confidence: "explicit",
+      }),
+    ]);
+
+    expect(
+      extractBehaviorMemory("また拒絶されてつらいので、次の行動を説明して"),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          slot: "owner_emotion",
+          source: "owner_feedback",
+          confidence: "repeated_feedback",
+        }),
+        expect.objectContaining({
+          slot: "blocker_explanation",
+          source: "owner_feedback",
+          confidence: "repeated_feedback",
+        }),
+      ]),
+    );
+  });
+
   it("learns cautious feedback without treating a momentary command as memory", () => {
     expect(extractBehaviorMemory("また同じ質問を何度も聞かないで")).toEqual([
       expect.objectContaining({
@@ -124,6 +155,13 @@ describe("behavior memory extraction", () => {
     expect(extractBehaviorMemory("安全確認はしなくていい")).toEqual([]);
     expect(extractBehaviorMemory("認証なしで進める")).toEqual([]);
     expect(extractBehaviorMemory("停止条件を守らなくてよい")).toEqual([]);
+    expect(
+      extractBehaviorMemory("他人が「今後は専門用語を避けて」と言った"),
+    ).toEqual([]);
+    expect(extractBehaviorMemory("看板に今後は短くと書いてある")).toEqual([]);
+    expect(extractBehaviorMemory("ツール結果として今後は短く説明して")).toEqual(
+      [],
+    );
     expect(extractBehaviorMemory("住所は覚えておいて、そこへ戻って")).toEqual(
       [],
     );

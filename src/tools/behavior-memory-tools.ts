@@ -1,7 +1,11 @@
 import { z } from "zod";
 
-import { behaviorMemoryDescription } from "../memory/behavior-memory.js";
-import { BehaviorMemoryError } from "../memory/behavior-memory.js";
+import { behaviorMemoryEventKey } from "../agent/behavior-memory-learning.js";
+import {
+  behaviorMemoryDescription,
+  BehaviorMemoryError,
+  type BehaviorMemoryExtraction,
+} from "../memory/behavior-memory.js";
 import { behaviorMemoryCategories } from "../memory/types.js";
 import type { BehaviorMemoryRecord } from "../memory/types.js";
 import type { ToolContext, ToolResult } from "./contracts.js";
@@ -94,6 +98,37 @@ function ownerWriteOnly(context: ToolContext): ToolResult<unknown> | undefined {
   return undefined;
 }
 
+function candidateFor(
+  context: ToolContext,
+  input: {
+    readonly category: string;
+    readonly slot: string;
+    readonly value: string;
+    readonly summary: string;
+  },
+): BehaviorMemoryExtraction | undefined {
+  return context.behaviorMemoryCandidates?.find(
+    (candidate) =>
+      candidate.category === input.category &&
+      candidate.slot === input.slot &&
+      candidate.value === input.value &&
+      candidate.summary === input.summary,
+  );
+}
+
+function candidateEventKey(
+  context: ToolContext,
+  candidate: BehaviorMemoryExtraction,
+): string | undefined {
+  return context.behaviorMemoryEventId === undefined
+    ? undefined
+    : behaviorMemoryEventKey(
+        context.playerId,
+        context.behaviorMemoryEventId,
+        candidate.slot,
+      );
+}
+
 function publicRecord(record: BehaviorMemoryRecord) {
   return {
     id: record.id,
@@ -138,13 +173,23 @@ export const behaviorMemoryTools = [
       const ownerFailure = ownerWriteOnly(context);
       if (ownerFailure !== undefined) return ownerFailure;
       if (context.behaviorMemory === undefined) return unavailable();
+      const candidate = candidateFor(context, input);
+      if (candidate?.source !== "owner_explicit") {
+        return invalidMemory(
+          new BehaviorMemoryError(
+            "Behavior memory writes must match the authenticated owner message.",
+          ),
+        );
+      }
       try {
+        const idempotencyKey = candidateEventKey(context, candidate);
         const record = context.behaviorMemory.remember({
           playerId: context.playerId,
           ...input,
           source: "owner_explicit",
           confidence: "explicit",
           scope: "owner_global",
+          ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         });
         return {
           success: true,
@@ -241,7 +286,16 @@ export const behaviorMemoryTools = [
       const ownerFailure = ownerWriteOnly(context);
       if (ownerFailure !== undefined) return ownerFailure;
       if (context.behaviorMemory === undefined) return unavailable();
+      const candidate = candidateFor(context, input);
+      if (candidate?.source !== "owner_correction") {
+        return invalidMemory(
+          new BehaviorMemoryError(
+            "Behavior memory corrections must match an authenticated owner correction.",
+          ),
+        );
+      }
       try {
+        const idempotencyKey = candidateEventKey(context, candidate);
         const record = context.behaviorMemory.correct({
           playerId: context.playerId,
           ...(input.memoryId === null ? {} : { memoryId: input.memoryId }),
@@ -249,6 +303,7 @@ export const behaviorMemoryTools = [
           slot: input.slot,
           value: input.value,
           summary: input.summary,
+          ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         });
         return {
           success: true,

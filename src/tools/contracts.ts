@@ -21,6 +21,7 @@ import type {
   ForgetBehaviorMemoryInput,
   RememberBehaviorMemoryInput,
 } from "../memory/types.js";
+import type { BehaviorMemoryExtraction } from "../memory/behavior-memory.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -345,6 +346,10 @@ export interface ToolContext {
   allowedDeliveryTargetKinds?: readonly ("home" | "chest")[];
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;
+  /** Candidates extracted from this authenticated owner message only. */
+  behaviorMemoryCandidates?: readonly BehaviorMemoryExtraction[];
+  /** Opaque accepted-message id used to make behavior writes idempotent. */
+  behaviorMemoryEventId?: string;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;
