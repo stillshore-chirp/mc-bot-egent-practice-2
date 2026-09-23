@@ -20,6 +20,15 @@ export interface ResourceTarget {
   readonly position: Position;
 }
 
+export interface BuildBlockObservation {
+  /** Null means the chunk or block could not be observed. */
+  readonly name: string | null;
+  /** The server confirmed the observed name through the read-only guard. */
+  readonly serverConfirmed: boolean;
+  /** A fresh permit would be possible now; placement rechecks before mutation. */
+  readonly placementAllowed: boolean;
+}
+
 export type EscapeMode = "environment" | "hostile";
 
 export interface ArmorEquipResult {
@@ -111,6 +120,11 @@ export interface MinecraftPort {
   collectItem(target: CollectItemInput, signal: AbortSignal): Promise<void>;
   craftItem(target: CraftItemInput, signal: AbortSignal): Promise<number>;
   placeBlock(target: PlaceBlockInput, signal: AbortSignal): Promise<void>;
+  inspectBuildBlock(
+    position: Position,
+    material: string,
+    signal: AbortSignal,
+  ): Promise<BuildBlockObservation>;
   smeltItem(target: SmeltItemInput, signal: AbortSignal): Promise<number>;
   collectDropsNear(
     position: Position,

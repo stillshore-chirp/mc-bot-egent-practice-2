@@ -33,6 +33,7 @@ import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay } from "../runtime/timeout.js";
 import type {
   ArmorEquipResult,
+  BuildBlockObservation,
   EscapeMode,
   MinecraftLogger,
   MinecraftPort,
@@ -2088,6 +2089,41 @@ export class MineflayerClient implements MinecraftPort {
         failedAt: "place_block",
       });
     }
+  }
+
+  public async inspectBuildBlock(
+    position: Position,
+    material: string,
+    signal: AbortSignal,
+  ): Promise<BuildBlockObservation> {
+    throwIfAborted(signal, "inspect_build_block");
+    const bot = this.requireBot();
+    const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
+    if (block === null) {
+      return { name: null, serverConfirmed: false, placementAllowed: false };
+    }
+    if (isAirName(block.name)) {
+      const decision = await queryActionGuard(
+        bot._client,
+        { operation: "place", name: material, position },
+        signal,
+      );
+      return {
+        name: "air",
+        serverConfirmed: decision === "allowed" || decision === "protected",
+        placementAllowed: decision === "allowed",
+      };
+    }
+    const decision = await queryActionGuard(
+      bot._client,
+      { operation: "inspect", name: block.name, position },
+      signal,
+    );
+    return {
+      name: block.name,
+      serverConfirmed: decision === "allowed",
+      placementAllowed: false,
+    };
   }
 
   public async smeltItem(
