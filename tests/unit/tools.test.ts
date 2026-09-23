@@ -2124,6 +2124,47 @@ describe("ToolExecutor", () => {
     expect(calls).toBe(1);
   });
 
+  it("keeps verified surplus logs from a direct gather and credits only the owner goal", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "オークの原木を1本集めて",
+      allowedResources: ["oak_log"],
+      targetItem: "oak_log",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    toolContext.game.gatherResource = async () => ({
+      before: status,
+      after: { ...status, inventory: { oak_log: 2 } },
+      outcome: "completed",
+      confirmedState: {
+        resource: "oak_log",
+        requestedCount: 1,
+        collectedCount: 2,
+        heldCount: 2,
+      },
+      summary: "オークの原木を2個収集し、所持品で確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "gather_resource",
+      JSON.stringify({ resource: "oak_log", count: 1, commitmentId: null }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      progress: { item: "oak_log", requestedCount: 1, completedCount: 2 },
+    });
+    expect(result.success && result.userSummary).toContain("2個収集");
+    expect(toolContext.safeActionAuthorizationUsage.remainingCount).toBe(0);
+  });
+
   it("consumes a confirmed partial direct gather before allowing the remainder", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
