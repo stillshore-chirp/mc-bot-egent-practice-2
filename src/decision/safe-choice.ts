@@ -32,9 +32,11 @@ export type SafeChoiceAuthorization =
       readonly targetItem: string;
       /** `*` permits one observed item from the bounded allowed resource set. */
       readonly selectionRequired?: boolean;
-      /** Exact quantity extracted from the owner message. */
+      /** Quantity authorized for this bounded stage. */
       readonly targetCount: number;
       readonly maxCount: number;
+      /** Larger owner goal; this stage alone must not be reported as complete. */
+      readonly totalGoalCount?: number;
     }
   | {
       readonly kind: "owner_scoped_change";

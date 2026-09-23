@@ -388,9 +388,9 @@ export function deriveOwnerGoalAuthorization(
   }
   const requestedCount =
     count ??
-    (hasDelegatedQuantity(goalClause)
-      ? delegatedCount(goalClause, input.maxCount)
-      : undefined);
+    (/[0-9]+\s*(?:秒|分|時間)/u.test(goalClause)
+      ? undefined
+      : delegatedCount(goalClause, input.maxCount));
   if (requestedCount === undefined) {
     return {
       outcome: "clarify",
@@ -409,13 +409,6 @@ export function deriveOwnerGoalAuthorization(
         "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
     };
   }
-  if (requestedCount > input.maxCount) {
-    return {
-      outcome: "clarify",
-      question: `指定数が上限を超えています。${resource.label}は${String(input.maxCount)}個以下で指定してください。`,
-    };
-  }
-
   return {
     outcome: "authorized",
     authorization: {
@@ -423,8 +416,11 @@ export function deriveOwnerGoalAuthorization(
       goal: goalClause,
       allowedResources: resource.allowedResources,
       targetItem: resource.targetItem,
-      targetCount: requestedCount,
+      targetCount: Math.min(requestedCount, input.maxCount),
       maxCount: input.maxCount,
+      ...(requestedCount > input.maxCount
+        ? { totalGoalCount: requestedCount }
+        : {}),
       ...(resource.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
@@ -442,12 +438,6 @@ function authorizePendingGoal(
         "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
     };
   }
-  if (count > maxCount) {
-    return {
-      outcome: "clarify",
-      question: `指定数が上限を超えています。${pendingGoal.label}は${String(maxCount)}個以下で指定してください。`,
-    };
-  }
   return {
     outcome: "authorized",
     authorization: {
@@ -455,8 +445,9 @@ function authorizePendingGoal(
       goal: pendingGoal.goal,
       allowedResources: pendingGoal.allowedResources,
       targetItem: pendingGoal.targetItem,
-      targetCount: count,
+      targetCount: Math.min(count, maxCount),
       maxCount,
+      ...(count > maxCount ? { totalGoalCount: count } : {}),
       ...(pendingGoal.targetItem === "*" ? { selectionRequired: true } : {}),
     },
   };
@@ -495,7 +486,7 @@ function isPendingGoalValid(
 }
 
 function isStandaloneQuantityReply(message: string): boolean {
-  return /^(?:あと\s*)?(?:[0-9]{1,3}\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
+  return /^(?:あと\s*)?(?:(?:[0-9]{1,7}|[0-9]{1,3}\s*万)\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)(?:\s*(?:で|お願いします|お願い|ください|ね))*$/iu.test(
     message,
   );
 }
@@ -506,19 +497,13 @@ function isStandaloneDelegationReply(message: string): boolean {
   );
 }
 
-function hasDelegatedQuantity(message: string): boolean {
-  return /(?:少し(?:だけ)?|ちょっと(?:だけ)?|適量|いい感じに|数量は任せる|量は任せる|何個か|切ってみて|集めてみて)/u.test(
-    message,
-  );
-}
-
 function delegatedCount(message: string, maxCount: number): number {
   const modestCount = /(?:少し|ちょっと)/u.test(message) ? 2 : 4;
   return Math.min(modestCount, maxCount);
 }
 
 function hasCollectionQuantityUnit(message: string): boolean {
-  return /(?:[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
+  return /(?:(?:[0-9]|万)\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
     message,
   );
 }
@@ -597,15 +582,20 @@ function hasMultipleResourceMentions(
 function countMentions(message: string): number {
   const numeric = [
     ...message.matchAll(
-      /[0-9]{1,3}\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
+      /(?:[0-9]{1,7}|[0-9]{1,3}\s*万)\s*(?:個分|個|つ|本|枚|ブロック|items?|blocks?)(?=\s|$|[^0-9])/giu,
     ),
   ].length;
   return numeric + [...message.matchAll(/一\s*本/gu)].length;
 }
 
 function parseCount(message: string): number | undefined {
+  const tenThousands =
+    /(?:^|[^0-9])([0-9]{1,3})\s*万\s*(?:個|つ|本|枚|ブロック)(?=\s|$|[^0-9])/u.exec(
+      message,
+    );
+  if (tenThousands !== null) return Number(tenThousands[1]) * 10_000;
   const match =
-    /(?:^|[^0-9])([0-9]{1,3})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
+    /(?:^|[^0-9])([0-9]{1,7})\s*(?:個|つ|本|枚|ブロック|個分|items?|blocks?)(?=\s|$|[^0-9])/iu.exec(
       message,
     );
   if (match === null) return /一\s*本/u.test(message) ? 1 : undefined;

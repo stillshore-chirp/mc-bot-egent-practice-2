@@ -314,7 +314,7 @@ describe("owner goal authorization", () => {
   it("binds the next standalone quantity reply to a pending owner goal", () => {
     const first = deriveOwnerGoalAuthorization({
       ...ownerInput,
-      message: "鉄を掘って",
+      message: "鉄を10秒採掘して",
       nowMs: 1_000,
     });
 
@@ -349,7 +349,7 @@ describe("owner goal authorization", () => {
     (message) => {
       const first = deriveOwnerGoalAuthorization({
         ...ownerInput,
-        message: "近くの木を切って",
+        message: "原木を10秒集めて",
         nowMs: 1_000,
       });
       if (first.outcome !== "clarify" || first.pendingGoal === undefined)
@@ -375,8 +375,10 @@ describe("owner goal authorization", () => {
 
   it.each([
     ["近くの木を切ってみて", 4],
+    ["近くの木を切って", 4],
     ["木を少し切って", 2],
     ["鉄を適量集めて", 4],
+    ["鉄を掘って", 4],
   ])("starts a small bounded trial for %s", (message, targetCount) => {
     expect(
       deriveOwnerGoalAuthorization({ ...ownerInput, message }),
@@ -399,12 +401,28 @@ describe("owner goal authorization", () => {
     });
   });
 
+  it.each(["鉄を2万個集めて", "鉄を20000個集めて", "鉄を65個集めて"])(
+    "starts a bounded stage of a larger owner goal: %s",
+    (message) => {
+      expect(
+        deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+      ).toMatchObject({
+        outcome: "authorized",
+        authorization: {
+          targetItem: "raw_iron",
+          targetCount: 64,
+          totalGoalCount: message.includes("65") ? 65 : 20_000,
+        },
+      });
+    },
+  );
+
   it.each(["適量でいい？", "適量は必要ない", "拠点に戻って"])(
     "does not authorize a pending goal from an unrelated reply: %s",
     (message) => {
       const first = deriveOwnerGoalAuthorization({
         ...ownerInput,
-        message: "近くの木を切って",
+        message: "原木を10秒集めて",
         nowMs: 1_000,
       });
       if (first.outcome !== "clarify" || first.pendingGoal === undefined)
@@ -426,7 +444,7 @@ describe("owner goal authorization", () => {
   ])("does not authorize a pending goal from a %s reply", (_label, message) => {
     const first = deriveOwnerGoalAuthorization({
       ...ownerInput,
-      message: "鉄を掘って",
+      message: "鉄を10秒採掘して",
       nowMs: 1_000,
     });
     if (first.outcome !== "clarify" || first.pendingGoal === undefined)
@@ -480,7 +498,7 @@ describe("owner goal authorization", () => {
   it("does not use an expired or foreign pending goal", () => {
     const first = deriveOwnerGoalAuthorization({
       ...ownerInput,
-      message: "鉄を掘って",
+      message: "鉄を10秒採掘して",
       nowMs: 1_000,
     });
     if (first.outcome !== "clarify" || first.pendingGoal === undefined)
@@ -506,8 +524,7 @@ describe("owner goal authorization", () => {
 
   it.each([
     ["unknown resource", "鉱石20個を集めて"],
-    ["missing count", "鉄を集めて"],
-    ["over limit", "鉄65個を集めて"],
+    ["time-limited request", "鉄を10秒採掘して"],
   ])("asks once for a concrete boundary when %s", (_label, message) => {
     const result = deriveOwnerGoalAuthorization({
       ...ownerInput,

@@ -202,7 +202,7 @@ describe("owner goal quantity follow-up boundary", () => {
     const contextFactory = createFactory(calls);
     const first = await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "integration-pending-1",
       "owner_message",
@@ -240,7 +240,7 @@ describe("owner goal quantity follow-up boundary", () => {
     const contextFactory = createFactory([]);
     await contextFactory.create(
       "owner",
-      "鉄を掘って",
+      "鉄を10秒採掘して",
       new AbortController().signal,
       "integration-held-1",
       "owner_message",
@@ -261,7 +261,7 @@ describe("owner goal quantity follow-up boundary", () => {
     const contextFactory = createFactory([]);
     await contextFactory.create(
       "owner",
-      "近くの木を切って",
+      "原木を10秒集めて",
       new AbortController().signal,
       "integration-delegated-1",
       "owner_message",
