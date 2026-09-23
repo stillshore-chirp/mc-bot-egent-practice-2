@@ -2657,9 +2657,22 @@ export class MineflayerClient implements MinecraftPort {
         );
         const shoreDeadline =
           Date.now() + (afterAscent.oxygenState === "normal" ? 5_000 : 2_000);
-        for (const candidate of candidates.slice(0, 4)) {
+        for (const candidate of candidates) {
           throwIfAborted(signal, "water_escape");
           if (Date.now() >= shoreDeadline) break;
+          const beforePlanning = await this.observe();
+          if (
+            beforePlanning.health < afterAscent.health ||
+            (beforePlanning.inWater && beforePlanning.oxygenState !== "normal")
+          ) {
+            throw new AppError({
+              category: "safety",
+              code: "SHORE_NOT_REACHED",
+              message: "Health or air became unsafe before reaching shore",
+              retryable: true,
+              failedAt: "water_escape",
+            });
+          }
           const goal = new goals.GoalBlock(
             candidate.x,
             candidate.y,
@@ -2689,15 +2702,19 @@ export class MineflayerClient implements MinecraftPort {
             bot.pathfinder.setMovements(
               new ObservedShoreMovements(bot, origin, radius, approvedNodes),
             );
-            await this.runPathfinder(
+            await this.runShorePathfinder(
               goal,
-              AbortSignal.any([
-                signal,
-                AbortSignal.timeout(Math.max(1, shoreDeadline - Date.now())),
-              ]),
+              signal,
+              shoreDeadline,
+              afterAscent.health,
             );
           } catch (error) {
             if (signal.aborted) throw error;
+            if (
+              error instanceof AppError &&
+              error.detail.code === "SHORE_NOT_REACHED"
+            )
+              throw error;
             continue;
           } finally {
             bot.pathfinder.setGoal(null);
@@ -2799,6 +2816,57 @@ export class MineflayerClient implements MinecraftPort {
       });
     }
     return this.botInstance;
+  }
+
+  private async runShorePathfinder(
+    goal: PathfinderGoals.Goal,
+    signal: AbortSignal,
+    deadline: number,
+    baselineHealth: number,
+  ): Promise<void> {
+    const unsafeAbort = new AbortController();
+    const traversalSignal = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      unsafeAbort.signal,
+    ]);
+    const unsafeVitals = { detected: false };
+    const vitalsTimer = setInterval(() => {
+      if (traversalSignal.aborted) return;
+      void this.observe()
+        .then((vitals) => {
+          if (traversalSignal.aborted) return;
+          if (
+            vitals.health < baselineHealth ||
+            (vitals.inWater && vitals.oxygenState !== "normal")
+          ) {
+            unsafeVitals.detected = true;
+            unsafeAbort.abort();
+          }
+        })
+        .catch(() => {
+          if (traversalSignal.aborted) return;
+          unsafeVitals.detected = true;
+          unsafeAbort.abort();
+        });
+    }, 250);
+    try {
+      await this.runPathfinder(goal, traversalSignal);
+    } catch (error) {
+      if (unsafeVitals.detected) {
+        throw new AppError({
+          category: "safety",
+          code: "SHORE_NOT_REACHED",
+          message: "Health or air became unsafe while moving to shore",
+          retryable: true,
+          failedAt: "water_escape",
+        });
+      }
+      throw error;
+    } finally {
+      clearInterval(vitalsTimer);
+      unsafeAbort.abort();
+    }
   }
 
   private async runPathfinder(
