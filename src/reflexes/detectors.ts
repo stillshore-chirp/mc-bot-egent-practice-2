@@ -49,6 +49,10 @@ export class ReflexDetector {
   public detect(
     current: WorldSnapshot,
     movementExpected: boolean,
+    isExpectedDescentDamage?: (
+      previous: WorldSnapshot,
+      current: WorldSnapshot,
+    ) => boolean,
   ): ReflexIncident | undefined {
     const previous = this.previous;
     this.previous = current;
@@ -83,7 +87,11 @@ export class ReflexDetector {
         observation,
       };
     }
-    if (previous?.health !== undefined && current.health < previous.health) {
+    if (
+      previous?.health !== undefined &&
+      current.health < previous.health &&
+      !isExpectedDescentDamage?.(previous, current)
+    ) {
       return {
         kind: "damage",
         reason: "Health decreased",

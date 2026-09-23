@@ -184,6 +184,13 @@ export class FakeMinecraft implements MinecraftPort {
     return structuredClone({ ...this.snapshot, observedAt: now() });
   }
 
+  public isExpectedDescentDamage(
+    _previous: WorldSnapshot,
+    _current: WorldSnapshot,
+  ): boolean {
+    return false;
+  }
+
   public async observeSurroundings(
     _radius: number,
     includeEntities: boolean,
@@ -232,6 +239,21 @@ export class FakeMinecraft implements MinecraftPort {
           position.z - player.position.z,
         ),
       })),
+    };
+  }
+
+  public async moveToWithSafeDescent(
+    position: Position,
+    range: number,
+    signal: AbortSignal,
+  ) {
+    const healthBefore = this.snapshot.health;
+    await this.moveTo(position, range, signal);
+    return {
+      usedDescent: false,
+      predictedMaxDamage: 0,
+      healthBefore,
+      healthAfter: this.snapshot.health,
     };
   }
 

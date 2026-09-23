@@ -31,8 +31,8 @@ export type DescentDecision =
     };
 
 /**
- * This deliberately overestimates ordinary fall damage by one health point
- * per drop. It never subtracts for armor, enchantments, water, or effects.
+ * This uses a conservative margin for ordinary fall damage. It never
+ * subtracts for armor, enchantments, water, or effects.
  */
 export function assessDescentRoute(
   origin: Position,

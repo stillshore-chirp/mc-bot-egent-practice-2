@@ -76,7 +76,12 @@ export class ReflexCoordinator {
     ) {
       return this.currentState;
     }
-    const incident = this.detector.detect(snapshot, movementExpected);
+    const incident = this.detector.detect(
+      snapshot,
+      movementExpected,
+      (previous, current) =>
+        this.minecraft.isExpectedDescentDamage(previous, current),
+    );
     if (incident === undefined) {
       if (this.currentState.state !== "safe") {
         this.currentState = { state: "safe" };

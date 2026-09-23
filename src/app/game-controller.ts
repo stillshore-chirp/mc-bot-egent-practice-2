@@ -1369,7 +1369,7 @@ export class CompanionGameController implements GameController {
     safeDistance: number,
     signal: AbortSignal,
   ): Promise<ActionReport> {
-    return this.#executeTask(
+    const report = await this.#executeTask(
       signal,
       () =>
         this.#returnToPlayer.run({
@@ -1379,9 +1379,39 @@ export class CompanionGameController implements GameController {
         }),
       (output) => ({
         outcome: "completed",
-        summary: `指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
+        confirmedState: {
+          distance: output.distance,
+          usedDescent: output.usedDescent,
+          predictedMaxDamage: output.predictedMaxDamage,
+          healthBefore: output.healthBefore,
+          healthAfter: output.healthAfter,
+        },
+        summary: output.usedDescent
+          ? `安全を確認した降下で利用者の場所へ戻りました。距離${output.distance.toFixed(1)}ブロック、Botの体力${output.healthBefore}→${output.healthAfter}を観測しました。`
+          : `歩ける経路で指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
       }),
     );
+    if (report.failureCode !== "SAFE_DESCENT_BLOCKED") return report;
+    const reason = report.confirmedState?.reason;
+    const explanation =
+      reason === "health_too_low"
+        ? "Botの体力に安全余裕が足りません。"
+        : reason === "drop_too_high"
+          ? "確認できた落差が軽微な損傷の上限を超えます。"
+          : reason === "hostile_nearby"
+            ? "降りる先の近くに敵を確認しました。"
+            : reason === "landing_unsafe"
+              ? "降りる先の足場または通り道を安全と確認できません。"
+              : reason === "no_descent"
+                ? "歩ける道も安全な降り道も見つかっていません。"
+                : "降りる先までの地形を十分に確認できません。";
+    return {
+      ...report,
+      summary: `高所からの帰還を試しましたが、${explanation} いまはその場で待機しています。`,
+      nextActions: [
+        "利用者が近くに来るか、降りる先に安全な足場と経路を確保してください。状況が変わればBotが再観測して帰還を試せます。",
+      ],
+    };
   }
 
   public async currentPosition(): Promise<Position> {

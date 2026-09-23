@@ -66,6 +66,83 @@ function createController(
 }
 
 describe("CompanionGameController", () => {
+  it("reports the observed distance and health after a bounded descent", async () => {
+    class DescendingMinecraft extends FakeMinecraft {
+      public override async moveToWithSafeDescent(
+        position: { x: number; y: number; z: number },
+        range: number,
+        signal: AbortSignal,
+      ) {
+        await this.moveTo(position, range, signal);
+        this.snapshot = { ...this.snapshot, health: 18 };
+        return {
+          usedDescent: true,
+          predictedMaxDamage: 2,
+          healthBefore: 20,
+          healthAfter: 18,
+        };
+      }
+    }
+    const minecraft = new DescendingMinecraft(
+      createSnapshot({
+        position: { x: 0, y: 68, z: 0 },
+        players: [
+          { username: "owner", position: { x: 1, y: 64, z: 0 }, distance: 4.1 },
+        ],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.returnToOwner(3, new AbortController().signal);
+      expect(report.outcome).toBe("completed");
+      expect(report.confirmedState).toMatchObject({
+        usedDescent: true,
+        healthBefore: 20,
+        healthAfter: 18,
+      });
+      expect(report.summary).toContain("体力20→18");
+      expect(report.summary).toContain("距離0.0");
+    } finally {
+      close();
+    }
+  });
+
+  it("explains a refused high-place return without exposing an internal error name", async () => {
+    class UnsafeLandingMinecraft extends FakeMinecraft {
+      public override async moveToWithSafeDescent(
+        _position: { x: number; y: number; z: number },
+        _range: number,
+        _signal: AbortSignal,
+      ): Promise<never> {
+        throw new AppError({
+          category: "safety",
+          code: "SAFE_DESCENT_BLOCKED",
+          message: "Unsafe landing",
+          retryable: false,
+          confirmedState: { reason: "landing_unsafe" },
+        });
+      }
+    }
+    const minecraft = new UnsafeLandingMinecraft(
+      createSnapshot({
+        position: { x: 0, y: 68, z: 0 },
+        players: [
+          { username: "owner", position: { x: 1, y: 64, z: 0 }, distance: 4.1 },
+        ],
+      }),
+    );
+    const { game, close } = createController(minecraft);
+    try {
+      const report = await game.returnToOwner(3, new AbortController().signal);
+      expect(report.outcome).toBe("failed");
+      expect(report.summary).toContain("足場または通り道");
+      expect(report.summary).not.toContain("SAFE_DESCENT_BLOCKED");
+      expect(report.nextActions?.[0]).toContain("安全な足場");
+    } finally {
+      close();
+    }
+  });
+
   const hostile = (id: number, distance: number) => ({
     id,
     name: "zombie",

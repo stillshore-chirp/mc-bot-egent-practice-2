@@ -203,6 +203,43 @@ describe("reflex loop", () => {
     expect(minecraft.actions).toContain("escape:hostile");
   });
 
+  it("does not interrupt a bounded planned fall but reacts to later unrelated damage", async () => {
+    class PlannedFallMinecraft extends FakeMinecraft {
+      public override isExpectedDescentDamage(
+        previous: ReturnType<typeof createSnapshot>,
+        current: ReturnType<typeof createSnapshot>,
+      ): boolean {
+        return (
+          previous.health === 20 &&
+          current.health === 19 &&
+          previous.position.y > current.position.y
+        );
+      }
+    }
+    const minecraft = new PlannedFallMinecraft(
+      createSnapshot({ position: { x: 0, y: 69, z: 0 } }),
+    );
+    const coordinator = coordinatorFor(minecraft);
+    await coordinator.tick(await minecraft.observe(), true);
+    minecraft.snapshot = createSnapshot({
+      position: { x: 1, y: 64, z: 0 },
+      health: 19,
+    });
+    expect(
+      (await coordinator.tick(await minecraft.observe(), true)).state,
+    ).toBe("safe");
+    expect(minecraft.actions).not.toContain("escape:environment");
+
+    minecraft.snapshot = createSnapshot({
+      position: { x: 1, y: 64, z: 0 },
+      health: 18,
+    });
+    expect(
+      (await coordinator.tick(await minecraft.observe(), true)).state,
+    ).toBe("stabilizing");
+    expect(minecraft.actions).toContain("escape:environment");
+  });
+
   it("clears a failed reflex after cooldown when the observed incident is gone", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-25T00:00:00.000Z"));

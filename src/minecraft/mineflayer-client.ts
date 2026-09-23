@@ -4,10 +4,16 @@ import pathfinderPackage, {
   pathfinder,
 } from "mineflayer-pathfinder";
 import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
+import type { Move } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import { recommendArmor } from "../decision/armor-equipment.js";
 import { isHostileEntity } from "../decision/hostile-classification.js";
+import {
+  assessDescentRoute,
+  safeDescentLimits,
+  type DescentBlockReason,
+} from "../decision/safe-descent.js";
 import {
   distance,
   oxygenObservationState,
@@ -26,6 +32,7 @@ import type {
   MinecraftLogger,
   MinecraftPort,
   ResourceTarget,
+  SafeMoveResult,
 } from "./port.js";
 import {
   actionGuardChannel,
@@ -259,11 +266,170 @@ function isAirName(name: string | undefined): boolean {
   return name === undefined || ["air", "cave_air", "void_air"].includes(name);
 }
 
+const unsafeDescentSurfaces = new Set([
+  "magma_block",
+  "cactus",
+  "campfire",
+  "soul_campfire",
+  "powder_snow",
+  "pointed_dripstone",
+  "lava",
+  "fire",
+  "water",
+]);
+
+const descentNodeKey = (position: Position): string =>
+  `${position.x},${position.y},${position.z}`;
+
+class ObservedDescentMovements extends Movements {
+  public constructor(
+    private readonly minecraftBot: Bot,
+    private readonly approvedNodes?: ReadonlySet<string>,
+  ) {
+    super(minecraftBot);
+    this.canDig = false;
+    this.allow1by1towers = false;
+    this.allowParkour = false;
+    this.allowSprinting = false;
+    // The pathfinder compares feet Y with the supporting block one below the
+    // landing feet. Its setting is therefore one greater than the foot drop.
+    this.maxDropDown = safeDescentLimits.maxDrop + 1;
+    this.infiniteLiquidDropdownDistance = false;
+    // An active exclusion area also disables the pathfinder's straight-line
+    // shortcut, which would otherwise bypass the individually checked nodes.
+    this.exclusionAreasStep = [() => 0];
+  }
+
+  public override getNeighbors(node: Move): Move[] {
+    return super.getNeighbors(node).filter((move) => {
+      if (
+        move.toBreak.length > 0 ||
+        move.toPlace.length > 0 ||
+        (this.approvedNodes !== undefined &&
+          !this.approvedNodes.has(descentNodeKey(move)))
+      ) {
+        return false;
+      }
+      return this.isObservedSafeLanding(move);
+    });
+  }
+
+  public isObservedSafeLanding(position: Position): boolean {
+    return this.landingReason(position) === null;
+  }
+
+  public landingReason(position: Position): DescentBlockReason | null {
+    const bot = this.minecraftBot;
+    if (
+      bot.entity.position.distanceTo(
+        new Vec3(position.x, position.y, position.z),
+      ) > 32
+    )
+      return "route_unobserved";
+    const feet = bot.blockAt(new Vec3(position.x, position.y, position.z));
+    const head = bot.blockAt(new Vec3(position.x, position.y + 1, position.z));
+    const ground = bot.blockAt(
+      new Vec3(position.x, position.y - 1, position.z),
+    );
+    if (
+      feet === null ||
+      head === null ||
+      ground === null ||
+      !isAirName(feet.name) ||
+      !isAirName(head.name) ||
+      ground.boundingBox !== "block" ||
+      unsafeDescentSurfaces.has(ground.name)
+    ) {
+      return feet === null || head === null || ground === null
+        ? "route_unobserved"
+        : "landing_unsafe";
+    }
+    const hostileNearby = Object.values(bot.entities).some((entity) => {
+      if (entity.id === bot.entity.id) return false;
+      const name = entity.name ?? entity.displayName ?? entity.type;
+      return (
+        isHostileEntity(name, entity.type, bot.registry) &&
+        entity.position.distanceTo(
+          new Vec3(position.x, position.y, position.z),
+        ) < safeDescentLimits.hostileClearance
+      );
+    });
+    return hostileNearby ? "hostile_nearby" : null;
+  }
+}
+
+function nearbyDescentFailureReason(
+  bot: Bot,
+  movements: ObservedDescentMovements,
+): DescentBlockReason {
+  const origin = bot.entity.position.floored();
+  let observedSafeLanding = false;
+  let tooHigh = false;
+  let unsafe = false;
+  let hostile = false;
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ] as const) {
+    for (let drop = 1; drop <= safeDescentLimits.maxDrop + 4; drop += 1) {
+      const feetY = origin.y - drop;
+      const support = bot.blockAt(
+        new Vec3(origin.x + dx, feetY - 1, origin.z + dz),
+      );
+      if (support === null) break;
+      if (support.boundingBox !== "block") continue;
+      if (drop <= 2) break;
+      if (drop > safeDescentLimits.maxDrop) {
+        tooHigh = true;
+        break;
+      }
+      const reason = movements.landingReason({
+        x: origin.x + dx,
+        y: feetY,
+        z: origin.z + dz,
+      });
+      if (reason === null) observedSafeLanding = true;
+      else if (reason === "hostile_nearby") hostile = true;
+      else if (reason === "landing_unsafe") unsafe = true;
+      break;
+    }
+  }
+  if (hostile) return "hostile_nearby";
+  if (unsafe) return "landing_unsafe";
+  if (tooHigh) return "drop_too_high";
+  return observedSafeLanding ? "no_descent" : "route_unobserved";
+}
+
+function safeDescentBlocked(
+  reason: DescentBlockReason,
+  predictedMaxDamage = 0,
+): AppError {
+  return new AppError({
+    category: "safety",
+    code: "SAFE_DESCENT_BLOCKED",
+    message: "A safe descent could not be confirmed",
+    retryable: false,
+    failedAt: "safe_descent",
+    confirmedState: { reason, predictedMaxDamage },
+  });
+}
+
 export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
   private spawned = false;
   private intentionalDisconnect = false;
   private authoritativeOxygen: number | null | undefined;
+  private expectedDescentDamage:
+    | {
+        readonly healthAfter: number;
+        readonly healthBefore: number;
+        readonly startY: number;
+        readonly landings: readonly Position[];
+        readonly expiresAt: number;
+      }
+    | undefined;
   private readonly chatListeners = new Set<
     (username: string, message: string) => void
   >();
@@ -281,6 +447,7 @@ export class MineflayerClient implements MinecraftPort {
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
     this.authoritativeOxygen = undefined;
+    this.expectedDescentDamage = undefined;
     const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
     bot._client.on("entity_metadata", (packet) => {
       const botEntity = bot.entity;
@@ -375,6 +542,7 @@ export class MineflayerClient implements MinecraftPort {
 
   public async disconnect(reason = "shutdown"): Promise<void> {
     this.intentionalDisconnect = true;
+    this.expectedDescentDamage = undefined;
     await this.stopCurrentAction();
     this.botInstance?.end(reason);
     this.spawned = false;
@@ -485,6 +653,31 @@ export class MineflayerClient implements MinecraftPort {
     };
   }
 
+  public isExpectedDescentDamage(
+    previous: WorldSnapshot,
+    current: WorldSnapshot,
+  ): boolean {
+    const expected = this.expectedDescentDamage;
+    if (expected === undefined) return false;
+    if (Date.now() > expected.expiresAt) {
+      this.expectedDescentDamage = undefined;
+      return false;
+    }
+    if (
+      current.health < expected.healthAfter ||
+      current.health > expected.healthBefore ||
+      current.health >= previous.health ||
+      current.position.y > expected.startY - 2 ||
+      !expected.landings.some(
+        (landing) => distance(current.position, landing) < 2,
+      )
+    ) {
+      return false;
+    }
+    this.expectedDescentDamage = undefined;
+    return true;
+  }
+
   public async observeSurroundings(
     radius: number,
     includeEntities: boolean,
@@ -581,10 +774,63 @@ export class MineflayerClient implements MinecraftPort {
   ): Promise<void> {
     throwIfAborted(signal, "move_to");
     const bot = this.requireBot();
-    await this.runPathfinder(
-      new goals.GoalNear(position.x, position.y, position.z, range),
-      signal,
-    );
+    const origin = bot.entity.position.floored();
+    const checkedHighNodes = new Set<string>();
+    const unsafeAscent = new AbortController();
+    const verifyHighRoute = (path: {
+      readonly path: readonly Move[];
+    }): void => {
+      for (const node of path.path) {
+        if (node.y - origin.y < 3) continue;
+        const highNode = new Vec3(
+          Math.floor(node.x),
+          Math.floor(node.y),
+          Math.floor(node.z),
+        );
+        const key = descentNodeKey(highNode);
+        if (checkedHighNodes.has(key)) continue;
+        let returnConfirmed = false;
+        if (checkedHighNodes.size < 12) {
+          try {
+            returnConfirmed = this.hasObservedReturnRoute(
+              bot,
+              highNode,
+              origin,
+            );
+          } catch {
+            returnConfirmed = false;
+          }
+        }
+        if (!returnConfirmed) {
+          unsafeAscent.abort(new Error("High-place return route unconfirmed"));
+          return;
+        }
+        checkedHighNodes.add(key);
+      }
+    };
+    bot.on("path_update", verifyHighRoute);
+    try {
+      await this.runPathfinder(
+        new goals.GoalNear(position.x, position.y, position.z, range),
+        AbortSignal.any([signal, unsafeAscent.signal]),
+      );
+    } catch (error) {
+      if (signal.aborted) throwIfAborted(signal, "move_to");
+      if (unsafeAscent.signal.aborted) {
+        bot.pathfinder.setGoal(null);
+        bot.clearControlStates();
+        throw new AppError({
+          category: "safety",
+          code: "ASCENT_RETURN_UNCONFIRMED",
+          message: "The planned high route has no observed safe return",
+          retryable: false,
+          failedAt: "move_to",
+        });
+      }
+      throw error;
+    } finally {
+      bot.off("path_update", verifyHighRoute);
+    }
     const snapshot = await this.observe();
     if (distance(snapshot.position, position) > range + 0.75) {
       throw new AppError({
@@ -597,6 +843,204 @@ export class MineflayerClient implements MinecraftPort {
       });
     }
     bot.clearControlStates();
+  }
+
+  private hasObservedReturnRoute(
+    bot: Bot,
+    highNode: Vec3,
+    origin: Vec3,
+  ): boolean {
+    const movements = new ObservedDescentMovements(bot);
+    const route = (
+      bot.pathfinder
+        .getPathFromTo(
+          movements,
+          highNode,
+          new goals.GoalNear(origin.x, origin.y, origin.z, 2),
+          {
+            optimizePath: false,
+            timeout: this.options.pathfinderThinkTimeoutMs,
+          },
+        )
+        .next().value as
+        | {
+            readonly result: { readonly status: string; readonly path: Move[] };
+          }
+        | undefined
+    )?.result;
+    if (route?.status !== "success") return false;
+    const decision = assessDescentRoute(
+      positionOf(highNode),
+      bot.health,
+      route.path.map((node) => ({
+        position: positionOf(node),
+        observed: true,
+        landingSafe: movements.isObservedSafeLanding(node),
+        hostileDistance: null,
+      })),
+    );
+    return decision.allowed || decision.reason === "no_descent";
+  }
+
+  public async moveToWithSafeDescent(
+    position: Position,
+    range: number,
+    signal: AbortSignal,
+  ): Promise<SafeMoveResult> {
+    const before = await this.observe();
+    try {
+      await this.moveTo(position, range, signal);
+      return {
+        usedDescent: false,
+        predictedMaxDamage: 0,
+        healthBefore: before.health,
+        healthAfter: (await this.observe()).health,
+      };
+    } catch (error) {
+      if (
+        !(error instanceof AppError) ||
+        !["PATHFINDER_FAILED", "MOVE_VERIFICATION_FAILED"].includes(
+          error.detail.code,
+        )
+      ) {
+        throw error;
+      }
+    }
+
+    throwIfAborted(signal, "safe_descent");
+    const bot = this.requireBot();
+    const current = await this.observe();
+    if (
+      current.onFire ||
+      current.inLava ||
+      current.inWater ||
+      current.suffocating ||
+      current.velocityY < -0.1
+    ) {
+      throw safeDescentBlocked("landing_unsafe");
+    }
+    const goal = new goals.GoalNear(position.x, position.y, position.z, range);
+    const planningMovements = new ObservedDescentMovements(bot);
+    const nextPath = (
+      bot.pathfinder
+        .getPathFromTo(planningMovements, bot.entity.position, goal, {
+          optimizePath: false,
+          timeout: this.options.pathfinderThinkTimeoutMs,
+        })
+        .next().value as
+        | {
+            readonly result: { readonly status: string; readonly path: Move[] };
+          }
+        | undefined
+    )?.result;
+    if (nextPath?.status !== "success") {
+      throw safeDescentBlocked(
+        nearbyDescentFailureReason(bot, planningMovements),
+      );
+    }
+    const route = nextPath.path;
+    const plannedLandings = route
+      .filter((node, index) => {
+        const previousY = route[index - 1]?.y ?? current.position.y;
+        return previousY - node.y > 2;
+      })
+      .map(positionOf);
+    const decision = assessDescentRoute(
+      current.position,
+      current.health,
+      route.map((move) => ({
+        position: positionOf(move),
+        observed: true,
+        landingSafe: planningMovements.isObservedSafeLanding(move),
+        hostileDistance: null,
+      })),
+    );
+    if (!decision.allowed) {
+      throw safeDescentBlocked(decision.reason, decision.predictedMaxDamage);
+    }
+
+    const approvedNodes = new Set(route.map(descentNodeKey));
+    const constrainedMovements = new ObservedDescentMovements(
+      bot,
+      approvedNodes,
+    );
+    const previousMovements = bot.pathfinder.movements;
+    const safetyStop = new AbortController();
+    const minimumExpectedHealth = current.health - decision.predictedMaxDamage;
+    let minimumObservedY = current.position.y;
+    let descentObserved = false;
+    const onPhysicsTick = (): void => {
+      minimumObservedY = Math.min(minimumObservedY, bot.entity.position.y);
+      if (!descentObserved && minimumObservedY < current.position.y - 2) {
+        descentObserved = true;
+        this.expectedDescentDamage = {
+          healthBefore: current.health,
+          healthAfter: minimumExpectedHealth,
+          startY: current.position.y,
+          landings: plannedLandings,
+          expiresAt: Date.now() + 5_000,
+        };
+      }
+    };
+    const onHealth = (): void => {
+      if (
+        bot.health < minimumExpectedHealth ||
+        bot.health < safeDescentLimits.minimumRemainingHealth
+      ) {
+        safetyStop.abort(new Error("Descent exceeded the health budget"));
+      }
+    };
+    bot.on("health", onHealth);
+    bot.on("physicsTick", onPhysicsTick);
+    try {
+      bot.pathfinder.setMovements(constrainedMovements);
+      await this.runPathfinder(
+        goal,
+        AbortSignal.any([signal, safetyStop.signal]),
+      );
+    } catch (error) {
+      if (signal.aborted) throwIfAborted(signal, "safe_descent");
+      if (safetyStop.signal.aborted) {
+        throw new AppError({
+          category: "safety",
+          code: "DESCENT_HEALTH_BUDGET_EXCEEDED",
+          message: "The observed health loss exceeded the safe descent budget",
+          retryable: false,
+          failedAt: "safe_descent",
+        });
+      }
+      throw error;
+    } finally {
+      bot.off("health", onHealth);
+      bot.off("physicsTick", onPhysicsTick);
+      bot.pathfinder.setGoal(null);
+      bot.pathfinder.setMovements(previousMovements);
+      bot.clearControlStates();
+    }
+    await delay(300, signal);
+    const after = await this.observe();
+    if (
+      distance(after.position, position) > range + 0.75 ||
+      after.velocityY < -0.1 ||
+      after.health < safeDescentLimits.minimumRemainingHealth ||
+      current.health - after.health > decision.predictedMaxDamage
+    ) {
+      throw new AppError({
+        category: "observation",
+        code: "DESCENT_RESULT_NOT_VERIFIED",
+        message:
+          "The descent result did not meet the verified position and health limits",
+        retryable: false,
+        failedAt: "safe_descent",
+      });
+    }
+    return {
+      usedDescent:
+        current.position.y - Math.min(minimumObservedY, after.position.y) > 2,
+      predictedMaxDamage: decision.predictedMaxDamage,
+      healthBefore: current.health,
+      healthAfter: after.health,
+    };
   }
 
   public async followPlayer(
