@@ -121,7 +121,7 @@ describe("hostile response command", () => {
           respondToHostiles,
           say: vi.fn(async () => undefined),
         } as unknown as GameController,
-        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        agent: { deliberate },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -161,7 +161,7 @@ describe("hostile response command", () => {
           events.push(`say:${message}`);
         }),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -365,7 +365,7 @@ describe("immediate stop command", () => {
             });
             return { text: "作業を開始しました。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -436,7 +436,7 @@ describe("immediate stop command", () => {
             events.push(`deliberate:${message}`);
             return { text: "拠点へ戻ります。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -469,7 +469,7 @@ describe("immediate stop command", () => {
         }),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -508,7 +508,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { stopCurrentAction, say } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -551,7 +551,7 @@ describe("immediate stop command", () => {
         }),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -604,7 +604,7 @@ describe("immediate stop command", () => {
             events.push(`deliberate:${text}`);
             return { text: "停止理由を説明します。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -645,7 +645,7 @@ describe("immediate stop command", () => {
           })),
           say,
         } as unknown as GameController,
-        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        agent: { deliberate },
         contextFactory: {} as ChatContextFactory,
         logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
       });
@@ -799,7 +799,7 @@ describe("immediate stop command", () => {
           text: "TRACE_RAW_MODEL_RESPONSE",
           toolResults: [],
         })),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory,
       logger: {
         error: vi.fn(),
@@ -836,7 +836,7 @@ describe("immediate stop command", () => {
           toolResults: [],
         })),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -874,7 +874,7 @@ describe("immediate stop command", () => {
           throw new Error("DELIBERATION_FAILED");
         }),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1103,7 +1103,7 @@ describe("immediate stop command", () => {
             return { text: "到達不能", toolResults: [] };
           },
         ),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(
           async (_username: string, _message: string, signal: AbortSignal) => ({
@@ -1153,7 +1153,7 @@ describe("immediate stop command", () => {
           text: "状態を確認しました。",
           toolResults: [],
         })),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1593,7 +1593,7 @@ describe("immediate stop command", () => {
         })),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1637,7 +1637,7 @@ describe("immediate stop command", () => {
         ),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1687,7 +1687,7 @@ describe("immediate stop command", () => {
       } as unknown as GameController,
       agent: {
         deliberate: vi.fn(async () => ({ text: "", toolResults: [] })),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         readOwnerStatusPreferences: vi.fn(() => {
           throw new Error("記憶参照に失敗");
