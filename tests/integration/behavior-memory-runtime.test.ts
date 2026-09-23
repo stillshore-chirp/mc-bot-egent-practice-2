@@ -230,6 +230,26 @@ describe("behavior memory runtime integration", () => {
       expect(reassessment.memoryContext).toContain("[behavior_preference:");
       expect(reassessment.toolContext.behaviorMemoryCandidates).toBeUndefined();
       expect(reassessment.toolContext.behaviorMemoryEventId).toBeUndefined();
+
+      const notificationFactory = factory(store, player.id);
+      notificationFactory.acceptOwnerMessage(
+        "owner",
+        "今後の自動通知は一文にまとめてください",
+        "notification-preference-event",
+      );
+      const notification = await notificationFactory.create(
+        "owner",
+        "安全状態を再評価して通知する",
+        new AbortController().signal,
+        "reassessment-event-0002",
+        "runtime_reassessment",
+      );
+      expect(notification.memoryContext).toContain(
+        "自動通知は必要な事実を残して一文にまとめる",
+      );
+      expect(notification.toolContext.behaviorNotificationOneSentence).toBe(
+        true,
+      );
     } finally {
       store.close();
       rmSync(directory, { recursive: true, force: true });

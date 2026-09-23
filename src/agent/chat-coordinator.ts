@@ -328,6 +328,17 @@ function compactStatusSummary(summary: string): string {
   return firstSentence?.trim() ?? summary;
 }
 
+function oneSentenceNotification(text: string): string {
+  // Keep every observed fact and safety instruction; only join sentence
+  // boundaries when the owner explicitly prefers a single notification line.
+  return text
+    .trim()
+    .replace(/されません。\s*(?=\S)/gu, "されず、")
+    .replace(/ありません。\s*(?=\S)/gu, "なく、")
+    .replace(/できません。\s*(?=\S)/gu, "できず、")
+    .replace(/。\s*(?=\S)/gu, "、");
+}
+
 export interface ChatContextFactory {
   clearPendingOwnerGoal?(): void;
   /** Persist owner behavior candidates when the chat message is accepted. */
@@ -1008,6 +1019,11 @@ export class ChatCoordinator {
         if (controller.signal.aborted) {
           throw controller.signal.reason ?? new Error("REQUEST_ABORTED");
         }
+        const deliveredText =
+          requestKind === "runtime_reassessment" &&
+          context.toolContext.behaviorNotificationOneSentence === true
+            ? oneSentenceNotification(reply.text)
+            : reply.text;
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -1017,17 +1033,17 @@ export class ChatCoordinator {
             resultKind: "final_response",
             summarizeResult: () => "最終応答を送信",
           },
-          () => this.#game.say(reply.text),
+          () => this.#game.say(deliveredText),
         );
         const deliveredRequestId =
           reply.conversationRequestId ?? conversationRequestId;
         if (deliveredRequestId === undefined) {
-          recorder.recordDeliveredReply?.(username, requestKind, reply.text);
+          recorder.recordDeliveredReply?.(username, requestKind, deliveredText);
         } else {
           recorder.recordDeliveredReply?.(
             username,
             requestKind,
-            reply.text,
+            deliveredText,
             deliveredRequestId,
           );
         }

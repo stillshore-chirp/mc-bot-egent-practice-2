@@ -244,15 +244,14 @@ export class CompanionContextFactory implements ChatContextFactory {
                   }),
               )
             : [];
+        const applicableBehaviorMemories = behaviorMemories.filter((record) =>
+          this.memoryStore.behaviorMemoryIsApplicable(record),
+        );
         contextLines.push(
-          ...behaviorMemories
-            .filter((record) =>
-              this.memoryStore.behaviorMemoryIsApplicable(record),
-            )
-            .map(
-              (record) =>
-                `[behavior_preference:${record.confidence}] ${behaviorMemoryDescription(record)}`,
-            ),
+          ...applicableBehaviorMemories.map(
+            (record) =>
+              `[behavior_preference:${record.confidence}] ${behaviorMemoryDescription(record)}`,
+          ),
         );
         const remaining = Math.max(
           0,
@@ -368,6 +367,15 @@ export class CompanionContextFactory implements ChatContextFactory {
             ...(this.toolBehaviorMemory === undefined
               ? {}
               : { behaviorMemory: this.toolBehaviorMemory }),
+            ...(requestKind === "runtime_reassessment" &&
+            requesterUsername === this.config.ownerUsername &&
+            applicableBehaviorMemories.some(
+              (record) =>
+                record.slot === "notification_length" &&
+                record.value === "one_sentence",
+            )
+              ? { behaviorNotificationOneSentence: true }
+              : {}),
             ...(requestKind === "owner_message" &&
             requesterUsername === this.config.ownerUsername
               ? {

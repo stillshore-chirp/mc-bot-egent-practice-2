@@ -63,6 +63,18 @@ describe("behavior memory extraction", () => {
     });
     expect(openEnded[0]?.value).not.toContain("覚えておいて");
     expect(openEnded[0]?.value.length).toBeLessThanOrEqual(160);
+    expect(
+      extractBehaviorMemory("今後の自動通知は一文にまとめてください"),
+    ).toEqual([
+      expect.objectContaining({
+        slot: "notification_length",
+        value: "one_sentence",
+        summary: "自動通知は必要な事実を残して一文にまとめる",
+      }),
+    ]);
+    expect(
+      extractBehaviorMemory("今後の作業前には目的を確認して")[0]?.value,
+    ).toBe("作業前には目的を確認して");
   });
 
   it("extracts several typed preferences from one owner utterance", () => {

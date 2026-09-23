@@ -1201,6 +1201,47 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it("joins a preferred one-sentence automatic notice without dropping safety facts", async () => {
+    const say = vi.fn(async (_message: string) => undefined);
+    const recordDeliveredReply = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({
+          text: "周囲の危険は確認されません。作業は停止中で、次に再観測します。",
+          toolResults: [],
+        })),
+        recordDeliveredReply,
+      },
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "",
+          memoryContext: "",
+          worldContext: "",
+          toolContext: {
+            ...minimalToolContext,
+            behaviorNotificationOneSentence: true,
+          },
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    expect(await coordinator.handleRuntimeEvent("safety_failed")).toBe(
+      "completed",
+    );
+    const delivered = say.mock.calls[0]?.[0];
+    expect(delivered).toContain("周囲の危険は確認されず、");
+    expect(delivered).toContain("作業は停止中で、次に再観測します");
+    expect(delivered?.match(/。/gu)).toHaveLength(1);
+    expect(recordDeliveredReply).toHaveBeenCalledWith(
+      "owner",
+      "runtime_reassessment",
+      delivered,
+    );
+  });
+
   it("returns a failed outcome when runtime deliberation cannot complete", async () => {
     const say = vi.fn(async () => undefined);
     const coordinator = new ChatCoordinator({

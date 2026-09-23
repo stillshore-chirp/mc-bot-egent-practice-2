@@ -572,6 +572,24 @@ function knownPreferences(
     results.push(candidate);
   };
 
+  if (
+    stable &&
+    /(?:自動)?通知|報告/iu.test(message) &&
+    /(?:一|1)文(?:に|で|へ|以内)/iu.test(message)
+  ) {
+    add(
+      extraction(
+        "communication",
+        "notification_length",
+        "one_sentence",
+        "自動通知は必要な事実を残して一文にまとめる",
+        source,
+        confidence,
+        reason,
+      ),
+    );
+  }
+
   const emotionPreference =
     /感情|気持ち|不満|苛立|いら立|失望|つら|辛い|悲し|困って|腹立|拒絶/iu.test(
       message,
@@ -788,6 +806,7 @@ export function behaviorMemoryDescription(
     plain_language: "専門用語を避けて平易に説明する",
     brief: "返答を短く要点中心にする",
     detailed: "必要な背景を含めて丁寧に説明する",
+    one_sentence: "自動通知は必要な事実を残して一文にまとめる",
     delegate_safe_low_impact: "安全で低影響・可逆な選択を自分で進める",
     avoid_repeated_confirmation: "同じ確認や細かな指示を繰り返し求めない",
     use_conversation_context: "会話と現在状態を踏まえて判断する",
@@ -934,7 +953,7 @@ function behaviorMemory(row: BehaviorMemoryRow): BehaviorMemoryRecord {
 function stablePreferenceTail(message: string): string {
   const tail = message
     .replace(
-      /^(?:覚えて(?:おいて)?|記憶して(?:おいて)?|今後(?:は)?|次から(?:は)?|これから(?:は)?|いつも|継続して|訂正[:：]?|修正[:：]?|違う[。,:： ]*)/u,
+      /^(?:覚えて(?:おいて)?|記憶して(?:おいて)?|今後(?:は|の)?|次から(?:は|の)?|これから(?:は|の)?|いつも|継続して|訂正[:：]?|修正[:：]?|違う[。,:： ]*)/u,
       "",
     )
     .replace(/[「」"'`]/gu, "")

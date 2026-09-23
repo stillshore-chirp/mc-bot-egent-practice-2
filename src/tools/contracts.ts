@@ -348,6 +348,8 @@ export interface ToolContext {
   recordDeliveredAssistantMessage?: (message: string) => void;
   /** Candidates extracted from this authenticated owner message only. */
   behaviorMemoryCandidates?: readonly BehaviorMemoryExtraction[];
+  /** Owner-only presentation preference; never changes safety facts or actions. */
+  behaviorNotificationOneSentence?: boolean;
   /** Opaque accepted-message id used to make behavior writes idempotent. */
   behaviorMemoryEventId?: string;
   executionEvidence: {
