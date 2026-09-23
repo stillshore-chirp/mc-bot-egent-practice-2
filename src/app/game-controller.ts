@@ -392,6 +392,10 @@ export class CompanionGameController implements GameController {
       const readyToSmelt =
         intermediateItem !== undefined &&
         countInventory(current, intermediateItem) >= request.count;
+      const craftFromInventory =
+        authorization.allowedResources.includes(targetItem) &&
+        intermediateItem === undefined &&
+        knownBlockDrops[targetItem] === undefined;
       const candidates = await this.observeActionCandidates(
         {
           radius: Math.min(32, this.#maxMoveDistance),
@@ -405,7 +409,12 @@ export class CompanionGameController implements GameController {
           (candidate) =>
             candidate.goalItem === targetItem &&
             candidate.purposeFit === "direct" &&
-            candidate.action === (readyToSmelt ? "smelt_item" : "mine_block"),
+            candidate.action ===
+              (readyToSmelt
+                ? "smelt_item"
+                : craftFromInventory
+                  ? "craft_item"
+                  : "mine_block"),
         )
         .map((candidate) =>
           candidate.action !== "smelt_item"
@@ -488,6 +497,21 @@ export class CompanionGameController implements GameController {
     const origin = await this.#minecraft.observe();
     const searchDistance = Math.min(32, this.#maxMoveDistance);
     const readyInput = knownSmeltInputs[authorization.targetItem];
+    if (
+      readyInput === undefined &&
+      authorization.allowedResources.includes(authorization.targetItem) &&
+      knownBlockDrops[authorization.targetItem] === undefined
+    ) {
+      return {
+        candidates: [],
+        attemptedWaypoints: 0,
+        blockedWaypoints: 0,
+        stop: {
+          code: "CRAFT_MATERIALS_NOT_OBSERVED",
+          reason: "所持品から目的の品を作れるレシピや素材を確認できません。",
+        },
+      };
+    }
     if (
       readyInput !== undefined &&
       countInventory(origin, readyInput) >= request.count

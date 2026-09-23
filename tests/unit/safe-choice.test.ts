@@ -178,6 +178,44 @@ describe("safe choice policy", () => {
     ).toMatchObject({ outcome: "selected", candidate: { id: "place-wall" } });
   });
 
+  it("selects an observed inventory craft only for the owner's matching item", () => {
+    const craft = candidate({
+      id: "craft-planks",
+      action: "craft_item",
+      operationClass: "world_change",
+      scopeId: "inventory",
+      requestedCount: 1,
+      goalItem: "oak_planks",
+      reversible: false,
+      impact: "low",
+    });
+    const authorization = {
+      kind: "owner_bounded_resource" as const,
+      goal: "オークの板材を1個作って",
+      allowedResources: ["oak_planks"],
+      targetItem: "oak_planks",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    expect(
+      chooseSafeCandidate({ mode: "delegated", candidates: [craft] }),
+    ).toMatchObject({ outcome: "clarify" });
+    expect(
+      chooseSafeCandidate({
+        mode: "delegated",
+        candidates: [craft],
+        authorization,
+      }),
+    ).toMatchObject({ outcome: "selected", candidate: { id: "craft-planks" } });
+    expect(
+      chooseSafeCandidate({
+        mode: "delegated",
+        candidates: [{ ...craft, goalItem: "oak_stairs" }],
+        authorization,
+      }),
+    ).toMatchObject({ outcome: "clarify" });
+  });
+
   it("requires explicit delegation before choosing among safe candidates", () => {
     const result = chooseSafeCandidate({
       mode: "unspecified",

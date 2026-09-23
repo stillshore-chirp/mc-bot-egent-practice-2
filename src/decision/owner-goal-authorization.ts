@@ -65,6 +65,12 @@ const resourceGoals: readonly ResourceGoal[] = [
     targetItem: "*",
   },
   {
+    label: "オークの板材",
+    aliases: ["オークの板材", "オーク板材", "oak_planks", "oak planks"],
+    allowedResources: ["oak_planks"],
+    targetItem: "oak_planks",
+  },
+  {
     label: "鉄インゴット",
     aliases: ["鉄インゴット", "iron ingot", "iron_ingot"],
     allowedResources: ["iron_ore", "deepslate_iron_ore"],

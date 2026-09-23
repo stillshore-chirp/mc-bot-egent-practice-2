@@ -181,6 +181,25 @@ function isEligible(
   if (
     trustedAuthorization.kind === "owner_bounded_resource" &&
     trustedAuthorization.targetItem !== "*" &&
+    candidate.action === "craft_item" &&
+    candidate.operationClass === "world_change" &&
+    candidate.scopeId === "inventory" &&
+    candidate.impact === "low" &&
+    candidate.goalItem === trustedAuthorization.targetItem &&
+    trustedAuthorization.allowedResources.includes(candidate.goalItem) &&
+    trustedAuthorization.goal.trim().length > 0 &&
+    Number.isInteger(trustedAuthorization.targetCount) &&
+    trustedAuthorization.targetCount > 0 &&
+    Number.isInteger(trustedAuthorization.maxCount) &&
+    trustedAuthorization.targetCount <= trustedAuthorization.maxCount &&
+    Number.isInteger(candidate.requestedCount) &&
+    (candidate.requestedCount ?? 0) > 0 &&
+    (candidate.requestedCount ?? 0) <= trustedAuthorization.targetCount
+  )
+    return true;
+  if (
+    trustedAuthorization.kind === "owner_bounded_resource" &&
+    trustedAuthorization.targetItem !== "*" &&
     candidate.action === "smelt_item" &&
     candidate.operationClass === "world_change" &&
     candidate.scopeId === "inventory" &&

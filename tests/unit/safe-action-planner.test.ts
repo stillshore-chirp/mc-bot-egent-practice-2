@@ -31,6 +31,50 @@ function candidate(
 }
 
 describe("safe action planner", () => {
+  it("binds an inventory craft step to the authorized output", () => {
+    const authorization = {
+      kind: "owner_bounded_resource" as const,
+      goal: "オークの板材を1個作って",
+      allowedResources: ["oak_planks"],
+      targetItem: "oak_planks",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    const craft = candidate({
+      id: "craft-planks",
+      action: "craft_item",
+      operationClass: "world_change",
+      scopeId: "inventory",
+      requestedCount: 1,
+      goalItem: "oak_planks",
+      reversible: false,
+      impact: "low",
+      steps: [{ tool: "craft_item", input: { name: "oak_planks", count: 1 } }],
+    });
+    expect(
+      planSafeAction({
+        mode: "delegated",
+        authorization,
+        candidates: [craft],
+        maxSteps: 4,
+      }),
+    ).toMatchObject({ outcome: "planned", steps: [{ tool: "craft_item" }] });
+    expect(
+      planSafeAction({
+        mode: "delegated",
+        authorization,
+        candidates: [
+          {
+            ...craft,
+            steps: [
+              { tool: "craft_item", input: { name: "oak_stairs", count: 1 } },
+            ],
+          },
+        ],
+        maxSteps: 4,
+      }),
+    ).toMatchObject({ outcome: "clarify" });
+  });
   it("preserves a bounded multi-step plan after delegated safe selection", () => {
     const result = planSafeAction({
       mode: "delegated",
