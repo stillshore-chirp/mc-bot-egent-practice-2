@@ -928,8 +928,12 @@ export class MineflayerClient implements MinecraftPort {
     throwIfAborted(signal, "move_to");
     const bot = this.requireBot();
     const origin = bot.entity.position.floored();
+    const maxSegments = Math.min(
+      4096,
+      Math.max(24, Math.ceil(distance(positionOf(origin), position) * 2) + 8),
+    );
     let stagnantSegments = 0;
-    for (let segment = 0; segment < 24; segment += 1) {
+    for (let segment = 0; segment < maxSegments; segment += 1) {
       throwIfAborted(signal, "move_to");
       const before = await this.observe();
       if (distance(before.position, position) <= range + 0.75) {
@@ -1122,6 +1126,8 @@ export class MineflayerClient implements MinecraftPort {
       }
     }
     bot.clearControlStates();
+    const final = await this.observe();
+    if (distance(final.position, position) <= range + 0.75) return;
     throw new AppError({
       category: "path",
       code: "PATH_EXPLORATION_LIMIT",

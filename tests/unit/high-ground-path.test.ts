@@ -144,4 +144,54 @@ describe("high-place path guard", () => {
     expect(bot.pathfinder.goto).toHaveBeenCalledTimes(2);
     expect(bot.entity.position.y).toBe(64);
   });
+
+  it("reaches a permitted distant destination through short segments", async () => {
+    const { client, bot } = makeClient(true);
+    bot.pathfinder.getPathFromTo = vi.fn(() => ({
+      next: () => ({
+        value: {
+          result: {
+            status: "success",
+            path: Array.from(
+              { length: 128 - bot.entity.position.x },
+              (_, index) => ({
+                x: bot.entity.position.x + index + 1,
+                y: 64,
+                z: 0,
+              }),
+            ),
+          },
+        },
+      }),
+    }));
+
+    await client.moveTo(
+      { x: 128, y: 64, z: 0 },
+      0,
+      new AbortController().signal,
+    );
+
+    expect(bot.entity.position.x).toBe(128);
+    expect(bot.pathfinder.goto).toHaveBeenCalledTimes(32);
+  });
+
+  it("accepts arrival during the final permitted segment", async () => {
+    const { client, bot } = makeClient(true);
+    let segments = 0;
+    bot.pathfinder.getPathFromTo = vi.fn(() => ({
+      next: () => ({
+        value: {
+          result: {
+            status: "success",
+            path: [{ x: ++segments === 24 ? 1 : segments + 1, y: 64, z: 0 }],
+          },
+        },
+      }),
+    }));
+
+    await client.moveTo({ x: 1, y: 64, z: 0 }, 0, new AbortController().signal);
+
+    expect(bot.pathfinder.goto).toHaveBeenCalledTimes(24);
+    expect(bot.entity.position.x).toBe(1);
+  });
 });
