@@ -24,6 +24,16 @@ def test_product_change_selects_only_product_gate() -> None:
     assert result["workflow_contract"] is False
 
 
+def test_runtime_summary_script_selects_product_gate() -> None:
+    result = MODULE.classify_paths(["scripts/summarize-runtime-reassessments.ts"])
+
+    assert result["classification_ok"] is True
+    assert result["product"] is True
+    assert result["browser"] is False
+    assert result["governance"] is False
+    assert result["workflow_contract"] is False
+
+
 def test_format_configuration_selects_product_gate() -> None:
     result = MODULE.classify_paths([".prettierignore"])
 
