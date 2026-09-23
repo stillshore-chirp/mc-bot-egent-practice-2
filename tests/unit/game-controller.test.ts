@@ -896,24 +896,27 @@ describe("CompanionGameController", () => {
   });
 
   it.each([
-    ["鉄", "iron_ore", "iron_ingot", "raw_iron"],
-    ["銅", "copper_ore", "copper_ingot", "raw_copper"],
+    ["鉄", "iron_ore", "iron_ingot", "raw_iron", 1],
+    ["銅", "copper_ore", "copper_ingot", "raw_copper", 1],
+    ["複数の鉄", "iron_ore", "iron_ingot", "raw_iron", 6],
   ])(
     "executes one bounded %s goal across mining and smelting from provider observations",
-    async (_label, ore, ingot, raw) => {
+    async (_label, ore, ingot, raw, count) => {
       const minecraft = new FakeMinecraft();
       minecraft.availableFurnace = true;
       minecraft.resources.push(
-        { name: ore, position: { x: 2, y: 63, z: 0 } },
-        { name: ore, position: { x: 3, y: 63, z: 0 } },
+        ...Array.from({ length: Math.max(2, count) }, (_, index) => ({
+          name: ore,
+          position: { x: 2 + index, y: 63, z: 0 },
+        })),
       );
       const { game, close } = createController(minecraft);
       const authorization = {
         kind: "owner_bounded_resource" as const,
-        goal: `${ingot}を1個作って`,
+        goal: `${ingot}を${String(count)}個作って`,
         allowedResources: [ore],
         targetItem: ingot,
-        targetCount: 1,
+        targetCount: count,
         maxCount: 8,
       };
       const context: ToolContext = {
@@ -930,7 +933,7 @@ describe("CompanionGameController", () => {
           "smelt_item",
         ],
         safeActionAuthorizationUsage: {
-          remainingCount: 1,
+          remainingCount: count,
           consumed: false,
         },
         executionEvidence: { verifiedActionReceipts: [] },
@@ -956,7 +959,7 @@ describe("CompanionGameController", () => {
           "plan_safe_action",
           JSON.stringify({
             goal: `${ingot}を作る`,
-            count: 1,
+            count,
             mode: "delegated",
             candidateId: null,
           }),
@@ -965,16 +968,17 @@ describe("CompanionGameController", () => {
         expect(result).toMatchObject({
           success: true,
           data: {
-            completedCount: 1,
-            completedSteps: [{ tool: "mine_block" }, { tool: "smelt_item" }],
+            completedCount: count,
           },
         });
         expect(
           minecraft.actions.filter((action) => action === `dig:${ore}`),
-        ).toHaveLength(1);
+        ).toHaveLength(count);
         expect(minecraft.actions).toContain(`collect:${raw}`);
-        expect(minecraft.actions).toContain(`smelt:${raw}:${ingot}:1`);
-        expect((await game.observeStatus()).inventory[ingot]).toBe(1);
+        expect(minecraft.actions).toContain(
+          `smelt:${raw}:${ingot}:${String(count)}`,
+        );
+        expect((await game.observeStatus()).inventory[ingot]).toBe(count);
       } finally {
         close();
       }

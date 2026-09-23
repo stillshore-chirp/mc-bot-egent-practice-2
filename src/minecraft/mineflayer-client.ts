@@ -1550,22 +1550,34 @@ export class MineflayerClient implements MinecraftPort {
       }>;
     };
     const inputItem = bot.registry.itemsByName[target.input];
-    const fuelItem =
-      bot.registry.itemsByName.coal ?? bot.registry.itemsByName.charcoal;
-    if (
-      typedBot.openFurnace === undefined ||
-      inputItem === undefined ||
-      fuelItem === undefined
-    ) {
+    if (typedBot.openFurnace === undefined || inputItem === undefined) {
       throw new AppError({
         category: "resource",
         code: "SMELT_UNAVAILABLE",
-        message: "The furnace or safe fuel contract is unavailable",
+        message: "The furnace or smelting input is unavailable",
         retryable: false,
         failedAt: "smelt_item",
       });
     }
     const before = await this.observe();
+    const fuelCount = Math.ceil(target.count / 8);
+    const fuelName = ["coal", "charcoal"].find(
+      (name) =>
+        (before.inventory.find((item) => item.name === name)?.count ?? 0) >=
+        fuelCount,
+    );
+    const fuelItem =
+      fuelName === undefined ? undefined : bot.registry.itemsByName[fuelName];
+    if (fuelItem === undefined) {
+      throw new AppError({
+        category: "resource",
+        code: "SMELT_FUEL_MISSING",
+        message: "Not enough known fuel is held for this bounded batch",
+        retryable: false,
+        failedAt: "smelt_item",
+        confirmedState: { requested: target.count, fuelNeeded: fuelCount },
+      });
+    }
     const furnace = await typedBot.openFurnace(furnaceBlock);
     try {
       const initialSlots = furnaceBatchReadiness({
@@ -1593,7 +1605,7 @@ export class MineflayerClient implements MinecraftPort {
         });
       }
       await furnace.putInput(inputItem.id, null, target.count);
-      await furnace.putFuel(fuelItem.id, null, target.count);
+      await furnace.putFuel(fuelItem.id, null, fuelCount);
       const boundInput = readFurnaceSlot(furnace.inputItem?.bind(furnace));
       const boundFuel = readFurnaceSlot(furnace.fuelItem?.bind(furnace));
       if (

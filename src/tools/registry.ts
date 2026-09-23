@@ -55,7 +55,7 @@ const memoryKinds = ["fact", "location", "commitment", "episode"] as const;
 const safeActionModes = z.enum(["delegated", "explicit"]);
 const maxSafeActionSteps = 8;
 const maxSafeActionPlanRounds = 64;
-const maxSafeActionDurationMs = 120_000;
+const maxSafeActionDurationMs = 900_000;
 function nowEvidence(
   kind: EvidenceReference["kind"],
   summary: string,
@@ -240,12 +240,25 @@ export const toolDefinitions = [
     action: true,
     execute: async (input, context) => {
       const startedAt = Date.now();
+      const authorization = context.safeActionAuthorization;
+      const smeltQuantity =
+        authorization?.kind === "owner_bounded_resource" &&
+        knownSmeltInputs[authorization.targetItem] !== undefined
+          ? (context.safeActionAuthorizationUsage?.remainingCount ??
+            authorization.targetCount)
+          : 0;
+      const desiredDurationMs =
+        smeltQuantity > 0 ? 30_000 + smeltQuantity * 13_000 : 60_000;
       const configuredDuration = context.limits.maxSafeActionDurationMs;
       const durationMs =
         typeof configuredDuration === "number" &&
         Number.isFinite(configuredDuration)
-          ? Math.min(Math.max(1, configuredDuration), maxSafeActionDurationMs)
-          : maxSafeActionDurationMs;
+          ? Math.min(
+              Math.max(1, configuredDuration),
+              desiredDurationMs,
+              maxSafeActionDurationMs,
+            )
+          : Math.min(desiredDurationMs, maxSafeActionDurationMs);
       const deadline = startedAt + durationMs;
       const deadlineSignal = AbortSignal.timeout(durationMs);
       const planSignal = AbortSignal.any([context.signal, deadlineSignal]);

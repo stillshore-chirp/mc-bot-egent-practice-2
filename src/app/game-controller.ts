@@ -390,7 +390,7 @@ export class CompanionGameController implements GameController {
       const current = await this.#minecraft.observe();
       const readyToSmelt =
         intermediateItem !== undefined &&
-        countInventory(current, intermediateItem) > 0;
+        countInventory(current, intermediateItem) >= request.count;
       const candidates = await this.observeActionCandidates(
         {
           radius: Math.min(32, this.#maxMoveDistance),
@@ -405,6 +405,19 @@ export class CompanionGameController implements GameController {
             candidate.goalItem === targetItem &&
             candidate.purposeFit === "direct" &&
             candidate.action === (readyToSmelt ? "smelt_item" : "mine_block"),
+        )
+        .map((candidate) =>
+          candidate.action !== "smelt_item"
+            ? candidate
+            : {
+                ...candidate,
+                requestedCount: request.count,
+                args: { ...candidate.args, count: request.count },
+                steps: candidate.steps.map((step) => ({
+                  ...step,
+                  input: { ...step.input, count: request.count },
+                })),
+              },
         )
         .slice(0, request.maxCandidates);
     }
