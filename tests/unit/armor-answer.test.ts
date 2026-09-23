@@ -44,7 +44,12 @@ describe("armor status answer", () => {
     const equipped = renderArmorAnswer("bot", {
       ...status,
       inventory: {},
-      armor: { ...status.armor!, head: "iron_helmet" },
+      armor: {
+        head: "iron_helmet",
+        torso: null,
+        legs: null,
+        feet: null,
+      },
     });
     expect(equipped).toContain("頭は鉄のヘルメット");
     expect(equipped).toContain("所持品に防具はありません");
