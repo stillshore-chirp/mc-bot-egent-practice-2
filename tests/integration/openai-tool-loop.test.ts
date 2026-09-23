@@ -185,6 +185,80 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("confirms an accepted correction from stored memory without a second write", async () => {
+    const record = {
+      id: "00000000-0000-4000-8000-000000000002",
+      playerId: "player",
+      category: "communication" as const,
+      slot: "length",
+      value: "detailed",
+      summary: "必要な背景を含めて丁寧に説明する",
+      source: "owner_correction" as const,
+      confidence: "corrected" as const,
+      scope: "owner_global" as const,
+      supportCount: 1,
+      status: "active" as const,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:00.000Z",
+    };
+    const remember = vi.fn();
+    const correct = vi.fn();
+    const list = vi.fn(() => [record]);
+    const fake = new ScriptedOpenAI([]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = {
+      remember,
+      correct,
+      list,
+      isApplicable: vi.fn(() => true),
+      forget: vi.fn(),
+    };
+    context.behaviorMemoryCandidates = [
+      {
+        category: "communication",
+        slot: "length",
+        value: "detailed",
+        summary: record.summary,
+        source: "owner_correction",
+        confidence: "corrected",
+        scope: "owner_global",
+        reason: "owner_correction",
+      },
+    ];
+
+    const reply = await agent.deliberate({
+      message: "訂正します。説明は短くじゃなくて詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(0);
+    expect(reply.text).toContain("訂正して記憶しました");
+    expect(reply.text).toContain(record.summary);
+    expect(list).toHaveBeenCalledOnce();
+    expect(remember).not.toHaveBeenCalled();
+    expect(correct).not.toHaveBeenCalled();
+
+    list.mockReturnValueOnce([]);
+    const unconfirmed = await agent.deliberate({
+      message: "訂正します。説明は短くじゃなくて詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(unconfirmed.text).toContain("保存を確認できませんでした");
+    expect(unconfirmed.text).not.toContain("記憶しました");
+  });
+
   it("routes owner memory list and forget commands without an LLM round trip", async () => {
     const record = {
       id: "00000000-0000-4000-8000-000000000001",

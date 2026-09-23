@@ -193,6 +193,8 @@ describe("behavior memory extraction", () => {
       [],
     );
     expect(extractBehaviorMemory("専門用語って何？")).toEqual([]);
+    expect(extractBehaviorMemory("覚えている行動の好みを一覧して")).toEqual([]);
+    expect(extractBehaviorMemory("詳しくする記憶から削除して")).toEqual([]);
   });
 
   it("parses list and forget requests without storing the request text", () => {

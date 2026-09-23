@@ -10,6 +10,7 @@ import {
 import {
   parseBehaviorMemoryCommand,
   type BehaviorMemoryCommand,
+  type BehaviorMemoryExtraction,
 } from "../memory/behavior-memory.js";
 import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
@@ -332,6 +333,36 @@ function behaviorMemoryCommandArguments(
   };
 }
 
+function confirmedBehaviorCorrection(
+  result: ToolResult<unknown>,
+  candidates: readonly BehaviorMemoryExtraction[],
+): string {
+  if (!result.success) {
+    return "訂正内容の保存を確認できませんでした。次回も反映されるとはまだ言えません。";
+  }
+  const data = result.data;
+  const records =
+    data !== null &&
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    Array.isArray((data as { readonly records?: unknown }).records)
+      ? (data as { readonly records: unknown[] }).records
+      : [];
+  const confirmed = candidates.every((candidate) =>
+    records.some(
+      (record) =>
+        record !== null &&
+        typeof record === "object" &&
+        !Array.isArray(record) &&
+        (record as { readonly slot?: unknown }).slot === candidate.slot &&
+        (record as { readonly value?: unknown }).value === candidate.value,
+    ),
+  );
+  return confirmed
+    ? `好みを訂正して記憶しました。${candidates.map((candidate) => candidate.summary).join("、")}。`
+    : "訂正内容の保存を確認できませんでした。次回も反映されるとはまだ言えません。";
+}
+
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,
@@ -538,6 +569,34 @@ export class OpenAIDeliberationAgent {
     ];
     const toolResults: { name: string; result: ToolResult<unknown> }[] = [];
     if (request.toolContext.requestKind === "owner_message") {
+      const correctionCandidates =
+        request.toolContext.behaviorMemoryCandidates?.filter(
+          (candidate) => candidate.source === "owner_correction",
+        ) ?? [];
+      if (
+        correctionCandidates.length > 0 &&
+        /^(?:訂正|修正)(?:します|して|したい)?[。,:：\s]*/u.test(
+          request.message.trim(),
+        ) &&
+        !/(?:次に|それから|その後|ついでに)/u.test(request.message)
+      ) {
+        const result = await this.#executor.execute(
+          "list_behavior_memory",
+          JSON.stringify({
+            query: null,
+            limit: request.toolContext.limits.memoryContextLimit,
+          }),
+          toolContext,
+        );
+        toolResults.push({ name: "list_behavior_memory", result });
+        return {
+          text: confirmedBehaviorCorrection(result, correctionCandidates),
+          toolResults,
+          ...(conversationRequestId === undefined
+            ? {}
+            : { conversationRequestId }),
+        };
+      }
       const command = parseBehaviorMemoryCommand(request.message);
       const directCommand =
         command === undefined

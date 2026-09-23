@@ -490,6 +490,7 @@ export function extractBehaviorMemory(
   if (untrustedAttribution.test(normalized)) return [];
   if (protectedOverride.test(normalized)) return [];
   if (/今だけ|今回は|一旦|この作業だけ/iu.test(normalized)) return [];
+  if (parseBehaviorMemoryCommand(normalized) !== undefined) return [];
 
   const stable =
     /覚えて(?:おいて)?|記憶して|今後|次から|これから|いつも|継続して|好み|訂正|修正|違う|前の|(?:感情|気持ち).{0,16}(?:重視|優先|大事|大切)|(?:重視|優先).{0,16}(?:感情|気持ち)/u.test(
