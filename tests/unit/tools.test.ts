@@ -534,6 +534,82 @@ describe("ToolExecutor", () => {
     },
   );
 
+  it("stops when an uncertain mining pickup exceeds the owner quantity", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let attempts = 0;
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal: attempts === 0 ? 0 : 2 },
+    });
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "coal-ore",
+        label: "石炭鉱石",
+        action: "mine_block",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: 1,
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: "coal_ore", position: { x: 1, y: 64, z: 0 } },
+          },
+        ],
+      },
+    ];
+    toolContext.game.mineBlock = async () => {
+      attempts += 1;
+      return {
+        before: status,
+        after: { ...status, inventory: { coal: 2 } },
+        outcome: "failed",
+        failureCategory: "inventory",
+        failureCode: "DROP_NOT_COLLECTED",
+        summary: "回収の完了判定ができませんでした。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        code: "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
+        confirmedState: { observedIncrease: 2, authorizedCount: 1 },
+      },
+    });
+    expect(attempts).toBe(1);
+  });
+
   it("executes every bounded plan step without a second owner prompt", async () => {
     const calls: string[] = [];
     const toolContext = context();

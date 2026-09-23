@@ -934,10 +934,27 @@ export const toolDefinitions = [
                 observedGoalHeld === undefined
                   ? 0
                   : Math.max(0, observedGoalHeld - initialGoalHeld);
-              const boundedIncrease = Math.min(actionCount, observedIncrease);
-              if (boundedIncrease > completedCount) {
-                inventoryReconciledCount += boundedIncrease - completedCount;
-                completedCount = boundedIncrease;
+              if (observedIncrease > actionCount) {
+                return safeActionFailure(
+                  "safety",
+                  "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
+                  false,
+                  step.tool,
+                  {
+                    goalItem: authorizedGoalItem,
+                    observedIncrease,
+                    authorizedCount: actionCount,
+                    completedCount,
+                  },
+                  [
+                    "所持品の増加と依頼数量を確認してから新しい目的として依頼する",
+                  ],
+                  `所持品の増加が許可された${String(actionCount)}個を超えたため、追加の採掘を停止しました。実測の増加は${String(observedIncrease)}個です。`,
+                );
+              }
+              if (observedIncrease > completedCount) {
+                inventoryReconciledCount += observedIncrease - completedCount;
+                completedCount = observedIncrease;
                 remainingCount = actionCount - completedCount;
                 failedCandidateIds.add(planned.candidate.id);
                 completedCandidateIds.pop();
