@@ -686,6 +686,92 @@ describe("CompanionGameController", () => {
     close();
   });
 
+  it("searches a bounded alternate route before selecting a protected log", async () => {
+    class RangeAwareMinecraft extends FakeMinecraft {
+      public override async findResources(
+        names: readonly string[],
+        maxDistance: number,
+        count: number,
+      ) {
+        return this.resources
+          .filter(
+            ({ name, position }) =>
+              names.includes(name) &&
+              Math.hypot(
+                position.x - this.snapshot.position.x,
+                position.y - this.snapshot.position.y,
+                position.z - this.snapshot.position.z,
+              ) <= maxDistance,
+          )
+          .slice(0, count);
+      }
+
+      public override async moveTo(
+        position: { x: number; y: number; z: number },
+        range: number,
+        signal: AbortSignal,
+      ): Promise<void> {
+        if (position.x > 0) {
+          throw new AppError({
+            category: "path",
+            code: "PATH_BLOCKED",
+            message: "Path blocked",
+            retryable: false,
+          });
+        }
+        await super.moveTo(position, range, signal);
+      }
+    }
+
+    const minecraft = new RangeAwareMinecraft();
+    minecraft.resources.push({
+      name: "birch_log",
+      position: { x: 0, y: 64, z: 45 },
+    });
+    const { game, close } = createController(minecraft);
+    try {
+      const search = await game.searchSafeResourceCandidates(
+        32,
+        1,
+        new AbortController().signal,
+        ["birch_log"],
+      );
+      expect(search).toMatchObject({
+        candidates: [{ resource: "birch_log" }],
+        attemptedWaypoints: 2,
+        blockedWaypoints: 1,
+      });
+      expect(minecraft.actions).toContain("move:0,64,16");
+      expect(
+        minecraft.actions.some((action) => action.startsWith("dig:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
+  it("stops resource search before movement when the current state is unsafe", async () => {
+    const minecraft = new FakeMinecraft(createSnapshot({ food: 10 }));
+    const { game, close } = createController(minecraft);
+    try {
+      const search = await game.searchSafeResourceCandidates(
+        32,
+        1,
+        new AbortController().signal,
+        ["oak_log"],
+      );
+      expect(search).toMatchObject({
+        attemptedWaypoints: 0,
+        stop: { code: "SAFE_RESOURCE_SEARCH_UNSAFE" },
+      });
+      expect(
+        minecraft.actions.some((action) => action.startsWith("move:")),
+      ).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
   it("normalizes a descriptive log collection goal", async () => {
     const minecraft = new FakeMinecraft();
     minecraft.resources.push({

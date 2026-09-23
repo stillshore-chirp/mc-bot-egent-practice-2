@@ -259,6 +259,97 @@ describe("tool schema registry", () => {
 });
 
 describe("ToolExecutor", () => {
+  it("searches once under an owner quantity contract and executes the newly observed log", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "木の原木を1個集めて",
+      allowedResources: ["birch_log", "oak_log"],
+      targetItem: "*",
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let observations = 0;
+    let searches = 0;
+    let gathers = 0;
+    toolContext.game.findSafeActionCandidates = async () => {
+      observations += 1;
+      if (observations === 1) return [];
+      return [
+        {
+          id: "gather_resource:birch_log",
+          label: "シラカバの原木",
+          action: "gather_resource",
+          observed: true,
+          purposeFit: "direct",
+          permission: "allowed",
+          safety: "allowed",
+          reversible: false,
+          impact: "medium",
+          operationClass: "natural_resource",
+          requestedCount: 1,
+          resourceName: "birch_log",
+          goalItem: "birch_log",
+          distance: 2,
+          steps: [
+            {
+              tool: "gather_resource",
+              input: { resource: "birch_log", count: 1, commitmentId: null },
+            },
+          ],
+        },
+      ];
+    };
+    toolContext.game.searchSafeResourceCandidates = async () => {
+      searches += 1;
+      return {
+        candidates: [{ resource: "birch_log", distance: 2 }],
+        attemptedWaypoints: 2,
+        blockedWaypoints: 1,
+      };
+    };
+    toolContext.game.gatherResource = async () => {
+      gathers += 1;
+      return {
+        before: status,
+        after: status,
+        outcome: "completed",
+        confirmedState: {
+          resource: "birch_log",
+          requestedCount: 1,
+          collectedCount: 1,
+          heldCount: 1,
+        },
+        summary: "所持数の増加を確認しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "collect_resource",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1, candidateId: "gather_resource:birch_log" },
+    });
+    expect({ observations, searches, gathers }).toEqual({
+      observations: 2,
+      searches: 1,
+      gathers: 1,
+    });
+  });
+
   it("executes every bounded plan step without a second owner prompt", async () => {
     const calls: string[] = [];
     const toolContext = context();
@@ -1435,6 +1526,49 @@ describe("ToolExecutor", () => {
       expect(result.error.userSummary).toContain("観測");
       expect(result.error.userSummary).not.toContain("MAIN_TASK_BUSY");
     }
+  });
+
+  it("searches for an owner-authorized tree before asking for its species", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "木を1本切って",
+      allowedResources: ["birch_log", "oak_log"],
+      targetItem: "*",
+      selectionRequired: true,
+      targetCount: 1,
+      maxCount: 16,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    toolContext.game.findSafeResourceCandidates = async () => [];
+    let searches = 0;
+    toolContext.game.searchSafeResourceCandidates = async () => {
+      searches += 1;
+      return {
+        candidates: [{ resource: "birch_log", distance: 3 }],
+        attemptedWaypoints: 1,
+        blockedWaypoints: 0,
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "select_safe_resource",
+      JSON.stringify({ count: 1 }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { resource: "birch_log", count: 1 },
+    });
+    expect(searches).toBe(1);
+    expect(toolContext.safeActionAuthorization).toMatchObject({
+      targetItem: "birch_log",
+      allowedResources: ["birch_log"],
+    });
   });
 
   it("fails closed when the adapter cannot provide the protected candidate observation", async () => {

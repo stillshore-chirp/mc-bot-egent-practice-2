@@ -47,6 +47,7 @@ import {
 import type { TaskRuntime } from "../runtime/task-service.js";
 import type { FollowPlayerSkill } from "../skills/follow-player.js";
 import type { GatherLogsSkill } from "../skills/gather-logs/gather-logs-skill.js";
+import { createSearchFrontier } from "../skills/gather-logs/search-strategy.js";
 import {
   gatherableLogs,
   type GatherableLog,
@@ -60,6 +61,7 @@ import type {
   GameStatus,
   Position,
   SafeResourceCandidate,
+  SafeResourceSearchResult,
   Surroundings,
 } from "../tools/contracts.js";
 
@@ -253,6 +255,97 @@ export class CompanionGameController implements GameController {
       }))
       .filter(({ distance }) => Number.isFinite(distance))
       .sort((left, right) => left.distance - right.distance);
+  }
+
+  public async searchSafeResourceCandidates(
+    maxDistance: number,
+    count: number,
+    signal: AbortSignal,
+    allowedNames?: readonly string[],
+  ): Promise<SafeResourceSearchResult> {
+    const searchDistance = Math.min(maxDistance, this.#maxMoveDistance, 32);
+    const initial = await this.findSafeResourceCandidates(
+      Math.min(32, searchDistance),
+      count,
+      signal,
+      allowedNames,
+    );
+    if (initial.length > 0) {
+      return {
+        candidates: initial,
+        attemptedWaypoints: 0,
+        blockedWaypoints: 0,
+      };
+    }
+    const origin = await this.#minecraft.observe();
+    const frontier = createSearchFrontier(
+      origin.position,
+      Math.min(16, searchDistance),
+      searchDistance,
+    ).slice(0, 4);
+    let attemptedWaypoints = 0;
+    let blockedWaypoints = 0;
+    let moved = false;
+    for (const point of frontier) {
+      signal.throwIfAborted();
+      const beforeMove = await this.#minecraft.observe();
+      const danger = observedCurrentDanger(beforeMove, this.#hungerThreshold);
+      if (!beforeMove.connected || !beforeMove.spawned || danger !== null) {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: "SAFE_RESOURCE_SEARCH_UNSAFE",
+            reason: danger ?? "Minecraftへの接続と現在位置を確認できません。",
+          },
+        };
+      }
+      attemptedWaypoints += 1;
+      const movement = await this.moveTo(point, 3, signal);
+      if (movement.outcome !== "completed") {
+        if (movement.failureCategory === "path") {
+          blockedWaypoints += 1;
+          continue;
+        }
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code: movement.failureCode ?? "SAFE_RESOURCE_SEARCH_STOPPED",
+            reason: movement.summary,
+          },
+        };
+      }
+      moved = true;
+      const candidates = await this.findSafeResourceCandidates(
+        Math.min(32, searchDistance),
+        count,
+        signal,
+        allowedNames,
+      );
+      if (candidates.length > 0) {
+        return { candidates, attemptedWaypoints, blockedWaypoints };
+      }
+    }
+    if (moved && !signal.aborted) {
+      const returnMove = await this.moveTo(origin.position, 3, signal);
+      if (returnMove.outcome !== "completed") {
+        return {
+          candidates: [],
+          attemptedWaypoints,
+          blockedWaypoints,
+          stop: {
+            code:
+              returnMove.failureCode ?? "SAFE_RESOURCE_SEARCH_RETURN_FAILED",
+            reason:
+              "候補がなく、探索前の位置へ戻る移動も完了できませんでした。",
+          },
+        };
+      }
+    }
+    return { candidates: [], attemptedWaypoints, blockedWaypoints };
   }
 
   public async findSafeActionCandidates(

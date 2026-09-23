@@ -495,6 +495,69 @@ export const toolDefinitions = [
             `安全計画を${String(completedCount)}個分まで実行し、制限時間を超えたため停止しました。`,
           );
         }
+        const resourceAuthorization = context.safeActionAuthorization;
+        if (
+          observed.length === 0 &&
+          resourceAuthorization?.kind === "owner_bounded_resource" &&
+          resourceAuthorization.allowedResources.some((resource) =>
+            resourceNames.includes(resource as (typeof resourceNames)[number]),
+          ) &&
+          context.game.searchSafeResourceCandidates !== undefined
+        ) {
+          const allowedLogs = resourceAuthorization.allowedResources.filter(
+            (resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ),
+          );
+          const search = await context.game.searchSafeResourceCandidates(
+            Math.min(32, context.limits.maxMoveDistance),
+            8,
+            planSignal,
+            allowedLogs,
+          );
+          if (search.stop !== undefined) {
+            return safeActionFailure(
+              "safety",
+              search.stop.code,
+              false,
+              "search_safe_resource_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [search.stop.reason],
+              `安全な候補を探す途中で停止しました。${search.stop.reason}`,
+            );
+          }
+          if (search.candidates.length === 0) {
+            return safeActionFailure(
+              "resource",
+              "SAFE_RESOURCE_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_resource_candidates",
+              {
+                completedCount,
+                remainingCount,
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              ["保護条件を満たす木が探索範囲に現れたら、残りを依頼する"],
+              `許可された範囲で${String(search.attemptedWaypoints)}方向を調べましたが、保護条件を満たす木を確認できませんでした。`,
+            );
+          }
+          observed = await context.game.findSafeActionCandidates(
+            {
+              goal: input.goal,
+              count: remainingCount,
+              maxCandidates: 8,
+              authorization: resourceAuthorization,
+            },
+            planSignal,
+          );
+        }
         const planned = planSafeAction({
           mode: input.mode,
           requestedId: input.candidateId ?? undefined,
@@ -990,11 +1053,68 @@ export const toolDefinitions = [
         };
       }
 
-      const observed = await context.game.findSafeResourceCandidates(
+      const ownerAuthorization = context.safeActionAuthorization;
+      const allowedLogNames =
+        ownerAuthorization?.kind === "owner_bounded_resource"
+          ? ownerAuthorization.allowedResources.filter((resource) =>
+              resourceNames.includes(
+                resource as (typeof resourceNames)[number],
+              ),
+            )
+          : undefined;
+      let observed = await context.game.findSafeResourceCandidates(
         Math.min(32, context.limits.maxMoveDistance),
         Math.min(8, input.count),
         context.signal,
+        allowedLogNames,
       );
+      const usage = context.safeActionAuthorizationUsage;
+      if (
+        observed.length === 0 &&
+        ownerAuthorization?.kind === "owner_bounded_resource" &&
+        usage !== undefined &&
+        !usage.consumed &&
+        input.count <= usage.remainingCount &&
+        context.game.searchSafeResourceCandidates !== undefined
+      ) {
+        if (allowedLogNames !== undefined && allowedLogNames.length > 0) {
+          const search = await context.game.searchSafeResourceCandidates(
+            Math.min(32, context.limits.maxMoveDistance),
+            Math.min(8, input.count),
+            AbortSignal.any([context.signal, AbortSignal.timeout(120_000)]),
+            allowedLogNames,
+          );
+          if (search.stop !== undefined) {
+            return safeActionFailure(
+              "safety",
+              search.stop.code,
+              false,
+              "search_safe_resource_candidates",
+              {
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              [search.stop.reason],
+              `安全な候補を探す途中で停止しました。${search.stop.reason}`,
+            );
+          }
+          observed = search.candidates;
+          if (observed.length === 0) {
+            return safeActionFailure(
+              "resource",
+              "SAFE_RESOURCE_SEARCH_EXHAUSTED",
+              false,
+              "search_safe_resource_candidates",
+              {
+                attemptedWaypoints: search.attemptedWaypoints,
+                blockedWaypoints: search.blockedWaypoints,
+              },
+              ["保護条件を満たす木が探索範囲に現れたら再依頼する"],
+              `許可された範囲で${String(search.attemptedWaypoints)}方向を調べましたが、保護条件を満たす木を確認できませんでした。`,
+            );
+          }
+        }
+      }
       const decision = chooseSafeCandidate({
         mode: "delegated",
         candidates: observed.map((candidate, index) => ({
