@@ -61,7 +61,7 @@ const persona: PersonaCore = {
   prohibitions: ["未確認の成功を断定しない"],
 };
 
-function factory(): CompanionContextFactory {
+function factory(latestBotDeath?: string): CompanionContextFactory {
   const memoryStore = {
     getRelationship: () => ({
       playerId: "player",
@@ -71,6 +71,7 @@ function factory(): CompanionContextFactory {
       updatedAt: new Date().toISOString(),
     }),
     getLifeState: () => undefined,
+    latestBotDeath: () => latestBotDeath,
     searchWorldMemories: () => [],
     listRecentTaskRuns: () => [],
     recall: () => [],
@@ -90,6 +91,35 @@ function factory(): CompanionContextFactory {
 }
 
 describe("CompanionContextFactory owner action boundary", () => {
+  it("includes an observed death for a recent event or an explicit death reference", async () => {
+    const recent = await factory(new Date().toISOString()).create(
+      "owner",
+      "何が起きた？",
+      new AbortController().signal,
+      "recent-death",
+      "owner_message",
+    );
+    expect(recent.memoryContext).toContain("[bot_death]");
+
+    const olderDeath = "2026-01-01T00:00:00.000Z";
+    const recalled = await factory(olderDeath).create(
+      "owner",
+      "前に死んだことを覚えてる？",
+      new AbortController().signal,
+      "death-history",
+      "owner_message",
+    );
+    expect(recalled.memoryContext).toContain(olderDeath);
+    const unrelated = await factory(olderDeath).create(
+      "owner",
+      "木を見てきて",
+      new AbortController().signal,
+      "old-death-unrelated",
+      "owner_message",
+    );
+    expect(unrelated.memoryContext).not.toContain("[bot_death]");
+  });
+
   it("authorizes only a direct owner request to equip carried armor", async () => {
     const contextFactory = factory();
     const allowed = await contextFactory.create(

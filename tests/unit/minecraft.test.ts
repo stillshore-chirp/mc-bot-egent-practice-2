@@ -81,6 +81,8 @@ describe("Minecraft boundary", () => {
       );
       const received = vi.fn();
       client.onChat(received);
+      const deaths = vi.fn();
+      const unsubscribeDeath = client.onDeath(deaths);
       const controller = new AbortController();
       const connection = client.connect(controller.signal);
       const rejected = expect(connection).rejects.toThrow("test complete");
@@ -88,6 +90,13 @@ describe("Minecraft boundary", () => {
       bot.emit("chat", "LOGIN@example.invalid", "self alias");
       bot.emit("chat", "fixture_owner", "停止");
       expect(received).toHaveBeenCalledExactlyOnceWith("fixture_owner", "停止");
+      bot.emit("death");
+      expect(deaths).toHaveBeenCalledExactlyOnceWith(
+        expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+      );
+      unsubscribeDeath();
+      bot.emit("death");
+      expect(deaths).toHaveBeenCalledTimes(1);
       controller.abort(new Error("test complete"));
       await rejected;
     } finally {

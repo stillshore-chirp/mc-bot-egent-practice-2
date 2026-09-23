@@ -25,6 +25,31 @@ afterEach(() => {
 });
 
 describe("MemoryStore", () => {
+  it("recalls the latest observed Bot death without mixing unrelated episodes", () => {
+    const store = MemoryStore.open(databasePath());
+    const player = store.getOrCreatePlayer("fixture_owner");
+    expect(store.latestBotDeath(player.id)).toBeUndefined();
+    store.recordEpisode({
+      playerId: player.id,
+      summary: "前の作業を確認した",
+      observedAt: "2026-09-23T12:00:00.000Z",
+    });
+    store.recordEpisode({
+      playerId: player.id,
+      summary: "Bot自身が死亡した",
+      details: { event: "bot_death" },
+      observedAt: "2026-09-23T12:01:00.000Z",
+    });
+    store.recordEpisode({
+      playerId: player.id,
+      summary: "Bot自身が死亡した",
+      details: { event: "bot_death" },
+      observedAt: "2026-09-23T12:03:00.000Z",
+    });
+    expect(store.latestBotDeath(player.id)).toBe("2026-09-23T12:03:00.000Z");
+    store.close();
+  });
+
   it("persists an empty initial life state without creating a stale search entry", () => {
     const store = MemoryStore.open(databasePath());
     const initial = store.saveLifeState({

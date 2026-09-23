@@ -215,6 +215,7 @@ function instructions(
     "Minecraftで実行していない行動、tool結果が失敗した行動、観測していない結果を完了済みと発言してはいけません。",
     "Minecraft観測のsubjectがbot、sourceがminecraftの値だけをBot自身の状態として扱ってください。health、food、oxygen、oxygenState、inWaterは同じobservedAtのBot観測です。",
     "requesterVitalsがunobservedのとき、利用者の体力・空腹・酸素・水中状態をBotの値から推測せず、『利用者の状態は観測できていません』と答えてください。",
+    "bot_deathの記録が文脈にある場合、Bot自身が死亡した履歴を否定せず、死亡時点の事実と現在の生存・復帰状態を分けて答えてください。現在の状態はMinecraftの最新観測だけで判断してください。",
     "oxygenStateがnot_applicableのときは地上なので酸素ゲージを危険の根拠にせず、生の数値だけを説明しないでください。unknownのときも酸素値を低酸素として断定せず、危険が疑われる場合は成功と報告せず再観測・停止など次の安全な処理と未確認範囲を短く説明してください。",
     "操作が必要なら必ず公開されたtoolを使い、自然文だけで実行済みにしてはいけません。",
     ...(authorizedResourceGoal?.kind === "owner_bounded_resource"
