@@ -1615,7 +1615,13 @@ export class MineflayerClient implements MinecraftPort {
         });
       }
       const boundInputCount = boundInput.count ?? target.count;
-      const deadline = Date.now() + this.options.collectTimeoutMs;
+      // A vanilla furnace needs about 10 seconds per item at 20 TPS. The
+      // generic pickup timeout can expire before its first output appears.
+      const smeltWaitMs = Math.max(
+        this.options.collectTimeoutMs,
+        20_000 + Math.max(0, target.count - 1) * 10_000,
+      );
+      const deadline = Date.now() + smeltWaitMs;
       while (Date.now() < deadline) {
         throwIfAborted(signal, "smelt_item");
         await delay(250, signal);
