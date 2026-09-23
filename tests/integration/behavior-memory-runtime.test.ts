@@ -16,6 +16,7 @@ import type {
   GameStatus,
   MemoryPort,
 } from "../../src/tools/contracts.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
 
 const status: GameStatus = {
@@ -268,6 +269,78 @@ describe("behavior memory runtime integration", () => {
           entry.kind,
         );
       }
+      expect(store.listBehaviorMemories(player.id)).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("supports owner list, correction, and forgetting through the registered tools", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mc-behavior-tools-"));
+    const path = join(directory, "memory.sqlite");
+    const store = SqliteMemoryStore.open(path);
+    try {
+      const player = store.getOrCreatePlayer("owner");
+      const executor = new ToolExecutor();
+      const initial = await factory(store, player.id).create(
+        "owner",
+        "今後は短く説明して",
+        new AbortController().signal,
+        "tools-event-0001",
+        "owner_message",
+      );
+      const listed = await executor.execute(
+        "list_behavior_memory",
+        JSON.stringify({ query: null, limit: 10 }),
+        initial.toolContext,
+      );
+      expect(listed).toMatchObject({
+        success: true,
+        data: { records: [expect.objectContaining({ slot: "length" })] },
+      });
+
+      const correction = await factory(store, player.id).create(
+        "owner",
+        "訂正: 今後は詳しく説明して",
+        new AbortController().signal,
+        "tools-event-0002",
+        "owner_message",
+      );
+      const candidate = correction.toolContext.behaviorMemoryCandidates?.find(
+        ({ slot }) => slot === "length",
+      );
+      if (candidate === undefined) throw new Error("correction not extracted");
+      const corrected = await executor.execute(
+        "correct_behavior_memory",
+        JSON.stringify({
+          memoryId: null,
+          category: candidate.category,
+          slot: candidate.slot,
+          value: candidate.value,
+          summary: candidate.summary,
+        }),
+        correction.toolContext,
+      );
+      expect(corrected).toMatchObject({
+        success: true,
+        data: { corrected: true },
+      });
+
+      const forgotten = await executor.execute(
+        "forget_behavior_memory",
+        JSON.stringify({
+          memoryId: null,
+          category: "communication",
+          slot: "length",
+          reason: "この説明の好みを忘れて",
+        }),
+        correction.toolContext,
+      );
+      expect(forgotten).toMatchObject({
+        success: true,
+        data: { forgotten: [expect.objectContaining({ slot: "length" })] },
+      });
       expect(store.listBehaviorMemories(player.id)).toEqual([]);
     } finally {
       store.close();
