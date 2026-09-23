@@ -256,4 +256,30 @@ describe("owner goal quantity follow-up boundary", () => {
     expect(held.toolContext.safeActionAuthorization).toBeUndefined();
     expect(held.toolContext.safeActionClarification).toContain("数量");
   });
+
+  it("carries a delegated small quantity into the next owner request", async () => {
+    const contextFactory = createFactory([]);
+    await contextFactory.create(
+      "owner",
+      "近くの木を切って",
+      new AbortController().signal,
+      "integration-delegated-1",
+      "owner_message",
+    );
+    const delegated = await contextFactory.create(
+      "owner",
+      "適量だよ",
+      new AbortController().signal,
+      "integration-delegated-2",
+      "owner_message",
+    );
+
+    expect(delegated.toolContext.safeActionAuthorization).toMatchObject({
+      kind: "owner_bounded_resource",
+      targetItem: "*",
+      targetCount: 4,
+      maxCount: 64,
+      selectionRequired: true,
+    });
+  });
 });

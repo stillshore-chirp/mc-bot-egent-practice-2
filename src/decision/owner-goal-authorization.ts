@@ -317,6 +317,18 @@ export function deriveOwnerGoalAuthorization(
   if (
     pendingGoalValid &&
     resource === undefined &&
+    isStandaloneDelegationReply(message)
+  ) {
+    return authorizePendingGoal(
+      pendingGoal,
+      delegatedCount(message, input.maxCount),
+      input.maxCount,
+    );
+  }
+
+  if (
+    pendingGoalValid &&
+    resource === undefined &&
     count !== undefined &&
     hasCollectionQuantityUnit(message)
   ) {
@@ -374,7 +386,12 @@ export function deriveOwnerGoalAuthorization(
         "集める資源を具体的に指定してください（鉄、鉄インゴット、石炭、銅など）。",
     };
   }
-  if (count === undefined) {
+  const requestedCount =
+    count ??
+    (hasDelegatedQuantity(goalClause)
+      ? delegatedCount(goalClause, input.maxCount)
+      : undefined);
+  if (requestedCount === undefined) {
     return {
       outcome: "clarify",
       question: `目的は${resource.label}の収集として理解しました。数量を指定してください（上限${String(input.maxCount)}個）。`,
@@ -392,7 +409,7 @@ export function deriveOwnerGoalAuthorization(
         "この操作の数量上限を確認できません。数量上限を設定してから再依頼してください。",
     };
   }
-  if (count > input.maxCount) {
+  if (requestedCount > input.maxCount) {
     return {
       outcome: "clarify",
       question: `指定数が上限を超えています。${resource.label}は${String(input.maxCount)}個以下で指定してください。`,
@@ -406,7 +423,7 @@ export function deriveOwnerGoalAuthorization(
       goal: goalClause,
       allowedResources: resource.allowedResources,
       targetItem: resource.targetItem,
-      targetCount: count,
+      targetCount: requestedCount,
       maxCount: input.maxCount,
       ...(resource.targetItem === "*" ? { selectionRequired: true } : {}),
     },
@@ -483,6 +500,23 @@ function isStandaloneQuantityReply(message: string): boolean {
   );
 }
 
+function isStandaloneDelegationReply(message: string): boolean {
+  return /^(?:少し(?:だけ)?|ちょっと(?:だけ)?|適量(?:で|だよ)?|いい感じに|任せる|任せた|お任せ|自分で考え(?:て|ろよ|てよ))(?:お願いします|お願い|ね)?[。！!]?$/u.test(
+    message,
+  );
+}
+
+function hasDelegatedQuantity(message: string): boolean {
+  return /(?:少し(?:だけ)?|ちょっと(?:だけ)?|適量|いい感じに|数量は任せる|量は任せる|何個か|切ってみて|集めてみて)/u.test(
+    message,
+  );
+}
+
+function delegatedCount(message: string, maxCount: number): number {
+  const modestCount = /(?:少し|ちょっと)/u.test(message) ? 2 : 4;
+  return Math.min(modestCount, maxCount);
+}
+
 function hasCollectionQuantityUnit(message: string): boolean {
   return /(?:[0-9]\s*(?:個|つ|本|枚|ブロック|items?|blocks?)|一\s*本)/iu.test(
     message,
@@ -523,7 +557,11 @@ function findNamedResource(
         normalize(right.alias).length - normalize(left.alias).length,
     )[0];
   if (named !== undefined) return named;
-  if (/木を(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(message)) {
+  if (
+    /木を(?:少し|ちょっと)?\s*(?:(?:[0-9]{1,3}|一)\s*本)?\s*(?:切|伐採|倒)/u.test(
+      message,
+    )
+  ) {
     const goal = resourceGoals[0];
     if (goal !== undefined) return { alias: "木", goal };
   }

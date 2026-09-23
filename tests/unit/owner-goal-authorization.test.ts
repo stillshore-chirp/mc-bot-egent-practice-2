@@ -344,6 +344,82 @@ describe("owner goal authorization", () => {
     });
   });
 
+  it.each(["いい感じに", "適量だよ", "自分で考えろよ"])(
+    "accepts a bounded quantity delegated for the pending goal: %s",
+    (message) => {
+      const first = deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "近くの木を切って",
+        nowMs: 1_000,
+      });
+      if (first.outcome !== "clarify" || first.pendingGoal === undefined)
+        throw new Error("expected pending owner goal");
+
+      expect(
+        deriveOwnerGoalAuthorization({
+          ...ownerInput,
+          message,
+          pendingGoal: first.pendingGoal,
+          nowMs: 1_001,
+        }),
+      ).toMatchObject({
+        outcome: "authorized",
+        authorization: {
+          targetItem: "*",
+          targetCount: 4,
+          selectionRequired: true,
+        },
+      });
+    },
+  );
+
+  it.each([
+    ["近くの木を切ってみて", 4],
+    ["木を少し切って", 2],
+    ["鉄を適量集めて", 4],
+  ])("starts a small bounded trial for %s", (message, targetCount) => {
+    expect(
+      deriveOwnerGoalAuthorization({ ...ownerInput, message }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: { targetCount },
+    });
+  });
+
+  it("caps delegated quantity by the configured maximum", () => {
+    expect(
+      deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        maxCount: 2,
+        message: "近くの木を切ってみて",
+      }),
+    ).toMatchObject({
+      outcome: "authorized",
+      authorization: { targetCount: 2, maxCount: 2 },
+    });
+  });
+
+  it.each(["適量でいい？", "適量は必要ない", "拠点に戻って"])(
+    "does not authorize a pending goal from an unrelated reply: %s",
+    (message) => {
+      const first = deriveOwnerGoalAuthorization({
+        ...ownerInput,
+        message: "近くの木を切って",
+        nowMs: 1_000,
+      });
+      if (first.outcome !== "clarify" || first.pendingGoal === undefined)
+        throw new Error("expected pending owner goal");
+      expect(
+        deriveOwnerGoalAuthorization({
+          ...ownerInput,
+          message,
+          pendingGoal: first.pendingGoal,
+          nowMs: 1_001,
+        }).outcome,
+      ).not.toBe("authorized");
+    },
+  );
+
   it.each([
     ["statement", "20個持ってるよ"],
     ["different task", "拠点に戻って"],
