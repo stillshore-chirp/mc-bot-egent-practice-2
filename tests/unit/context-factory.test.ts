@@ -6,7 +6,11 @@ import type { MemoryStore } from "../../src/memory/store.js";
 import type { PersonaCore } from "../../src/persona/persona.js";
 import { TaskRuntime } from "../../src/runtime/task-service.js";
 import { InMemoryTaskStore } from "../support/in-memory-task-store.js";
-import type { GameController, MemoryPort } from "../../src/tools/contracts.js";
+import type {
+  GameController,
+  GameStatus,
+  MemoryPort,
+} from "../../src/tools/contracts.js";
 
 const status = {
   connected: true,
@@ -61,7 +65,10 @@ const persona: PersonaCore = {
   prohibitions: ["未確認の成功を断定しない"],
 };
 
-function factory(latestBotDeath?: string): CompanionContextFactory {
+function factory(
+  latestBotDeath?: string,
+  statusOverride: Partial<GameStatus> = {},
+): CompanionContextFactory {
   const memoryStore = {
     getRelationship: () => ({
       playerId: "player",
@@ -77,7 +84,7 @@ function factory(latestBotDeath?: string): CompanionContextFactory {
     recall: () => [],
   } as unknown as MemoryStore;
   const game = {
-    observeStatus: async () => status,
+    observeStatus: async () => ({ ...status, ...statusOverride }),
   } as unknown as GameController;
   return new CompanionContextFactory(
     config,
@@ -148,28 +155,30 @@ describe("CompanionContextFactory owner action boundary", () => {
       expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
     }
   });
-  it("uses a recent bot armor-status context for a short owner suggestion only", async () => {
+  it("uses freshly observed wearable armor for a short owner suggestion only", async () => {
     const message = "それを着れば？";
-    const allowed = await factory().create(
+    const wearable = {
+      inventory: { iron_helmet: 1 },
+      armor: { head: null, torso: null, legs: null, feet: null },
+    };
+    const allowed = await factory(undefined, wearable).create(
       "owner",
       message,
       new AbortController().signal,
       "armor-followup",
       "owner_message",
-      { recentBotArmorStatus: true },
     );
     expect(allowed.toolContext.armorEquipAuthorized).toBe(true);
-    for (const [username, context] of [
-      ["owner", undefined],
-      ["other", { recentBotArmorStatus: true }],
+    for (const [username, observed] of [
+      ["owner", {}],
+      ["other", wearable],
     ] as const) {
-      const rejected = await factory().create(
+      const rejected = await factory(undefined, observed).create(
         username,
         message,
         new AbortController().signal,
         "armor-followup-rejected",
         "owner_message",
-        context,
       );
       expect(rejected.toolContext.armorEquipAuthorized).toBeUndefined();
     }

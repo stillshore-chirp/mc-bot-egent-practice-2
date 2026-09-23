@@ -8,6 +8,7 @@ import type { CognitiveStage } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import { OwnerBehaviorMemoryLearner } from "../agent/behavior-memory-learning.js";
 import {
+  hasWearableCarriedArmor,
   isArmorEquipRequest,
   isContextualArmorEquipSuggestion,
 } from "../agent/armor-answer.js";
@@ -139,7 +140,6 @@ export class CompanionContextFactory implements ChatContextFactory {
     signal: AbortSignal,
     correlationId: string,
     requestKind: ToolContext["requestKind"],
-    ownerTurnContext?: { readonly recentBotArmorStatus: boolean },
   ): Promise<{
     personaContext: string;
     memoryContext: string;
@@ -462,7 +462,7 @@ export class CompanionContextFactory implements ChatContextFactory {
                   behaviorMemoryCandidates: learned.candidates,
                   behaviorMemoryEventId: correlationId,
                   ...(isArmorEquipRequest(message) ||
-                  (ownerTurnContext?.recentBotArmorStatus === true &&
+                  (hasWearableCarriedArmor(status) &&
                     isContextualArmorEquipSuggestion(message))
                     ? {
                         armorEquipAuthorized: true,
