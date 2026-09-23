@@ -63,6 +63,7 @@ BROWSER_PATTERNS = (
 
 PRODUCT_PATTERNS = (
     "src/**",
+    "scripts/*.ts",
     "server/tree-guard/**",
     "docs/building-protection.md",
     "docs/delivery-storage.md",

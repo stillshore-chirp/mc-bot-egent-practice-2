@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   reflexReassessmentForTransition,
   runtimeReassessmentState,
+  SafetyReassessmentEpisodes,
   taskExpectsMovement,
 } from "../../src/app/application.js";
+import { RuntimeReassessmentGate } from "../../src/app/runtime-reassessment-gate.js";
 import type { ReflexState } from "../../src/reflexes/reflex-coordinator.js";
 
 const failed = (
@@ -148,7 +150,7 @@ describe("application reflex policy", () => {
     expect(
       runtimeReassessmentState("safety_stabilized", nextStabilizing, safe),
     ).toEqual({
-      stateKey: "safety:stabilized:stuck:episode:2026-08-25T00:05:00_000Z",
+      stateKey: "safety:stabilized:stuck",
       causeKey: "reflex:stuck",
     });
     const retriedFailure: ReflexState = {
@@ -174,5 +176,65 @@ describe("application reflex policy", () => {
       stateKey: "connection:recovered:2",
       causeKey: "connection",
     });
+  });
+
+  it("groups brief repeated recoveries but immediately reports failure and a new episode", async () => {
+    const episodes = new SafetyReassessmentEpisodes(60_000);
+    const decisions: string[] = [];
+    const delivered: string[] = [];
+    const gate = new RuntimeReassessmentGate({
+      run: async (event: string) => {
+        delivered.push(event);
+      },
+      priority: () => 1,
+      cooldownMs: 30_000,
+      onError: () => undefined,
+      onDecision: ({ outcome, reason }) =>
+        decisions.push(`${outcome}:${reason ?? "none"}`),
+    });
+    const recovered = {
+      stateKey: "safety:stabilized:hostile",
+      causeKey: "reflex:hostile",
+    };
+    gate.request({
+      event: "safety_stabilized",
+      ...episodes.state("safety_stabilized", recovered, 0),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.request({
+      event: "safety_stabilized",
+      ...episodes.state("safety_stabilized", recovered, 10_000),
+    });
+    expect(delivered).toEqual(["safety_stabilized"]);
+    expect(decisions).toContain("suppressed:unchanged_state");
+
+    gate.request({
+      event: "safety_stabilized",
+      ...episodes.state("safety_stabilized", recovered, 75_000),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.request({
+      event: "safety_failed",
+      ...episodes.state(
+        "safety_failed",
+        {
+          stateKey: "safety:failed:hostile:REFLEX_NOT_STABLE",
+          causeKey: "reflex:hostile",
+        },
+        76_000,
+      ),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.request({
+      event: "safety_stabilized",
+      ...episodes.state("safety_stabilized", recovered, 77_000),
+    });
+    await gate.stop();
+    expect(delivered).toEqual([
+      "safety_stabilized",
+      "safety_stabilized",
+      "safety_failed",
+      "safety_stabilized",
+    ]);
   });
 });
