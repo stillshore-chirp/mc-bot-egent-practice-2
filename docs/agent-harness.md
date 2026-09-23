@@ -47,7 +47,7 @@ gate ledgerは gate、snapshot phase・HEAD・base、input paths、関連config�
 
 completed laneは、status、scope / revision、conclusion、changed paths、verification、unperformed checks、remaining risks、stop reason、snapshot / diff、artifact referenceを含むcompact evidence packageを返します。raw logや長いfile全文は含めません。
 
-task budgetは、primaryとlaneごとの最小context、owned paths、実行時間またはdeadline、runtime資源、output capを開始時に固定します。review budgetは、対象HEAD、review cycle数、確認するseverityとclosure、再取得条件を固定し、同じHEADでclean結果を増やすための再reviewを行いません。P0/P1またはsecurity・acceptance contradictionは予算外でもblockingとして扱います。
+task budgetは、primaryとlaneごとの最小context、owned paths、実行時間またはdeadline、runtime資源、output capを開始時に固定します。review budgetは、対象HEAD、review cycle数、確認するseverityとclosure、再取得条件を固定します。包括reviewはcode freeze後に依頼し、指摘を集約して修正します。修正後はreview対象HEADからの差分、関連検証、CI、thread、mergeabilityを照合し、修正だけを理由に再reviewを依頼しません。再依頼は前回評価できなかった重大な論点がある場合に限り、同一PRで最大2回です。P0/P1またはsecurity・acceptance contradictionは予算外でもblockingとして扱い、上限後も残る場合はmergeを止めます。
 
 checkpointを逃した時だけ同じownerへ一度partial resultを求め、進展がなければscope shrink、縮小後も進展がなければreassignします。partial / unverifiedは未確認範囲と再開条件を保持します。primaryが分離可能な作業を直接行う場合は、specific reason、subagent不能のevidence、scope shrink history、reassignment history、primary-only question、target paths、output capを記録します。
 

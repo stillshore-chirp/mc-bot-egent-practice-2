@@ -57,9 +57,9 @@ description: "ソースコード変更とIssue、branch、commit、push、PR、C
 ## 5. CIとreview
 <!-- agent-harness:delivery-review:start -->
 
-- latest headに紐づく対象branchのCIを確認し、成功後はlatest-head review、未解決thread、mergeabilityも確認する。失敗時は原因を特定し、修正、commit、push、再確認する。
+- latest headに紐づく対象branchのCIを確認し、成功後はreview履歴の対象HEADから最新HEADまでの差分と指摘対応、未解決thread、mergeabilityも確認する。失敗時は原因を特定し、修正、commit、push、再確認する。
 - 開発中とreview修正中は変更pathに対応するfocused testを使い、最終HEAD確定前にfull gateを機械的に繰り返さない。
-- 配送対象の最終HEADでは、変更範囲に必要な検証を入力閉包へ束縛して一度実行する。ガバナンス変更では `python3 scripts/validate_governance.py` を使い、同じsnapshot・条件の検査を重ねない。stacked PRは親merge後にbase統合、必要な検証、latest HEAD reviewを確認する。
+- 配送対象の最終HEADでは、変更範囲に必要な検証を入力閉包へ束縛して一度実行する。ガバナンス変更では `python3 scripts/validate_governance.py` を使い、同じsnapshot・条件の検査を重ねない。stacked PRは親merge後にbase統合、必要な検証、review対象HEADとの差分と指摘対応を確認する。
 - workflowまたは検証分類を変更した場合は、変更pathに対応するcontract test、YAML parse、`base...head` classification、latest Actionsを選択する。製品runtimeに影響しない場合、無関係なfull suiteや実環境操作を追加しない。workflow未変更のreview fixでは、既存のYAML証跡を保持する。
 - gateの入力閉包は、変更path、関連設定、生成物、実行条件の集合とする。`gate / HEAD・base / input closure / conditions / result / artifact reference` をcompact ledgerへ記録し、失効時は `invalidation reason / reacquire scope`、判定不能時は `fallback reason` を残す。laneとevidence packageのschemaは [`docs/agent-harness.md`](../../../docs/agent-harness.md) を正本とする。
 - measurement後にreportやPR本文を更新した場合は、測定scope外のpublication annotationとして扱うか、publication gateを別に記録する。更新後の内容を同じmeasurement evidenceへ黙って混ぜず、必要なら交差するgateだけを再取得する。
@@ -71,7 +71,8 @@ description: "ソースコード変更とIssue、branch、commit、push、PR、C
 - 無変化の外部待ちでは固定timeout回数を完了条件にせず、logical checkpointまたはdeadlineで継続の必要性を再評価する。継続不要と判断した場合は監視とscheduled taskを停止し、停止理由と未確認範囲を通知する。
 - 待機中に返すのはHEAD、success / failure / pending / skip count、changed checks、failure detailだけとし、TTYの全表再描画を流さない。状態キーが変わらない間は詳細を再取得せず、timeoutだけでは証拠を失効させない。failureまたはfinal時だけ詳細を取得する。
 - read-only照会はbounded field、bounded result、小さい合計出力に限定し、PR本文と全check一覧を同じ結果へ詰め込まない。長いraw logは一時artifactへ退避し、成功時は全体結果・閾値・artifact参照だけ返し、file別coverageや反復行は返さない。
-- actionableな指摘はまとめて修正し、正本のreview予算と限定条件に従って変更後の証拠を再確認する。
+- 包括reviewは変更範囲・関連検証を固めてから依頼する。actionableな指摘は同じ回の結果を集約して修正し、正本のreview予算と限定条件に従って変更後の証拠を再確認する。修正だけを理由に再reviewを依頼しない。
+- 再reviewは前回評価できなかった重大な新規リスク・仕様変更・未解決の重大指摘など、具体的な論点がある時に限り、同一PRで最大2回とする。上限後も重大な懸念が未解決ならmergeを止め、例外申請を繰り返さず論点を示す。
 - 正本のreview収束条件を満たし、actionableな未解決threadがなく、GitHubのmergeabilityがcleanで、CIと必須条件を満たせばreviewを終了する。
 - 変更のないheadでclean結果を増やすためだけの再レビューを行わない。
 - ソースコード変更でコードレビューが提供されない場合、自己レビューは補助証跡に限り、完了条件の代替にしない。未完了のblockerとして報告する。
@@ -80,7 +81,7 @@ description: "ソースコード変更とIssue、branch、commit、push、PR、C
 ## 6. 権限境界と終了
 <!-- agent-harness:delivery-exit:start -->
 
-- merge直前は再確認済みの単一snapshotへlatest HEAD、base（親merge含む）、CI、latest-head review、未解決thread、mergeabilityを記録する。snapshot後にHEAD・base・CI・review状態が変わった場合は、該当証拠を失効して更新する。最終delivery judgmentはprimaryがacceptance、CI、review、thread、mergeabilityを照合して行う。
+- merge直前は再確認済みの単一snapshotへlatest HEAD、base（親merge含む）、CI、review履歴の対象HEADと最新HEADの差分・指摘対応、未解決thread、mergeabilityを記録する。snapshot後にHEAD・base・CI・review状態が変わった場合は、該当証拠を失効して更新する。HEADが進んだだけでは新たなreview依頼を必須としない。最終delivery judgmentはprimaryがacceptance、CI、review、thread、mergeabilityを照合して行う。
 - merge、Issue / PRのclose、release、production deploy、破壊的変更は、対象を特定した別の明示指示がある場合だけ行う。
 - blocker報告には、失敗しているcheckまたは操作、証跡、試した対応、未完了範囲、次の最短アクションを含める。
 - 最終報告には、Issue、branch、commit、PR、local verification、CI、review、remaining risksのうち今回に関係するものを示す。
