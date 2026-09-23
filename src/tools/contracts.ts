@@ -17,10 +17,12 @@ import type {
   SmeltItemInput,
 } from "../minecraft/general-actions.js";
 import type {
+  BehaviorMemoryCategory,
   BehaviorMemoryRecord,
   ForgetBehaviorMemoryInput,
   RememberBehaviorMemoryInput,
 } from "../memory/types.js";
+import type { BehaviorMemoryExtraction } from "../memory/behavior-memory.js";
 export type ErrorCategory =
   | "connection"
   | "observation"
@@ -345,6 +347,17 @@ export interface ToolContext {
   allowedDeliveryTargetKinds?: readonly ("home" | "chest")[];
   /** Called only after the public say tool has delivered a message. */
   recordDeliveredAssistantMessage?: (message: string) => void;
+  /** Candidates extracted from this authenticated owner message only. */
+  behaviorMemoryCandidates?: readonly BehaviorMemoryExtraction[];
+  /** The exact preference the authenticated owner asked to forget this turn. */
+  behaviorMemoryForgetTarget?: {
+    readonly category: BehaviorMemoryCategory;
+    readonly slot: string;
+  };
+  /** Owner-only presentation preference; never changes safety facts or actions. */
+  behaviorNotificationOneSentence?: boolean;
+  /** Opaque accepted-message id used to make behavior writes idempotent. */
+  behaviorMemoryEventId?: string;
   executionEvidence: {
     verifiedActionReceipts: {
       receiptId: string;

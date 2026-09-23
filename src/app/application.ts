@@ -41,7 +41,11 @@ import { TraceService, type TraceSession } from "../trace/service.js";
 import { TraceStore } from "../trace/store.js";
 import { CompanionContextFactory } from "./context-factory.js";
 import { CompanionGameController } from "./game-controller.js";
-import { MemoryTaskStore, ToolMemoryAdapter } from "./memory-adapters.js";
+import {
+  MemoryTaskStore,
+  ToolBehaviorMemoryAdapter,
+  ToolMemoryAdapter,
+} from "./memory-adapters.js";
 import {
   RuntimeReassessmentGate,
   type RuntimeReassessmentRequest,
@@ -951,6 +955,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     config.limits.skillRetryLimit + 1,
   );
   const toolMemory = new ToolMemoryAdapter(memory);
+  const toolBehaviorMemory = new ToolBehaviorMemoryAdapter(memory);
   const executor = new ToolExecutor(traceService);
   const agent = new OpenAIDeliberationAgent({
     apiKey: config.openai.apiKey,
@@ -968,6 +973,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     game,
     tasks,
     traceService,
+    toolBehaviorMemory,
   );
   const coordinator = new ChatCoordinator({
     ownerUsername: config.ownerUsername,

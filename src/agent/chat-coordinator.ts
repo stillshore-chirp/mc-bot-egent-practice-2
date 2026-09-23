@@ -262,17 +262,39 @@ export function isHostileEvadeIntent(message: string): boolean {
   return hostileResponseIntent(message) === "evade";
 }
 
-function renderReadOnlyStatus(status: GameStatus): string {
+/**
+ * Presentation-only preferences that the status fast path may consume. They
+ * never alter the observed state, safety decision, authorization, or action
+ * selection. The defaults preserve the bounded, plain-language contract even
+ * when an older context factory does not expose behavior memory.
+ */
+export interface StatusPresentationPreferences {
+  readonly brief: boolean;
+  readonly plainLanguage: boolean;
+}
+
+const DEFAULT_STATUS_PRESENTATION: StatusPresentationPreferences = {
+  brief: true,
+  plainLanguage: true,
+};
+
+export function renderReadOnlyStatus(
+  status: GameStatus,
+  preferences: StatusPresentationPreferences = DEFAULT_STATUS_PRESENTATION,
+): string {
   if (!status.connected) {
     return "Minecraftへの接続を確認できません。再接続後に現在の状態を確認してください。";
   }
   const summary = status.activeTaskSummary?.trim();
-  if (summary !== undefined && summary.length > 0) return summary;
+  if (summary !== undefined && summary.length > 0) {
+    return preferences.brief ? compactStatusSummary(summary) : summary;
+  }
   const task = status.activeTaskState?.trim();
   if (task === undefined || task.length === 0) {
     const latest = status.latestTaskState?.trim();
     if (latest !== undefined && latest.length > 0) {
-      return `${latest}現在、進行中のMinecraft作業はありません。`;
+      const result = `${latest}現在、進行中のMinecraft作業はありません。`;
+      return preferences.brief ? compactStatusSummary(result) : result;
     }
     return "現在、進行中のMinecraft作業は確認できません。直前の作業結果は追加の観測が必要です。";
   }
@@ -293,8 +315,44 @@ function renderReadOnlyStatus(status: GameStatus): string {
   return description;
 }
 
+function compactStatusSummary(summary: string): string {
+  // Safety summaries carry the current check and next operation. Keep the
+  // full text so a brief preference cannot remove actionable safety facts.
+  if (
+    /(?:安全|危険|停止|再確認|次の操作|進行中|作業はありません|完了)/u.test(
+      summary,
+    )
+  )
+    return summary;
+  const firstSentence = /^.*?[。！？!?]/u.exec(summary)?.[0];
+  return firstSentence?.trim() ?? summary;
+}
+
+function oneSentenceNotification(text: string): string {
+  // Keep every observed fact and safety instruction; only join sentence
+  // boundaries when the owner explicitly prefers a single notification line.
+  return text
+    .trim()
+    .replace(/されません。\s*(?=\S)/gu, "されず、")
+    .replace(/ありません。\s*(?=\S)/gu, "なく、")
+    .replace(/できません。\s*(?=\S)/gu, "できず、")
+    .replace(/[。！？!?]\s*(?=\S)/gu, "、")
+    .replace(/\s*\n+\s*/gu, "、")
+    .replace(/、{2,}/gu, "、");
+}
+
 export interface ChatContextFactory {
   clearPendingOwnerGoal?(): void;
+  /** Persist owner behavior candidates when the chat message is accepted. */
+  acceptOwnerMessage?(
+    requesterUsername: string,
+    message: string,
+    eventId: string,
+  ): void;
+  /** Read presentation-only owner preferences for the factual status path. */
+  readOwnerStatusPreferences?(
+    requesterUsername: string,
+  ): StatusPresentationPreferences | Promise<StatusPresentationPreferences>;
   create(
     requesterUsername: string,
     message: string,
@@ -339,6 +397,9 @@ interface DeliveredReplyRecorder {
     conversationRequestId?: number,
   ) => void;
 }
+
+type ConversationAgent = Pick<OpenAIDeliberationAgent, "deliberate"> &
+  DeliveredReplyRecorder;
 
 export interface RuntimeReassessmentContext {
   readonly event: RuntimeReassessmentEvent;
@@ -429,7 +490,7 @@ async function safeCompleteTrace(
 export class ChatCoordinator {
   readonly #ownerUsername: string;
   readonly #game: GameController;
-  readonly #agent: OpenAIDeliberationAgent;
+  readonly #agent: ConversationAgent;
   readonly #contextFactory: ChatContextFactory;
   readonly #logger: Logger;
   readonly #traceService: TraceService | undefined;
@@ -448,7 +509,7 @@ export class ChatCoordinator {
   public constructor(input: {
     ownerUsername: string;
     game: GameController;
-    agent: OpenAIDeliberationAgent;
+    agent: ConversationAgent;
     contextFactory: ChatContextFactory;
     logger: Logger;
     traceService?: TraceService;
@@ -556,6 +617,22 @@ export class ChatCoordinator {
       return true;
     }
 
+    const acceptedCorrelationId = createCorrelationId();
+    try {
+      this.#contextFactory.acceptOwnerMessage?.(
+        username,
+        normalized,
+        acceptedCorrelationId,
+      );
+    } catch (error) {
+      this.#logger.warn(
+        {
+          code: "OWNER_BEHAVIOR_MEMORY_ACCEPT_FAILED",
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        },
+        "owner behavior memory acceptance failed",
+      );
+    }
     this.#runtimeGeneration += 1;
     this.#notifyOwnerMessage();
 
@@ -625,7 +702,13 @@ export class ChatCoordinator {
           );
           return this.#respondToHostiles(username, normalized);
         }
-        return this.#deliberate(username, normalized, "owner_message");
+        return this.#deliberate(
+          username,
+          normalized,
+          "owner_message",
+          undefined,
+          acceptedCorrelationId,
+        );
       });
     await this.#conversationTail;
     return true;
@@ -753,10 +836,19 @@ export class ChatCoordinator {
         }
       }
       if (questionGeneration !== this.#generation) return false;
+      let preferences = DEFAULT_STATUS_PRESENTATION;
+      try {
+        preferences =
+          (await this.#contextFactory.readOwnerStatusPreferences?.(username)) ??
+          DEFAULT_STATUS_PRESENTATION;
+      } catch {
+        // Status reporting stays available when optional memory reads fail.
+      }
+      if (questionGeneration !== this.#generation) return false;
       const reply =
         status === undefined
           ? "現在のMinecraft状態を確認できません。再観測が必要です。"
-          : renderReadOnlyStatus(status);
+          : renderReadOnlyStatus(status, preferences);
       const delivery = (async (): Promise<boolean> => {
         const delivered = await safeWithTraceSpan(
           this.#traceService,
@@ -877,6 +969,7 @@ export class ChatCoordinator {
     message: string,
     requestKind: ToolContext["requestKind"],
     reassessment?: RuntimeReassessmentContext,
+    acceptedCorrelationId?: string,
   ): Promise<RuntimeReassessmentRunOutcome> {
     const controller = new AbortController();
     this.#activeController = controller;
@@ -909,7 +1002,7 @@ export class ChatCoordinator {
         ? operation()
         : safeWithTrace(this.#traceService, session, operation);
     const process = async (): Promise<void> => {
-      const correlationId = createCorrelationId();
+      const correlationId = acceptedCorrelationId ?? createCorrelationId();
       await runWithCorrelation(correlationId, async () => {
         const context = await this.#contextFactory.create(
           username,
@@ -928,6 +1021,11 @@ export class ChatCoordinator {
         if (controller.signal.aborted) {
           throw controller.signal.reason ?? new Error("REQUEST_ABORTED");
         }
+        const deliveredText =
+          requestKind === "runtime_reassessment" &&
+          context.toolContext.behaviorNotificationOneSentence === true
+            ? oneSentenceNotification(reply.text)
+            : reply.text;
         await safeWithTraceSpan(
           this.#traceService,
           "response",
@@ -937,17 +1035,17 @@ export class ChatCoordinator {
             resultKind: "final_response",
             summarizeResult: () => "最終応答を送信",
           },
-          () => this.#game.say(reply.text),
+          () => this.#game.say(deliveredText),
         );
         const deliveredRequestId =
           reply.conversationRequestId ?? conversationRequestId;
         if (deliveredRequestId === undefined) {
-          recorder.recordDeliveredReply?.(username, requestKind, reply.text);
+          recorder.recordDeliveredReply?.(username, requestKind, deliveredText);
         } else {
           recorder.recordDeliveredReply?.(
             username,
             requestKind,
-            reply.text,
+            deliveredText,
             deliveredRequestId,
           );
         }

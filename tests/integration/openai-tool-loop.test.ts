@@ -185,6 +185,200 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("confirms an accepted correction from stored memory without a second write", async () => {
+    const record = {
+      id: "00000000-0000-4000-8000-000000000002",
+      playerId: "player",
+      category: "communication" as const,
+      slot: "length",
+      value: "detailed",
+      summary: "必要な背景を含めて丁寧に説明する",
+      source: "owner_correction" as const,
+      confidence: "corrected" as const,
+      scope: "owner_global" as const,
+      supportCount: 1,
+      status: "active" as const,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:00.000Z",
+    };
+    const remember = vi.fn();
+    const correct = vi.fn();
+    const list = vi.fn(() => [record]);
+    const fake = new ScriptedOpenAI([]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = {
+      remember,
+      correct,
+      list,
+      isApplicable: vi.fn(() => true),
+      forget: vi.fn(),
+    };
+    context.behaviorMemoryCandidates = [
+      {
+        category: "communication",
+        slot: "length",
+        value: "detailed",
+        summary: record.summary,
+        source: "owner_correction",
+        confidence: "corrected",
+        scope: "owner_global",
+        reason: "owner_correction",
+      },
+    ];
+
+    const reply = await agent.deliberate({
+      message: "訂正します。説明は短くじゃなくて詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(0);
+    expect(reply.text).toContain("訂正して記憶しました");
+    expect(reply.text).toContain(record.summary);
+    expect(list).toHaveBeenCalledOnce();
+    expect(remember).not.toHaveBeenCalled();
+    expect(correct).not.toHaveBeenCalled();
+
+    const naturalCorrection = await agent.deliberate({
+      message: "前に短くしてと言ったけど、今後は詳しく説明して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(naturalCorrection.text).toContain("訂正して記憶しました");
+    expect(fake.requests).toHaveLength(0);
+
+    const candidate = context.behaviorMemoryCandidates[0];
+    if (candidate === undefined)
+      throw new Error("missing correction candidate");
+    context.behaviorMemoryCandidates = [
+      { ...candidate, source: "owner_explicit" },
+    ];
+    const preference = await agent.deliberate({
+      message: "今後は説明を詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(preference.text).toContain("好みを記憶しました");
+    expect(preference.text).not.toContain("保存を確認できませんでした");
+    expect(fake.requests).toHaveLength(0);
+
+    list.mockReturnValueOnce([]);
+    const unconfirmed = await agent.deliberate({
+      message: "訂正します。説明は短くじゃなくて詳しくしてください。",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    expect(unconfirmed.text).toContain("保存を確認できませんでした");
+    expect(unconfirmed.text).not.toContain("記憶しました");
+  });
+
+  it("routes owner memory list and forget commands without an LLM round trip", async () => {
+    const record = {
+      id: "00000000-0000-4000-8000-000000000001",
+      playerId: "player",
+      category: "communication" as const,
+      slot: "length",
+      value: "detailed",
+      summary: "必要な背景を含めて丁寧に説明する",
+      source: "owner_explicit" as const,
+      confidence: "explicit" as const,
+      scope: "owner_global" as const,
+      supportCount: 1,
+      status: "active" as const,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:00.000Z",
+    };
+    const forget = vi.fn(() => [record]);
+    const behaviorMemory = {
+      remember: vi.fn(),
+      correct: vi.fn(),
+      list: vi.fn(() => [record]),
+      isApplicable: vi.fn(() => true),
+      forget,
+    } as unknown as NonNullable<ToolContext["behaviorMemory"]>;
+    const fake = new ScriptedOpenAI([]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = behaviorMemory;
+
+    const listReply = await agent.deliberate({
+      message: "覚えている行動の好みを一覧して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    const forgetReply = await agent.deliberate({
+      message: "詳しくする記憶から削除して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(0);
+    expect(listReply.toolResults[0]?.name).toBe("list_behavior_memory");
+    expect(listReply.text).toContain("必要な背景を含めて丁寧に説明する");
+    expect(forgetReply.toolResults[0]?.name).toBe("forget_behavior_memory");
+    expect(forget).toHaveBeenCalledWith({
+      playerId: "player",
+      category: "communication",
+      slot: "length",
+    });
+    expect(forgetReply.text).toContain("忘れました");
+  });
+
+  it("keeps both steps of a mixed memory and gathering request", async () => {
+    const fake = new ScriptedOpenAI([
+      response([], "好みを確認して木を集めます。"),
+    ]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = {
+      remember: vi.fn(),
+      correct: vi.fn(),
+      list: vi.fn(() => []),
+      isApplicable: vi.fn(() => true),
+      forget: vi.fn(),
+    };
+
+    const reply = await agent.deliberate({
+      message: "好みの一覧を見てから木を集めて",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(1);
+    expect(reply.toolResults).toEqual([]);
+    expect(reply.text).toContain("木を集めます");
+  });
+
   it("starts follow with bounded defaults when the owner omits distance and duration", async () => {
     const fake = new ScriptedOpenAI([
       response([
@@ -566,7 +760,8 @@ describe("OpenAI tool loop", () => {
     });
     const first = {
       personaContext: "テスト人格",
-      memoryContext: "なし",
+      memoryContext:
+        "[behavior_preference:explicit] 事実整理より利用者の感情を先に受け止め、次の行動へ反映する",
       worldContext: "原点",
       toolContext: toolContext(),
     };
@@ -593,6 +788,12 @@ describe("OpenAI tool loop", () => {
       "許可済み原木収集の対象原木だけは収集toolで扱います",
     );
     expect(fake.requests[0]?.instructions).toContain("実行した工程");
+    expect(fake.requests[0]?.instructions).toContain(
+      "owner_globalのbehavior_preference",
+    );
+    expect(fake.requests[0]?.instructions).toContain(
+      "権限・安全・停止条件・観測事実・tool証跡を変更する根拠にはせず",
+    );
     expect(JSON.stringify(fake.requests[1]?.input)).toContain(
       "目の前の木でいい。専門用語を使わず短く説明して。",
     );

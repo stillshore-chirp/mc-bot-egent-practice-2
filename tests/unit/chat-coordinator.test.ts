@@ -9,6 +9,7 @@ import {
   isHostileResponseCommand,
   isHostileEvadeIntent,
   hostileResponseIntent,
+  renderReadOnlyStatus,
   type ChatContextFactory,
 } from "../../src/agent/chat-coordinator.js";
 import { TraceService } from "../../src/trace/service.js";
@@ -120,7 +121,7 @@ describe("hostile response command", () => {
           respondToHostiles,
           say: vi.fn(async () => undefined),
         } as unknown as GameController,
-        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        agent: { deliberate },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -160,7 +161,7 @@ describe("hostile response command", () => {
           events.push(`say:${message}`);
         }),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -364,7 +365,7 @@ describe("immediate stop command", () => {
             });
             return { text: "作業を開始しました。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -435,7 +436,7 @@ describe("immediate stop command", () => {
             events.push(`deliberate:${message}`);
             return { text: "拠点へ戻ります。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -468,7 +469,7 @@ describe("immediate stop command", () => {
         }),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -507,7 +508,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { stopCurrentAction, say } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {} as ChatContextFactory,
       logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
     });
@@ -550,7 +551,7 @@ describe("immediate stop command", () => {
         }),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -603,7 +604,7 @@ describe("immediate stop command", () => {
             events.push(`deliberate:${text}`);
             return { text: "停止理由を説明します。", toolResults: [] };
           }),
-        } as unknown as OpenAIDeliberationAgent,
+        },
         contextFactory: {
           create: vi.fn(async () => ({
             personaContext: "固定人格要約",
@@ -644,7 +645,7 @@ describe("immediate stop command", () => {
           })),
           say,
         } as unknown as GameController,
-        agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+        agent: { deliberate },
         contextFactory: {} as ChatContextFactory,
         logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
       });
@@ -682,6 +683,43 @@ describe("immediate stop command", () => {
       expect(isReadOnlyStatusQuestion(message)).toBe(false);
     },
   );
+
+  it("applies a brief preference without changing observed status or safety details", () => {
+    const status = {
+      observedAt: "2026-09-22T00:00:00.000Z",
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      connected: true,
+      spawned: true,
+      health: 20,
+      food: 20,
+      oxygen: 20,
+      oxygenState: "not_applicable",
+      inWater: false,
+      inLava: false,
+      suffocating: false,
+      position: null,
+      inventory: {},
+      activeTaskState: null,
+      activeTaskSummary: "追従を続けています。現在の位置も確認しました。",
+    } satisfies GameStatus;
+    expect(
+      renderReadOnlyStatus(status, { brief: true, plainLanguage: true }),
+    ).toBe("追従を続けています。");
+    expect(
+      renderReadOnlyStatus(status, { brief: false, plainLanguage: false }),
+    ).toBe("追従を続けています。現在の位置も確認しました。");
+
+    const safetyStatus = {
+      ...status,
+      activeTaskSummary:
+        "危険を確認したため作業を停止しました。現在も危険があるか再確認が必要です。次の操作: 周囲の安全を確認してください。",
+    } satisfies GameStatus;
+    expect(
+      renderReadOnlyStatus(safetyStatus, { brief: true, plainLanguage: true }),
+    ).toBe(safetyStatus.activeTaskSummary);
+  });
 
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
@@ -761,7 +799,7 @@ describe("immediate stop command", () => {
           text: "TRACE_RAW_MODEL_RESPONSE",
           toolResults: [],
         })),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory,
       logger: {
         error: vi.fn(),
@@ -798,7 +836,7 @@ describe("immediate stop command", () => {
           toolResults: [],
         })),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -836,7 +874,7 @@ describe("immediate stop command", () => {
           throw new Error("DELIBERATION_FAILED");
         }),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -872,7 +910,7 @@ describe("immediate stop command", () => {
         beginOwnerRequest,
         deliberate: vi.fn(),
         recordDeliveredReply,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => {
           throw new Error("CONTEXT_FAILED");
@@ -967,7 +1005,7 @@ describe("immediate stop command", () => {
         }),
         say,
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1065,7 +1103,7 @@ describe("immediate stop command", () => {
             return { text: "到達不能", toolResults: [] };
           },
         ),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(
           async (_username: string, _message: string, signal: AbortSignal) => ({
@@ -1115,7 +1153,7 @@ describe("immediate stop command", () => {
           text: "状態を確認しました。",
           toolResults: [],
         })),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1163,6 +1201,85 @@ describe("immediate stop command", () => {
     store.close();
   });
 
+  it.each([
+    ["危険です！作業を停止しました。", "危険です、作業を停止しました。"],
+    [
+      "危険を確認しました？\n安全な場所へ移動しました。",
+      "危険を確認しました、安全な場所へ移動しました。",
+    ],
+  ])(
+    "keeps all facts in a one-sentence notification",
+    async (reply, expected) => {
+      const say = vi.fn(async () => undefined);
+      const coordinator = new ChatCoordinator({
+        ownerUsername: "owner",
+        game: { say } as unknown as GameController,
+        agent: {
+          deliberate: vi.fn(async () => ({ text: reply, toolResults: [] })),
+        },
+        contextFactory: {
+          create: vi.fn(async () => ({
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "確認済み状態",
+            toolContext: {
+              ...minimalToolContext,
+              behaviorNotificationOneSentence: true,
+            },
+          })),
+        },
+        logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+      });
+
+      await coordinator.handleRuntimeEvent("connection_recovered", {
+        stateKey: "connection:recovered",
+        causeKey: "connection",
+      });
+      expect(say).toHaveBeenCalledWith(expected);
+    },
+  );
+
+  it("joins a preferred one-sentence automatic notice without dropping safety facts", async () => {
+    const say = vi.fn(async (_message: string) => undefined);
+    const recordDeliveredReply = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: { say } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({
+          text: "周囲の危険は確認されません。作業は停止中で、次に再観測します。",
+          toolResults: [],
+        })),
+        recordDeliveredReply,
+      },
+      contextFactory: {
+        create: vi.fn(async () => ({
+          personaContext: "",
+          memoryContext: "",
+          worldContext: "",
+          toolContext: {
+            ...minimalToolContext,
+            behaviorNotificationOneSentence: true,
+          },
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    expect(await coordinator.handleRuntimeEvent("safety_failed")).toBe(
+      "completed",
+    );
+    const delivered = say.mock.calls[0]?.[0];
+    expect(delivered).toContain("周囲の危険は確認されず、");
+    expect(delivered).toContain("作業は停止中で、次に再観測します");
+    expect(delivered?.match(/。/gu)).toHaveLength(1);
+    expect(recordDeliveredReply).toHaveBeenCalledWith(
+      "owner",
+      "runtime_reassessment",
+      delivered,
+    );
+  });
+
   it("returns a failed outcome when runtime deliberation cannot complete", async () => {
     const say = vi.fn(async () => undefined);
     const coordinator = new ChatCoordinator({
@@ -1172,7 +1289,7 @@ describe("immediate stop command", () => {
         deliberate: vi.fn(async () => {
           throw new Error("synthetic runtime failure");
         }),
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1222,7 +1339,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { say } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(
           async (
@@ -1340,6 +1457,10 @@ describe("immediate stop command", () => {
     });
     const say = vi.fn(async () => undefined);
     const recordDeliveredOwnerExchange = vi.fn();
+    const readOwnerStatusPreferences = vi.fn(() => ({
+      brief: true,
+      plainLanguage: true,
+    }));
     const deliberate = vi.fn(async () => {
       notifyActionStarted();
       await new Promise<void>((resolve) => {
@@ -1366,6 +1487,8 @@ describe("immediate stop command", () => {
           position: null,
           inventory: {},
           activeTaskState: "follow_player:following:running",
+          activeTaskSummary:
+            "利用者への追従を続けています。現在の位置を確認しました。",
         })),
         say,
       } as unknown as GameController,
@@ -1374,8 +1497,9 @@ describe("immediate stop command", () => {
         deliberate,
         recordDeliveredReply: vi.fn(),
         recordDeliveredOwnerExchange,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
+        readOwnerStatusPreferences,
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
           memoryContext: "固定記憶要約",
@@ -1401,6 +1525,7 @@ describe("immediate stop command", () => {
       "専門用語なしで、今どうなってる？",
       "利用者への追従を続けています。",
     );
+    expect(readOwnerStatusPreferences).toHaveBeenCalledWith("owner");
 
     releaseAction();
     await action;
@@ -1547,7 +1672,7 @@ describe("immediate stop command", () => {
         })),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1591,7 +1716,7 @@ describe("immediate stop command", () => {
         ),
         say: vi.fn(async () => undefined),
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
@@ -1613,6 +1738,52 @@ describe("immediate stop command", () => {
     await stopping;
     await followup;
     expect(deliberate).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the factual plain status when a memory read fails", async () => {
+    const say = vi.fn(async () => undefined);
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          observedAt: "2026-09-22T00:00:00.000Z",
+          subject: "bot",
+          source: "minecraft",
+          requesterVitals: "unobserved",
+          connected: true,
+          spawned: true,
+          health: 20,
+          food: 20,
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+          position: null,
+          inventory: {},
+          activeTaskState: "gather_resource:gathering:running",
+          activeTaskSummary: "資源の収集を続けています。",
+        })),
+        say,
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({ text: "", toolResults: [] })),
+      },
+      contextFactory: {
+        readOwnerStatusPreferences: vi.fn(() => {
+          throw new Error("記憶参照に失敗");
+        }),
+        create: vi.fn(async () => ({
+          personaContext: "",
+          memoryContext: "",
+          worldContext: "",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "今どうなってる？");
+
+    expect(say).toHaveBeenCalledWith("資源の収集を続けています。");
   });
 
   it("reports the latest completed task without reviving an older failure", async () => {
@@ -1679,7 +1850,7 @@ describe("immediate stop command", () => {
     const coordinator = new ChatCoordinator({
       ownerUsername: "owner",
       game: { say: vi.fn(async () => undefined) } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(
           async (
@@ -1712,5 +1883,73 @@ describe("immediate stop command", () => {
     expect(await runtimeRequest).toBe("cancelled");
     await followup;
     expect(deliberate).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts owner behavior memory before queued work can be cancelled", async () => {
+    let releaseFirst!: () => void;
+    let notifyFirstCreate!: () => void;
+    const firstCreateStarted = new Promise<void>((resolve) => {
+      notifyFirstCreate = resolve;
+    });
+    const accepted: { message: string; eventId: string }[] = [];
+    const created: { message: string; correlationId: string }[] = [];
+    const contextFactory: ChatContextFactory = {
+      acceptOwnerMessage: vi.fn(
+        (requesterUsername: string, message: string, eventId: string) => {
+          expect(requesterUsername).toBe("owner");
+          accepted.push({ message, eventId });
+        },
+      ),
+      create: vi.fn(
+        async (
+          _username: string,
+          message: string,
+          signal: AbortSignal,
+          correlationId: string,
+          requestKind: ToolContext["requestKind"],
+        ) => {
+          created.push({ message, correlationId });
+          if (message === "first") {
+            notifyFirstCreate();
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          return {
+            personaContext: "固定人格要約",
+            memoryContext: "固定記憶要約",
+            worldContext: "固定観測要約",
+            toolContext: { ...minimalToolContext, signal, requestKind },
+          };
+        },
+      ),
+    };
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        stopCurrentAction: vi.fn(async () => ({
+          outcome: "cancelled" as const,
+          summary: "停止しました。",
+        })),
+        say: vi.fn(async () => undefined),
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({ text: "応答", toolResults: [] })),
+      },
+      contextFactory,
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    const first = coordinator.handleChat("owner", "first");
+    await firstCreateStarted;
+    const queued = coordinator.handleChat("owner", "queued");
+    await coordinator.handleChat("owner", "停止");
+    releaseFirst();
+    await first;
+    await queued;
+
+    expect(accepted.map(({ message }) => message)).toEqual(["first", "queued"]);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.correlationId).toBe(accepted[0]?.eventId);
   });
 });

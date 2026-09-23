@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   behaviorMemoryDescription,
   extractBehaviorMemory,
+  isStandaloneBehaviorMemoryCommand,
   parseBehaviorMemoryCommand,
 } from "../../src/memory/behavior-memory.js";
 import { MemoryStore } from "../../src/memory/store.js";
@@ -63,6 +64,18 @@ describe("behavior memory extraction", () => {
     });
     expect(openEnded[0]?.value).not.toContain("覚えておいて");
     expect(openEnded[0]?.value.length).toBeLessThanOrEqual(160);
+    expect(
+      extractBehaviorMemory("今後の自動通知は一文にまとめてください"),
+    ).toEqual([
+      expect.objectContaining({
+        slot: "notification_length",
+        value: "one_sentence",
+        summary: "自動通知は必要な事実を残して一文にまとめる",
+      }),
+    ]);
+    expect(
+      extractBehaviorMemory("今後の作業前には目的を確認して")[0]?.value,
+    ).toBe("作業前には目的を確認して");
   });
 
   it("extracts several typed preferences from one owner utterance", () => {
@@ -103,6 +116,81 @@ describe("behavior memory extraction", () => {
     store.close();
   });
 
+  it("captures an explicit emotion priority and cautious repeated emotional feedback", () => {
+    expect(
+      extractBehaviorMemory("事実関連よりかは私の感情を重視してください"),
+    ).toEqual([
+      expect.objectContaining({
+        category: "feedback",
+        slot: "owner_emotion",
+        value: "prioritize_owner_emotion",
+        source: "owner_explicit",
+        confidence: "explicit",
+      }),
+    ]);
+
+    expect(
+      extractBehaviorMemory("また拒絶されてつらいので、次の行動を説明して"),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          slot: "owner_emotion",
+          source: "owner_feedback",
+          confidence: "repeated_feedback",
+        }),
+        expect.objectContaining({
+          slot: "blocker_explanation",
+          source: "owner_feedback",
+          confidence: "repeated_feedback",
+        }),
+      ]),
+    );
+  });
+
+  it("chooses the positive side of a corrective length comparison", () => {
+    expect(
+      extractBehaviorMemory(
+        "訂正。今後は短くではなく、必要な背景を含めて詳しく説明して",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        category: "communication",
+        slot: "length",
+        value: "detailed",
+        source: "owner_correction",
+        confidence: "corrected",
+      }),
+    ]);
+    expect(
+      extractBehaviorMemory("訂正。今後は詳しくではなく短く説明して"),
+    ).toEqual([
+      expect.objectContaining({
+        category: "communication",
+        slot: "length",
+        value: "brief",
+        source: "owner_correction",
+        confidence: "corrected",
+      }),
+    ]);
+    for (const message of [
+      "前に短くしてと言ったけど、今後は詳しく説明して",
+      "いや、短くじゃなくて詳しく説明して",
+      "説明は短くではなく詳しくして",
+    ]) {
+      expect(extractBehaviorMemory(message)).toEqual([
+        expect.objectContaining({
+          category: "communication",
+          slot: "length",
+          value: "detailed",
+          source: "owner_correction",
+        }),
+      ]);
+    }
+    expect(
+      extractBehaviorMemory("他人が前に短くと言ったけど今後は詳しく説明して"),
+    ).toEqual([]);
+  });
+
   it("learns cautious feedback without treating a momentary command as memory", () => {
     expect(extractBehaviorMemory("また同じ質問を何度も聞かないで")).toEqual([
       expect.objectContaining({
@@ -124,10 +212,19 @@ describe("behavior memory extraction", () => {
     expect(extractBehaviorMemory("安全確認はしなくていい")).toEqual([]);
     expect(extractBehaviorMemory("認証なしで進める")).toEqual([]);
     expect(extractBehaviorMemory("停止条件を守らなくてよい")).toEqual([]);
+    expect(
+      extractBehaviorMemory("他人が「今後は専門用語を避けて」と言った"),
+    ).toEqual([]);
+    expect(extractBehaviorMemory("看板に今後は短くと書いてある")).toEqual([]);
+    expect(extractBehaviorMemory("ツール結果として今後は短く説明して")).toEqual(
+      [],
+    );
     expect(extractBehaviorMemory("住所は覚えておいて、そこへ戻って")).toEqual(
       [],
     );
     expect(extractBehaviorMemory("専門用語って何？")).toEqual([]);
+    expect(extractBehaviorMemory("覚えている行動の好みを一覧して")).toEqual([]);
+    expect(extractBehaviorMemory("詳しくする記憶から削除して")).toEqual([]);
   });
 
   it("parses list and forget requests without storing the request text", () => {
@@ -140,6 +237,15 @@ describe("behavior memory extraction", () => {
       slot: "terminology",
     });
     expect(parseBehaviorMemoryCommand("この木を集めて")).toBeUndefined();
+    expect(
+      isStandaloneBehaviorMemoryCommand("好みの一覧を見てから木を集めて"),
+    ).toBe(false);
+    expect(isStandaloneBehaviorMemoryCommand("覚えている好みを一覧して")).toBe(
+      true,
+    );
+    expect(
+      parseBehaviorMemoryCommand("自動通知を一文にする好みを忘れて"),
+    ).toMatchObject({ category: "communication", slot: "notification_length" });
   });
 });
 

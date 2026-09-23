@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { behaviorMemoryTools } from "./behavior-memory-tools.js";
 import { deliveryRegistrationTools } from "./delivery-tools.js";
 
 import {
@@ -225,6 +226,7 @@ function defineTool<Name extends string, Input extends z.ZodType, Output>(
 
 export const toolDefinitions = [
   ...deliveryRegistrationTools,
+  ...behaviorMemoryTools,
   defineTool({
     name: "observe_status",
     description:
@@ -2214,6 +2216,9 @@ export const toolDefinitions = [
 
 /** Persistent writes need owner scope even when not marked as game actions. */
 export const ownerScopedMutationToolNames: ReadonlySet<string> = new Set([
+  "remember_behavior_memory",
+  "correct_behavior_memory",
+  "forget_behavior_memory",
   "register_delivery_target",
   "forget_delivery_target",
   "remember_player_fact",

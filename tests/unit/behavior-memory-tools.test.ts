@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { extractBehaviorMemory } from "../../src/memory/behavior-memory.js";
 import { behaviorMemoryTools } from "../../src/tools/behavior-memory-tools.js";
-import type { ToolContext } from "../../src/tools/contracts.js";
+import type {
+  BehaviorMemoryPort,
+  ToolContext,
+} from "../../src/tools/contracts.js";
 import { toOpenAIFunctionTool } from "../../src/tools/definition.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 
 const ownerContext = {
   requesterUsername: "owner",
@@ -77,5 +82,195 @@ describe("behavior memory tool contract", () => {
       success: false,
       error: { code: "RUNTIME_REASSESSMENT_TOOL_NOT_ALLOWED" },
     });
+  });
+
+  it("accepts remember only when the values match the authenticated owner candidate", async () => {
+    const candidate = extractBehaviorMemory(
+      "今後は専門用語を使わず、平易に説明して",
+    )[0];
+    if (candidate === undefined) throw new Error("candidate was not extracted");
+    const record = {
+      id: "00000000-0000-0000-0000-000000000001",
+      playerId: "player",
+      category: candidate.category,
+      slot: candidate.slot,
+      value: candidate.value,
+      summary: candidate.summary,
+      source: "owner_explicit" as const,
+      confidence: "explicit" as const,
+      scope: "owner_global" as const,
+      supportCount: 1,
+      status: "active" as const,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:00.000Z",
+    };
+    let rememberedInput:
+      | { confidence?: string; idempotencyKey?: string; source?: string }
+      | undefined;
+    const remember = vi.fn(
+      (input: {
+        confidence?: string;
+        idempotencyKey?: string;
+        source?: string;
+      }) => {
+        rememberedInput = input;
+        return record;
+      },
+    );
+    const context = {
+      ...ownerContext,
+      playerId: "player",
+      behaviorMemory: { remember } as unknown as BehaviorMemoryPort,
+      behaviorMemoryCandidates: [candidate],
+      behaviorMemoryEventId: "accepted-event-0001",
+    } as unknown as ToolContext;
+
+    const accepted = await behaviorMemoryTools[0].execute(
+      {
+        category: candidate.category,
+        slot: candidate.slot,
+        value: candidate.value,
+        summary: candidate.summary,
+      },
+      context,
+    );
+    expect(accepted).toMatchObject({ success: true });
+    expect(rememberedInput).toMatchObject({
+      source: "owner_explicit",
+      confidence: "explicit",
+    });
+    expect(rememberedInput?.idempotencyKey).toMatch(
+      /^owner-message:[0-9a-f]{32}:terminology$/u,
+    );
+
+    const rejected = await behaviorMemoryTools[0].execute(
+      {
+        category: candidate.category,
+        slot: candidate.slot,
+        value: candidate.value,
+        summary: "別の希望を保存する",
+      },
+      context,
+    );
+    expect(rejected).toMatchObject({
+      success: false,
+      error: { code: "BEHAVIOR_MEMORY_REJECTED" },
+    });
+    expect(remember).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts correct only for an extracted owner correction", async () => {
+    const candidate = extractBehaviorMemory("訂正: 今後は短く説明して")[0];
+    if (candidate === undefined) throw new Error("candidate was not extracted");
+    let correctedInput: { idempotencyKey?: string } | undefined;
+    const correct = vi.fn((input: { idempotencyKey?: string }) => {
+      correctedInput = input;
+      return {
+        id: "00000000-0000-0000-0000-000000000002",
+        playerId: "player",
+        category: candidate.category,
+        slot: candidate.slot,
+        value: candidate.value,
+        summary: candidate.summary,
+        source: "owner_correction" as const,
+        confidence: "corrected" as const,
+        scope: "owner_global" as const,
+        supportCount: 1,
+        status: "active" as const,
+        createdAt: "2026-09-22T00:00:00.000Z",
+        updatedAt: "2026-09-22T00:00:00.000Z",
+      };
+    });
+    const context = {
+      ...ownerContext,
+      playerId: "player",
+      behaviorMemory: { correct } as unknown as BehaviorMemoryPort,
+      behaviorMemoryCandidates: [candidate],
+      behaviorMemoryEventId: "accepted-event-0002",
+    } as unknown as ToolContext;
+
+    const accepted = await behaviorMemoryTools[2].execute(
+      {
+        memoryId: null,
+        category: candidate.category,
+        slot: candidate.slot,
+        value: candidate.value,
+        summary: candidate.summary,
+      },
+      context,
+    );
+    expect(accepted).toMatchObject({ success: true });
+    expect(correctedInput?.idempotencyKey).toMatch(
+      /^owner-message:[0-9a-f]{32}:length$/u,
+    );
+  });
+
+  it("forgets only the exact preference selected by the owner", async () => {
+    const forget = vi.fn(() => []);
+    const input = {
+      memoryId: null,
+      category: "communication" as const,
+      slot: "length",
+      reason: null,
+    };
+    const base = {
+      ...ownerContext,
+      playerId: "player",
+      behaviorMemory: { forget } as unknown as BehaviorMemoryPort,
+    } as ToolContext;
+    expect(await behaviorMemoryTools[3].execute(input, base)).toMatchObject({
+      success: false,
+      error: { code: "BEHAVIOR_MEMORY_REJECTED" },
+    });
+    expect(
+      await behaviorMemoryTools[3].execute(input, {
+        ...base,
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "terminology",
+        },
+      }),
+    ).toMatchObject({
+      success: false,
+      error: { code: "BEHAVIOR_MEMORY_REJECTED" },
+    });
+    expect(forget).not.toHaveBeenCalled();
+    expect(
+      await behaviorMemoryTools[3].execute(input, {
+        ...base,
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "length",
+        },
+      }),
+    ).toMatchObject({ success: true });
+    expect(forget).toHaveBeenCalledOnce();
+  });
+
+  it("blocks behavior-memory deletion outside the current action scope", async () => {
+    const forget = vi.fn();
+    const result = await new ToolExecutor().execute(
+      "forget_behavior_memory",
+      JSON.stringify({
+        memoryId: null,
+        category: "communication",
+        slot: "length",
+        reason: null,
+      }),
+      {
+        ...ownerContext,
+        allowedActionToolNames: ["move_to"],
+        behaviorMemoryForgetTarget: {
+          category: "communication",
+          slot: "length",
+        },
+        behaviorMemory: { forget } as unknown as BehaviorMemoryPort,
+      },
+    );
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "OWNER_ACTION_SCOPE_NOT_ALLOWED" },
+    });
+    expect(forget).not.toHaveBeenCalled();
   });
 });
