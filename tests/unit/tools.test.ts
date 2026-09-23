@@ -335,9 +335,13 @@ describe("ToolExecutor", () => {
     });
   });
 
-  it.each([3, 6])(
-    "keeps a copper goal bounded after one ore yields %i raw copper",
-    async (dropCount) => {
+  it.each([
+    { dropCount: 3, minedCount: 1 },
+    { dropCount: 6, minedCount: 1 },
+    { dropCount: 3, minedCount: 0 },
+  ])(
+    "keeps a copper goal bounded after $dropCount raw copper with $minedCount verified block",
+    async ({ dropCount, minedCount }) => {
       const toolContext = context();
       toolContext.safeActionAuthorization = {
         kind: "owner_bounded_resource",
@@ -430,7 +434,7 @@ describe("ToolExecutor", () => {
             block: "copper_ore",
             item: "raw_copper",
             requestedCount: 1,
-            minedCount: 1,
+            minedCount,
             collectedCount: dropCount,
             heldCount: rawCopper,
           },
@@ -469,16 +473,21 @@ describe("ToolExecutor", () => {
         toolContext,
       );
 
-      if (dropCount <= 5) {
+      if (minedCount === 1) {
         expect(result).toMatchObject({
           success: true,
           data: {
             completedCount: 1,
-            intermediateProgress: [{ item: "raw_copper", completedCount: 3 }],
+            intermediateProgress: [
+              { item: "raw_copper", completedCount: dropCount },
+            ],
           },
         });
         expect(smeltCalls).toBe(1);
-        expect(rawCopper).toBe(2);
+        expect(rawCopper).toBe(dropCount - 1);
+        expect(result.success && result.userSummary).toContain(
+          `余ったraw_copperは${String(dropCount - 1)}個所持しています。`,
+        );
       } else {
         expect(result).toMatchObject({
           success: false,
@@ -488,6 +497,147 @@ describe("ToolExecutor", () => {
       }
     },
   );
+
+  it("keeps surplus ore drops while crediting only the owner's requested item", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_bounded_resource",
+      goal: "石炭を1個集めて",
+      allowedResources: ["coal_ore"],
+      targetItem: "coal",
+      targetCount: 1,
+      maxCount: 8,
+    };
+    toolContext.safeActionAuthorizationUsage = {
+      remainingCount: 1,
+      consumed: false,
+    };
+    let coal = 0;
+    toolContext.game.observeStatus = async () => ({
+      ...status,
+      inventory: { coal },
+    });
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "coal-ore",
+        label: "観測した石炭鉱石",
+        action: "mine_block",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "medium",
+        operationClass: "natural_resource",
+        requestedCount: 1,
+        resourceName: "coal_ore",
+        goalItem: "coal",
+        distance: 1,
+        steps: [
+          {
+            tool: "mine_block",
+            input: { name: "coal_ore", position: { x: 1, y: 64, z: 0 } },
+          },
+        ],
+      },
+    ];
+    toolContext.game.mineBlock = async () => {
+      coal = 2;
+      return {
+        before: status,
+        after: { ...status, inventory: { coal } },
+        outcome: "completed",
+        confirmedState: {
+          block: "coal_ore",
+          item: "coal",
+          requestedCount: 1,
+          minedCount: 1,
+          collectedCount: 2,
+          heldCount: 2,
+        },
+        summary: "石炭2個の増加を確認しました。",
+      };
+    };
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "石炭を1個集めて",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1 },
+    });
+    expect(coal).toBe(2);
+    expect(result.success && result.userSummary).toContain(
+      "依頼数より多く増えたcoal1個も所持しています。",
+    );
+  });
+
+  it("accepts a verified crafting batch larger than the requested item count", async () => {
+    const toolContext = context();
+    toolContext.safeActionAuthorization = {
+      kind: "owner_scoped_change",
+      scopeId: "inventory",
+      maxImpact: "medium",
+    };
+    toolContext.game.findSafeActionCandidates = async () => [
+      {
+        id: "craft-planks",
+        label: "原木から板材をクラフト",
+        action: "craft_item",
+        observed: true,
+        purposeFit: "direct",
+        permission: "allowed",
+        safety: "allowed",
+        reversible: false,
+        impact: "low",
+        operationClass: "world_change",
+        scopeId: "inventory",
+        requestedCount: 1,
+        goalItem: "oak_planks",
+        distance: 0,
+        steps: [
+          { tool: "craft_item", input: { name: "oak_planks", count: 1 } },
+        ],
+      },
+    ];
+    toolContext.game.craftItem = async () => ({
+      before: status,
+      after: { ...status, inventory: { oak_planks: 4 } },
+      outcome: "completed",
+      confirmedState: {
+        item: "oak_planks",
+        requestedCount: 1,
+        craftedCount: 4,
+        heldCount: 4,
+      },
+      summary: "板材を4個クラフトし、所持品で確認しました。",
+    });
+
+    const result = await new ToolExecutor().execute(
+      "plan_safe_action",
+      JSON.stringify({
+        goal: "板材を1個作る",
+        count: 1,
+        mode: "delegated",
+        candidateId: null,
+      }),
+      toolContext,
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      data: { completedCount: 1 },
+    });
+    expect(result.success && result.userSummary).toContain("板材を4個クラフト");
+  });
 
   it("searches once under an owner quantity contract and executes the newly observed log", async () => {
     const toolContext = context();
@@ -764,7 +914,7 @@ describe("ToolExecutor", () => {
     },
   );
 
-  it("stops when an uncertain mining pickup exceeds the owner quantity", async () => {
+  it("credits the requested quantity without discarding an uncertain extra pickup", async () => {
     const toolContext = context();
     toolContext.safeActionAuthorization = {
       kind: "owner_bounded_resource",
@@ -831,12 +981,12 @@ describe("ToolExecutor", () => {
     );
 
     expect(result).toMatchObject({
-      success: false,
-      error: {
-        code: "SAFE_ACTION_INVENTORY_EXCEEDS_BOUND",
-        confirmedState: { observedIncrease: 2, authorizedCount: 1 },
-      },
+      success: true,
+      data: { completedCount: 1, inventoryReconciledCount: 1 },
     });
+    expect(result.success && result.userSummary).toContain(
+      "依頼数より多く増えたcoal1個も所持しています。",
+    );
     expect(attempts).toBe(1);
   });
 
