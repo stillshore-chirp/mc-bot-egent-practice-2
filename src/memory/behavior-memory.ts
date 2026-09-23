@@ -606,10 +606,22 @@ function knownPreferences(
       ),
     );
   }
-  if (
+  const briefRequested =
     /短く|簡潔|要点だけ|長すぎ|冗長|くどい/iu.test(message) &&
-    /説明|返答|回答|話|文章|長|専門用語|平易/iu.test(message)
-  ) {
+    /説明|返答|回答|話|文章|長|専門用語|平易/iu.test(message);
+  const detailedRequested =
+    stable &&
+    /詳しく|長め|丁寧|背景も/iu.test(message) &&
+    /説明|返答|回答|話|文章/iu.test(message);
+  const briefNegated =
+    /(?:短く|簡潔|要点だけ|長すぎ|冗長|くどい).{0,16}(?:ではなく|じゃなく|にせず|ではなくて)/iu.test(
+      message,
+    );
+  const detailedNegated =
+    /(?:詳しく|長め|丁寧|背景も).{0,16}(?:ではなく|じゃなく|にせず|ではなくて)/iu.test(
+      message,
+    );
+  if (briefRequested && (!detailedRequested || !briefNegated)) {
     add(
       extraction(
         "communication",
@@ -623,9 +635,8 @@ function knownPreferences(
     );
   }
   if (
-    stable &&
-    /詳しく|長め|丁寧|背景も/iu.test(message) &&
-    /説明|返答|回答|話|文章/iu.test(message)
+    detailedRequested &&
+    (!briefRequested || briefNegated || !detailedNegated)
   ) {
     add(
       extraction(

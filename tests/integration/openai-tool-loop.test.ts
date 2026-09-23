@@ -185,6 +185,67 @@ function response(output: unknown[], outputText = "") {
 }
 
 describe("OpenAI tool loop", () => {
+  it("routes owner memory list and forget commands without an LLM round trip", async () => {
+    const record = {
+      id: "00000000-0000-4000-8000-000000000001",
+      playerId: "player",
+      category: "communication" as const,
+      slot: "length",
+      value: "detailed",
+      summary: "必要な背景を含めて丁寧に説明する",
+      source: "owner_explicit" as const,
+      confidence: "explicit" as const,
+      scope: "owner_global" as const,
+      supportCount: 1,
+      status: "active" as const,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      updatedAt: "2026-09-22T00:00:00.000Z",
+    };
+    const forget = vi.fn(() => [record]);
+    const behaviorMemory = {
+      remember: vi.fn(),
+      correct: vi.fn(),
+      list: vi.fn(() => [record]),
+      isApplicable: vi.fn(() => true),
+      forget,
+    } as unknown as NonNullable<ToolContext["behaviorMemory"]>;
+    const fake = new ScriptedOpenAI([]);
+    const agent = new OpenAIDeliberationAgent({
+      apiKey: "test-only",
+      model: "test-model",
+      client: fake.asClient(),
+      logger: pino({ level: "silent" }),
+    });
+    const context = toolContext();
+    context.behaviorMemory = behaviorMemory;
+
+    const listReply = await agent.deliberate({
+      message: "覚えている行動の好みを一覧して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+    const forgetReply = await agent.deliberate({
+      message: "詳しくする記憶から削除して",
+      personaContext: "テスト人格",
+      memoryContext: "なし",
+      worldContext: "原点",
+      toolContext: context,
+    });
+
+    expect(fake.requests).toHaveLength(0);
+    expect(listReply.toolResults[0]?.name).toBe("list_behavior_memory");
+    expect(listReply.text).toContain("必要な背景を含めて丁寧に説明する");
+    expect(forgetReply.toolResults[0]?.name).toBe("forget_behavior_memory");
+    expect(forget).toHaveBeenCalledWith({
+      playerId: "player",
+      category: "communication",
+      slot: "length",
+    });
+    expect(forgetReply.text).toContain("忘れました");
+  });
+
   it("starts follow with bounded defaults when the owner omits distance and duration", async () => {
     const fake = new ScriptedOpenAI([
       response([

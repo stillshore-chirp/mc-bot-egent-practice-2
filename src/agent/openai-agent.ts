@@ -7,6 +7,10 @@ import {
   knownBlockDrops,
   knownSmeltInputs,
 } from "../minecraft/general-actions.js";
+import {
+  parseBehaviorMemoryCommand,
+  type BehaviorMemoryCommand,
+} from "../memory/behavior-memory.js";
 import type { CognitiveStage, TraceMetrics } from "../trace/contracts.js";
 import type { TraceService, WithSpanOptions } from "../trace/service.js";
 import type { ToolContext, ToolResult } from "../tools/contracts.js";
@@ -259,6 +263,75 @@ function deterministicActionSummary(
     .join(" ");
 }
 
+function behaviorMemoryCommandReply(
+  command: BehaviorMemoryCommand,
+  result: ToolResult<unknown>,
+): string {
+  if (!result.success) return result.error.userSummary;
+  if (command.kind === "forget") {
+    const data = result.data;
+    const forgotten =
+      data !== null &&
+      typeof data === "object" &&
+      !Array.isArray(data) &&
+      Array.isArray((data as { readonly forgotten?: unknown }).forgotten)
+        ? (data as { readonly forgotten: unknown[] }).forgotten.length
+        : 0;
+    return forgotten === 0
+      ? "指定された行動の好みは見つかりませんでした。"
+      : `${String(forgotten)}件の行動の好みを忘れました。`;
+  }
+
+  const data = result.data;
+  const records =
+    data !== null &&
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    Array.isArray((data as { readonly records?: unknown }).records)
+      ? (data as { readonly records: unknown[] }).records
+      : [];
+  const summaries = records.flatMap((record) => {
+    if (record === null || typeof record !== "object" || Array.isArray(record))
+      return [];
+    const summary = (record as { readonly summary?: unknown }).summary;
+    return typeof summary === "string" && summary.trim().length > 0
+      ? [summary.trim()]
+      : [];
+  });
+  return summaries.length === 0
+    ? "継続する行動の好みは記録されていません。"
+    : `現在の行動の好み: ${summaries.join("、")}。`;
+}
+
+function behaviorMemoryCommandArguments(
+  command: BehaviorMemoryCommand,
+  limit: number,
+):
+  | {
+      readonly name: "list_behavior_memory" | "forget_behavior_memory";
+      readonly arguments: string;
+    }
+  | undefined {
+  if (command.kind === "list") {
+    return {
+      name: "list_behavior_memory",
+      arguments: JSON.stringify({ query: null, limit }),
+    };
+  }
+  if (command.category === undefined || command.slot === undefined) {
+    return undefined;
+  }
+  return {
+    name: "forget_behavior_memory",
+    arguments: JSON.stringify({
+      memoryId: null,
+      category: command.category,
+      slot: command.slot,
+      reason: null,
+    }),
+  };
+}
+
 async function safeWithTraceSpan<T>(
   traceService: TraceService | undefined,
   stage: CognitiveStage,
@@ -464,6 +537,31 @@ export class OpenAIDeliberationAgent {
       { role: "user", content: request.message },
     ];
     const toolResults: { name: string; result: ToolResult<unknown> }[] = [];
+    if (request.toolContext.requestKind === "owner_message") {
+      const command = parseBehaviorMemoryCommand(request.message);
+      const directCommand =
+        command === undefined
+          ? undefined
+          : behaviorMemoryCommandArguments(
+              command,
+              request.toolContext.limits.memoryContextLimit,
+            );
+      if (command !== undefined && directCommand !== undefined) {
+        const result = await this.#executor.execute(
+          directCommand.name,
+          directCommand.arguments,
+          toolContext,
+        );
+        toolResults.push({ name: directCommand.name, result });
+        return {
+          text: behaviorMemoryCommandReply(command, result),
+          toolResults,
+          ...(conversationRequestId === undefined
+            ? {}
+            : { conversationRequestId }),
+        };
+      }
+    }
     const availableTools =
       request.toolContext.requestKind === "runtime_reassessment"
         ? toolDefinitions.filter(({ name }) =>

@@ -1005,7 +1005,7 @@ describe("immediate stop command", () => {
         }),
         say,
       } as unknown as GameController,
-      agent: { deliberate } as unknown as OpenAIDeliberationAgent,
+      agent: { deliberate },
       contextFactory: {
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",

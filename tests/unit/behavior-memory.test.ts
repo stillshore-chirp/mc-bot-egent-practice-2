@@ -134,6 +134,33 @@ describe("behavior memory extraction", () => {
     );
   });
 
+  it("chooses the positive side of a corrective length comparison", () => {
+    expect(
+      extractBehaviorMemory(
+        "訂正。今後は短くではなく、必要な背景を含めて詳しく説明して",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        category: "communication",
+        slot: "length",
+        value: "detailed",
+        source: "owner_correction",
+        confidence: "corrected",
+      }),
+    ]);
+    expect(
+      extractBehaviorMemory("訂正。今後は詳しくではなく短く説明して"),
+    ).toEqual([
+      expect.objectContaining({
+        category: "communication",
+        slot: "length",
+        value: "brief",
+        source: "owner_correction",
+        confidence: "corrected",
+      }),
+    ]);
+  });
+
   it("learns cautious feedback without treating a momentary command as memory", () => {
     expect(extractBehaviorMemory("また同じ質問を何度も聞かないで")).toEqual([
       expect.objectContaining({
