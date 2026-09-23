@@ -1587,6 +1587,7 @@ export class MineflayerClient implements MinecraftPort {
     let operationError: unknown;
     let cleanupError: unknown;
     try {
+      throwIfAborted(signal, "smelt_item");
       const initialSlots = furnaceBatchReadiness({
         input: readFurnaceSlot(furnace.inputItem?.bind(furnace)),
         fuel: readFurnaceSlot(furnace.fuelItem?.bind(furnace)),
@@ -1611,9 +1612,12 @@ export class MineflayerClient implements MinecraftPort {
           },
         });
       }
+      throwIfAborted(signal, "smelt_item");
       batchStarted = true;
       await furnace.putInput(inputItem.id, null, target.count);
+      throwIfAborted(signal, "smelt_item");
       await furnace.putFuel(fuelItem.id, null, fuelCount);
+      throwIfAborted(signal, "smelt_item");
       const boundInput = readFurnaceSlot(furnace.inputItem?.bind(furnace));
       const boundFuel = readFurnaceSlot(furnace.fuelItem?.bind(furnace));
       if (

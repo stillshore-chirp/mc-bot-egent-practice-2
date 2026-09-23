@@ -209,6 +209,96 @@ describe("Minecraft boundary", () => {
     expect(furnace.close).toHaveBeenCalledOnce();
   });
 
+  it.each(["open", "input"] as const)(
+    "does not fuel a furnace after cancellation during %s",
+    async (abortDuring) => {
+      const controller = new AbortController();
+      const client = new MineflayerClient(
+        {
+          bot: { username: "fixture_bot" },
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      );
+      let rawIron = 6;
+      let inputSlot: { name: string; count: number } | null = null;
+      const putInput = vi.fn(async () => {
+        rawIron = 0;
+        inputSlot = { name: "raw_iron", count: 6 };
+        if (abortDuring === "input") controller.abort(new Error("owner stop"));
+      });
+      const putFuel = vi.fn(async () => undefined);
+      const furnace = {
+        inputItem: () => inputSlot,
+        fuelItem: () => null,
+        outputItem: () => null,
+        putInput,
+        putFuel,
+        takeInput: async () => {
+          rawIron = 6;
+          inputSlot = null;
+        },
+        takeFuel: async () => undefined,
+        takeOutput: async () => undefined,
+        close: vi.fn(),
+      };
+      const bot = {
+        username: "fixture_bot",
+        entity: {
+          id: 1,
+          position: new Vec3(0, 64, 0),
+          velocity: new Vec3(0, 0, 0),
+        },
+        inventory: {
+          items: () => [
+            { name: "raw_iron", count: rawIron },
+            { name: "coal", count: 1 },
+          ],
+        },
+        players: {},
+        entities: {},
+        registry: {
+          itemsByName: {
+            raw_iron: { id: 1, name: "raw_iron" },
+            coal: { id: 2, name: "coal" },
+          },
+          blocksByName: {},
+        },
+        blockAt: (position: Vec3) =>
+          position.equals(new Vec3(1, 64, 0))
+            ? { name: "furnace" }
+            : { name: "air" },
+        openFurnace: async () => {
+          if (abortDuring === "open") controller.abort(new Error("owner stop"));
+          return furnace;
+        },
+        game: { dimension: "overworld" },
+        health: 20,
+        food: 20,
+      };
+      Object.assign(client, { spawned: true, botInstance: bot });
+
+      await expect(
+        client.smeltItem(
+          {
+            input: "raw_iron",
+            output: "iron_ingot",
+            count: 6,
+            furnace: { x: 1, y: 64, z: 0 },
+          },
+          controller.signal,
+        ),
+      ).rejects.toThrow();
+      expect(putInput).toHaveBeenCalledTimes(abortDuring === "open" ? 0 : 1);
+      expect(putFuel).not.toHaveBeenCalled();
+      expect(inputSlot).toBeNull();
+      expect(rawIron).toBe(6);
+      expect(furnace.close).toHaveBeenCalledOnce();
+    },
+  );
+
   it("subscribes and unsubscribes chat listeners", () => {
     const minecraft = new FakeMinecraft();
     const messages: string[] = [];
