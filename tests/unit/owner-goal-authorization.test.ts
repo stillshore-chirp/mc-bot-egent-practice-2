@@ -459,7 +459,15 @@ describe("owner goal authorization", () => {
     expect(result).not.toMatchObject({ outcome: "authorized" });
   });
 
-  it.each(["オークの原木を3本集めた", "オークの原木を3本集められる？"])(
+  it.each([
+    "オークの原木を3本集めた",
+    "オークの原木を3本集められる？",
+    "鉄を集めてくれてありがとう",
+    "鉄を集めていたよ",
+    "鉄を集めてと伝えただけ",
+    "鉄を集めて、やっぱりやめて",
+    "鉄を集めてとは言ってない",
+  ])(
     "does not authorize a statement or question as collection: %s",
     (message) => {
       expect(

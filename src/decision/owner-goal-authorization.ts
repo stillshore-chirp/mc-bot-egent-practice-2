@@ -211,7 +211,9 @@ const resourceGoals: readonly ResourceGoal[] = [
 ];
 
 const affirmativeCollectionIntentPattern =
-  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|切(?:って|りたい|ろう)|伐採(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu;
+  /(?:集め(?:て|たい|よう)|採掘(?:して|したい|しよう)|掘(?:って|りたい|ろう)|採取(?:して|したい|しよう)|切(?:って|りたい|ろう)|伐採(?:して|したい|しよう)|持ってき(?:て|たい|てね)|取ってき(?:て|たい|てね)|作(?:って|りたい|ろう)|作成(?:して|したい|しよう)|精錬(?:して|したい|しよう))(?:みて|ください|下さい|くれ|ほしい(?:です)?|欲しい(?:です)?|ね|よ|なさい|です)?[。！!]?$/iu;
+const englishCollectionIntentPattern =
+  /^(?:please\s+)?(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b/iu;
 const negatedCollectionIntentPattern =
   /(?:集め|採掘|掘|採取|持ってき|持ってこ|取ってき|取ってこ|作|作成|精錬)(?:ない|ません|ず|ないで|しないで|しない|するな|るな)|(?:切ら(?:ない|ず)|切るな|伐採しない|伐採するな)|(?:採ら|取ら)(?:ない|ず)|(?:集め|採掘し|掘っ|採取し|切っ|伐採し|持ってき|取ってき|作っ|作成し|精錬し)て(?:は|ほしく)ない|(?:do not|don't|never|cancel)\s+(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)|(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\s+(?:not|never|cancel)/iu;
 const collectionPermissionQuestionPattern =
@@ -260,6 +262,16 @@ export function deriveOwnerGoalAuthorization(
   }
 
   const message = normalize(input.message);
+  const collectionRequest = (clause: string): boolean =>
+    affirmativeCollectionIntentPattern.test(clause) ||
+    englishCollectionIntentPattern.test(clause);
+  if (
+    /(?:やっぱり|やはり|訂正|撤回).{0,12}(?:やめ|中止|しないで|なし)|(?:とは|って)(?:言って(?:い)?ない|言ったわけではない)/u.test(
+      message,
+    )
+  ) {
+    return { outcome: "none" };
+  }
   const nowMs = input.nowMs ?? Date.now();
   const clauses = message
     .split(/[、，,。；;]+/u)
@@ -267,7 +279,7 @@ export function deriveOwnerGoalAuthorization(
     .filter((clause) => clause.length > 0);
   const affirmativeClauses = clauses.filter(
     (clause) =>
-      affirmativeCollectionIntentPattern.test(clause) &&
+      collectionRequest(clause) &&
       !negatedCollectionIntentPattern.test(clause) &&
       !collectionPermissionQuestionPattern.test(clause) &&
       !/[?？]/u.test(clause),
@@ -288,13 +300,16 @@ export function deriveOwnerGoalAuthorization(
       ? canonicalResourceId(goalClause)
       : undefined;
   const count = parseCount(goalClause);
-  const hasCollectionIntent =
-    affirmativeCollectionIntentPattern.test(goalClause);
+  const hasCollectionIntent = collectionRequest(goalClause);
+  const mentionsCollectionAction =
+    /(?:集めて|採掘して|掘って|採取して|切って|伐採して|持ってきて|取ってきて|作って|作成して|精錬して|\b(?:mine|collect|gather|obtain|fetch|harvest|craft|smelt)\b)/iu.test(
+      goalClause,
+    );
   const hasNegatedCollectionIntent =
     negatedCollectionIntentPattern.test(goalClause);
   const asksCollectionPermission =
     collectionPermissionQuestionPattern.test(goalClause) ||
-    (hasCollectionIntent && /[?？]/u.test(goalClause));
+    (mentionsCollectionAction && /[?？]/u.test(goalClause));
 
   const pendingGoal = input.pendingGoal;
   const pendingGoalValid =
