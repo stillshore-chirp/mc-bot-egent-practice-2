@@ -1661,6 +1661,52 @@ describe("immediate stop command", () => {
     expect(deliberate).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back to the factual plain status when a memory read fails", async () => {
+    const say = vi.fn(async () => undefined);
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: {
+        observeStatus: vi.fn(async () => ({
+          observedAt: "2026-09-22T00:00:00.000Z",
+          subject: "bot",
+          source: "minecraft",
+          requesterVitals: "unobserved",
+          connected: true,
+          spawned: true,
+          health: 20,
+          food: 20,
+          oxygen: 20,
+          oxygenState: "not_applicable",
+          inWater: false,
+          position: null,
+          inventory: {},
+          activeTaskState: "gather_resource:gathering:running",
+          activeTaskSummary: "資源の収集を続けています。",
+        })),
+        say,
+      } as unknown as GameController,
+      agent: {
+        deliberate: vi.fn(async () => ({ text: "", toolResults: [] })),
+      } as unknown as OpenAIDeliberationAgent,
+      contextFactory: {
+        readOwnerStatusPreferences: vi.fn(() => {
+          throw new Error("記憶参照に失敗");
+        }),
+        create: vi.fn(async () => ({
+          personaContext: "",
+          memoryContext: "",
+          worldContext: "",
+          toolContext: minimalToolContext,
+        })),
+      },
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "今どうなってる？");
+
+    expect(say).toHaveBeenCalledWith("資源の収集を続けています。");
+  });
+
   it("reports the latest completed task without reviving an older failure", async () => {
     const say = vi.fn(async () => undefined);
     const recordDeliveredOwnerExchange = vi.fn();
