@@ -41,6 +41,9 @@ describe("armor status answer", () => {
     expect(classifyArmorQuestion("防具を装備して？")).toBeNull();
     expect(classifyArmorQuestion("防具を着て？")).toBeNull();
     expect(classifyArmorQuestion("防具を脱いで？")).toBeNull();
+    expect(classifyArmorQuestion("防具を着てもいい？")).toBeNull();
+    expect(classifyArmorQuestion("防具を脱いでもいい？")).toBeNull();
+    expect(classifyArmorQuestion("防具を脱がないで？")).toBeNull();
     expect(classifyArmorQuestion("防具を装備しないで？")).toBeNull();
     expect(classifyArmorQuestion("木を集めて、防具は？")).toBeNull();
   });
