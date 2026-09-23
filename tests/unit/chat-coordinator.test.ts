@@ -721,6 +721,61 @@ describe("immediate stop command", () => {
     ).toBe(safetyStatus.activeTaskSummary);
   });
 
+  it("answers owner and Bot vital questions without inventing owner observations or calling the LLM", async () => {
+    const status = {
+      observedAt: "2026-01-01T00:00:00.000Z",
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      connected: true,
+      spawned: true,
+      health: 18,
+      food: 17,
+      oxygen: 4,
+      oxygenState: "low",
+      inWater: true,
+      inLava: false,
+      suffocating: false,
+      position: null,
+      inventory: {},
+      activeTaskState: null,
+    } satisfies GameStatus;
+    const game = {
+      observeStatus: vi.fn(async () => status),
+      say: vi.fn(async () => undefined),
+      stopCurrentAction: vi.fn(async () => ({
+        outcome: "completed" as const,
+        summary: "停止しました。",
+      })),
+    };
+    const deliberate = vi.fn();
+    const coordinator = new ChatCoordinator({
+      ownerUsername: "owner",
+      game: game as unknown as GameController,
+      agent: { deliberate },
+      contextFactory: {} as ChatContextFactory,
+      logger: { warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    });
+
+    await coordinator.handleChat("owner", "私は水中？");
+    expect(game.observeStatus).not.toHaveBeenCalled();
+    expect(game.say).toHaveBeenLastCalledWith(
+      "あなたの水中状態は観測できていません。",
+    );
+
+    await coordinator.handleChat("owner", "あなたの酸素は？");
+    expect(game.observeStatus).toHaveBeenCalledTimes(1);
+    expect(game.say).toHaveBeenLastCalledWith(
+      "Bot自身の観測では、酸素は4/20。",
+    );
+    await coordinator.handleChat("owner", "停止。私は水中？");
+    expect(game.stopCurrentAction).toHaveBeenCalledTimes(1);
+    expect(game.say).toHaveBeenLastCalledWith(
+      "あなたの水中状態は観測できていません。",
+    );
+    expect(deliberate).not.toHaveBeenCalled();
+  });
+
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
     const clearPendingOwnerGoal = vi.fn();

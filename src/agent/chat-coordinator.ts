@@ -19,6 +19,11 @@ import type {
 } from "../tools/contracts.js";
 import { isExplicitGoalResumeMessage } from "./conversation-context.js";
 import type { OpenAIDeliberationAgent } from "./openai-agent.js";
+import {
+  classifyVitalsQuestion,
+  renderVitalsAnswer,
+  type VitalsQuestion,
+} from "./vitals-answer.js";
 
 const stopTeForms =
   "(?:止めて|停止して|やめて|中止して|中断して|止まって|ストップして)";
@@ -141,6 +146,7 @@ function immediateStopFollowUp(message: string): string | undefined {
   return followUp.length > 0 &&
     ((isExplicitGoalResumeMessage(followUp) && !/[?？]/u.test(followUp)) ||
       isReadOnlyStatusQuestion(followUp) ||
+      classifyVitalsQuestion(followUp) !== null ||
       isSafeReadOnlyFollowUp(followUp))
     ? followUp
     : undefined;
@@ -640,7 +646,8 @@ export class ChatCoordinator {
       this.#activeController?.abort(new Error("OWNER_MESSAGE_PRIORITIZED"));
     }
 
-    if (isReadOnlyStatusQuestion(normalized)) {
+    const vitalsQuestion = classifyVitalsQuestion(normalized);
+    if (vitalsQuestion !== null || isReadOnlyStatusQuestion(normalized)) {
       const questionGeneration = this.#generation;
       let prefetchedStatus: GameStatus | undefined;
       if (normalized === "なぜ") {
@@ -658,12 +665,17 @@ export class ChatCoordinator {
           prefetchedStatus = undefined;
         }
       }
-      if (normalized !== "なぜ" || prefetchedStatus !== undefined) {
+      if (
+        vitalsQuestion !== null ||
+        normalized !== "なぜ" ||
+        prefetchedStatus !== undefined
+      ) {
         const statusQuestion = this.#answerReadOnlyStatusQuestion(
           username,
           normalized,
           questionGeneration,
           prefetchedStatus,
+          vitalsQuestion,
         );
         this.#readOnlyStatusQuestions.add(statusQuestion);
         try {
@@ -811,6 +823,7 @@ export class ChatCoordinator {
     message: string,
     questionGeneration: number,
     prefetchedStatus?: GameStatus,
+    vitalsQuestion: VitalsQuestion | null = null,
   ): Promise<void> {
     const recorder = this.#agent as unknown as DeliveredReplyRecorder;
     const session = await safeStartTrace(
@@ -822,7 +835,7 @@ export class ChatCoordinator {
     const process = async (): Promise<boolean> => {
       if (questionGeneration !== this.#generation) return false;
       let status: GameStatus | undefined = prefetchedStatus;
-      if (status === undefined) {
+      if (status === undefined && (vitalsQuestion?.bot ?? true)) {
         try {
           status = await safeWithTraceSpan(
             this.#traceService,
@@ -851,9 +864,11 @@ export class ChatCoordinator {
       }
       if (questionGeneration !== this.#generation) return false;
       const reply =
-        status === undefined
-          ? "現在のMinecraft状態を確認できません。再観測が必要です。"
-          : renderReadOnlyStatus(status, preferences);
+        vitalsQuestion === null
+          ? status === undefined
+            ? "現在のMinecraft状態を確認できません。再観測が必要です。"
+            : renderReadOnlyStatus(status, preferences)
+          : renderVitalsAnswer(vitalsQuestion, status);
       const delivery = (async (): Promise<boolean> => {
         const delivered = await safeWithTraceSpan(
           this.#traceService,
