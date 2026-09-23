@@ -9,6 +9,7 @@ import {
   isHostileResponseCommand,
   isHostileEvadeIntent,
   hostileResponseIntent,
+  renderReadOnlyStatus,
   type ChatContextFactory,
 } from "../../src/agent/chat-coordinator.js";
 import { TraceService } from "../../src/trace/service.js";
@@ -683,6 +684,43 @@ describe("immediate stop command", () => {
     },
   );
 
+  it("applies a brief preference without changing observed status or safety details", () => {
+    const status = {
+      observedAt: "2026-09-22T00:00:00.000Z",
+      subject: "bot",
+      source: "minecraft",
+      requesterVitals: "unobserved",
+      connected: true,
+      spawned: true,
+      health: 20,
+      food: 20,
+      oxygen: 20,
+      oxygenState: "not_applicable",
+      inWater: false,
+      inLava: false,
+      suffocating: false,
+      position: null,
+      inventory: {},
+      activeTaskState: null,
+      activeTaskSummary: "追従を続けています。現在の位置も確認しました。",
+    } satisfies GameStatus;
+    expect(
+      renderReadOnlyStatus(status, { brief: true, plainLanguage: true }),
+    ).toBe("追従を続けています。");
+    expect(
+      renderReadOnlyStatus(status, { brief: false, plainLanguage: false }),
+    ).toBe("追従を続けています。現在の位置も確認しました。");
+
+    const safetyStatus = {
+      ...status,
+      activeTaskSummary:
+        "危険を確認したため作業を停止しました。現在も危険があるか再確認が必要です。次の操作: 周囲の安全を確認してください。",
+    } satisfies GameStatus;
+    expect(
+      renderReadOnlyStatus(safetyStatus, { brief: true, plainLanguage: true }),
+    ).toBe(safetyStatus.activeTaskSummary);
+  });
+
   it("notifies pending-runtime cancellation synchronously on owner stop", async () => {
     const calls: string[] = [];
     const clearPendingOwnerGoal = vi.fn();
@@ -1340,6 +1378,10 @@ describe("immediate stop command", () => {
     });
     const say = vi.fn(async () => undefined);
     const recordDeliveredOwnerExchange = vi.fn();
+    const readOwnerStatusPreferences = vi.fn(() => ({
+      brief: true,
+      plainLanguage: true,
+    }));
     const deliberate = vi.fn(async () => {
       notifyActionStarted();
       await new Promise<void>((resolve) => {
@@ -1366,6 +1408,8 @@ describe("immediate stop command", () => {
           position: null,
           inventory: {},
           activeTaskState: "follow_player:following:running",
+          activeTaskSummary:
+            "利用者への追従を続けています。現在の位置を確認しました。",
         })),
         say,
       } as unknown as GameController,
@@ -1374,8 +1418,9 @@ describe("immediate stop command", () => {
         deliberate,
         recordDeliveredReply: vi.fn(),
         recordDeliveredOwnerExchange,
-      } as unknown as OpenAIDeliberationAgent,
+      },
       contextFactory: {
+        readOwnerStatusPreferences,
         create: vi.fn(async () => ({
           personaContext: "固定人格要約",
           memoryContext: "固定記憶要約",
@@ -1401,6 +1446,7 @@ describe("immediate stop command", () => {
       "専門用語なしで、今どうなってる？",
       "利用者への追従を続けています。",
     );
+    expect(readOwnerStatusPreferences).toHaveBeenCalledWith("owner");
 
     releaseAction();
     await action;

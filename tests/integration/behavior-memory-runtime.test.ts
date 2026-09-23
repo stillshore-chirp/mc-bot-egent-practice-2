@@ -188,6 +188,15 @@ describe("behavior memory runtime integration", () => {
       expect(first.toolContext.behaviorMemoryEventId).toBe(
         "accepted-event-0001",
       );
+      expect(
+        factory(store, player.id).readOwnerStatusPreferences("owner"),
+      ).toEqual({ brief: true, plainLanguage: true });
+      // The presentation read is owner-scoped and consumes typed records only;
+      // it does not expose summaries or accepted message text to the status
+      // renderer.
+      expect(
+        factory(store, player.id).readOwnerStatusPreferences("other"),
+      ).toEqual({ brief: true, plainLanguage: true });
 
       await factory(store, player.id).create(
         "owner",
@@ -221,6 +230,44 @@ describe("behavior memory runtime integration", () => {
       expect(reassessment.memoryContext).toContain("[behavior_preference:");
       expect(reassessment.toolContext.behaviorMemoryCandidates).toBeUndefined();
       expect(reassessment.toolContext.behaviorMemoryEventId).toBeUndefined();
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("derives the factual status style from typed owner memory only", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mc-behavior-status-style-"));
+    const path = join(directory, "memory.sqlite");
+    const store = SqliteMemoryStore.open(path);
+    try {
+      const player = store.getOrCreatePlayer("owner");
+      await factory(store, player.id).create(
+        "owner",
+        "今後は短く説明して",
+        new AbortController().signal,
+        "status-style-event-0001",
+        "owner_message",
+      );
+      expect(
+        factory(store, player.id).readOwnerStatusPreferences("owner"),
+      ).toMatchObject({ brief: true, plainLanguage: true });
+
+      await factory(store, player.id).create(
+        "owner",
+        "訂正。今後は詳しく説明して",
+        new AbortController().signal,
+        "status-style-event-0002",
+        "owner_message",
+      );
+      expect(
+        factory(store, player.id).readOwnerStatusPreferences("owner"),
+      ).toMatchObject({ brief: false, plainLanguage: true });
+      // A non-owner receives the bounded default and cannot inspect owner
+      // preference records through this presentation-only read.
+      expect(
+        factory(store, player.id).readOwnerStatusPreferences("other"),
+      ).toEqual({ brief: true, plainLanguage: true });
     } finally {
       store.close();
       rmSync(directory, { recursive: true, force: true });

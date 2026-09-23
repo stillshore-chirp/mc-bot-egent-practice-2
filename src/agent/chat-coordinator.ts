@@ -262,17 +262,39 @@ export function isHostileEvadeIntent(message: string): boolean {
   return hostileResponseIntent(message) === "evade";
 }
 
-function renderReadOnlyStatus(status: GameStatus): string {
+/**
+ * Presentation-only preferences that the status fast path may consume. They
+ * never alter the observed state, safety decision, authorization, or action
+ * selection. The defaults preserve the bounded, plain-language contract even
+ * when an older context factory does not expose behavior memory.
+ */
+export interface StatusPresentationPreferences {
+  readonly brief: boolean;
+  readonly plainLanguage: boolean;
+}
+
+const DEFAULT_STATUS_PRESENTATION: StatusPresentationPreferences = {
+  brief: true,
+  plainLanguage: true,
+};
+
+export function renderReadOnlyStatus(
+  status: GameStatus,
+  preferences: StatusPresentationPreferences = DEFAULT_STATUS_PRESENTATION,
+): string {
   if (!status.connected) {
     return "Minecraftへの接続を確認できません。再接続後に現在の状態を確認してください。";
   }
   const summary = status.activeTaskSummary?.trim();
-  if (summary !== undefined && summary.length > 0) return summary;
+  if (summary !== undefined && summary.length > 0) {
+    return preferences.brief ? compactStatusSummary(summary) : summary;
+  }
   const task = status.activeTaskState?.trim();
   if (task === undefined || task.length === 0) {
     const latest = status.latestTaskState?.trim();
     if (latest !== undefined && latest.length > 0) {
-      return `${latest}現在、進行中のMinecraft作業はありません。`;
+      const result = `${latest}現在、進行中のMinecraft作業はありません。`;
+      return preferences.brief ? compactStatusSummary(result) : result;
     }
     return "現在、進行中のMinecraft作業は確認できません。直前の作業結果は追加の観測が必要です。";
   }
@@ -293,6 +315,19 @@ function renderReadOnlyStatus(status: GameStatus): string {
   return description;
 }
 
+function compactStatusSummary(summary: string): string {
+  // Safety summaries carry the current check and next operation. Keep the
+  // full text so a brief preference cannot remove actionable safety facts.
+  if (
+    /(?:安全|危険|停止|再確認|次の操作|進行中|作業はありません|完了)/u.test(
+      summary,
+    )
+  )
+    return summary;
+  const firstSentence = /^.*?[。！？!?]/u.exec(summary)?.[0];
+  return firstSentence?.trim() ?? summary;
+}
+
 export interface ChatContextFactory {
   clearPendingOwnerGoal?(): void;
   /** Persist owner behavior candidates when the chat message is accepted. */
@@ -301,6 +336,10 @@ export interface ChatContextFactory {
     message: string,
     eventId: string,
   ): void;
+  /** Read presentation-only owner preferences for the factual status path. */
+  readOwnerStatusPreferences?(
+    requesterUsername: string,
+  ): StatusPresentationPreferences | Promise<StatusPresentationPreferences>;
   create(
     requesterUsername: string,
     message: string,
@@ -784,10 +823,19 @@ export class ChatCoordinator {
         }
       }
       if (questionGeneration !== this.#generation) return false;
+      let preferences = DEFAULT_STATUS_PRESENTATION;
+      try {
+        preferences =
+          (await this.#contextFactory.readOwnerStatusPreferences?.(username)) ??
+          DEFAULT_STATUS_PRESENTATION;
+      } catch {
+        // Status reporting stays available when optional memory reads fail.
+      }
+      if (questionGeneration !== this.#generation) return false;
       const reply =
         status === undefined
           ? "現在のMinecraft状態を確認できません。再観測が必要です。"
-          : renderReadOnlyStatus(status);
+          : renderReadOnlyStatus(status, preferences);
       const delivery = (async (): Promise<boolean> => {
         const delivered = await safeWithTraceSpan(
           this.#traceService,

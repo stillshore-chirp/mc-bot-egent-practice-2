@@ -13,7 +13,10 @@ import type {
   MemoryPort,
   ToolContext,
 } from "../tools/contracts.js";
-import type { ChatContextFactory } from "../agent/chat-coordinator.js";
+import type {
+  ChatContextFactory,
+  StatusPresentationPreferences,
+} from "../agent/chat-coordinator.js";
 import {
   deriveOwnerGoalAuthorization,
   type PendingOwnerGoal,
@@ -80,6 +83,35 @@ export class CompanionContextFactory implements ChatContextFactory {
       requestKind: "owner_message",
       eventId,
     });
+  }
+
+  public readOwnerStatusPreferences(
+    requesterUsername: string,
+  ): StatusPresentationPreferences {
+    if (requesterUsername !== this.config.ownerUsername) {
+      return { brief: true, plainLanguage: true };
+    }
+    const records = (query: string) =>
+      this.memoryStore
+        .listBehaviorMemories(this.playerId, { query, limit: 1 })
+        .filter((record) =>
+          this.memoryStore.behaviorMemoryIsApplicable(record),
+        );
+    const lengthRecords = records("length");
+    const prefersDetailed = lengthRecords.some(
+      (record) =>
+        record.category === "communication" &&
+        record.slot === "length" &&
+        record.value === "detailed",
+    );
+    return {
+      // The factual fast path is brief by default. An explicit detailed
+      // preference can relax that presentation while safety details remain.
+      brief: !prefersDetailed,
+      // Its built-in renderer is already plain-language; the owner preference
+      // is retained in normal LLM contexts where terminology can vary.
+      plainLanguage: true,
+    };
   }
 
   public async create(
