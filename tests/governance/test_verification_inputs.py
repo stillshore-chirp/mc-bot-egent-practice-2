@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -59,6 +61,28 @@ def test_behavior_memory_e2e_guide_selects_product_gate() -> None:
 
     assert result["classification_ok"] is True
     assert result["product"] is True
+    assert result["browser"] is False
+    assert result["governance"] is False
+    assert result["workflow_contract"] is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "docs/mc-bot-skills.md",
+        "docs/player-body.md",
+        "docs/autonomous-player.md",
+        "docs/ai-player-e2e.md",
+    ),
+)
+def test_player_architecture_and_acceptance_docs_select_only_product_gate(
+    path: str,
+) -> None:
+    result = MODULE.classify_paths([path])
+
+    assert result["classification_ok"] is True
+    assert result["product"] is True
+    assert result["unknown_paths"] == []
     assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
