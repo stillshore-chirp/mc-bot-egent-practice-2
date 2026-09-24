@@ -366,7 +366,58 @@ describe("player agent response rounds", () => {
       );
       expect(
         fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
-      ).toMatchObject({ resultCode: "CAS_STALE" });
+      ).toMatchObject({
+        resultCode: "CAS_STALE",
+        staleChangedComponents: ["knowledge_state"],
+      });
+      expect(
+        JSON.stringify(fixture.mind.snapshot().recentAgentActivity),
+      ).not.toContain("A newer observed fact");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("reports unknown when a stale revision has no observable component delta", async () => {
+    const mindRef: { current?: PlayerMindStore } = {};
+    const fixture = openPurposeFixture([
+      (_request, index) => {
+        const mind = mindRef.current;
+        if (index !== 0 || mind === undefined)
+          throw new Error("TEST_REVISION_FIXTURE_MISSING");
+        mind.enqueueEvent("state_changed", "second event of the same kind");
+        return functionCallResponse(
+          "stale-commit",
+          "commit_action_decision",
+          actionArguments(),
+        );
+      },
+    ]);
+    mindRef.current = fixture.mind;
+    const firstEvent = fixture.mind.enqueueEvent(
+      "state_changed",
+      "first event of the same kind",
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [firstEvent],
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.mind.pendingEvents()).toHaveLength(2);
+      expect(
+        fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
+      ).toMatchObject({
+        resultCode: "CAS_STALE",
+        staleChangedComponents: ["unknown"],
+      });
+      const activity = JSON.stringify(
+        fixture.mind.snapshot().recentAgentActivity,
+      );
+      expect(activity).not.toContain("first event of the same kind");
+      expect(activity).not.toContain("second event of the same kind");
     } finally {
       fixture.close();
     }

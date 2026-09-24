@@ -23,6 +23,7 @@ import type {
 } from "./contracts.js";
 import {
   playerThoughtCommitRejectionCodes,
+  playerThoughtStaleChangeComponents,
   type PlayerThoughtCommitRejectionCode,
 } from "./contracts.js";
 
@@ -159,6 +160,10 @@ const agentActivitySchema = z
             name: z.union([z.enum(playerAgentToolNames), z.literal("unknown")]),
             resultClass: z.enum(["ok", "rejected", "error", "unknown"]),
             resultCode: z.enum(playerThoughtCommitRejectionCodes).optional(),
+            staleChangedComponents: z
+              .array(z.enum(playerThoughtStaleChangeComponents))
+              .max(playerThoughtStaleChangeComponents.length)
+              .optional(),
             outputChars: z.number().int().nonnegative(),
           })
           .strict(),

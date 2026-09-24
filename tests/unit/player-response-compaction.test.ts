@@ -43,6 +43,10 @@ describe("Responses server-side compaction", () => {
           name: "commit_action_decision",
           resultClass: "rejected",
           resultCode: index === 69 ? "CAS_STALE" : "private-code-sentinel",
+          staleChangedComponents:
+            index === 69
+              ? ["knowledge_state", "private-component-sentinel"]
+              : ["private-component-sentinel"],
           outputChars: 40,
         },
       ],
@@ -58,10 +62,12 @@ describe("Responses server-side compaction", () => {
     expect(serialized).not.toContain("private argument sentinel");
     expect(serialized).not.toContain("private output sentinel");
     expect(serialized).not.toContain("private-code-sentinel");
+    expect(serialized).not.toContain("private-component-sentinel");
     expect(serialized).not.toContain("arguments");
     expect(serialized).not.toContain("prompt");
     expect(projected.at(-1)?.toolCalls[1]).toMatchObject({
       resultCode: "CAS_STALE",
+      staleChangedComponents: ["knowledge_state"],
     });
   });
 

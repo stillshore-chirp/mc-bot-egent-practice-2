@@ -21,6 +21,7 @@ import type {
   PlayerBodyObservation,
 } from "../minecraft/player-body.js";
 import type { TraceService } from "../trace/service.js";
+import { playerThoughtStaleChangeComponents } from "./contracts.js";
 import type {
   PlayerGoalChange,
   PlayerMemoryPort,
@@ -28,6 +29,7 @@ import type {
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
   PlayerThoughtDecision,
+  PlayerThoughtStaleChangeComponent,
   PlayerWakeKind,
 } from "./contracts.js";
 import type { PlayerMindStore } from "./mind-store.js";
@@ -129,6 +131,61 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function serializedStateChanged(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) !== JSON.stringify(right);
+}
+
+function staleRevisionChangedComponents(
+  expected: PlayerRuntimeSnapshot,
+  current: PlayerRuntimeSnapshot,
+): PlayerThoughtStaleChangeComponent[] {
+  const changed: PlayerThoughtStaleChangeComponent[] = [];
+  if (
+    expected.stopped !== current.stopped ||
+    expected.stopGeneration !== current.stopGeneration
+  )
+    changed.push("stop_state");
+  if (expected.actionRevision !== current.actionRevision)
+    changed.push("action_revision");
+  if (
+    serializedStateChanged(
+      {
+        lastOutcome: expected.lastOutcome,
+        recentOutcomes: expected.recentOutcomes,
+      },
+      {
+        lastOutcome: current.lastOutcome,
+        recentOutcomes: current.recentOutcomes,
+      },
+    )
+  )
+    changed.push("outcomes");
+  if (serializedStateChanged(expected.proposals, current.proposals))
+    changed.push("proposal_state");
+  if (
+    serializedStateChanged(
+      { purpose: expected.purpose, goals: expected.goals },
+      { purpose: current.purpose, goals: current.goals },
+    )
+  )
+    changed.push("purpose_state");
+  if (
+    serializedStateChanged(
+      { facts: expected.stateFacts, uncertainties: expected.uncertainties },
+      { facts: current.stateFacts, uncertainties: current.uncertainties },
+    )
+  )
+    changed.push("knowledge_state");
+  const expectedEventKinds = [...expected.pendingEventKinds].sort();
+  const currentEventKinds = [...current.pendingEventKinds].sort();
+  if (serializedStateChanged(expectedEventKinds, currentEventKinds))
+    changed.push("pending_event_kinds");
+  if (changed.length === 0) changed.push("unknown");
+  return playerThoughtStaleChangeComponents.filter((component) =>
+    changed.includes(component),
+  );
 }
 
 export interface ConversationAgentOptions {
@@ -528,6 +585,7 @@ export class PlayerPurposeAgent {
     readonly decision?: PlayerThoughtDecision;
   }> {
     let expectedRevision = input.snapshot.revision;
+    let expectedSnapshot = input.snapshot;
     let committedDecision: PlayerThoughtDecision | undefined;
     const eventIds = input.events.map((event) => event.id);
     const memoryContext = this.options.memory.context();
@@ -765,6 +823,7 @@ export class PlayerPurposeAgent {
           if (goal !== undefined)
             this.options.memory.persistGoals(saved.snapshot.goals);
           expectedRevision = saved.snapshot.revision;
+          expectedSnapshot = saved.snapshot;
           return {
             ok: true,
             revision: expectedRevision,
@@ -788,6 +847,7 @@ export class PlayerPurposeAgent {
           if (!saved.accepted)
             return { ok: false, code: "STALE_REVISION_OR_EMPTY" };
           expectedRevision = saved.snapshot.revision;
+          expectedSnapshot = saved.snapshot;
           return {
             ok: true,
             revision: expectedRevision,
@@ -880,6 +940,14 @@ export class PlayerPurposeAgent {
                   ? "STALE_REVISION"
                   : rejectionCode,
               rejectionCode,
+              ...(rejectionCode === "CAS_STALE"
+                ? {
+                    changedComponents: staleRevisionChangedComponents(
+                      expectedSnapshot,
+                      saved.snapshot,
+                    ),
+                  }
+                : {}),
             };
           }
           committedDecision = decision;

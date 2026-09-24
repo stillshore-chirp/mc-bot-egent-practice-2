@@ -11,7 +11,11 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import type { TraceService } from "../trace/service.js";
-import type { PlayerThoughtCommitRejectionCode } from "./contracts.js";
+import {
+  playerThoughtStaleChangeComponents,
+  type PlayerThoughtCommitRejectionCode,
+  type PlayerThoughtStaleChangeComponent,
+} from "./contracts.js";
 
 export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 
@@ -51,6 +55,8 @@ export interface PlayerAgentToolRoundActivity {
   readonly name: PlayerAgentToolName;
   readonly resultClass: PlayerAgentToolResultClass;
   readonly resultCode?: PlayerThoughtCommitRejectionCode | undefined;
+  readonly staleChangedComponents?:
+    readonly PlayerThoughtStaleChangeComponent[] | undefined;
   readonly outputChars: number;
 }
 
@@ -380,6 +386,8 @@ export async function runPlayerAgent(
       let result: unknown;
       let resultClass: PlayerAgentToolResultClass;
       let resultCode: PlayerThoughtCommitRejectionCode | undefined;
+      let staleChangedComponents:
+        PlayerThoughtStaleChangeComponent[] | undefined;
       if (tool === undefined) {
         result = { ok: false, code: "UNKNOWN_TOOL" };
         resultClass = "unknown";
@@ -389,6 +397,10 @@ export async function runPlayerAgent(
           result = await tool.execute(parsed);
           resultClass = classifyToolResult(result);
           resultCode = safeCommitRejectionCode(call.name, result);
+          staleChangedComponents = safeStaleChangedComponents(
+            call.name,
+            result,
+          );
         } catch (error) {
           result = { ok: false, code: safeErrorCode(error) };
           resultClass = "error";
@@ -399,6 +411,9 @@ export async function runPlayerAgent(
           name: safeToolName(call.name),
           resultClass,
           ...(resultCode === undefined ? {} : { resultCode }),
+          ...(staleChangedComponents === undefined
+            ? {}
+            : { staleChangedComponents }),
           outputChars: boundedJson(result).length,
         });
       }
@@ -487,6 +502,25 @@ function safeCommitRejectionCode(
     : undefined;
 }
 
+function safeStaleChangedComponents(
+  toolName: string,
+  value: unknown,
+): PlayerThoughtStaleChangeComponent[] | undefined {
+  if (
+    toolName !== "commit_action_decision" ||
+    !isRecord(value) ||
+    value.rejectionCode !== "CAS_STALE" ||
+    !Array.isArray(value.changedComponents)
+  )
+    return undefined;
+  const allowed = new Set<string>(playerThoughtStaleChangeComponents);
+  const components = [...new Set(value.changedComponents)].filter(
+    (component): component is PlayerThoughtStaleChangeComponent =>
+      typeof component === "string" && allowed.has(component),
+  );
+  return components.length === 0 ? ["unknown"] : components;
+}
+
 function safeSerializedLength(value: unknown): number {
   try {
     const serialized = JSON.stringify(value);
@@ -548,11 +582,18 @@ export function projectSafePlayerAgentActivityTail(
                     rejectionCode: tool.resultCode,
                   })
                 : undefined;
+            const staleChangedComponents = safeStaleChangedComponents(name, {
+              rejectionCode: tool.resultCode,
+              changedComponents: tool.staleChangedComponents,
+            });
             return [
               {
                 name,
                 resultClass,
                 ...(resultCode === undefined ? {} : { resultCode }),
+                ...(staleChangedComponents === undefined
+                  ? {}
+                  : { staleChangedComponents }),
                 outputChars: safeNonnegativeInteger(tool.outputChars),
               },
             ];

@@ -32,6 +32,21 @@ export const playerThoughtCommitRejectionCodes = [
 export type PlayerThoughtCommitRejectionCode =
   (typeof playerThoughtCommitRejectionCodes)[number];
 
+/** Content-free state components observed to differ after a stale CAS. */
+export const playerThoughtStaleChangeComponents = [
+  "stop_state",
+  "action_revision",
+  "outcomes",
+  "proposal_state",
+  "purpose_state",
+  "knowledge_state",
+  "pending_event_kinds",
+  "unknown",
+] as const;
+
+export type PlayerThoughtStaleChangeComponent =
+  (typeof playerThoughtStaleChangeComponents)[number];
+
 export interface PlayerGoal {
   readonly id: string;
   readonly title: string;
