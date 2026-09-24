@@ -11,6 +11,121 @@ import {
 } from "../../src/player/responses.js";
 
 describe("Responses server-side compaction", () => {
+  it("emits content-free round activity for tool and terminal responses", async () => {
+    const activities: unknown[] = [];
+    const requests: unknown[] = [];
+    const argumentSecret = "private-argument-sentinel";
+    const resultSecret = "private-result-sentinel";
+    const terminalSecret = "private-terminal-sentinel";
+
+    await runPlayerAgent({
+      client: scriptedClient(
+        [
+          outputResponse([
+            {
+              type: "function_call",
+              call_id: "private-call-id",
+              name: "search_memory",
+              arguments: JSON.stringify({ query: argumentSecret }),
+            },
+          ]),
+          terminalResponse(terminalSecret),
+        ],
+        requests,
+      ),
+      model: "test-model",
+      instructions: "private-instructions",
+      input: "private-initial-input",
+      initialObservationChars: 123,
+      role: "conversation",
+      tools: [
+        createPlayerTool({
+          name: "search_memory",
+          description: "Search test memory.",
+          schema: z.object({ query: z.string() }).strict(),
+          execute: () => ({ ok: true, value: resultSecret }),
+        }),
+      ],
+      logger: silentLogger(),
+      onRoundActivity: (activity) => activities.push(activity),
+    });
+
+    expect(activities).toHaveLength(2);
+    const toolRound = z.record(z.string(), z.unknown()).parse(activities[0]);
+    const terminalRound = z
+      .record(z.string(), z.unknown())
+      .parse(activities[1]);
+    expect(toolRound).toMatchObject({
+      role: "conversation",
+      round: 1,
+      responseStatus: "completed",
+      initialInputChars: "private-initial-input".length,
+      instructionsChars: "private-instructions".length,
+      initialObservationChars: 123,
+      functionCallCount: 1,
+      compactionItemPresent: false,
+      toolCalls: [{ name: "search_memory", resultClass: "ok" }],
+    });
+    expect(toolRound.requestInputChars).toBeGreaterThan(0);
+    expect(toolRound.toolSchemaChars).toBeGreaterThan(0);
+    expect(toolRound.responseOutputChars).toBeGreaterThan(0);
+    expect(terminalRound.round).toBe(2);
+    expect(terminalRound.runSequence).toBe(toolRound.runSequence);
+    expect(terminalRound.requestInputChars).toBeGreaterThan(
+      toolRound.requestInputChars as number,
+    );
+    const serialized = JSON.stringify(activities);
+    expect(serialized).not.toContain(argumentSecret);
+    expect(serialized).not.toContain(resultSecret);
+    expect(serialized).not.toContain(terminalSecret);
+    expect(serialized).not.toContain("private-call-id");
+    expect(serialized).not.toContain("private-instructions");
+  });
+
+  it("marks compaction and unknown tools with fixed safe classifications", async () => {
+    const activities: unknown[] = [];
+    const opaque = "opaque-private-compaction-value";
+    await runPlayerAgent({
+      client: scriptedClient(
+        [
+          outputResponse([
+            {
+              type: "compaction",
+              id: "private-compaction-id",
+              encrypted_content: opaque,
+            },
+            {
+              type: "function_call",
+              call_id: "private-call-id",
+              name: "unregistered_private_tool",
+              arguments: JSON.stringify({ secret: "private-argument" }),
+            },
+          ]),
+          terminalResponse("done"),
+        ],
+        [],
+      ),
+      model: "test-model",
+      instructions: "Keep system state.",
+      input: "Start.",
+      tools: [],
+      logger: silentLogger(),
+      onRoundActivity: (activity) => activities.push(activity),
+    });
+
+    const activity = activities[0] as Record<string, unknown>;
+    expect(activity).toMatchObject({
+      compactionItemPresent: true,
+      functionCallCount: 1,
+      toolCalls: [{ name: "unknown", resultClass: "unknown" }],
+    });
+    const serialized = JSON.stringify(activities);
+    expect(serialized).not.toContain(opaque);
+    expect(serialized).not.toContain("private-compaction-id");
+    expect(serialized).not.toContain("private-call-id");
+    expect(serialized).not.toContain("private-argument");
+  });
+
   it("keeps the full tool transcript when no compaction item is returned", async () => {
     const requests: unknown[] = [];
     const tool = recordTool();

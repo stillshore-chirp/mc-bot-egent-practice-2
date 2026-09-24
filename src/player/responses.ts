@@ -17,6 +17,63 @@ export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 /** Server compaction threshold applies to one rendered request, not run totals. */
 export const playerResponseCompactionThreshold = 16_000;
 
+export type PlayerAgentRole = "purpose" | "conversation";
+export type PlayerAgentToolResultClass =
+  "ok" | "rejected" | "error" | "unknown";
+
+export const playerAgentToolNames = [
+  "propose_goal_change",
+  "stop_autonomy",
+  "resume_autonomy",
+  "inspect_player_status",
+  "search_memory",
+  "observe_body",
+  "locate_owner",
+  "ask_body_knowledge",
+  "describe_operation",
+  "search_skills",
+  "read_skill",
+  "read_skill_history",
+  "export_skill_markdown",
+  "import_skill_markdown",
+  "propose_skill_learning",
+  "commit_goal_state",
+  "update_understanding",
+  "commit_action_decision",
+] as const;
+
+export type PlayerAgentToolName =
+  (typeof playerAgentToolNames)[number] | "unknown";
+
+export interface PlayerAgentToolRoundActivity {
+  readonly name: PlayerAgentToolName;
+  readonly resultClass: PlayerAgentToolResultClass;
+  readonly outputChars: number;
+}
+
+/** Content-free per-response diagnostics. Never includes prompts or tool data. */
+export interface PlayerAgentRoundActivity {
+  readonly runSequence: number;
+  readonly role: PlayerAgentRole;
+  readonly round: number;
+  readonly responseStatus:
+    "completed" | "incomplete" | "failed" | "unknown" | "request_error";
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly latencyMs: number;
+  readonly requestInputChars: number;
+  readonly initialInputChars: number;
+  readonly instructionsChars: number;
+  readonly toolSchemaChars: number;
+  readonly initialObservationChars: number;
+  readonly responseOutputChars: number;
+  readonly functionCallCount: number;
+  readonly compactionItemPresent: boolean;
+  readonly toolCalls: readonly PlayerAgentToolRoundActivity[];
+}
+
+let nextRunSequence = 0;
+
 export interface PlayerAgentTool {
   readonly definition: FunctionTool;
   execute(argumentsValue: unknown): Promise<unknown>;
@@ -41,12 +98,16 @@ export interface RunPlayerAgentInput {
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
   readonly maxRounds?: number;
+  readonly role?: PlayerAgentRole;
+  /** Character count only; the observation itself is never copied here. */
+  readonly initialObservationChars?: number;
   /** Allows a caller to finish on a tool result it has durably committed. */
   readonly shouldFinishAfterTool?: (
     toolName: string,
     result: unknown,
   ) => boolean;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
+  readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
 }
 
 export function createPlayerTool<I extends z.ZodType>(input: {
@@ -121,10 +182,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export async function runPlayerAgent(
   input: RunPlayerAgentInput,
 ): Promise<PlayerAgentCallResult> {
+  const runSequence = ++nextRunSequence;
+  const role = input.role ?? "purpose";
   const byName = new Map(
     input.tools.map((tool) => [tool.definition.name, tool]),
   );
   const tools = input.tools.map((tool) => tool.definition);
+  const toolSchemaChars = safeSerializedLength(tools);
   const messages: ResponseInputItem[] = [
     { role: "user", content: input.input },
   ];
@@ -139,6 +203,7 @@ export async function runPlayerAgent(
     input.signal?.throwIfAborted();
     const started = performance.now();
     let response: Response;
+    const requestInputChars = safeSerializedLength(messages);
     try {
       const request = (): Promise<Response> =>
         input.client.responses.create(
@@ -181,6 +246,24 @@ export async function runPlayerAgent(
               request,
             );
     } catch (error) {
+      emitRoundActivity(input, {
+        runSequence,
+        role,
+        round: round + 1,
+        responseStatus: "request_error",
+        inputTokens: 0,
+        outputTokens: 0,
+        latencyMs: Math.round(performance.now() - started),
+        requestInputChars,
+        initialInputChars: input.input.length,
+        instructionsChars: input.instructions.length,
+        toolSchemaChars,
+        initialObservationChars: safeCount(input.initialObservationChars),
+        responseOutputChars: 0,
+        functionCallCount: 0,
+        compactionItemPresent: false,
+        toolCalls: [],
+      });
       input.onCall?.({
         calls: 1,
         inputTokens: 0,
@@ -203,6 +286,7 @@ export async function runPlayerAgent(
       toolCalls: 0,
     });
     const responseStatus = response.status ?? "unknown";
+    const activityToolCalls: PlayerAgentToolRoundActivity[] = [];
     input.logger.info(
       {
         category: "llm",
@@ -217,12 +301,48 @@ export async function runPlayerAgent(
       "player agent response completed",
     );
     if (response.status !== "completed") {
+      emitRoundActivity(input, {
+        runSequence,
+        role,
+        round: round + 1,
+        responseStatus: safeResponseStatus(response.status),
+        inputTokens: safeCount(response.usage?.input_tokens),
+        outputTokens: safeCount(response.usage?.output_tokens),
+        latencyMs: elapsed,
+        requestInputChars,
+        initialInputChars: input.input.length,
+        instructionsChars: input.instructions.length,
+        toolSchemaChars,
+        initialObservationChars: safeCount(input.initialObservationChars),
+        responseOutputChars: safeSerializedLength(response.output),
+        functionCallCount: response.output.filter(isFunctionCall).length,
+        compactionItemPresent: containsCompactionItem(response.output),
+        toolCalls: [],
+      });
       throw new Error(`PLAYER_AGENT_${responseStatus.toUpperCase()}`);
     }
 
     messages.push(...(response.output as ResponseInputItem[]));
     const functionCalls = response.output.filter(isFunctionCall);
     if (functionCalls.length === 0) {
+      emitRoundActivity(input, {
+        runSequence,
+        role,
+        round: round + 1,
+        responseStatus: "completed",
+        inputTokens: safeCount(response.usage?.input_tokens),
+        outputTokens: safeCount(response.usage?.output_tokens),
+        latencyMs: elapsed,
+        requestInputChars,
+        initialInputChars: input.input.length,
+        instructionsChars: input.instructions.length,
+        toolSchemaChars,
+        initialObservationChars: safeCount(input.initialObservationChars),
+        responseOutputChars: safeSerializedLength(response.output),
+        functionCallCount: 0,
+        compactionItemPresent: containsCompactionItem(response.output),
+        toolCalls: [],
+      });
       return {
         text: response.output_text.trim(),
         calls,
@@ -236,15 +356,26 @@ export async function runPlayerAgent(
       toolCalls += 1;
       const tool = byName.get(call.name);
       let result: unknown;
+      let resultClass: PlayerAgentToolResultClass;
       if (tool === undefined) {
         result = { ok: false, code: "UNKNOWN_TOOL" };
+        resultClass = "unknown";
       } else {
         try {
           const parsed: unknown = JSON.parse(call.arguments);
           result = await tool.execute(parsed);
+          resultClass = classifyToolResult(result);
         } catch (error) {
           result = { ok: false, code: safeErrorCode(error) };
+          resultClass = "error";
         }
+      }
+      if (activityToolCalls.length < 8) {
+        activityToolCalls.push({
+          name: safeToolName(call.name),
+          resultClass,
+          outputChars: boundedJson(result).length,
+        });
       }
       messages.push({
         type: "function_call_output",
@@ -256,6 +387,24 @@ export async function runPlayerAgent(
         tool !== undefined &&
         input.shouldFinishAfterTool?.(call.name, result) === true
       ) {
+        emitRoundActivity(input, {
+          runSequence,
+          role,
+          round: round + 1,
+          responseStatus: "completed",
+          inputTokens: safeCount(response.usage?.input_tokens),
+          outputTokens: safeCount(response.usage?.output_tokens),
+          latencyMs: elapsed,
+          requestInputChars,
+          initialInputChars: input.input.length,
+          instructionsChars: input.instructions.length,
+          toolSchemaChars,
+          initialObservationChars: safeCount(input.initialObservationChars),
+          responseOutputChars: safeSerializedLength(response.output),
+          functionCallCount: functionCalls.length,
+          compactionItemPresent: containsCompactionItem(response.output),
+          toolCalls: activityToolCalls,
+        });
         return {
           text: response.output_text.trim(),
           calls,
@@ -266,9 +415,75 @@ export async function runPlayerAgent(
         };
       }
     }
+    emitRoundActivity(input, {
+      runSequence,
+      role,
+      round: round + 1,
+      responseStatus: "completed",
+      inputTokens: safeCount(response.usage?.input_tokens),
+      outputTokens: safeCount(response.usage?.output_tokens),
+      latencyMs: elapsed,
+      requestInputChars,
+      initialInputChars: input.input.length,
+      instructionsChars: input.instructions.length,
+      toolSchemaChars,
+      initialObservationChars: safeCount(input.initialObservationChars),
+      responseOutputChars: safeSerializedLength(response.output),
+      functionCallCount: functionCalls.length,
+      compactionItemPresent: containsCompactionItem(response.output),
+      toolCalls: activityToolCalls,
+    });
     pruneMessagesBeforeLatestCompaction(messages);
   }
   throw new Error("PLAYER_AGENT_TOOL_ROUND_LIMIT");
+}
+
+function emitRoundActivity(
+  input: RunPlayerAgentInput,
+  activity: PlayerAgentRoundActivity,
+): void {
+  try {
+    input.onRoundActivity?.(activity);
+  } catch {
+    input.logger.warn(
+      { category: "telemetry" },
+      "player activity callback failed",
+    );
+  }
+}
+
+function safeResponseStatus(
+  status: Response["status"],
+): "completed" | "incomplete" | "failed" | "unknown" {
+  if (status === "completed" || status === "incomplete" || status === "failed")
+    return status;
+  return "unknown";
+}
+
+function containsCompactionItem(output: readonly unknown[]): boolean {
+  return output.some((item) => isRecord(item) && item.type === "compaction");
+}
+
+function safeToolName(name: string): PlayerAgentToolName {
+  return (playerAgentToolNames as readonly string[]).includes(name)
+    ? (name as PlayerAgentToolName)
+    : "unknown";
+}
+
+function classifyToolResult(value: unknown): PlayerAgentToolResultClass {
+  if (!isRecord(value)) return "unknown";
+  if (value.ok === true) return "ok";
+  if (value.ok === false) return "rejected";
+  return "unknown";
+}
+
+function safeSerializedLength(value: unknown): number {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized.length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
