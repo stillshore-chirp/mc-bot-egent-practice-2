@@ -1019,10 +1019,7 @@ export class McSkillRepository {
     let content: string;
     let descriptor: number | undefined;
     try {
-      descriptor = openSync(
-        target,
-        constants.O_RDONLY | constants.O_NOFOLLOW,
-      );
+      descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
       const fileStat = fstatSync(descriptor);
       if (!fileStat.isFile()) {
         throw new McSkillRepositoryError(
@@ -1657,8 +1654,7 @@ function enumValue<T extends readonly string[]>(
   field: string,
 ): T[number] {
   const matched = allowed.find((candidate) => candidate === value);
-  if (matched === undefined)
-    throw validationError(`${field} is not supported`);
+  if (matched === undefined) throw validationError(`${field} is not supported`);
   return matched;
 }
 

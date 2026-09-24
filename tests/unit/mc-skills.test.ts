@@ -150,8 +150,7 @@ function updateMetadata(
   const content = readFileSync(filePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match?.[1] === undefined)
-    throw new Error("Metadata fence is missing");
+  if (match?.[1] === undefined) throw new Error("Metadata fence is missing");
   const metadata = JSON.parse(match[1]) as Record<string, unknown>;
   update(metadata);
   const replacement = `\`\`\`mc-bot-skill\n${JSON.stringify(metadata, null, 2)}\n\`\`\``;
@@ -162,8 +161,7 @@ function readMetadata(filePath: string): Record<string, unknown> {
   const content = readFileSync(filePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match?.[1] === undefined)
-    throw new Error("Metadata fence is missing");
+  if (match?.[1] === undefined) throw new Error("Metadata fence is missing");
   return JSON.parse(match[1]) as Record<string, unknown>;
 }
 
@@ -175,8 +173,7 @@ function copyMarkdownWithSkillId(
   const content = readFileSync(sourcePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match?.[1] === undefined)
-    throw new Error("Metadata fence is missing");
+  if (match?.[1] === undefined) throw new Error("Metadata fence is missing");
   const metadata = JSON.parse(match[1]) as Record<string, unknown>;
   const skill = metadata.skill as Record<string, unknown>;
   skill.id = skillId;
@@ -776,9 +773,9 @@ describe("McSkillRepository", () => {
     const { directory, options } = createFixture();
     const repository = open(options);
     const skill = repository.get("mc-skill-navigation");
-    expect(() =>
-      repository.exportSkill(skill.id, "../outside.md"),
-    ).toThrow(McSkillRepositoryError);
+    expect(() => repository.exportSkill(skill.id, "../outside.md")).toThrow(
+      McSkillRepositoryError,
+    );
     expect(() => repository.importSkill("../outside.md")).toThrow(
       McSkillRepositoryError,
     );
