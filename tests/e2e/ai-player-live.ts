@@ -1300,6 +1300,7 @@ async function main(): Promise<void> {
     );
 
     const baselineSkills = readSkillSnapshot(state.databasePath);
+    let verifiedLearnedSkillIds: readonly string[] = [];
     const autonomousResult = await recordCase(
       state,
       "autonomous_life",
@@ -1401,9 +1402,22 @@ async function main(): Promise<void> {
       CASE_DEADLINES.unknown_composite,
       requireLiveContext(),
       async (context) => {
+        const spawn = { x: 0.5, y: 64, z: 0.5 };
+        await rcon.command(
+          `tp ${state.botName} ${spawn.x} ${spawn.y} ${spawn.z}`,
+        );
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
+        if (
+          Math.hypot(
+            origin.x - spawn.x,
+            origin.y - spawn.y,
+            origin.z - spawn.z,
+          ) > 1.5
+        ) {
+          incomplete("UNKNOWN_FIXTURE_SPAWN_RESET_FAILED");
+        }
         await configureUnknownFixture(rcon, origin, state.botName);
         const fixtureRegion = await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
@@ -1499,9 +1513,9 @@ async function main(): Promise<void> {
               );
               const returned =
                 Math.hypot(
-                  position.x - beforeWorld.position.x,
-                  position.y - beforeWorld.position.y,
-                  position.z - beforeWorld.position.z,
+                  position.x - spawn.x,
+                  position.y - spawn.y,
+                  position.z - spawn.z,
                 ) <= 4.5;
               serverGoalObserved =
                 targetCleared &&
@@ -1565,7 +1579,7 @@ async function main(): Promise<void> {
           distinctOperationKinds: afterKinds.size,
           serverProgressObserved: observedProgress,
           targetClearedAndItemReturned: serverGoalObserved,
-          playerReturnedToStart: serverGoalObserved,
+          playerReturnedToSpawn: serverGoalObserved,
           failedAttemptObserved: true,
           postFailureObservationSeen,
           postFailureJudgmentSeen,
@@ -1828,6 +1842,11 @@ async function main(): Promise<void> {
         );
         if (newSkillIds.length === 0 || !trustedSuccess)
           incomplete("ONE_SUCCESS_DID_NOT_CREATE_VERIFIED_HYPOTHESIS");
+        verifiedLearnedSkillIds = newSkillIds.filter(
+          (skillId) =>
+            learned.successfulDerivedSkillIds.has(skillId) &&
+            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
+        );
 
         const beforeReuse = readSkillSnapshot(state.databasePath);
         const reuseOrigin = parsePosition(
@@ -1976,6 +1995,8 @@ async function main(): Promise<void> {
       CASE_DEADLINES.skill_exchange,
       requireLiveContext(),
       async (context) => {
+        if (verifiedLearnedSkillIds.length === 0)
+          incomplete("LEARNED_SKILL_IDS_NOT_AVAILABLE_FOR_EXCHANGE");
         const beforeFiles = new Set(
           await exchangeMarkdownFiles(state.exchangeDirectory),
         );
@@ -1983,6 +2004,7 @@ async function main(): Promise<void> {
         const exportActivityKeys = new Set(
           beforeExport.skillActivity.map(skillActivityKey),
         );
+        const exportedLearnedSkillIds = new Set<string>();
         const exportResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
@@ -1992,21 +2014,58 @@ async function main(): Promise<void> {
           const current = await exchangeMarkdownFiles(state.exchangeDirectory);
           const exportedActivity = playerOf(
             await collect(context.runtime.app),
-          ).skillActivity.some(
-            (activity) =>
-              activity.kind === "exported" &&
-              !exportActivityKeys.has(skillActivityKey(activity)),
-          );
+          ).skillActivity.some((activity) => {
+            if (
+              activity.kind !== "exported" ||
+              !verifiedLearnedSkillIds.includes(activity.skillId) ||
+              exportActivityKeys.has(skillActivityKey(activity))
+            )
+              return false;
+            exportedLearnedSkillIds.add(activity.skillId);
+            return true;
+          });
           return (
             current.some((file) => !beforeFiles.has(file)) &&
             exportedActivity &&
             context.responseQueue.length > exportResponseStart
           );
         });
-        const exportedFile = (
+        const newFiles = (
           await exchangeMarkdownFiles(state.exchangeDirectory)
-        ).find((file) => !beforeFiles.has(file));
-        if (exportedFile === undefined) incomplete("SKILL_EXPORT_FILE_MISSING");
+        ).filter((file) => !beforeFiles.has(file));
+        let exportedFile: string | undefined;
+        let exportedSkillId: string | undefined;
+        for (const file of newFiles) {
+          const markdown = await readFile(
+            resolve(state.exchangeDirectory, file),
+            "utf8",
+          );
+          const metadataBlock = /```mc-bot-skill\s*\n([\s\S]*?)\n```/u.exec(
+            markdown,
+          );
+          if (metadataBlock === null) continue;
+          const metadataJson = metadataBlock[1];
+          if (metadataJson === undefined) continue;
+          let metadata: unknown;
+          try {
+            metadata = JSON.parse(metadataJson) as unknown;
+          } catch {
+            continue;
+          }
+          const skill = isRecord(metadata) ? metadata.skill : undefined;
+          const skillId = isRecord(skill) ? skill.id : undefined;
+          if (
+            typeof skillId === "string" &&
+            verifiedLearnedSkillIds.includes(skillId) &&
+            exportedLearnedSkillIds.has(skillId)
+          ) {
+            exportedFile = file;
+            exportedSkillId = skillId;
+            break;
+          }
+        }
+        if (exportedFile === undefined || exportedSkillId === undefined)
+          fail("LEARNED_SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
         const filePath = resolve(state.exchangeDirectory, exportedFile);
         const exported = await readFile(filePath, "utf8");
         const editedName = `e2e-edited-${randomBytes(3).toString("hex")}.md`;
