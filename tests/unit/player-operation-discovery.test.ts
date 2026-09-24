@@ -24,6 +24,88 @@ import type { PlayerResponsesClient } from "../../src/player/responses.js";
 
 const temporaryDirectories: string[] = [];
 
+function completedResponse(output: unknown[] = []): unknown {
+  return {
+    status: "completed",
+    output,
+    output_text: "",
+    usage: { input_tokens: 0, output_tokens: 0 },
+  };
+}
+
+function describeOperationResponse(kind: string): unknown {
+  return completedResponse([
+    {
+      type: "function_call",
+      call_id: `describe-${kind}`,
+      name: "describe_operation",
+      arguments: JSON.stringify({ kind }),
+    },
+  ]);
+}
+
+function createPurposeAgent(responses: unknown[]) {
+  const directory = mkdtempSync(join(tmpdir(), "player-operation-schema-"));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, "player.sqlite");
+  const mind = PlayerMindStore.open(databasePath);
+  const skills = McSkillRepository.open({
+    databasePath,
+    exchangeDirectory: join(directory, "skills"),
+    allowedOperationNames: playerOperationNames,
+  });
+  const requests: unknown[] = [];
+  const client = {
+    responses: {
+      create: async (request: unknown) => {
+        requests.push(request);
+        const response = responses.shift();
+        if (response === undefined)
+          throw new Error("response fixture exhausted");
+        return response;
+      },
+    },
+  } as unknown as PlayerResponsesClient;
+  const memory: PlayerMemoryPort = {
+    context: () => ({
+      persona: "",
+      ownerUsername: "owner",
+      relationship: {},
+      lifeState: {},
+      recalled: [],
+    }),
+    recall: () => [],
+    persistGoals: () => undefined,
+    recordEpisode: () => undefined,
+  };
+  const body = {
+    observe: async () => {
+      throw new Error("observation fixture unavailable");
+    },
+  } as unknown as PlayerBody;
+  const agent = new PlayerPurposeAgent({
+    client,
+    apiKey: "",
+    model: "gpt-6-luna",
+    body,
+    skills,
+    mind,
+    memory,
+    ownerPlayerId: "owner-player",
+    logger: pino({ level: "silent" }),
+    onCommitted: () => undefined,
+  });
+  return {
+    agent,
+    mind,
+    requests,
+    close: () => {
+      skills.close();
+      mind.close();
+    },
+  };
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0))
     rmSync(directory, { recursive: true, force: true });
@@ -67,6 +149,16 @@ describe("on-demand player operation schemas", () => {
       expect(result.schema).toEqual(expected);
       expect(result.description).toEqual(expect.any(String));
     }
+
+    const returned = (await playerOperationDescriptionTool.execute({
+      kind: "use",
+    })) as { schema: Record<string, unknown> };
+    returned.schema.properties = { injected: true };
+    const reread = await playerOperationDescriptionTool.execute({
+      kind: "use",
+    });
+    expect(reread).toMatchObject({ kind: "use" });
+    expect(reread).not.toHaveProperty("schema.properties.injected");
   });
 
   it("sends a compact catalog and exposes schema discovery to the purpose agent", async () => {
@@ -137,6 +229,9 @@ describe("on-demand player operation schemas", () => {
 
       expect(instructions).toContain(playerOperationCatalog);
       expect(instructions).toContain("describe_operation({kind})");
+      expect(instructions).toContain(
+        "提示済みの現行schemaは再利用してください。schemaが未提示、または引数が不明な操作はdescribe_operation({kind})で確認し、引数を省略せず",
+      );
       expect(instructions.length).toBeLessThan(
         instructions.replace(playerOperationCatalog, fullSchemaText).length,
       );
@@ -146,6 +241,50 @@ describe("on-demand player operation schemas", () => {
     } finally {
       skills.close();
       mind.close();
+    }
+  });
+
+  it("reuses only the four most recently described canonical schemas within the character cap", async () => {
+    const kinds = ["move_to", "look", "control", "equip", "use"] as const;
+    const responses = kinds.flatMap((kind) => [
+      describeOperationResponse(kind),
+      completedResponse(),
+    ]);
+    responses.push(completedResponse());
+    const { agent, mind, requests, close } = createPurposeAgent(responses);
+
+    try {
+      for (const _kind of kinds)
+        await agent.think({ snapshot: mind.snapshot(), events: [] });
+      await agent.think({ snapshot: mind.snapshot(), events: [] });
+
+      const request = z.record(z.string(), z.unknown()).parse(requests[10]);
+      const instructions = z.string().parse(request.instructions);
+      const marker = "以前に確認した操作schema（現在の定義）:\n";
+      const cacheStart = instructions.indexOf(marker);
+      expect(cacheStart).toBeGreaterThanOrEqual(0);
+      const cacheText =
+        instructions.slice(cacheStart).split("\n永続化されたgoal/purpose")[0] ??
+        "";
+      expect(cacheText.length + 1).toBeLessThanOrEqual(4_096);
+
+      const entries = cacheText.slice(marker.length).split("\n");
+      expect(entries).toHaveLength(4);
+      const entryKinds = entries.map((entry) => {
+        const parsed = z
+          .record(z.string(), z.unknown())
+          .parse(JSON.parse(entry));
+        return z.string().parse(parsed.kind);
+      });
+      expect(entryKinds).toEqual(kinds.slice(1));
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      expect(tools.some(({ name }) => name === "describe_operation")).toBe(
+        true,
+      );
+    } finally {
+      close();
     }
   });
 });
