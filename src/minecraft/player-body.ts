@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import type { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import type { Bot, BotEvents } from "mineflayer";
 import type { Block } from "prismarine-block";
@@ -16,6 +15,7 @@ import {
 import {
   entityEyeHeight,
   observePlayerBody,
+  type BodyItemStack,
   type PlayerBodyObservation,
   type PlayerBodyObservationOptions,
 } from "./player-body-observation.js";
@@ -70,7 +70,26 @@ if (typeof prismarineItemModule !== "function")
   throw new Error("The prismarine-item loader is unavailable");
 const loadPrismarineItem = prismarineItemModule as PrismarineItemLoader;
 
-function slotUpdateEvents(window: Window): EventEmitter {
+interface WindowUpdateEventTarget {
+  on(
+    event: "updateSlot",
+    listener: (
+      slot: number,
+      oldItem: Item | null,
+      newItem: Item | null,
+    ) => void,
+  ): unknown;
+  removeListener(
+    event: "updateSlot",
+    listener: (
+      slot: number,
+      oldItem: Item | null,
+      newItem: Item | null,
+    ) => void,
+  ): unknown;
+}
+
+function slotUpdateEvents(window: Window): WindowUpdateEventTarget {
   return window;
 }
 
@@ -453,7 +472,7 @@ function countWindowItem(
   if (window === null || window === undefined) return 0;
   return window.slots
     .slice(0, window.inventoryStart)
-    .filter((item) => item !== null && item.name === itemName)
+    .filter((item): item is BodyItemStack => item?.name === itemName)
     .reduce((total, item) => total + item.count, 0);
 }
 
