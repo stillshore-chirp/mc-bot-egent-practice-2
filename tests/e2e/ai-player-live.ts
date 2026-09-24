@@ -29,7 +29,6 @@ import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_SERVER_JAR = "/tmp/mc-server-1.21.11.jar";
 const DEFAULT_JAVA_HOME =
   "/usr/local/Cellar/openjdk@21/21.0.10/libexec/openjdk.jdk/Contents/Home";
 const SERVER_VERSION = "1.21.11";
@@ -1729,9 +1728,10 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  const serverJar = resolve(
-    process.env.AI_PLAYER_E2E_SERVER_JAR ?? DEFAULT_SERVER_JAR,
-  );
+  const serverJarValue = process.env.AI_PLAYER_E2E_SERVER_JAR;
+  if (serverJarValue === undefined || serverJarValue.trim() === "")
+    incomplete("SERVER_JAR_REQUIRED");
+  const serverJar = resolve(serverJarValue);
   const eulaFile = process.env.AI_PLAYER_E2E_EULA_FILE;
   if (eulaFile === undefined || eulaFile.trim() === "")
     incomplete("EULA_FILE_REQUIRED");
