@@ -60,6 +60,10 @@ import {
   isStoppedHandoffBoundaryConfirmed,
 } from "./autonomous-milestone.js";
 import { classifyObservationReply } from "./observation-reply-classifier.js";
+import {
+  safeUnknownOperationKind,
+  type SafeUnknownOperationKind,
+} from "./unknown-composite-diagnostic.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -188,11 +192,13 @@ interface UnknownCompositeDiagnostic {
   readonly unknownDayTime?: number;
   readonly unknownFailureObserved?: boolean;
   readonly unknownFailureSource?: "natural" | "controlled_obstacle";
+  readonly unknownFailureOperationKind?: SafeUnknownOperationKind;
   readonly unknownPostFailureObservationSeen?: boolean;
   readonly unknownPostFailureObservationAfterRestore?: boolean;
   readonly unknownPostFailureActJudgmentSeen?: boolean;
   readonly unknownPostFailureJudgmentSeen?: boolean;
   readonly unknownRecoveryObserved?: boolean;
+  readonly unknownRecoveryOperationKind?: SafeUnknownOperationKind;
   readonly unknownRecoveryAfterRestore?: boolean;
   readonly unknownDistinctRecoveryOperation?: boolean;
   readonly unknownControlledObstacleStatus?: UnknownObstacleStatus;
@@ -2027,6 +2033,9 @@ async function main(): Promise<void> {
             if (failed !== undefined) {
               updateUnknownCompositeDiagnostic(state, {
                 unknownFailureObserved: true,
+                unknownFailureOperationKind: safeUnknownOperationKind(
+                  failed.kind,
+                ),
                 ...(state.unknownCompositeDiagnostic?.unknownFailureSource ===
                 "controlled_obstacle"
                   ? {}
@@ -2115,6 +2124,13 @@ async function main(): Promise<void> {
               unknownPostFailureJudgmentSeen:
                 failed !== undefined && postFailureJudgmentSeen,
               unknownRecoveryObserved: recovery !== undefined,
+              ...(recovery === undefined
+                ? {}
+                : {
+                    unknownRecoveryOperationKind: safeUnknownOperationKind(
+                      recovery.kind,
+                    ),
+                  }),
               unknownRecoveryAfterRestore:
                 controlledFailure && recoveryAfterRestore,
               ...(failed === undefined || recovery === undefined
