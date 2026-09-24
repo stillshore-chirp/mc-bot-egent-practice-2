@@ -7,6 +7,7 @@ import java.util.*;
 import com.google.gson.*;
 import org.bukkit.*;
 import org.bukkit.block.*;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.*;
@@ -24,6 +25,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     private final GrowthLedger ledger = new GrowthLedger();
     private final ActionLedger actionLedger = new ActionLedger();
     private Set<String> botNames = Set.of();
+    private boolean legacyBotActionGuardEnabled;
     private List<Region> protectedRegions = List.of();
     private List<Region> naturalResourceRegions = List.of();
     private List<Region> baseBuildSafeRegions = List.of();
@@ -39,6 +41,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         Set<String> names = new HashSet<>();
         for (String name : getConfig().getStringList("bot-names")) names.add(name.toLowerCase(Locale.ROOT));
         botNames = Set.copyOf(names);
+        legacyBotActionGuardEnabled = legacyActionGuardEnabled(getConfig());
         protectedRegions = readRegions("protected-regions");
         naturalResourceRegions = readRegions("natural-resource-regions");
         baseBuildSafeRegions = readRegions("base-build-safe-regions");
@@ -145,6 +148,12 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
         }
     }
     private boolean bot(Player p) { return botNames.contains(p.getName().toLowerCase(Locale.ROOT)); }
+    static boolean legacyActionGuardEnabled(ConfigurationSection config) {
+        return config.getBoolean("legacy-bot-action-guard.enabled", false);
+    }
+    static boolean shouldEnforceLegacyActionGuard(boolean enabled, boolean isConfiguredBot) {
+        return enabled && isConfiguredBot;
+    }
     private void saturateActionLedger() {
         actionLedger.markSaturated();
         // Persist at the event boundary so a crash cannot reopen a stale
@@ -296,7 +305,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     }
     @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
     public void protectBreak(BlockBreakEvent e) {
-        if (!bot(e.getPlayer())) return;
+        if (!shouldEnforceLegacyActionGuard(legacyBotActionGuardEnabled, bot(e.getPlayer()))) return;
         if (log(e.getBlock().getType())) {
             if (!decision(e.getBlock()).equals("allowed")) e.setCancelled(true);
             return;
@@ -308,7 +317,7 @@ public final class TreeGuardPlugin extends JavaPlugin implements Listener, Plugi
     }
     @EventHandler(priority=EventPriority.HIGHEST,ignoreCancelled=true)
     public void protectPlace(BlockPlaceEvent e) {
-        if (!bot(e.getPlayer())) return;
+        if (!shouldEnforceLegacyActionGuard(legacyBotActionGuardEnabled, bot(e.getPlayer()))) return;
         ActionLedger.Permit permit = new ActionLedger.Permit(
             e.getPlayer().getUniqueId(), "place", actionPoint(e.getBlock()), name(e.getBlock()));
         if (!actionLedger.consume(permit, System.currentTimeMillis())) e.setCancelled(true);

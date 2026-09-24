@@ -6,6 +6,24 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
 
 class TreeGuardPluginTest {
+    @Test void legacyBotActionGuardDefaultsToDisabled() {
+        YamlConfiguration config = new YamlConfiguration();
+
+        assertFalse(TreeGuardPlugin.legacyActionGuardEnabled(config));
+        assertFalse(TreeGuardPlugin.shouldEnforceLegacyActionGuard(
+            TreeGuardPlugin.legacyActionGuardEnabled(config), true));
+    }
+
+    @Test void legacyBotActionGuardRequiresExplicitEnablementAndConfiguredBot() {
+        YamlConfiguration config = new YamlConfiguration();
+        config.set("legacy-bot-action-guard.enabled", true);
+
+        assertTrue(TreeGuardPlugin.legacyActionGuardEnabled(config));
+        assertTrue(TreeGuardPlugin.shouldEnforceLegacyActionGuard(true, true));
+        assertFalse(TreeGuardPlugin.shouldEnforceLegacyActionGuard(true, false));
+        assertFalse(TreeGuardPlugin.shouldEnforceLegacyActionGuard(false, true));
+    }
+
     @Test void emptyOrMalformedLedgerCannotPassSchemaValidation() {
         YamlConfiguration empty = new YamlConfiguration();
         assertFalse(TreeGuardPlugin.validActionLedgerSchema(empty));
