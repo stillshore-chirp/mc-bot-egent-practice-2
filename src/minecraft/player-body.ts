@@ -1619,7 +1619,8 @@ export class MineflayerPlayerBody implements PlayerBody {
           const block = requireReachableBlock(bot, operation.target.position);
           await openWindowCancellable(
             bot,
-            () => activateBlockCancellable(bot, block, signal),
+            (markPacketSent) =>
+              activateBlockCancellable(bot, block, signal, markPacketSent),
             signal,
           );
           return;
@@ -1631,7 +1632,8 @@ export class MineflayerPlayerBody implements PlayerBody {
         );
         await openWindowCancellable(
           bot,
-          () => activateEntityCancellable(bot, entity, signal),
+          (markPacketSent) =>
+            activateEntityCancellable(bot, entity, signal, markPacketSent),
           signal,
         );
         return;
@@ -2211,6 +2213,7 @@ async function activateBlockCancellable(
   bot: Bot,
   block: Block,
   signal: AbortSignal,
+  markPacketSent?: () => void,
 ): Promise<void> {
   await waitForAction(
     bot.lookAt(block.position.offset(0.5, 0.5, 0.5), false),
@@ -2220,9 +2223,13 @@ async function activateBlockCancellable(
   const client = bot._client as unknown as PacketClient;
   const directionNumber = 1;
   const cursor = new Vec3(0.5, 0.5, 0.5);
+  const writePacket = (packet: unknown): void => {
+    client.write("block_place", packet);
+    markPacketSent?.();
+  };
   if (bot.supportFeature("blockPlaceHasHeldItem")) {
     const Item = loadPrismarineItem(bot.registry);
-    client.write("block_place", {
+    writePacket({
       location: block.position,
       direction: directionNumber,
       heldItem: Item.toNotch(heldItemOrNull(bot)),
@@ -2231,7 +2238,7 @@ async function activateBlockCancellable(
       cursorZ: cursor.z * 16,
     });
   } else if (bot.supportFeature("blockPlaceHasHandAndIntCursor")) {
-    client.write("block_place", {
+    writePacket({
       location: block.position,
       direction: directionNumber,
       hand: 0,
@@ -2240,7 +2247,7 @@ async function activateBlockCancellable(
       cursorZ: cursor.z * 16,
     });
   } else if (bot.supportFeature("blockPlaceHasHandAndFloatCursor")) {
-    client.write("block_place", {
+    writePacket({
       location: block.position,
       direction: directionNumber,
       hand: 0,
@@ -2249,7 +2256,7 @@ async function activateBlockCancellable(
       cursorZ: cursor.z,
     });
   } else if (bot.supportFeature("blockPlaceHasInsideBlock")) {
-    client.write("block_place", {
+    writePacket({
       location: block.position,
       direction: directionNumber,
       hand: 0,
@@ -2272,6 +2279,7 @@ async function activateEntityCancellable(
   bot: Bot,
   entity: Entity,
   signal: AbortSignal,
+  markPacketSent?: () => void,
 ): Promise<void> {
   await waitForAction(
     bot.lookAt(entity.position.offset(0, 1, 0), false),
@@ -2285,6 +2293,7 @@ async function activateEntityCancellable(
     sneaking: false,
     hand: 0,
   });
+  markPacketSent?.();
 }
 
 async function placeBlockCancellable(
@@ -2319,15 +2328,18 @@ async function placeBlockCancellable(
 
 function openWindowCancellable(
   bot: Bot,
-  activate: () => Promise<void>,
+  activate: (markPacketSent: () => void) => Promise<void>,
   signal: AbortSignal,
 ): Promise<Window> {
   return new Promise<Window>((resolve, reject) => {
     let finished = false;
+    let packetSent = false;
+    let abortedAfterPacket = false;
     const finish = (error?: unknown, window?: Window): void => {
       if (finished) return;
       finished = true;
       bot.removeListener("windowOpen", onOpen);
+      bot.removeListener("end", onEnd);
       signal.removeEventListener("abort", onAbort);
       if (error !== undefined)
         reject(
@@ -2338,15 +2350,43 @@ function openWindowCancellable(
       else if (window !== undefined) resolve(window);
       else reject(new Error("Window opened without a Mineflayer window"));
     };
-    const onOpen = (window: Window): void => finish(undefined, window);
-    const onAbort = (): void => finish(abortError(signal));
+    const onOpen = (window: Window): void => {
+      if (abortedAfterPacket) {
+        if (bot.currentWindow === window) {
+          try {
+            bot.closeWindow(window);
+          } catch {
+            // A disconnect will settle this operation if closing is no longer possible.
+            return;
+          }
+        }
+        finish(abortError(signal));
+        return;
+      }
+      finish(undefined, window);
+    };
+    const onEnd = (): void =>
+      finish(new Error("Minecraft disconnected while opening a window"));
+    const onAbort = (): void => {
+      if (packetSent) {
+        abortedAfterPacket = true;
+        return;
+      }
+      finish(abortError(signal));
+    };
+    const markPacketSent = (): void => {
+      packetSent = true;
+    };
     if (signal.aborted) {
       reject(abortError(signal));
       return;
     }
-    bot.once("windowOpen", onOpen);
+    bot.on("windowOpen", onOpen);
+    bot.once("end", onEnd);
     signal.addEventListener("abort", onAbort, { once: true });
-    void activate().catch((error: unknown) => finish(error));
+    void activate(markPacketSent).catch((error: unknown) => {
+      if (!packetSent) finish(error);
+    });
   });
 }
 

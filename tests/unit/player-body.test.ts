@@ -49,7 +49,12 @@ function makeWindow(id = 3): Window & EventEmitter {
   return window;
 }
 
-function makeFakeBot(options: { deferInventory?: boolean } = {}): {
+function makeFakeBot(
+  options: {
+    deferInventory?: boolean;
+    deferWindowOpen?: boolean;
+  } = {},
+): {
   bot: Bot;
   inventory: EventEmitter;
   initializeInventory(): void;
@@ -57,6 +62,8 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
   candidates: Vec3[];
   hiddenBlockKeys: Set<string>;
   setWindow(window: Window): void;
+  emitWindowOpen(): void;
+  resumeWindowOpen(): void;
 } {
   const botEvents = new EventEmitter();
   const client = new EventEmitter() as EventEmitter & {
@@ -66,6 +73,7 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
   const candidates: Vec3[] = [];
   const hiddenBlockKeys = new Set<string>();
   let pendingWindow: (Window & EventEmitter) | undefined;
+  let deferWindowOpen = options.deferWindowOpen === true;
   const key = (position: Vec3): string =>
     `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
   const inventorySlots: (Record<string, unknown> | null)[] = Array.from(
@@ -175,7 +183,9 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
     attack: vi.fn(),
     heldItem: null,
     swingArm: vi.fn(),
-    closeWindow: vi.fn(),
+    closeWindow: vi.fn((window: Window) => {
+      if (bot.currentWindow === window) bot.currentWindow = null;
+    }),
     dig: vi.fn(async () => undefined),
     clickWindow: vi.fn(async () => undefined),
     recipesAll: () => [],
@@ -190,11 +200,13 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
     });
   }
   client.write = (event, packet) => {
-    if (event !== "block_place") return;
-    const location = (packet as { location?: Vec3 }).location;
-    if (location === undefined) return;
+    if (event !== "block_place" && event !== "use_entity") return;
+    if (event === "block_place") {
+      const location = (packet as { location?: Vec3 }).location;
+      if (location === undefined) return;
+    }
     const window = pendingWindow;
-    if (window !== undefined) {
+    if (window !== undefined && !deferWindowOpen) {
       bot.currentWindow = window;
       pendingWindow = undefined;
       queueMicrotask(() => bot.emit("windowOpen", window));
@@ -215,6 +227,16 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
     hiddenBlockKeys,
     setWindow: (window) => {
       pendingWindow = window as Window & EventEmitter;
+    },
+    emitWindowOpen: () => {
+      const window = pendingWindow;
+      if (window === undefined) throw new Error("No pending window");
+      pendingWindow = undefined;
+      bot.currentWindow = window;
+      bot.emit("windowOpen", window);
+    },
+    resumeWindowOpen: () => {
+      deferWindowOpen = false;
     },
   };
 }
@@ -898,6 +920,266 @@ describe("player body", () => {
       mode: 0,
     });
     expect(clicked.status).toBe("successful");
+  });
+
+  it("removes the window waiter when cancellation happens before activation sends a packet", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, -2);
+    fake.blocks.set("0,64,-2", makeBlock("brewing_stand", 2, target));
+    fake.candidates.push(target);
+    const window = makeWindow();
+    fake.setWindow(window);
+    let finishLook!: () => void;
+    let looked!: () => void;
+    const lookStarted = new Promise<void>((resolve) => (looked = resolve));
+    const lookDeferred = new Promise<void>((resolve) => (finishLook = resolve));
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(() => {
+      looked();
+      return lookDeferred;
+    });
+    const client = (
+      fake.bot as Bot & {
+        _client: EventEmitter & {
+          write: (event: string, packet: unknown) => void;
+        };
+      }
+    )._client;
+    const write = vi.spyOn(client, "write");
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    const pending = body.execute(
+      {
+        kind: "open_window",
+        target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+      },
+      controller.signal,
+    );
+    await lookStarted;
+    controller.abort(new Error("cancel before packet"));
+    const cancelled = await pending;
+    expect(cancelled.status).toBe("interrupted");
+    expect(cancelled.recoveryRequired).toBe(false);
+    finishLook();
+    await Promise.resolve();
+    expect(write).not.toHaveBeenCalled();
+
+    const replacement = await body.execute({
+      kind: "open_window",
+      target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+    });
+    expect(replacement.status).toBe("successful");
+    expect(fake.bot.closeWindow).not.toHaveBeenCalledWith(window);
+  });
+
+  it("quarantines a sent window activation until its late window is closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot({ deferWindowOpen: true });
+      const target = new Vec3(0, 64, -2);
+      fake.blocks.set("0,64,-2", makeBlock("brewing_stand", 2, target));
+      fake.candidates.push(target);
+      const lateWindow = makeWindow();
+      fake.setWindow(lateWindow);
+      vi.mocked(fake.bot.swingArm).mockImplementationOnce(() => {
+        throw new Error("activation completion failed after packet dispatch");
+      });
+      const client = (
+        fake.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      const write = vi.spyOn(client, "write");
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const controller = new AbortController();
+      const pending = body.execute(
+        {
+          kind: "open_window",
+          target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+        },
+        controller.signal,
+      );
+      await vi.waitFor(() =>
+        expect(write).toHaveBeenCalledWith("block_place", expect.any(Object)),
+      );
+      controller.abort(new Error("cancel after packet"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      const cancelled = await pending;
+      expect(cancelled.status).toBe("interrupted");
+      expect(cancelled.recoveryRequired).toBe(true);
+      await expect(body.execute({ kind: "window_close" })).rejects.toThrow(
+        /still settling/,
+      );
+
+      fake.emitWindowOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fake.bot.closeWindow).toHaveBeenCalledWith(lateWindow);
+      expect(fake.bot.currentWindow).toBeNull();
+
+      fake.resumeWindowOpen();
+      const nextWindow = makeWindow(4);
+      fake.setWindow(nextWindow);
+      const replacement = await body.execute({
+        kind: "open_window",
+        target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+      });
+      expect(replacement.status).toBe("successful");
+      expect(fake.bot.closeWindow).not.toHaveBeenCalledWith(nextWindow);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks entity-use packet dispatch before waiting for its late window", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot({ deferWindowOpen: true });
+      const target = {
+        id: 2,
+        name: "cow",
+        type: "mob",
+        position: new Vec3(0, 64, -2),
+        velocity: new Vec3(0, 0, 0),
+        height: 1.4,
+      };
+      Object.assign(fake.bot, {
+        entities: {
+          1: (fake.bot as unknown as { entity: unknown }).entity,
+          2: target,
+        },
+      });
+      const lateWindow = makeWindow();
+      fake.setWindow(lateWindow);
+      const client = (
+        fake.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      const write = vi.spyOn(client, "write");
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const controller = new AbortController();
+      const pending = body.execute(
+        { kind: "open_window", target: { kind: "entity", entityId: 2 } },
+        controller.signal,
+      );
+      await vi.waitFor(() =>
+        expect(write).toHaveBeenCalledWith(
+          "use_entity",
+          expect.objectContaining({ target: 2 }),
+        ),
+      );
+      controller.abort(new Error("cancel entity open"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect((await pending).recoveryRequired).toBe(true);
+      fake.emitWindowOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fake.bot.closeWindow).toHaveBeenCalledWith(lateWindow);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("settles and disposes a pending window waiter on disconnect before reattaching", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = makeFakeBot({ deferWindowOpen: true });
+      const target = new Vec3(0, 64, -2);
+      first.blocks.set("0,64,-2", makeBlock("brewing_stand", 2, target));
+      first.candidates.push(target);
+      first.setWindow(makeWindow());
+      const client = (
+        first.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      const write = vi.spyOn(client, "write");
+      let currentBot = first.bot;
+      const body = new MineflayerPlayerBody(() => currentBot);
+      const controller = new AbortController();
+      const pending = body.execute(
+        {
+          kind: "open_window",
+          target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+        },
+        controller.signal,
+      );
+      await vi.waitFor(() =>
+        expect(write).toHaveBeenCalledWith("block_place", expect.any(Object)),
+      );
+      const persistentWindowListeners =
+        first.bot.listenerCount("windowOpen") - 1;
+      controller.abort(new Error("cancel pending open"));
+      first.bot.emit("end", "test disconnect");
+      await vi.advanceTimersByTimeAsync(2_000);
+      const cancelled = await pending;
+      expect(cancelled.status).toBe("interrupted");
+      expect(cancelled.recoveryRequired).toBe(false);
+      expect(first.bot.listenerCount("windowOpen")).toBe(
+        persistentWindowListeners,
+      );
+
+      const second = makeFakeBot();
+      currentBot = second.bot;
+      body.attach(second.bot);
+      const replacement = await body.execute({
+        kind: "look",
+        target: { x: 0, y: 65, z: -2 },
+      });
+      expect(replacement.status).toBe("successful");
+      expect(first.bot.listenerCount("windowOpen")).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a stopped body's pending window quarantined until the late window is closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot({ deferWindowOpen: true });
+      const target = new Vec3(0, 64, -2);
+      fake.blocks.set("0,64,-2", makeBlock("brewing_stand", 2, target));
+      fake.candidates.push(target);
+      const lateWindow = makeWindow();
+      fake.setWindow(lateWindow);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const client = (
+        fake.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      const write = vi.spyOn(client, "write");
+      const pending = body.execute({
+        kind: "open_window",
+        target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+      });
+      await vi.waitFor(() =>
+        expect(write).toHaveBeenCalledWith("block_place", expect.any(Object)),
+      );
+      const stopping = body.stop();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      const result = await pending;
+      expect(result.status).toBe("interrupted");
+      expect(result.recoveryRequired).toBe(true);
+      expect(write).toHaveBeenCalledTimes(1);
+
+      fake.emitWindowOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fake.bot.closeWindow).toHaveBeenCalledWith(lateWindow);
+      expect(fake.bot.currentWindow).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
