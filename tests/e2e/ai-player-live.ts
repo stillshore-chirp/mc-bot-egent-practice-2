@@ -35,6 +35,7 @@ import {
   projectSafePlayerAgentActivityTail,
   type PlayerAgentRoundActivity,
 } from "../../src/player/responses.js";
+import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
   classifyFurnaceRconReply,
   type FurnaceRconReplyClass,
@@ -2307,13 +2308,16 @@ async function main(): Promise<void> {
           (player) =>
             player.counters.llmCalls > context.usageAtStart.llmCalls &&
             context.responseQueue.length > beforeResponses &&
-            readDbContains(state.databasePath, durableFact),
+            readDbContainsOwnerFact(state.databasePath, durableFact),
         );
         const beforeRestart = readDbTableCount(
           state.databasePath,
           "player_runtime_state",
         );
-        const factPersisted = readDbContains(state.databasePath, durableFact);
+        const factPersisted = readDbContainsOwnerFact(
+          state.databasePath,
+          durableFact,
+        );
         if (!factPersisted)
           incomplete("SYNTHETIC_FACT_NOT_PERSISTED_BEFORE_RESTART");
         await context.runtime.app.shutdown("ai_player_e2e_memory_restart");
@@ -2342,7 +2346,7 @@ async function main(): Promise<void> {
         const afterRestart = await collect(nextApp);
         const restartPlayer = playerOf(afterRestart);
         if (beforeRestart < 1) incomplete("PERSISTENT_RUNTIME_ROW_MISSING");
-        if (!readDbContains(state.databasePath, durableFact))
+        if (!readDbContainsOwnerFact(state.databasePath, durableFact))
           incomplete("SYNTHETIC_FACT_MISSING_AFTER_RESTART");
         const responseStart = context.responseQueue.length;
         const restartCallsBefore = restartPlayer.counters.llmCalls;
@@ -5046,7 +5050,10 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
   }
 }
 
-function readDbContains(databasePath: string, syntheticFact: string): boolean {
+function readDbContainsOwnerFact(
+  databasePath: string,
+  syntheticFact: string,
+): boolean {
   const database = new Database(databasePath, {
     readonly: true,
     fileMustExist: true,
@@ -5055,10 +5062,11 @@ function readDbContains(databasePath: string, syntheticFact: string): boolean {
   try {
     const row = database
       .prepare(
-        "SELECT COUNT(*) AS count FROM player_runtime_state WHERE payload_json LIKE ?",
+        "SELECT payload_json FROM player_runtime_state WHERE singleton_id = 1",
       )
-      .get(`%${syntheticFact}%`) as { readonly count: number };
-    return row.count > 0;
+      .get() as { readonly payload_json: string } | undefined;
+    if (row === undefined) return false;
+    return hasPersistedOwnerFact(row.payload_json, syntheticFact);
   } catch {
     incomplete("PERSISTENT_RUNTIME_FACT_EVIDENCE_MISSING");
   } finally {

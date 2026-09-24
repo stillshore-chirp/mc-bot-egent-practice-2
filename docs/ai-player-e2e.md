@@ -12,20 +12,20 @@
 
 ## Issue #72 の機械的な確認範囲
 
-| Issue受け入れ条件     | ケースと根拠                                                                                                                                                                                                                                    |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 身体操作の接続        | `body_operation_smoke` は非OPのPlayerBodyを直接使い、採掘・視点変更・かまど画面の開閉と入出庫をBody観測およびRCONで照合します。GPT受け入れは別に集計します。                                                                                    |
-| 既存層の見直し        | `runtime_contract` が既定アプリのplayer runtime evidenceと接続を確認し、`autonomous_life` がowner指示なしの実行を確認します。既存legacy経路との静的な責務確認はソース・設計文書も併せてレビューします。                                         |
-| 自発的な生活          | `autonomous_life` はself由来の目標、GPT判断、成功した操作結果、RCONで観測する位置・所持品・fixture regionのいずれかの実変化を要求します。操作kindを`place`等に固定しません。                                                                    |
-| 未知の状況への対応    | `unknown_composite` は壁・水路・日没が近い状況を組み合わせ、実際の失敗、失敗後の再観測と行動判断、異なるkindまたは変化した条件での後続回復、server progress、対象の取得・持帰りを確認します。途中oracle診断は失敗の有無から独立して保存します。 |
-| 擬似視覚と記憶        | `observation_boundary` は遮蔽したemerald入りchestをRCON oracleで確認し、runtimeの可視観測とownerへの返答に未確認の内容を出さないことを見ます。`persistent_memory_restart` は合成factをDB保存し、同じDBで再起動した後のGPT回答に照合します。     |
-| 並行会話と行動変更    | `parallel_dialogue_stop` は進行中の操作へguestとownerが実際に話しかけ、guestの状態変更拒否、ownerの強い要請に対する目的解決とownerへ近づくRCON位置変化、停止ラッチと停止後の再開防止を確認します。                                              |
-| 拒否境界の更新        | `game_action_discretion` はownerの依頼でfixture建築の穴を実際に埋めたことをRCON確認します。独立した建築fixtureで、建築の一律拒否やブロック単位の再承認が残っていないことを検証します。                                                          |
-| Skillの必要時参照     | `learning_reuse` と`skill_compactness_and_knowledge_separation` は収集結果に結び付いたSkillの作成・後続相談と、限定された参照量、ゲームレジストリ知識の分離を確認します。                                                                       |
-| 自己学習              | `learning_reuse` は一度の成功から作られた仮説、DB上のtrusted receipt/outcome、Skillの再利用と次回の版・証跡変化を照合します。                                                                                                                   |
-| 簡潔なSkillと知識分離 | `skill_compactness_and_knowledge_separation` は保存本文が8 KiB以内であること、全件ではないSkill参照、別のregistry知識APIを確認します。                                                                                                          |
-| DBとMarkdownの往復    | `skill_exchange` はexportしたファイル名と同一Skill IDをimport活動・DBで照合し、合成編集marker、同IDの版・receipt更新、同じファイルの再import試行後に同IDの本文・版・receiptが変わらないことを確認します。                                       |
-| 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                              |
+| Issue受け入れ条件     | ケースと根拠                                                                                                                                                                                                                                          |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 身体操作の接続        | `body_operation_smoke` は非OPのPlayerBodyを直接使い、採掘・視点変更・かまど画面の開閉と入出庫をBody観測およびRCONで照合します。GPT受け入れは別に集計します。                                                                                          |
+| 既存層の見直し        | `runtime_contract` が既定アプリのplayer runtime evidenceと接続を確認し、`autonomous_life` がowner指示なしの実行を確認します。既存legacy経路との静的な責務確認はソース・設計文書も併せてレビューします。                                               |
+| 自発的な生活          | `autonomous_life` はself由来の目標、GPT判断、成功した操作結果、RCONで観測する位置・所持品・fixture regionのいずれかの実変化を要求します。操作kindを`place`等に固定しません。                                                                          |
+| 未知の状況への対応    | `unknown_composite` は壁・水路・日没が近い状況を組み合わせ、実際の失敗、失敗後の再観測と行動判断、異なるkindまたは変化した条件での後続回復、server progress、対象の取得・持帰りを確認します。途中oracle診断は失敗の有無から独立して保存します。       |
+| 擬似視覚と記憶        | `observation_boundary` は遮蔽したemerald入りchestをRCON oracleで確認し、runtimeの可視観測とownerへの返答に未確認の内容を出さないことを見ます。`persistent_memory_restart` はowner由来fact noteのDB保存と、同じDBで再起動した後のGPT回答を照合します。 |
+| 並行会話と行動変更    | `parallel_dialogue_stop` は進行中の操作へguestとownerが実際に話しかけ、guestの状態変更拒否、ownerの強い要請に対する目的解決とownerへ近づくRCON位置変化、停止ラッチと停止後の再開防止を確認します。                                                    |
+| 拒否境界の更新        | `game_action_discretion` はownerの依頼でfixture建築の穴を実際に埋めたことをRCON確認します。独立した建築fixtureで、建築の一律拒否やブロック単位の再承認が残っていないことを検証します。                                                                |
+| Skillの必要時参照     | `learning_reuse` と`skill_compactness_and_knowledge_separation` は収集結果に結び付いたSkillの作成・後続相談と、限定された参照量、ゲームレジストリ知識の分離を確認します。                                                                             |
+| 自己学習              | `learning_reuse` は一度の成功から作られた仮説、DB上のtrusted receipt/outcome、Skillの再利用と次回の版・証跡変化を照合します。                                                                                                                         |
+| 簡潔なSkillと知識分離 | `skill_compactness_and_knowledge_separation` は保存本文が8 KiB以内であること、全件ではないSkill参照、別のregistry知識APIを確認します。                                                                                                                |
+| DBとMarkdownの往復    | `skill_exchange` はexportしたファイル名と同一Skill IDをimport活動・DBで照合し、合成編集marker、同IDの版・receipt更新、同じファイルの再import試行後に同IDの本文・版・receiptが変わらないことを確認します。                                             |
+| 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                                    |
 
 これらは代表ケースです。全操作の網羅、すべてのMinecraft環境・mod・protocol差、死亡を含むすべての結果を証明しません。未実装と判断した操作はありません。確認していない能力や環境差は未検証として残します。
 
