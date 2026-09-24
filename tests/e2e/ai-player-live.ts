@@ -1008,6 +1008,13 @@ async function main(): Promise<void> {
       }
     });
     const operationSmokeResult = await runOperationSmoke(state, rcon);
+    if (operationSmokeResult.status !== "pass") {
+      const failureCode =
+        operationSmokeResult.reason ?? "BODY_OPERATION_SMOKE_NOT_CONFIRMED";
+      state.status = operationSmokeResult.status;
+      state.failureCode ??= failureCode;
+      throw new HarnessError(operationSmokeResult.status, failureCode);
+    }
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
 
