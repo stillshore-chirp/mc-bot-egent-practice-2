@@ -53,6 +53,11 @@ import {
   recoveryCagePlan,
   withRestorableObstacle,
 } from "./unknown-recovery-obstacle.js";
+import {
+  hasJudgmentAfterSuccessfulOutcome,
+  hasTerminalOutcomeForOperation,
+  isStoppedHandoffBoundaryConfirmed,
+} from "./autonomous-milestone.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -142,6 +147,11 @@ interface SafeAutonomousProgress {
   readonly successfulActionSeen: boolean;
   readonly worldProgressSeen: boolean;
   readonly successfulOutcomeCount: number;
+  readonly followupJudgmentSeen: boolean;
+  readonly milestoneSeen: boolean;
+  readonly activeOperationPresent: boolean;
+  readonly activeBodyStarted: boolean;
+  readonly activeBodyElapsedBucket: string;
 }
 
 type UnknownObstacleStatus =
@@ -194,6 +204,27 @@ interface UnknownCompositeDiagnostic {
   readonly unknownControlledObstaclePlayerInsideAtFailure?: boolean;
   readonly unknownControlledObstacleOtherEntitiesClear?: boolean;
   readonly unknownControlledObstacleRestored?: boolean;
+  readonly unknownHandoffMilestoneConfirmed?: boolean;
+  readonly unknownHandoffStopRequested?: boolean;
+  readonly unknownHandoffStopLatchConfirmed?: boolean;
+  readonly unknownHandoffStopGenerationAdvanced?: boolean;
+  readonly unknownHandoffActiveOperationPresent?: boolean;
+  readonly unknownHandoffActiveBodyStarted?: boolean;
+  readonly unknownHandoffActiveBodyElapsedBucket?: string;
+  readonly unknownHandoffActiveCleared?: boolean;
+  readonly unknownHandoffActiveTerminalRequired?: boolean;
+  readonly unknownHandoffActiveTerminalObserved?: boolean;
+  readonly unknownHandoffPendingCancelled?: boolean;
+  readonly unknownHandoffPendingOperationAtStop?: boolean;
+  readonly unknownHandoffShutdownCompleted?: boolean;
+  readonly unknownHandoffDisconnectConfirmed?: boolean;
+  readonly unknownHandoffRestarted?: boolean;
+  readonly unknownHandoffStoppedLatchRestored?: boolean;
+  readonly unknownHandoffFixturePreparedWhileStopped?: boolean;
+  readonly unknownHandoffResumeRequested?: boolean;
+  readonly unknownHandoffResumed?: boolean;
+  readonly unknownHandoffActiveAfterResume?: boolean;
+  readonly unknownHandoffTaskSent?: boolean;
 }
 
 type BodyOperationStatus =
@@ -999,6 +1030,11 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
           autonomousSuccessfulActionSeen: progress.successfulActionSeen,
           autonomousWorldProgressSeen: progress.worldProgressSeen,
           autonomousSuccessfulOutcomeCount: progress.successfulOutcomeCount,
+          autonomousFollowupJudgmentSeen: progress.followupJudgmentSeen,
+          autonomousMilestoneSeen: progress.milestoneSeen,
+          autonomousActiveOperationPresent: progress.activeOperationPresent,
+          autonomousActiveBodyStarted: progress.activeBodyStarted,
+          autonomousActiveBodyElapsedBucket: progress.activeBodyElapsedBucket,
         }),
   };
 }
@@ -1495,7 +1531,14 @@ async function main(): Promise<void> {
           autonomousGoalSeen: false,
           activitySeen: false,
           successfulActionSeen: false,
+          followupJudgmentSeen: false,
         };
+        const initialJudgmentKeys = new Set(
+          initial.recentJudgments.map(
+            (judgment) =>
+              `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+          ),
+        );
         let progressKind: string | undefined;
         let lastWorldCheckAt = 0;
         state.autonomousLifeProgress = {
@@ -1504,6 +1547,11 @@ async function main(): Promise<void> {
           successfulActionSeen: false,
           worldProgressSeen: false,
           successfulOutcomeCount: 0,
+          followupJudgmentSeen: false,
+          milestoneSeen: false,
+          activeOperationPresent: false,
+          activeBodyStarted: false,
+          activeBodyElapsedBucket: "none",
         };
         const result = await observeForPlayer(
           context,
@@ -1525,6 +1573,17 @@ async function main(): Promise<void> {
               initial,
               player,
             ).some((outcome) => outcome.status === "successful");
+            const newJudgments = player.recentJudgments.filter(
+              (judgment) =>
+                !initialJudgmentKeys.has(
+                  `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+                ),
+            );
+            autonomousProgress.followupJudgmentSeen ||=
+              hasJudgmentAfterSuccessfulOutcome(
+                newOutcomes(initial, player),
+                newJudgments,
+              );
             if (
               autonomousProgress.successfulActionSeen &&
               Date.now() - lastWorldCheckAt >= 1_500
@@ -1548,12 +1607,22 @@ async function main(): Promise<void> {
               successfulOutcomeCount: newOutcomes(initial, player).filter(
                 (outcome) => outcome.status === "successful",
               ).length,
+              followupJudgmentSeen: autonomousProgress.followupJudgmentSeen,
+              milestoneSeen:
+                autonomousProgress.activitySeen &&
+                autonomousProgress.successfulActionSeen &&
+                progressKind !== undefined &&
+                autonomousProgress.followupJudgmentSeen,
+              activeOperationPresent: isOperationActive(player),
+              activeBodyStarted:
+                typeof player.activeOperation?.bodyStartedAt === "string",
+              activeBodyElapsedBucket: activeBodyElapsedBucket(player),
             };
             return (
               autonomousProgress.activitySeen &&
               autonomousProgress.successfulActionSeen &&
               progressKind !== undefined &&
-              !isOperationActive(player)
+              autonomousProgress.followupJudgmentSeen
             );
           },
         );
@@ -1562,10 +1631,14 @@ async function main(): Promise<void> {
             incomplete("AUTONOMOUS_ACTIVITY_NOT_SELECTED");
           if (!autonomousProgress.successfulActionSeen)
             incomplete("AUTONOMOUS_SUCCESSFUL_ACTION_NOT_CONFIRMED");
-          incomplete("AUTONOMOUS_WORLD_PROGRESS_NOT_OBSERVED");
+          if (progressKind === undefined)
+            incomplete("AUTONOMOUS_WORLD_PROGRESS_NOT_OBSERVED");
+          incomplete("AUTONOMOUS_FOLLOWUP_JUDGMENT_NOT_OBSERVED");
         }
         if (progressKind === undefined)
           incomplete("AUTONOMOUS_WORLD_PROGRESS_NOT_OBSERVED");
+        if (!autonomousProgress.followupJudgmentSeen)
+          incomplete("AUTONOMOUS_FOLLOWUP_JUDGMENT_NOT_OBSERVED");
         return {
           autonomousGoalObserved: true,
           autonomousActionRevisionAdvanced:
@@ -1576,6 +1649,11 @@ async function main(): Promise<void> {
           serverProgressKind: progressKind,
           llmDecisionObserved:
             result.counters.llmCalls > initial.counters.llmCalls,
+          judgmentAfterSuccessfulOutcome: true,
+          activeOperationAtMilestone: isOperationActive(result),
+          activeBodyStartedAtMilestone:
+            typeof result.activeOperation?.bodyStartedAt === "string",
+          activeBodyElapsedBucketAtMilestone: activeBodyElapsedBucket(result),
           noOwnerPrompt: true,
         };
       },
@@ -1587,6 +1665,9 @@ async function main(): Promise<void> {
       CASE_DEADLINES.unknown_composite,
       requireLiveContext(),
       async (context) => {
+        const handoff = await stopAndRestartForUnknownCase(state, context);
+        context = handoff.context;
+        const stopGeneration = handoff.stopGeneration;
         const spawn = { x: 0.5, y: 64, z: 0.5 };
         await rcon.command(
           `tp ${state.botName} ${spawn.x} ${spawn.y} ${spawn.z}`,
@@ -1615,12 +1696,22 @@ async function main(): Promise<void> {
           state.botName,
           fixtureRegion,
         );
-        const before = playerOf(await collect(context.runtime.app));
-        const beforePlayer = before;
-        const beforeRevision = beforePlayer.actionRevision;
+        const beforeFixturePlayer = playerOf(
+          await collect(context.runtime.app),
+        );
+        if (
+          !beforeFixturePlayer.stopped ||
+          beforeFixturePlayer.stopGeneration !== stopGeneration ||
+          isOperationActive(beforeFixturePlayer)
+        ) {
+          incomplete("UNKNOWN_FIXTURE_NOT_PREPARED_WHILE_STOPPED");
+        }
         const target = unknownFixtureTarget(beforeWorld.position);
         const targetInitiallyPresent = await isBlock(rcon, target, "blue_wool");
         if (!targetInitiallyPresent) fail("UNKNOWN_TARGET_FIXTURE_INVALID");
+        updateUnknownCompositeDiagnostic(state, {
+          unknownHandoffFixturePreparedWhileStopped: true,
+        });
         let serverGoalObserved = false;
         let failureSnapshot: WorldSnapshot | undefined;
         let recoverySnapshot: WorldSnapshot | undefined;
@@ -1683,13 +1774,37 @@ async function main(): Promise<void> {
           }
         };
         await sampleUnknownOracle();
+        const resumed = await resumeAfterUnknownFixture(
+          state,
+          context,
+          stopGeneration,
+        );
+        if (resumed.stopped)
+          incomplete("UNKNOWN_AUTONOMY_RESUME_NOT_CONFIRMED");
+        const beforePlayer = playerOf(await collect(context.runtime.app));
+        if (
+          beforePlayer.stopped ||
+          beforePlayer.stopGeneration <= stopGeneration
+        )
+          incomplete("UNKNOWN_AUTONOMY_RESUME_NOT_CONFIRMED");
+        const beforeRevision = beforePlayer.actionRevision;
+        updateUnknownCompositeDiagnostic(state, {
+          unknownHandoffActiveAfterResume: isOperationActive(beforePlayer),
+        });
+        const unknownObservationBudgetMs =
+          context.caseDeadlineAt - Date.now() - 60_000;
+        if (unknownObservationBudgetMs < 1)
+          incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
         sendChat(
           context.owner,
           "日没が近づいています。水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
+        updateUnknownCompositeDiagnostic(state, {
+          unknownHandoffTaskSent: true,
+        });
         const afterPlayer = await waitForPlayer(
           context,
-          CASE_DEADLINES.unknown_composite - 60_000,
+          unknownObservationBudgetMs,
           async (player) => {
             let currentPlayer = player;
             const currentOutcomes = newOutcomes(beforePlayer, currentPlayer);
@@ -3957,6 +4072,174 @@ async function connectApplication(
   }
 }
 
+async function stopAndRestartForUnknownCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<{ readonly context: CaseContext; readonly stopGeneration: number }> {
+  if (state.autonomousLifeProgress?.milestoneSeen !== true)
+    incomplete("AUTONOMOUS_MILESTONE_NOT_RECORDED");
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffMilestoneConfirmed: true,
+    unknownHandoffStopRequested: false,
+    unknownHandoffStopLatchConfirmed: false,
+    unknownHandoffActiveTerminalRequired: false,
+    unknownHandoffActiveTerminalObserved: false,
+    unknownHandoffPendingCancelled: false,
+    unknownHandoffPendingOperationAtStop: false,
+    unknownHandoffShutdownCompleted: false,
+    unknownHandoffDisconnectConfirmed: false,
+    unknownHandoffRestarted: false,
+    unknownHandoffStoppedLatchRestored: false,
+    unknownHandoffFixturePreparedWhileStopped: false,
+    unknownHandoffResumeRequested: false,
+    unknownHandoffResumed: false,
+    unknownHandoffTaskSent: false,
+  });
+
+  const beforeStop = playerOf(await collect(context.runtime.app));
+  if (beforeStop.stopped) incomplete("AUTONOMOUS_STOPPED_BEFORE_HANDOFF");
+  const activeBeforeStop = beforeStop.activeOperation;
+  const activeBodyStarted = typeof activeBeforeStop?.bodyStartedAt === "string";
+  const terminalRequired = activeBeforeStop !== undefined && activeBodyStarted;
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffActiveOperationPresent: activeBeforeStop !== undefined,
+    unknownHandoffActiveBodyStarted: activeBodyStarted,
+    unknownHandoffActiveBodyElapsedBucket: activeBodyElapsedBucket(beforeStop),
+    unknownHandoffActiveTerminalRequired: terminalRequired,
+    unknownHandoffPendingOperationAtStop:
+      activeBeforeStop !== undefined && !activeBodyStarted,
+  });
+
+  const stopGenerationBefore = beforeStop.stopGeneration;
+  sendChat(context.owner, "今の行動を停止してください。");
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffStopRequested: true,
+  });
+  const stopped = await waitForPlayer(context, 45_000, (player) => {
+    const activeTerminalObserved =
+      terminalRequired &&
+      hasTerminalOutcomeForOperation(
+        activeBeforeStop.operationId,
+        player.recentOutcomes,
+      );
+    const stopBoundaryConfirmed = isStoppedHandoffBoundaryConfirmed({
+      stopped: player.stopped,
+      activeCleared: !isOperationActive(player),
+      stopGeneration: player.stopGeneration,
+      previousStopGeneration: stopGenerationBefore,
+      terminalRequired,
+      ...(terminalRequired
+        ? { operationId: activeBeforeStop.operationId }
+        : {}),
+      outcomes: player.recentOutcomes,
+    });
+    updateUnknownCompositeDiagnostic(state, {
+      unknownHandoffStopLatchConfirmed: player.stopped,
+      unknownHandoffActiveCleared: !isOperationActive(player),
+      unknownHandoffStopGenerationAdvanced:
+        player.stopGeneration > stopGenerationBefore,
+      unknownHandoffActiveTerminalObserved: activeTerminalObserved,
+      unknownHandoffPendingCancelled:
+        activeBeforeStop !== undefined &&
+        !activeBodyStarted &&
+        stopBoundaryConfirmed,
+    });
+    return stopBoundaryConfirmed;
+  });
+  const stopGeneration = stopped.stopGeneration;
+
+  await boundedShutdown(context.runtime.app, "ai_player_e2e_unknown_handoff");
+  if (appForCleanup === context.runtime.app) appForCleanup = undefined;
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffShutdownCompleted: true,
+  });
+  await waitForPlayerEntityDisconnect(
+    context.rcon,
+    context.botName,
+    Math.min(10_000, context.caseDeadlineAt - Date.now()),
+  );
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffDisconnectConfirmed: true,
+  });
+
+  const { createApplication } = await import("../../src/app/application.js");
+  const nextApp = createApplication(context.runtime.config);
+  appForCleanup = nextApp;
+  await connectApplication(nextApp, state);
+  const restartedEvidence = await collect(nextApp);
+  const restartedPlayer = playerOf(restartedEvidence);
+  if (
+    restartedEvidence.connectionState !== "connected" ||
+    !restartedPlayer.stopped ||
+    restartedPlayer.stopGeneration !== stopGeneration ||
+    isOperationActive(restartedPlayer)
+  ) {
+    incomplete("UNKNOWN_HANDOFF_STOPPED_RESTART_NOT_CONFIRMED");
+  }
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffRestarted: true,
+    unknownHandoffStoppedLatchRestored: true,
+  });
+
+  const restartedContext: CaseContext = {
+    ...makeContext(
+      state,
+      nextApp,
+      context.runtime.config,
+      context.rcon,
+      context.owner,
+      context.guest,
+    ),
+    usageAtStart: context.usageAtStart,
+    runUsageAtStart: context.runUsageAtStart,
+    startedAt: context.startedAt,
+    runDeadlineAt: context.runDeadlineAt,
+    caseDeadlineAt: context.caseDeadlineAt,
+    runBudget: context.runBudget,
+    ...(context.caseBudget === undefined
+      ? {}
+      : { caseBudget: context.caseBudget }),
+  };
+  liveContext = restartedContext;
+  return { context: restartedContext, stopGeneration };
+}
+
+async function waitForPlayerEntityDisconnect(
+  rcon: LocalRcon,
+  botName: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + Math.max(1, timeoutMs);
+  const positionPattern =
+    /\[\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*\]/u;
+  while (Date.now() < deadline) {
+    const reply = await rcon.command(`data get entity ${botName} Pos`);
+    if (/no entity was found/iu.test(reply)) return;
+    if (!positionPattern.test(reply))
+      incomplete("PLAYER_DISCONNECT_STATE_UNKNOWN");
+    await waitMs(250);
+  }
+  incomplete("PLAYER_DISCONNECT_NOT_CONFIRMED");
+}
+
+function resumeAfterUnknownFixture(
+  state: RunState,
+  context: CaseContext,
+  stopGeneration: number,
+): Promise<PlayerEvidence> {
+  updateUnknownCompositeDiagnostic(state, {
+    unknownHandoffResumeRequested: true,
+  });
+  sendChat(context.owner, "自律を再開してください。");
+  return waitForPlayer(context, 90_000, (player) => {
+    const resumed = !player.stopped && player.stopGeneration > stopGeneration;
+    updateUnknownCompositeDiagnostic(state, {
+      unknownHandoffResumed: resumed,
+    });
+    return resumed;
+  });
+}
+
 const APPLICATION_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 async function boundedShutdown(
@@ -4302,6 +4585,20 @@ function sendChat(client: Bot, message: string): void {
 
 function isOperationActive(player: PlayerEvidence): boolean {
   return player.activeOperation !== undefined;
+}
+
+function activeBodyElapsedBucket(
+  player: PlayerEvidence,
+  now = Date.now(),
+): string {
+  const startedAt = player.activeOperation?.bodyStartedAt;
+  if (startedAt === undefined)
+    return isOperationActive(player) ? "not_started" : "none";
+  const elapsedMs = now - Date.parse(startedAt);
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "unknown";
+  if (elapsedMs < 2_000) return "under_2s";
+  if (elapsedMs < 10_000) return "2_to_10s";
+  return "over_10s";
 }
 
 function newOutcomes(

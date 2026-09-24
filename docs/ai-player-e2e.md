@@ -93,4 +93,8 @@ run13後のハーネス差分では、`unknown_composite`のtarget・item・帰�
 
 run14はHEAD `855d39a`で実施し、Body smokeと`runtime_contract`がpassしました。`autonomous_life`も3 calls・16,947 tokensでpassし、position進展を観測しました。`unknown_composite`は19 calls・125,313 tokensでcase予算停止となり、後続9 caseは未実行、cleanupは3/3確認済みです。
 
-したがってIssue #72全体の受け入れは未達です。run14ではBody smoke・`runtime_contract`・`autonomous_life`がpassしましたが、`unknown_composite`は予算停止し未完了です。自律生活はrun10・14でpass、run11・13では予算停止しており、安定した再現性は確認できていません。run12のsuccessful `dig`とrun13のsuccessful `look` 3件はいずれもworld進展未確認でした。観測境界、再起動、並行会話と停止、建築依頼、Skill学習・交換など後続caseはrun14でも未実行です。
+run15はHEAD `1d60721`で実施し、Body smokeと`runtime_contract`がpassしました。`autonomous_life`ではself goal・activity・successful outcome・RCON world progressを確認し、successful `look` 1件、action revision 2、最後の判断`continue`、観測時点のactive operation `move_to`を記録しました。10 calls・60,198 tokensでcase上限を超え未完了となり、後続9 caseは未実行、cleanupは3/3確認済みです。active operationが残ったままmilestone相当の証拠が揃ったため、run15を遡ってpassにはしていません。
+
+今回のharness差分では、自律milestoneにsuccessful outcomeの後の新しいjudgmentを要求し、操作がactiveという理由だけではmilestoneを保留しません。次のunknown fixture境界ではowner停止後、実Body開始済みの停止前operationだけ同IDの終端outcomeを確認します。実行前のpending operationは停止後に消えたことを安全診断へ記録します。その後app shutdownとBot切断を確認し、同じDB・configで再起動して停止ラッチを照合し、停止中にfixtureとoracleを準備してからowner明示resumeと未知課題を送ります。unknown scenarioのoutcome基準は再開後・課題送信直前のsnapshotに置き、stop/handoffの終端outcomeを自然失敗に含めません。停止・再起動・再開は成功証拠にせず、artifactには段階bool、Body開始有無と経過bucketを残します。この差分は静的検証段階で、実Minecraft/GPT未実施です。
+
+Issue #72全体の受け入れは未達です。`unknown_composite`と後続caseは未完了で、自律生活のpassはrun10・14、予算未完了はrun11・13・15と差があります。case遷移の新しい停止・再起動境界も実ゲームでは未検証です。
