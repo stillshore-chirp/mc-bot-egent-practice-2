@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifyUnknownTaskVisibility,
+  isFacingUnknownFixture,
+  parseEntityRotation,
   safeUnknownOperationKind,
 } from "../e2e/unknown-composite-diagnostic.js";
 
@@ -36,5 +38,24 @@ describe("unknown composite operation-kind evidence", () => {
       waterBlockVisible: false,
       wallMaterialVisible: false,
     });
+  });
+});
+
+describe("unknown fixture facing evidence", () => {
+  it("parses yaw and pitch and accepts equivalent wrapped angles", () => {
+    const rotation = parseEntityRotation("Entity data: [270.0f, 0.0f]");
+
+    expect(rotation).toEqual({ yaw: 270, pitch: 0 });
+    expect(isFacingUnknownFixture(rotation)).toBe(true);
+  });
+
+  it("rejects unparsable or misdirected rotation readback", () => {
+    expect(parseEntityRotation("Entity data unavailable")).toBeUndefined();
+    expect(parseEntityRotation("Entity data [270, 0], readback failed")).toBe(
+      undefined,
+    );
+    expect(isFacingUnknownFixture(undefined)).toBe(false);
+    expect(isFacingUnknownFixture({ yaw: 0, pitch: 0 })).toBe(false);
+    expect(isFacingUnknownFixture({ yaw: -90, pitch: 10 })).toBe(false);
   });
 });

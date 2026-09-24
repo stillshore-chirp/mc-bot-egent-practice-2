@@ -62,7 +62,11 @@ import {
 import { classifyObservationReply } from "./observation-reply-classifier.js";
 import {
   classifyUnknownTaskVisibility,
+  isFacingUnknownFixture,
+  parseEntityRotation,
   safeUnknownOperationKind,
+  UNKNOWN_FIXTURE_PITCH,
+  UNKNOWN_FIXTURE_YAW,
   type SafeUnknownOperationKind,
 } from "./unknown-composite-diagnostic.js";
 import {
@@ -199,6 +203,13 @@ interface UnknownCompositeDiagnostic {
   readonly unknownTaskTargetBlockVisible?: boolean;
   readonly unknownTaskWaterBlockVisible?: boolean;
   readonly unknownTaskWallMaterialVisible?: boolean;
+  readonly unknownFixtureFacingCommanded?: boolean;
+  readonly unknownFixtureFacingReadbackAvailable?: boolean;
+  readonly unknownFixtureFacingConfirmed?: boolean;
+  readonly unknownPreTaskObservationStatus?: "available" | "unknown";
+  readonly unknownPreTaskTargetBlockVisible?: boolean;
+  readonly unknownPreTaskWaterBlockVisible?: boolean;
+  readonly unknownPreTaskWallMaterialVisible?: boolean;
   readonly unknownFailureObserved?: boolean;
   readonly unknownFailureSource?: "natural" | "controlled_obstacle";
   readonly unknownFailureOperationKind?: SafeUnknownOperationKind;
@@ -1751,6 +1762,55 @@ async function main(): Promise<void> {
         const target = unknownFixtureTarget(beforeWorld.position);
         const targetInitiallyPresent = await isBlock(rcon, target, "blue_wool");
         if (!targetInitiallyPresent) fail("UNKNOWN_TARGET_FIXTURE_INVALID");
+        await rcon.command(
+          `tp ${state.botName} ${origin.x} ${origin.y} ${origin.z} ${UNKNOWN_FIXTURE_YAW} ${UNKNOWN_FIXTURE_PITCH}`,
+        );
+        updateUnknownCompositeDiagnostic(state, {
+          unknownFixtureFacingCommanded: true,
+          unknownFixtureFacingReadbackAvailable: false,
+          unknownFixtureFacingConfirmed: false,
+          unknownPreTaskObservationStatus: "unknown",
+        });
+        const rotation = parseEntityRotation(
+          await rcon.command(`data get entity ${state.botName} Rotation`),
+        );
+        if (rotation === undefined) {
+          incomplete("UNKNOWN_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
+        }
+        const fixtureFacingConfirmed = isFacingUnknownFixture(rotation);
+        updateUnknownCompositeDiagnostic(state, {
+          unknownFixtureFacingReadbackAvailable: true,
+          unknownFixtureFacingConfirmed: fixtureFacingConfirmed,
+        });
+        if (!fixtureFacingConfirmed)
+          incomplete("UNKNOWN_FIXTURE_FACING_NOT_CONFIRMED");
+        const facingConfirmedAt = Date.now();
+        const preTaskObservation = playerOf(
+          await collect(context.runtime.app),
+        ).lastObservation;
+        const preTaskObservedAt =
+          preTaskObservation?.observedAt === undefined
+            ? Number.NaN
+            : Date.parse(preTaskObservation.observedAt);
+        const freshPreTaskObservation =
+          Number.isFinite(preTaskObservedAt) &&
+          preTaskObservedAt > facingConfirmedAt;
+        const preTaskVisibility = freshPreTaskObservation
+          ? classifyUnknownTaskVisibility(preTaskObservation?.visibleBlockNames)
+          : { status: "unknown" as const };
+        updateUnknownCompositeDiagnostic(state, {
+          unknownPreTaskObservationStatus: preTaskVisibility.status,
+          ...(preTaskVisibility.targetBlockVisible === undefined
+            ? {}
+            : {
+                unknownPreTaskTargetBlockVisible:
+                  preTaskVisibility.targetBlockVisible,
+                unknownPreTaskWaterBlockVisible:
+                  preTaskVisibility.waterBlockVisible === true,
+                unknownPreTaskWallMaterialVisible:
+                  preTaskVisibility.wallMaterialVisible === true,
+              }),
+        });
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffFixturePreparedWhileStopped: true,
         });
