@@ -258,7 +258,10 @@ describe("restorable unknown-scenario obstacle", () => {
       reason: "not_eligible_before_snapshot",
     });
     expect(
-      rcon.commands.some((command) => command.startsWith("setblock ")),
+      rcon.commands.some(
+        (command) =>
+          command.startsWith("setblock ") || command.startsWith("fill "),
+      ),
     ).toBe(false);
   });
 
@@ -280,7 +283,10 @@ describe("restorable unknown-scenario obstacle", () => {
       reason: "not_eligible_before_mutation",
     });
     expect(
-      rcon.commands.some((command) => command.startsWith("setblock ")),
+      rcon.commands.some(
+        (command) =>
+          command.startsWith("setblock ") || command.startsWith("fill "),
+      ),
     ).toBe(false);
   });
 
