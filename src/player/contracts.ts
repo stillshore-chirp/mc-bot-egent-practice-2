@@ -27,6 +27,7 @@ export const playerThoughtCommitRejectionCodes = [
   "STOPPED",
   "NO_ACTIVE_OPERATION",
   "PROPOSAL_NOT_PENDING",
+  "GOAL_CAPACITY",
 ] as const;
 
 export type PlayerThoughtCommitRejectionCode =
@@ -49,6 +50,7 @@ export type PlayerThoughtStaleChangeComponent =
 
 export interface PlayerGoal {
   readonly id: string;
+  readonly ownerProposalId?: string | undefined;
   readonly title: string;
   readonly status: "active" | "paused" | "completed" | "abandoned";
   readonly priority: number;

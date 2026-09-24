@@ -490,14 +490,20 @@ function safeCommitRejectionCode(
   toolName: string,
   value: unknown,
 ): PlayerThoughtCommitRejectionCode | undefined {
-  if (toolName !== "commit_action_decision" || !isRecord(value))
-    return undefined;
+  if (!isRecord(value)) return undefined;
   if (value.ok !== false) return undefined;
+  if (toolName === "commit_goal_state")
+    return value.rejectionCode === "GOAL_CAPACITY" ||
+      value.code === "GOAL_CAPACITY"
+      ? "GOAL_CAPACITY"
+      : undefined;
+  if (toolName !== "commit_action_decision") return undefined;
   const code = value.rejectionCode;
   return code === "CAS_STALE" ||
     code === "STOPPED" ||
     code === "NO_ACTIVE_OPERATION" ||
-    code === "PROPOSAL_NOT_PENDING"
+    code === "PROPOSAL_NOT_PENDING" ||
+    code === "GOAL_CAPACITY"
     ? code
     : undefined;
 }

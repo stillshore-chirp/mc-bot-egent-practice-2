@@ -44,6 +44,7 @@ const purposeCompletionWakeSummary = "目的完了後の自律目的を再評価
 const goalSchema = z
   .object({
     id: z.string().min(1).max(80),
+    ownerProposalId: z.string().min(1).max(80).optional(),
     title: z.string().min(1).max(240),
     status: z.enum(["active", "paused", "completed", "abandoned"]),
     priority: z.number().int().min(1).max(5),
@@ -561,7 +562,24 @@ export class PlayerMindStore {
     };
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
-      const proposals = [...current.proposals, proposal].slice(-60);
+      const proposals = [...current.proposals];
+      if (proposals.length >= 60) {
+        const protectedProposalIds = new Set(
+          current.goals
+            .filter(
+              (goal) =>
+                goal.ownerProposalId !== undefined &&
+                (goal.status === "active" || goal.status === "paused"),
+            )
+            .map((goal) => goal.ownerProposalId),
+        );
+        const evictionIndex = proposals.findIndex(
+          (entry) => !protectedProposalIds.has(entry.id),
+        );
+        if (evictionIndex < 0) throw new Error("PLAYER_PROPOSAL_CAPACITY");
+        proposals.splice(evictionIndex, 1);
+      }
+      proposals.push(proposal);
       this.writeStored(
         { ...current, revision: current.revision + 1, proposals },
         now,
@@ -672,6 +690,7 @@ export class PlayerMindStore {
         };
       }
       let proposals = current.proposals;
+      let proposalBeingResolved: OwnerProposal | undefined;
       if (input.proposalResolution !== undefined) {
         const { proposalId, disposition, resolution } =
           input.proposalResolution;
@@ -684,6 +703,7 @@ export class PlayerMindStore {
             snapshot: this.snapshot(),
             rejectionCode: "PROPOSAL_NOT_PENDING",
           };
+        proposalBeingResolved = proposals[proposalIndex];
         proposals = proposals.map((entry, index) =>
           index === proposalIndex
             ? {
@@ -694,8 +714,20 @@ export class PlayerMindStore {
             : entry,
         );
       }
-      let goals = current.goals;
-      if (input.goal !== undefined) goals = mergeGoal(goals, input.goal, now);
+      const goalUpdate = applyGoalAndProposalResolution(
+        current.goals,
+        input.goal,
+        proposalBeingResolved,
+        input.proposalResolution,
+        now,
+      );
+      if (!goalUpdate.accepted)
+        return {
+          accepted: false,
+          snapshot: this.snapshot(),
+          rejectionCode: "GOAL_CAPACITY" as const,
+        };
+      const goals = goalUpdate.goals;
       const goalProgress =
         input.goal !== undefined &&
         goalChangeIsMeaningful(current.goals, input.goal);
@@ -842,7 +874,11 @@ export class PlayerMindStore {
     readonly expectedRevision: number;
     readonly goal?: PlayerGoalChange;
     readonly proposalResolution?: PlayerProposalResolution;
-  }): { readonly accepted: boolean; readonly snapshot: PlayerRuntimeSnapshot } {
+  }): {
+    readonly accepted: boolean;
+    readonly snapshot: PlayerRuntimeSnapshot;
+    readonly rejectionCode?: PlayerThoughtCommitRejectionCode | undefined;
+  } {
     const now = new Date().toISOString();
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
@@ -850,6 +886,7 @@ export class PlayerMindStore {
         return { accepted: false, snapshot: this.snapshot() };
       }
       let proposals = current.proposals;
+      let proposalBeingResolved: OwnerProposal | undefined;
       if (input.proposalResolution !== undefined) {
         const { proposalId, disposition, resolution } =
           input.proposalResolution;
@@ -858,6 +895,7 @@ export class PlayerMindStore {
         );
         if (proposalIndex < 0)
           return { accepted: false, snapshot: this.snapshot() };
+        proposalBeingResolved = proposals[proposalIndex];
         proposals = proposals.map((entry, index) =>
           index === proposalIndex
             ? {
@@ -872,13 +910,22 @@ export class PlayerMindStore {
         input.goal !== undefined &&
         goalChangeIsMeaningful(current.goals, input.goal);
       const proposalProgress = input.proposalResolution !== undefined;
-      const goals =
-        input.goal === undefined
-          ? current.goals
-          : mergeGoal(current.goals, input.goal, now);
       if (input.goal === undefined && input.proposalResolution === undefined) {
         return { accepted: false, snapshot: this.snapshot() };
       }
+      const goalUpdate = applyGoalAndProposalResolution(
+        current.goals,
+        input.goal,
+        proposalBeingResolved,
+        input.proposalResolution,
+        now,
+      );
+      if (!goalUpdate.accepted)
+        return {
+          accepted: false,
+          snapshot: this.snapshot(),
+          rejectionCode: "GOAL_CAPACITY" as const,
+        };
       this.writeStored(
         {
           ...current,
@@ -886,7 +933,7 @@ export class PlayerMindStore {
           purposeProgressRevision:
             current.purposeProgressRevision +
             (goalProgress || proposalProgress ? 1 : 0),
-          goals,
+          goals: goalUpdate.goals,
           proposals,
         },
         now,
@@ -1336,15 +1383,131 @@ export class PlayerMindStore {
   }
 }
 
+function applyGoalAndProposalResolution(
+  currentGoals: readonly PlayerGoal[],
+  goalChange: PlayerGoalChange | undefined,
+  proposal: OwnerProposal | undefined,
+  resolution: PlayerProposalResolution | undefined,
+  now: string,
+): { readonly accepted: boolean; readonly goals: PlayerGoal[] } {
+  let goals = [...currentGoals];
+  const goalById =
+    goalChange?.id === undefined
+      ? undefined
+      : currentGoals.find((goal) => goal.id === goalChange.id);
+  const mismatchedProposalLink =
+    proposal !== undefined &&
+    resolution?.disposition !== "declined" &&
+    goalById?.ownerProposalId !== undefined &&
+    goalById.ownerProposalId !== proposal.id;
+  const goalChangeForLink = mismatchedProposalLink ? undefined : goalChange;
+  const shouldLinkExplicitGoal =
+    proposal !== undefined &&
+    resolution !== undefined &&
+    resolution.disposition !== "declined" &&
+    goalChangeForLink?.source === "owner" &&
+    (currentGoals.some(
+      (goal) =>
+        goal.ownerProposalId === proposal.id &&
+        goalChangeForLink.id !== undefined &&
+        goal.id === goalChangeForLink.id,
+    ) ||
+      normalizeGoalTitle(goalChangeForLink.title) ===
+        normalizeGoalTitle(proposal.title));
+  if (goalChange !== undefined) {
+    const merged = mergeGoal(
+      goals,
+      goalChange,
+      now,
+      shouldLinkExplicitGoal ? proposal.id : undefined,
+    );
+    if (merged === undefined)
+      return { accepted: false, goals: [...currentGoals] };
+    goals = merged;
+  }
+  if (
+    proposal === undefined ||
+    resolution === undefined ||
+    resolution.disposition === "declined"
+  )
+    return { accepted: true, goals };
+
+  const proposalTitle = bounded(proposal.title, 240, "goal title");
+  const linkedGoal = goals.find((goal) => goal.ownerProposalId === proposal.id);
+  const explicitOwnerGoal =
+    goalChangeForLink?.source === "owner" &&
+    ((linkedGoal !== undefined &&
+      goalChangeForLink.id !== undefined &&
+      linkedGoal.id === goalChangeForLink.id) ||
+      normalizeGoalTitle(goalChangeForLink.title) ===
+        normalizeGoalTitle(proposalTitle));
+  const explicitlySelectedGoal =
+    goalChangeForLink?.id === undefined
+      ? undefined
+      : goals.find(
+          (goal) =>
+            goal.id === goalChangeForLink.id &&
+            goal.source === "owner" &&
+            (goal.ownerProposalId === undefined ||
+              goal.ownerProposalId === proposal.id),
+        );
+  const titleMatchedOwnerGoal = goals.find(
+    (goal) =>
+      goal.source === "owner" &&
+      (goal.ownerProposalId === undefined ||
+        goal.ownerProposalId === proposal.id) &&
+      normalizeGoalTitle(goal.title) === normalizeGoalTitle(proposalTitle),
+  );
+  const reusableGoal =
+    linkedGoal ??
+    (explicitOwnerGoal
+      ? (explicitlySelectedGoal ?? titleMatchedOwnerGoal)
+      : undefined) ??
+    titleMatchedOwnerGoal;
+  const change: PlayerGoalChange =
+    explicitOwnerGoal && reusableGoal !== undefined
+      ? { ...goalChangeForLink, id: reusableGoal.id, source: "owner" }
+      : {
+          ...(reusableGoal === undefined ? {} : { id: reusableGoal.id }),
+          title: proposalTitle,
+          status: "active",
+          priority: proposal.priorityPreference,
+          changeReason: proposal.reason,
+          source: "owner",
+        };
+  const merged = mergeGoal(goals, change, now, proposal.id);
+  if (merged === undefined)
+    return { accepted: false, goals: [...currentGoals] };
+  return { accepted: true, goals: merged };
+}
+
 function mergeGoal(
   goals: readonly PlayerGoal[],
   change: PlayerGoalChange,
   now: string,
-): PlayerGoal[] {
+  ownerProposalId?: string,
+): PlayerGoal[] | undefined {
   const title = bounded(change.title, 240, "goal title");
   const reason = bounded(change.changeReason, 400, "goal change reason");
   const priority = Math.max(1, Math.min(5, Math.round(change.priority)));
-  const existing = findGoalForChange(goals, change, title);
+  const existing =
+    ownerProposalId === undefined
+      ? findGoalForChange(goals, change, title)
+      : ((change.id === undefined
+          ? undefined
+          : goals.find(
+              (goal) =>
+                goal.id === change.id &&
+                (goal.ownerProposalId === undefined ||
+                  goal.ownerProposalId === ownerProposalId),
+            )) ??
+        goals.find((goal) => goal.ownerProposalId === ownerProposalId) ??
+        goals.find(
+          (goal) =>
+            goal.source === "owner" &&
+            goal.ownerProposalId === undefined &&
+            normalizeGoalTitle(goal.title) === normalizeGoalTitle(title),
+        ));
   if (existing !== undefined) {
     return goals.map((goal) =>
       goal.id === existing.id
@@ -1354,7 +1517,17 @@ function mergeGoal(
             status: change.status,
             priority,
             changeReason: reason,
-            source: change.source,
+            source:
+              ownerProposalId !== undefined ||
+              goal.ownerProposalId !== undefined
+                ? "owner"
+                : change.source,
+            ...(ownerProposalId === undefined &&
+            goal.ownerProposalId === undefined
+              ? {}
+              : {
+                  ownerProposalId: ownerProposalId ?? goal.ownerProposalId,
+                }),
             updatedAt: now,
           }
         : goal,
@@ -1365,6 +1538,7 @@ function mergeGoal(
       change.id === undefined
         ? randomUUID()
         : bounded(change.id, 80, "goal id"),
+    ...(ownerProposalId === undefined ? {} : { ownerProposalId }),
     title,
     status: change.status,
     priority,
@@ -1372,7 +1546,18 @@ function mergeGoal(
     source: change.source,
     updatedAt: now,
   };
-  return [...goals, goal].slice(-60);
+  const expanded = [...goals, goal];
+  if (expanded.length <= 60) return expanded;
+  const removableIndex = expanded.findIndex(
+    (candidate, index) =>
+      index < expanded.length - 1 &&
+      (candidate.ownerProposalId === undefined ||
+        candidate.status === "completed" ||
+        candidate.status === "abandoned"),
+  );
+  if (removableIndex < 0) return undefined;
+  expanded.splice(removableIndex, 1);
+  return expanded;
 }
 
 function goalChangeIsMeaningful(
