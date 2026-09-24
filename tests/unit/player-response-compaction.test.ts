@@ -39,6 +39,12 @@ describe("Responses server-side compaction", () => {
           arguments: "private argument sentinel",
           output: "private output sentinel",
         },
+        {
+          name: "commit_action_decision",
+          resultClass: "rejected",
+          resultCode: index === 69 ? "CAS_STALE" : "private-code-sentinel",
+          outputChars: 40,
+        },
       ],
     }));
 
@@ -51,8 +57,66 @@ describe("Responses server-side compaction", () => {
     expect(serialized).not.toContain("private prompt sentinel");
     expect(serialized).not.toContain("private argument sentinel");
     expect(serialized).not.toContain("private output sentinel");
+    expect(serialized).not.toContain("private-code-sentinel");
     expect(serialized).not.toContain("arguments");
     expect(serialized).not.toContain("prompt");
+    expect(projected.at(-1)?.toolCalls[1]).toMatchObject({
+      resultCode: "CAS_STALE",
+    });
+  });
+
+  it("records only allowlisted action rejection reasons", async () => {
+    const activities: unknown[] = [];
+    const tool = createPlayerTool({
+      name: "commit_action_decision",
+      description: "Test action commit.",
+      schema: z.object({ reason: z.enum(["known", "unknown"]) }).strict(),
+      execute: ({ reason }) =>
+        reason === "known"
+          ? { ok: false, code: "STALE_REVISION", rejectionCode: "CAS_STALE" }
+          : {
+              ok: false,
+              code: "private-code-sentinel",
+              rejectionCode: "private-code-sentinel",
+            },
+    });
+
+    await runPlayerAgent({
+      client: scriptedClient(
+        [
+          outputResponse([
+            {
+              type: "function_call",
+              call_id: "call-known",
+              name: "commit_action_decision",
+              arguments: JSON.stringify({ reason: "known" }),
+            },
+            {
+              type: "function_call",
+              call_id: "call-unknown",
+              name: "commit_action_decision",
+              arguments: JSON.stringify({ reason: "unknown" }),
+            },
+          ]),
+          terminalResponse("Done."),
+        ],
+        [],
+      ),
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Input.",
+      tools: [tool],
+      logger: silentLogger(),
+      onRoundActivity: (activity) => activities.push(activity),
+    });
+
+    expect(activities[0]).toMatchObject({
+      toolCalls: [
+        { resultClass: "rejected", resultCode: "CAS_STALE" },
+        { resultClass: "rejected" },
+      ],
+    });
+    expect(JSON.stringify(activities)).not.toContain("private-code-sentinel");
   });
 
   it("marks a budget abort after response receipt without inventing tool results", async () => {

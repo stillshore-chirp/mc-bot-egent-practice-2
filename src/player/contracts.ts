@@ -22,6 +22,16 @@ export type PlayerWakeKind =
   | "deadline"
   | "manual";
 
+export const playerThoughtCommitRejectionCodes = [
+  "CAS_STALE",
+  "STOPPED",
+  "NO_ACTIVE_OPERATION",
+  "PROPOSAL_NOT_PENDING",
+] as const;
+
+export type PlayerThoughtCommitRejectionCode =
+  (typeof playerThoughtCommitRejectionCodes)[number];
+
 export interface PlayerGoal {
   readonly id: string;
   readonly title: string;

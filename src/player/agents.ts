@@ -797,11 +797,17 @@ export class PlayerPurposeAgent {
             ...(proposalResolution === undefined ? {} : { proposalResolution }),
             ...(understanding === undefined ? {} : { understanding }),
           });
-          if (!saved.accepted)
+          if (!saved.accepted) {
+            const { rejectionCode } = saved;
             return {
               ok: false,
-              code: saved.snapshot.stopped ? "STOPPED" : "STALE_REVISION",
+              code:
+                rejectionCode === "CAS_STALE"
+                  ? "STALE_REVISION"
+                  : rejectionCode,
+              rejectionCode,
             };
+          }
           committedDecision = decision;
           this.options.onCommitted(saved.snapshot, decision);
           let goalMemoryPersisted: boolean | undefined;

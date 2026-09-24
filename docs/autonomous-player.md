@@ -21,9 +21,9 @@
 
 目的エージェントには28種類のoperation kindと短い説明を提示し、参照済みの現行schemaは直近4種・合計4,096文字以内で再提示します。未提示または引数が不明なschemaは必要時に `describe_operation` で取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証されます。
 
-行動判断時のgoal変更、owner proposal解決、fact/uncertainty更新は、必要なものを`commit_action_decision.stateUpdates`へ含めると同じrevision CAS transactionで確定します。更新なしは`null`で表し、`commit_goal_state`と`update_understanding`も判断途中の単独更新用に残しています。`continue`と状態更新を同時に確定しても、進行中body操作の`actionRevision`は変わりません。goal mirrorの外部記憶保存に失敗した場合もMindStoreのcommitとaction dispatchは維持し、tool結果の`goalMemoryPersisted: false`で区別します。run11以降の実ゲームでの成功やAPI呼び出し・token削減効果は未測定です。
+行動判断時のgoal変更、owner proposal解決、fact/uncertainty更新は、必要なものを`commit_action_decision.stateUpdates`へ含めると同じrevision CAS transactionで確定します。更新なしは`null`で表し、`commit_goal_state`と`update_understanding`も判断途中の単独更新用に残しています。`continue`と状態更新を同時に確定しても、進行中body操作の`actionRevision`は変わりません。goal mirrorの外部記憶保存に失敗した場合もMindStoreのcommitとaction dispatchは維持し、tool結果の`goalMemoryPersisted: false`で区別します。run13までの統合試験では自律生活の完了に至っておらず、各修正によるAPI呼び出し・token削減効果も比較条件を揃えて検証していません。
 
-目的エージェントは `commit_action_decision` の永続commitが成功した時点で判断を完了し、余分な最終LLM roundを要求しません。行動commitが `STALE_REVISION` または `STOPPED` で拒否された場合も同じthought内の再試行はせず終了し、次回の判断へ渡します。未commitのthoughtでは受領eventを消費せず、commit後にだけ消費します。入力修正可能な操作エラーは同じthought内で修正できます。会話エージェントは返答文を必要とするため、tool後の最終応答を引き続き取得します。
+目的エージェントは `commit_action_decision` の永続commitが成功した時点で判断を完了し、余分な最終LLM roundを要求しません。CAS不一致はtool code `STALE_REVISION` と理由 `CAS_STALE`、停止は `STOPPED` で同じthought内の再試行を終え、次回の判断へ渡します。進行中操作がない`continue`とpendingでないproposalはそれぞれ `NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` として返し、同じthought内で修正できます。未commitのthoughtでは受領eventを消費せず、commit後にだけ消費します。会話エージェントは返答文を必要とするため、tool後の最終応答を引き続き取得します。
 
 長いResponses tool loopではserver-side compactionを有効にし、各requestのrendered inputが16,000 tokenの閾値を超える時にcontextを圧縮します。この閾値は一requestのcontext用で、run全体の累積usage budgetとは別です。`store:false` を保ち、返されたopaque compaction itemは次requestへ引き継ぎます。tool処理済み境界で最新compactionより前をpruneし、call/outputが境界をまたぐ時は対になるcallまで保持します。system instructionsとtoolsは各requestに維持します。MindStoreの目的・停止・CAS stateは永続runtimeで管理し、圧縮結果で上書きしません。
 
@@ -43,4 +43,4 @@ body eventを種類ごとにまとめ、意味のあるvitals、inventory、enti
 
 Markdown import/exportは専用の `mc-skills` exchange directoryを使います。importした本文は未信頼の知識で、system指示、認可、停止境界を変更しません。export結果はownerへローカルのファイル位置を返します。
 
-`collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。Responsesの直近64 roundはrole、プロセス内の連番とround、token/latency、入力/schema/outputの文字数、allowlist済みtool名と固定結果分類だけをMindStoreへ保存します。中断roundはモデルが要求したtool数と実際に結果を得たtoolだけを区別します。E2E failure artifactにも同じ安全projectionを使います。reasoning本文、prompt、tool引数/出力、tool call ID等の生成識別子、owner位置の例外座標は保存・公開しません。
+`collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。Responsesの直近64 roundはrole、プロセス内の連番とround、token/latency、入力/schema/outputの文字数、allowlist済みtool名・固定結果分類とaction commitの固定拒否理由enumだけをMindStoreへ保存します。拒否理由は `CAS_STALE`、`STOPPED`、`NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` に限り、任意tool codeは記録しません。中断roundはモデルが要求したtool数と実際に結果を得たtoolだけを区別します。E2E failure artifactにも同じ安全projectionを使います。reasoning本文、prompt、tool引数/出力、tool call ID等の生成識別子、owner位置の例外座標は保存・公開しません。

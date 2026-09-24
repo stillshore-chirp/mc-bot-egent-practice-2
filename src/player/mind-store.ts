@@ -21,6 +21,10 @@ import type {
   PlayerThoughtDecision,
   PlayerWakeKind,
 } from "./contracts.js";
+import {
+  playerThoughtCommitRejectionCodes,
+  type PlayerThoughtCommitRejectionCode,
+} from "./contracts.js";
 
 const wakeKinds = [
   "startup",
@@ -152,6 +156,7 @@ const agentActivitySchema = z
           .object({
             name: z.union([z.enum(playerAgentToolNames), z.literal("unknown")]),
             resultClass: z.enum(["ok", "rejected", "error", "unknown"]),
+            resultCode: z.enum(playerThoughtCommitRejectionCodes).optional(),
             outputChars: z.number().int().nonnegative(),
           })
           .strict(),
@@ -280,6 +285,14 @@ const stateSchema = z
   .strict();
 
 type StoredState = z.infer<typeof stateSchema>;
+
+type CommitThoughtResult =
+  | { readonly accepted: true; readonly snapshot: PlayerRuntimeSnapshot }
+  | {
+      readonly accepted: false;
+      readonly snapshot: PlayerRuntimeSnapshot;
+      readonly rejectionCode: PlayerThoughtCommitRejectionCode;
+    };
 
 interface PlayerUnderstandingUpdate {
   readonly facts: readonly {
@@ -586,18 +599,33 @@ export class PlayerMindStore {
     goal?: PlayerGoalChange;
     proposalResolution?: PlayerProposalResolution;
     understanding?: PlayerUnderstandingUpdate;
-  }): { readonly accepted: boolean; readonly snapshot: PlayerRuntimeSnapshot } {
+  }): CommitThoughtResult {
     const now = new Date().toISOString();
-    const transaction = this.database.transaction(() => {
+    const transaction = this.database.transaction((): CommitThoughtResult => {
       const current = this.readStored();
-      if (current.revision !== input.expectedRevision || current.stopped) {
-        return { accepted: false, snapshot: this.snapshot() };
+      if (current.stopped) {
+        return {
+          accepted: false,
+          snapshot: this.snapshot(),
+          rejectionCode: "STOPPED",
+        };
+      }
+      if (current.revision !== input.expectedRevision) {
+        return {
+          accepted: false,
+          snapshot: this.snapshot(),
+          rejectionCode: "CAS_STALE",
+        };
       }
       if (
         input.decision.kind === "continue" &&
         current.activeOperation === undefined
       ) {
-        return { accepted: false, snapshot: this.snapshot() };
+        return {
+          accepted: false,
+          snapshot: this.snapshot(),
+          rejectionCode: "NO_ACTIVE_OPERATION",
+        };
       }
       let proposals = current.proposals;
       if (input.proposalResolution !== undefined) {
@@ -607,7 +635,11 @@ export class PlayerMindStore {
           (entry) => entry.id === proposalId && entry.status === "pending",
         );
         if (proposalIndex < 0)
-          return { accepted: false, snapshot: this.snapshot() };
+          return {
+            accepted: false,
+            snapshot: this.snapshot(),
+            rejectionCode: "PROPOSAL_NOT_PENDING",
+          };
         proposals = proposals.map((entry, index) =>
           index === proposalIndex
             ? {

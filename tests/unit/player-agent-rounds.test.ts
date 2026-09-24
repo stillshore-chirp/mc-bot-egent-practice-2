@@ -188,7 +188,11 @@ describe("player agent response rounds", () => {
           },
         }),
       ),
-      terminalResponse("The proposal could not be committed."),
+      functionCallResponse(
+        "repaired-action-after-proposal-rejection",
+        "commit_action_decision",
+        actionArguments(),
+      ),
     ]);
     const proposal = fixture.mind.addProposal({
       title: "Existing proposal",
@@ -201,7 +205,11 @@ describe("player agent response rounds", () => {
         snapshot: before,
         events: [],
       });
-      expect(result.accepted).toBe(false);
+      expect(result.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(2);
+      expect(JSON.stringify(fixture.requests[1])).toContain(
+        "PROPOSAL_NOT_PENDING",
+      );
       expect(fixture.mind.snapshot().goals).toEqual(before.goals);
       expect(fixture.mind.snapshot().proposals).toEqual(before.proposals);
       expect(fixture.mind.snapshot().stateFacts).toEqual(before.stateFacts);
@@ -211,6 +219,13 @@ describe("player agent response rounds", () => {
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({ id: proposal.id, status: "pending" }),
       );
+      expect(
+        fixture.mind.snapshot().recentAgentActivity[0]?.toolCalls[0],
+      ).toMatchObject({
+        name: "commit_action_decision",
+        resultClass: "rejected",
+        resultCode: "PROPOSAL_NOT_PENDING",
+      });
     } finally {
       fixture.close();
     }
@@ -349,6 +364,9 @@ describe("player agent response rounds", () => {
       expect(fixture.mind.pendingEvents()).toContainEqual(
         expect.objectContaining({ id: event.id }),
       );
+      expect(
+        fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
+      ).toMatchObject({ resultCode: "CAS_STALE" });
     } finally {
       fixture.close();
     }
@@ -393,6 +411,39 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("keeps a continue-without-active-operation rejection repairable", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "continue-without-operation",
+        "commit_action_decision",
+        { ...actionArguments(), kind: "continue", operationJson: "" },
+      ),
+      functionCallResponse(
+        "repaired-action",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+    ]);
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(2);
+      expect(JSON.stringify(fixture.requests[1])).toContain(
+        "NO_ACTIVE_OPERATION",
+      );
+      expect(
+        fixture.mind.snapshot().recentAgentActivity[0]?.toolCalls[0],
+      ).toMatchObject({ resultCode: "NO_ACTIVE_OPERATION" });
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("finishes on a stopped action CAS and preserves its uncommitted wake event", async () => {
     const mindRef: { current?: PlayerMindStore } = {};
     const fixture = openPurposeFixture([
@@ -424,6 +475,9 @@ describe("player agent response rounds", () => {
       expect(fixture.mind.pendingEvents()).toContainEqual(
         expect.objectContaining({ id: event.id }),
       );
+      expect(
+        fixture.mind.snapshot().recentAgentActivity[0]?.toolCalls[0],
+      ).toMatchObject({ resultCode: "STOPPED" });
     } finally {
       fixture.close();
     }
@@ -558,6 +612,7 @@ function openPurposeFixture(
     memory,
     ownerPlayerId: "owner-player",
     logger: pino({ level: "silent" }),
+    onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     onCommitted,
   });
   return {

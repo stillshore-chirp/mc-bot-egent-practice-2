@@ -11,6 +11,7 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import type { TraceService } from "../trace/service.js";
+import type { PlayerThoughtCommitRejectionCode } from "./contracts.js";
 
 export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 
@@ -48,6 +49,7 @@ export type PlayerAgentToolName =
 export interface PlayerAgentToolRoundActivity {
   readonly name: PlayerAgentToolName;
   readonly resultClass: PlayerAgentToolResultClass;
+  readonly resultCode?: PlayerThoughtCommitRejectionCode | undefined;
   readonly outputChars: number;
 }
 
@@ -376,6 +378,7 @@ export async function runPlayerAgent(
       const tool = byName.get(call.name);
       let result: unknown;
       let resultClass: PlayerAgentToolResultClass;
+      let resultCode: PlayerThoughtCommitRejectionCode | undefined;
       if (tool === undefined) {
         result = { ok: false, code: "UNKNOWN_TOOL" };
         resultClass = "unknown";
@@ -384,6 +387,7 @@ export async function runPlayerAgent(
           const parsed: unknown = JSON.parse(call.arguments);
           result = await tool.execute(parsed);
           resultClass = classifyToolResult(result);
+          resultCode = safeCommitRejectionCode(call.name, result);
         } catch (error) {
           result = { ok: false, code: safeErrorCode(error) };
           resultClass = "error";
@@ -393,6 +397,7 @@ export async function runPlayerAgent(
         activityToolCalls.push({
           name: safeToolName(call.name),
           resultClass,
+          ...(resultCode === undefined ? {} : { resultCode }),
           outputChars: boundedJson(result).length,
         });
       }
@@ -465,6 +470,22 @@ function classifyToolResult(value: unknown): PlayerAgentToolResultClass {
   return "unknown";
 }
 
+function safeCommitRejectionCode(
+  toolName: string,
+  value: unknown,
+): PlayerThoughtCommitRejectionCode | undefined {
+  if (toolName !== "commit_action_decision" || !isRecord(value))
+    return undefined;
+  if (value.ok !== false) return undefined;
+  const code = value.rejectionCode;
+  return code === "CAS_STALE" ||
+    code === "STOPPED" ||
+    code === "NO_ACTIVE_OPERATION" ||
+    code === "PROPOSAL_NOT_PENDING"
+    ? code
+    : undefined;
+}
+
 function safeSerializedLength(value: unknown): number {
   try {
     const serialized = JSON.stringify(value);
@@ -514,13 +535,23 @@ export function projectSafePlayerAgentActivityTail(
           .flatMap((tool): PlayerAgentToolRoundActivity[] => {
             if (!isRecord(tool) || !isSafeNonnegativeInteger(tool.outputChars))
               return [];
+            const name =
+              typeof tool.name === "string"
+                ? safeToolName(tool.name)
+                : "unknown";
+            const resultClass = safeToolResultClass(tool.resultClass);
+            const resultCode =
+              resultClass === "rejected"
+                ? safeCommitRejectionCode(name, {
+                    ok: false,
+                    rejectionCode: tool.resultCode,
+                  })
+                : undefined;
             return [
               {
-                name:
-                  typeof tool.name === "string"
-                    ? safeToolName(tool.name)
-                    : "unknown",
-                resultClass: safeToolResultClass(tool.resultClass),
+                name,
+                resultClass,
+                ...(resultCode === undefined ? {} : { resultCode }),
                 outputChars: safeNonnegativeInteger(tool.outputChars),
               },
             ];

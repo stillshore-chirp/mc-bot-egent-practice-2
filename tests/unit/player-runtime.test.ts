@@ -66,6 +66,62 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("returns fixed reasons for each atomic thought rejection", () => {
+    const directory = temporaryDirectory();
+    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    try {
+      const initial = mind.snapshot();
+      const stale = mind.commitThought({
+        expectedRevision: initial.revision - 1,
+        decision: action("stale-reason"),
+      });
+      expect(stale).toMatchObject({
+        accepted: false,
+        rejectionCode: "CAS_STALE",
+      });
+
+      const noActiveOperation = mind.commitThought({
+        expectedRevision: initial.revision,
+        decision: { kind: "continue", reason: "continue current work" },
+      });
+      expect(noActiveOperation).toMatchObject({
+        accepted: false,
+        rejectionCode: "NO_ACTIVE_OPERATION",
+      });
+
+      const proposal = mind.addProposal({
+        title: "A test proposal",
+        reason: "Used to check atomic resolution validation.",
+      });
+      const invalidProposal = mind.commitThought({
+        expectedRevision: mind.snapshot().revision,
+        decision: action("proposal-reason"),
+        proposalResolution: {
+          proposalId: `${proposal.id}-missing`,
+          disposition: "adopted",
+          resolution: "This proposal is not pending.",
+        },
+      });
+      expect(invalidProposal).toMatchObject({
+        accepted: false,
+        rejectionCode: "PROPOSAL_NOT_PENDING",
+      });
+
+      const stopped = mind.stop();
+      if (stopped === undefined) throw new Error("stop latch was not set");
+      const stoppedCommit = mind.commitThought({
+        expectedRevision: stopped.revision,
+        decision: action("stopped-reason"),
+      });
+      expect(stoppedCommit).toMatchObject({
+        accepted: false,
+        rejectionCode: "STOPPED",
+      });
+    } finally {
+      mind.close();
+    }
+  });
+
   it("keeps conversation independent and settles a body action before replacing it", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
