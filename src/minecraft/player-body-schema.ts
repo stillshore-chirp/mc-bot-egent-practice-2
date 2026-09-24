@@ -2,9 +2,9 @@ import { z } from "zod";
 
 const vectorSchema = z
   .object({
-    x: z.number().finite(),
-    y: z.number().finite(),
-    z: z.number().finite(),
+    x: z.number(),
+    y: z.number(),
+    z: z.number(),
   })
   .strict();
 
@@ -109,7 +109,7 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
     .object({
       kind: z.literal("move_to"),
       position: vectorSchema,
-      range: z.number().finite().min(0.25).max(8).default(1),
+      range: z.number().min(0.25).max(8).default(1),
     })
     .strict(),
   z.object({ kind: z.literal("look"), target: vectorSchema }).strict(),
@@ -224,8 +224,8 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("move_vehicle"),
-      left: z.number().finite().min(-1).max(1),
-      forward: z.number().finite().min(-1).max(1),
+      left: z.number().min(-1).max(1),
+      forward: z.number().min(-1).max(1),
       ticks: z.number().int().min(1).max(100),
     })
     .strict(),

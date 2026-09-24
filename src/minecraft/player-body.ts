@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import type { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import type { Bot, BotEvents } from "mineflayer";
 import type { Block } from "prismarine-block";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
-import prismarineItem from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
@@ -13,6 +14,7 @@ import {
   type PlayerOperationName,
 } from "./player-body-schema.js";
 import {
+  entityEyeHeight,
   observePlayerBody,
   type PlayerBodyObservation,
   type PlayerBodyObservationOptions,
@@ -55,6 +57,38 @@ const interactRange = 4.5;
 const attackRange = 3.2;
 const stallCheckMs = 5_000;
 const stallAfterMs = 20_000;
+interface LoadedPrismarineItem {
+  toNotch(item: Item | null): unknown;
+}
+
+type PrismarineItemLoader = (registry: Bot["registry"]) => LoadedPrismarineItem;
+
+const prismarineItemModule: unknown = createRequire(import.meta.url)(
+  "prismarine-item",
+);
+if (typeof prismarineItemModule !== "function")
+  throw new Error("The prismarine-item loader is unavailable");
+const loadPrismarineItem = prismarineItemModule as PrismarineItemLoader;
+
+function slotUpdateEvents(window: Window): EventEmitter {
+  return window;
+}
+
+function activeWindow(bot: Bot): Window {
+  return bot.currentWindow ?? bot.inventory;
+}
+
+function selectedItem(window: Window): Item | null {
+  return window.selectedItem;
+}
+
+function heldItemOrNull(bot: Bot): Item | null {
+  return bot.heldItem;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError(signal);
+}
 
 export type PlayerOperationStatus =
   "successful" | "failed" | "interrupted" | "unverified";
@@ -272,7 +306,14 @@ function waitForAction<T>(action: Promise<T>, signal: AbortSignal): Promise<T> {
     signal.addEventListener("abort", onAbort, { once: true });
     action.then(
       (value) => finish(() => resolve(value)),
-      (error: unknown) => finish(() => reject(error)),
+      (error: unknown) =>
+        finish(() =>
+          reject(
+            error instanceof Error
+              ? error
+              : new Error("Mineflayer action rejected"),
+          ),
+        ),
     );
   });
 }
@@ -410,12 +451,10 @@ function countWindowItem(
 ): number {
   const window = observation?.window;
   if (window === null || window === undefined) return 0;
-  return (
-    window.slots
-      .slice(0, window.inventoryStart)
-      .filter((item) => item?.name === itemName)
-      .reduce((total, item) => total + (item?.count ?? 0), 0) ?? 0
-  );
+  return window.slots
+    .slice(0, window.inventoryStart)
+    .filter((item) => item !== null && item.name === itemName)
+    .reduce((total, item) => total + item.count, 0);
 }
 
 function countWindowItemInPlayerInventory(
@@ -471,12 +510,12 @@ function captureAttackEvidence(
 ): (() => void) | undefined {
   if (operation.kind !== "attack") return undefined;
   const targetId = operation.entityId;
-  const onEntityHurt = (target: Entity, source: Entity): void => {
-    if (target?.id === targetId && source?.id === bot.entity?.id)
+  const onEntityHurt = (target: Entity, source: Entity | undefined): void => {
+    if (target.id === targetId && source?.id === bot.entity.id)
       active.targetHitObserved = true;
   };
   const onEntityDead = (target: Entity): void => {
-    if (target?.id === targetId && active.targetHitObserved === true)
+    if (target.id === targetId && active.targetHitObserved === true)
       active.targetDiedObserved = true;
   };
   bot.on("entityHurt", onEntityHurt);
@@ -548,8 +587,6 @@ function operationEvidence(
       return (
         after.self.equipment[operation.destination]?.name === operation.item
       );
-    case "attack":
-      return false;
     case "dig": {
       const update = serverBlockUpdates.get(blockKey(operation.position));
       const observed = bot.blockAt(blockPosition(operation.position));
@@ -571,8 +608,7 @@ function operationEvidence(
         observed?.stateId === update.stateId &&
         !["air", "cave_air", "void_air"].includes(update.name) &&
         update.name !== "unknown" &&
-        expectedBlock !== undefined &&
-        update.name === expectedBlock.name
+        expectedBlock?.name === update.name
       );
     }
     case "craft":
@@ -581,10 +617,7 @@ function operationEvidence(
         countNamedItem(before, operation.item) + operation.count
       );
     case "open_window":
-      return (
-        after.window !== null &&
-        (before.window === null || before.window.id !== after.window.id)
-      );
+      return after.window !== null && before.window?.id !== after.window.id;
     case "window_click": {
       const beforeSlot = before.window?.slots[operation.slot] ?? null;
       const afterSlot = after.window?.slots[operation.slot] ?? null;
@@ -722,7 +755,9 @@ function operationEvidence(
           (item.durability !== null &&
             oldStacks.some(
               (old) =>
-                old.durability !== null && item.durability > old.durability,
+                old.durability !== null &&
+                item.durability !== null &&
+                item.durability > old.durability,
             )) ||
           item.enchantments.some(
             (enchantment) =>
@@ -748,8 +783,7 @@ function operationEvidence(
           update.stateId !== oldBlock.stateId &&
           observed?.stateId === update.stateId;
         const openedWindow =
-          after.window !== null &&
-          (before.window === null || before.window.id !== after.window.id);
+          after.window !== null && before.window?.id !== after.window.id;
         return blockChanged || openedWindow;
       }
       if (operation.target.kind === "item") {
@@ -900,7 +934,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   private admission: Promise<void> = Promise.resolve();
   private readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   private boundBot: Bot | undefined;
-  private readonly botHandlers: Array<() => void> = [];
+  private readonly botHandlers: (() => void)[] = [];
   private readonly windowUpdateHandlers = new Map<Window, () => void>();
   private readonly stateTimers = new Map<
     string,
@@ -989,8 +1023,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         signal.addEventListener("abort", abort, { once: true });
         active = this.makeActive(operation, bot, controller, abort);
       }
-      if (active === undefined)
-        active = this.makeActive(operation, bot, controller);
+      active ??= this.makeActive(operation, bot, controller);
       this.active = active;
       this.emit({
         type: "operation_started",
@@ -1003,8 +1036,6 @@ export class MineflayerPlayerBody implements PlayerBody {
       resolveAdmission();
     }
 
-    if (active === undefined)
-      throw new Error("Player operation admission failed");
     const result = await active.done;
     if (signal !== undefined && active.externalAbort !== undefined)
       signal.removeEventListener("abort", active.externalAbort);
@@ -1137,7 +1168,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           }
         : undefined;
     let status: PlayerOperationStatus;
-    let detail: string | undefined;
+    let detail: string;
     if (confirmed) {
       status = "successful";
       detail =
@@ -1175,7 +1206,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       after,
       recoveryRequired,
       ...(observedEffect === undefined ? {} : { observedEffect }),
-      ...(detail === undefined ? {} : { detail }),
+      detail,
     };
     if (recoveryRequired) {
       this.emit({
@@ -1183,7 +1214,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         at: completedAt,
         operationId: active.id,
         operation: operation.kind,
-        detail: detail ?? "Reconnect before issuing another action.",
+        detail,
       });
     }
     active.runFinished = true;
@@ -1198,7 +1229,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         at: completedAt,
         operationId: active.id,
         operation: operation.kind,
-        detail: detail ?? "Operation failed",
+        detail,
       });
     } else {
       this.emit({
@@ -1361,7 +1392,9 @@ export class MineflayerPlayerBody implements PlayerBody {
         if (operation.target.kind === "item") {
           const hand = operation.target.offHand ? "off-hand" : "hand";
           const slot = bot.getEquipmentDestSlot(hand);
-          active.effectItemName = bot.inventory.slots[slot]?.name;
+          const item = bot.inventory.slots[slot];
+          if (item !== null && item !== undefined)
+            active.effectItemName = item.name;
           bot.activateItem(operation.target.offHand);
           await waitTicks(4, signal);
           return;
@@ -1376,7 +1409,8 @@ export class MineflayerPlayerBody implements PlayerBody {
           operation.target.entityId,
           interactRange,
         );
-        active.effectItemName = bot.heldItem?.name;
+        const heldItem = heldItemOrNull(bot);
+        if (heldItem !== null) active.effectItemName = heldItem.name;
         await activateEntityCancellable(bot, entity, signal);
         return;
       }
@@ -1469,11 +1503,12 @@ export class MineflayerPlayerBody implements PlayerBody {
             `No recipe for ${operation.item} can be made from current inventory and available crafting surface`,
           );
         const repetitions = Math.ceil(operation.count / recipe.result.count);
-        await bot.craft(
-          recipe,
-          repetitions,
-          recipe.requiresTable ? craftingTable : null,
-        );
+        const craftingSurface = recipe.requiresTable
+          ? craftingTable
+          : undefined;
+        if (craftingSurface === null)
+          throw new Error("This recipe requires a reachable crafting table");
+        await bot.craft(recipe, repetitions, craftingSurface);
         return;
       }
       case "open_window": {
@@ -1525,7 +1560,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         const sourceItem = window.slots
           .slice(sourceStart, sourceEnd)
           .find((item) => item?.type === registryItem.id);
-        if (sourceItem === undefined)
+        if (sourceItem == null)
           throw new Error(
             `${operation.item} is absent from the selected transfer source`,
           );
@@ -1678,9 +1713,9 @@ export class MineflayerPlayerBody implements PlayerBody {
         const item = findInventoryItem(bot, operation.item);
         const lapis = findInventoryItem(bot, operation.lapisItem);
         await table.putTargetItem(item);
-        if (signal.aborted) throw abortError(signal);
+        throwIfAborted(signal);
         await table.putLapis(lapis);
-        if (signal.aborted) throw abortError(signal);
+        throwIfAborted(signal);
         await table.enchant(operation.choice);
         return;
       }
@@ -1694,7 +1729,10 @@ export class MineflayerPlayerBody implements PlayerBody {
         if (operation.operation === "rename")
           await anvil.rename(item, operation.name);
         else {
-          const second = findInventoryItem(bot, operation.secondItem as string);
+          const secondItem = operation.secondItem;
+          if (secondItem === undefined)
+            throw new Error("Combining items requires a second inventory item");
+          const second = findInventoryItem(bot, secondItem);
           await anvil.combine(item, second, operation.name);
         }
         return;
@@ -1716,9 +1754,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
     for (const detach of this.botHandlers.splice(0)) detach();
-    for (const [window, detach] of this.windowUpdateHandlers) {
-      window.removeListener("updateSlot", detach);
-    }
+    for (const detach of this.windowUpdateHandlers.values()) detach();
     this.windowUpdateHandlers.clear();
     for (const timer of this.stateTimers.values()) clearTimeout(timer);
     this.stateTimers.clear();
@@ -1751,15 +1787,18 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("windowOpen", (window: Window) => {
       this.scheduleStateEvent("window");
       const onWindowUpdate = (): void => this.scheduleStateEvent("window");
-      window.on("updateSlot", onWindowUpdate);
-      this.windowUpdateHandlers.set(window, onWindowUpdate);
+      const events = slotUpdateEvents(window);
+      events.on("updateSlot", onWindowUpdate);
+      this.windowUpdateHandlers.set(window, () =>
+        events.removeListener("updateSlot", onWindowUpdate),
+      );
     });
     listen("windowClose", (window: Window | null) => {
       this.scheduleStateEvent("window");
       if (window === null) return;
-      const handler = this.windowUpdateHandlers.get(window);
-      if (handler === undefined) return;
-      window.removeListener("updateSlot", handler);
+      const detach = this.windowUpdateHandlers.get(window);
+      if (detach === undefined) return;
+      detach();
       this.windowUpdateHandlers.delete(window);
     });
     listen("blockUpdate", state("blocks"));
@@ -1872,7 +1911,7 @@ function requireReachableBlock(
   if (block === null)
     throw new Error("Target block is outside loaded world data");
   const target = block.position.offset(0.5, 0.5, 0.5);
-  const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0);
+  const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
   if (eye.distanceTo(target) > interactRange + 0.15)
     throw new Error("Target block is outside normal player reach");
   if (!bot.canSeeBlock(block)) throw new Error("Target block is occluded");
@@ -1896,7 +1935,7 @@ function requireVisibleEntity(
     (candidate) => candidate.id === entityId,
   );
   if (!visible) throw new Error(`Entity ${entityId} is not currently visible`);
-  const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0);
+  const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
   const target = entity.position.offset(
     0,
     Math.max(0.1, entity.height * 0.55),
@@ -2054,16 +2093,16 @@ async function activateBlockCancellable(
     bot.lookAt(block.position.offset(0.5, 0.5, 0.5), false),
     signal,
   );
-  if (signal.aborted) throw abortError(signal);
+  throwIfAborted(signal);
   const client = bot._client as unknown as PacketClient;
   const directionNumber = 1;
   const cursor = new Vec3(0.5, 0.5, 0.5);
   if (bot.supportFeature("blockPlaceHasHeldItem")) {
-    const Item = prismarineItem(bot.registry);
+    const Item = loadPrismarineItem(bot.registry);
     client.write("block_place", {
       location: block.position,
       direction: directionNumber,
-      heldItem: Item.toNotch(bot.heldItem),
+      heldItem: Item.toNotch(heldItemOrNull(bot)),
       cursorX: cursor.x * 16,
       cursorY: cursor.y * 16,
       cursorZ: cursor.z * 16,
@@ -2103,7 +2142,7 @@ async function activateBlockCancellable(
       "This Minecraft protocol has no supported block-use packet",
     );
   }
-  bot.swingArm();
+  bot.swingArm("right");
 }
 
 async function activateEntityCancellable(
@@ -2115,7 +2154,7 @@ async function activateEntityCancellable(
     bot.lookAt(entity.position.offset(0, 1, 0), false),
     signal,
   );
-  if (signal.aborted) throw abortError(signal);
+  throwIfAborted(signal);
   const client = bot._client as unknown as PacketClient;
   client.write("use_entity", {
     target: entity.id,
@@ -2137,7 +2176,7 @@ async function placeBlockCancellable(
     0.5 + face.z * 0.5,
   );
   await waitForAction(bot.lookAt(point, true), signal);
-  if (signal.aborted) throw abortError(signal);
+  throwIfAborted(signal);
   const internal = bot as Bot & {
     _genericPlace?: (
       block: Block,
@@ -2167,7 +2206,12 @@ function openWindowCancellable(
       finished = true;
       bot.removeListener("windowOpen", onOpen);
       signal.removeEventListener("abort", onAbort);
-      if (error !== undefined) reject(error);
+      if (error !== undefined)
+        reject(
+          error instanceof Error
+            ? error
+            : new Error("Mineflayer window activation failed"),
+        );
       else if (window !== undefined) resolve(window);
       else reject(new Error("Window opened without a Mineflayer window"));
     };
@@ -2206,7 +2250,7 @@ async function transferByClicks(
   destinationEnd: number,
   signal: AbortSignal,
 ): Promise<void> {
-  if (window.selectedItem !== null)
+  if (selectedItem(window) !== null)
     throw new Error(
       "Close or empty the carried cursor item before transferring",
     );
@@ -2214,7 +2258,7 @@ async function transferByClicks(
   let lastSourceSlot: number | undefined;
   while (remaining > 0) {
     if (signal.aborted) throw abortError(signal);
-    let held = window.selectedItem;
+    let held = selectedItem(window);
     if (held?.type !== itemType || held.metadata !== metadata) {
       const source = window.findItemRange(
         sourceStart,
@@ -2230,9 +2274,9 @@ async function transferByClicks(
         );
       lastSourceSlot = source.slot;
       await clickWindowCancellable(bot, source.slot, 0, 0, signal);
-      held = window.selectedItem;
+      held = selectedItem(window);
     }
-    if (held === null || held.type !== itemType || held.metadata !== metadata)
+    if (held?.type !== itemType || held.metadata !== metadata)
       throw new Error("The server did not select the requested transfer item");
     const destination = window.findItemRange(
       destinationStart,
@@ -2260,7 +2304,7 @@ async function transferByClicks(
       remaining -= 1;
     }
   }
-  if (window.selectedItem !== null && lastSourceSlot !== undefined)
+  if (selectedItem(window) !== null && lastSourceSlot !== undefined)
     await clickWindowCancellable(bot, lastSourceSlot, 0, 0, signal);
 }
 
@@ -2272,13 +2316,13 @@ async function moveSlotWithClicks(
 ): Promise<void> {
   if (sourceSlot === destinationSlot)
     throw new Error("Source and destination slots must differ");
-  const window = bot.currentWindow ?? bot.inventory;
+  const window = activeWindow(bot);
   if (
     sourceSlot >= window.slots.length ||
     destinationSlot >= window.slots.length
   )
     throw new Error("A requested slot is outside the current window");
-  if (window.selectedItem !== null)
+  if (selectedItem(window) !== null)
     throw new Error(
       "Close or empty the carried cursor item before transferring",
     );
@@ -2286,13 +2330,13 @@ async function moveSlotWithClicks(
     throw new Error("The requested source slot is empty");
   try {
     await clickWindowCancellable(bot, sourceSlot, 0, 0, signal);
-    if (signal.aborted) throw abortError(signal);
+    throwIfAborted(signal);
     await clickWindowCancellable(bot, destinationSlot, 0, 0, signal);
-    if (signal.aborted) throw abortError(signal);
-    if (window.selectedItem !== null)
+    throwIfAborted(signal);
+    if (selectedItem(window) !== null)
       await clickWindowCancellable(bot, sourceSlot, 0, 0, signal);
   } catch (error) {
-    if (window.selectedItem !== null) {
+    if (selectedItem(window) !== null) {
       try {
         await bot.clickWindow(sourceSlot, 0, 0);
       } catch {

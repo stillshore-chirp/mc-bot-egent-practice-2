@@ -128,7 +128,7 @@ function recipeFacts(
       count: recipe.result.count,
     },
     requiresTable: recipe.requiresTable,
-    ingredients: (recipe.ingredients ?? []).map((ingredient) => ({
+    ingredients: recipe.ingredients.map((ingredient) => ({
       id: ingredient.id,
       name: bot.registry.items[ingredient.id]?.name ?? `item_${ingredient.id}`,
       count: ingredient.count,
@@ -188,7 +188,15 @@ export function queryPlayerKnowledge(bot: Bot, query: string): PlayerKnowledge {
         displayName: block.displayName,
         hardness: Number.isFinite(block.hardness) ? block.hardness : null,
         boundingBox: block.boundingBox,
-        drops: (block.drops ?? []).map((drop) => drop.item),
+        drops: block.drops.map((drop) => {
+          const itemId =
+            typeof drop === "number"
+              ? drop
+              : typeof drop.drop === "number"
+                ? drop.drop
+                : drop.drop.id;
+          return bot.registry.items[itemId]?.name ?? `item_${itemId}`;
+        }),
       });
       if (facts.length >= factLimit) break;
     }
@@ -232,7 +240,7 @@ export function queryPlayerKnowledge(bot: Bot, query: string): PlayerKnowledge {
         name: enchantment.name,
         displayName: enchantment.displayName,
         maxLevel: enchantment.maxLevel,
-        category: enchantment.category ?? null,
+        category: enchantment.category,
       });
       if (facts.length >= factLimit) break;
     }

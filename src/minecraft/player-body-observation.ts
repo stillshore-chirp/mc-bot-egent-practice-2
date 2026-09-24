@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
-import { Vec3 } from "vec3";
+import type { Vec3 } from "vec3";
 
 export interface BodyPosition {
   readonly x: number;
@@ -136,6 +136,14 @@ const entityCandidateLimit = 128;
 const blockOutputLimit = 96;
 const entityOutputLimit = 64;
 
+interface EntityWithEyeHeight extends Entity {
+  readonly eyeHeight?: number;
+}
+
+interface EntityWithOptionalVehicle extends Omit<Entity, "vehicle"> {
+  readonly vehicle?: Entity | null;
+}
+
 const positionOf = (position: Vec3, dimension: string): BodyPosition => ({
   x: position.x,
   y: position.y,
@@ -143,12 +151,15 @@ const positionOf = (position: Vec3, dimension: string): BodyPosition => ({
   dimension,
 });
 
+export function entityEyeHeight(entity: Entity): number {
+  const eyeHeight = (entity as EntityWithEyeHeight).eyeHeight;
+  return typeof eyeHeight === "number" && Number.isFinite(eyeHeight)
+    ? eyeHeight
+    : Math.max(1.2, entity.height * 0.9);
+}
+
 function eyePosition(bot: Bot): Vec3 {
-  return bot.entity.position.offset(
-    0,
-    bot.entity.eyeHeight ?? Math.max(1.2, bot.entity.height * 0.9),
-    0,
-  );
+  return bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
 }
 
 function insideViewCone(bot: Bot, point: Vec3): boolean {
@@ -217,8 +228,8 @@ function itemStack(
       typeof item.maxDurability === "number" ? item.maxDurability : null,
     customName: item.customName,
     ...(pages === null ? {} : { bookPages: pages }),
-    enchantments: (item.enchants ?? []).map((enchantment) => ({
-      name: String(enchantment.name ?? enchantment.id),
+    enchantments: item.enchants.map((enchantment) => ({
+      name: enchantment.name,
       level: enchantment.lvl,
     })),
   };
@@ -246,8 +257,8 @@ function windowSnapshot(window: Window | null): BodyWindowSnapshot | null {
   if (window === null) return null;
   return {
     id: window.id,
-    type: window.type,
-    title: String(window.title),
+    type: String(window.type),
+    title: window.title,
     inventoryStart: window.inventoryStart,
     inventoryEnd: window.inventoryEnd,
     selectedItem: itemStack(window.selectedItem, -1),
@@ -290,13 +301,23 @@ export function observePlayerBody(
       !bot.canSeeBlock(block)
     )
       continue;
+    const signText = block.name.endsWith("sign")
+      ? block.getSignText()
+      : undefined;
     visibleBlocks.push({
       name: block.name,
       stateId: block.stateId,
       position: positionOf(block.position, dimension),
       distance,
-      properties: { ...(block.getProperties() ?? {}) },
-      ...(block.name.endsWith("sign") ? { signText: block.getSignText() } : {}),
+      properties: { ...block.getProperties() },
+      ...(signText === undefined
+        ? {}
+        : {
+            signText:
+              signText[1] === undefined
+                ? [signText[0]]
+                : [signText[0], signText[1]],
+          }),
     });
   }
   visibleBlocks.sort((left, right) => left.distance - right.distance);
@@ -362,18 +383,20 @@ export function observePlayerBody(
   };
   const inWater =
     physics.isInWater ?? (feet === null ? null : feet.name === "water");
+  const requestedOwner =
+    options.ownerPositionException === true ? ownerUsername : undefined;
   const owner =
-    options.ownerPositionException === true && ownerUsername !== undefined
-      ? bot.players[ownerUsername]?.entity
-      : undefined;
+    requestedOwner === undefined
+      ? undefined
+      : bot.players[requestedOwner]?.entity;
   const ownerCurrentlyVisible =
     owner !== undefined &&
     insideViewCone(bot, owner.position.offset(0, owner.height * 0.55, 0)) &&
     unoccludedToEntity(bot, owner);
   const ownerPositionException =
-    owner !== undefined
+    owner !== undefined && requestedOwner !== undefined
       ? {
-          username: ownerUsername as string,
+          username: requestedOwner,
           position: positionOf(owner.position, dimension),
           source: "owner_position_exception" as const,
           currentlyVisible: ownerCurrentlyVisible,
@@ -396,7 +419,7 @@ export function observePlayerBody(
     self: {
       username: bot.username,
       position: positionOf(origin, dimension),
-      eyeHeight: bot.entity.eyeHeight ?? Math.max(1.2, bot.entity.height * 0.9),
+      eyeHeight: entityEyeHeight(bot.entity),
       yaw: bot.entity.yaw,
       pitch: bot.entity.pitch,
       velocity: {
@@ -421,8 +444,7 @@ export function observePlayerBody(
             ) && head.boundingBox === "block",
       sleeping: bot.isSleeping,
       mountedEntityId:
-        (bot.entity as typeof bot.entity & { readonly vehicle?: Entity })
-          .vehicle?.id ?? null,
+        (bot.entity as EntityWithOptionalVehicle).vehicle?.id ?? null,
       gameMode:
         typeof bot.game.gameMode === "string" ? bot.game.gameMode : null,
       experience: {

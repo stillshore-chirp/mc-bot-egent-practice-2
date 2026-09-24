@@ -64,13 +64,13 @@ function makeFakeBot(): {
   let pendingWindow: (Window & EventEmitter) | undefined;
   const key = (position: Vec3): string =>
     `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
-  const inventorySlots: Array<Record<string, unknown> | null> = Array.from(
+  const inventorySlots: (Record<string, unknown> | null)[] = Array.from(
     { length: 46 },
     () => null,
   );
   const inventory = new EventEmitter() as EventEmitter & {
-    slots: Array<Record<string, unknown> | null>;
-    items: () => Array<Record<string, unknown>>;
+    slots: (Record<string, unknown> | null)[];
+    items: () => Record<string, unknown>[];
   };
   Object.assign(inventory, {
     slots: inventorySlots,
@@ -169,6 +169,7 @@ function makeFakeBot(): {
     moveVehicle: vi.fn(),
     activateItem: vi.fn(),
     attack: vi.fn(),
+    heldItem: null,
     swingArm: vi.fn(),
     closeWindow: vi.fn(),
     dig: vi.fn(async () => undefined),
@@ -351,6 +352,16 @@ describe("player body", () => {
     expect(unrelatedHit.status).toBe("unverified");
 
     vi.mocked(fake.bot.attack).mockImplementationOnce((entity) => {
+      botEvents.emit("entityHurt", entity, undefined);
+    });
+    const sourceLessHit = await body.execute({
+      kind: "attack",
+      entityId: 2,
+    });
+    expect(sourceLessHit.status).toBe("unverified");
+    expect(sourceLessHit.observedEffect).toBeUndefined();
+
+    vi.mocked(fake.bot.attack).mockImplementationOnce((entity) => {
       botEvents.emit("entityHurt", entity, fake.bot.entity);
     });
     const hit = await body.execute({ kind: "attack", entityId: 2 });
@@ -366,6 +377,34 @@ describe("player body", () => {
     expect(killed.observedEffect).toEqual({ type: "entity_died", entityId: 2 });
   });
 
+  it("uses a visible entity with an empty hand without throwing", async () => {
+    const fake = makeFakeBot();
+    const target = {
+      id: 2,
+      name: "cow",
+      type: "mob",
+      position: new Vec3(0, 64, -2),
+      velocity: new Vec3(0, 0, 0),
+      height: 1.4,
+    };
+    Object.assign(fake.bot, {
+      entities: {
+        1: (fake.bot as unknown as { entity: unknown }).entity,
+        2: target,
+      },
+      heldItem: null,
+    });
+
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const result = await body.execute({
+      kind: "use",
+      target: { kind: "entity", entityId: 2 },
+    });
+
+    expect(result.status).toBe("unverified");
+    expect(result.observedEffect).toBeUndefined();
+  });
+
   it("quarantines an unsettled native action and admits a replacement only after it settles", async () => {
     vi.useFakeTimers();
     try {
@@ -375,7 +414,7 @@ describe("player body", () => {
       const started = new Promise<void>((resolve) => {
         announceStarted = resolve;
       });
-      vi.mocked(fake.bot.pathfinder.goto).mockImplementationOnce(() => {
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(() => {
         announceStarted();
         return new Promise<void>((resolve) => {
           resolveNative = resolve;
@@ -387,6 +426,7 @@ describe("player body", () => {
         {
           kind: "move_to",
           position: { x: 5, y: 64, z: 0 },
+          range: 1,
         },
         controller.signal,
       );
@@ -450,6 +490,7 @@ describe("player body", () => {
       kind: "window_click",
       slot: 0,
       button: 0,
+      mode: 0,
     });
     expect(clicked.status).toBe("successful");
   });
