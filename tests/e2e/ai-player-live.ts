@@ -31,6 +31,10 @@ import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
+import {
+  classifyFurnaceRconReply,
+  type FurnaceRconReplyClass,
+} from "./furnace-rcon-classifier.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -190,6 +194,15 @@ interface BodySmokeDiagnostic {
   readonly furnaceCursorRawIronAfterTransferIn?: number;
   readonly furnaceRconInventoryInputConfirmed?: boolean;
   readonly furnaceRconInputConfirmedAfterTransferIn?: boolean;
+  readonly furnaceRconInputInitialClass?: FurnaceRconReplyClass;
+  readonly furnaceRconInputFinalClass?: FurnaceRconReplyClass;
+  readonly furnaceRconInputInitialConfirmed?: boolean;
+  readonly furnaceRconInputFinalConfirmed?: boolean;
+  readonly furnaceTransferInWaitElapsedMs?: number;
+  readonly furnaceInventoryRawIronAtTransferInInitial?: number;
+  readonly furnaceWindowInventoryRawIronAtTransferInInitial?: number;
+  readonly furnaceWindowInputRawIronAtTransferInInitial?: number;
+  readonly furnaceCursorRawIronAtTransferInInitial?: number;
   readonly furnaceInventoryRawIronBeforeTransferOut?: number;
   readonly furnaceWindowInventoryRawIronBeforeTransferOut?: number;
   readonly furnaceWindowInputRawIronBeforeTransferOut?: number;
@@ -202,6 +215,15 @@ interface BodySmokeDiagnostic {
   readonly furnaceWindowInputRawIronAfterTransferOut?: number;
   readonly furnaceCursorRawIronAfterTransferOut?: number;
   readonly furnaceRconEmptyConfirmedAfterTransferOut?: boolean;
+  readonly furnaceRconReturnInitialClass?: FurnaceRconReplyClass;
+  readonly furnaceRconReturnFinalClass?: FurnaceRconReplyClass;
+  readonly furnaceRconReturnInitialEmptyConfirmed?: boolean;
+  readonly furnaceRconReturnFinalEmptyConfirmed?: boolean;
+  readonly furnaceTransferOutWaitElapsedMs?: number;
+  readonly furnaceInventoryRawIronAtTransferOutInitial?: number;
+  readonly furnaceWindowInventoryRawIronAtTransferOutInitial?: number;
+  readonly furnaceWindowInputRawIronAtTransferOutInitial?: number;
+  readonly furnaceCursorRawIronAtTransferOutInitial?: number;
   readonly furnaceInventoryRawIronBeforeClose?: number;
   readonly furnaceWindowInventoryRawIronBeforeClose?: number;
   readonly furnaceWindowInputRawIronBeforeClose?: number;
@@ -3015,34 +3037,77 @@ async function runOperationSmoke(
           ),
         };
         state.bodySmokeDiagnostic = furnaceDiagnostic;
-        const furnaceInput = await body.observe();
-        const furnaceInputCounts = furnaceItemCounts(furnaceInput);
-        const furnaceInputVisible =
-          furnaceInput.window?.slots
-            .slice(0, furnaceInput.window.inventoryStart)
-            .some((item) => item?.name === "raw_iron" && item.count === 1) ===
-          true;
+        const transferInWaitStartedAt = Date.now();
+        const transferInDeadline = transferInWaitStartedAt + 5_000;
+        let furnaceInputVisible = false;
         let furnaceInputConfirmed = false;
-        try {
-          furnaceInputConfirmed = (
-            await rcon.command(
-              `data get block ${target.x} ${target.y} ${target.z} Items`,
-            )
-          ).includes("minecraft:raw_iron");
-        } catch {
-          furnaceInputConfirmed = false;
-        }
-        furnaceDiagnostic = {
-          ...furnaceDiagnostic,
-          furnaceInventoryRawIronAfterTransferIn: furnaceInputCounts.inventory,
-          furnaceWindowInventoryRawIronAfterTransferIn:
-            furnaceInputCounts.windowInventory,
-          furnaceWindowInputRawIronAfterTransferIn:
-            furnaceInputCounts.windowInput,
-          furnaceCursorRawIronAfterTransferIn: furnaceInputCounts.cursor,
-          furnaceRconInputConfirmedAfterTransferIn: furnaceInputConfirmed,
+        let furnaceInputCounts = {
+          inventory: 0,
+          windowInventory: 0,
+          windowInput: 0,
+          cursor: 0,
         };
-        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        let firstInputReply = classifyFurnaceRconReply(null);
+        let firstInputCounts = furnaceInputCounts;
+        let firstInputSample = true;
+        let inputReply = classifyFurnaceRconReply(null);
+        let inputWaitElapsedMs = 0;
+        do {
+          let reply: string | null = null;
+          try {
+            reply = await rcon.command(
+              `data get block ${target.x} ${target.y} ${target.z} Items`,
+              Math.max(1, Math.min(1_000, transferInDeadline - Date.now())),
+            );
+          } catch {
+            reply = null;
+          }
+          const furnaceInput = await body.observe();
+          furnaceInputCounts = furnaceItemCounts(furnaceInput);
+          furnaceInputVisible =
+            furnaceInput.window?.slots
+              .slice(0, furnaceInput.window.inventoryStart)
+              .some((item) => item?.name === "raw_iron" && item.count === 1) ===
+            true;
+          inputReply = classifyFurnaceRconReply(reply);
+          furnaceInputConfirmed = inputReply.hasCanonicalRawIron;
+          inputWaitElapsedMs = Date.now() - transferInWaitStartedAt;
+          if (firstInputSample) {
+            firstInputReply = inputReply;
+            firstInputCounts = furnaceInputCounts;
+            firstInputSample = false;
+          }
+          furnaceDiagnostic = {
+            ...furnaceDiagnostic,
+            furnaceInventoryRawIronAtTransferInInitial:
+              firstInputCounts.inventory,
+            furnaceWindowInventoryRawIronAtTransferInInitial:
+              firstInputCounts.windowInventory,
+            furnaceWindowInputRawIronAtTransferInInitial:
+              firstInputCounts.windowInput,
+            furnaceCursorRawIronAtTransferInInitial: firstInputCounts.cursor,
+            furnaceRconInputInitialClass: firstInputReply.replyClass,
+            furnaceRconInputInitialConfirmed:
+              firstInputReply.hasCanonicalRawIron,
+            furnaceInventoryRawIronAfterTransferIn:
+              furnaceInputCounts.inventory,
+            furnaceWindowInventoryRawIronAfterTransferIn:
+              furnaceInputCounts.windowInventory,
+            furnaceWindowInputRawIronAfterTransferIn:
+              furnaceInputCounts.windowInput,
+            furnaceCursorRawIronAfterTransferIn: furnaceInputCounts.cursor,
+            furnaceRconInputFinalClass: inputReply.replyClass,
+            furnaceRconInputFinalConfirmed: furnaceInputConfirmed,
+            furnaceRconInputConfirmedAfterTransferIn: furnaceInputConfirmed,
+            furnaceTransferInWaitElapsedMs: inputWaitElapsedMs,
+          };
+          state.bodySmokeDiagnostic = furnaceDiagnostic;
+          if (furnaceInputVisible && furnaceInputConfirmed) {
+            break;
+          }
+          if (Date.now() >= transferInDeadline) break;
+          await waitMs(Math.min(100, transferInDeadline - Date.now()));
+        } while (!abort.signal.aborted);
         if (!furnaceInputVisible || !furnaceInputConfirmed) {
           incomplete("FURNACE_INPUT_NOT_CONFIRMED_BY_BODY_AND_SERVER");
         }
@@ -3076,31 +3141,73 @@ async function runOperationSmoke(
           ),
         };
         state.bodySmokeDiagnostic = furnaceDiagnostic;
-        const returned = await body.observe();
-        const returnedCounts = furnaceItemCounts(returned);
-        const itemReturnedToInventory = returned.self.inventory.some(
-          (item) => item.name === "raw_iron" && item.count === 1,
-        );
-        let furnaceEmpty = false;
-        try {
-          furnaceEmpty = !(
-            await rcon.command(
-              `data get block ${target.x} ${target.y} ${target.z} Items`,
-            )
-          ).includes("minecraft:raw_iron");
-        } catch {
-          furnaceEmpty = false;
-        }
-        furnaceDiagnostic = {
-          ...furnaceDiagnostic,
-          furnaceInventoryRawIronAfterTransferOut: returnedCounts.inventory,
-          furnaceWindowInventoryRawIronAfterTransferOut:
-            returnedCounts.windowInventory,
-          furnaceWindowInputRawIronAfterTransferOut: returnedCounts.windowInput,
-          furnaceCursorRawIronAfterTransferOut: returnedCounts.cursor,
-          furnaceRconEmptyConfirmedAfterTransferOut: furnaceEmpty,
+        const transferOutWaitStartedAt = Date.now();
+        const transferOutDeadline = transferOutWaitStartedAt + 5_000;
+        let returnedCounts = {
+          inventory: 0,
+          windowInventory: 0,
+          windowInput: 0,
+          cursor: 0,
         };
-        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        let itemReturnedToInventory = false;
+        let furnaceEmpty = false;
+        let firstReturnReply = classifyFurnaceRconReply(null);
+        let firstReturnCounts = returnedCounts;
+        let firstReturnSample = true;
+        let returnReply = classifyFurnaceRconReply(null);
+        let returnWaitElapsedMs = 0;
+        do {
+          let reply: string | null = null;
+          try {
+            reply = await rcon.command(
+              `data get block ${target.x} ${target.y} ${target.z} Items`,
+              Math.max(1, Math.min(1_000, transferOutDeadline - Date.now())),
+            );
+          } catch {
+            reply = null;
+          }
+          const returned = await body.observe();
+          returnedCounts = furnaceItemCounts(returned);
+          itemReturnedToInventory =
+            returnedCounts.windowInventory === 1 &&
+            returnedCounts.windowInput === 0 &&
+            returnedCounts.cursor === 0;
+          returnReply = classifyFurnaceRconReply(reply);
+          furnaceEmpty = returnReply.replyClass === "empty_list";
+          returnWaitElapsedMs = Date.now() - transferOutWaitStartedAt;
+          if (firstReturnSample) {
+            firstReturnReply = returnReply;
+            firstReturnCounts = returnedCounts;
+            firstReturnSample = false;
+          }
+          furnaceDiagnostic = {
+            ...furnaceDiagnostic,
+            furnaceInventoryRawIronAtTransferOutInitial:
+              firstReturnCounts.inventory,
+            furnaceWindowInventoryRawIronAtTransferOutInitial:
+              firstReturnCounts.windowInventory,
+            furnaceWindowInputRawIronAtTransferOutInitial:
+              firstReturnCounts.windowInput,
+            furnaceCursorRawIronAtTransferOutInitial: firstReturnCounts.cursor,
+            furnaceRconReturnInitialClass: firstReturnReply.replyClass,
+            furnaceRconReturnInitialEmptyConfirmed:
+              firstReturnReply.replyClass === "empty_list",
+            furnaceInventoryRawIronAfterTransferOut: returnedCounts.inventory,
+            furnaceWindowInventoryRawIronAfterTransferOut:
+              returnedCounts.windowInventory,
+            furnaceWindowInputRawIronAfterTransferOut:
+              returnedCounts.windowInput,
+            furnaceCursorRawIronAfterTransferOut: returnedCounts.cursor,
+            furnaceRconReturnFinalClass: returnReply.replyClass,
+            furnaceRconReturnFinalEmptyConfirmed: furnaceEmpty,
+            furnaceRconEmptyConfirmedAfterTransferOut: furnaceEmpty,
+            furnaceTransferOutWaitElapsedMs: returnWaitElapsedMs,
+          };
+          state.bodySmokeDiagnostic = furnaceDiagnostic;
+          if (itemReturnedToInventory && furnaceEmpty) break;
+          if (Date.now() >= transferOutDeadline) break;
+          await waitMs(Math.min(100, transferOutDeadline - Date.now()));
+        } while (!abort.signal.aborted);
         furnaceDiagnostic = {
           ...furnaceDiagnostic,
           furnaceInventoryRawIronBeforeClose: returnedCounts.inventory,
