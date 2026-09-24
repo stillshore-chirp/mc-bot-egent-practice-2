@@ -6,11 +6,157 @@ import type { Logger } from "pino";
 import {
   createPlayerTool,
   playerResponseCompactionThreshold,
+  projectSafePlayerAgentActivityTail,
   runPlayerAgent,
   type PlayerResponsesClient,
 } from "../../src/player/responses.js";
 
 describe("Responses server-side compaction", () => {
+  it("projects a bounded content-free activity tail for failure evidence", () => {
+    const unsafeActivities = Array.from({ length: 70 }, (_, index) => ({
+      runSequence: index + 1,
+      role: "purpose",
+      round: 1,
+      responseStatus: "completed",
+      processingStatus: "complete",
+      inputTokens: 7,
+      outputTokens: 2,
+      latencyMs: 30,
+      requestInputChars: 900,
+      initialInputChars: 120,
+      instructionsChars: 400,
+      toolSchemaChars: 200,
+      initialObservationChars: 180,
+      responseOutputChars: 75,
+      functionCallCount: 1,
+      compactionItemPresent: false,
+      prompt: "private prompt sentinel",
+      toolCalls: [
+        {
+          name: "search_memory",
+          resultClass: "ok",
+          outputChars: 24,
+          arguments: "private argument sentinel",
+          output: "private output sentinel",
+        },
+      ],
+    }));
+
+    const projected = projectSafePlayerAgentActivityTail(unsafeActivities);
+
+    expect(projected).toHaveLength(64);
+    expect(projected[0]?.runSequence).toBe(7);
+    expect(projected.at(-1)?.runSequence).toBe(70);
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain("private prompt sentinel");
+    expect(serialized).not.toContain("private argument sentinel");
+    expect(serialized).not.toContain("private output sentinel");
+    expect(serialized).not.toContain("arguments");
+    expect(serialized).not.toContain("prompt");
+  });
+
+  it("marks a budget abort after response receipt without inventing tool results", async () => {
+    const activities: unknown[] = [];
+    const controller = new AbortController();
+    const budgetError = new Error("TEST_BUDGET_EXHAUSTED");
+    let executedTools = 0;
+    const tool = createPlayerTool({
+      name: "search_memory",
+      description: "Search test memory.",
+      schema: z.object({ query: z.string() }).strict(),
+      execute: () => {
+        executedTools += 1;
+        return { ok: true };
+      },
+    });
+
+    await expect(
+      runPlayerAgent({
+        client: scriptedClient(
+          [
+            outputResponse([
+              {
+                type: "function_call",
+                call_id: "private-call-id",
+                name: "search_memory",
+                arguments: JSON.stringify({ query: "private query" }),
+              },
+            ]),
+          ],
+          [],
+        ),
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [tool],
+        logger: silentLogger(),
+        signal: controller.signal,
+        onCall: () => controller.abort(budgetError),
+        onRoundActivity: (activity) => activities.push(activity),
+      }),
+    ).rejects.toBe(budgetError);
+
+    expect(executedTools).toBe(0);
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      responseStatus: "completed",
+      processingStatus: "interrupted",
+      functionCallCount: 1,
+      toolCalls: [],
+    });
+    expect(JSON.stringify(activities)).not.toContain("private-call-id");
+    expect(JSON.stringify(activities)).not.toContain("private query");
+  });
+
+  it("retains only the completed tool result when cancellation arrives mid-tool", async () => {
+    const activities: unknown[] = [];
+    const controller = new AbortController();
+    const budgetError = new Error("TEST_BUDGET_EXHAUSTED");
+    const tool = createPlayerTool({
+      name: "search_memory",
+      description: "Search test memory.",
+      schema: z.object({ query: z.string() }).strict(),
+      execute: () => {
+        controller.abort(budgetError);
+        return { ok: true, privateValue: "result sentinel" };
+      },
+    });
+
+    await expect(
+      runPlayerAgent({
+        client: scriptedClient(
+          [
+            outputResponse([
+              {
+                type: "function_call",
+                call_id: "private-call-id",
+                name: "search_memory",
+                arguments: JSON.stringify({ query: "private query" }),
+              },
+            ]),
+          ],
+          [],
+        ),
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [tool],
+        logger: silentLogger(),
+        signal: controller.signal,
+        onRoundActivity: (activity) => activities.push(activity),
+      }),
+    ).rejects.toBe(budgetError);
+
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      processingStatus: "interrupted",
+      functionCallCount: 1,
+      toolCalls: [{ name: "search_memory", resultClass: "ok" }],
+    });
+    expect(JSON.stringify(activities)).not.toContain("result sentinel");
+    expect(JSON.stringify(activities)).not.toContain("private-call-id");
+  });
+
   it("emits content-free round activity for tool and terminal responses", async () => {
     const activities: unknown[] = [];
     const requests: unknown[] = [];

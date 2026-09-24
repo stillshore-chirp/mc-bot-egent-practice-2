@@ -389,6 +389,7 @@ export function createPlayerApplication(
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
       }),
+    onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     say,
     onProposal: () => runtimeRef.current?.onOwnerProposal(),
     onStop: async () => {
@@ -413,6 +414,7 @@ export function createPlayerApplication(
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
       }),
+    onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     onObservation: (observation) =>
       mind.recordObservation(toObservationEvidence(observation)),
     onCommitted: (snapshot, decision) =>

@@ -5,6 +5,10 @@ import { z } from "zod";
 
 import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
+import {
+  playerAgentToolNames,
+  type PlayerAgentRoundActivity,
+} from "./responses.js";
 import type {
   OwnerProposal,
   PlayerGoal,
@@ -118,6 +122,44 @@ const skillActivitySchema = z
   })
   .strict();
 
+const agentActivitySchema = z
+  .object({
+    runSequence: z.number().int().positive(),
+    role: z.enum(["purpose", "conversation"]),
+    round: z.number().int().positive(),
+    responseStatus: z.enum([
+      "completed",
+      "incomplete",
+      "failed",
+      "unknown",
+      "request_error",
+    ]),
+    processingStatus: z.enum(["complete", "interrupted"]),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    latencyMs: z.number().int().nonnegative(),
+    requestInputChars: z.number().int().nonnegative(),
+    initialInputChars: z.number().int().nonnegative(),
+    instructionsChars: z.number().int().nonnegative(),
+    toolSchemaChars: z.number().int().nonnegative(),
+    initialObservationChars: z.number().int().nonnegative(),
+    responseOutputChars: z.number().int().nonnegative(),
+    functionCallCount: z.number().int().nonnegative(),
+    compactionItemPresent: z.boolean(),
+    toolCalls: z
+      .array(
+        z
+          .object({
+            name: z.union([z.enum(playerAgentToolNames), z.literal("unknown")]),
+            resultClass: z.enum(["ok", "rejected", "error", "unknown"]),
+            outputChars: z.number().int().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(8),
+  })
+  .strict();
+
 const stateNoteSchema = z
   .object({
     id: z.string().min(1).max(80),
@@ -186,6 +228,7 @@ const stateSchema = z
     recentOutcomes: z.array(outcomeHistorySchema).max(24),
     learningReferences: z.array(learningSchema).max(24),
     skillActivity: z.array(skillActivitySchema).max(32),
+    recentAgentActivity: z.array(agentActivitySchema).max(64).default([]),
     activeOperation: z
       .object({
         operationId: z.string().min(1).max(80),
@@ -252,6 +295,7 @@ const initialState: StoredState = {
   recentOutcomes: [],
   learningReferences: [],
   skillActivity: [],
+  recentAgentActivity: [],
   counters: {
     llmCalls: 0,
     inputTokens: 0,
@@ -1095,6 +1139,27 @@ export class PlayerMindStore {
       );
     });
     transaction.immediate();
+  }
+
+  public recordAgentActivity(
+    activity: PlayerAgentRoundActivity,
+  ): PlayerRuntimeSnapshot {
+    const validated = agentActivitySchema.parse(activity);
+    const transaction = this.database.transaction(() => {
+      const current = this.readStored();
+      this.writeStored(
+        {
+          ...current,
+          recentAgentActivity: [
+            ...current.recentAgentActivity,
+            validated,
+          ].slice(-64),
+        },
+        new Date().toISOString(),
+      );
+      return this.snapshot();
+    });
+    return transaction.immediate();
   }
 
   private readStored(): StoredState {

@@ -9,6 +9,7 @@ import type {
   McSkillOutcomeStatus,
   McSkillRecord,
 } from "../mc-skills/index.js";
+import type { PlayerAgentRoundActivity } from "./responses.js";
 
 export type PlayerWakeKind =
   | "startup"
@@ -216,6 +217,7 @@ export interface PlayerRuntimeSnapshot {
   readonly learningReferences: readonly PlayerLearningEvidence[];
   readonly skillActivity: readonly PlayerSkillActivityEvidence[];
   readonly lastObservation?: PlayerObservationEvidence | undefined;
+  readonly recentAgentActivity: readonly PlayerAgentRoundActivity[];
   readonly counters: {
     readonly llmCalls: number;
     readonly inputTokens: number;

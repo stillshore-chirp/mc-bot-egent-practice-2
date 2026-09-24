@@ -26,7 +26,10 @@ import {
   type PlayerConversationPort,
   type PlayerPurposePort,
 } from "../../src/player/runtime.js";
-import { createPlayerTool } from "../../src/player/responses.js";
+import {
+  createPlayerTool,
+  type PlayerAgentRoundActivity,
+} from "../../src/player/responses.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -37,6 +40,32 @@ afterEach(() => {
 });
 
 describe("integrated player runtime", () => {
+  it("persists only the bounded safe activity tail across restart", () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    let mind = PlayerMindStore.open(databasePath);
+    for (let runSequence = 1; runSequence <= 66; runSequence += 1) {
+      mind.recordAgentActivity(agentActivity(runSequence));
+    }
+    const rejected = {
+      ...agentActivity(67),
+      prompt: "private prompt sentinel",
+    } as PlayerAgentRoundActivity;
+    expect(() => mind.recordAgentActivity(rejected)).toThrow();
+    mind.close();
+
+    mind = PlayerMindStore.open(databasePath);
+    try {
+      const activity = mind.snapshot().recentAgentActivity;
+      expect(activity).toHaveLength(64);
+      expect(activity[0]?.runSequence).toBe(3);
+      expect(activity.at(-1)?.runSequence).toBe(66);
+      expect(JSON.stringify(activity)).not.toContain("private prompt sentinel");
+    } finally {
+      mind.close();
+    }
+  });
+
   it("keeps conversation independent and settles a body action before replacing it", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
@@ -530,6 +559,28 @@ function temporaryDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "player-runtime-test-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function agentActivity(runSequence: number): PlayerAgentRoundActivity {
+  return {
+    runSequence,
+    role: "purpose",
+    round: 1,
+    responseStatus: "completed",
+    processingStatus: "complete",
+    inputTokens: 8,
+    outputTokens: 2,
+    latencyMs: 25,
+    requestInputChars: 800,
+    initialInputChars: 100,
+    instructionsChars: 400,
+    toolSchemaChars: 200,
+    initialObservationChars: 175,
+    responseOutputChars: 70,
+    functionCallCount: 1,
+    compactionItemPresent: false,
+    toolCalls: [{ name: "observe_body", resultClass: "ok", outputChars: 70 }],
+  };
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

@@ -35,6 +35,7 @@ import {
   createPlayerTool,
   runPlayerAgent,
   type PlayerAgentCallResult,
+  type PlayerAgentRoundActivity,
   type PlayerResponsesClient,
 } from "./responses.js";
 
@@ -125,6 +126,7 @@ export interface ConversationAgentOptions {
   readonly onStop: () => Promise<void>;
   readonly onResume: () => void;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
+  readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
 }
 
 /** Owner-facing dialogue never receives a Minecraft operation tool. */
@@ -246,6 +248,10 @@ export class PlayerConversationAgent {
       input: `所有者の今回の発話:\n${input.message}\n\n保存済み状態:\n${state}`,
       tools,
       logger: this.options.logger,
+      role: "conversation",
+      initialObservationChars: safeSerializedLength(
+        initial.lastObservation ?? null,
+      ),
       ...(this.options.trace === undefined
         ? {}
         : { trace: this.options.trace }),
@@ -253,6 +259,9 @@ export class PlayerConversationAgent {
       ...(this.options.onCall === undefined
         ? {}
         : { onCall: this.options.onCall }),
+      ...(this.options.onRoundActivity === undefined
+        ? {}
+        : { onRoundActivity: this.options.onRoundActivity }),
     });
     if (input.turn !== this.#latestTurn || result.text.length === 0) return;
     await this.options.say(result.text.slice(0, 240));
@@ -366,6 +375,7 @@ export interface PurposeAgentOptions {
   readonly logger: Logger;
   readonly trace?: TraceService;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
+  readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
   readonly onObservation?: (observation: PlayerBodyObservation) => void;
   readonly onCommitted: (
     snapshot: PlayerRuntimeSnapshot,
@@ -792,6 +802,8 @@ export class PlayerPurposeAgent {
         input: inputText,
         tools,
         logger: this.options.logger,
+        role: "purpose",
+        initialObservationChars: safeSerializedLength(bodyObservation),
         ...(this.options.trace === undefined
           ? {}
           : { trace: this.options.trace }),
@@ -808,6 +820,9 @@ export class PlayerPurposeAgent {
         ...(this.options.onCall === undefined
           ? {}
           : { onCall: this.options.onCall }),
+        ...(this.options.onRoundActivity === undefined
+          ? {}
+          : { onRoundActivity: this.options.onRoundActivity }),
       });
       this.options.mind.consumeEvents(eventIds);
       return {
@@ -976,6 +991,15 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
       .slice(-12)
       .map(({ filePath: _filePath, ...activity }) => activity),
   };
+}
+
+function safeSerializedLength(value: unknown): number {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized.length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function compactMemory(

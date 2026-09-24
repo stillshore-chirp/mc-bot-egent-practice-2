@@ -32,6 +32,10 @@ import { loadConfig } from "../../src/config/load-config.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
+  projectSafePlayerAgentActivityTail,
+  type PlayerAgentRoundActivity,
+} from "../../src/player/responses.js";
+import {
   classifyFurnaceRconReply,
   type FurnaceRconReplyClass,
 } from "./furnace-rcon-classifier.js";
@@ -105,7 +109,7 @@ interface SafeCaseResult {
   readonly outputTokens: number;
   readonly latencyMs: number;
   readonly usageStatus: UsageStatus;
-  readonly evidence: Readonly<Record<string, boolean | number | string>>;
+  readonly evidence: SafeEvidence;
   readonly reason?: string;
 }
 
@@ -113,7 +117,9 @@ type PlayerOperationName = (typeof playerOperationNames)[number];
 type PlayerJudgmentKind = "act" | "wait" | "continue" | "complete";
 type PlayerOutcomeStatus =
   "successful" | "failed" | "interrupted" | "cancelled" | "unverified";
-type SafeEvidence = Readonly<Record<string, boolean | number | string>>;
+type SafeEvidenceValue =
+  boolean | number | string | readonly PlayerAgentRoundActivity[];
+type SafeEvidence = Readonly<Record<string, SafeEvidenceValue>>;
 
 interface SafeAutonomousProgress {
   readonly autonomousGoalSeen: boolean;
@@ -355,6 +361,7 @@ interface PlayerEvidence {
     }[];
     readonly ownerPositionExceptionUsed?: boolean;
   };
+  readonly recentAgentActivity?: readonly PlayerAgentRoundActivity[];
   readonly counters: Counters;
 }
 
@@ -860,6 +867,9 @@ function safePlayerDiagnostic(
     ...(lastOutcomeStatus === undefined
       ? {}
       : { lastKnownOutcomeStatus: lastOutcomeStatus }),
+    recentAgentActivity: projectSafePlayerAgentActivityTail(
+      player.recentAgentActivity ?? [],
+    ),
   };
 }
 

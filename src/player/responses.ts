@@ -58,6 +58,7 @@ export interface PlayerAgentRoundActivity {
   readonly round: number;
   readonly responseStatus:
     "completed" | "incomplete" | "failed" | "unknown" | "request_error";
+  readonly processingStatus: "complete" | "interrupted";
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
@@ -251,6 +252,7 @@ export async function runPlayerAgent(
         role,
         round: round + 1,
         responseStatus: "request_error",
+        processingStatus: "interrupted",
         inputTokens: 0,
         outputTokens: 0,
         latencyMs: Math.round(performance.now() - started),
@@ -306,6 +308,7 @@ export async function runPlayerAgent(
         role,
         round: round + 1,
         responseStatus: safeResponseStatus(response.status),
+        processingStatus: "complete",
         inputTokens: safeCount(response.usage?.input_tokens),
         outputTokens: safeCount(response.usage?.output_tokens),
         latencyMs: elapsed,
@@ -324,12 +327,15 @@ export async function runPlayerAgent(
 
     messages.push(...(response.output as ResponseInputItem[]));
     const functionCalls = response.output.filter(isFunctionCall);
-    if (functionCalls.length === 0) {
+    const emitCompletedResponseActivity = (
+      processingStatus: "complete" | "interrupted",
+    ): void =>
       emitRoundActivity(input, {
         runSequence,
         role,
         round: round + 1,
         responseStatus: "completed",
+        processingStatus,
         inputTokens: safeCount(response.usage?.input_tokens),
         outputTokens: safeCount(response.usage?.output_tokens),
         latencyMs: elapsed,
@@ -339,10 +345,19 @@ export async function runPlayerAgent(
         toolSchemaChars,
         initialObservationChars: safeCount(input.initialObservationChars),
         responseOutputChars: safeSerializedLength(response.output),
-        functionCallCount: 0,
+        functionCallCount: functionCalls.length,
         compactionItemPresent: containsCompactionItem(response.output),
-        toolCalls: [],
+        toolCalls: activityToolCalls,
       });
+
+    // onCall may consume the remaining run budget and abort the active signal.
+    // Keep the received model calls count, but record no fabricated tool result.
+    if (input.signal?.aborted) {
+      emitCompletedResponseActivity("interrupted");
+      input.signal.throwIfAborted();
+    }
+    if (functionCalls.length === 0) {
+      emitCompletedResponseActivity("complete");
       return {
         text: response.output_text.trim(),
         calls,
@@ -353,6 +368,10 @@ export async function runPlayerAgent(
       };
     }
     for (const call of functionCalls) {
+      if (input.signal?.aborted) {
+        emitCompletedResponseActivity("interrupted");
+        input.signal.throwIfAborted();
+      }
       toolCalls += 1;
       const tool = byName.get(call.name);
       let result: unknown;
@@ -382,29 +401,15 @@ export async function runPlayerAgent(
         call_id: call.call_id,
         output: boundedJson(result),
       });
-      input.signal?.throwIfAborted();
+      if (input.signal?.aborted) {
+        emitCompletedResponseActivity("interrupted");
+        input.signal.throwIfAborted();
+      }
       if (
         tool !== undefined &&
         input.shouldFinishAfterTool?.(call.name, result) === true
       ) {
-        emitRoundActivity(input, {
-          runSequence,
-          role,
-          round: round + 1,
-          responseStatus: "completed",
-          inputTokens: safeCount(response.usage?.input_tokens),
-          outputTokens: safeCount(response.usage?.output_tokens),
-          latencyMs: elapsed,
-          requestInputChars,
-          initialInputChars: input.input.length,
-          instructionsChars: input.instructions.length,
-          toolSchemaChars,
-          initialObservationChars: safeCount(input.initialObservationChars),
-          responseOutputChars: safeSerializedLength(response.output),
-          functionCallCount: functionCalls.length,
-          compactionItemPresent: containsCompactionItem(response.output),
-          toolCalls: activityToolCalls,
-        });
+        emitCompletedResponseActivity("complete");
         return {
           text: response.output_text.trim(),
           calls,
@@ -415,24 +420,7 @@ export async function runPlayerAgent(
         };
       }
     }
-    emitRoundActivity(input, {
-      runSequence,
-      role,
-      round: round + 1,
-      responseStatus: "completed",
-      inputTokens: safeCount(response.usage?.input_tokens),
-      outputTokens: safeCount(response.usage?.output_tokens),
-      latencyMs: elapsed,
-      requestInputChars,
-      initialInputChars: input.input.length,
-      instructionsChars: input.instructions.length,
-      toolSchemaChars,
-      initialObservationChars: safeCount(input.initialObservationChars),
-      responseOutputChars: safeSerializedLength(response.output),
-      functionCallCount: functionCalls.length,
-      compactionItemPresent: containsCompactionItem(response.output),
-      toolCalls: activityToolCalls,
-    });
+    emitCompletedResponseActivity("complete");
     pruneMessagesBeforeLatestCompaction(messages);
   }
   throw new Error("PLAYER_AGENT_TOOL_ROUND_LIMIT");
@@ -484,6 +472,116 @@ function safeSerializedLength(value: unknown): number {
   } catch {
     return 0;
   }
+}
+
+/** Projects unknown snapshot data into a bounded, content-free activity tail. */
+export function projectSafePlayerAgentActivityTail(
+  value: unknown,
+): PlayerAgentRoundActivity[] {
+  if (!Array.isArray(value)) return [];
+  const result: PlayerAgentRoundActivity[] = [];
+  for (const candidate of value.slice(-64)) {
+    if (!isRecord(candidate)) continue;
+    const runSequence = safePositiveInteger(candidate.runSequence);
+    const round = safePositiveInteger(candidate.round);
+    const role = candidate.role;
+    if (
+      runSequence === undefined ||
+      round === undefined ||
+      (role !== "purpose" && role !== "conversation") ||
+      (candidate.processingStatus !== "complete" &&
+        candidate.processingStatus !== "interrupted")
+    )
+      continue;
+    const numericFields = [
+      candidate.inputTokens,
+      candidate.outputTokens,
+      candidate.latencyMs,
+      candidate.requestInputChars,
+      candidate.initialInputChars,
+      candidate.instructionsChars,
+      candidate.toolSchemaChars,
+      candidate.initialObservationChars,
+      candidate.responseOutputChars,
+      candidate.functionCallCount,
+    ];
+    if (!numericFields.every(isSafeNonnegativeInteger)) continue;
+    const toolCalls: PlayerAgentToolRoundActivity[] = Array.isArray(
+      candidate.toolCalls,
+    )
+      ? candidate.toolCalls
+          .slice(0, 8)
+          .flatMap((tool): PlayerAgentToolRoundActivity[] => {
+            if (!isRecord(tool) || !isSafeNonnegativeInteger(tool.outputChars))
+              return [];
+            return [
+              {
+                name:
+                  typeof tool.name === "string"
+                    ? safeToolName(tool.name)
+                    : "unknown",
+                resultClass: safeToolResultClass(tool.resultClass),
+                outputChars: safeNonnegativeInteger(tool.outputChars),
+              },
+            ];
+          })
+      : [];
+    result.push({
+      runSequence,
+      role,
+      round,
+      responseStatus: safeActivityResponseStatus(candidate.responseStatus),
+      processingStatus: candidate.processingStatus,
+      inputTokens: safeNonnegativeInteger(candidate.inputTokens),
+      outputTokens: safeNonnegativeInteger(candidate.outputTokens),
+      latencyMs: safeNonnegativeInteger(candidate.latencyMs),
+      requestInputChars: safeNonnegativeInteger(candidate.requestInputChars),
+      initialInputChars: safeNonnegativeInteger(candidate.initialInputChars),
+      instructionsChars: safeNonnegativeInteger(candidate.instructionsChars),
+      toolSchemaChars: safeNonnegativeInteger(candidate.toolSchemaChars),
+      initialObservationChars: safeNonnegativeInteger(
+        candidate.initialObservationChars,
+      ),
+      responseOutputChars: safeNonnegativeInteger(
+        candidate.responseOutputChars,
+      ),
+      functionCallCount: safeNonnegativeInteger(candidate.functionCallCount),
+      compactionItemPresent: candidate.compactionItemPresent === true,
+      toolCalls,
+    });
+  }
+  return result;
+}
+
+function safeActivityResponseStatus(
+  value: unknown,
+): PlayerAgentRoundActivity["responseStatus"] {
+  return value === "completed" ||
+    value === "incomplete" ||
+    value === "failed" ||
+    value === "request_error"
+    ? value
+    : "unknown";
+}
+
+function safeToolResultClass(value: unknown): PlayerAgentToolResultClass {
+  return value === "ok" || value === "rejected" || value === "error"
+    ? value
+    : "unknown";
+}
+
+function safePositiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function safeNonnegativeInteger(value: unknown): number {
+  return isSafeNonnegativeInteger(value) ? value : 0;
+}
+
+function isSafeNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /**

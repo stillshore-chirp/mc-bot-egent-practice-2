@@ -41,4 +41,4 @@ body eventを種類ごとにまとめ、意味のあるvitals、inventory、enti
 
 Markdown import/exportは専用の `mc-skills` exchange directoryを使います。importした本文は未信頼の知識で、system指示、認可、停止境界を変更しません。export結果はownerへローカルのファイル位置を返します。
 
-`collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。reasoning本文やowner位置の例外座標は保存・公開しません。
+`collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。Responsesの直近64 roundはrole、プロセス内の連番とround、token/latency、入力/schema/outputの文字数、allowlist済みtool名と固定結果分類だけをMindStoreへ保存します。中断roundはモデルが要求したtool数と実際に結果を得たtoolだけを区別します。E2E failure artifactにも同じ安全projectionを使います。reasoning本文、prompt、tool引数/出力、tool call ID等の生成識別子、owner位置の例外座標は保存・公開しません。
