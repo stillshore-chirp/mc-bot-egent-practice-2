@@ -39,6 +39,13 @@ import {
   classifyFurnaceRconReply,
   type FurnaceRconReplyClass,
 } from "./furnace-rcon-classifier.js";
+import {
+  blockIs,
+  destinationRegion,
+  establishBaseline,
+  forceLoadRegion,
+  regionsEqual,
+} from "./world-oracle.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -1194,7 +1201,8 @@ interface RunState {
   loopbackListenersClosed?: boolean;
   preStartPlayer?: PlayerEvidence;
   autonomousBaseline?: WorldSnapshot;
-  smokeSnapshot?: WorldSnapshot;
+  autonomousSmokeBaseline?: WorldSnapshot;
+  autonomousRegion?: BlockRegion;
   copiedServerCacheAreas?: string[];
   privateServerLogStream: WriteStream | undefined;
   privateDiagnosticLogPath?: string;
@@ -1248,6 +1256,10 @@ async function main(): Promise<void> {
     }
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
+    const autonomousRegion = state.autonomousRegion;
+    const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
+    if (autonomousRegion === undefined || autonomousSmokeBaseline === undefined)
+      incomplete("AUTONOMOUS_WORLD_BASELINE_MISSING");
 
     const config = loadConfig({
       ...process.env,
@@ -1272,14 +1284,15 @@ async function main(): Promise<void> {
     state.countersInitial = countersOf(preStartEvidence);
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
     await connectApplication(activeApp, state);
-    const smokeBaseline = state.smokeSnapshot;
-    const connectedWorld = await readWorldSnapshot(rcon, state.botName);
+    const connectedWorld = await readWorldSnapshot(
+      rcon,
+      state.botName,
+      autonomousRegion,
+    );
     state.autonomousBaseline = {
       position: connectedWorld.position,
-      blockRegionChanged:
-        smokeBaseline?.blockRegionChanged ?? connectedWorld.blockRegionChanged,
-      inventorySignature:
-        smokeBaseline?.inventorySignature ?? connectedWorld.inventorySignature,
+      blockRegionChanged: autonomousSmokeBaseline.blockRegionChanged,
+      inventorySignature: autonomousSmokeBaseline.inventorySignature,
     };
     const contractResult = await recordCase(
       state,
@@ -1351,7 +1364,14 @@ async function main(): Promise<void> {
               autonomousProgress.successfulActionSeen &&
               Date.now() - lastWorldCheckAt >= 1_500
             ) {
-              const currentWorld = await readWorldSnapshot(rcon, state.botName);
+              const autonomousRegion = state.autonomousRegion;
+              if (autonomousRegion === undefined)
+                incomplete("AUTONOMOUS_WORLD_REGION_MISSING");
+              const currentWorld = await readWorldSnapshot(
+                rcon,
+                state.botName,
+                autonomousRegion,
+              );
               progressKind ??= observedWorldProgress(before, currentWorld);
               lastWorldCheckAt = Date.now();
             }
@@ -2756,6 +2776,14 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   await setAndVerifyGamerule(rcon, "advanceTime", false);
   await setAndVerifyGamerule(rcon, "spawnMobs", false);
   await setAndVerifyGamerule(rcon, "keepInventory", true);
+  await rcon.command("scoreboard objectives add ai_e2e dummy");
+  await rcon.command("scoreboard players set #diff ai_e2e 0");
+  await forceLoadRegion(rcon, REGION, incomplete);
+  await forceLoadRegion(
+    rcon,
+    destinationRegion(REGION, REGION_BASELINE),
+    incomplete,
+  );
   await rcon.command("time set 1000");
   await rcon.command("weather clear");
   await rcon.command("setworldspawn 0 64 0");
@@ -2767,11 +2795,7 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   );
   await configureHiddenContainer(rcon);
   await configureAutonomousBuildFixture(rcon);
-  await rcon.command(
-    `clone ${REGION.minX} ${REGION.minY} ${REGION.minZ} ${REGION.maxX} ${REGION.maxY} ${REGION.maxZ} ${REGION_BASELINE.x} ${REGION_BASELINE.y} ${REGION_BASELINE.z} force`,
-  );
-  await rcon.command("scoreboard objectives add ai_e2e dummy");
-  await rcon.command("scoreboard players set #diff ai_e2e 0");
+  await establishBaseline(rcon, REGION, REGION_BASELINE, incomplete);
   await mkdir(dirname(state.databasePath), { recursive: true, mode: 0o700 });
 }
 
@@ -2873,7 +2897,6 @@ async function runOperationSmoke(
         if (!registryKnowledgeAvailable)
           incomplete("GAME_REGISTRY_KNOWLEDGE_FIXTURE_MISSING");
         const playerSnapshot = await readWorldSnapshot(rcon, state.botName);
-        state.smokeSnapshot = playerSnapshot;
         target = {
           x: Math.floor(playerSnapshot.position.x) + 1,
           y: Math.floor(playerSnapshot.position.y),
@@ -3323,6 +3346,18 @@ async function runOperationSmoke(
           incomplete("BODY_OPERATION_EFFECT_NOT_CONFIRMED");
         await rcon.command(`setblock ${target.x} ${target.y} ${target.z} air`);
         await rcon.command(`clear ${state.botName} minecraft:raw_iron`);
+        const smokeEndPosition = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        state.autonomousRegion = await captureBlockBaseline(
+          rcon,
+          smokeEndPosition,
+        );
+        state.autonomousSmokeBaseline = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          state.autonomousRegion,
+        );
         return {
           declaredOperationCount: names.size,
           nonOpDigAcceptedByServer: blockIsAir,
@@ -3963,9 +3998,7 @@ async function captureBlockBaseline(
   origin?: Position,
 ): Promise<BlockRegion> {
   const region = origin === undefined ? REGION : regionAround(origin);
-  await rcon.command(
-    `clone ${region.minX} ${region.minY} ${region.minZ} ${region.maxX} ${region.maxY} ${region.maxZ} ${REGION_BASELINE.x} ${REGION_BASELINE.y} ${REGION_BASELINE.z} force`,
-  );
+  await establishBaseline(rcon, region, REGION_BASELINE, incomplete);
   return region;
 }
 
@@ -3982,12 +4015,7 @@ async function regionChanged(
   rcon: LocalRcon,
   region: BlockRegion = REGION,
 ): Promise<boolean> {
-  await rcon.command("scoreboard players set #diff ai_e2e 0");
-  await rcon.command(
-    `execute unless blocks ${region.minX} ${region.minY} ${region.minZ} ${region.maxX} ${region.maxY} ${region.maxZ} ${REGION_BASELINE.x} ${REGION_BASELINE.y} ${REGION_BASELINE.z} all run scoreboard players set #diff ai_e2e 1`,
-  );
-  const value = await rcon.command("scoreboard players get #diff ai_e2e");
-  return /has 1\b/u.test(value);
+  return !(await regionsEqual(rcon, region, REGION_BASELINE, incomplete));
 }
 
 async function isBlock(
@@ -3995,13 +4023,7 @@ async function isBlock(
   position: Position,
   block: string,
 ): Promise<boolean> {
-  await rcon.command("scoreboard players set #probe ai_e2e 0");
-  await rcon.command(
-    `execute if block ${position.x} ${position.y} ${position.z} minecraft:${block} run scoreboard players set #probe ai_e2e 1`,
-  );
-  return /has 1\b/u.test(
-    await rcon.command("scoreboard players get #probe ai_e2e"),
-  );
+  return blockIs(rcon, position, block, incomplete);
 }
 
 function worldChangedFromBlock(
