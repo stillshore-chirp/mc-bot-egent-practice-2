@@ -27,7 +27,7 @@ export function classifyFurnaceRconReply(
   ) {
     return { replyClass: "empty_list", hasCanonicalRawIron: false };
   }
-  if (/minecraft:raw_iron(?![a-z0-9_.\/-])/.exec(normalized) !== null) {
+  if (/minecraft:raw_iron(?![a-z0-9_./-])/.exec(normalized) !== null) {
     return { replyClass: "canonical_item", hasCanonicalRawIron: true };
   }
   if (/(?:^|\b)raw_iron(?:\b|$)/.exec(normalized) !== null) {
