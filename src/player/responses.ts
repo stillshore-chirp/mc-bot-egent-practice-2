@@ -14,6 +14,9 @@ import type { TraceService } from "../trace/service.js";
 
 export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 
+/** Server compaction threshold applies to one rendered request, not run totals. */
+export const playerResponseCompactionThreshold = 16_000;
+
 export interface PlayerAgentTool {
   readonly definition: FunctionTool;
   execute(argumentsValue: unknown): Promise<unknown>;
@@ -148,6 +151,12 @@ export async function runPlayerAgent(
             parallel_tool_calls: false,
             store: false,
             include: ["reasoning.encrypted_content"],
+            context_management: [
+              {
+                type: "compaction",
+                compact_threshold: playerResponseCompactionThreshold,
+              },
+            ],
           } satisfies ResponseCreateParamsNonStreaming,
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -257,8 +266,57 @@ export async function runPlayerAgent(
         };
       }
     }
+    pruneMessagesBeforeLatestCompaction(messages);
   }
   throw new Error("PLAYER_AGENT_TOOL_ROUND_LIMIT");
+}
+
+/**
+ * Trim old context only after every call in the response has an output. If a
+ * call straddles the compaction item, retain the call and its complete suffix.
+ */
+function pruneMessagesBeforeLatestCompaction(
+  messages: ResponseInputItem[],
+): void {
+  let latestCompaction = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (isRecord(item) && item.type === "compaction") {
+      latestCompaction = index;
+      break;
+    }
+  }
+  if (latestCompaction <= 0) return;
+
+  const outputCallIds = new Set<string>();
+  for (let index = latestCompaction + 1; index < messages.length; index += 1) {
+    const item = messages[index];
+    if (
+      isRecord(item) &&
+      item.type === "function_call_output" &&
+      typeof item.call_id === "string"
+    )
+      outputCallIds.add(item.call_id);
+  }
+  if (outputCallIds.size === 0) {
+    messages.splice(0, latestCompaction);
+    return;
+  }
+
+  let keepFrom = latestCompaction;
+  for (let index = 0; index < latestCompaction; index += 1) {
+    const item = messages[index];
+    if (
+      isRecord(item) &&
+      item.type === "function_call" &&
+      typeof item.call_id === "string" &&
+      outputCallIds.has(item.call_id)
+    ) {
+      keepFrom = index;
+      break;
+    }
+  }
+  if (keepFrom > 0) messages.splice(0, keepFrom);
 }
 
 function isFunctionCall(
