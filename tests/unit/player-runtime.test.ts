@@ -159,6 +159,350 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("single-flights slow purpose thoughts and follows queued events once", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    let thoughtCount = 0;
+    let activeThoughts = 0;
+    let maxActiveThoughts = 0;
+    let firstSignal: AbortSignal | undefined;
+    let followupEvents: readonly { kind: string; summary: string }[] = [];
+    let followupSnapshot: ReturnType<PlayerMindStore["snapshot"]> | undefined;
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events, signal }) => {
+          thoughtCount += 1;
+          activeThoughts += 1;
+          maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+          try {
+            if (thoughtCount === 1) {
+              firstSignal = signal;
+              const decision = action("slow-action");
+              const saved = mind.commitThought({
+                expectedRevision: snapshot.revision,
+                decision,
+              });
+              if (saved.accepted)
+                runtimeRef.current?.handleCommittedDecision(
+                  saved.snapshot,
+                  decision,
+                );
+              await firstThoughtGate;
+              return { accepted: saved.accepted, decision };
+            }
+            followupEvents = events;
+            followupSnapshot = snapshot;
+            return { accepted: false };
+          } finally {
+            activeThoughts -= 1;
+          }
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      expect(thoughtCount).toBe(1);
+
+      const hurt = observation();
+      body.setObservation({
+        ...hurt,
+        self: { ...hurt.self, health: 15 },
+      });
+      body.emit({
+        type: "state_changed",
+        reason: "vitals",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        mind
+          .pendingEvents(64)
+          .some(({ summary }) => summary.includes("vitals")),
+      );
+
+      const night = observation();
+      body.setObservation({
+        ...night,
+        time: { ...night.time, timeOfDay: 16_000, isDay: false },
+      });
+      body.emit({
+        type: "state_changed",
+        reason: "time",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        mind.pendingEvents(64).some(({ summary }) => summary.includes("time")),
+      );
+
+      body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "look",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      body.completeActive("successful");
+      await waitFor(() => body.results.length === 1);
+      expect(firstSignal?.aborted).toBe(false);
+      expect(thoughtCount).toBe(1);
+      expect(releaseFirstThought).toBeDefined();
+      releaseFirstThought?.();
+
+      await waitFor(() => thoughtCount === 2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(maxActiveThoughts).toBe(1);
+      expect(thoughtCount).toBe(2);
+      expect(followupEvents.map(({ kind }) => kind)).toEqual(
+        expect.arrayContaining([
+          "state_changed",
+          "operation_stalled",
+          "body_outcome",
+        ]),
+      );
+      expect(followupSnapshot?.lastOutcome?.status).toBe("successful");
+      expect(followupSnapshot?.lastObservation?.timeOfDay).toBe(16_000);
+    } finally {
+      releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("preempts a slow thought for an owner proposal and waits for settlement", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    let thoughtCount = 0;
+    let activeThoughts = 0;
+    let maxActiveThoughts = 0;
+    let firstSignal: AbortSignal | undefined;
+    let followupKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body: new DeferredBody(),
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events, signal }) => {
+          thoughtCount += 1;
+          activeThoughts += 1;
+          maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+          try {
+            if (thoughtCount === 1) {
+              firstSignal = signal;
+              await firstThoughtGate;
+              return { accepted: false };
+            }
+            followupKinds = events.map(({ kind }) => kind);
+            return { accepted: false };
+          } finally {
+            activeThoughts -= 1;
+          }
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      mind.addProposal({ title: "Visit the village", reason: "Meet there" });
+      runtime.onOwnerProposal();
+
+      expect(firstSignal?.aborted).toBe(true);
+      expect(thoughtCount).toBe(1);
+      expect(maxActiveThoughts).toBe(1);
+      releaseFirstThought?.();
+
+      await waitFor(() => thoughtCount === 2);
+      expect(maxActiveThoughts).toBe(1);
+      expect(followupKinds).toContain("owner_proposal");
+    } finally {
+      releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("clears queued thought wakes on stop and does not restart after settlement", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let releaseThought: (() => void) | undefined;
+    const thoughtGate = new Promise<void>((resolve) => {
+      releaseThought = resolve;
+    });
+    let thoughtCount = 0;
+    let signal: AbortSignal | undefined;
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async (input) => {
+          thoughtCount += 1;
+          signal = input.signal;
+          await thoughtGate;
+          return { accepted: false };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "look",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      expect(mind.snapshot().pendingEventKinds).toContain("operation_stalled");
+
+      mind.stop();
+      await runtime.stopNow();
+      expect(signal?.aborted).toBe(true);
+      releaseThought?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      body.emit({ type: "reconnected", at: new Date().toISOString() });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(thoughtCount).toBe(1);
+      expect(runtime.snapshot.stopped).toBe(true);
+    } finally {
+      releaseThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("dispatches an accepted pending wake once despite a newer wait gate", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    let thoughtCount = 0;
+    let followupWaitKinds: readonly string[] = [];
+    let followupEventKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events }) => {
+          thoughtCount += 1;
+          if (thoughtCount === 1) {
+            await firstThoughtGate;
+            return { accepted: true };
+          }
+          followupWaitKinds = snapshot.wait?.wakeOn ?? [];
+          followupEventKinds = events.map(({ kind }) => kind);
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "look",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      const latest = mind.snapshot();
+      const newWait = mind.commitThought({
+        expectedRevision: latest.revision,
+        decision: {
+          kind: "wait",
+          purpose: "wait for the action result",
+          reason: "only reevaluate on a body outcome",
+          wakeOn: ["body_outcome"],
+        },
+      });
+      expect(newWait.accepted).toBe(true);
+
+      releaseFirstThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(followupWaitKinds).toEqual(["body_outcome"]);
+      expect(followupEventKinds).toContain("operation_stalled");
+
+      body.emit({ type: "bot_death", at: new Date().toISOString() });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(thoughtCount).toBe(2);
+    } finally {
+      releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("persists stop across restart and rejects a stale action thought", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
@@ -375,6 +719,9 @@ class DeferredBody implements PlayerBody {
   #listeners = new Set<(event: PlayerBodyEvent) => void>();
   #active = 0;
   #recoveryOnNextResult = false;
+  #finishActive:
+    ((status: PlayerOperationResult["status"]) => void) | undefined;
+  #observation = observation();
   maxConcurrent = 0;
   stopCalls = 0;
 
@@ -383,7 +730,15 @@ class DeferredBody implements PlayerBody {
   }
 
   public async observe(): Promise<PlayerBodyObservation> {
-    return observation();
+    return this.#observation;
+  }
+
+  public setObservation(value: PlayerBodyObservation): void {
+    this.#observation = value;
+  }
+
+  public completeActive(status: PlayerOperationResult["status"]): void {
+    this.#finishActive?.(status);
   }
 
   public execute(
@@ -420,9 +775,11 @@ class DeferredBody implements PlayerBody {
           after: null,
           recoveryRequired,
         };
+        if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);
         resolve(result);
       };
+      this.#finishActive = finish;
       const onAbort = (): void => {
         setTimeout(() => finish("interrupted"), 15);
       };

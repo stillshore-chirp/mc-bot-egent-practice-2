@@ -73,6 +73,11 @@ export interface PlayerRuntimeOptions {
   readonly requestReconnect?: (reason: string) => Promise<void> | void;
 }
 
+interface PendingThoughtWake {
+  readonly kind: PlayerWakeKind;
+  readonly reason: string;
+}
+
 /** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
 export class PlayerRuntime {
   readonly #eventTimes = new Map<string, number>();
@@ -81,6 +86,7 @@ export class PlayerRuntime {
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
   #activeThought: AbortController | undefined;
+  #pendingThoughtWake: PendingThoughtWake | undefined;
   #replacementTail: Promise<void> = Promise.resolve();
   #retryTimer: NodeJS.Timeout | undefined;
   #deadlineTimer: NodeJS.Timeout | undefined;
@@ -375,26 +381,40 @@ export class PlayerRuntime {
     this.#requestThought(kind, event.summary);
   }
 
-  #requestThought(kind: PlayerWakeKind, reason: string): void {
+  #requestThought(
+    kind: PlayerWakeKind,
+    reason: string,
+    acceptedPendingWake = false,
+  ): void {
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
     const current = this.options.mind.snapshot();
     if (
+      !acceptedPendingWake &&
       current.wait !== undefined &&
       !current.wait.wakeOn.includes(kind) &&
-      kind !== "deadline"
+      kind !== "deadline" &&
+      kind !== "owner_proposal"
     )
       return;
     if (
+      !acceptedPendingWake &&
       current.wait?.wakeAt !== undefined &&
       Date.parse(current.wait.wakeAt) > Date.now() &&
       kind !== "owner_proposal" &&
       kind !== "manual"
     )
       return;
-    this.#cancelThought("newer_meaningful_event");
+    const activeThought = this.#activeThought;
+    if (activeThought !== undefined) {
+      this.#queueThoughtWake(kind, reason);
+      if (kind === "owner_proposal")
+        activeThought.abort(new Error("owner_proposal_preempted_thought"));
+      return;
+    }
     const controller = new AbortController();
     this.#activeThought = controller;
     const events = this.options.mind.pendingEvents(32);
+    let retry = false;
     void this.#traceCall("autonomous purpose thought", async () => {
       try {
         const result = await this.options.purpose.think({
@@ -412,27 +432,64 @@ export class PlayerRuntime {
               : events,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
         });
-        if (this.#activeThought === controller) this.#activeThought = undefined;
         if (
           !result.accepted &&
           !controller.signal.aborted &&
           !this.options.mind.snapshot().stopped
         )
-          this.#retryThought();
+          retry = true;
       } catch (error) {
-        if (this.#activeThought === controller) this.#activeThought = undefined;
         if (
           !controller.signal.aborted &&
           !this.#lifetime.signal.aborted &&
           !this.options.mind.snapshot().stopped
         ) {
           this.#logFailure("PLAYER_PURPOSE_THOUGHT_FAILED", error);
-          this.#retryThought();
+          retry = true;
         }
       }
-    }).catch((error: unknown) =>
-      this.#logFailure("PLAYER_THOUGHT_TRACE_FAILED", error),
-    );
+    })
+      .catch((error: unknown) => {
+        this.#logFailure("PLAYER_THOUGHT_TRACE_FAILED", error);
+        retry =
+          !controller.signal.aborted && !this.options.mind.snapshot().stopped;
+      })
+      .finally(() => this.#finishThought(controller, retry));
+  }
+
+  #queueThoughtWake(kind: PlayerWakeKind, reason: string): void {
+    const pending = this.#pendingThoughtWake;
+    if (pending?.kind === "owner_proposal" && kind !== "owner_proposal") return;
+    if (kind === "owner_proposal" || pending === undefined) {
+      this.#pendingThoughtWake = { kind, reason };
+      return;
+    }
+    if (kind !== "state_changed" || pending.kind === "state_changed")
+      this.#pendingThoughtWake = { kind, reason };
+  }
+
+  #finishThought(controller: AbortController, retry: boolean): void {
+    if (this.#activeThought !== controller) return;
+    this.#activeThought = undefined;
+    if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
+      this.#pendingThoughtWake = undefined;
+      return;
+    }
+    if (retry) {
+      this.#retryThought();
+      return;
+    }
+    this.#dispatchPendingThought();
+  }
+
+  #dispatchPendingThought(): void {
+    const pending = this.#pendingThoughtWake;
+    if (pending === undefined) return;
+    this.#pendingThoughtWake = undefined;
+    // The event already passed its wait/deadline gate when queued. A newer
+    // thought may have committed a different wait since then; honor this
+    // accepted wake once against the latest snapshot without widening gates.
+    this.#requestThought(pending.kind, pending.reason, true);
   }
 
   async #replaceBodyOperation(
@@ -631,7 +688,7 @@ export class PlayerRuntime {
 
   #cancelThought(reason: string): void {
     const thought = this.#activeThought;
-    this.#activeThought = undefined;
+    this.#pendingThoughtWake = undefined;
     thought?.abort(new Error(reason));
   }
 
@@ -740,6 +797,10 @@ export class PlayerRuntime {
     this.#retryDelayMs = Math.min(60_000, Math.round(this.#retryDelayMs * 2));
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
+      if (this.#pendingThoughtWake !== undefined) {
+        this.#dispatchPendingThought();
+        return;
+      }
       const event = this.options.mind.enqueueEvent(
         "manual",
         "自律判断の一時失敗をbackoff後に再試行",
