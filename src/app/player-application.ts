@@ -26,6 +26,20 @@ import { TraceService } from "../trace/service.js";
 import { TraceStore } from "../trace/store.js";
 import type { CompanionApplication, LiveEvidence } from "./application.js";
 
+const CHAT_COMMAND_GUARD = "\u200B";
+
+/** Normalize outgoing chat while ensuring no line can become a slash command. */
+export function sanitizeMinecraftChatText(text: string): string {
+  const protectedLines = text.split(/\r\n|\r|\n/u).map((line) => {
+    const leadingWhitespace = /^\s*/u.exec(line)?.[0] ?? "";
+    const content = line.slice(leadingWhitespace.length);
+    return content.startsWith("/")
+      ? `${leadingWhitespace}${CHAT_COMMAND_GUARD}${content}`
+      : line;
+  });
+  return protectedLines.join(" ").replace(/\s+/gu, " ").trim().slice(0, 240);
+}
+
 export class PlayerCompanionApplication implements CompanionApplication {
   readonly #connection: ConnectionManager;
   readonly #minecraft: MineflayerClient;
@@ -356,7 +370,10 @@ export function createPlayerApplication(
       }),
   };
   const runtimeRef: { current?: PlayerRuntime } = {};
-  const say = (text: string): Promise<void> => minecraft.say(text);
+  const say = async (text: string): Promise<void> => {
+    const safeText = sanitizeMinecraftChatText(text);
+    if (safeText.length > 0) await minecraft.say(safeText);
+  };
   const conversation = new PlayerConversationAgent({
     client,
     apiKey: config.openai.apiKey,

@@ -7,6 +7,20 @@ import { describe, expect, it } from "vitest";
 
 import type { AppConfig } from "../../src/config/schema.js";
 import { createApplication } from "../../src/app/application.js";
+import { sanitizeMinecraftChatText } from "../../src/app/player-application.js";
+
+describe("outgoing Minecraft chat normalization", () => {
+  it("prevents slash-leading commands on every line and keeps text bounded", () => {
+    const guard = "\u200B";
+    expect(sanitizeMinecraftChatText("/cmd")).toBe(`${guard}/cmd`);
+    expect(sanitizeMinecraftChatText("\n/cmd")).toBe(`${guard}/cmd`);
+    expect(sanitizeMinecraftChatText("first\r\n/cmd")).toBe(
+      `first ${guard}/cmd`,
+    );
+    expect(sanitizeMinecraftChatText("a".repeat(241))).toHaveLength(240);
+    expect(sanitizeMinecraftChatText("Hello there.")).toBe("Hello there.");
+  });
+});
 
 describe("player application database setup", () => {
   it("creates a missing nested database directory before opening stores", async () => {
