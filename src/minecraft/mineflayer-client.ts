@@ -82,6 +82,7 @@ import { queryStorageIdentity, storageChannel } from "./storage-identity.js";
 import { depositIntoChest } from "./chest-deposit.js";
 import type { ChestTarget } from "../memory/delivery-targets.js";
 import { gatherableLogs } from "../skills/gather-logs/resource-catalog.js";
+import { MineflayerPlayerBody, type PlayerBody } from "./player-body.js";
 
 const unsafeFoods = new Set([
   "chicken",
@@ -555,6 +556,7 @@ function safeDescentBlocked(
 
 export class MineflayerClient implements MinecraftPort {
   private botInstance: Bot | undefined;
+  private playerBodyInstance: MineflayerPlayerBody | undefined;
   private spawned = false;
   private intentionalDisconnect = false;
   private authoritativeOxygen: number | null | undefined;
@@ -569,6 +571,17 @@ export class MineflayerClient implements MinecraftPort {
     private readonly options: MineflayerClientOptions,
     private readonly logger: MinecraftLogger,
   ) {}
+
+  /** Create the unrestricted ordinary-player body facade for the connected bot. */
+  public createPlayerBody(): PlayerBody {
+    this.playerBodyInstance ??= new MineflayerPlayerBody(
+      () => this.requireBot(),
+      this.options.ownerUsername,
+    );
+    if (this.botInstance !== undefined)
+      this.playerBodyInstance.attach(this.botInstance);
+    return this.playerBodyInstance;
+  }
 
   public async connect(signal?: AbortSignal): Promise<void> {
     if (this.spawned) return;
@@ -589,6 +602,7 @@ export class MineflayerClient implements MinecraftPort {
     const bot = mineflayer.createBot(this.options.bot);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
+    this.playerBodyInstance?.attach(bot);
     this.authoritativeOxygen = undefined;
     this.expectedDescentDamage = undefined;
     const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
