@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   McSkillRepository,
   McSkillRepositoryError,
+  type CreateMcSkillInput,
   type McSkillRepositoryOptions,
 } from "../../src/mc-skills/index.js";
 
@@ -92,6 +93,23 @@ function createDigSkill(
     expectedOutcome: "目的の鉱石が所持品に入る。",
     confidence: 0.2,
   });
+}
+
+function hypothesisInput(
+  id?: string,
+  title = "採掘結果から学んだ手順",
+): CreateMcSkillInput {
+  return {
+    ...(id === undefined ? {} : { id }),
+    category: "gathering",
+    title,
+    purpose: "観測した成功を次の採集判断へ活用する。",
+    conditions: ["採掘対象と足場を観測した"],
+    body: "対象を掘り、所持品の変化を確認して手順を調整する。",
+    operationRefs: ["look", "dig"],
+    expectedOutcome: "採掘対象の変化を観測できる。",
+    confidence: 0.1,
+  };
 }
 
 function trustedDigEvidence(
@@ -383,6 +401,203 @@ describe("McSkillRepository", () => {
         proposedOutcome: "successful",
       }),
     ).toThrowError(/operation/iu);
+  });
+
+  it("derives one immutable hypothesis from a seed success without recounting its outcome", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const seed = repository.get("mc-skill-gathering");
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: "model-claimed-success",
+        input: hypothesisInput("untrusted-hypothesis"),
+      }),
+    ).toThrowError(/trusted evidence receipt/iu);
+    const receipt = trustedDigEvidence(repository, "seed-hypothesis-run", {
+      skillIdAtUse: seed.id,
+      skillVersionAtUse: seed.version,
+    });
+    repository.recordOutcome({
+      skillId: seed.id,
+      runId: receipt.runId,
+      proposedOutcome: "successful",
+    });
+    const before = repository.get(seed.id).nativeStatistics;
+    const input = hypothesisInput("derived-from-seed");
+    const learned = repository.createHypothesisFromEvidence({
+      runId: receipt.runId,
+      input,
+    });
+
+    expect(learned).toMatchObject({
+      skill: { id: "derived-from-seed", nativeStatistics: { successful: 0 } },
+      evidenceLink: {
+        runId: receipt.runId,
+        receiptId: receipt.receiptId,
+        skillId: "derived-from-seed",
+        skillVersion: 1,
+        nativeOutcomeRecorded: false,
+      },
+      idempotent: false,
+    });
+    expect(repository.get(seed.id).nativeStatistics).toEqual(before);
+    expect(repository.getEvidence(receipt.runId)).toEqual(receipt);
+    expect(repository.listDerivedHypotheses(learned.skill.id)).toEqual([
+      learned.evidenceLink,
+    ]);
+
+    const duplicate = repository.createHypothesisFromEvidence({
+      runId: receipt.runId,
+      input,
+    });
+    expect(duplicate.idempotent).toBe(true);
+    expect(duplicate.skill.id).toBe(learned.skill.id);
+    expect(repository.listDerivedHypotheses(learned.skill.id)).toHaveLength(1);
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: receipt.runId,
+        input: hypothesisInput("derived-from-seed", "別タイトルの別仮説"),
+      }),
+    ).toThrowError(McSkillRepositoryError);
+    expect(repository.search({ query: "別タイトルの別仮説" })).toHaveLength(0);
+    expect(repository.get(seed.id).nativeStatistics).toEqual(before);
+    expect(repository.get(learned.skill.id).nativeStatistics.successful).toBe(
+      0,
+    );
+
+    const mismatchedReceipt = trustedDigEvidence(
+      repository,
+      "hypothesis-operation-mismatch",
+      { skillIdAtUse: seed.id, skillVersionAtUse: seed.version },
+    );
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: mismatchedReceipt.runId,
+        input: {
+          ...hypothesisInput("missing-operation"),
+          operationRefs: ["look"],
+        },
+      }),
+    ).toThrowError(/operation observed in its trusted receipt/iu);
+    expect(() => repository.get("missing-operation")).toThrowError(
+      McSkillRepositoryError,
+    );
+
+    const failedReceipt = trustedDigEvidence(
+      repository,
+      "failed-hypothesis-run",
+      {
+        observedOutcome: "failed",
+      },
+    );
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: failedReceipt.runId,
+        input: hypothesisInput("failed-hypothesis"),
+      }),
+    ).toThrowError(/observed successful receipt/iu);
+    expect(() => repository.get("failed-hypothesis")).toThrowError(
+      McSkillRepositoryError,
+    );
+  });
+
+  it("atomically records a first native success for a new hypothesis and keeps retries stable across restart", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const receipt = trustedDigEvidence(repository, "novel-hypothesis-run");
+    const input = hypothesisInput();
+    const learned = repository.createHypothesisFromEvidence({
+      runId: receipt.runId,
+      input,
+    });
+    expect(learned.idempotent).toBe(false);
+    expect(learned.evidenceLink.nativeOutcomeRecorded).toBe(true);
+    expect(learned.skill.nativeStatistics.successful).toBe(1);
+    expect(repository.listOutcomes(learned.skill.id)).toMatchObject([
+      {
+        runId: receipt.runId,
+        status: "successful",
+        successHypothesis: true,
+        evidenceReceiptId: receipt.receiptId,
+      },
+    ]);
+
+    const sameRunRetry = repository.createHypothesisFromEvidence({
+      runId: receipt.runId,
+      input,
+    });
+    expect(sameRunRetry.idempotent).toBe(true);
+    expect(sameRunRetry.skill.id).toBe(learned.skill.id);
+    expect(repository.get(learned.skill.id).nativeStatistics.successful).toBe(
+      1,
+    );
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: receipt.runId,
+        input: hypothesisInput(undefined, "再試行で別タイトル"),
+      }),
+    ).toThrowError(McSkillRepositoryError);
+
+    repository.close();
+    const reopened = open(options);
+    const persistedLink = reopened.listDerivedHypotheses(learned.skill.id);
+    expect(persistedLink).toEqual([learned.evidenceLink]);
+    expect(reopened.getEvidence(receipt.runId)).toEqual(receipt);
+    expect(
+      reopened.createHypothesisFromEvidence({ runId: receipt.runId, input })
+        .idempotent,
+    ).toBe(true);
+    expect(reopened.get(learned.skill.id).nativeStatistics.successful).toBe(1);
+  });
+
+  it("rolls back the skill, revision, outcome, and attribution if atomic learning fails", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    trustedDigEvidence(repository, "hypothesis-rollback-run");
+    const blocker = new Database(options.databasePath);
+    blocker.exec(`
+      CREATE TRIGGER reject_hypothesis_outcome
+      BEFORE INSERT ON mc_bot_skill_outcomes
+      WHEN NEW.run_id = 'hypothesis-rollback-run'
+      BEGIN SELECT RAISE(ABORT, 'injected outcome failure'); END;
+    `);
+    blocker.close();
+
+    expect(() =>
+      repository.createHypothesisFromEvidence({
+        runId: "hypothesis-rollback-run",
+        input: hypothesisInput("rollback-hypothesis"),
+      }),
+    ).toThrowError(/injected outcome failure/iu);
+
+    const inspected = new Database(options.databasePath);
+    expect(
+      inspected
+        .prepare("SELECT COUNT(*) AS count FROM mc_bot_skills WHERE id = ?")
+        .get("rollback-hypothesis"),
+    ).toEqual({ count: 0 });
+    expect(
+      inspected
+        .prepare(
+          "SELECT COUNT(*) AS count FROM mc_bot_skill_revisions WHERE skill_id = ?",
+        )
+        .get("rollback-hypothesis"),
+    ).toEqual({ count: 0 });
+    expect(
+      inspected
+        .prepare(
+          "SELECT COUNT(*) AS count FROM mc_bot_skill_outcomes WHERE run_id = ?",
+        )
+        .get("hypothesis-rollback-run"),
+    ).toEqual({ count: 0 });
+    expect(
+      inspected
+        .prepare(
+          "SELECT COUNT(*) AS count FROM mc_bot_skill_derived_hypotheses WHERE run_id = ?",
+        )
+        .get("hypothesis-rollback-run"),
+    ).toEqual({ count: 0 });
+    inspected.close();
   });
 
   it("uses optimistic versions and preserves immutable text revisions", () => {

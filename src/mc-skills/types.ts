@@ -67,6 +67,27 @@ export interface CreateMcSkillInput extends Omit<McSkillDefinition, "id"> {
   readonly id?: string;
 }
 
+export interface CreateMcSkillHypothesisInput {
+  readonly runId: string;
+  readonly input: CreateMcSkillInput;
+}
+
+export interface McSkillHypothesisEvidenceLink {
+  readonly runId: string;
+  readonly receiptId: string;
+  readonly skillId: string;
+  readonly skillVersion: number;
+  /** True only when this call atomically recorded the run as the new skill's first native success. */
+  readonly nativeOutcomeRecorded: boolean;
+  readonly createdAt: string;
+}
+
+export interface CreateMcSkillHypothesisResult {
+  readonly skill: McSkillRecord;
+  readonly evidenceLink: McSkillHypothesisEvidenceLink;
+  readonly idempotent: boolean;
+}
+
 export interface ReviseMcSkillInput {
   readonly skillId: string;
   readonly expectedVersion: number;

@@ -23,12 +23,15 @@ import { z } from "zod";
 import {
   mcSkillCategories,
   mcSkillOutcomeStatuses,
+  type CreateMcSkillHypothesisInput,
+  type CreateMcSkillHypothesisResult,
   type CreateMcSkillInput,
   type ExportedMcSkillResult,
   type ImportedMcSkillResult,
   type ImportedMcSkillStatistics,
   type McSkillCategory,
   type McSkillDefinition,
+  type McSkillHypothesisEvidenceLink,
   type McSkillOutcome,
   type McSkillOutcomeStatus,
   type McSkillRecord,
@@ -172,6 +175,16 @@ interface ImportReceiptRow {
   readonly import_key: string;
   readonly skill_id: string;
   readonly fingerprint: string;
+}
+
+interface DerivedHypothesisRow {
+  readonly run_id: string;
+  readonly receipt_id: string;
+  readonly skill_id: string;
+  readonly skill_version: number;
+  readonly definition_digest: string;
+  readonly native_outcome_recorded: number;
+  readonly created_at: string;
 }
 
 interface OutcomeCountRow {
@@ -339,6 +352,25 @@ const schemaSql = `
   CREATE TRIGGER IF NOT EXISTS mc_bot_skill_receipts_no_delete
     BEFORE DELETE ON mc_bot_skill_evidence_receipts BEGIN
       SELECT RAISE(ABORT, 'skill evidence receipts are immutable');
+    END;
+  CREATE TABLE IF NOT EXISTS mc_bot_skill_derived_hypotheses (
+    run_id TEXT PRIMARY KEY REFERENCES mc_bot_skill_evidence_receipts(run_id) ON DELETE RESTRICT,
+    receipt_id TEXT NOT NULL UNIQUE REFERENCES mc_bot_skill_evidence_receipts(receipt_id) ON DELETE RESTRICT,
+    skill_id TEXT NOT NULL REFERENCES mc_bot_skills(id) ON DELETE RESTRICT,
+    skill_version INTEGER NOT NULL CHECK (skill_version > 0),
+    definition_digest TEXT NOT NULL,
+    native_outcome_recorded INTEGER NOT NULL CHECK (native_outcome_recorded IN (0, 1)),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS mc_bot_skill_derived_hypotheses_skill_idx
+    ON mc_bot_skill_derived_hypotheses(skill_id, created_at DESC);
+  CREATE TRIGGER IF NOT EXISTS mc_bot_skill_derived_hypotheses_no_update
+    BEFORE UPDATE ON mc_bot_skill_derived_hypotheses BEGIN
+      SELECT RAISE(ABORT, 'derived skill hypotheses are immutable');
+    END;
+  CREATE TRIGGER IF NOT EXISTS mc_bot_skill_derived_hypotheses_no_delete
+    BEFORE DELETE ON mc_bot_skill_derived_hypotheses BEGIN
+      SELECT RAISE(ABORT, 'derived skill hypotheses are immutable');
     END;
   CREATE TABLE IF NOT EXISTS mc_bot_skill_outcomes (
     skill_id TEXT NOT NULL REFERENCES mc_bot_skills(id) ON DELETE RESTRICT,
@@ -516,6 +548,171 @@ export class McSkillRepository {
     return this.get(skill.id);
   }
 
+  /**
+   * Creates a hypothesis from a stored successful receipt. A learning facade
+   * may call this with a model proposal; this method revalidates the receipt,
+   * operation reference, and run-level idempotency inside one transaction.
+   */
+  public createHypothesisFromEvidence(
+    input: CreateMcSkillHypothesisInput,
+  ): CreateMcSkillHypothesisResult {
+    const runId = shortText(input.runId, "runId");
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/u.test(runId)) {
+      throw validationError("runId must be an opaque alphanumeric identifier");
+    }
+    const transaction = this.database.transaction(() => {
+      const receipt = this.database
+        .prepare<[string], EvidenceRow>(
+          "SELECT * FROM mc_bot_skill_evidence_receipts WHERE run_id = ?",
+        )
+        .get(runId);
+      if (receipt === undefined) {
+        throw new McSkillRepositoryError(
+          "NOT_FOUND",
+          "A trusted evidence receipt for this run was not found",
+        );
+      }
+      if (receipt.observed_outcome !== "successful") {
+        throw validationError(
+          "Only an observed successful receipt can create a skill hypothesis",
+        );
+      }
+      this.validateReceiptSkillVersion(receipt);
+
+      const existingLink = this.database
+        .prepare<[string], DerivedHypothesisRow>(
+          "SELECT * FROM mc_bot_skill_derived_hypotheses WHERE run_id = ?",
+        )
+        .get(runId);
+      const existingOutcome = this.database
+        .prepare<[string], OutcomeRow>(
+          "SELECT * FROM mc_bot_skill_outcomes WHERE run_id = ?",
+        )
+        .get(runId);
+      const expectedOutcomeSkillId =
+        receipt.skill_id_at_use ?? existingLink?.skill_id;
+      const existingOutcomeMatchesReceipt =
+        existingOutcome !== undefined &&
+        existingOutcome.status === "successful" &&
+        existingOutcome.evidence_receipt_id === receipt.receipt_id &&
+        (expectedOutcomeSkillId === undefined ||
+          existingOutcome.skill_id === expectedOutcomeSkillId);
+      const reusableOutcome =
+        existingLink === undefined &&
+        receipt.skill_id_at_use === null &&
+        existingOutcomeMatchesReceipt;
+      if (
+        (existingOutcome !== undefined && !existingOutcomeMatchesReceipt) ||
+        (existingLink?.native_outcome_recorded === 1 &&
+          !existingOutcomeMatchesReceipt)
+      ) {
+        throw new McSkillRepositoryError(
+          "OUTCOME_CONFLICT",
+          "The successful receipt already has a different native outcome attribution",
+        );
+      }
+
+      const skillId =
+        input.input.id ??
+        existingLink?.skill_id ??
+        (reusableOutcome ? existingOutcome?.skill_id : undefined) ??
+        randomUUID();
+      const skill = normalizeSkill({ ...input.input, id: skillId });
+      this.validateOperationRefs(skill.operationRefs);
+      if (!skill.operationRefs.includes(receipt.operation_name)) {
+        throw validationError(
+          "The hypothesis must reference the operation observed in its trusted receipt",
+        );
+      }
+      const skillDigest = definitionDigest(skill);
+
+      if (existingLink !== undefined) {
+        if (
+          existingLink.skill_id !== skill.id ||
+          existingLink.definition_digest !== skillDigest
+        ) {
+          throw new McSkillRepositoryError(
+            "OUTCOME_CONFLICT",
+            "This run already produced a different skill hypothesis",
+          );
+        }
+        return {
+          skill: this.get(existingLink.skill_id),
+          evidenceLink: derivedHypothesisFromRow(existingLink),
+          idempotent: true,
+        };
+      }
+
+      const skillVersion = 1;
+      let nativeOutcomeRecorded = false;
+      const now = new Date().toISOString();
+      if (reusableOutcome) {
+        const initialRevision = this.database
+          .prepare<[string], RevisionRow>(
+            "SELECT * FROM mc_bot_skill_revisions WHERE skill_id = ? AND version = 1",
+          )
+          .get(skill.id);
+        if (
+          initialRevision === undefined ||
+          definitionDigest(definitionFromRevisionRow(initialRevision)) !==
+            skillDigest
+        ) {
+          throw new McSkillRepositoryError(
+            "OUTCOME_CONFLICT",
+            "The existing native outcome belongs to a different skill definition",
+          );
+        }
+      } else {
+        if (this.findSkillRow(skill.id) !== undefined) {
+          throw new McSkillRepositoryError(
+            "ID_CONFLICT",
+            "A skill with this id already exists",
+          );
+        }
+        this.insertSkill(skill, skillVersion, now, now);
+        this.insertRevision(
+          skill,
+          skillVersion,
+          "create",
+          "観測済みの成功から仮説を作成",
+          now,
+        );
+        if (receipt.skill_id_at_use === null) {
+          this.insertHypothesisNativeOutcome(skill, receipt, now);
+          nativeOutcomeRecorded = true;
+        }
+      }
+
+      this.database
+        .prepare(
+          "INSERT INTO mc_bot_skill_derived_hypotheses (run_id, receipt_id, skill_id, skill_version, definition_digest, native_outcome_recorded, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          runId,
+          receipt.receipt_id,
+          skill.id,
+          skillVersion,
+          skillDigest,
+          nativeOutcomeRecorded ? 1 : 0,
+          now,
+        );
+      const storedLink = this.database
+        .prepare<[string], DerivedHypothesisRow>(
+          "SELECT * FROM mc_bot_skill_derived_hypotheses WHERE run_id = ?",
+        )
+        .get(runId);
+      if (storedLink === undefined) {
+        throw new Error("Derived skill hypothesis did not persist");
+      }
+      return {
+        skill: this.get(skill.id),
+        evidenceLink: derivedHypothesisFromRow(storedLink),
+        idempotent: false,
+      };
+    });
+    return transaction.immediate();
+  }
+
   public revise(input: ReviseMcSkillInput): McSkillRecord {
     const transaction = this.database.transaction(() => {
       const current = this.skillRow(input.skillId);
@@ -563,8 +760,9 @@ export class McSkillRepository {
   }
 
   /**
-   * This writer belongs in the game-observation/verification code path. Keep
-   * it out of GPT tool definitions; model-proposed outcomes use recordOutcome.
+   * Only game-observation/verification code may call this writer. Never issue
+   * a trusted receipt from GPT/model input or expose this method as a GPT tool.
+   * Model-proposed outcomes use recordOutcome instead.
    */
   public recordTrustedEvidence(
     input: RecordTrustedMcSkillEvidenceInput,
@@ -739,6 +937,24 @@ export class McSkillRepository {
       )
       .get(runId);
     return row === undefined ? undefined : evidenceFromRow(row);
+  }
+
+  public listDerivedHypotheses(
+    skillId: string,
+    limit = 50,
+  ): McSkillHypothesisEvidenceLink[] {
+    this.skillRow(skillId);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH_LIMIT) {
+      throw validationError(
+        `Hypothesis limit must be from 1 to ${MAX_SEARCH_LIMIT}`,
+      );
+    }
+    return this.database
+      .prepare<[string, number], DerivedHypothesisRow>(
+        "SELECT * FROM mc_bot_skill_derived_hypotheses WHERE skill_id = ? ORDER BY created_at DESC, run_id DESC LIMIT ?",
+      )
+      .all(skillId, limit)
+      .map(derivedHypothesisFromRow);
   }
 
   public listOutcomes(skillId: string, limit = 50): McSkillOutcome[] {
@@ -1157,6 +1373,50 @@ export class McSkillRepository {
     }
   }
 
+  private validateReceiptSkillVersion(receipt: EvidenceRow): void {
+    if (receipt.skill_id_at_use === null) return;
+    if (receipt.skill_version_at_use === null) {
+      throw new McSkillRepositoryError(
+        "OUTCOME_CONFLICT",
+        "The trusted receipt does not identify the skill version used",
+      );
+    }
+    const revision = this.database
+      .prepare<[string, number], { readonly operation_refs_json: string }>(
+        "SELECT operation_refs_json FROM mc_bot_skill_revisions WHERE skill_id = ? AND version = ?",
+      )
+      .get(receipt.skill_id_at_use, receipt.skill_version_at_use);
+    if (
+      revision === undefined ||
+      !parseJson<string[]>(revision.operation_refs_json).includes(
+        receipt.operation_name,
+      )
+    ) {
+      throw new McSkillRepositoryError(
+        "OUTCOME_CONFLICT",
+        "The trusted operation is absent from the referenced skill revision",
+      );
+    }
+  }
+
+  private insertHypothesisNativeOutcome(
+    skill: McSkillDefinition,
+    receipt: EvidenceRow,
+    recordedAt: string,
+  ): void {
+    this.database
+      .prepare(
+        "INSERT INTO mc_bot_skill_outcomes (skill_id, run_id, proposed_outcome, status, summary, evidence_receipt_id, skill_version_at_use, success_hypothesis, recorded_at) VALUES (?, ?, 'successful', 'successful', ?, ?, NULL, 1, ?)",
+      )
+      .run(
+        skill.id,
+        receipt.run_id,
+        "観測済み成功から初回Skill仮説を作成",
+        receipt.receipt_id,
+        recordedAt,
+      );
+  }
+
   private exchangePath(fileName: string, allowMissing: boolean): string {
     this.assertExchangeDirectory();
     const safeName = safeFileName(fileName);
@@ -1440,6 +1700,19 @@ function outcomeFromRow(row: OutcomeRow): McSkillOutcome {
       : { skillVersionAtUse: row.skill_version_at_use }),
     successHypothesis: row.success_hypothesis === 1,
     recordedAt: row.recorded_at,
+  };
+}
+
+function derivedHypothesisFromRow(
+  row: DerivedHypothesisRow,
+): McSkillHypothesisEvidenceLink {
+  return {
+    runId: row.run_id,
+    receiptId: row.receipt_id,
+    skillId: row.skill_id,
+    skillVersion: row.skill_version,
+    nativeOutcomeRecorded: row.native_outcome_recorded === 1,
+    createdAt: row.created_at,
   };
 }
 
