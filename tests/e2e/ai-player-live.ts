@@ -37,6 +37,20 @@ const DEFAULT_JAVA_HOME =
 const SERVER_VERSION = "1.21.11";
 const MODEL = "gpt-6-luna";
 const WORLD_SEED = "720926";
+const E2E_GAMERULES = {
+  advanceTime: {
+    id: "minecraft:advance_time",
+    readbackFailure: "WORLD_ADVANCE_TIME_READBACK_MISMATCH",
+  },
+  spawnMobs: {
+    id: "minecraft:spawn_mobs",
+    readbackFailure: "WORLD_SPAWN_MOBS_READBACK_MISMATCH",
+  },
+  keepInventory: {
+    id: "minecraft:keep_inventory",
+    readbackFailure: "WORLD_KEEP_INVENTORY_READBACK_MISMATCH",
+  },
+} as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
 const RUN_BUDGET_LIMITS = {
@@ -2302,9 +2316,9 @@ function classifyServerStartupFailure(tail: string, fallback: string): string {
 }
 
 async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
-  await rcon.command("gamerule doDaylightCycle false");
-  await rcon.command("gamerule doMobSpawning false");
-  await rcon.command("gamerule keepInventory true");
+  await setAndVerifyGamerule(rcon, "advanceTime", false);
+  await setAndVerifyGamerule(rcon, "spawnMobs", false);
+  await setAndVerifyGamerule(rcon, "keepInventory", true);
   await rcon.command("time set 1000");
   await rcon.command("weather clear");
   await rcon.command("setworldspawn 0 64 0");
@@ -2322,6 +2336,22 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   await rcon.command("scoreboard objectives add ai_e2e dummy");
   await rcon.command("scoreboard players set #diff ai_e2e 0");
   await mkdir(dirname(state.databasePath), { recursive: true, mode: 0o700 });
+}
+
+async function setAndVerifyGamerule(
+  rcon: LocalRcon,
+  rule: keyof typeof E2E_GAMERULES,
+  value: boolean,
+): Promise<void> {
+  const { id, readbackFailure } = E2E_GAMERULES[rule];
+  await rcon.command(`gamerule ${id} ${value}`);
+  const readback = (await rcon.command(`gamerule ${id}`))
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/gu, " ");
+  const reportedValue = /(?:^|\s)(true|false)$/u.exec(readback)?.[1];
+  if (!readback.includes(id) || reportedValue !== String(value))
+    incomplete(readbackFailure);
 }
 
 async function assertNoOperators(state: RunState): Promise<void> {
@@ -3051,7 +3081,7 @@ async function configureUnknownFixture(
     `fill ${target.x - 5} 64 ${z - 2} ${target.x - 2} 64 ${z + 2} water`,
   );
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
-  await rcon.command("gamerule doDaylightCycle true");
+  await setAndVerifyGamerule(rcon, "advanceTime", true);
   await rcon.command("time set 11500");
 }
 
