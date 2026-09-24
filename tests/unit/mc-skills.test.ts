@@ -140,6 +140,15 @@ function updateMetadata(
   writeFileSync(filePath, content.replace(expression, replacement), "utf8");
 }
 
+function readMetadata(filePath: string): Record<string, unknown> {
+  const content = readFileSync(filePath, "utf8");
+  const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
+  const match = expression.exec(content);
+  if (match === null || match[1] === undefined)
+    throw new Error("Metadata fence is missing");
+  return JSON.parse(match[1]) as Record<string, unknown>;
+}
+
 function copyMarkdownWithSkillId(
   sourcePath: string,
   targetPath: string,
@@ -454,7 +463,7 @@ describe("McSkillRepository", () => {
     );
   });
 
-  it("carries imported statistics through another export without colliding across target skills", () => {
+  it("preserves distinct repository origins through relays and keeps an origin stable after reopen", () => {
     const { directory, options } = createFixture();
     const origin = open(options);
     const skill = createDigSkill(origin, "origin-skill");
@@ -467,30 +476,69 @@ describe("McSkillRepository", () => {
       runId: receipt.runId,
       proposedOutcome: "successful",
     });
-    origin.exportSkill(skill.id, "origin.md");
+    const originExport = origin.exportSkill(skill.id, "origin.md");
+    const originMetadata = readMetadata(originExport.path);
+    const originProvenance = originMetadata.provenance;
 
-    const relay = open({
+    const relayOptions = {
       ...options,
       databasePath: join(directory, "relay.sqlite"),
-    });
+    };
+    const relay = open(relayOptions);
     relay.importSkill("origin.md");
-    relay.exportSkill(skill.id, "relay.md");
+    const relaySkill = relay.get(skill.id);
+    const relayReceipt = trustedDigEvidence(relay, "relay-native-run", {
+      skillIdAtUse: relaySkill.id,
+      skillVersionAtUse: relaySkill.version,
+    });
+    relay.recordOutcome({
+      skillId: relaySkill.id,
+      runId: relayReceipt.runId,
+      proposedOutcome: "successful",
+    });
+    const relayExport = relay.exportSkill(skill.id, "relay.md");
+    const relayMetadata = readMetadata(relayExport.path);
+    const relayProvenance = relayMetadata.provenance;
+    expect(relayProvenance).not.toBe(originProvenance);
+
+    relay.close();
+    const reopenedRelay = open(relayOptions);
+    const reopenedExport = reopenedRelay.exportSkill(
+      skill.id,
+      "relay-reopened.md",
+    );
+    expect(readMetadata(reopenedExport.path).provenance).toBe(relayProvenance);
 
     const target = open({
       ...options,
       databasePath: join(directory, "target.sqlite"),
     });
-    const first = target.importSkill("relay.md");
+    const first = target.importSkill("relay-reopened.md");
     expect(first.skill.nativeStatistics.successful).toBe(0);
+    expect(first.skill.importedStatistics).toHaveLength(2);
     expect(first.skill.importedStatistics).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ sourceSkillId: skill.id, successful: 1 }),
+        expect.objectContaining({
+          sourceSkillId: skill.id,
+          successful: 1,
+          provenance: originProvenance,
+        }),
+        expect.objectContaining({
+          sourceSkillId: skill.id,
+          successful: 1,
+          provenance: relayProvenance,
+        }),
       ]),
     );
+    expect(
+      new Set(
+        first.skill.importedStatistics.map(({ provenance }) => provenance),
+      ).size,
+    ).toBe(2);
 
     const copiedMarkdown = join(options.exchangeDirectory, "relay-copy.md");
     copyMarkdownWithSkillId(
-      join(options.exchangeDirectory, "relay.md"),
+      reopenedExport.path,
       copiedMarkdown,
       "relay-copy-skill",
     );

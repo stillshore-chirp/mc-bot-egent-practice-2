@@ -20,7 +20,7 @@ MC Bot Skill は、Minecraftで繰り返し使える行動の要点を、目的�
 
 `exportSkill(skillId, fileName?)` と `importSkill(fileName)` は、open時に設定した交換directory内のMarkdownファイル名だけを受け取ります。`..`、区切り文字、symbolic link、regular fileでないentryを拒否します。読み込み時は `O_NOFOLLOW` とfile descriptorのsize確認を使い、canonical pathが交換directory内にあることを再確認します。交換ファイルはresource limitとして64 KiBまでです。
 
-ファイルは `mc-bot-skill` fenced JSON metadata（schema version 1）と `## 本文` セクションで構成します。metadataにはSkill ID/version、base digest、native outcome集計、import済み統計と各provenanceが入ります。本文はfenceの後ろに一度だけ書きます。import時にJSON schema、version、本文見出し、利用側から渡された `allowedOperationNames` を検証し、内容はデータとしてのみ扱います。SQLite側のSkill payloadは48 KiB、証跡とoutcome payloadは各16 KiB、交換Markdownは64 KiBまでのresource boundを設けます。
+ファイルは `mc-bot-skill` fenced JSON metadata（schema version 1）と `## 本文` セクションで構成します。metadataにはSkill ID/version、base digest、native outcome集計、import済み統計と各provenanceが入ります。export元のprovenanceにはDBごとに永続化するsynthetic UUIDを含め、別DBで中継してもimport済みのsource provenanceを保持します。本文はfenceの後ろに一度だけ書きます。import時にJSON schema、version、本文見出し、利用側から渡された `allowedOperationNames` を検証し、内容はデータとしてのみ扱います。SQLite側のSkill payloadは48 KiB、証跡とoutcome payloadは各16 KiB、交換Markdownは64 KiBまでのresource boundを設けます。
 
 既存Skillへの編集importはexport時のbase versionとdigestが現在記録に一致する場合だけ適用し、immutable revisionを一つ追加します。別の更新が先に入っていればversion conflictになります。同じsource ID/versionと内容の再importはidempotentです。native outcomeはoutcome行から算出し、import統計は移入先Skill・source ID/version・provenanceごとの別テーブルに保持します。各versionの統計は独立したprovenance snapshotとして置き、異なるversionの値を実行回数として加算しません。再importでは同じsnapshotを置き換えるため、外部統計がnative experienceに混ざりません。再exportでもnativeとimport済み統計を別々に運びます。
 

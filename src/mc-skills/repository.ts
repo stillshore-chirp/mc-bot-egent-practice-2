@@ -375,12 +375,17 @@ const schemaSql = `
     skill_id TEXT NOT NULL REFERENCES mc_bot_skills(id) ON DELETE RESTRICT,
     fingerprint TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS mc_bot_skill_repository_metadata (
+    metadata_key TEXT PRIMARY KEY,
+    metadata_value TEXT NOT NULL
+  );
 `;
 
 export class McSkillRepository {
   private readonly database: Database.Database;
   private readonly exchangeDirectory: string;
   private readonly allowedOperationNames: ReadonlySet<string>;
+  private readonly repositoryOrigin: string;
 
   private constructor(options: McSkillRepositoryOptions) {
     this.allowedOperationNames = new Set(options.allowedOperationNames);
@@ -410,6 +415,7 @@ export class McSkillRepository {
       this.database.pragma("journal_mode = WAL");
     }
     this.seedInitialSkills();
+    this.repositoryOrigin = this.ensureRepositoryOrigin();
   }
 
   public static open(options: McSkillRepositoryOptions): McSkillRepository {
@@ -759,6 +765,7 @@ export class McSkillRepository {
     const content = formatExchangeDocument(
       skill,
       nativeStatisticsFromRecord(skill),
+      this.repositoryOrigin,
     );
     const target = this.exchangePath(fileName, true);
     const temporaryPath = resolve(
@@ -961,6 +968,31 @@ export class McSkillRepository {
       }
     });
     transaction.immediate();
+  }
+
+  private ensureRepositoryOrigin(): string {
+    const transaction = this.database.transaction(() => {
+      this.database
+        .prepare(
+          "INSERT OR IGNORE INTO mc_bot_skill_repository_metadata (metadata_key, metadata_value) VALUES ('repository_origin', ?)",
+        )
+        .run(randomUUID());
+      const row = this.database
+        .prepare<[], { readonly metadata_value: string }>(
+          "SELECT metadata_value FROM mc_bot_skill_repository_metadata WHERE metadata_key = 'repository_origin'",
+        )
+        .get();
+      if (
+        row === undefined ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+          row.metadata_value,
+        )
+      ) {
+        throw new Error("Skill repository origin metadata is invalid");
+      }
+      return row.metadata_value;
+    });
+    return transaction.immediate();
   }
 
   private upsertImportedStatistics(
@@ -1470,6 +1502,7 @@ function digest(value: string): string {
 function formatExchangeDocument(
   skill: McSkillRecord,
   statistics: McSkillStatistics,
+  repositoryOrigin: string,
 ): string {
   const definition: McSkillDefinition = {
     id: skill.id,
@@ -1489,7 +1522,7 @@ function formatExchangeDocument(
     baseDigest: definitionDigest(definition),
     skill: definition,
     statistics: { native: statistics, imported: skill.importedStatistics },
-    provenance: "mc-bot-skill repository export",
+    provenance: `mc-bot-skill repository:${repositoryOrigin}`,
   };
   const { body: _body, ...metadataSkill } = definition;
   const serializedMetadata = { ...metadata, skill: metadataSkill };
