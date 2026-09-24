@@ -559,6 +559,7 @@ export class MineflayerClient implements MinecraftPort {
   private playerBodyInstance: MineflayerPlayerBody | undefined;
   private spawned = false;
   private intentionalDisconnect = false;
+  private connectionEpoch = 0;
   private authoritativeOxygen: number | null | undefined;
   private expectedDescentDamage: ExpectedDescentDamage | undefined;
   private readonly chatListeners = new Set<
@@ -599,12 +600,16 @@ export class MineflayerClient implements MinecraftPort {
       });
     }
     this.intentionalDisconnect = false;
+    const connectionEpoch = ++this.connectionEpoch;
     const bot = mineflayer.createBot(this.options.bot);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
     this.playerBodyInstance?.attach(bot);
     this.authoritativeOxygen = undefined;
     this.expectedDescentDamage = undefined;
+    const sendsPlayerLoadedPacket = bot.supportFeature(
+      "sendsPlayerLoadedPacket",
+    );
     const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
     bot._client.on("entity_metadata", (packet) => {
       const botEntity = bot.entity;
@@ -635,8 +640,16 @@ export class MineflayerClient implements MinecraftPort {
       const observedAt = new Date().toISOString();
       for (const listener of this.deathListeners) listener(observedAt);
     });
+    let connectionOpen = true;
+    let invalidatePendingSpawn: (() => void) | undefined;
+    let rejectPendingConnect: ((reason: string) => void) | undefined;
     bot.on("end", (reason) => {
+      if (this.botInstance !== bot || this.connectionEpoch !== connectionEpoch)
+        return;
+      connectionOpen = false;
+      invalidatePendingSpawn?.();
       this.spawned = false;
+      rejectPendingConnect?.(reason);
       this.logger.warn(
         { intentional: this.intentionalDisconnect },
         "Minecraft connection ended",
@@ -644,19 +657,56 @@ export class MineflayerClient implements MinecraftPort {
       for (const listener of this.disconnectListeners) listener(reason);
     });
     await new Promise<void>((resolve, reject) => {
-      const cleanup = (): void => {
+      let connectSettled = false;
+      let spawnGeneration = 0;
+      const invalidateSpawnWork = (): void => {
+        spawnGeneration += 1;
+      };
+      invalidatePendingSpawn = invalidateSpawnWork;
+      const cleanupConnectWait = (): void => {
         bot.off("login", onLogin);
-        bot.off("spawn", onSpawn);
-        bot.off("error", onError);
         signal?.removeEventListener("abort", onAbort);
       };
+      const settleResolve = (): void => {
+        if (connectSettled) return;
+        connectSettled = true;
+        cleanupConnectWait();
+        resolve();
+      };
+      const settleReject = (error: Error): void => {
+        if (connectSettled) return;
+        connectSettled = true;
+        cleanupConnectWait();
+        reject(error);
+      };
+      rejectPendingConnect = (reason): void =>
+        settleReject(
+          new AppError({
+            category: "connection",
+            code: "MINECRAFT_CONNECT_FAILED",
+            message: `Minecraft connection ended before ready: ${reason}`,
+            retryable: true,
+          }),
+        );
+      const isCurrentSpawn = (generation: number): boolean =>
+        connectionOpen &&
+        this.botInstance === bot &&
+        this.connectionEpoch === connectionEpoch &&
+        spawnGeneration === generation &&
+        !this.intentionalDisconnect;
       const onLogin = (): void => {
+        if (
+          this.botInstance !== bot ||
+          this.connectionEpoch !== connectionEpoch
+        )
+          return;
         if (!sameMinecraftIdentity(bot.username, this.options.ownerUsername))
           return;
-        cleanup();
         this.intentionalDisconnect = true;
-        bot.end("identity conflict");
-        reject(
+        connectionOpen = false;
+        invalidateSpawnWork();
+        this.spawned = false;
+        settleReject(
           new AppError({
             category: "connection",
             code: "MINECRAFT_IDENTITY_CONFLICT",
@@ -664,53 +714,123 @@ export class MineflayerClient implements MinecraftPort {
             retryable: false,
           }),
         );
+        bot.end("identity conflict");
       };
       const onSpawn = (): void => {
-        cleanup();
-        this.spawned = true;
-        bot._client.write("custom_payload", {
-          channel: "minecraft:register",
-          data: Buffer.from(
-            `${treeProtectionChannel}\0${storageChannel}\0${actionGuardChannel}`,
-          ),
+        if (
+          this.botInstance !== bot ||
+          this.connectionEpoch !== connectionEpoch ||
+          this.intentionalDisconnect ||
+          !connectionOpen
+        )
+          return;
+        const generation = ++spawnGeneration;
+        if (!connectSettled) {
+          bot._client.write("custom_payload", {
+            channel: "minecraft:register",
+            data: Buffer.from(
+              `${treeProtectionChannel}\0${storageChannel}\0${actionGuardChannel}`,
+            ),
+          });
+          const movements = new NavigationMovements(bot);
+          bot.pathfinder.setMovements(movements);
+          bot.pathfinder.thinkTimeout = this.options.pathfinderThinkTimeoutMs;
+          bot.pathfinder.tickTimeout = this.options.pathfinderTickTimeoutMs;
+          this.logger.info(
+            { minecraftVersion: bot.version },
+            "Minecraft bot spawned",
+          );
+        }
+        void (async () => {
+          if (sendsPlayerLoadedPacket) await bot.waitForChunksToLoad();
+          if (!isCurrentSpawn(generation)) return;
+          if (sendsPlayerLoadedPacket) bot._client.write("player_loaded", {});
+          this.spawned = true;
+          settleResolve();
+        })().catch((error: unknown) => {
+          if (!isCurrentSpawn(generation)) return;
+          connectionOpen = false;
+          invalidateSpawnWork();
+          this.spawned = false;
+          if (!connectSettled) {
+            settleReject(
+              new AppError(
+                {
+                  category: "connection",
+                  code: "MINECRAFT_CONNECT_FAILED",
+                  message:
+                    error instanceof Error
+                      ? error.message
+                      : "Minecraft chunks failed to load",
+                  retryable: true,
+                },
+                { cause: error },
+              ),
+            );
+          } else {
+            this.logger.warn(
+              { errorType: error instanceof Error ? error.name : typeof error },
+              "Minecraft respawn chunks failed to load",
+            );
+          }
+          bot.end("chunk loading failed");
         });
-        const movements = new NavigationMovements(bot);
-        bot.pathfinder.setMovements(movements);
-        bot.pathfinder.thinkTimeout = this.options.pathfinderThinkTimeoutMs;
-        bot.pathfinder.tickTimeout = this.options.pathfinderTickTimeoutMs;
-        this.logger.info(
-          { minecraftVersion: bot.version },
-          "Minecraft bot spawned",
-        );
-        resolve();
       };
       const onError = (error: Error): void => {
-        cleanup();
-        reject(
-          new AppError(
-            {
-              category: "connection",
-              code: "MINECRAFT_CONNECT_FAILED",
-              message: error.message,
-              retryable: true,
-            },
-            { cause: error },
-          ),
-        );
+        if (
+          this.botInstance !== bot ||
+          this.connectionEpoch !== connectionEpoch
+        )
+          return;
+        connectionOpen = false;
+        invalidateSpawnWork();
+        this.spawned = false;
+        if (!connectSettled)
+          settleReject(
+            new AppError(
+              {
+                category: "connection",
+                code: "MINECRAFT_CONNECT_FAILED",
+                message: error.message,
+                retryable: true,
+              },
+              { cause: error },
+            ),
+          );
+        bot.end("connection error");
       };
       const onAbort = (): void => {
-        cleanup();
-        bot.end("connect cancelled");
-        reject(
+        if (
+          this.botInstance !== bot ||
+          this.connectionEpoch !== connectionEpoch
+        )
+          return;
+        this.intentionalDisconnect = true;
+        connectionOpen = false;
+        invalidateSpawnWork();
+        this.spawned = false;
+        settleReject(
           signal?.reason instanceof Error
             ? signal.reason
             : new Error("Minecraft connection cancelled"),
         );
+        bot.end("connect cancelled");
       };
       bot.once("login", onLogin);
-      bot.once("spawn", onSpawn);
-      bot.once("error", onError);
+      bot.on("spawn", onSpawn);
+      bot.on("error", onError);
+      bot._client.on("respawn", () => {
+        if (
+          this.botInstance !== bot ||
+          this.connectionEpoch !== connectionEpoch ||
+          !connectionOpen
+        )
+          return;
+        invalidateSpawnWork();
+        this.spawned = false;
+      });
       signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
     bot.on("kicked", (reason) => {
       this.logger.warn(
@@ -723,9 +843,12 @@ export class MineflayerClient implements MinecraftPort {
   public async disconnect(reason = "shutdown"): Promise<void> {
     this.intentionalDisconnect = true;
     this.expectedDescentDamage = undefined;
+    const bot = this.botInstance;
+    const connectionEpoch = this.connectionEpoch;
     await this.stopCurrentAction();
-    this.botInstance?.end(reason);
-    this.spawned = false;
+    bot?.end(reason);
+    if (this.botInstance === bot && this.connectionEpoch === connectionEpoch)
+      this.spawned = false;
   }
 
   public onChat(
