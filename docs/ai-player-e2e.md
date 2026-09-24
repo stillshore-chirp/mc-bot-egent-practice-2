@@ -12,20 +12,20 @@
 
 ## Issue #72 の機械的な確認範囲
 
-| Issue受け入れ条件     | ケースと根拠                                                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 身体操作の接続        | `body_operation_smoke` は非OPのPlayerBodyを直接使い、採掘・視点変更・かまど画面の開閉と入出庫をBody観測およびRCONで照合します。GPT受け入れは別に集計します。                                                                                |
-| 既存層の見直し        | `runtime_contract` が既定アプリのplayer runtime evidenceと接続を確認し、`autonomous_life` がowner指示なしの実行を確認します。既存legacy経路との静的な責務確認はソース・設計文書も併せてレビューします。                                     |
-| 自発的な生活          | `autonomous_life` はself由来の目標、GPT判断、成功した操作結果、RCONで観測する位置・所持品・fixture regionのいずれかの実変化を要求します。操作kindを`place`等に固定しません。                                                                |
-| 未知の状況への対応    | `unknown_composite` は壁・水路・期限を組み合わせたfixtureで、実際の失敗、失敗後の再観測と行動判断、後続の成功、異なる操作kindまたは同種操作の条件変化、対象の取得・持帰りを確認します。                                                     |
-| 擬似視覚と記憶        | `observation_boundary` は遮蔽したemerald入りchestをRCON oracleで確認し、runtimeの可視観測とownerへの返答に未確認の内容を出さないことを見ます。`persistent_memory_restart` は合成factをDB保存し、同じDBで再起動した後のGPT回答に照合します。 |
-| 並行会話と行動変更    | `parallel_dialogue_stop` は進行中の操作へguestとownerが実際に話しかけ、guestの状態変更拒否、ownerの強い要請に対する目的解決とownerへ近づくRCON位置変化、停止ラッチと停止後の再開防止を確認します。                                          |
-| 拒否境界の更新        | `game_action_discretion` はownerの依頼でfixture建築の穴を実際に埋めたことをRCON確認します。独立した建築fixtureで、建築の一律拒否やブロック単位の再承認が残っていないことを検証します。                                                      |
-| Skillの必要時参照     | `learning_reuse` と`skill_compactness_and_knowledge_separation` は収集結果に結び付いたSkillの作成・後続相談と、限定された参照量、ゲームレジストリ知識の分離を確認します。                                                                   |
-| 自己学習              | `learning_reuse` は一度の成功から作られた仮説、DB上のtrusted receipt/outcome、Skillの再利用と次回の版・証跡変化を照合します。                                                                                                               |
-| 簡潔なSkillと知識分離 | `skill_compactness_and_knowledge_separation` は保存本文が8 KiB以内であること、全件ではないSkill参照、別のregistry知識APIを確認します。                                                                                                      |
-| DBとMarkdownの往復    | `skill_exchange` はゲームチャットからのexport、合成追記したMarkdownのimport、DB版・receipt、同一ファイル再import時に実績が増えないことを照合します。                                                                                        |
-| 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                          |
+| Issue受け入れ条件     | ケースと根拠                                                                                                                                                                                                                                    |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 身体操作の接続        | `body_operation_smoke` は非OPのPlayerBodyを直接使い、採掘・視点変更・かまど画面の開閉と入出庫をBody観測およびRCONで照合します。GPT受け入れは別に集計します。                                                                                    |
+| 既存層の見直し        | `runtime_contract` が既定アプリのplayer runtime evidenceと接続を確認し、`autonomous_life` がowner指示なしの実行を確認します。既存legacy経路との静的な責務確認はソース・設計文書も併せてレビューします。                                         |
+| 自発的な生活          | `autonomous_life` はself由来の目標、GPT判断、成功した操作結果、RCONで観測する位置・所持品・fixture regionのいずれかの実変化を要求します。操作kindを`place`等に固定しません。                                                                    |
+| 未知の状況への対応    | `unknown_composite` は壁・水路・日没が近い状況を組み合わせ、実際の失敗、失敗後の再観測と行動判断、異なるkindまたは変化した条件での後続回復、server progress、対象の取得・持帰りを確認します。途中oracle診断は失敗の有無から独立して保存します。 |
+| 擬似視覚と記憶        | `observation_boundary` は遮蔽したemerald入りchestをRCON oracleで確認し、runtimeの可視観測とownerへの返答に未確認の内容を出さないことを見ます。`persistent_memory_restart` は合成factをDB保存し、同じDBで再起動した後のGPT回答に照合します。     |
+| 並行会話と行動変更    | `parallel_dialogue_stop` は進行中の操作へguestとownerが実際に話しかけ、guestの状態変更拒否、ownerの強い要請に対する目的解決とownerへ近づくRCON位置変化、停止ラッチと停止後の再開防止を確認します。                                              |
+| 拒否境界の更新        | `game_action_discretion` はownerの依頼でfixture建築の穴を実際に埋めたことをRCON確認します。独立した建築fixtureで、建築の一律拒否やブロック単位の再承認が残っていないことを検証します。                                                          |
+| Skillの必要時参照     | `learning_reuse` と`skill_compactness_and_knowledge_separation` は収集結果に結び付いたSkillの作成・後続相談と、限定された参照量、ゲームレジストリ知識の分離を確認します。                                                                       |
+| 自己学習              | `learning_reuse` は一度の成功から作られた仮説、DB上のtrusted receipt/outcome、Skillの再利用と次回の版・証跡変化を照合します。                                                                                                                   |
+| 簡潔なSkillと知識分離 | `skill_compactness_and_knowledge_separation` は保存本文が8 KiB以内であること、全件ではないSkill参照、別のregistry知識APIを確認します。                                                                                                          |
+| DBとMarkdownの往復    | `skill_exchange` はゲームチャットからのexport、合成追記したMarkdownのimport、DB版・receipt、同一ファイル再import時に実績が増えないことを照合します。                                                                                            |
+| 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                              |
 
 これらは代表ケースです。全操作の網羅、すべてのMinecraft環境・mod・protocol差、死亡を含むすべての結果を証明しません。未実装と判断した操作はありません。確認していない能力や環境差は未検証として残します。
 
@@ -89,4 +89,8 @@ run12後のno-GPT world-oracle probe1–3は、cloneの書式、scoreboard readb
 
 run13はHEAD `638ebdc`で実施し、Body fixture smokeと`runtime_contract`がpassしました。`autonomous_life`は10 calls・input 59,551・output 2,596・合計62,147 tokensでcase予算を超過し、`CASE_LLM_BUDGET_EXCEEDED`となりました。成功outcomeは3件、action revisionは3で、いずれも`look`でしたがworld進展は確認できませんでした。5 sequenceは各2 roundで、`commit_action_decision`はok 3件・rejected 2件、拒否理由は記録されていません。activityは10件でrequest error・interrupted・compactionは0件、最大round inputは6,670 tokensでした。usageは`partial_or_unknown`、後続9 caseは未実行、cleanupは3/3確認済みです。
 
-したがってIssue #72全体の受け入れは未達です。Body smokeと`runtime_contract`はrun13でもpassしましたが、自律生活はrun10でpassした後、run11–13では予算停止となり再現性を確認できていません。run12ではsuccessful `dig`を記録しましたがoracle進展は未確認、run13ではsuccessful `look` 3件を記録しましたがworld進展は未確認です。unknown状況caseはrun10で未完了、run11–13では未実行です。観測境界、再起動、並行会話と停止、建築依頼、Skill学習・交換なども未実行です。
+run13後のハーネス差分では、`unknown_composite`のtarget・item・帰還・daytime oracleを失敗前から定期取得し、未読取と既知falseを区別するsafe診断を失敗artifactにも残します。自然失敗が先に観測されない場合は、`bodyStartedAt`のある`move_to`を一度だけ候補にし、同じoperation ID、プレイヤーの立ち位置、足元・頭上の空間、近傍entityの不在を再確認した場合だけ、床と内部を保護する5×3×5の障害を注入します。注入中に同じoperation IDの実際のfailed outcomeと内側の位置を観測し、障害領域をsnapshotへ復元してreadback一致を確認してから回復判定へ進みます。operation終了・位置逸脱・近傍entity・読戻し失敗は注入しないか未完了として残し、LLM outcomeを作りません。復元はbudget例外を含む全終了経路で実行します。observer client用の足場は各platform chunkをforce-load・loaded確認した後に設置し、位置をreadbackします。この差分はsource/static確認段階で、MC/GPT実行はしていません。
+
+run14はHEAD `855d39a`で実施し、Body smokeと`runtime_contract`がpassしました。`autonomous_life`も3 calls・16,947 tokensでpassし、position進展を観測しました。`unknown_composite`は19 calls・125,313 tokensでcase予算停止となり、後続9 caseは未実行、cleanupは3/3確認済みです。
+
+したがってIssue #72全体の受け入れは未達です。run14ではBody smoke・`runtime_contract`・`autonomous_life`がpassしましたが、`unknown_composite`は予算停止し未完了です。自律生活はrun10・14でpass、run11・13では予算停止しており、安定した再現性は確認できていません。run12のsuccessful `dig`とrun13のsuccessful `look` 3件はいずれもworld進展未確認でした。観測境界、再起動、並行会話と停止、建築依頼、Skill学習・交換など後続caseはrun14でも未実行です。

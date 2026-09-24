@@ -41,11 +41,18 @@ import {
 } from "./furnace-rcon-classifier.js";
 import {
   blockIs,
+  classifyRconReply,
   destinationRegion,
   establishBaseline,
   forceLoadRegion,
+  parseScore,
   regionsEqual,
+  type OracleRcon,
 } from "./world-oracle.js";
+import {
+  recoveryCagePlan,
+  withRestorableObstacle,
+} from "./unknown-recovery-obstacle.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -74,6 +81,7 @@ const RUN_BUDGET_LIMITS = {
   llmCalls: 160,
   totalTokens: 800_000,
 } as const;
+const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 500;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
@@ -134,6 +142,58 @@ interface SafeAutonomousProgress {
   readonly successfulActionSeen: boolean;
   readonly worldProgressSeen: boolean;
   readonly successfulOutcomeCount: number;
+}
+
+type UnknownObstacleStatus =
+  | "not_attempted"
+  | "skipped_ineligible"
+  | "incomplete_before_mutation"
+  | "injection_incomplete_restored"
+  | "applied_without_failure"
+  | "applied_failure_observed"
+  | "restore_failed";
+
+type UnknownObstaclePhase =
+  | "eligibility_checked"
+  | "backup_verified"
+  | "eligibility_lost"
+  | "mutation_started"
+  | "mutation_verified"
+  | "observation_started"
+  | "restore_started"
+  | "restore_verified"
+  | "mutation_failed";
+
+interface UnknownCompositeDiagnostic {
+  readonly unknownTargetInitiallyPresent?: boolean;
+  readonly unknownOracleReadStatus?: "available" | "incomplete";
+  readonly unknownOracleChecked?: boolean;
+  readonly unknownOracleReadCount?: number;
+  readonly unknownTargetCleared?: boolean;
+  readonly unknownItemReturned?: boolean;
+  readonly unknownReturnedToSpawn?: boolean;
+  readonly unknownServerProgressObserved?: boolean;
+  readonly unknownDayTime?: number;
+  readonly unknownFailureObserved?: boolean;
+  readonly unknownFailureSource?: "natural" | "controlled_obstacle";
+  readonly unknownPostFailureObservationSeen?: boolean;
+  readonly unknownPostFailureObservationAfterRestore?: boolean;
+  readonly unknownPostFailureActJudgmentSeen?: boolean;
+  readonly unknownPostFailureJudgmentSeen?: boolean;
+  readonly unknownRecoveryObserved?: boolean;
+  readonly unknownRecoveryAfterRestore?: boolean;
+  readonly unknownDistinctRecoveryOperation?: boolean;
+  readonly unknownControlledObstacleStatus?: UnknownObstacleStatus;
+  readonly unknownControlledObstaclePhase?: UnknownObstaclePhase;
+  readonly unknownControlledObstaclePlacementCount?: number;
+  readonly unknownControlledObstacleConfirmedPlacementCount?: number;
+  readonly unknownControlledObstacleEligibilityChecks?: number;
+  readonly unknownControlledObstacleSameOperationConfirmed?: boolean;
+  readonly unknownControlledObstaclePlayerInsideBefore?: boolean;
+  readonly unknownControlledObstacleStandingSpaceConfirmed?: boolean;
+  readonly unknownControlledObstaclePlayerInsideAtFailure?: boolean;
+  readonly unknownControlledObstacleOtherEntitiesClear?: boolean;
+  readonly unknownControlledObstacleRestored?: boolean;
 }
 
 type BodyOperationStatus =
@@ -926,6 +986,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
   return {
     ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(caseId === "unknown_composite"
+      ? (state.unknownCompositeDiagnostic ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -936,6 +999,104 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
           autonomousSuccessfulOutcomeCount: progress.successfulOutcomeCount,
         }),
   };
+}
+
+function updateUnknownCompositeDiagnostic(
+  state: RunState,
+  diagnostic: UnknownCompositeDiagnostic,
+): void {
+  state.unknownCompositeDiagnostic = {
+    ...(state.unknownCompositeDiagnostic ?? {}),
+    ...diagnostic,
+  };
+}
+
+function boundedOracleRcon(rcon: LocalRcon): OracleRcon {
+  return {
+    command: (command, timeoutMs) =>
+      rcon.command(
+        command,
+        Math.min(
+          timeoutMs ?? UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS,
+          UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS,
+        ),
+      ),
+  };
+}
+
+async function nearbyEntitiesClear(
+  rcon: OracleRcon,
+  position: Position,
+  botName: string,
+): Promise<boolean> {
+  const reset = await rcon.command("scoreboard players set #oracle ai_e2e 0");
+  if (classifyRconReply(reset) !== "success")
+    incomplete("UNKNOWN_OBSTACLE_ENTITY_CHECK_UNAVAILABLE");
+  const origin = `${Math.floor(position.x)} ${Math.floor(position.y)} ${Math.floor(position.z)}`;
+  for (const selector of [
+    `@a[name=!${botName},distance=..5]`,
+    "@e[type=!player,distance=..5]",
+  ]) {
+    const reply = await rcon.command(
+      `execute positioned ${origin} if entity ${selector} run scoreboard players set #oracle ai_e2e 1`,
+    );
+    if (reply !== "" && classifyRconReply(reply) !== "success")
+      incomplete("UNKNOWN_OBSTACLE_ENTITY_CHECK_UNAVAILABLE");
+  }
+  const score = parseScore(
+    await rcon.command("scoreboard players get #oracle ai_e2e"),
+  );
+  if (score !== 0 && score !== 1)
+    incomplete("UNKNOWN_OBSTACLE_ENTITY_CHECK_UNAVAILABLE");
+  return score === 0;
+}
+
+function positionInsideCage(position: Position, region: BlockRegion): boolean {
+  return (
+    position.x >= region.minX + 1 &&
+    position.x < region.maxX &&
+    position.y >= region.minY &&
+    position.y < region.minY + 1.5 &&
+    position.z >= region.minZ + 1 &&
+    position.z < region.maxZ
+  );
+}
+
+function positionStandingCenteredInCage(
+  position: Position,
+  region: BlockRegion,
+): boolean {
+  return (
+    position.x >= region.minX + 1.5 &&
+    position.x < region.maxX - 0.5 &&
+    Math.abs(position.y - region.minY) <= 0.05 &&
+    position.z >= region.minZ + 1.5 &&
+    position.z < region.maxZ - 0.5
+  );
+}
+
+async function standingSpaceSafe(
+  rcon: OracleRcon,
+  position: Position,
+  region: BlockRegion,
+): Promise<boolean> {
+  if (!positionStandingCenteredInCage(position, region)) return false;
+  const x = Math.floor(position.x);
+  const z = Math.floor(position.z);
+  if (
+    !(await blockIs(rcon, { x, y: region.minY, z }, "air", incomplete)) ||
+    !(await blockIs(rcon, { x, y: region.minY + 1, z }, "air", incomplete))
+  )
+    return false;
+  return blockIs(rcon, { x, y: region.minY - 1, z }, "stone", incomplete);
+}
+
+async function readSafeDayTime(rcon: LocalRcon): Promise<number | undefined> {
+  const reply = await rcon.command("time query daytime");
+  const match = /(?:^|\s)(\d+)$/u.exec(reply.trim());
+  if (match === null) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : undefined;
 }
 
 function subtractCounters(after: Counters, before: Counters): Counters {
@@ -1194,6 +1355,7 @@ interface RunState {
   countersFinal?: Counters;
   lastKnownPlayerDiagnostic?: SafeEvidence;
   autonomousLifeProgress?: SafeAutonomousProgress;
+  unknownCompositeDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -1440,6 +1602,11 @@ async function main(): Promise<void> {
           incomplete("UNKNOWN_FIXTURE_SPAWN_RESET_FAILED");
         }
         await configureUnknownFixture(rcon, origin, state.botName);
+        await prepareUnknownObservationClients(
+          rcon,
+          context.ownerName,
+          state.guestName,
+        );
         const fixtureRegion = await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
           rcon,
@@ -1452,11 +1619,6 @@ async function main(): Promise<void> {
         const target = unknownFixtureTarget(beforeWorld.position);
         const targetInitiallyPresent = await isBlock(rcon, target, "blue_wool");
         if (!targetInitiallyPresent) fail("UNKNOWN_TARGET_FIXTURE_INVALID");
-        sendChat(
-          context.owner,
-          "夜になる前に、水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
-        );
-        let lastOracleCheckAt = 0;
         let serverGoalObserved = false;
         let failureSnapshot: WorldSnapshot | undefined;
         let recoverySnapshot: WorldSnapshot | undefined;
@@ -1464,15 +1626,274 @@ async function main(): Promise<void> {
         let failureOperationId: string | undefined;
         let postFailureObservationSeen = false;
         let postFailureJudgmentSeen = false;
+        let lastOracleCheckAt = 0;
+        let controlledObstacleAttempted = false;
+        let controlledObstacleRestoredAt: number | undefined;
+        updateUnknownCompositeDiagnostic(state, {
+          unknownTargetInitiallyPresent: true,
+          unknownControlledObstacleStatus: "not_attempted",
+          unknownOracleReadCount: 0,
+        });
+        const sampleUnknownOracle = async (): Promise<void> => {
+          const currentCount =
+            (state.unknownCompositeDiagnostic?.unknownOracleReadCount as
+              number | undefined) ?? 0;
+          try {
+            const targetCleared = await isBlock(rcon, target, "air");
+            const inventory = await rcon.command(
+              `data get entity ${state.botName} Inventory`,
+            );
+            const position = parsePosition(
+              await rcon.command(`data get entity ${state.botName} Pos`),
+            );
+            const currentWorld = await readWorldSnapshot(
+              rcon,
+              state.botName,
+              fixtureRegion,
+            );
+            const dayTime = await readSafeDayTime(rcon);
+            const itemReturned = /minecraft:blue_wool/iu.test(inventory);
+            const returnedToSpawn =
+              Math.hypot(
+                position.x - spawn.x,
+                position.y - spawn.y,
+                position.z - spawn.z,
+              ) <= 4.5;
+            serverGoalObserved =
+              targetCleared && itemReturned && returnedToSpawn;
+            updateUnknownCompositeDiagnostic(state, {
+              unknownOracleChecked: true,
+              unknownOracleReadStatus: "available",
+              unknownOracleReadCount: currentCount + 1,
+              unknownTargetCleared: targetCleared,
+              unknownItemReturned: itemReturned,
+              unknownReturnedToSpawn: returnedToSpawn,
+              unknownServerProgressObserved:
+                observedWorldProgress(beforeWorld, currentWorld) !== undefined,
+              ...(dayTime === undefined ? {} : { unknownDayTime: dayTime }),
+            });
+          } catch {
+            serverGoalObserved = false;
+            updateUnknownCompositeDiagnostic(state, {
+              unknownOracleReadStatus: "incomplete",
+              unknownOracleReadCount: currentCount + 1,
+            });
+          }
+        };
+        await sampleUnknownOracle();
+        sendChat(
+          context.owner,
+          "日没が近づいています。水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
+        );
         const afterPlayer = await waitForPlayer(
           context,
           CASE_DEADLINES.unknown_composite - 60_000,
           async (player) => {
-            const outcomes = newOutcomes(beforePlayer, player);
+            let currentPlayer = player;
+            const currentOutcomes = newOutcomes(beforePlayer, currentPlayer);
+            const naturalFailureAlreadySeen = currentOutcomes.some(
+              (outcome) => outcome.status === "failed",
+            );
+            const activeOperation = currentPlayer.activeOperation;
+            if (
+              !controlledObstacleAttempted &&
+              !naturalFailureAlreadySeen &&
+              activeOperation?.kind === "move_to" &&
+              typeof activeOperation.bodyStartedAt === "string" &&
+              activeOperation.operationId.length > 0
+            ) {
+              controlledObstacleAttempted = true;
+              const remainingCaseMs = context.caseDeadlineAt - Date.now();
+              if (remainingCaseMs >= 180_000) {
+                const operationId = activeOperation.operationId;
+                const initialPosition = parsePosition(
+                  await rcon.command(`data get entity ${state.botName} Pos`),
+                );
+                const obstaclePlan = recoveryCagePlan(initialPosition, {
+                  x: 2_000,
+                  y: 64,
+                  z: 2_000,
+                });
+                const obstacleRcon = boundedOracleRcon(rcon);
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownControlledObstacleStatus: "not_attempted",
+                  unknownControlledObstaclePlayerInsideBefore:
+                    positionStandingCenteredInCage(
+                      initialPosition,
+                      obstaclePlan.sourceRegion,
+                    ),
+                });
+                try {
+                  const obstacleResult = await withRestorableObstacle(
+                    obstacleRcon,
+                    obstaclePlan,
+                    {
+                      eligible: async () => {
+                        const eligibilityChecks =
+                          (state.unknownCompositeDiagnostic
+                            ?.unknownControlledObstacleEligibilityChecks as
+                            number | undefined) ?? 0;
+                        const freshPlayer = playerOf(
+                          await collect(context.runtime.app),
+                        );
+                        const active = freshPlayer.activeOperation;
+                        const sameStartedOperation =
+                          active?.kind === "move_to" &&
+                          active.operationId === operationId &&
+                          typeof active.bodyStartedAt === "string";
+                        const position = parsePosition(
+                          await obstacleRcon.command(
+                            `data get entity ${state.botName} Pos`,
+                          ),
+                        );
+                        const inside = positionStandingCenteredInCage(
+                          position,
+                          obstaclePlan.sourceRegion,
+                        );
+                        const standingSpaceConfirmed = await standingSpaceSafe(
+                          obstacleRcon,
+                          position,
+                          obstaclePlan.sourceRegion,
+                        );
+                        const otherEntitiesClear = await nearbyEntitiesClear(
+                          obstacleRcon,
+                          position,
+                          state.botName,
+                        );
+                        updateUnknownCompositeDiagnostic(state, {
+                          unknownControlledObstacleEligibilityChecks:
+                            eligibilityChecks + 1,
+                          unknownControlledObstacleSameOperationConfirmed:
+                            sameStartedOperation,
+                          unknownControlledObstaclePlayerInsideBefore: inside,
+                          unknownControlledObstacleStandingSpaceConfirmed:
+                            standingSpaceConfirmed,
+                          unknownControlledObstacleOtherEntitiesClear:
+                            otherEntitiesClear,
+                        });
+                        return (
+                          sameStartedOperation &&
+                          standingSpaceConfirmed &&
+                          otherEntitiesClear
+                        );
+                      },
+                      observeWhileApplied: async () => {
+                        let lastSampleAt = 0;
+                        const failurePlayer = await observeForPlayer(
+                          context,
+                          30_000,
+                          async (candidate) => {
+                            if (Date.now() - lastSampleAt >= 2_000) {
+                              await sampleUnknownOracle();
+                              lastSampleAt = Date.now();
+                              lastOracleCheckAt = lastSampleAt;
+                            }
+                            return candidate.recentOutcomes.some(
+                              (outcome) =>
+                                outcome.operationId === operationId &&
+                                outcome.status === "failed",
+                            );
+                          },
+                        );
+                        const sameOperationFailed =
+                          failurePlayer?.recentOutcomes.some(
+                            (outcome) =>
+                              outcome.operationId === operationId &&
+                              outcome.status === "failed",
+                          ) === true;
+                        if (!sameOperationFailed)
+                          return { failedInPlace: false };
+                        const failurePosition = parsePosition(
+                          await rcon.command(
+                            `data get entity ${state.botName} Pos`,
+                          ),
+                        );
+                        const playerInsideAtFailure = positionInsideCage(
+                          failurePosition,
+                          obstaclePlan.sourceRegion,
+                        );
+                        const confirmed = playerInsideAtFailure;
+                        updateUnknownCompositeDiagnostic(state, {
+                          unknownControlledObstacleSameOperationConfirmed: true,
+                          unknownControlledObstaclePlayerInsideAtFailure:
+                            playerInsideAtFailure,
+                          ...(confirmed
+                            ? {
+                                unknownFailureObserved: true,
+                                unknownFailureSource: "controlled_obstacle",
+                              }
+                            : {}),
+                        });
+                        return { failedInPlace: confirmed };
+                      },
+                      onProgress: (progress) => {
+                        if (progress.phase === "restore_verified")
+                          controlledObstacleRestoredAt = Date.now();
+                        updateUnknownCompositeDiagnostic(state, {
+                          unknownControlledObstaclePhase: progress.phase,
+                          unknownControlledObstaclePlacementCount:
+                            progress.placementCount,
+                          unknownControlledObstacleConfirmedPlacementCount:
+                            progress.confirmedPlacementCount,
+                          ...(progress.phase === "restore_verified"
+                            ? { unknownControlledObstacleRestored: true }
+                            : {}),
+                        });
+                      },
+                    },
+                    incomplete,
+                  );
+                  if (obstacleResult.status === "skipped") {
+                    updateUnknownCompositeDiagnostic(state, {
+                      unknownControlledObstacleStatus: "skipped_ineligible",
+                    });
+                  } else {
+                    const failureObservedInPlace =
+                      obstacleResult.observation.failedInPlace;
+                    controlledObstacleRestoredAt ??= Date.now();
+                    updateUnknownCompositeDiagnostic(state, {
+                      unknownControlledObstacleStatus: failureObservedInPlace
+                        ? "applied_failure_observed"
+                        : "applied_without_failure",
+                      unknownControlledObstacleRestored:
+                        obstacleResult.restorationVerified,
+                    });
+                  }
+                } catch (error) {
+                  const code = error instanceof HarnessError ? error.code : "";
+                  const obstacleRestored =
+                    state.unknownCompositeDiagnostic
+                      ?.unknownControlledObstacleRestored === true;
+                  updateUnknownCompositeDiagnostic(state, {
+                    unknownControlledObstacleStatus: code.includes("RESTORE")
+                      ? "restore_failed"
+                      : obstacleRestored
+                        ? "injection_incomplete_restored"
+                        : "incomplete_before_mutation",
+                  });
+                  throw error;
+                }
+                currentPlayer = playerOf(await collect(context.runtime.app));
+              } else {
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownControlledObstacleStatus: "skipped_ineligible",
+                });
+              }
+            }
+            const outcomes = newOutcomes(beforePlayer, currentPlayer);
             const failedAt = outcomes.findIndex(
               (outcome) => outcome.status === "failed",
             );
             const failed = failedAt >= 0 ? outcomes[failedAt] : undefined;
+            if (failed !== undefined) {
+              updateUnknownCompositeDiagnostic(state, {
+                unknownFailureObserved: true,
+                ...(state.unknownCompositeDiagnostic?.unknownFailureSource ===
+                "controlled_obstacle"
+                  ? {}
+                  : { unknownFailureSource: "natural" }),
+              });
+            }
             if (failed !== undefined && failureSnapshot === undefined) {
               failureSnapshot = await readWorldSnapshot(
                 rcon,
@@ -1480,6 +1901,10 @@ async function main(): Promise<void> {
                 fixtureRegion,
               );
               failureOperationId = failed.operationId;
+            }
+            if (Date.now() - lastOracleCheckAt >= 2_000) {
+              await sampleUnknownOracle();
+              lastOracleCheckAt = Date.now();
             }
             const laterSuccesses =
               failedAt < 0
@@ -1493,30 +1918,82 @@ async function main(): Promise<void> {
                 ? Number.NaN
                 : Date.parse(failed.observedAt);
             const observationTime =
-              player.lastObservation?.observedAt === undefined
+              currentPlayer.lastObservation?.observedAt === undefined
                 ? Number.NaN
-                : Date.parse(player.lastObservation.observedAt);
+                : Date.parse(currentPlayer.lastObservation.observedAt);
+            const controlledFailure =
+              state.unknownCompositeDiagnostic?.unknownFailureSource ===
+              "controlled_obstacle";
+            const recoveryEvidenceBoundary = controlledFailure
+              ? (controlledObstacleRestoredAt ?? Number.NaN)
+              : failureTime;
             postFailureObservationSeen =
               Number.isFinite(failureTime) &&
               Number.isFinite(observationTime) &&
               observationTime >= failureTime;
+            const postFailureObservationAfterRestore =
+              controlledFailure &&
+              Number.isFinite(recoveryEvidenceBoundary) &&
+              Number.isFinite(observationTime) &&
+              observationTime >= recoveryEvidenceBoundary;
+            const recoveryTime =
+              recovery?.observedAt === undefined
+                ? Number.NaN
+                : Date.parse(recovery.observedAt);
+            const postFailureActJudgmentSeen =
+              Number.isFinite(failureTime) &&
+              currentPlayer.recentJudgments.some(
+                (judgment) =>
+                  judgment.kind === "act" &&
+                  typeof judgment.decidedAt === "string" &&
+                  Date.parse(judgment.decidedAt) >= recoveryEvidenceBoundary,
+              );
             postFailureJudgmentSeen =
               recovery !== undefined &&
-              Number.isFinite(failureTime) &&
-              player.recentJudgments.some(
+              postFailureActJudgmentSeen &&
+              currentPlayer.recentJudgments.some(
                 (judgment) =>
                   judgment.kind === "act" &&
                   judgment.operationKind === recovery.kind &&
                   typeof judgment.decidedAt === "string" &&
-                  Date.parse(judgment.decidedAt) >= failureTime,
+                  Number.isFinite(recoveryTime) &&
+                  Date.parse(judgment.decidedAt) >= recoveryEvidenceBoundary &&
+                  Date.parse(judgment.decidedAt) <= recoveryTime,
               );
+            const recoveryAfterRestore =
+              controlledFailure &&
+              recovery !== undefined &&
+              Number.isFinite(recoveryEvidenceBoundary) &&
+              Number.isFinite(recoveryTime) &&
+              recoveryTime >= recoveryEvidenceBoundary;
+            updateUnknownCompositeDiagnostic(state, {
+              unknownPostFailureObservationSeen:
+                failed !== undefined && postFailureObservationSeen,
+              unknownPostFailureObservationAfterRestore:
+                controlledFailure && postFailureObservationAfterRestore,
+              unknownPostFailureActJudgmentSeen:
+                failed !== undefined && postFailureActJudgmentSeen,
+              unknownPostFailureJudgmentSeen:
+                failed !== undefined && postFailureJudgmentSeen,
+              unknownRecoveryObserved: recovery !== undefined,
+              unknownRecoveryAfterRestore:
+                controlledFailure && recoveryAfterRestore,
+              ...(failed === undefined || recovery === undefined
+                ? {}
+                : {
+                    unknownDistinctRecoveryOperation:
+                      failed.operationId !== recovery.operationId,
+                  }),
+            });
             const canCheckOracle =
               failed !== undefined &&
               recovery !== undefined &&
               postFailureObservationSeen &&
               postFailureJudgmentSeen &&
-              !isOperationActive(player);
-            if (canCheckOracle && Date.now() - lastOracleCheckAt >= 2_000) {
+              (!controlledFailure ||
+                (postFailureObservationAfterRestore && recoveryAfterRestore)) &&
+              !isOperationActive(currentPlayer);
+            if (canCheckOracle) {
               if (recovery.operationId !== recoverySnapshotOperationId) {
                 recoverySnapshot = await readWorldSnapshot(
                   rcon,
@@ -1525,27 +2002,9 @@ async function main(): Promise<void> {
                 );
                 recoverySnapshotOperationId = recovery.operationId;
               }
-              const targetCleared = await isBlock(rcon, target, "air");
-              const inventory = await rcon.command(
-                `data get entity ${state.botName} Inventory`,
-              );
-              const position = parsePosition(
-                await rcon.command(`data get entity ${state.botName} Pos`),
-              );
-              const returned =
-                Math.hypot(
-                  position.x - spawn.x,
-                  position.y - spawn.y,
-                  position.z - spawn.z,
-                ) <= 4.5;
-              serverGoalObserved =
-                targetCleared &&
-                /minecraft:blue_wool/iu.test(inventory) &&
-                returned;
-              lastOracleCheckAt = Date.now();
             }
             return (
-              player.actionRevision > beforeRevision &&
+              currentPlayer.actionRevision > beforeRevision &&
               canCheckOracle &&
               serverGoalObserved
             );
@@ -1596,11 +2055,25 @@ async function main(): Promise<void> {
         }
         if (!changedApproachAfterFailure)
           fail("FAILED_OPERATION_WAS_NOT_REPLACED");
+        updateUnknownCompositeDiagnostic(state, {
+          unknownFailureObserved: true,
+          unknownPostFailureObservationSeen: postFailureObservationSeen,
+          unknownPostFailureJudgmentSeen: postFailureJudgmentSeen,
+          unknownRecoveryObserved: true,
+          unknownDistinctRecoveryOperation:
+            failed.operationId !== recovery.operationId,
+          unknownServerProgressObserved: observedProgress,
+        });
+        const finalDiagnostic = state.unknownCompositeDiagnostic ?? {};
         return {
+          ...finalDiagnostic,
           distinctOperationKinds: afterKinds.size,
           serverProgressObserved: observedProgress,
-          targetClearedAndItemReturned: serverGoalObserved,
-          playerReturnedToSpawn: serverGoalObserved,
+          targetClearedAndItemReturned:
+            finalDiagnostic.unknownTargetCleared === true &&
+            finalDiagnostic.unknownItemReturned === true,
+          playerReturnedToSpawn:
+            finalDiagnostic.unknownReturnedToSpawn === true,
           failedAttemptObserved: true,
           postFailureObservationSeen,
           postFailureJudgmentSeen,
@@ -3665,6 +4138,9 @@ async function runCase(
         ...(reason === "RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE"
           ? {}
           : safeFailureEvidence(state, id)),
+        ...(id === "unknown_composite"
+          ? (state.unknownCompositeDiagnostic ?? {})
+          : {}),
       },
       reason,
     };
@@ -3877,6 +4353,51 @@ async function configureUnknownFixture(
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
   await setAndVerifyGamerule(rcon, "advanceTime", true);
   await rcon.command("time set 11500");
+}
+
+async function prepareUnknownObservationClients(
+  rcon: LocalRcon,
+  ownerName: string,
+  guestName: string,
+): Promise<void> {
+  const observers = [
+    { name: ownerName, x: 64 },
+    { name: guestName, x: -64 },
+  ] as const;
+  for (const observer of observers) {
+    await forceLoadRegion(
+      rcon,
+      {
+        minX: observer.x - 1,
+        minY: 199,
+        minZ: 63,
+        maxX: observer.x + 1,
+        maxY: 199,
+        maxZ: 65,
+      },
+      incomplete,
+    );
+    await rcon.command(
+      `fill ${observer.x - 1} 199 63 ${observer.x + 1} 199 65 minecraft:stone replace`,
+    );
+    for (let x = observer.x - 1; x <= observer.x + 1; x += 1) {
+      for (let z = 63; z <= 65; z += 1) {
+        if (!(await isBlock(rcon, { x, y: 199, z }, "stone")))
+          incomplete("UNKNOWN_OBSERVER_PLATFORM_NOT_CONFIRMED");
+      }
+    }
+    await rcon.command(`tp ${observer.name} ${observer.x} 200 64`);
+    const position = parsePosition(
+      await rcon.command(`data get entity ${observer.name} Pos`),
+    );
+    if (
+      Math.hypot(position.x - observer.x, position.y - 200, position.z - 64) >
+        1.5 ||
+      !(await isBlock(rcon, { x: observer.x, y: 199, z: 64 }, "stone"))
+    ) {
+      incomplete("UNKNOWN_OBSERVER_POSITION_UNSAFE");
+    }
+  }
 }
 
 async function configureHiddenContainer(
