@@ -566,6 +566,189 @@ describe("player agent response rounds", () => {
       mind.close();
     }
   });
+
+  it("persists concise owner facts once and retains them after reopening the same database", async () => {
+    const fixture = openConversationFixture();
+    const fact = "合言葉は maple-47";
+    fixture.responses.push(
+      functionCallResponse("remember-once", "remember_owner_fact", {
+        summary: fact,
+      }),
+      functionCallResponse("remember-again", "remember_owner_fact", {
+        summary: " 合言葉は   maple-47 ",
+      }),
+      terminalResponse("合言葉を記憶しました。"),
+    );
+    const initialRevision = fixture.mind.snapshot().revision;
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "次回も覚えてください。合言葉は maple-47 です。",
+        turn,
+      });
+
+      const saved = fixture.mind.snapshot();
+      expect(
+        saved.stateFacts.filter((note) => note.summary === fact),
+      ).toHaveLength(1);
+      expect(saved.stateFacts).toContainEqual(
+        expect.objectContaining({
+          kind: "fact",
+          source: "owner",
+          summary: fact,
+        }),
+      );
+      expect(saved.revision).toBe(initialRevision + 1);
+      expect(fixture.messages).toEqual(["合言葉を記憶しました。"]);
+
+      const tool = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(
+          z.record(z.string(), z.unknown()).parse(fixture.requests[0]).tools,
+        )
+        .find((entry) => entry.name === "remember_owner_fact");
+      expect(tool).toBeDefined();
+      expect(JSON.stringify(tool?.parameters)).toContain(
+        '"required":["summary"]',
+      );
+      expect(JSON.stringify(tool?.parameters)).not.toContain('"source"');
+
+      fixture.mind.close();
+      const reopened = PlayerMindStore.open(fixture.databasePath);
+      try {
+        expect(reopened.snapshot().stateFacts).toContainEqual(
+          expect.objectContaining({
+            kind: "fact",
+            source: "owner",
+            summary: fact,
+          }),
+        );
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rejects guest and stale conversation attempts to remember owner facts", async () => {
+    const guestFixture = openConversationFixture();
+    guestFixture.responses.push(
+      functionCallResponse("guest-fact", "remember_owner_fact", {
+        summary: "guest fact",
+      }),
+    );
+    try {
+      const turn = guestFixture.conversation.nextTurn();
+      await guestFixture.conversation.handleOwnerMessage({
+        username: "guest",
+        message: "Remember this: guest fact",
+        turn,
+      });
+      expect(guestFixture.requests).toHaveLength(0);
+      expect(guestFixture.mind.snapshot().stateFacts).toHaveLength(0);
+      expect(guestFixture.messages).toHaveLength(0);
+    } finally {
+      guestFixture.close();
+    }
+
+    const staleFixture = openConversationFixture();
+    staleFixture.responses.push((_request, index) => {
+      if (index !== 0) throw new Error("TEST_STALE_TURN_FIXTURE_MISSING");
+      staleFixture.conversation.nextTurn();
+      return functionCallResponse("stale-fact", "remember_owner_fact", {
+        summary: "stale fact",
+      });
+    });
+    try {
+      const turn = staleFixture.conversation.nextTurn();
+      await staleFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Remember this next time: stale fact",
+        turn,
+      });
+      expect(staleFixture.requests).toHaveLength(1);
+      expect(staleFixture.mind.snapshot().stateFacts).toHaveLength(0);
+      expect(staleFixture.messages).toHaveLength(0);
+    } finally {
+      staleFixture.close();
+    }
+  });
+
+  it("does not store the owner's complete message as a fact summary", async () => {
+    const fixture = openConversationFixture();
+    const message = "次回覚えてください。合言葉は maple-47 です。";
+    fixture.responses.push(
+      functionCallResponse("verbatim-fact", "remember_owner_fact", {
+        summary: message,
+      }),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message,
+        turn,
+      });
+      expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
+      expect(fixture.messages).toEqual([
+        "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each(["stopped", "stale CAS"] as const)(
+    "does not claim an owner fact was saved after %s rejection",
+    async (failure) => {
+      const fixture = openConversationFixture();
+      fixture.responses.push(
+        failure === "stopped"
+          ? () => {
+              fixture.mind.stop();
+              return functionCallResponse(
+                "rejected-fact",
+                "remember_owner_fact",
+                {
+                  summary: `rejected ${failure} fact`,
+                },
+              );
+            }
+          : functionCallResponse("rejected-fact", "remember_owner_fact", {
+              summary: `rejected ${failure} fact`,
+            }),
+      );
+      if (failure === "stale CAS") {
+        const commitUnderstanding = fixture.mind.commitUnderstanding.bind(
+          fixture.mind,
+        );
+        fixture.mind.commitUnderstanding = (input) => {
+          fixture.mind.enqueueEvent("state_changed", "CAS test revision");
+          return commitUnderstanding(input);
+        };
+      }
+
+      try {
+        const turn = fixture.conversation.nextTurn();
+        await fixture.conversation.handleOwnerMessage({
+          username: "owner",
+          message: `次回覚えてください。rejected ${failure} fact`,
+          turn,
+        });
+        expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
+        expect(fixture.messages).toEqual([
+          "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+        ]);
+        expect(fixture.messages.join(" ")).not.toContain("保存しました");
+      } finally {
+        fixture.close();
+      }
+    },
+  );
 });
 
 type ScriptedResponse =
@@ -638,6 +821,50 @@ function createMemoryPort(): PlayerMemoryPort {
     recall: () => [],
     persistGoals: () => undefined,
     recordEpisode: () => undefined,
+  };
+}
+
+interface ConversationFixture {
+  readonly conversation: PlayerConversationAgent;
+  readonly databasePath: string;
+  readonly messages: string[];
+  readonly mind: PlayerMindStore;
+  readonly requests: unknown[];
+  readonly responses: ScriptedResponse[];
+  close(): void;
+}
+
+function openConversationFixture(): ConversationFixture {
+  const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, "player.sqlite");
+  const mind = PlayerMindStore.open(databasePath);
+  const requests: unknown[] = [];
+  const responses: ScriptedResponse[] = [];
+  const messages: string[] = [];
+  const conversation = new PlayerConversationAgent({
+    client: scriptedClient(responses, requests),
+    apiKey: "test-only",
+    model: "test-model",
+    ownerUsername: "owner",
+    mind,
+    memory: createMemoryPort(),
+    logger: pino({ level: "silent" }),
+    say: async (text) => {
+      messages.push(text);
+    },
+    onProposal: () => undefined,
+    onStop: async () => undefined,
+    onResume: () => undefined,
+  });
+  return {
+    conversation,
+    databasePath,
+    messages,
+    mind,
+    requests,
+    responses,
+    close: () => mind.close(),
   };
 }
 
