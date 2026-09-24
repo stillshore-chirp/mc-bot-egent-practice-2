@@ -61,7 +61,7 @@ Paper cache copyを使う場合は、上の環境変数行へ次を加えます�
 AI_PLAYER_E2E_SERVER_CACHE_DIR=/path/to/paper-cache
 ```
 
-既定上限は45分、160回のGPT呼び出し、合計800,000 tokensです。case上限は合計148 calls / 795,000 tokensで、各caseに独立したdeadlineがあります。`AI_PLAYER_E2E_MAX_DURATION_MINUTES`、`AI_PLAYER_E2E_MAX_LLM_CALLS`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS`で既定値以下へ下げられます。上限の超過やdeadlineはrun/caseを未完了にし、そこで停止します。偶然passするまで同じ高コストcaseを反復しません。GPT usageが取得できなかったAPI失敗や中断を0消費とはみなさず、既知合計と`partial_or_unknown`を分けます。
+既定上限は45分、160回のGPT呼び出し、合計800,000 tokensです。case上限は合計156 calls / 875,000 tokensで、各caseに独立したdeadlineがあります。`unknown_composite` は32 calls / 200,000 tokens、case deadlineは7分です。run17では125,200 tokens消費時点で最低2つのterminal actionが不足していました。直近のround規模（1 actionあたり2–3 round、最大約8,500 input tokens）から、残る2 actionに約34,000–51,000 tokensが必要と見積もり、200,000を一回の測定に使う上限として設定しました。この見積もりは達成保証ではなく、上限まで消費する再試行や追加拡張の根拠にはしません。case上限のtoken合計はrun上限を75,000超えるため、run全体の上限を維持したままでは後続caseがglobal budgetで未完了停止する場合があります。`AI_PLAYER_E2E_MAX_DURATION_MINUTES`、`AI_PLAYER_E2E_MAX_LLM_CALLS`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS`で既定値以下へ下げられます。上限の超過やdeadlineはrun/caseを未完了にし、そこで停止します。偶然passするまで同じ高コストcaseを反復しません。GPT usageが取得できなかったAPI失敗や中断を0消費とはみなさず、既知合計と`partial_or_unknown`を分けます。
 
 artifactのrun/case duration、runtime報告call/token/latency、case status、fixture seedを使って結果を再現・比較します。API受付やGPT応答だけではpassにならず、成功caseはDB・Body観測・独立したRCON world oracleなど、ケースごとの結果条件を満たす必要があります。全caseがpassしcleanupも確認できた時だけrun全体をpassとします。
 

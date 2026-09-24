@@ -98,7 +98,7 @@ const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 12, totalTokens: 60_000 },
-  unknown_composite: { llmCalls: 24, totalTokens: 120_000 },
+  unknown_composite: { llmCalls: 32, totalTokens: 200_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
   learning_reuse: { llmCalls: 30, totalTokens: 150_000 },
