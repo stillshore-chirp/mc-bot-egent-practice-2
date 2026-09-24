@@ -1272,14 +1272,18 @@ export class PlayerPurposeAgent {
 }
 
 export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
-  const activeOwnerGoals = snapshot.goals.filter(isActiveLinkedOwnerGoal);
-  const activeOwnerGoalIds = new Set(activeOwnerGoals.map(({ id }) => id));
+  const continuingOwnerGoals = snapshot.goals.filter(
+    isContinuingLinkedOwnerGoal,
+  );
+  const continuingOwnerGoalIds = new Set(
+    continuingOwnerGoals.map(({ id }) => id),
+  );
   const includedGoalIds = new Set([
-    ...activeOwnerGoalIds,
+    ...continuingOwnerGoalIds,
     ...snapshot.goals.slice(-12).map(({ id }) => id),
   ]);
-  const activeOwnerProposalIds = new Set(
-    activeOwnerGoals
+  const continuingOwnerProposalIds = new Set(
+    continuingOwnerGoals
       .map(({ ownerProposalId }) => ownerProposalId)
       .filter((proposalId): proposalId is string => proposalId !== undefined),
   );
@@ -1288,7 +1292,7 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
     .slice(-12);
   const linkedOwnerProposals = snapshot.proposals.filter(
     ({ id, status }) =>
-      activeOwnerProposalIds.has(id) &&
+      continuingOwnerProposalIds.has(id) &&
       (status === "adopted" || status === "compromised"),
   );
   const includedProposalIds = new Set([
@@ -1326,10 +1330,10 @@ function ownerProposalIdOf(goal: PlayerGoal): string | undefined {
   return goal.ownerProposalId;
 }
 
-function isActiveLinkedOwnerGoal(goal: PlayerGoal): boolean {
+function isContinuingLinkedOwnerGoal(goal: PlayerGoal): boolean {
   return (
     goal.source === "owner" &&
-    goal.status === "active" &&
+    (goal.status === "active" || goal.status === "paused") &&
     ownerProposalIdOf(goal) !== undefined
   );
 }

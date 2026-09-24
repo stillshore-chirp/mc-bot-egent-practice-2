@@ -18,7 +18,10 @@ import type {
   PlayerMemoryPort,
   PlayerRuntimeSnapshot,
 } from "../../src/player/contracts.js";
-import { PlayerPurposeAgent } from "../../src/player/agents.js";
+import {
+  compactSnapshot,
+  PlayerPurposeAgent,
+} from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   projectSafePlayerAgentActivityTail,
@@ -197,6 +200,90 @@ describe("player owner intent context", () => {
             "I will first inspect the area, then choose a way to proceed.",
         }),
       );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps a paused linked owner intent beyond the recent-goal window", () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Retrieve the requested item",
+      reason: "Please find the item and bring it back.",
+      priority: 4,
+    });
+
+    try {
+      let snapshot = resolveProposal(
+        fixture.mind,
+        fixture.mind.snapshot(),
+        proposal,
+        "compromised",
+      );
+      const linkedGoal = snapshot.goals.find(
+        ({ ownerProposalId }) => ownerProposalId === proposal.id,
+      );
+      if (linkedGoal === undefined)
+        throw new Error("TEST_LINKED_OWNER_GOAL_NOT_CREATED");
+
+      const paused = fixture.mind.commitGoalState({
+        expectedRevision: snapshot.revision,
+        goal: {
+          id: linkedGoal.id,
+          title: linkedGoal.title,
+          status: "paused",
+          priority: linkedGoal.priority,
+          changeReason: "Pause while considering another approach.",
+          source: "owner",
+        },
+      });
+      expect(paused.accepted).toBe(true);
+      snapshot = paused.snapshot;
+
+      for (let index = 0; index < 13; index += 1) {
+        const added = fixture.mind.commitGoalState({
+          expectedRevision: snapshot.revision,
+          goal: {
+            title: `Newer self goal ${index}`,
+            status: "active",
+            priority: 1,
+            changeReason: "A newer independent purpose was considered.",
+            source: "self",
+          },
+        });
+        expect(added.accepted).toBe(true);
+        snapshot = added.snapshot;
+      }
+
+      expect(snapshot.goals.slice(-12)).not.toContainEqual(
+        expect.objectContaining({ ownerProposalId: proposal.id }),
+      );
+      const compacted = record(compactSnapshot(snapshot));
+      expect(compacted.goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          title: proposal.title,
+          source: "owner",
+          status: "paused",
+        }),
+      );
+      expect(compacted.proposals).toContainEqual(
+        expect.objectContaining({
+          id: proposal.id,
+          title: proposal.title,
+          reason: proposal.reason,
+          status: "compromised",
+          resolution:
+            "Resolve the owner intent based on the current situation.",
+        }),
+      );
+
+      expect(
+        fixture.mind
+          .snapshot()
+          .goals.find(({ ownerProposalId }) => ownerProposalId === proposal.id)
+          ?.status,
+      ).toBe("paused");
     } finally {
       fixture.close();
     }
