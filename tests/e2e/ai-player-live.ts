@@ -61,6 +61,7 @@ import {
 } from "./autonomous-milestone.js";
 import { classifyObservationReply } from "./observation-reply-classifier.js";
 import {
+  classifyUnknownTaskVisibility,
   safeUnknownOperationKind,
   type SafeUnknownOperationKind,
 } from "./unknown-composite-diagnostic.js";
@@ -190,6 +191,10 @@ interface UnknownCompositeDiagnostic {
   readonly unknownReturnedToSpawn?: boolean;
   readonly unknownServerProgressObserved?: boolean;
   readonly unknownDayTime?: number;
+  readonly unknownTaskObservationStatus?: "available" | "unknown";
+  readonly unknownTaskTargetBlockVisible?: boolean;
+  readonly unknownTaskWaterBlockVisible?: boolean;
+  readonly unknownTaskWallMaterialVisible?: boolean;
   readonly unknownFailureObserved?: boolean;
   readonly unknownFailureSource?: "natural" | "controlled_obstacle";
   readonly unknownFailureOperationKind?: SafeUnknownOperationKind;
@@ -1823,18 +1828,49 @@ async function main(): Promise<void> {
           context.caseDeadlineAt - Date.now() - 60_000;
         if (unknownObservationBudgetMs < 1)
           incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
+        const unknownTaskSentAt = Date.now();
         sendChat(
           context.owner,
           "日没が近づいています。水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffTaskSent: true,
+          unknownTaskObservationStatus: "unknown",
         });
+        let taskObservationCaptured = false;
         const afterPlayer = await waitForPlayer(
           context,
           unknownObservationBudgetMs,
           async (player) => {
             let currentPlayer = player;
+            const taskObservation = currentPlayer.lastObservation;
+            const taskObservedAt =
+              taskObservation?.observedAt === undefined
+                ? Number.NaN
+                : Date.parse(taskObservation.observedAt);
+            if (
+              !taskObservationCaptured &&
+              Number.isFinite(taskObservedAt) &&
+              taskObservedAt > unknownTaskSentAt
+            ) {
+              taskObservationCaptured = true;
+              const visibility = classifyUnknownTaskVisibility(
+                taskObservation?.visibleBlockNames,
+              );
+              updateUnknownCompositeDiagnostic(state, {
+                unknownTaskObservationStatus: visibility.status,
+                ...(visibility.targetBlockVisible === undefined
+                  ? {}
+                  : {
+                      unknownTaskTargetBlockVisible:
+                        visibility.targetBlockVisible,
+                      unknownTaskWaterBlockVisible:
+                        visibility.waterBlockVisible === true,
+                      unknownTaskWallMaterialVisible:
+                        visibility.wallMaterialVisible === true,
+                    }),
+              });
+            }
             const currentOutcomes = newOutcomes(beforePlayer, currentPlayer);
             const naturalFailureAlreadySeen = currentOutcomes.some(
               (outcome) => outcome.status === "failed",

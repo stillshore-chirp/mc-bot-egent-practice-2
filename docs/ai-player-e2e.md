@@ -27,6 +27,8 @@
 | DBとMarkdownの往復    | `skill_exchange` はexportしたファイル名と同一Skill IDをimport活動・DBで照合し、合成編集marker、同IDの版・receipt更新、同じファイルの再import試行後に同IDの本文・版・receiptが変わらないことを確認します。                                                                                                                                                                                                                                                                                               |
 | 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                                                                                                                                                                                                                                                                                      |
 
+`unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
+
 これらは代表ケースです。全操作の網羅、すべてのMinecraft環境・mod・protocol差、死亡を含むすべての結果を証明しません。未実装と判断した操作はありません。確認していない能力や環境差は未検証として残します。
 
 ## 操作群の検証状態
