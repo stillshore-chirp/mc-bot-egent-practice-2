@@ -38,6 +38,8 @@ const wakeKinds = [
   "manual",
 ] as const satisfies readonly PlayerWakeKind[];
 
+const purposeCompletionWakeSummary = "目的完了後の自律目的を再評価";
+
 const goalSchema = z
   .object({
     id: z.string().min(1).max(80),
@@ -221,6 +223,9 @@ const stateSchema = z
   .object({
     revision: z.number().int().nonnegative(),
     actionRevision: z.number().int().nonnegative(),
+    purposeProgressRevision: z.number().int().nonnegative().default(0),
+    lastCompletionProgressRevision: z.number().int().nonnegative().optional(),
+    purposeCompletionWakeSequence: z.number().int().nonnegative().default(0),
     stopped: z.boolean(),
     stopGeneration: z.number().int().nonnegative(),
     purpose: z.string().max(400),
@@ -338,6 +343,8 @@ function appendPlayerUnderstanding(
 const initialState: StoredState = {
   revision: 0,
   actionRevision: 0,
+  purposeProgressRevision: 0,
+  purposeCompletionWakeSequence: 0,
   stopped: false,
   stopGeneration: 0,
   purpose: "",
@@ -417,9 +424,39 @@ export class PlayerMindStore {
       )
       .all()
       .map(({ kind }) => parseWakeKind(kind));
+    const {
+      purposeProgressRevision: _purposeProgressRevision,
+      lastCompletionProgressRevision: _lastCompletionProgressRevision,
+      purposeCompletionWakeSequence: _purposeCompletionWakeSequence,
+      ...publicState
+    } = state;
     return {
-      ...state,
+      ...publicState,
       pendingEventKinds: pendingKinds,
+    };
+  }
+
+  public purposeCompletionWakeState(): {
+    readonly sequence: number;
+    readonly pendingEvent: PlayerRuntimeEvent | undefined;
+  } {
+    const state = this.readStored();
+    const row = this.database
+      .prepare<[string], EventRow>(
+        "SELECT id, kind, summary, created_at FROM player_runtime_events WHERE kind = 'manual' AND summary = ? AND consumed_at IS NULL ORDER BY created_at, rowid LIMIT 1",
+      )
+      .get(purposeCompletionWakeSummary);
+    return {
+      sequence: state.purposeCompletionWakeSequence,
+      pendingEvent:
+        row === undefined
+          ? undefined
+          : {
+              id: row.id,
+              kind: parseWakeKind(row.kind),
+              summary: row.summary,
+              createdAt: row.created_at,
+            },
     };
   }
 
@@ -488,6 +525,7 @@ export class PlayerMindStore {
         WHERE id IN (
           SELECT id FROM player_runtime_events
           WHERE consumed_at IS NULL AND kind NOT IN ('bot_death','owner_proposal','operation_stalled')
+            AND NOT (kind = 'manual' AND summary = '目的完了後の自律目的を再評価')
             AND NOT (kind = 'state_changed' AND summary LIKE '%vitals%')
           ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 48
         )
@@ -653,6 +691,10 @@ export class PlayerMindStore {
       }
       let goals = current.goals;
       if (input.goal !== undefined) goals = mergeGoal(goals, input.goal, now);
+      const goalProgress =
+        input.goal !== undefined &&
+        goalChangeIsMeaningful(current.goals, input.goal);
+      const proposalProgress = input.proposalResolution !== undefined;
       const understanding = appendPlayerUnderstanding(
         current,
         input.understanding ?? { facts: [], uncertainties: [] },
@@ -714,6 +756,18 @@ export class PlayerMindStore {
           actionChanged = true;
           break;
       }
+      const purposeProgressRevision =
+        current.purposeProgressRevision +
+        (input.decision.kind === "act" || goalProgress || proposalProgress
+          ? 1
+          : 0);
+      const shouldWakeAfterCompletion =
+        input.decision.kind === "complete" &&
+        (current.lastCompletionProgressRevision === undefined ||
+          purposeProgressRevision > current.lastCompletionProgressRevision);
+      const purposeCompletionWakeSequence =
+        current.purposeCompletionWakeSequence +
+        (shouldWakeAfterCompletion ? 1 : 0);
       const resolutionChanged = input.proposalResolution !== undefined;
       const stateChanged =
         resolutionChanged || input.goal !== undefined || understanding.changed;
@@ -746,6 +800,11 @@ export class PlayerMindStore {
         ...current,
         revision: nextRevision,
         actionRevision: current.actionRevision + (actionChanged ? 1 : 0),
+        purposeProgressRevision,
+        ...(input.decision.kind === "complete" && shouldWakeAfterCompletion
+          ? { lastCompletionProgressRevision: purposeProgressRevision }
+          : {}),
+        purposeCompletionWakeSequence,
         purpose,
         goals,
         proposals,
@@ -762,6 +821,13 @@ export class PlayerMindStore {
         recentJudgments: [...current.recentJudgments, judgment].slice(-24),
       };
       this.writeStored(next, now);
+      if (shouldWakeAfterCompletion) {
+        this.database
+          .prepare(
+            "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'manual', ?, ?, NULL)",
+          )
+          .run(randomUUID(), purposeCompletionWakeSummary, now);
+      }
       return { accepted: true, snapshot: this.snapshot() };
     });
     return transaction.immediate();
@@ -797,6 +863,10 @@ export class PlayerMindStore {
             : entry,
         );
       }
+      const goalProgress =
+        input.goal !== undefined &&
+        goalChangeIsMeaningful(current.goals, input.goal);
+      const proposalProgress = input.proposalResolution !== undefined;
       const goals =
         input.goal === undefined
           ? current.goals
@@ -808,6 +878,9 @@ export class PlayerMindStore {
         {
           ...current,
           revision: current.revision + 1,
+          purposeProgressRevision:
+            current.purposeProgressRevision +
+            (goalProgress || proposalProgress ? 1 : 0),
           goals,
           proposals,
         },
@@ -893,11 +966,18 @@ export class PlayerMindStore {
           ? {}
           : { skillVersion: evidence.skillVersion }),
       };
+      const outcomeAlreadyCounted =
+        current.lastOutcome?.operationId === evidence.operationId ||
+        current.recentOutcomes.some(
+          (outcome) => outcome.operationId === evidence.operationId,
+        );
       this.writeStored(
         {
           ...current,
           revision: current.revision + 1,
           actionRevision: current.actionRevision + (waitForReconnect ? 1 : 0),
+          purposeProgressRevision:
+            current.purposeProgressRevision + (outcomeAlreadyCounted ? 0 : 1),
           ...(stillActive ? { activeOperation: undefined } : {}),
           ...(waitForReconnect
             ? {
@@ -1013,6 +1093,7 @@ export class PlayerMindStore {
         {
           ...current,
           revision: current.revision + 1,
+          purposeProgressRevision: current.purposeProgressRevision + 1,
           activeOperation: undefined,
           lastOutcome: {
             operationId: active.operationId,
@@ -1258,10 +1339,7 @@ function mergeGoal(
   const title = bounded(change.title, 240, "goal title");
   const reason = bounded(change.changeReason, 400, "goal change reason");
   const priority = Math.max(1, Math.min(5, Math.round(change.priority)));
-  const existing =
-    change.id === undefined
-      ? undefined
-      : goals.find((goal) => goal.id === change.id);
+  const existing = findGoalForChange(goals, change, title);
   if (existing !== undefined) {
     return goals.map((goal) =>
       goal.id === existing.id
@@ -1290,6 +1368,41 @@ function mergeGoal(
     updatedAt: now,
   };
   return [...goals, goal].slice(-60);
+}
+
+function goalChangeIsMeaningful(
+  goals: readonly PlayerGoal[],
+  change: PlayerGoalChange,
+): boolean {
+  const title = bounded(change.title, 240, "goal title");
+  const existing = findGoalForChange(goals, change, title);
+  if (existing === undefined) return true;
+  return (
+    normalizeGoalTitle(existing.title) !== normalizeGoalTitle(title) ||
+    existing.status !== change.status ||
+    existing.priority !==
+      Math.max(1, Math.min(5, Math.round(change.priority))) ||
+    existing.source !== change.source
+  );
+}
+
+function findGoalForChange(
+  goals: readonly PlayerGoal[],
+  change: PlayerGoalChange,
+  title: string,
+): PlayerGoal | undefined {
+  if (change.id !== undefined)
+    return goals.find((goal) => goal.id === change.id);
+  const normalizedTitle = normalizeGoalTitle(title);
+  return goals.find(
+    (goal) =>
+      goal.source === change.source &&
+      normalizeGoalTitle(goal.title) === normalizedTitle,
+  );
+}
+
+function normalizeGoalTitle(title: string): string {
+  return title.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
 }
 
 function parseWakeKind(value: string): PlayerWakeKind {

@@ -99,6 +99,7 @@ export class PlayerRuntime {
   #bodyConnected = true;
   #started = false;
   #shuttingDown = false;
+  #handledPurposeCompletionWakeSequence = 0;
 
   public constructor(private readonly options: PlayerRuntimeOptions) {}
 
@@ -144,20 +145,32 @@ export class PlayerRuntime {
       });
     }
     const snapshot = this.options.mind.snapshot();
+    this.#handledPurposeCompletionWakeSequence =
+      this.options.mind.purposeCompletionWakeState().sequence;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
     if (!snapshot.stopped) {
       await this.#sampleSemanticState();
       this.#startSampler();
-      const kind: PlayerWakeKind =
-        snapshot.wait?.wakeOn.includes("reconnected") === true
-          ? "reconnected"
-          : "startup";
-      const summary =
-        kind === "reconnected"
-          ? "接続済みの新しいMinecraft sessionでランタイムを起動"
-          : "接続後に自律目的と現在状態を評価";
-      const event = this.options.mind.enqueueEvent(kind, summary);
-      this.#requestThought(event.kind, event.summary);
+      const completionWake = this.options.mind.purposeCompletionWakeState();
+      this.#handledPurposeCompletionWakeSequence = completionWake.sequence;
+      if (completionWake.pendingEvent !== undefined) {
+        this.#requestThought(
+          completionWake.pendingEvent.kind,
+          completionWake.pendingEvent.summary,
+          true,
+        );
+      } else {
+        const kind: PlayerWakeKind =
+          snapshot.wait?.wakeOn.includes("reconnected") === true
+            ? "reconnected"
+            : "startup";
+        const summary =
+          kind === "reconnected"
+            ? "接続済みの新しいMinecraft sessionでランタイムを起動"
+            : "接続後に自律目的と現在状態を評価";
+        const event = this.options.mind.enqueueEvent(kind, summary);
+        this.#requestThought(event.kind, event.summary);
+      }
     }
   }
 
@@ -222,7 +235,17 @@ export class PlayerRuntime {
     if (this.options.mind.snapshot().stopped) return;
     void this.#sampleSemanticState();
     this.#startSampler();
-    this.#requestThought("manual", "所有者が自律行動を再開");
+    const completionWake = this.options.mind.purposeCompletionWakeState();
+    this.#handledPurposeCompletionWakeSequence = completionWake.sequence;
+    if (completionWake.pendingEvent !== undefined) {
+      this.#requestThought(
+        completionWake.pendingEvent.kind,
+        completionWake.pendingEvent.summary,
+        true,
+      );
+    } else {
+      this.#requestThought("manual", "所有者が自律行動を再開");
+    }
   }
 
   public async shutdown(reason = "shutdown"): Promise<void> {
@@ -250,6 +273,7 @@ export class PlayerRuntime {
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     this.#retryTimer = undefined;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
+    if (decision.kind === "complete") this.#dispatchNewPurposeCompletionWake();
     if (decision.kind === "act") {
       this.#abortActiveBody("action_revision_changed");
       this.#replacementTail = this.#replacementTail
@@ -263,6 +287,18 @@ export class PlayerRuntime {
         .catch(() => undefined)
         .then(() => this.#stopBody("action_revision_changed"));
     }
+  }
+
+  #dispatchNewPurposeCompletionWake(): void {
+    const state = this.options.mind.purposeCompletionWakeState();
+    if (state.sequence <= this.#handledPurposeCompletionWakeSequence) return;
+    this.#handledPurposeCompletionWakeSequence = state.sequence;
+    if (state.pendingEvent === undefined) return;
+    this.#requestThought(
+      state.pendingEvent.kind,
+      state.pendingEvent.summary,
+      true,
+    );
   }
 
   private onBodyEvent(event: PlayerBodyEvent): void {

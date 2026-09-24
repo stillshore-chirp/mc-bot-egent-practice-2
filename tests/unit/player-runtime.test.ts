@@ -123,6 +123,96 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("wakes once after completion for semantic goal, action, and outcome progress", () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    try {
+      const complete = (expectedRevision: number) =>
+        mind.commitThought({
+          expectedRevision,
+          decision: {
+            kind: "complete",
+            purpose: "purpose finished",
+            reason: "no unfinished work remains",
+            wakeOn: ["body_outcome"],
+          },
+        });
+      const goal = {
+        id: "goal-one",
+        title: "Explore the nearby forest",
+        status: "active" as const,
+        priority: 3,
+        changeReason: "A useful first destination",
+        source: "self" as const,
+      };
+
+      let saved = mind.commitGoalState({
+        expectedRevision: mind.snapshot().revision,
+        goal,
+      });
+      expect(saved.accepted).toBe(true);
+      saved = complete(saved.snapshot.revision);
+      expect(saved.accepted).toBe(true);
+      expect(mind.purposeCompletionWakeState().sequence).toBe(1);
+      expect(
+        mind
+          .pendingEvents(64)
+          .filter(({ summary }) =>
+            summary.includes("目的完了後の自律目的を再評価"),
+          ),
+      ).toHaveLength(1);
+
+      saved = mind.commitGoalState({
+        expectedRevision: saved.snapshot.revision,
+        goal: { ...goal, changeReason: "The same goal remains useful" },
+      });
+      expect(saved.accepted).toBe(true);
+      saved = complete(saved.snapshot.revision);
+      expect(saved.accepted).toBe(true);
+      expect(mind.purposeCompletionWakeState().sequence).toBe(1);
+
+      saved = mind.commitGoalState({
+        expectedRevision: saved.snapshot.revision,
+        goal: { ...goal, status: "completed", changeReason: "Reached it" },
+      });
+      expect(saved.accepted).toBe(true);
+      saved = complete(saved.snapshot.revision);
+      expect(saved.accepted).toBe(true);
+      expect(mind.purposeCompletionWakeState().sequence).toBe(2);
+
+      const actionDecision = action("progress-action");
+      saved = mind.commitThought({
+        expectedRevision: saved.snapshot.revision,
+        decision: actionDecision,
+      });
+      expect(saved.accepted).toBe(true);
+      mind.recordOutcome({
+        evidence: {
+          operationId: actionDecision.operationId,
+          kind: "look",
+          status: "failed",
+          summary: "The view did not change",
+          observedAt: new Date().toISOString(),
+        },
+      });
+      saved = complete(mind.snapshot().revision);
+      expect(saved.accepted).toBe(true);
+      expect(mind.purposeCompletionWakeState().sequence).toBe(3);
+      expect(mind.snapshot()).not.toHaveProperty("purposeProgressRevision");
+    } finally {
+      mind.close();
+    }
+
+    const reopened = PlayerMindStore.open(databasePath);
+    try {
+      expect(reopened.purposeCompletionWakeState().sequence).toBe(3);
+      expect(reopened.purposeCompletionWakeState().pendingEvent).toBeDefined();
+    } finally {
+      reopened.close();
+    }
+  });
+
   it("records bodyStartedAt only after the matching body-start event", () => {
     const directory = temporaryDirectory();
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
@@ -422,6 +512,290 @@ describe("integrated player runtime", () => {
       expect(followupSnapshot?.lastObservation?.timeOfDay).toBe(16_000);
     } finally {
       releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it.each(["successful", "failed"] as const)(
+    "starts a fresh purpose thought after a %s body outcome and one completion",
+    async (outcome) => {
+      const directory = temporaryDirectory();
+      const databasePath = join(directory, "player.sqlite");
+      const mind = PlayerMindStore.open(databasePath);
+      const skills = openSkills(databasePath, directory);
+      const body = new DeferredBody();
+      const runtimeRef: { current?: PlayerRuntime } = {};
+      let thoughtCount = 0;
+      let activeThoughts = 0;
+      let maxActiveThoughts = 0;
+      let finalEvents: readonly { kind: string; summary: string }[] = [];
+      const runtime = new PlayerRuntime({
+        ownerUsername: "owner",
+        playerId: "owner-player",
+        body,
+        mind,
+        memory: createMemoryPort(),
+        skills,
+        conversation: {
+          nextTurn: () => 1,
+          handleOwnerMessage: async () => undefined,
+        },
+        purpose: {
+          think: async ({ snapshot, events }) => {
+            thoughtCount += 1;
+            activeThoughts += 1;
+            maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+            try {
+              if (thoughtCount === 1) {
+                const decision = action("outcome-action");
+                const saved = mind.commitThought({
+                  expectedRevision: snapshot.revision,
+                  decision,
+                });
+                if (saved.accepted)
+                  runtimeRef.current?.handleCommittedDecision(
+                    saved.snapshot,
+                    decision,
+                  );
+                if (saved.accepted)
+                  mind.consumeEvents(events.map(({ id }) => id));
+                return { accepted: saved.accepted, decision };
+              }
+              if (thoughtCount === 2) {
+                expect(snapshot.lastOutcome?.status).toBe(outcome);
+                const decision: PlayerThoughtDecision = {
+                  kind: "complete",
+                  purpose: "the current activity is complete",
+                  reason: "choose another purpose after observing the result",
+                  wakeOn: ["body_outcome"],
+                };
+                const saved = mind.commitThought({
+                  expectedRevision: snapshot.revision,
+                  decision,
+                });
+                if (saved.accepted)
+                  runtimeRef.current?.handleCommittedDecision(
+                    saved.snapshot,
+                    decision,
+                  );
+                if (saved.accepted)
+                  mind.consumeEvents(events.map(({ id }) => id));
+                return { accepted: saved.accepted, decision };
+              }
+              finalEvents = events;
+              mind.consumeEvents(events.map(({ id }) => id));
+              return { accepted: true };
+            } finally {
+              activeThoughts -= 1;
+            }
+          },
+        },
+        logger: pino({ level: "silent" }),
+        say: async () => undefined,
+      });
+      runtimeRef.current = runtime;
+
+      try {
+        await runtime.start();
+        await waitFor(() => body.started.length === 1);
+        body.completeActive(outcome);
+        await waitFor(() => thoughtCount === 3);
+
+        expect(finalEvents).toContainEqual(
+          expect.objectContaining({
+            kind: "manual",
+            summary: "目的完了後の自律目的を再評価",
+          }),
+        );
+        expect(maxActiveThoughts).toBe(1);
+        expect(mind.purposeCompletionWakeState().sequence).toBe(1);
+        expect(mind.purposeCompletionWakeState().pendingEvent).toBeUndefined();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(thoughtCount).toBe(3);
+      } finally {
+        await runtime.shutdown();
+        skills.close();
+        mind.close();
+      }
+    },
+  );
+
+  it("prioritizes an unconsumed completion wake after restart over its wait gate", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const firstMind = PlayerMindStore.open(databasePath);
+    const committed = firstMind.commitThought({
+      expectedRevision: firstMind.snapshot().revision,
+      decision: {
+        kind: "complete",
+        purpose: "finished before restart",
+        reason: "wait for a body outcome",
+        wakeOn: ["body_outcome"],
+      },
+    });
+    expect(committed.accepted).toBe(true);
+    firstMind.close();
+
+    const firstRestartMind = PlayerMindStore.open(databasePath);
+    const firstRestartSkills = openSkills(databasePath, directory);
+    const firstBody = new DeferredBody();
+    let firstThoughtCount = 0;
+    let firstThoughtActive = false;
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    const firstRuntime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body: firstBody,
+      mind: firstRestartMind,
+      memory: createMemoryPort(),
+      skills: firstRestartSkills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async () => {
+          firstThoughtCount += 1;
+          firstThoughtActive = true;
+          try {
+            await firstThoughtGate;
+            return { accepted: false };
+          } finally {
+            firstThoughtActive = false;
+          }
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    try {
+      await firstRuntime.start();
+      await waitFor(() => firstThoughtCount === 1);
+      expect(firstRuntime.snapshot.wait?.wakeOn).toEqual(["body_outcome"]);
+      await firstRuntime.shutdown();
+      releaseFirstThought?.();
+      await waitFor(() => !firstThoughtActive);
+      expect(
+        firstRestartMind.purposeCompletionWakeState().pendingEvent,
+      ).toBeDefined();
+    } finally {
+      releaseFirstThought?.();
+      await firstRuntime.shutdown();
+      firstRestartSkills.close();
+      firstRestartMind.close();
+    }
+
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let thoughtCount = 0;
+    let eventKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events }) => {
+          thoughtCount += 1;
+          eventKinds = events.map(({ kind }) => kind);
+          mind.consumeEvents(events.map(({ id }) => id));
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      expect(runtime.snapshot.wait?.wakeOn).toEqual(["body_outcome"]);
+      expect(eventKinds).toContain("manual");
+      expect(mind.purposeCompletionWakeState().pendingEvent).toBeUndefined();
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("keeps a completion wake durable through stop and restart until explicit resume", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const firstMind = PlayerMindStore.open(databasePath);
+    const completed = firstMind.commitThought({
+      expectedRevision: firstMind.snapshot().revision,
+      decision: {
+        kind: "complete",
+        purpose: "finished",
+        reason: "wait for relevant changes",
+        wakeOn: ["body_outcome"],
+      },
+    });
+    expect(completed.accepted).toBe(true);
+    const stopped = firstMind.stop();
+    if (stopped === undefined) throw new Error("stop latch was not persisted");
+    firstMind.close();
+
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let thoughtCount = 0;
+    let seenEvents: readonly { kind: string; summary: string }[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events }) => {
+          thoughtCount += 1;
+          seenEvents = events;
+          mind.consumeEvents(events.map(({ id }) => id));
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      expect(runtime.snapshot.stopped).toBe(true);
+      expect(thoughtCount).toBe(0);
+      expect(mind.purposeCompletionWakeState().pendingEvent).toBeDefined();
+
+      const resumed = mind.resume(stopped.stopGeneration);
+      expect(resumed).toBeDefined();
+      runtime.onResume();
+      await waitFor(() => thoughtCount === 1);
+      expect(seenEvents).toContainEqual(
+        expect.objectContaining({
+          kind: "manual",
+          summary: "目的完了後の自律目的を再評価",
+        }),
+      );
+      expect(mind.purposeCompletionWakeState().pendingEvent).toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(thoughtCount).toBe(1);
+    } finally {
       await runtime.shutdown();
       skills.close();
       mind.close();
