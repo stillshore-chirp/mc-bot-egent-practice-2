@@ -32,6 +32,12 @@ import {
 import { throwIfAborted } from "../runtime/cancellation.js";
 import { delay, withTimeout } from "../runtime/timeout.js";
 import { buildGroundNames } from "./port.js";
+import {
+  closedDoorAt,
+  handOperableDoorAt,
+  isHandOperableDoor,
+  NavigationMovements,
+} from "./navigation-movements.js";
 import type {
   ArmorEquipResult,
   BuildBlockObservation,
@@ -409,7 +415,7 @@ class ObservedShoreMovements extends Movements {
   }
 }
 
-class ObservedDescentMovements extends Movements {
+class ObservedDescentMovements extends NavigationMovements {
   public constructor(
     private readonly minecraftBot: Bot,
     private readonly approvedNodes?: ReadonlySet<string>,
@@ -432,7 +438,10 @@ class ObservedDescentMovements extends Movements {
     return super.getNeighbors(node).filter((move) => {
       if (
         move.toBreak.length > 0 ||
-        move.toPlace.length > 0 ||
+        move.toPlace.some(
+          (placement) =>
+            (placement as { readonly useOne?: boolean }).useOne !== true,
+        ) ||
         (this.approvedNodes !== undefined &&
           !this.approvedNodes.has(descentNodeKey(move)))
       ) {
@@ -463,8 +472,8 @@ class ObservedDescentMovements extends Movements {
       feet === null ||
       head === null ||
       ground === null ||
-      !isAirName(feet.name) ||
-      !isAirName(head.name) ||
+      (!isAirName(feet.name) && !isHandOperableDoor(feet.name)) ||
+      (!isAirName(head.name) && !isHandOperableDoor(head.name)) ||
       ground.boundingBox !== "block" ||
       unsafeDescentSurfaces.has(ground.name)
     ) {
@@ -651,11 +660,7 @@ export class MineflayerClient implements MinecraftPort {
             `${treeProtectionChannel}\0${storageChannel}\0${actionGuardChannel}`,
           ),
         });
-        const movements = new Movements(bot);
-        movements.canDig = false;
-        movements.allow1by1towers = false;
-        movements.allowParkour = false;
-        movements.maxDropDown = 2;
+        const movements = new NavigationMovements(bot);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.thinkTimeout = this.options.pathfinderThinkTimeoutMs;
         bot.pathfinder.tickTimeout = this.options.pathfinderTickTimeoutMs;
@@ -923,74 +928,264 @@ export class MineflayerClient implements MinecraftPort {
     throwIfAborted(signal, "move_to");
     const bot = this.requireBot();
     const origin = bot.entity.position.floored();
-    const checkedHighNodes = new Set<string>();
-    const unsafeAscent = new AbortController();
-    const verifyHighRoute = (path: {
-      readonly path: readonly Move[];
-    }): void => {
-      for (const node of path.path) {
-        if (node.y - origin.y < 3) continue;
+    const maxSegments = Math.min(
+      4096,
+      Math.max(24, Math.ceil(distance(positionOf(origin), position) * 2) + 8),
+    );
+    let stagnantSegments = 0;
+    for (let segment = 0; segment < maxSegments; segment += 1) {
+      throwIfAborted(signal, "move_to");
+      const before = await this.observe();
+      if (distance(before.position, position) <= range + 0.75) {
+        bot.clearControlStates();
+        return;
+      }
+      const checkedHighNodes = new Set<string>();
+      const confirmReturn = (node: Move): boolean => {
+        if (node.y - origin.y < 3) return true;
         const highNode = new Vec3(
           Math.floor(node.x),
           Math.floor(node.y),
           Math.floor(node.z),
         );
         const key = descentNodeKey(highNode);
-        if (checkedHighNodes.has(key)) continue;
-        let returnConfirmed = false;
-        if (checkedHighNodes.size < 12) {
-          try {
-            returnConfirmed = this.hasObservedReturnRoute(
-              bot,
-              highNode,
-              origin,
-            );
-          } catch {
-            returnConfirmed = false;
-          }
-        }
-        if (!returnConfirmed) {
-          unsafeAscent.abort(new Error("High-place return route unconfirmed"));
-          return;
+        if (checkedHighNodes.has(key)) return true;
+        if (checkedHighNodes.size >= 12) return false;
+        try {
+          if (!this.hasObservedReturnRoute(bot, highNode, origin)) return false;
+        } catch {
+          return false;
         }
         checkedHighNodes.add(key);
-      }
-    };
-    bot.on("path_update", verifyHighRoute);
-    try {
-      await this.runPathfinder(
-        new goals.GoalNear(position.x, position.y, position.z, range),
-        AbortSignal.any([signal, unsafeAscent.signal]),
+        return true;
+      };
+      const target = new goals.GoalNear(
+        position.x,
+        position.y,
+        position.z,
+        range,
       );
-    } catch (error) {
-      if (signal.aborted) throwIfAborted(signal, "move_to");
-      if (unsafeAscent.signal.aborted) {
-        bot.pathfinder.setGoal(null);
-        bot.clearControlStates();
+      const search = bot.pathfinder.getPathFromTo(
+        bot.pathfinder.movements,
+        bot.entity.position,
+        target,
+        {
+          optimizePath: false,
+          timeout: Math.min(this.options.pathfinderThinkTimeoutMs, 700),
+        },
+      );
+      const nextPlan = ():
+        | {
+            readonly status: string;
+            readonly path: Move[];
+          }
+        | undefined =>
+        (
+          search.next().value as
+            | {
+                readonly result: {
+                  readonly status: string;
+                  readonly path: Move[];
+                };
+              }
+            | undefined
+        )?.result;
+      let planned = nextPlan();
+      for (
+        let continuation = 0;
+        planned?.status === "partial" &&
+        planned.path.length === 0 &&
+        continuation < 3;
+        continuation += 1
+      ) {
+        planned = nextPlan();
+      }
+      if (planned === undefined || planned.path.length === 0) {
+        throw new AppError({
+          category: "path",
+          code: "PATHFINDER_FAILED",
+          message: "No nearby walking progress could be planned",
+          retryable: true,
+          failedAt: "move_to",
+        });
+      }
+      // A partial path is useful: take a few observed steps and plan again
+      // instead of requiring a complete route before leaving the start.
+      let waypoint: Move | undefined;
+      let crossedDoor = false;
+      for (const [index, node] of planned.path.slice(0, 4).entries()) {
+        const nodePosition = new Vec3(
+          Math.floor(node.x),
+          Math.floor(node.y),
+          Math.floor(node.z),
+        );
+        const door = handOperableDoorAt(bot, nodePosition);
+        if (door !== null) {
+          // Walk to the door first when it is out of reach. The pathfinder's
+          // optimized path can mistake the leaf for a floor one block higher.
+          if (
+            bot.entity.position.distanceTo(
+              door.position.offset(0.5, 0.5, 0.5),
+            ) > 2.5
+          )
+            break;
+          const beyond = planned.path[index + 1] ?? node;
+          if (!confirmReturn(node) || !confirmReturn(beyond)) break;
+          throwIfAborted(signal, "move_to");
+          if (closedDoorAt(bot, nodePosition) !== null) {
+            try {
+              await bot.activateBlock(door);
+              await bot.waitForTicks(2);
+            } catch (error) {
+              throw new AppError(
+                {
+                  category: "path",
+                  code: "DOOR_OPEN_FAILED",
+                  message: "The nearby door could not be opened",
+                  retryable: true,
+                  failedAt: "move_to",
+                },
+                { cause: error },
+              );
+            }
+            throwIfAborted(signal, "move_to");
+            if (closedDoorAt(bot, nodePosition) !== null) {
+              throw new AppError({
+                category: "path",
+                code: "DOOR_OPEN_UNCONFIRMED",
+                message: "The nearby door did not open in the world",
+                retryable: true,
+                failedAt: "move_to",
+              });
+            }
+          }
+          await this.crossObservedDoor(bot, beyond, signal);
+          crossedDoor = true;
+          break;
+        }
+        if (!confirmReturn(node)) break;
+        waypoint = node;
+      }
+      if (crossedDoor) continue;
+      if (waypoint === undefined) {
         throw new AppError({
           category: "safety",
           code: "ASCENT_RETURN_UNCONFIRMED",
-          message: "The planned high route has no observed safe return",
+          message: "No observed safe return from the next high step",
           retryable: false,
           failedAt: "move_to",
         });
       }
-      throw error;
-    } finally {
-      bot.off("path_update", verifyHighRoute);
+      const unsafeAscent = new AbortController();
+      const verifyNearbyRoute = (path: {
+        readonly path: readonly Move[];
+      }): void => {
+        for (const node of path.path) {
+          if (confirmReturn(node)) continue;
+          unsafeAscent.abort(new Error("High-place return route unconfirmed"));
+          break;
+        }
+      };
+      bot.on("path_update", verifyNearbyRoute);
+      try {
+        await this.runPathfinder(
+          new goals.GoalNear(waypoint.x, waypoint.y, waypoint.z, 0),
+          AbortSignal.any([signal, unsafeAscent.signal]),
+        );
+      } catch (error) {
+        if (signal.aborted) throwIfAborted(signal, "move_to");
+        if (unsafeAscent.signal.aborted) {
+          bot.pathfinder.setGoal(null);
+          bot.clearControlStates();
+          throw new AppError({
+            category: "safety",
+            code: "ASCENT_RETURN_UNCONFIRMED",
+            message: "The nearby high route has no observed safe return",
+            retryable: false,
+            failedAt: "move_to",
+          });
+        }
+        throw error;
+      } finally {
+        bot.off("path_update", verifyNearbyRoute);
+      }
+      const after = await this.observe();
+      stagnantSegments =
+        distance(before.position, after.position) < 0.75
+          ? stagnantSegments + 1
+          : 0;
+      if (stagnantSegments >= 2) {
+        bot.clearControlStates();
+        throw new AppError({
+          category: "path",
+          code: "PATH_PROGRESS_STALLED",
+          message: "Two walking segments completed without observed progress",
+          retryable: false,
+          failedAt: "move_to",
+        });
+      }
     }
-    const snapshot = await this.observe();
-    if (distance(snapshot.position, position) > range + 0.75) {
+    bot.clearControlStates();
+    const final = await this.observe();
+    if (distance(final.position, position) <= range + 0.75) return;
+    throw new AppError({
+      category: "path",
+      code: "PATH_EXPLORATION_LIMIT",
+      message: "Bounded walking exploration did not reach the goal",
+      retryable: false,
+      failedAt: "move_to",
+    });
+  }
+
+  private async crossObservedDoor(
+    bot: Bot,
+    beyond: Move,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const destination = new Vec3(
+      Math.floor(beyond.x) + 0.5,
+      beyond.y,
+      Math.floor(beyond.z) + 0.5,
+    );
+    const before = bot.entity.position.clone();
+    const deadline = Date.now() + 2500;
+    bot.pathfinder.setGoal(null);
+    try {
+      while (Date.now() < deadline) {
+        throwIfAborted(signal, "move_to");
+        const current = bot.entity.position;
+        if (
+          Math.hypot(current.x - destination.x, current.z - destination.z) <
+            0.65 &&
+          Math.abs(current.y - destination.y) < 1
+        )
+          break;
+        await bot.lookAt(
+          new Vec3(destination.x, current.y + 1.5, destination.z),
+          true,
+        );
+        bot.setControlState("forward", true);
+        await delay(100, signal);
+      }
+    } finally {
+      bot.clearControlStates();
+    }
+    const after = await this.observe();
+    if (
+      distance(positionOf(before), after.position) < 0.75 ||
+      Math.hypot(
+        after.position.x - destination.x,
+        after.position.z - destination.z,
+      ) >= 1
+    ) {
       throw new AppError({
         category: "path",
-        code: "MOVE_VERIFICATION_FAILED",
-        message:
-          "Pathfinder completed but the observed position is outside the goal",
+        code: "DOOR_PASSAGE_STALLED",
+        message: "The open doorway could not be crossed",
         retryable: true,
         failedAt: "move_to",
       });
     }
-    bot.clearControlStates();
   }
 
   private hasObservedReturnRoute(
@@ -1051,9 +1246,12 @@ export class MineflayerClient implements MinecraftPort {
     } catch (error) {
       if (
         !(error instanceof AppError) ||
-        !["PATHFINDER_FAILED", "MOVE_VERIFICATION_FAILED"].includes(
-          error.detail.code,
-        )
+        ![
+          "PATHFINDER_FAILED",
+          "MOVE_VERIFICATION_FAILED",
+          "PATH_PROGRESS_STALLED",
+          "PATH_EXPLORATION_LIMIT",
+        ].includes(error.detail.code)
       ) {
         throw error;
       }
