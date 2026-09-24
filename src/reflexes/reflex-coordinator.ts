@@ -4,6 +4,7 @@ import {
   type FailureDetail,
 } from "../domain/errors.js";
 import type { WorldSnapshot } from "../domain/snapshot.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
 import type { MinecraftPort } from "../minecraft/port.js";
 import {
   actionPriorities,
@@ -50,6 +51,7 @@ export class ReflexCoordinator {
   private currentState: ReflexState = { state: "safe" };
   private handling = false;
   private retryNotBefore = 0;
+  private noSafeFoodContext: string | undefined;
 
   public constructor(
     private readonly detector: ReflexDetector,
@@ -59,6 +61,7 @@ export class ReflexCoordinator {
     private readonly arbiter: ActionArbiter,
     private readonly actionTimeoutMs: number,
     private readonly stuckRecoveryAttempts = 3,
+    private readonly ownerUsername?: string,
   ) {}
 
   public get state(): ReflexState {
@@ -70,18 +73,23 @@ export class ReflexCoordinator {
     movementExpected: boolean,
   ): Promise<ReflexState> {
     if (this.handling) return this.currentState;
-    if (
-      this.currentState.state === "failed" &&
-      Date.now() < this.retryNotBefore
-    ) {
-      return this.currentState;
-    }
     const incident = this.detector.detect(
       snapshot,
       movementExpected,
       (previous, current) =>
         this.minecraft.isExpectedDescentDamage(previous, current),
     );
+    if (
+      this.currentState.state === "failed" &&
+      incident?.kind === this.currentState.incident.kind &&
+      incident.reason === this.currentState.incident.reason &&
+      (this.currentState.failure.code === "NO_SAFE_FOOD"
+        ? this.noSafeFoodContext ===
+          noSafeFoodContext(snapshot, this.ownerUsername)
+        : Date.now() < this.retryNotBefore)
+    ) {
+      return this.currentState;
+    }
     if (incident === undefined) {
       if (this.currentState.state !== "safe") {
         this.currentState = { state: "safe" };
@@ -108,7 +116,67 @@ export class ReflexCoordinator {
       await withTimeout(
         async (timeoutSignal) => {
           const signal = AbortSignal.any([acquiredLease.signal, timeoutSignal]);
-          if (incident.kind === "hunger")
+          if (incident.kind === "equipment") {
+            const result = await this.minecraft.equipAvailableArmor(signal);
+            if (result.failed || result.equipped.length === 0) {
+              throw new AppError({
+                category: "safety",
+                code: "AUTONOMOUS_ARMOR_EQUIP_FAILED",
+                message: "No armor slot was confirmed equipped",
+                retryable: true,
+                failedAt: "reflex:equipment",
+              });
+            }
+          } else if (incident.kind === "critical_health") {
+            const hostile = snapshot.nearbyEntities.some(
+              (entity) =>
+                entity.hostile &&
+                entity.distance <= this.thresholds.hostileDistance,
+            );
+            if (hostile) {
+              await this.minecraft.escapeDanger("hostile", signal);
+            } else if (recommendArmor(snapshot).length > 0) {
+              const result = await this.minecraft.equipAvailableArmor(signal);
+              if (result.failed || result.equipped.length === 0) {
+                throw new AppError({
+                  category: "safety",
+                  code: "AUTONOMOUS_ARMOR_EQUIP_FAILED",
+                  message: "No armor slot was confirmed equipped",
+                  retryable: true,
+                  failedAt: "reflex:critical_health",
+                });
+              }
+            } else if (snapshot.food < 18) {
+              try {
+                await this.minecraft.eatBestFood(signal);
+              } catch (error) {
+                const owner = safeOwnerForRecovery(
+                  snapshot,
+                  this.ownerUsername,
+                );
+                if (
+                  !(error instanceof AppError) ||
+                  error.detail.code !== "NO_SAFE_FOOD" ||
+                  owner === undefined
+                ) {
+                  throw error;
+                }
+                await this.minecraft.moveToWithSafeDescent(
+                  owner.position,
+                  2,
+                  signal,
+                );
+              }
+            } else {
+              throw new AppError({
+                category: "safety",
+                code: "CRITICAL_HEALTH_NO_SAFE_ACTION",
+                message: "No safe immediate recovery action is available",
+                retryable: true,
+                failedAt: "reflex:critical_health",
+              });
+            }
+          } else if (incident.kind === "hunger")
             await this.minecraft.eatBestFood(signal);
           else if (incident.kind === "stuck") {
             await this.minecraft.recoverFromStuck(
@@ -154,6 +222,7 @@ export class ReflexCoordinator {
         after,
       };
       this.retryNotBefore = 0;
+      this.noSafeFoodContext = undefined;
     } catch (error) {
       if (after === undefined) {
         try {
@@ -178,10 +247,49 @@ export class ReflexCoordinator {
         ...(after === undefined ? {} : { after }),
       };
       this.retryNotBefore = Date.now() + 5_000;
+      this.noSafeFoodContext =
+        this.currentState.failure.code === "NO_SAFE_FOOD"
+          ? noSafeFoodContext(snapshot, this.ownerUsername)
+          : undefined;
     } finally {
       lease?.release();
       this.handling = false;
     }
     return this.currentState;
   }
+}
+
+function inventorySignature(snapshot: WorldSnapshot): string {
+  return snapshot.inventory
+    .map((item) => `${item.name}:${String(item.count)}`)
+    .sort()
+    .join("|");
+}
+
+function safeOwnerForRecovery(
+  snapshot: WorldSnapshot,
+  ownerUsername: string | undefined,
+): WorldSnapshot["players"][number] | undefined {
+  if (
+    ownerUsername === undefined ||
+    snapshot.inWater ||
+    snapshot.nearbyEntities.some(
+      (entity) => entity.hostile && entity.distance <= 12,
+    )
+  ) {
+    return undefined;
+  }
+  return snapshot.players.find(
+    (player) =>
+      player.username === ownerUsername &&
+      player.distance > 3 &&
+      player.distance <= 12,
+  );
+}
+
+function noSafeFoodContext(
+  snapshot: WorldSnapshot,
+  ownerUsername: string | undefined,
+): string {
+  return `${inventorySignature(snapshot)}:${safeOwnerForRecovery(snapshot, ownerUsername) === undefined ? "no_fallback" : "owner_available"}`;
 }

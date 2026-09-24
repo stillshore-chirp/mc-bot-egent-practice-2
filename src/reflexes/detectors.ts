@@ -5,11 +5,14 @@ import {
   type Position,
   type WorldSnapshot,
 } from "../domain/snapshot.js";
+import { recommendArmor } from "../decision/armor-equipment.js";
 
 export const reflexKinds = [
   "hazard",
   "damage",
   "hostile",
+  "critical_health",
+  "equipment",
   "hunger",
   "stuck",
 ] as const;
@@ -37,6 +40,10 @@ export interface ReflexThresholds {
   readonly fallingVelocity: number;
   readonly stuckWindowMs: number;
   readonly stuckDistance: number;
+}
+
+export function isCriticalHealth(snapshot: WorldSnapshot): boolean {
+  return snapshot.health > 0 && snapshot.health <= 6 && snapshot.food < 18;
 }
 
 export class ReflexDetector {
@@ -112,6 +119,22 @@ export class ReflexDetector {
         observation,
       };
     }
+    if (isCriticalHealth(current)) {
+      return {
+        kind: "critical_health",
+        reason: "Bot health is critically low",
+        priority: 250,
+        observation,
+      };
+    }
+    if (recommendArmor(current).length > 0) {
+      return {
+        kind: "equipment",
+        reason: "Wearable armor is available for an empty slot",
+        priority: 225,
+        observation,
+      };
+    }
     if (current.food <= this.thresholds.lowFood) {
       return {
         kind: "hunger",
@@ -181,6 +204,10 @@ export function isStableAfterIncident(
       );
     case "hunger":
       return snapshot.food > thresholds.lowFood;
+    case "critical_health":
+      return snapshot.health > 0;
+    case "equipment":
+      return snapshot.armor !== null && recommendArmor(snapshot).length === 0;
     case "stuck":
       return true;
   }

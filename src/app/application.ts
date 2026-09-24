@@ -62,6 +62,11 @@ const MOVEMENT_PHASES = new Set([
   "return_to_player",
   "following",
 ]);
+const spatialHazardKinds = new Set(["hazard", "damage", "hostile", "stuck"]);
+
+export function isSpatialHazardIncident(state: ReflexState): boolean {
+  return state.state !== "safe" && spatialHazardKinds.has(state.incident.kind);
+}
 
 const runtimeReassessmentPriority = (event: RuntimeReassessmentEvent): number =>
   ({
@@ -539,7 +544,7 @@ class DefaultCompanionApplication implements CompanionApplication {
       await this.#recordReflexTransition(previousReflexState, state);
       if (state.state === "safe") {
         this.#lastRememberedIncident = "";
-      } else if (state.incident.kind !== "hunger") {
+      } else if (isSpatialHazardIncident(state)) {
         const incidentKey = [
           state.incident.kind,
           Math.round(snapshot.position.x),
@@ -978,6 +983,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
     arbiter,
     Math.min(config.limits.taskTimeoutMs, 10_000),
     config.limits.skillRetryLimit + 1,
+    config.ownerUsername,
   );
   const toolMemory = new ToolMemoryAdapter(memory);
   const toolBehaviorMemory = new ToolBehaviorMemoryAdapter(memory);

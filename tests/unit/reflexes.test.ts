@@ -33,6 +33,8 @@ const coordinatorFor = (minecraft: FakeMinecraft): ReflexCoordinator =>
     ),
     new ActionArbiter(),
     1_000,
+    3,
+    "owner",
   );
 
 describe("reflex loop", () => {
@@ -46,6 +48,264 @@ describe("reflex loop", () => {
     );
     expect(state.state).toBe("stabilizing");
     expect(minecraft.actions).toContain("eat:bread");
+  });
+
+  it("equips carried armor on its own when an observed slot is empty", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ inventory: [{ name: "iron_chestplate", count: 1 }] }),
+    );
+    const coordinator = coordinatorFor(minecraft);
+
+    expect(
+      (await coordinator.tick(await minecraft.observe(), false)).state,
+    ).toBe("stabilizing");
+    expect(minecraft.actions).toContain("equip:torso:iron_chestplate");
+    expect((await minecraft.observe()).armor?.torso).toBe("iron_chestplate");
+    expect(
+      (await coordinator.tick(await minecraft.observe(), false)).state,
+    ).toBe("safe");
+  });
+
+  it("prioritizes armor over food at critical health without a visible attacker", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        inventory: [{ name: "iron_helmet", count: 1 }],
+      }),
+    );
+
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("equip:head:iron_helmet");
+    expect(minecraft.actions).not.toContain("eat:bread");
+  });
+
+  it("eats at critical health when no armor or attacker is available", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({ health: 4, food: 10 }),
+    );
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("eat:bread");
+  });
+
+  it("moves toward the nearby owner on a safe route when critical and out of food", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        players: [
+          {
+            username: "owner",
+            position: { x: 8, y: 64, z: 0 },
+            distance: 8,
+          },
+        ],
+      }),
+    );
+    const response = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("move:8,64,0");
+  });
+
+  it("does not approach another player as a no-food recovery substitute", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(
+      createSnapshot({
+        health: 4,
+        food: 10,
+        players: [
+          {
+            username: "visitor",
+            position: { x: 8, y: 64, z: 0 },
+            distance: 8,
+          },
+        ],
+      }),
+    );
+    const response = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(response).toMatchObject({
+      state: "failed",
+      failure: { code: "NO_SAFE_FOOD" },
+    });
+    expect(minecraft.actions).not.toContain("move:8,64,0");
+  });
+
+  it.each([
+    {
+      situation: "the owner comes into range",
+      before: () => createSnapshot({ health: 4, food: 10, players: [] }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+    {
+      situation: "the Bot leaves water",
+      before: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          inWater: true,
+          oxygen: 20,
+          oxygenState: "normal",
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+    {
+      situation: "a distant hostile leaves the route",
+      before: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+          nearbyEntities: [
+            {
+              id: 1,
+              name: "zombie",
+              kind: "mob",
+              position: { x: 10, y: 64, z: 0 },
+              distance: 10,
+              hostile: true,
+            },
+          ],
+        }),
+      after: () =>
+        createSnapshot({
+          health: 4,
+          food: 10,
+          players: [
+            {
+              username: "owner",
+              position: { x: 8, y: 64, z: 0 },
+              distance: 8,
+            },
+          ],
+        }),
+    },
+  ])(
+    "reevaluates a safe fallback when $situation",
+    async ({ before, after }) => {
+      class NoFoodMinecraft extends FakeMinecraft {
+        public override async eatBestFood(): Promise<string> {
+          throw new AppError({
+            category: "inventory",
+            code: "NO_SAFE_FOOD",
+            message: "No safe food is carried",
+            retryable: false,
+          });
+        }
+      }
+      const minecraft = new NoFoodMinecraft(before());
+      const coordinator = coordinatorFor(minecraft);
+
+      expect(
+        await coordinator.tick(await minecraft.observe(), false),
+      ).toMatchObject({
+        state: "failed",
+        failure: { code: "NO_SAFE_FOOD" },
+      });
+      minecraft.snapshot = after();
+      expect(
+        (await coordinator.tick(await minecraft.observe(), false)).state,
+      ).toBe("stabilizing");
+      expect(minecraft.actions).toContain("move:8,64,0");
+    },
+  );
+
+  it("retreats before equipping when a critically injured Bot sees a hostile", async () => {
+    const minecraft = new FakeMinecraft(
+      createSnapshot({
+        health: 4,
+        inventory: [{ name: "iron_helmet", count: 1 }],
+        nearbyEntities: [
+          {
+            id: 1,
+            name: "zombie",
+            kind: "mob",
+            position: { x: 1, y: 64, z: 0 },
+            distance: 1,
+            hostile: true,
+          },
+        ],
+      }),
+    );
+    const state = await coordinatorFor(minecraft).tick(
+      await minecraft.observe(),
+      false,
+    );
+
+    expect(state.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("escape:hostile");
+    expect(minecraft.actions).not.toContain("equip:head:iron_helmet");
   });
 
   it("escapes an observed lava hazard", async () => {
@@ -336,6 +596,80 @@ describe("reflex loop", () => {
     vi.advanceTimersByTime(5_001);
     const recovered = await coordinator.tick(await minecraft.observe(), false);
     expect(recovered.state).toBe("safe");
+  });
+
+  it("reacts to a new hostile immediately after a no-food failure", async () => {
+    class NoFoodMinecraft extends FakeMinecraft {
+      public override async eatBestFood(): Promise<string> {
+        throw new AppError({
+          category: "inventory",
+          code: "NO_SAFE_FOOD",
+          message: "No safe food is carried",
+          retryable: false,
+        });
+      }
+    }
+    const minecraft = new NoFoodMinecraft(createSnapshot({ food: 10 }));
+    const coordinator = coordinatorFor(minecraft);
+    const failed = await coordinator.tick(await minecraft.observe(), false);
+    expect(failed).toMatchObject({
+      state: "failed",
+      failure: { code: "NO_SAFE_FOOD" },
+    });
+
+    minecraft.snapshot = createSnapshot({
+      food: 10,
+      nearbyEntities: [
+        {
+          id: 2,
+          name: "zombie",
+          kind: "mob",
+          position: { x: 2, y: 64, z: 0 },
+          distance: 2,
+          hostile: true,
+        },
+      ],
+    });
+    const response = await coordinator.tick(await minecraft.observe(), false);
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.actions).toContain("escape:hostile");
+  });
+
+  it("does not retry unavailable food until the observed inventory changes", async () => {
+    class InventoryAwareMinecraft extends FakeMinecraft {
+      public eatAttempts = 0;
+
+      public override async eatBestFood(signal: AbortSignal): Promise<string> {
+        this.eatAttempts += 1;
+        if (
+          !this.snapshot.inventory.some(
+            (item) => item.name === "bread" && item.count > 0,
+          )
+        ) {
+          throw new AppError({
+            category: "inventory",
+            code: "NO_SAFE_FOOD",
+            message: "No safe food is carried",
+            retryable: false,
+          });
+        }
+        return super.eatBestFood(signal);
+      }
+    }
+    const minecraft = new InventoryAwareMinecraft(createSnapshot({ food: 10 }));
+    const coordinator = coordinatorFor(minecraft);
+    await coordinator.tick(await minecraft.observe(), false);
+    await coordinator.tick(await minecraft.observe(), false);
+    expect(minecraft.eatAttempts).toBe(1);
+
+    minecraft.snapshot = createSnapshot({
+      food: 10,
+      inventory: [{ name: "bread", count: 1 }],
+    });
+    const response = await coordinator.tick(await minecraft.observe(), false);
+    expect(response.state).toBe("stabilizing");
+    expect(minecraft.eatAttempts).toBe(2);
+    expect(minecraft.actions).toContain("eat:bread");
   });
 
   it("uses bounded stuck recovery after the movement window expires", async () => {

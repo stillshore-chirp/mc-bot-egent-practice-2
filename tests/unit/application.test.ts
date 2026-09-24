@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isSpatialHazardIncident,
   reflexReassessmentForTransition,
   runtimeReassessmentState,
   SafetyReassessmentEpisodes,
@@ -37,6 +38,27 @@ const failed = (
 });
 
 describe("application reflex policy", () => {
+  it("remembers environmental incidents as locations but not equipment or low vitals", () => {
+    const base = failed();
+    for (const kind of ["hazard", "damage", "hostile", "stuck"] as const) {
+      expect(
+        isSpatialHazardIncident({
+          ...base,
+          incident: { ...base.incident, kind },
+        }),
+      ).toBe(true);
+    }
+    for (const kind of ["equipment", "critical_health", "hunger"] as const) {
+      expect(
+        isSpatialHazardIncident({
+          ...base,
+          incident: { ...base.incident, kind },
+        }),
+      ).toBe(false);
+    }
+    expect(isSpatialHazardIncident({ state: "safe" })).toBe(false);
+  });
+
   it("expects movement only from a running movement phase", () => {
     expect(
       taskExpectsMovement({ status: "running", phase: "following" }, 8, 3),
