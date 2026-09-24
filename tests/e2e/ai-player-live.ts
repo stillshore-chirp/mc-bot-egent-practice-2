@@ -24,9 +24,12 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { config as loadEnvironmentFile } from "dotenv";
 import mineflayer, { type Bot } from "mineflayer";
+import { ZodError } from "zod";
 
+import { AppError, errorCategories } from "../../src/domain/errors.js";
 import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
+import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -85,6 +88,61 @@ interface SafeCaseResult {
   readonly usageStatus: UsageStatus;
   readonly evidence: Readonly<Record<string, boolean | number | string>>;
   readonly reason?: string;
+}
+
+type BodyOperationStatus =
+  "successful" | "failed" | "interrupted" | "unverified";
+
+type BodyDetailClass =
+  | "none"
+  | "target_not_loaded"
+  | "target_out_of_reach"
+  | "target_occluded"
+  | "target_out_of_field_of_view"
+  | "block_not_diggable"
+  | "action_timeout"
+  | "action_interrupted"
+  | "effect_unverified"
+  | "transport_error"
+  | "other";
+
+type ConnectionFailureClass =
+  | "schema_validation"
+  | "timeout"
+  | "connection_refused"
+  | "connection_reset"
+  | "protocol"
+  | "authentication_or_kick"
+  | "disconnected"
+  | "connection_error"
+  | "other";
+
+interface BodySmokeDiagnostic {
+  readonly fixtureLookStatus: BodyOperationStatus;
+  readonly fixtureLookDetailClass: BodyDetailClass;
+  readonly fixtureTargetVisibleAfterLook: boolean;
+  readonly fixtureTargetBlockName: string;
+  readonly targetVisibleInDigBeforeSnapshot?: boolean;
+  readonly targetBlockNameInDigBeforeSnapshot?: string;
+  readonly digStatus?: BodyOperationStatus;
+  readonly digRecoveryRequired?: boolean;
+  readonly digDetailClass?: BodyDetailClass;
+  readonly serverBlockAirAfterDig?: boolean;
+}
+
+interface SafeApplicationStartDiagnostic {
+  readonly errorName: string;
+  readonly connectionFailureClass: ConnectionFailureClass;
+  readonly appError?: {
+    readonly category: string;
+    readonly code: string;
+  };
+  readonly nodeErrorCode?: string;
+  readonly zodIssues?: readonly {
+    readonly code: string;
+    readonly path: readonly string[];
+  }[];
+  readonly zodIssuesTruncated?: boolean;
 }
 
 interface Counters {
@@ -246,6 +304,215 @@ function incomplete(code: string): never {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const safeErrorNames = new Set([
+  "AbortError",
+  "AppError",
+  "Error",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TimeoutError",
+  "TypeError",
+  "ZodError",
+]);
+
+const safeNodeErrorCodes = new Set([
+  "ABORT_ERR",
+  "EADDRINUSE",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ERR_MODULE_NOT_FOUND",
+  "ERR_NETWORK",
+  "ERR_SOCKET_CLOSED",
+  "ERR_STREAM_DESTROYED",
+]);
+
+function safeNodeErrorCode(error: unknown): string | undefined {
+  if (!isRecord(error) || typeof error.code !== "string") return undefined;
+  return safeNodeErrorCodes.has(error.code) ? error.code : undefined;
+}
+
+function safeSchemaPathSegment(segment: unknown, state: RunState): string {
+  if (typeof segment === "number") return "index";
+  if (typeof segment !== "string") return "dynamic";
+  if (
+    segment === state.botName ||
+    segment === state.ownerName ||
+    segment === state.guestName ||
+    (process.env.OPENAI_API_KEY !== undefined &&
+      segment === process.env.OPENAI_API_KEY)
+  ) {
+    return "redacted";
+  }
+  return /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/u.test(segment) ? segment : "dynamic";
+}
+
+function classifyConnectionFailure(error: unknown): ConnectionFailureClass {
+  if (error instanceof ZodError) return "schema_validation";
+  const message =
+    error instanceof AppError
+      ? `${error.detail.code} ${error.detail.message}`
+      : error instanceof Error
+        ? error.message
+        : "";
+  const searchable =
+    `${safeNodeErrorCode(error) ?? ""} ${message}`.toLowerCase();
+  if (/etimedout|timed out|timeout/u.test(searchable)) return "timeout";
+  if (/econnrefused|connection refused/u.test(searchable))
+    return "connection_refused";
+  if (/econnreset|connection reset|reset by peer/u.test(searchable))
+    return "connection_reset";
+  if (
+    /protocol|unsupported version|version mismatch|bad packet/u.test(searchable)
+  )
+    return "protocol";
+  if (/authentication|login|invalid session|kicked/u.test(searchable))
+    return "authentication_or_kick";
+  if (
+    /disconnected|connection closed|not connected|end of stream/u.test(
+      searchable,
+    )
+  )
+    return "disconnected";
+  if (error instanceof AppError && error.detail.category === "connection")
+    return "connection_error";
+  return "other";
+}
+
+function applicationStartDiagnostic(
+  error: unknown,
+  state: RunState,
+): SafeApplicationStartDiagnostic {
+  const errorName =
+    error instanceof Error && safeErrorNames.has(error.name)
+      ? error.name
+      : error instanceof Error
+        ? "OtherError"
+        : "NonError";
+  const appError =
+    error instanceof AppError
+      ? {
+          category: errorCategories.includes(error.detail.category)
+            ? error.detail.category
+            : "unknown",
+          code: /^[A-Z][A-Z0-9_]{0,63}$/u.test(error.detail.code)
+            ? error.detail.code
+            : "OTHER",
+        }
+      : undefined;
+  const zodIssues =
+    error instanceof ZodError
+      ? error.issues.slice(0, 12).map((issue) => ({
+          code: /^[a-z][a-z0-9_]{0,47}$/u.test(issue.code)
+            ? issue.code
+            : "other",
+          path: issue.path
+            .slice(0, 8)
+            .map((segment) => safeSchemaPathSegment(segment, state)),
+        }))
+      : undefined;
+  const zodIssuesTruncated =
+    error instanceof ZodError && zodIssues !== undefined
+      ? error.issues.length > zodIssues.length
+      : undefined;
+  const nodeErrorCode = safeNodeErrorCode(error);
+  return {
+    errorName,
+    connectionFailureClass: classifyConnectionFailure(error),
+    ...(appError === undefined ? {} : { appError }),
+    ...(nodeErrorCode === undefined ? {} : { nodeErrorCode }),
+    ...(zodIssues === undefined
+      ? {}
+      : { zodIssues, zodIssuesTruncated: zodIssuesTruncated === true }),
+  };
+}
+
+function observedBlockName(
+  observation: PlayerBodyObservation | null,
+  target: Position,
+): string | undefined {
+  return observation?.perception.blocks.find(
+    (block) =>
+      block.position.x === target.x &&
+      block.position.y === target.y &&
+      block.position.z === target.z,
+  )?.name;
+}
+
+function classifyBodyOperationDetail(
+  detail: string | undefined,
+): BodyDetailClass {
+  if (detail === undefined) return "none";
+  const normalized = detail.toLowerCase();
+  if (normalized.includes("outside loaded world data"))
+    return "target_not_loaded";
+  if (normalized.includes("outside normal player reach"))
+    return "target_out_of_reach";
+  if (normalized.includes("occluded")) return "target_occluded";
+  if (normalized.includes("outside the current field of view"))
+    return "target_out_of_field_of_view";
+  if (normalized.includes("not diggable")) return "block_not_diggable";
+  if (normalized.includes("bounded action wait expired"))
+    return "action_timeout";
+  if (normalized.includes("action was stopped")) return "action_interrupted";
+  if (
+    normalized.includes("effect could not be confirmed") ||
+    normalized.includes("effect was not confirmed") ||
+    normalized.includes("not observable")
+  ) {
+    return "effect_unverified";
+  }
+  if (
+    /econnrefused|econnreset|etimedout|connection (?:closed|reset)/u.test(
+      normalized,
+    )
+  ) {
+    return "transport_error";
+  }
+  return "other";
+}
+
+function bodySmokeEvidence(
+  diagnostic: BodySmokeDiagnostic | undefined,
+): Readonly<Record<string, boolean | number | string>> {
+  if (diagnostic === undefined) return {};
+  return {
+    fixtureLookStatus: diagnostic.fixtureLookStatus,
+    fixtureLookDetailClass: diagnostic.fixtureLookDetailClass,
+    fixtureTargetVisibleAfterLook: diagnostic.fixtureTargetVisibleAfterLook,
+    fixtureTargetBlockName: diagnostic.fixtureTargetBlockName,
+    ...(diagnostic.targetVisibleInDigBeforeSnapshot === undefined
+      ? {}
+      : {
+          targetVisibleInDigBeforeSnapshot:
+            diagnostic.targetVisibleInDigBeforeSnapshot,
+        }),
+    ...(diagnostic.targetBlockNameInDigBeforeSnapshot === undefined
+      ? {}
+      : {
+          targetBlockNameInDigBeforeSnapshot:
+            diagnostic.targetBlockNameInDigBeforeSnapshot,
+        }),
+    ...(diagnostic.digStatus === undefined
+      ? {}
+      : { digStatus: diagnostic.digStatus }),
+    ...(diagnostic.digRecoveryRequired === undefined
+      ? {}
+      : { digRecoveryRequired: diagnostic.digRecoveryRequired }),
+    ...(diagnostic.digDetailClass === undefined
+      ? {}
+      : { digDetailClass: diagnostic.digDetailClass }),
+    ...(diagnostic.serverBlockAirAfterDig === undefined
+      ? {}
+      : { serverBlockAirAfterDig: diagnostic.serverBlockAirAfterDig }),
+  };
 }
 
 function positiveNumber(value: unknown, fallback = 0): number {
@@ -571,6 +838,9 @@ interface RunState {
   privateDiagnosticLogRetained?: boolean;
   privateServerLogWriteFailed?: boolean;
   abortRequested?: boolean;
+  serverReadyObserved?: boolean;
+  applicationStartDiagnostic?: SafeApplicationStartDiagnostic;
+  bodySmokeDiagnostic?: BodySmokeDiagnostic;
 }
 
 let appForCleanup: CompanionApplication | undefined;
@@ -590,6 +860,7 @@ async function main(): Promise<void> {
   const results = state.cases;
   try {
     await startServer(state);
+    state.serverReadyObserved = true;
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
@@ -628,7 +899,7 @@ async function main(): Promise<void> {
     state.preStartPlayer = playerOf(preStartEvidence);
     state.countersInitial = countersOf(preStartEvidence);
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
-    await connectApplication(activeApp);
+    await connectApplication(activeApp, state);
     const smokeBaseline = state.smokeSnapshot;
     const connectedWorld = await readWorldSnapshot(rcon, state.botName);
     state.autonomousBaseline = {
@@ -1035,7 +1306,7 @@ async function main(): Promise<void> {
           await import("../../src/app/application.js");
         const nextApp = createApplication(context.runtime.config);
         appForCleanup = nextApp;
-        await connectApplication(nextApp);
+        await connectApplication(nextApp, state);
         const restartedContext: CaseContext = {
           ...makeContext(
             state,
@@ -2140,11 +2411,66 @@ async function runOperationSmoke(
         await rcon.command(
           `setblock ${target.x} ${target.y} ${target.z} stone`,
         );
+        const fixtureLookResult = await body.execute(
+          {
+            kind: "look",
+            target: {
+              x: target.x + 0.5,
+              y: target.y + 0.5,
+              z: target.z + 0.5,
+            },
+          },
+          abort.signal,
+        );
+        let fixtureObservation: PlayerBodyObservation | null = null;
+        const visibilityDeadline = Date.now() + 5_000;
+        while (!abort.signal.aborted && Date.now() < visibilityDeadline) {
+          fixtureObservation = await body.observe();
+          if (observedBlockName(fixtureObservation, target) !== undefined)
+            break;
+          await waitMs(100);
+        }
+        const fixtureTargetBlockName =
+          observedBlockName(fixtureObservation, target) ?? "not_observed";
+        const fixtureTargetVisibleAfterLook =
+          fixtureTargetBlockName !== "not_observed";
+        state.bodySmokeDiagnostic = {
+          fixtureLookStatus: fixtureLookResult.status,
+          fixtureLookDetailClass: classifyBodyOperationDetail(
+            fixtureLookResult.detail,
+          ),
+          fixtureTargetVisibleAfterLook,
+          fixtureTargetBlockName,
+        };
+        if (fixtureLookResult.status !== "successful")
+          incomplete("BODY_SMOKE_LOOK_NOT_CONFIRMED");
+        if (!fixtureTargetVisibleAfterLook)
+          incomplete("BODY_SMOKE_TARGET_NOT_VISIBLE_BEFORE_DIG");
+        if (fixtureTargetBlockName !== "stone")
+          incomplete("BODY_SMOKE_FIXTURE_BLOCK_MISMATCH");
         const digResult = await body.execute(
           { kind: "dig", position: target },
           abort.signal,
         );
+        const digBeforeBlockName = observedBlockName(digResult.before, target);
         const blockIsAir = await isBlock(rcon, target, "air");
+        state.bodySmokeDiagnostic = {
+          fixtureLookStatus: fixtureLookResult.status,
+          fixtureLookDetailClass: classifyBodyOperationDetail(
+            fixtureLookResult.detail,
+          ),
+          fixtureTargetVisibleAfterLook,
+          fixtureTargetBlockName,
+          targetVisibleInDigBeforeSnapshot: digBeforeBlockName !== undefined,
+          targetBlockNameInDigBeforeSnapshot:
+            digBeforeBlockName ?? "not_observed",
+          digStatus: digResult.status,
+          digRecoveryRequired: digResult.recoveryRequired,
+          digDetailClass: classifyBodyOperationDetail(digResult.detail),
+          serverBlockAirAfterDig: blockIsAir,
+        };
+        if (digResult.status !== "successful")
+          fail("NON_OP_BODY_DIG_NOT_CONFIRMED_BY_BODY");
         if (!blockIsAir) fail("NON_OP_BODY_DIG_NOT_CONFIRMED_BY_SERVER");
         await rcon.command(
           `setblock ${target.x} ${target.y} ${target.z} furnace`,
@@ -2265,10 +2591,14 @@ async function runOperationSmoke(
   return result;
 }
 
-async function connectApplication(app: CompanionApplication): Promise<void> {
+async function connectApplication(
+  app: CompanionApplication,
+  state: RunState,
+): Promise<void> {
   try {
     await app.start();
-  } catch {
+  } catch (error) {
+    state.applicationStartDiagnostic = applicationStartDiagnostic(error, state);
     incomplete("APPLICATION_START_FAILED");
   }
 }
@@ -2523,7 +2853,10 @@ async function runCase(
       outputTokens: delta.outputTokens,
       latencyMs: delta.latencyMs,
       usageStatus: usageUncertain ? "partial_or_unknown" : "runtime_reported",
-      evidence: {},
+      evidence:
+        id === "body_operation_smoke"
+          ? bodySmokeEvidence(state.bodySmokeDiagnostic)
+          : {},
       reason,
     };
     state.cases.push(item);
@@ -3260,6 +3593,11 @@ async function writeArtifact(state: RunState): Promise<void> {
       serverProcessExited: state.serverProcessExited === true,
       loopbackListenersClosed: state.loopbackListenersClosed === true,
       temporaryWorldRemoved: state.temporaryWorldRemoved === true,
+    },
+    diagnostics: {
+      serverReadyObserved: state.serverReadyObserved === true,
+      applicationStart: state.applicationStartDiagnostic ?? null,
+      bodyOperationSmoke: state.bodySmokeDiagnostic ?? null,
     },
     budgets: {
       run: state.runBudget,
