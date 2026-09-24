@@ -358,7 +358,7 @@ export class PlayerRuntime {
     kind: PlayerWakeKind,
     summary: string,
     at: string,
-    key = kind,
+    key: string = kind,
     minimumGapMs = 3_000,
   ): void {
     const now = Date.parse(at);
