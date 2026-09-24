@@ -458,8 +458,10 @@ interface SkillSnapshot {
   readonly evidenceReceiptCount: number;
   readonly successfulDerivedSkillIds: ReadonlySet<string>;
   readonly revisionVersionsBySkill: ReadonlyMap<string, ReadonlySet<number>>;
+  readonly learnedBodiesBySkill: ReadonlyMap<string, string>;
   readonly learnedBodiesUnderLimit: boolean;
   readonly importReceiptCount: number;
+  readonly importReceiptCountsBySkill: ReadonlyMap<string, number>;
 }
 
 interface OwnerResponse {
@@ -2374,7 +2376,7 @@ async function main(): Promise<void> {
           const newConsultedSkills = player.skillActivity.filter(
             (activity) =>
               activity.kind === "consulted" &&
-              newSkillIds.includes(activity.skillId) &&
+              verifiedLearnedSkillIds.includes(activity.skillId) &&
               !existingActivityKeys.has(skillActivityKey(activity)),
           );
           for (const activity of newConsultedSkills) {
@@ -2581,28 +2583,84 @@ async function main(): Promise<void> {
         );
         await waitForPlayer(context, 120_000, async () => {
           const now = readSkillSnapshot(state.databasePath);
-          const importedActivity = playerOf(
-            await collect(context.runtime.app),
-          ).skillActivity.some(
+          const currentPlayer = playerOf(await collect(context.runtime.app));
+          const importedActivity = currentPlayer.skillActivity.some(
             (activity) =>
               activity.kind === "imported" &&
+              activity.skillId === exportedSkillId &&
+              activity.summary ===
+                `未信頼の交換用Markdown ${editedName} を知識として取込` &&
               !importActivityKeys.has(skillActivityKey(activity)),
           );
+          const beforeVersions =
+            beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
+            new Set<number>();
+          const currentVersions =
+            now.revisionVersionsBySkill.get(exportedSkillId) ??
+            new Set<number>();
+          const sameSkillRevisionAdvanced = [...currentVersions].some(
+            (version) => !beforeVersions.has(version),
+          );
+          const editedBodyObserved =
+            now.learnedBodiesBySkill
+              .get(exportedSkillId)
+              ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
+          const sameSkillReceiptCount =
+            now.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+          const priorSkillReceiptCount =
+            beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
           return (
-            (now.importReceiptCount > beforeImport.importReceiptCount ||
-              now.revisionCount > beforeImport.revisionCount) &&
+            sameSkillRevisionAdvanced &&
+            editedBodyObserved &&
+            sameSkillReceiptCount > priorSkillReceiptCount &&
             importedActivity &&
             context.responseQueue.length > importResponseStart
           );
         });
         const afterImport = readSkillSnapshot(state.databasePath);
-        const importedRevision =
-          afterImport.revisionCount > beforeImport.revisionCount;
-        if (!importedRevision)
-          incomplete("SKILL_IMPORT_NOT_RECORDED_IN_DATABASE");
-        const receiptsBeforeDuplicate = afterImport.importReceiptCount;
+        const importedActivities = playerOf(
+          await collect(context.runtime.app),
+        ).skillActivity;
+        const importedSkillActivity = importedActivities.find(
+          (activity) =>
+            activity.kind === "imported" &&
+            activity.skillId === exportedSkillId &&
+            activity.summary ===
+              `未信頼の交換用Markdown ${editedName} を知識として取込` &&
+            !importActivityKeys.has(skillActivityKey(activity)),
+        );
+        const beforeImportedVersions =
+          beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const afterImportedVersions =
+          afterImport.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const importedSkillVersion = Math.max(0, ...afterImportedVersions);
+        const importedRevision = [...afterImportedVersions].some(
+          (version) => !beforeImportedVersions.has(version),
+        );
+        const editedBodyImported =
+          afterImport.learnedBodiesBySkill
+            .get(exportedSkillId)
+            ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
+        const beforeSkillReceiptCount =
+          beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        const importedSkillReceiptCount =
+          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        if (
+          importedSkillActivity === undefined ||
+          !importedRevision ||
+          !editedBodyImported ||
+          importedSkillReceiptCount <= beforeSkillReceiptCount
+        )
+          incomplete("EXPORTED_SKILL_EDIT_NOT_CONFIRMED_FOR_SAME_ID");
+        const receiptsBeforeDuplicate =
+          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
         const duplicateImportStart = playerOf(
           await collect(context.runtime.app),
+        );
+        const duplicateActivityKeys = new Set(
+          duplicateImportStart.skillActivity.map(skillActivityKey),
         );
         const duplicateResponseStart = context.responseQueue.length;
         sendChat(
@@ -2614,13 +2672,36 @@ async function main(): Promise<void> {
           60_000,
           (player) =>
             player.counters.llmCalls > duplicateImportStart.counters.llmCalls &&
-            context.responseQueue.length > duplicateResponseStart,
+            context.responseQueue.length > duplicateResponseStart &&
+            player.skillActivity.some(
+              (activity) =>
+                activity.kind === "imported" &&
+                activity.skillId === exportedSkillId &&
+                activity.version === importedSkillVersion &&
+                activity.summary ===
+                  `未信頼の交換用Markdown ${editedName} を知識として取込` &&
+                !duplicateActivityKeys.has(skillActivityKey(activity)),
+            ),
         );
         const afterDuplicate = readSkillSnapshot(state.databasePath);
-        if (afterDuplicate.importReceiptCount !== receiptsBeforeDuplicate)
+        const duplicateReceiptCount =
+          afterDuplicate.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        if (duplicateReceiptCount !== receiptsBeforeDuplicate)
           fail("DUPLICATE_IMPORT_CREATED_NEW_RECEIPT");
-        if (afterDuplicate.revisionCount !== afterImport.revisionCount)
-          fail("DUPLICATE_IMPORT_CREATED_NEW_REVISION");
+        const afterDuplicateVersions =
+          afterDuplicate.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const duplicateRevisionChanged =
+          afterDuplicateVersions.size !== afterImportedVersions.size ||
+          [...afterImportedVersions].some(
+            (version) => !afterDuplicateVersions.has(version),
+          );
+        if (
+          duplicateRevisionChanged ||
+          afterDuplicate.learnedBodiesBySkill.get(exportedSkillId) !==
+            afterImport.learnedBodiesBySkill.get(exportedSkillId)
+        )
+          fail("DUPLICATE_IMPORT_CHANGED_SKILL_REVISION");
         return {
           markdownExportCreated: true,
           humanEditImported: true,
@@ -4633,6 +4714,11 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
         .get() as { readonly count: number };
       return row.count;
     };
+    const importReceiptsBySkill = database
+      .prepare(
+        "SELECT skill_id, COUNT(*) AS count FROM mc_bot_skill_import_receipts GROUP BY skill_id",
+      )
+      .all() as { readonly skill_id: string; readonly count: number }[];
     const successfulDerivedSkills = database
       .prepare(
         "SELECT DISTINCT derived.skill_id FROM mc_bot_skill_derived_hypotheses AS derived INNER JOIN mc_bot_skill_evidence_receipts AS receipt ON receipt.receipt_id = derived.receipt_id WHERE receipt.observed_outcome = 'successful'",
@@ -4647,10 +4733,16 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
         successfulDerivedSkills.map((row) => row.skill_id),
       ),
       revisionVersionsBySkill,
+      learnedBodiesBySkill: new Map(
+        skills.map((skill) => [skill.id, skill.body]),
+      ),
       learnedBodiesUnderLimit: skills.every(
         (skill) => Buffer.byteLength(skill.body, "utf8") <= 8_192,
       ),
       importReceiptCount: count("mc_bot_skill_import_receipts"),
+      importReceiptCountsBySkill: new Map(
+        importReceiptsBySkill.map((row) => [row.skill_id, row.count]),
+      ),
     };
   } finally {
     database.close();
@@ -4717,6 +4809,9 @@ async function exchangeMarkdownFiles(directory: string): Promise<string[]> {
     .sort();
 }
 
+const SYNTHETIC_SKILL_EDIT_MARKER =
+  "Synthetic acceptance note: apply only when the marked fixture is reachable.";
+
 function appendSyntheticSkillEdit(markdown: string): string {
   const separator = "\n\n## 本文\n";
   if (
@@ -4725,7 +4820,7 @@ function appendSyntheticSkillEdit(markdown: string): string {
   ) {
     incomplete("EXPORTED_SKILL_MARKDOWN_INVALID");
   }
-  return `${markdown.trimEnd()}\n\nSynthetic acceptance note: apply only when the marked fixture is reachable.\n`;
+  return `${markdown.trimEnd()}\n\n${SYNTHETIC_SKILL_EDIT_MARKER}\n`;
 }
 
 async function cleanup(state: RunState): Promise<void> {
