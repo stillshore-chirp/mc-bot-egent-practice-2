@@ -389,7 +389,6 @@ describe("player skill learning", () => {
         "commit_action_decision",
         waitArguments(),
       ),
-      textResponse("learn-final", "Learning hypothesis recorded."),
       functionCallResponse(
         "retry-1",
         "propose_skill_learning",
@@ -400,7 +399,6 @@ describe("player skill learning", () => {
         "commit_action_decision",
         waitArguments(),
       ),
-      textResponse("retry-final", "Existing hypothesis reused."),
     ];
     const client = {
       responses: {
