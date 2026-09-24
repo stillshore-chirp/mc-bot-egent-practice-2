@@ -19,6 +19,8 @@
 
 所有者のMinecraft chatは独立した会話エージェントへ送られます。会話エージェントは返答、目的提案、明示的な停止・再開を扱います。目的提案はMindStoreへ先に保存され、行動中のbodyを直接変更しません。目的エージェントは現在の目的・proposal・観測・記憶を照らし、採用、妥協、辞退、別の自律目的を理由付きで選びます。owner以外のchatは受け付けません。
 
+目的エージェントには28種類のoperation kindと短い説明だけを常時提示します。選んだkindの引数が必要な時に `describe_operation` でその操作のJSON Schemaを取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証されます。
+
 会話turnは長いbody操作の完了を待たずに並行できます。行動を変更するかは別の目的判断が決めます。判断の一般的な `revision` は状態更新を、`actionRevision` は行動計画の有効性を管理するCAS値です。結果が古い判断はcommitされません。新しい行動を始める前に現在の操作をcancelし、身体側のdispatchがsettleしたことを確認します。同時にbodyを操作する実行ownerは一つです。
 
 停止はSQLiteへ永続化され、再起動や観測イベントがあっても解除されません。即時stop commandはLLMを呼ばず停止latchを先に保存します。停止後はownerから認証された再開が行われた時だけ自律判断を再開します。古いconversation turnやaction decisionはstop generation/CASにより新しい状態を上書きできません。
