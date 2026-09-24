@@ -19,7 +19,9 @@
 
 所有者のMinecraft chatは独立した会話エージェントへ送られます。会話エージェントは返答、目的提案、明示的な停止・再開を扱います。目的提案はMindStoreへ先に保存され、行動中のbodyを直接変更しません。目的エージェントは現在の目的・proposal・観測・記憶を照らし、採用、妥協、辞退、別の自律目的を理由付きで選びます。owner以外のchatは受け付けません。
 
-目的エージェントには28種類のoperation kindと短い説明だけを常時提示します。選んだkindの引数が必要な時に `describe_operation` でその操作のJSON Schemaを取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証されます。
+目的エージェントには28種類のoperation kindと短い説明を提示し、参照済みの現行schemaは直近4種・合計4,096文字以内で再提示します。未提示または引数が不明なschemaは必要時に `describe_operation` で取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証されます。
+
+行動判断時のgoal変更、owner proposal解決、fact/uncertainty更新は、必要なものを`commit_action_decision.stateUpdates`へ含めると同じrevision CAS transactionで確定します。更新なしは`null`で表し、`commit_goal_state`と`update_understanding`も判断途中の単独更新用に残しています。`continue`と状態更新を同時に確定しても、進行中body操作の`actionRevision`は変わりません。goal mirrorの外部記憶保存に失敗した場合もMindStoreのcommitとaction dispatchは維持し、tool結果の`goalMemoryPersisted: false`で区別します。run11以降の実ゲームでの成功やAPI呼び出し・token削減効果は未測定です。
 
 目的エージェントは `commit_action_decision` の永続commitが成功した時点で判断を完了し、余分な最終LLM roundを要求しません。会話エージェントは返答文を必要とするため、tool後の最終応答を引き続き取得します。
 

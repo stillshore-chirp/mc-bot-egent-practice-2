@@ -263,12 +263,20 @@ describe("on-demand player operation schemas", () => {
       const marker = "以前に確認した操作schema（現在の定義）:\n";
       const cacheStart = instructions.indexOf(marker);
       expect(cacheStart).toBeGreaterThanOrEqual(0);
-      const cacheText =
-        instructions.slice(cacheStart).split("\n永続化されたgoal/purpose")[0] ??
-        "";
+      const entries: string[] = [];
+      for (const line of instructions
+        .slice(cacheStart + marker.length)
+        .split("\n")) {
+        try {
+          z.record(z.string(), z.unknown()).parse(JSON.parse(line));
+          entries.push(line);
+        } catch {
+          break;
+        }
+      }
+      const cacheText = `${marker}${entries.join("\n")}`;
       expect(cacheText.length + 1).toBeLessThanOrEqual(4_096);
 
-      const entries = cacheText.slice(marker.length).split("\n");
       expect(entries).toHaveLength(4);
       const entryKinds = entries.map((entry) => {
         const parsed = z

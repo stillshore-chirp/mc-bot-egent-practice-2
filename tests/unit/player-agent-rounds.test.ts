@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 
 import { McSkillRepository } from "../../src/mc-skills/index.js";
@@ -29,6 +30,241 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
+  it("commits action, goal, proposal resolution, and understanding in one CAS", async () => {
+    const persistedGoals: unknown[] = [];
+    const memory = createMemoryPort();
+    memory.persistGoals = (goals) => persistedGoals.push(goals);
+    let proposalId = "";
+    const fixture = openPurposeFixture(
+      [
+        () =>
+          functionCallResponse(
+            "atomic-action-state",
+            "commit_action_decision",
+            actionArguments({
+              goalState: {
+                proposalId,
+                proposalDisposition: "adopted",
+                resolution: "It fits the current purpose.",
+                goalId: "",
+                goalTitle: "Explore the nearby valley",
+                goalStatus: "active",
+                goalPriority: 3,
+                changeReason: "The observed route is useful.",
+                goalSource: "self",
+              },
+              understanding: {
+                facts: [
+                  { summary: "A valley is visible.", source: "observed" },
+                ],
+                uncertainties: [
+                  { summary: "The route may be blocked.", source: "inferred" },
+                ],
+              },
+            }),
+          ),
+        functionCallResponse(
+          "continue-with-understanding",
+          "commit_action_decision",
+          {
+            ...actionArguments(),
+            kind: "continue",
+            operationJson: "",
+            stateUpdates: {
+              goalState: null,
+              understanding: {
+                facts: [
+                  {
+                    summary: "The current operation remains active.",
+                    source: "observed",
+                  },
+                ],
+                uncertainties: [],
+              },
+            },
+          },
+        ),
+      ],
+      undefined,
+      memory,
+    );
+    const proposal = fixture.mind.addProposal({
+      title: "Explore the valley",
+      reason: "It may reveal useful landmarks.",
+      priority: 3,
+    });
+    proposalId = proposal.id;
+    const before = fixture.mind.snapshot();
+
+    try {
+      const first = await fixture.agent.think({ snapshot: before, events: [] });
+      expect(first.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(1);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const toolDefinitions = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      const actionTool = toolDefinitions.find(
+        (tool) => tool.name === "commit_action_decision",
+      );
+      expect(actionTool).toBeDefined();
+      const parameters = z
+        .record(z.string(), z.unknown())
+        .parse(actionTool?.parameters);
+      const properties = z
+        .record(z.string(), z.unknown())
+        .parse(parameters.properties);
+      expect(parameters.required).toContain("stateUpdates");
+      expect(JSON.stringify(properties.stateUpdates)).toContain(
+        '"type":"null"',
+      );
+      const afterAction = fixture.mind.snapshot();
+      expect(afterAction.revision).toBe(before.revision + 1);
+      expect(afterAction.actionRevision).toBe(before.actionRevision + 1);
+      expect(afterAction.goals).toContainEqual(
+        expect.objectContaining({ title: "Explore the nearby valley" }),
+      );
+      expect(afterAction.proposals).toContainEqual(
+        expect.objectContaining({
+          id: proposal.id,
+          status: "adopted",
+          resolution: "It fits the current purpose.",
+        }),
+      );
+      expect(afterAction.stateFacts).toContainEqual(
+        expect.objectContaining({
+          summary: "A valley is visible.",
+          source: "observed",
+        }),
+      );
+      expect(afterAction.uncertainties).toContainEqual(
+        expect.objectContaining({
+          summary: "The route may be blocked.",
+          source: "inferred",
+        }),
+      );
+      expect(persistedGoals).toHaveLength(1);
+
+      const continued = await fixture.agent.think({
+        snapshot: afterAction,
+        events: [],
+      });
+      expect(continued.decision?.kind).toBe("continue");
+      expect(fixture.mind.snapshot().revision).toBe(afterAction.revision + 1);
+      expect(fixture.mind.snapshot().actionRevision).toBe(
+        afterAction.actionRevision,
+      );
+      expect(fixture.mind.snapshot().activeOperation).toEqual(
+        afterAction.activeOperation,
+      );
+      expect(persistedGoals).toHaveLength(1);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rejects all combined updates when the proposal is no longer pending", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "invalid-atomic-proposal",
+        "commit_action_decision",
+        actionArguments({
+          goalState: {
+            proposalId: "missing-proposal",
+            proposalDisposition: "adopted",
+            resolution: "Accepted.",
+            goalId: "",
+            goalTitle: "A new goal",
+            goalStatus: "active",
+            goalPriority: 2,
+            changeReason: "It seems useful.",
+            goalSource: "self",
+          },
+          understanding: {
+            facts: [{ summary: "Observed fact.", source: "observed" }],
+            uncertainties: [],
+          },
+        }),
+      ),
+      terminalResponse("The proposal could not be committed."),
+    ]);
+    const proposal = fixture.mind.addProposal({
+      title: "Existing proposal",
+      reason: "Pending proposal fixture.",
+    });
+    const before = fixture.mind.snapshot();
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: before,
+        events: [],
+      });
+      expect(result.accepted).toBe(false);
+      expect(fixture.mind.snapshot().goals).toEqual(before.goals);
+      expect(fixture.mind.snapshot().proposals).toEqual(before.proposals);
+      expect(fixture.mind.snapshot().stateFacts).toEqual(before.stateFacts);
+      expect(fixture.mind.snapshot().uncertainties).toEqual(
+        before.uncertainties,
+      );
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({ id: proposal.id, status: "pending" }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("still delivers an accepted action if the external goal mirror fails", async () => {
+    const memory = createMemoryPort();
+    memory.persistGoals = () => {
+      throw new Error("fixture persistence error");
+    };
+    const committed: PlayerThoughtDecision[] = [];
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "goal-mirror-failure",
+          "commit_action_decision",
+          actionArguments({
+            goalState: {
+              proposalId: "",
+              proposalDisposition: "none",
+              resolution: "",
+              goalId: "",
+              goalTitle: "Explore the nearby valley",
+              goalStatus: "active",
+              goalPriority: 3,
+              changeReason: "The route looks useful.",
+              goalSource: "self",
+            },
+            understanding: null,
+          }),
+        ),
+      ],
+      (_snapshot, decision) => committed.push(decision),
+      memory,
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(committed).toHaveLength(1);
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({ title: "Explore the nearby valley" }),
+      );
+      expect(fixture.mind.snapshot().activeOperation).toBeDefined();
+      expect(fixture.requests).toHaveLength(1);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("returns a successful purpose commit on the sixth tool round", async () => {
     const responses = [
       ...Array.from({ length: 5 }, (_, index) =>
@@ -214,6 +450,7 @@ function openPurposeFixture(
     snapshot: PlayerRuntimeSnapshot,
     decision: PlayerThoughtDecision,
   ) => void = () => undefined,
+  memory: PlayerMemoryPort = createMemoryPort(),
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-agent-rounds-"));
   temporaryDirectories.push(directory);
@@ -231,7 +468,6 @@ function openPurposeFixture(
     },
   } as unknown as PlayerBody;
   const client = scriptedClient(responses, requests);
-  const memory = createMemoryPort();
   const agent = new PlayerPurposeAgent({
     client,
     apiKey: "test-only",
@@ -318,7 +554,9 @@ function terminalResponse(outputText: string): Response {
   } as unknown as Response;
 }
 
-function actionArguments(): Record<string, unknown> {
+function actionArguments(
+  stateUpdates?: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     kind: "act",
     purpose: "Look at a nearby landmark.",
@@ -332,6 +570,7 @@ function actionArguments(): Record<string, unknown> {
     reason: "A visible landmark can help orient the next decision.",
     wakeOn: [],
     wakeAt: "",
+    ...(stateUpdates === undefined ? {} : { stateUpdates }),
   };
 }
 

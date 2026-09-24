@@ -281,6 +281,46 @@ const stateSchema = z
 
 type StoredState = z.infer<typeof stateSchema>;
 
+interface PlayerUnderstandingUpdate {
+  readonly facts: readonly {
+    readonly summary: string;
+    readonly source: "owner" | "observed" | "inferred";
+  }[];
+  readonly uncertainties: readonly {
+    readonly summary: string;
+    readonly source: "owner" | "observed" | "inferred";
+  }[];
+}
+
+function appendPlayerUnderstanding(
+  current: Pick<StoredState, "stateFacts" | "uncertainties">,
+  update: PlayerUnderstandingUpdate,
+  now: string,
+): {
+  readonly stateFacts: PlayerStateNote[];
+  readonly uncertainties: PlayerStateNote[];
+  readonly changed: boolean;
+} {
+  const makeNotes = (
+    kind: "fact" | "uncertainty",
+    values: PlayerUnderstandingUpdate["facts"],
+  ): PlayerStateNote[] =>
+    values.slice(0, 8).map((note) => ({
+      id: randomUUID(),
+      kind,
+      summary: bounded(note.summary, 400, "state note"),
+      source: note.source,
+      updatedAt: now,
+    }));
+  const factNotes = makeNotes("fact", update.facts);
+  const uncertaintyNotes = makeNotes("uncertainty", update.uncertainties);
+  return {
+    stateFacts: [...current.stateFacts, ...factNotes].slice(-40),
+    uncertainties: [...current.uncertainties, ...uncertaintyNotes].slice(-40),
+    changed: factNotes.length > 0 || uncertaintyNotes.length > 0,
+  };
+}
+
 const initialState: StoredState = {
   revision: 0,
   actionRevision: 0,
@@ -545,6 +585,7 @@ export class PlayerMindStore {
     decision: PlayerThoughtDecision;
     goal?: PlayerGoalChange;
     proposalResolution?: PlayerProposalResolution;
+    understanding?: PlayerUnderstandingUpdate;
   }): { readonly accepted: boolean; readonly snapshot: PlayerRuntimeSnapshot } {
     const now = new Date().toISOString();
     const transaction = this.database.transaction(() => {
@@ -579,10 +620,15 @@ export class PlayerMindStore {
       }
       let goals = current.goals;
       if (input.goal !== undefined) goals = mergeGoal(goals, input.goal, now);
+      const understanding = appendPlayerUnderstanding(
+        current,
+        input.understanding ?? { facts: [], uncertainties: [] },
+        now,
+      );
       let purpose = current.purpose;
       let activeOperation = current.activeOperation;
       let wait = current.wait;
-      let actionChanged = input.goal !== undefined;
+      let actionChanged = false;
       switch (input.decision.kind) {
         case "act":
           purpose = bounded(input.decision.purpose, 400, "purpose");
@@ -636,11 +682,10 @@ export class PlayerMindStore {
           break;
       }
       const resolutionChanged = input.proposalResolution !== undefined;
+      const stateChanged =
+        resolutionChanged || input.goal !== undefined || understanding.changed;
       const nextRevision =
-        current.revision +
-        (resolutionChanged || actionChanged || input.goal !== undefined
-          ? 1
-          : 0);
+        current.revision + (stateChanged || actionChanged ? 1 : 0);
       const judgment = {
         revision: nextRevision,
         decidedAt: now,
@@ -671,6 +716,8 @@ export class PlayerMindStore {
         purpose,
         goals,
         proposals,
+        stateFacts: understanding.stateFacts,
+        uncertainties: understanding.uncertainties,
         ...(activeOperation === undefined
           ? { activeOperation: undefined }
           : { activeOperation }),
@@ -740,14 +787,8 @@ export class PlayerMindStore {
 
   public commitUnderstanding(input: {
     readonly expectedRevision: number;
-    readonly facts: readonly {
-      readonly summary: string;
-      readonly source: "owner" | "observed" | "inferred";
-    }[];
-    readonly uncertainties: readonly {
-      readonly summary: string;
-      readonly source: "owner" | "observed" | "inferred";
-    }[];
+    readonly facts: PlayerUnderstandingUpdate["facts"];
+    readonly uncertainties: PlayerUnderstandingUpdate["uncertainties"];
   }): { readonly accepted: boolean; readonly snapshot: PlayerRuntimeSnapshot } {
     const now = new Date().toISOString();
     const transaction = this.database.transaction(() => {
@@ -755,37 +796,16 @@ export class PlayerMindStore {
       if (current.revision !== input.expectedRevision || current.stopped) {
         return { accepted: false, snapshot: this.snapshot() };
       }
-      const makeNotes = (
-        kind: "fact" | "uncertainty",
-        values: typeof input.facts,
-      ): PlayerStateNote[] =>
-        values.slice(0, 8).map((note) => ({
-          id: randomUUID(),
-          kind,
-          summary: bounded(note.summary, 400, "state note"),
-          source: note.source,
-          updatedAt: now,
-        }));
-      const stateFacts = [
-        ...current.stateFacts,
-        ...makeNotes("fact", input.facts),
-      ].slice(-40);
-      const uncertainties = [
-        ...current.uncertainties,
-        ...makeNotes("uncertainty", input.uncertainties),
-      ].slice(-40);
-      if (
-        stateFacts.length === current.stateFacts.length &&
-        uncertainties.length === current.uncertainties.length
-      ) {
+      const understanding = appendPlayerUnderstanding(current, input, now);
+      if (!understanding.changed) {
         return { accepted: false, snapshot: this.snapshot() };
       }
       this.writeStored(
         {
           ...current,
           revision: current.revision + 1,
-          stateFacts,
-          uncertainties,
+          stateFacts: understanding.stateFacts,
+          uncertainties: understanding.uncertainties,
         },
         now,
       );
