@@ -133,6 +133,15 @@ type BodyDetailClass =
   | "action_interrupted"
   | "effect_unverified"
   | "transport_error"
+  | "transfer_source_item_unavailable"
+  | "transfer_cursor_item_present"
+  | "transfer_source_slot_empty"
+  | "transfer_destination_full"
+  | "transfer_destination_no_capacity"
+  | "transfer_window_missing"
+  | "transfer_slot_invalid"
+  | "transfer_click_rejected"
+  | "transfer_server_selection_unconfirmed"
   | "other";
 
 type FurnaceTargetClass = "furnace" | "other" | "not_observed";
@@ -168,6 +177,43 @@ interface BodySmokeDiagnostic {
   readonly furnaceOpenStatus?: BodyOperationStatus;
   readonly furnaceOpenDetailClass?: BodyDetailClass;
   readonly furnaceWindowTypeClass?: WindowTypeClass;
+  readonly furnaceInventoryRawIronBeforeTransferIn?: number;
+  readonly furnaceWindowInventoryRawIronBeforeTransferIn?: number;
+  readonly furnaceWindowInputRawIronBeforeTransferIn?: number;
+  readonly furnaceCursorRawIronBeforeTransferIn?: number;
+  readonly furnaceTransferInStatus?: BodyOperationStatus;
+  readonly furnaceTransferInRecoveryRequired?: boolean;
+  readonly furnaceTransferInDetailClass?: BodyDetailClass;
+  readonly furnaceInventoryRawIronAfterTransferIn?: number;
+  readonly furnaceWindowInventoryRawIronAfterTransferIn?: number;
+  readonly furnaceWindowInputRawIronAfterTransferIn?: number;
+  readonly furnaceCursorRawIronAfterTransferIn?: number;
+  readonly furnaceRconInventoryInputConfirmed?: boolean;
+  readonly furnaceRconInputConfirmedAfterTransferIn?: boolean;
+  readonly furnaceInventoryRawIronBeforeTransferOut?: number;
+  readonly furnaceWindowInventoryRawIronBeforeTransferOut?: number;
+  readonly furnaceWindowInputRawIronBeforeTransferOut?: number;
+  readonly furnaceCursorRawIronBeforeTransferOut?: number;
+  readonly furnaceTransferOutStatus?: BodyOperationStatus;
+  readonly furnaceTransferOutRecoveryRequired?: boolean;
+  readonly furnaceTransferOutDetailClass?: BodyDetailClass;
+  readonly furnaceInventoryRawIronAfterTransferOut?: number;
+  readonly furnaceWindowInventoryRawIronAfterTransferOut?: number;
+  readonly furnaceWindowInputRawIronAfterTransferOut?: number;
+  readonly furnaceCursorRawIronAfterTransferOut?: number;
+  readonly furnaceRconEmptyConfirmedAfterTransferOut?: boolean;
+  readonly furnaceInventoryRawIronBeforeClose?: number;
+  readonly furnaceWindowInventoryRawIronBeforeClose?: number;
+  readonly furnaceWindowInputRawIronBeforeClose?: number;
+  readonly furnaceCursorRawIronBeforeClose?: number;
+  readonly furnaceWindowCloseStatus?: BodyOperationStatus;
+  readonly furnaceWindowCloseRecoveryRequired?: boolean;
+  readonly furnaceWindowCloseDetailClass?: BodyDetailClass;
+  readonly furnaceInventoryRawIronAfterClose?: number;
+  readonly furnaceWindowInventoryRawIronAfterClose?: number;
+  readonly furnaceWindowInputRawIronAfterClose?: number;
+  readonly furnaceCursorRawIronAfterClose?: number;
+  readonly furnaceWindowClosed?: boolean;
 }
 
 interface SafeApplicationStartDiagnostic {
@@ -486,6 +532,45 @@ function observedBlockName(
   )?.name;
 }
 
+function rawIronCount(
+  items: readonly { readonly name: string; readonly count: number }[],
+): number {
+  return items.reduce(
+    (total, item) => total + (item.name === "raw_iron" ? item.count : 0),
+    0,
+  );
+}
+
+function furnaceItemCounts(observation: PlayerBodyObservation): {
+  readonly inventory: number;
+  readonly windowInventory: number;
+  readonly windowInput: number;
+  readonly cursor: number;
+} {
+  const window = observation.window;
+  return {
+    inventory: rawIronCount(observation.self.inventory),
+    windowInventory:
+      window === null
+        ? 0
+        : rawIronCount(
+            window.slots
+              .slice(window.inventoryStart, window.inventoryEnd)
+              .filter((item) => item !== null),
+          ),
+    windowInput:
+      window === null
+        ? 0
+        : rawIronCount(
+            window.slots
+              .slice(0, window.inventoryStart)
+              .filter((item) => item !== null),
+          ),
+    cursor:
+      window?.selectedItem?.name === "raw_iron" ? window.selectedItem.count : 0,
+  };
+}
+
 function classifyBodyOperationDetail(
   detail: string | undefined,
 ): BodyDetailClass {
@@ -499,6 +584,57 @@ function classifyBodyOperationDetail(
   if (normalized.includes("outside the current field of view"))
     return "target_out_of_field_of_view";
   if (normalized.includes("not diggable")) return "block_not_diggable";
+  if (
+    normalized.includes(
+      "requested item count is not available in the transfer source",
+    )
+  ) {
+    return "transfer_source_item_unavailable";
+  }
+  if (
+    normalized.includes(
+      "close or empty the carried cursor item before transferring",
+    ) ||
+    normalized.includes("unexpected cursor item")
+  ) {
+    return "transfer_cursor_item_present";
+  }
+  if (normalized.includes("requested source slot is empty"))
+    return "transfer_source_slot_empty";
+  if (normalized.includes("transfer destination is full"))
+    return "transfer_destination_full";
+  if (normalized.includes("transfer destination has no capacity"))
+    return "transfer_destination_no_capacity";
+  if (
+    normalized.includes("no window is open") ||
+    normalized.includes("window is not open") ||
+    normalized.includes("there is no active window") ||
+    normalized.includes("no block or entity window is open")
+  ) {
+    return "transfer_window_missing";
+  }
+  if (
+    normalized.includes("outside the current window") ||
+    normalized.includes("is outside the open window") ||
+    normalized.includes("source and destination slots must differ")
+  ) {
+    return "transfer_slot_invalid";
+  }
+  if (
+    normalized.includes("did not select the requested transfer item") ||
+    normalized.includes("server did not select")
+  ) {
+    return "transfer_server_selection_unconfirmed";
+  }
+  if (
+    normalized.includes("window click") ||
+    normalized.includes("clickwindow") ||
+    normalized.includes("click rejected") ||
+    normalized.includes("server rejected transaction") ||
+    normalized.includes("server didn't respond to transaction")
+  ) {
+    return "transfer_click_rejected";
+  }
   if (normalized.includes("bounded action wait expired"))
     return "action_timeout";
   if (normalized.includes("action was stopped")) return "action_interrupted";
@@ -533,7 +669,7 @@ function bodySmokeEvidence(
   diagnostic: BodySmokeDiagnostic | undefined,
 ): Readonly<Record<string, boolean | number | string>> {
   if (diagnostic === undefined) return {};
-  return {
+  const evidence: Record<string, boolean | number | string> = {
     fixtureLookStatus: diagnostic.fixtureLookStatus,
     fixtureLookDetailClass: diagnostic.fixtureLookDetailClass,
     fixtureTargetVisibleAfterLook: diagnostic.fixtureTargetVisibleAfterLook,
@@ -594,6 +730,17 @@ function bodySmokeEvidence(
       ? {}
       : { furnaceWindowTypeClass: diagnostic.furnaceWindowTypeClass }),
   };
+  for (const [key, value] of Object.entries(diagnostic)) {
+    if (
+      key.startsWith("furnace") &&
+      (typeof value === "boolean" ||
+        typeof value === "number" ||
+        typeof value === "string")
+    ) {
+      evidence[key] = value;
+    }
+  }
+  return evidence;
 }
 
 function positiveNumber(value: unknown, fallback = 0): number {
@@ -2808,6 +2955,48 @@ async function runOperationSmoke(
         ) {
           incomplete("FURNACE_WINDOW_OPEN_NOT_CONFIRMED");
         }
+        let furnaceInputInventory: PlayerBodyObservation;
+        const furnaceInventoryDeadline = Date.now() + 5_000;
+        let rconInventoryInputConfirmed = false;
+        try {
+          rconInventoryInputConfirmed = (
+            await rcon.command(`data get entity ${state.botName} Inventory`)
+          ).includes("minecraft:raw_iron");
+        } catch {
+          rconInventoryInputConfirmed = false;
+        }
+        do {
+          furnaceInputInventory = await body.observe();
+          const itemCounts = furnaceItemCounts(furnaceInputInventory);
+          furnaceDiagnostic = {
+            ...furnaceDiagnostic,
+            furnaceInventoryRawIronBeforeTransferIn: itemCounts.inventory,
+            furnaceWindowInventoryRawIronBeforeTransferIn:
+              itemCounts.windowInventory,
+            furnaceWindowInputRawIronBeforeTransferIn: itemCounts.windowInput,
+            furnaceCursorRawIronBeforeTransferIn: itemCounts.cursor,
+            furnaceRconInventoryInputConfirmed: rconInventoryInputConfirmed,
+          };
+          state.bodySmokeDiagnostic = furnaceDiagnostic;
+          if (
+            itemCounts.windowInventory === 1 ||
+            Date.now() >= furnaceInventoryDeadline
+          ) {
+            break;
+          }
+          await waitMs(
+            Math.max(1, Math.min(100, furnaceInventoryDeadline - Date.now())),
+          );
+        } while (!abort.signal.aborted);
+        const furnaceInputInventoryCounts = furnaceItemCounts(
+          furnaceInputInventory,
+        );
+        if (
+          furnaceInputInventoryCounts.windowInventory !== 1 ||
+          !rconInventoryInputConfirmed
+        ) {
+          incomplete("FURNACE_FIXTURE_INVENTORY_NOT_CONFIRMED");
+        }
         const transferInResult = await body.execute(
           {
             kind: "window_transfer",
@@ -2817,20 +3006,57 @@ async function runOperationSmoke(
           },
           abort.signal,
         );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceTransferInStatus: transferInResult.status,
+          furnaceTransferInRecoveryRequired: transferInResult.recoveryRequired,
+          furnaceTransferInDetailClass: classifyBodyOperationDetail(
+            transferInResult.detail,
+          ),
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         const furnaceInput = await body.observe();
+        const furnaceInputCounts = furnaceItemCounts(furnaceInput);
         const furnaceInputVisible =
           furnaceInput.window?.slots
             .slice(0, furnaceInput.window.inventoryStart)
             .some((item) => item?.name === "raw_iron" && item.count === 1) ===
           true;
-        const furnaceInputConfirmed = (
-          await rcon.command(
-            `data get block ${target.x} ${target.y} ${target.z} Items`,
-          )
-        ).includes("minecraft:raw_iron");
+        let furnaceInputConfirmed = false;
+        try {
+          furnaceInputConfirmed = (
+            await rcon.command(
+              `data get block ${target.x} ${target.y} ${target.z} Items`,
+            )
+          ).includes("minecraft:raw_iron");
+        } catch {
+          furnaceInputConfirmed = false;
+        }
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceInventoryRawIronAfterTransferIn: furnaceInputCounts.inventory,
+          furnaceWindowInventoryRawIronAfterTransferIn:
+            furnaceInputCounts.windowInventory,
+          furnaceWindowInputRawIronAfterTransferIn:
+            furnaceInputCounts.windowInput,
+          furnaceCursorRawIronAfterTransferIn: furnaceInputCounts.cursor,
+          furnaceRconInputConfirmedAfterTransferIn: furnaceInputConfirmed,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         if (!furnaceInputVisible || !furnaceInputConfirmed) {
           incomplete("FURNACE_INPUT_NOT_CONFIRMED_BY_BODY_AND_SERVER");
         }
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceInventoryRawIronBeforeTransferOut:
+            furnaceInputCounts.inventory,
+          furnaceWindowInventoryRawIronBeforeTransferOut:
+            furnaceInputCounts.windowInventory,
+          furnaceWindowInputRawIronBeforeTransferOut:
+            furnaceInputCounts.windowInput,
+          furnaceCursorRawIronBeforeTransferOut: furnaceInputCounts.cursor,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         const transferOutResult = await body.execute(
           {
             kind: "window_transfer",
@@ -2840,24 +3066,74 @@ async function runOperationSmoke(
           },
           abort.signal,
         );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceTransferOutStatus: transferOutResult.status,
+          furnaceTransferOutRecoveryRequired:
+            transferOutResult.recoveryRequired,
+          furnaceTransferOutDetailClass: classifyBodyOperationDetail(
+            transferOutResult.detail,
+          ),
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         const returned = await body.observe();
+        const returnedCounts = furnaceItemCounts(returned);
         const itemReturnedToInventory = returned.self.inventory.some(
           (item) => item.name === "raw_iron" && item.count === 1,
         );
-        const furnaceEmpty = !(
-          await rcon.command(
-            `data get block ${target.x} ${target.y} ${target.z} Items`,
-          )
-        ).includes("minecraft:raw_iron");
-        if (!itemReturnedToInventory || !furnaceEmpty) {
-          incomplete("FURNACE_INPUT_NOT_RETURNED_TO_INVENTORY");
+        let furnaceEmpty = false;
+        try {
+          furnaceEmpty = !(
+            await rcon.command(
+              `data get block ${target.x} ${target.y} ${target.z} Items`,
+            )
+          ).includes("minecraft:raw_iron");
+        } catch {
+          furnaceEmpty = false;
         }
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceInventoryRawIronAfterTransferOut: returnedCounts.inventory,
+          furnaceWindowInventoryRawIronAfterTransferOut:
+            returnedCounts.windowInventory,
+          furnaceWindowInputRawIronAfterTransferOut: returnedCounts.windowInput,
+          furnaceCursorRawIronAfterTransferOut: returnedCounts.cursor,
+          furnaceRconEmptyConfirmedAfterTransferOut: furnaceEmpty,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceInventoryRawIronBeforeClose: returnedCounts.inventory,
+          furnaceWindowInventoryRawIronBeforeClose:
+            returnedCounts.windowInventory,
+          furnaceWindowInputRawIronBeforeClose: returnedCounts.windowInput,
+          furnaceCursorRawIronBeforeClose: returnedCounts.cursor,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         const closeResult = await body.execute(
           { kind: "window_close" },
           abort.signal,
         );
         const closed = await body.observe();
+        const closedCounts = furnaceItemCounts(closed);
         const windowClosed = closed.window === null;
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceWindowCloseStatus: closeResult.status,
+          furnaceWindowCloseRecoveryRequired: closeResult.recoveryRequired,
+          furnaceWindowCloseDetailClass: classifyBodyOperationDetail(
+            closeResult.detail,
+          ),
+          furnaceInventoryRawIronAfterClose: closedCounts.inventory,
+          furnaceWindowInventoryRawIronAfterClose: closedCounts.windowInventory,
+          furnaceWindowInputRawIronAfterClose: closedCounts.windowInput,
+          furnaceCursorRawIronAfterClose: closedCounts.cursor,
+          furnaceWindowClosed: windowClosed,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (!itemReturnedToInventory || !furnaceEmpty) {
+          incomplete("FURNACE_INPUT_NOT_RETURNED_TO_INVENTORY");
+        }
         if (!windowClosed) incomplete("FURNACE_WINDOW_NOT_CLOSED");
         const apiOperationsReportedSuccess = [
           digResult,
