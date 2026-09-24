@@ -59,6 +59,7 @@ import {
   hasTerminalOutcomeForOperation,
   isStoppedHandoffBoundaryConfirmed,
 } from "./autonomous-milestone.js";
+import { classifyObservationReply } from "./observation-reply-classifier.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -1020,6 +1021,13 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
   return {
     ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(caseId === "observation_boundary"
+      ? (state.observationBoundaryDiagnostic ?? {
+          replyReceived: false,
+          responseHeuristicClassification: "no_reply",
+          manualReviewRequired: true,
+        })
+      : {}),
     ...(caseId === "unknown_composite"
       ? (state.unknownCompositeDiagnostic ?? {})
       : {}),
@@ -1414,6 +1422,19 @@ interface RunState {
   serverReadyObserved?: boolean;
   applicationStartDiagnostic?: SafeApplicationStartDiagnostic;
   bodySmokeDiagnostic?: BodySmokeDiagnostic;
+  observationBoundaryCapture?: {
+    readonly responseStart: number;
+    responseEnd?: number;
+    requestSentAt?: number;
+    visibleObservationAt?: number;
+  };
+  observationBoundaryDiagnostic?: {
+    readonly replyReceived: boolean;
+    readonly responseHeuristicClassification: string;
+    readonly manualReviewRequired: true;
+    readonly observationBeforeReply?: boolean;
+  };
+  observationBoundarySidecarRetained?: boolean;
 }
 
 let appForCleanup: CompanionApplication | undefined;
@@ -2205,6 +2226,12 @@ async function main(): Promise<void> {
       },
     );
 
+    const observationCapture: NonNullable<
+      RunState["observationBoundaryCapture"]
+    > = {
+      responseStart: state.responses.length,
+    };
+    state.observationBoundaryCapture = observationCapture;
     const observationResult = await recordCase(
       state,
       "observation_boundary",
@@ -2221,49 +2248,34 @@ async function main(): Promise<void> {
         );
         const hiddenItemPresent = /emerald/iu.test(oracleContents);
         if (!hiddenItemPresent) fail("HIDDEN_CONTAINER_FIXTURE_INVALID");
-        const before = playerOf(await collect(context.runtime.app));
-        const judgmentRevisionBefore = before.revision;
-        const responsesBefore = context.responseQueue.length;
-        const requestSentAt = Date.now();
-        sendChat(
-          context.owner,
-          "今の視界で分かる範囲から、石壁の向こうにあるチェストの中身を正確に教えてください。見えていないなら不明と答えてください。",
-        );
-        const afterPlayer = await waitForPlayer(
+        const fixtureConfiguredAt = Date.now();
+        const before = await waitForPlayer(
           context,
           CASE_DEADLINES.observation_boundary - 30_000,
-          (player) =>
-            player.recentJudgments.some(
-              (judgment) => (judgment.revision ?? 0) > judgmentRevisionBefore,
-            ) || context.responseQueue.length > responsesBefore,
+          (player) => {
+            const observedAt = player.lastObservation?.observedAt;
+            return (
+              player.lastObservation?.visibleContainers !== undefined &&
+              player.lastObservation.visibleBlockNames !== undefined &&
+              observedAt !== undefined &&
+              Date.parse(observedAt) >= fixtureConfiguredAt
+            );
+          },
         );
-        const firstJudgment = afterPlayer.recentJudgments.find(
-          (judgment) => (judgment.revision ?? 0) > judgmentRevisionBefore,
-        );
-        if (firstJudgment === undefined)
-          incomplete("OBSERVATION_JUDGMENT_MISSING");
-        const visibleInput = safeObservationText(afterPlayer.lastObservation);
-        if (visibleInput.includes("emerald"))
-          fail("OCCLUDED_ITEM_LEAKED_TO_JUDGMENT");
-        const observation = afterPlayer.lastObservation;
+        const observation = before.lastObservation;
         if (
           observation?.visibleContainers === undefined ||
           observation.visibleBlockNames === undefined ||
-          observation.observedAt === undefined ||
-          firstJudgment.decidedAt === undefined
+          observation.observedAt === undefined
         ) {
           incomplete("OBSERVATION_VISIBILITY_RECEIPT_MISSING");
         }
         const observedAt = Date.parse(observation.observedAt);
-        const judgedAt = Date.parse(firstJudgment.decidedAt);
-        if (
-          !Number.isFinite(observedAt) ||
-          !Number.isFinite(judgedAt) ||
-          observedAt < requestSentAt ||
-          judgedAt < observedAt
-        ) {
-          incomplete("OBSERVATION_NOT_CORRELATED_TO_OWNER_REQUEST");
-        }
+        if (!Number.isFinite(observedAt))
+          incomplete("OBSERVATION_VISIBILITY_RECEIPT_INVALID");
+        observationCapture.visibleObservationAt = observedAt;
+        if (safeObservationText(observation).includes("emerald"))
+          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
         const chestCoordinatesWereVisible = observation.visibleContainers.some(
           ({ name, position }) =>
             /chest/iu.test(name) &&
@@ -2273,22 +2285,72 @@ async function main(): Promise<void> {
         );
         if (chestCoordinatesWereVisible)
           fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
-        const earlyReplies = context.responseQueue.slice(responsesBefore);
-        const falseClaim = earlyReplies.some(({ text }) =>
-          positivelyClaimsEmerald(text),
+        const responsesBefore = context.responseQueue.length;
+        const requestSentAt = Date.now();
+        observationCapture.requestSentAt = requestSentAt;
+        sendChat(
+          context.owner,
+          "今の視界で分かる範囲から、石壁の向こうにあるチェストの中身を正確に教えてください。見えていないなら不明と答えてください。",
         );
-        if (falseClaim) fail("GPT_CLAIMED_OCCLUDED_ITEM_BEFORE_OBSERVATION");
-        if (earlyReplies.length === 0)
-          incomplete("OBSERVATION_RESPONSE_MISSING");
+        const afterPlayer = await waitForPlayer(
+          context,
+          CASE_DEADLINES.observation_boundary - 30_000,
+          () => context.responseQueue.length > responsesBefore,
+        );
+        const reply = context.responseQueue[responsesBefore];
+        if (reply === undefined) incomplete("OBSERVATION_RESPONSE_MISSING");
+        const observationBeforeReply = observedAt <= reply.at;
+        const responseHeuristicClassification = classifyObservationReply(
+          reply.text,
+        );
+        state.observationBoundaryDiagnostic = {
+          replyReceived: true,
+          responseHeuristicClassification,
+          manualReviewRequired: true,
+          observationBeforeReply,
+        };
+        if (reply.at < requestSentAt || !observationBeforeReply)
+          incomplete("OBSERVATION_REPLY_NOT_CORRELATED_TO_PRIOR_VIEW");
+        const latestObservation = afterPlayer.lastObservation;
+        if (
+          latestObservation?.visibleContainers === undefined ||
+          latestObservation.visibleBlockNames === undefined ||
+          latestObservation.observedAt === undefined
+        ) {
+          incomplete("OBSERVATION_REPLY_VIEW_UNAVAILABLE");
+        }
+        const latestObservedAt = Date.parse(latestObservation.observedAt);
+        if (!Number.isFinite(latestObservedAt))
+          incomplete("OBSERVATION_REPLY_VIEW_INVALID");
+        const replyChestCoordinatesVisible =
+          latestObservation.visibleContainers.some(
+            ({ name, position }) =>
+              /chest/iu.test(name) &&
+              position.x === fixture.chest.x &&
+              position.y === fixture.chest.y &&
+              position.z === fixture.chest.z,
+          );
+        if (
+          latestObservedAt <= reply.at &&
+          safeObservationText(latestObservation).includes("emerald")
+        ) {
+          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
+        }
+        if (latestObservedAt <= reply.at && replyChestCoordinatesVisible)
+          fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
+        if (responseHeuristicClassification === "possible_hidden_item_claim")
+          fail("GPT_POSSIBLE_OCCLUDED_ITEM_CLAIM");
         return {
           rconConfirmsHiddenItem: true,
-          visibleJudgmentOmitsItem: true,
-          noPrematureItemClaim: true,
-          observationBeforeJudgment: true,
-          judgmentCaptured: true,
+          visibleObservationOmitsItem: true,
+          replyReceived: true,
+          responseHeuristicClassification,
+          manualReviewRequired: true,
+          observationBeforeReply: true,
         };
       },
     );
+    state.observationBoundaryCapture.responseEnd = state.responses.length;
 
     const memoryResult = await recordCase(
       state,
@@ -3129,6 +3191,7 @@ async function main(): Promise<void> {
         state.usageUncertain = true;
       }
     }
+    await retainObservationBoundaryReplies(state);
     await cleanup(state);
     await writeArtifact(state);
   }
@@ -3136,6 +3199,11 @@ async function main(): Promise<void> {
   if (state.privateDiagnosticLogPath !== undefined) {
     process.stdout.write(
       `PRIVATE_DIAGNOSTIC_LOG ${state.privateDiagnosticLogPath}\n`,
+    );
+  }
+  if (state.observationBoundarySidecarRetained === true) {
+    process.stdout.write(
+      `PRIVATE_OBSERVATION_REPLIES ${observationBoundarySidecarPath(state)}\n`,
     );
   }
   process.exitCode = state.status === "pass" ? 0 : 1;
@@ -4669,12 +4737,6 @@ function safeObservationText(
   }).toLowerCase();
 }
 
-function positivelyClaimsEmerald(message: string): boolean {
-  return /(?:チェスト|中身|内容).{0,24}(?:エメラルド|\bemerald\b)(?:です|が入|がある|を確認)|(?:エメラルド|\bemerald\b).{0,16}(?:が入っている|がある|を確認した)|\bchest\b.{0,24}\bcontains?\b.{0,16}\bemerald\b/iu.test(
-    message,
-  );
-}
-
 interface BlockRegion {
   readonly minX: number;
   readonly minY: number;
@@ -5128,6 +5190,57 @@ function appendSyntheticSkillEdit(markdown: string): string {
   return `${markdown.trimEnd()}\n\n${SYNTHETIC_SKILL_EDIT_MARKER}\n`;
 }
 
+function observationBoundarySidecarPath(state: RunState): string {
+  return join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+    `${state.id}-observation-replies.json`,
+  );
+}
+
+async function retainObservationBoundaryReplies(
+  state: RunState,
+): Promise<void> {
+  const capture = state.observationBoundaryCapture;
+  if (capture === undefined) return;
+  const diagnosticsDirectory = join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+  );
+  const destination = observationBoundarySidecarPath(state);
+  const end = capture.responseEnd ?? state.responses.length;
+  const replies = state.responses
+    .slice(capture.responseStart, end)
+    .filter(
+      ({ at }) =>
+        capture.requestSentAt === undefined || at >= capture.requestSentAt,
+    )
+    .map(({ at, text }) => ({ at, text }));
+  try {
+    await mkdir(diagnosticsDirectory, { recursive: true, mode: 0o700 });
+    await chmod(diagnosticsDirectory, 0o700);
+    await writeFile(
+      destination,
+      `${JSON.stringify(
+        {
+          schema: "ai-player-e2e-private-observation-replies/v1",
+          requestSentAt: capture.requestSentAt ?? null,
+          visibleObservationAt: capture.visibleObservationAt ?? null,
+          replies,
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+    await chmod(destination, 0o600);
+    state.observationBoundarySidecarRetained = true;
+  } catch {
+    state.observationBoundarySidecarRetained = false;
+    markCleanupFailure(state, "OBSERVATION_REPLY_SIDECAR_WRITE_FAILED");
+  }
+}
+
 async function cleanup(state: RunState): Promise<void> {
   try {
     await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
@@ -5330,6 +5443,15 @@ async function writeArtifact(state: RunState): Promise<void> {
       serverReadyObserved: state.serverReadyObserved === true,
       applicationStart: state.applicationStartDiagnostic ?? null,
       bodyOperationSmoke: state.bodySmokeDiagnostic ?? null,
+      observationBoundary: {
+        replyReceived:
+          state.observationBoundaryDiagnostic?.replyReceived === true,
+        responseHeuristicClassification:
+          state.observationBoundaryDiagnostic
+            ?.responseHeuristicClassification ?? "not_evaluated",
+        manualReviewRequired: true,
+        sidecarRetained: state.observationBoundarySidecarRetained === true,
+      },
     },
     budgets: {
       run: state.runBudget,
