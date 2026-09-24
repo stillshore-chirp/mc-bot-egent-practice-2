@@ -38,6 +38,11 @@ export interface RunPlayerAgentInput {
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
   readonly maxRounds?: number;
+  /** Allows a caller to finish on a tool result it has durably committed. */
+  readonly shouldFinishAfterTool?: (
+    toolName: string,
+    result: unknown,
+  ) => boolean;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
 }
 
@@ -237,6 +242,20 @@ export async function runPlayerAgent(
         call_id: call.call_id,
         output: boundedJson(result),
       });
+      input.signal?.throwIfAborted();
+      if (
+        tool !== undefined &&
+        input.shouldFinishAfterTool?.(call.name, result) === true
+      ) {
+        return {
+          text: response.output_text.trim(),
+          calls,
+          inputTokens,
+          outputTokens,
+          latencyMs,
+          toolCalls,
+        };
+      }
     }
   }
   throw new Error("PLAYER_AGENT_TOOL_ROUND_LIMIT");

@@ -796,6 +796,15 @@ export class PlayerPurposeAgent {
           ? {}
           : { trace: this.options.trace }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
+        shouldFinishAfterTool: (toolName, result) => {
+          const outcome = asRecord(result);
+          return (
+            toolName === "commit_action_decision" &&
+            committedDecision !== undefined &&
+            outcome?.ok === true &&
+            outcome.accepted === true
+          );
+        },
         ...(this.options.onCall === undefined
           ? {}
           : { onCall: this.options.onCall }),
