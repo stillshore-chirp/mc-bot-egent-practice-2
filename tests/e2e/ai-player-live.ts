@@ -307,6 +307,7 @@ interface PlayerEvidence {
     readonly kind: string;
     readonly actionRevision: number;
     readonly startedAt?: string;
+    readonly bodyStartedAt?: string;
     readonly skillId?: string;
     readonly skillVersion?: number;
   };

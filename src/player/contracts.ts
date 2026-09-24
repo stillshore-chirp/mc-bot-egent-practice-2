@@ -63,6 +63,7 @@ export interface ActivePlayerOperation {
   readonly kind: PlayerOperation["kind"];
   readonly actionRevision: number;
   readonly startedAt: string;
+  readonly bodyStartedAt?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }

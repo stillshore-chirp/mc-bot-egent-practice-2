@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -119,6 +120,86 @@ describe("integrated player runtime", () => {
       });
     } finally {
       mind.close();
+    }
+  });
+
+  it("records bodyStartedAt only after the matching body-start event", () => {
+    const directory = temporaryDirectory();
+    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    try {
+      const committed = mind.commitThought({
+        expectedRevision: mind.snapshot().revision,
+        decision: action("body-start-time"),
+      });
+      expect(committed.accepted).toBe(true);
+      const active = committed.snapshot.activeOperation;
+      if (active === undefined) throw new Error("active operation missing");
+      expect(active.startedAt).toBeDefined();
+      expect(active.bodyStartedAt).toBeUndefined();
+
+      const startedAt = "2026-09-25T03:00:00.000Z";
+      mind.markOperationStarted("different-operation", startedAt);
+      expect(mind.snapshot().activeOperation?.bodyStartedAt).toBeUndefined();
+      mind.markOperationStarted(active.operationId, startedAt);
+
+      expect(mind.snapshot().activeOperation).toMatchObject({
+        operationId: active.operationId,
+        startedAt,
+        bodyStartedAt: startedAt,
+      });
+    } finally {
+      mind.close();
+    }
+  });
+
+  it("loads persisted active operations without the optional body start time", () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const committed = mind.commitThought({
+      expectedRevision: mind.snapshot().revision,
+      decision: action("old-active-operation-shape"),
+    });
+    expect(committed.accepted).toBe(true);
+    const active = committed.snapshot.activeOperation;
+    if (active === undefined) throw new Error("active operation missing");
+    mind.markOperationStarted(active.operationId, "2026-09-25T03:00:00.000Z");
+    mind.close();
+
+    const database = new Database(databasePath);
+    try {
+      const row = database
+        .prepare<[], { readonly payload_json: string }>(
+          "SELECT payload_json FROM player_runtime_state WHERE singleton_id = 1",
+        )
+        .get();
+      if (row === undefined) throw new Error("runtime state missing");
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      const oldActive = payload.activeOperation as
+        Record<string, unknown> | undefined;
+      if (oldActive === undefined)
+        throw new Error("active operation not persisted");
+      delete oldActive.bodyStartedAt;
+      database
+        .prepare(
+          "UPDATE player_runtime_state SET payload_json = ? WHERE singleton_id = 1",
+        )
+        .run(JSON.stringify(payload));
+    } finally {
+      database.close();
+    }
+
+    const reopened = PlayerMindStore.open(databasePath);
+    try {
+      expect(reopened.snapshot().activeOperation).toMatchObject({
+        operationId: active.operationId,
+        startedAt: "2026-09-25T03:00:00.000Z",
+      });
+      expect(
+        reopened.snapshot().activeOperation?.bodyStartedAt,
+      ).toBeUndefined();
+    } finally {
+      reopened.close();
     }
   });
 

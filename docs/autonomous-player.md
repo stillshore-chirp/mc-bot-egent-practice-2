@@ -29,6 +29,8 @@
 
 会話turnは長いbody操作の完了を待たずに並行できます。行動を変更するかは別の目的判断が決めます。判断の一般的な `revision` は状態更新を、`actionRevision` は行動計画の有効性を管理するCAS値です。結果が古い判断はcommitされません。新しい行動を始める前に現在の操作をcancelし、身体側のdispatchがsettleしたことを確認します。同時にbodyを操作する実行ownerは一つです。
 
+`activeOperation.startedAt` は行動判断のcommit時刻で、`bodyStartedAt` はPlayerBodyから実operation開始eventを受けた時だけ記録します。E2E診断は両者を区別して開始後の介入を判定できます。既存の `startedAt` は互換性のためbody開始時にも更新され、旧保存データでは `bodyStartedAt` を省略できます。
+
 停止はSQLiteへ永続化され、再起動や観測イベントがあっても解除されません。即時stop commandはLLMを呼ばず停止latchを先に保存します。停止後はownerから認証された再開が行われた時だけ自律判断を再開します。古いconversation turnやaction decisionはstop generation/CASにより新しい状態を上書きできません。
 
 ## 観測、待機、再接続

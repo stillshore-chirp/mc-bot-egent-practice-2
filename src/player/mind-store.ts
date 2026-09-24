@@ -240,6 +240,7 @@ const stateSchema = z
         kind: z.enum(playerOperationNames),
         actionRevision: z.number().int().nonnegative(),
         startedAt: z.iso.datetime(),
+        bodyStartedAt: z.iso.datetime().optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
       })
@@ -971,7 +972,11 @@ export class PlayerMindStore {
       this.writeStored(
         {
           ...current,
-          activeOperation: { ...current.activeOperation, startedAt: at },
+          activeOperation: {
+            ...current.activeOperation,
+            startedAt: at,
+            bodyStartedAt: at,
+          },
         },
         at,
       );
