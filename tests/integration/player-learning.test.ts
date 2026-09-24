@@ -1,4 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -153,6 +159,186 @@ describe("player skill learning", () => {
           ),
       ).toBe(true);
       expect(mind.snapshot().lastOutcome?.status).toBe("successful");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("carries an owner proposal through the agent Markdown export and import tools", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-markdown-test-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const exchangeDirectory = join(directory, "exchange");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory,
+      allowedOperationNames: playerOperationNames,
+    });
+    const seed = skills.search({ limit: 1 })[0];
+    if (seed === undefined) throw new Error("seed skill is missing");
+    const historyBefore = skills.getHistory(seed.id).length;
+    const fileName = "owner-edited-skill.md";
+    const exportedPath = join(exchangeDirectory, fileName);
+    const editedTitle = `${seed.title} reviewed by owner`;
+    const editedBody =
+      "Check the visible situation, choose a suitable step, and verify its result from the next observation.";
+    const sayMessages: string[] = [];
+    const observationBody = observationOnlyBody();
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient([
+        functionCallResponse("markdown-proposal", "propose_goal_change", {
+          title: "Review a stored Minecraft skill",
+          reason: "I want to inspect and improve one reusable skill.",
+          priority: 3,
+        }),
+        textResponse("markdown-conversation-final", "I will review that goal."),
+      ]),
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      ownerUsername: "owner",
+      mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (text) => {
+        sayMessages.push(text);
+      },
+      onProposal: () => runtimeRef.current?.onOwnerProposal(),
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const purpose = new PlayerPurposeAgent({
+      client: scriptedClient([
+        proposalResolutionResponse,
+        functionCallResponse("markdown-export", "export_skill_markdown", {
+          skillId: seed.id,
+          fileName,
+        }),
+        (request) => {
+          const exported = recordOf(toolOutput(request, "markdown-export"));
+          expect(exported?.ok).toBe(true);
+          expect(exported?.path).toBe(realpathSync(exportedPath));
+          const originalMarkdown = readFileSync(exportedPath, "utf8");
+          expect(exported?.content).toBe(originalMarkdown);
+          editExportedSkillMarkdown(exportedPath, editedTitle, editedBody);
+          return functionCallResponse(
+            "markdown-import-first",
+            "import_skill_markdown",
+            { fileName },
+          );
+        },
+        (request) => {
+          expect(toolOutput(request, "markdown-import-first")).toMatchObject({
+            ok: true,
+            id: seed.id,
+            title: editedTitle,
+            trustedInstructions: false,
+          });
+          const imported = skills.get(seed.id);
+          expect(imported.title).toBe(editedTitle);
+          expect(imported.body).toBe(editedBody);
+          expect(imported.version).toBe(seed.version + 1);
+          expect(skills.getHistory(seed.id)).toHaveLength(historyBefore + 1);
+          return functionCallResponse(
+            "markdown-import-repeat",
+            "import_skill_markdown",
+            { fileName },
+          );
+        },
+        (request) => {
+          expect(toolOutput(request, "markdown-import-repeat")).toMatchObject({
+            ok: true,
+            id: seed.id,
+            title: editedTitle,
+            trustedInstructions: false,
+          });
+          const repeated = skills.get(seed.id);
+          expect(repeated.version).toBe(seed.version + 1);
+          expect(repeated.body).toBe(editedBody);
+          expect(skills.getHistory(seed.id)).toHaveLength(historyBefore + 1);
+          return functionCallResponse(
+            "markdown-wait",
+            "commit_action_decision",
+            {
+              ...waitArguments(),
+              reason:
+                "The edited skill was imported and verified; wait for a new world change.",
+            },
+          );
+        },
+        (request) => {
+          expect(recordOf(toolOutput(request, "markdown-wait"))?.ok).toBe(true);
+          return textResponse(
+            "markdown-purpose-final",
+            "The edited skill is saved for future use.",
+          );
+        },
+      ]),
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationBody,
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: (snapshot, decision) =>
+        runtimeRef.current?.handleCommittedDecision(snapshot, decision),
+    });
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body: observationBody,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation,
+      purpose,
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      runtime.receiveChat(
+        "owner",
+        "Please review a stored skill and make its guidance clearer.",
+      );
+      await waitFor(
+        () =>
+          sayMessages.length === 1 &&
+          !runtime.busy &&
+          mind.snapshot().wait?.reason ===
+            "The edited skill was imported and verified; wait for a new world change.",
+      );
+
+      expect(mind.snapshot().proposals[0]?.status).toBe("adopted");
+      const searchResults = skills.search({ query: editedTitle, limit: 4 });
+      expect(searchResults.some((skill) => skill.id === seed.id)).toBe(true);
+      expect(skills.get(seed.id)).toMatchObject({
+        title: editedTitle,
+        body: editedBody,
+        version: seed.version + 1,
+      });
+      expect(
+        mind
+          .snapshot()
+          .skillActivity.filter(
+            (activity) =>
+              activity.skillId === seed.id && activity.kind === "exported",
+          ),
+      ).toHaveLength(1);
+      expect(
+        mind
+          .snapshot()
+          .skillActivity.filter(
+            (activity) =>
+              activity.skillId === seed.id && activity.kind === "imported",
+          ),
+      ).toHaveLength(2);
     } finally {
       await runtime.shutdown();
       skills.close();
@@ -394,6 +580,58 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     return undefined;
   return value as Record<string, unknown>;
+}
+
+function toolOutput(request: unknown, responseId: string): unknown {
+  const requestRecord = recordOf(request);
+  const messages = requestRecord?.input;
+  if (!Array.isArray(messages))
+    throw new Error("purpose request is not a message list");
+  const output = messages
+    .map(recordOf)
+    .find(
+      (item) =>
+        item?.type === "function_call_output" &&
+        item.call_id === `${responseId}-call`,
+    );
+  if (typeof output?.output !== "string")
+    throw new Error(`tool output was not found: ${responseId}`);
+  return JSON.parse(output.output) as unknown;
+}
+
+function editExportedSkillMarkdown(
+  path: string,
+  title: string,
+  body: string,
+): void {
+  const markdown = readFileSync(path, "utf8");
+  const match =
+    /^# [^\n]+\n\n```mc-bot-skill\n([\s\S]*?)\n```\n\n## 本文\n[\s\S]*?\n?$/u.exec(
+      markdown,
+    );
+  if (match?.[1] === undefined)
+    throw new Error("exported skill Markdown has an unexpected format");
+  const metadata: unknown = JSON.parse(match[1]);
+  const metadataRecord = recordOf(metadata);
+  const skillRecord = recordOf(metadataRecord?.skill);
+  if (metadataRecord === undefined || skillRecord === undefined)
+    throw new Error("exported skill metadata is invalid");
+  metadataRecord.skill = { ...skillRecord, title };
+  writeFileSync(
+    path,
+    [
+      `# ${title}`,
+      "",
+      "```mc-bot-skill",
+      JSON.stringify(metadataRecord, null, 2),
+      "```",
+      "",
+      "## 本文",
+      body,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
 }
 
 function functionCallResponse(
