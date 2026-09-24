@@ -8,6 +8,7 @@ import {
   playerOperationNames,
   playerOperationDescriptions,
   playerOperationSchema,
+  type PlayerBodyEvent,
 } from "../../src/minecraft/player-body.js";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
 
@@ -47,8 +48,10 @@ function makeWindow(id = 3): Window & EventEmitter {
   return window;
 }
 
-function makeFakeBot(): {
+function makeFakeBot(options: { deferInventory?: boolean } = {}): {
   bot: Bot;
+  inventory: EventEmitter;
+  initializeInventory(): void;
   blocks: Map<string, FakeBlock>;
   candidates: Vec3[];
   hiddenBlockKeys: Set<string>;
@@ -178,6 +181,13 @@ function makeFakeBot(): {
     recipesFor: () => [],
     isABed: () => false,
   });
+  if (options.deferInventory === true) {
+    Object.defineProperty(bot, "inventory", {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+  }
   client.write = (event, packet) => {
     if (event !== "block_place") return;
     const location = (packet as { location?: Vec3 }).location;
@@ -191,6 +201,14 @@ function makeFakeBot(): {
   };
   return {
     bot: bot as unknown as Bot,
+    inventory,
+    initializeInventory: () => {
+      Object.defineProperty(bot, "inventory", {
+        configurable: true,
+        value: inventory,
+        writable: true,
+      });
+    },
     blocks,
     candidates,
     hiddenBlockKeys,
@@ -231,6 +249,57 @@ describe("player body", () => {
         tradeIndex: "first",
       }),
     ).toThrow();
+  });
+
+  it("waits for Mineflayer plugin injection and retains lifecycle events across reconnects", async () => {
+    let currentBot: Bot | undefined;
+    const body = new MineflayerPlayerBody(() => {
+      if (currentBot === undefined) throw new Error("Bot is not connected");
+      return currentBot;
+    });
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    const first = makeFakeBot({ deferInventory: true });
+    const firstEvents = first.bot as unknown as EventEmitter;
+    firstEvents.once("inject_allowed", () => first.initializeInventory());
+    currentBot = first.bot;
+    body.attach(first.bot);
+    expect(first.inventory.listenerCount("updateSlot")).toBe(0);
+    expect(firstEvents.listenerCount("spawn")).toBe(1);
+    expect(firstEvents.listenerCount("end")).toBe(1);
+    firstEvents.emit("spawn");
+
+    firstEvents.emit("inject_allowed");
+    await Promise.resolve();
+    expect(first.inventory.listenerCount("updateSlot")).toBe(1);
+    body.attach(first.bot);
+    expect(first.inventory.listenerCount("updateSlot")).toBe(1);
+
+    const window = makeWindow();
+    firstEvents.emit("windowOpen", window);
+    firstEvents.emit("windowOpen", window);
+    expect(window.listenerCount("updateSlot")).toBe(1);
+
+    first.inventory.emit("updateSlot", 0, null, null);
+    await new Promise((resolve) => setTimeout(resolve, 175));
+    expect(
+      events.some(
+        (event) =>
+          event.type === "state_changed" && event.reason === "inventory",
+      ),
+    ).toBe(true);
+
+    firstEvents.emit("end", "reconnect requested");
+    const second = makeFakeBot();
+    currentBot = second.bot;
+    body.attach(second.bot);
+    expect(first.inventory.listenerCount("updateSlot")).toBe(0);
+    expect(window.listenerCount("updateSlot")).toBe(0);
+    expect(second.inventory.listenerCount("updateSlot")).toBe(1);
+    (second.bot as unknown as EventEmitter).emit("spawn");
+    expect(events.some((event) => event.type === "reconnected")).toBe(true);
+    expect(events.some((event) => event.type === "disconnected")).toBe(true);
   });
 
   it("limits block and entity perception to visible, unoccluded targets and labels unknowns", () => {

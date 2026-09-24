@@ -93,6 +93,12 @@ function slotUpdateEvents(window: Window): WindowUpdateEventTarget {
   return window;
 }
 
+function initializedInventory(bot: Bot): Bot["inventory"] | undefined {
+  const inventory = (bot as unknown as { inventory?: Bot["inventory"] | null })
+    .inventory;
+  return inventory ?? undefined;
+}
+
 function activeWindow(bot: Bot): Window {
   return bot.currentWindow ?? bot.inventory;
 }
@@ -954,6 +960,8 @@ export class MineflayerPlayerBody implements PlayerBody {
   private readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   private boundBot: Bot | undefined;
   private readonly botHandlers: (() => void)[] = [];
+  private readonly inventoryHandlers: (() => void)[] = [];
+  private inventoryBoundBot: Bot | undefined;
   private readonly windowUpdateHandlers = new Map<Window, () => void>();
   private readonly stateTimers = new Map<
     string,
@@ -1773,6 +1781,8 @@ export class MineflayerPlayerBody implements PlayerBody {
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
     for (const detach of this.botHandlers.splice(0)) detach();
+    for (const detach of this.inventoryHandlers.splice(0)) detach();
+    this.inventoryBoundBot = undefined;
     for (const detach of this.windowUpdateHandlers.values()) detach();
     this.windowUpdateHandlers.clear();
     for (const timer of this.stateTimers.values()) clearTimeout(timer);
@@ -1798,13 +1808,9 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("experience", state("vitals"));
     listen("heldItemChanged", state("inventory"));
     listen("playerCollect", state("inventory"));
-    const onInventoryUpdate = (): void => this.scheduleStateEvent("inventory");
-    bot.inventory.on("updateSlot", onInventoryUpdate);
-    this.botHandlers.push(() =>
-      bot.inventory.removeListener("updateSlot", onInventoryUpdate),
-    );
     listen("windowOpen", (window: Window) => {
       this.scheduleStateEvent("window");
+      this.windowUpdateHandlers.get(window)?.();
       const onWindowUpdate = (): void => this.scheduleStateEvent("window");
       const events = slotUpdateEvents(window);
       events.on("updateSlot", onWindowUpdate);
@@ -1852,6 +1858,32 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       this.scheduleStateEvent("position");
     });
+    this.bindInventoryEventsWhenReady(bot);
+  }
+
+  private bindInventoryEventsWhenReady(bot: Bot): void {
+    if (this.boundBot !== bot || this.inventoryBoundBot === bot) return;
+    const inventory = initializedInventory(bot);
+    if (inventory !== undefined) {
+      this.inventoryBoundBot = bot;
+      const onInventoryUpdate = (): void =>
+        this.scheduleStateEvent("inventory");
+      inventory.on("updateSlot", onInventoryUpdate);
+      this.inventoryHandlers.push(() =>
+        inventory.removeListener("updateSlot", onInventoryUpdate),
+      );
+      return;
+    }
+
+    const onPluginsInjected = (): void => {
+      // Mineflayer injects its plugins synchronously while emitting this event.
+      // Run after all listeners so the inventory plugin has installed its API.
+      queueMicrotask(() => this.bindInventoryEventsWhenReady(bot));
+    };
+    bot.once("inject_allowed", onPluginsInjected);
+    this.botHandlers.push(() =>
+      bot.removeListener("inject_allowed", onPluginsInjected),
+    );
   }
 
   private scheduleStateEvent(
