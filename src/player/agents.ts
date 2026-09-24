@@ -845,7 +845,6 @@ export class PlayerPurposeAgent {
       latest.stopped ||
       input.signal?.aborted
     ) {
-      this.options.mind.consumeEvents(eventIds);
       return { accepted: false };
     }
     const instructions = [
@@ -896,8 +895,13 @@ export class PlayerPurposeAgent {
         ...(input.signal === undefined ? {} : { signal: input.signal }),
         shouldFinishAfterTool: (toolName, result) => {
           const outcome = asRecord(result);
+          if (toolName !== "commit_action_decision") return false;
+          if (
+            outcome?.ok === false &&
+            (outcome.code === "STALE_REVISION" || outcome.code === "STOPPED")
+          )
+            return true;
           return (
-            toolName === "commit_action_decision" &&
             committedDecision !== undefined &&
             outcome?.ok === true &&
             outcome.accepted === true
@@ -910,7 +914,8 @@ export class PlayerPurposeAgent {
           ? {}
           : { onRoundActivity: this.options.onRoundActivity }),
       });
-      this.options.mind.consumeEvents(eventIds);
+      if (committedDecision !== undefined)
+        this.options.mind.consumeEvents(eventIds);
       return {
         accepted: committedDecision !== undefined,
         ...(committedDecision === undefined
@@ -918,7 +923,8 @@ export class PlayerPurposeAgent {
           : { decision: committedDecision }),
       };
     } catch (error) {
-      this.options.mind.consumeEvents(eventIds);
+      if (committedDecision !== undefined)
+        this.options.mind.consumeEvents(eventIds);
       throw error;
     }
   }

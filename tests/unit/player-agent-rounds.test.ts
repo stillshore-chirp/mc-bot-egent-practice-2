@@ -298,7 +298,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("continues after unknown tools and a rejected CAS instead of finishing", async () => {
+  it("finishes on a stale action CAS and preserves its uncommitted wake event", async () => {
     const mindRef: { current?: PlayerMindStore } = {};
     const responses: ScriptedResponse[] = [
       functionCallResponse("unknown", "not_a_registered_tool", {}),
@@ -324,26 +324,106 @@ describe("player agent response rounds", () => {
           actionArguments(),
         );
       },
-      terminalResponse("No action was committed."),
     ];
     const committed: PlayerThoughtDecision[] = [];
     const fixture = openPurposeFixture(responses, (_snapshot, decision) => {
       committed.push(decision);
     });
     mindRef.current = fixture.mind;
+    const event = fixture.mind.enqueueEvent(
+      "state_changed",
+      "meaningful change: nearby block changed",
+    );
 
     try {
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
-        events: [],
+        events: [event],
       });
 
       expect(result.accepted).toBe(false);
       expect(committed).toHaveLength(0);
-      expect(fixture.requests).toHaveLength(4);
+      expect(fixture.requests).toHaveLength(3);
       expect(JSON.stringify(fixture.requests[1])).toContain("UNKNOWN_TOOL");
       expect(JSON.stringify(fixture.requests[2])).toContain("NO_STATE_CHANGE");
-      expect(JSON.stringify(fixture.requests[3])).toContain("STALE_REVISION");
+      expect(fixture.mind.pendingEvents()).toContainEqual(
+        expect.objectContaining({ id: event.id }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("allows repairable operation errors and consumes wake events after commit", async () => {
+    const invalidAction = actionArguments();
+    invalidAction.operationJson = JSON.stringify({ kind: "look" });
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "invalid-action",
+        "commit_action_decision",
+        invalidAction,
+      ),
+      functionCallResponse(
+        "corrected-action",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+    ]);
+    const event = fixture.mind.enqueueEvent(
+      "state_changed",
+      "meaningful change: position moved",
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [event],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(2);
+      expect(JSON.stringify(fixture.requests[1])).toContain(
+        "INVALID_PLAYER_OPERATION",
+      );
+      expect(fixture.mind.pendingEvents()).not.toContainEqual(
+        expect.objectContaining({ id: event.id }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("finishes on a stopped action CAS and preserves its uncommitted wake event", async () => {
+    const mindRef: { current?: PlayerMindStore } = {};
+    const fixture = openPurposeFixture([
+      (_request, index) => {
+        if (index !== 0) throw new Error("TEST_STOP_LATCH_NOT_SET");
+        const stopped = mindRef.current?.stop();
+        if (!stopped?.stopped) throw new Error("TEST_STOP_LATCH_NOT_SET");
+        return functionCallResponse(
+          "stopped-action",
+          "commit_action_decision",
+          actionArguments(),
+        );
+      },
+    ]);
+    mindRef.current = fixture.mind;
+    const event = fixture.mind.enqueueEvent(
+      "state_changed",
+      "meaningful change: health changed",
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [event],
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.pendingEvents()).toContainEqual(
+        expect.objectContaining({ id: event.id }),
+      );
     } finally {
       fixture.close();
     }
