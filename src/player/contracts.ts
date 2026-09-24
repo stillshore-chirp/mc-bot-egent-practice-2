@@ -38,13 +38,13 @@ export interface OwnerProposal {
   readonly createdAt: string;
   readonly priorityPreference: number;
   readonly status: "pending" | "adopted" | "compromised" | "declined";
-  readonly resolution?: string;
+  readonly resolution?: string | undefined;
 }
 
 export interface PlayerWaitState {
   readonly reason: string;
   readonly wakeOn: readonly PlayerWakeKind[];
-  readonly wakeAt?: string;
+  readonly wakeAt?: string | undefined;
 }
 
 export interface ActivePlayerOperation {
@@ -52,8 +52,8 @@ export interface ActivePlayerOperation {
   readonly kind: PlayerOperation["kind"];
   readonly actionRevision: number;
   readonly startedAt: string;
-  readonly skillId?: string;
-  readonly skillVersion?: number;
+  readonly skillId?: string | undefined;
+  readonly skillVersion?: number | undefined;
 }
 
 export interface PlayerOutcomeEvidence {
@@ -62,8 +62,8 @@ export interface PlayerOutcomeEvidence {
   readonly status: McSkillOutcomeStatus;
   readonly summary: string;
   readonly observedAt: string;
-  readonly skillId?: string;
-  readonly skillVersion?: number;
+  readonly skillId?: string | undefined;
+  readonly skillVersion?: number | undefined;
 }
 
 export interface PlayerProposalResolution {
@@ -77,11 +77,12 @@ export interface PlayerJudgmentEvidence {
   readonly decidedAt: string;
   readonly kind: PlayerThoughtDecision["kind"];
   readonly summary: string;
-  readonly operationKind?: PlayerOperation["kind"];
-  readonly proposalId?: string;
-  readonly proposalDisposition?: PlayerProposalResolution["disposition"];
-  readonly skillId?: string;
-  readonly skillVersion?: number;
+  readonly operationKind?: PlayerOperation["kind"] | undefined;
+  readonly proposalId?: string | undefined;
+  readonly proposalDisposition?:
+    PlayerProposalResolution["disposition"] | undefined;
+  readonly skillId?: string | undefined;
+  readonly skillVersion?: number | undefined;
 }
 
 export interface PlayerLearningEvidence {
@@ -101,8 +102,8 @@ export interface PlayerTrustedOutcomeEvidence {
   readonly status: McSkillOutcomeStatus;
   readonly summary: string;
   readonly observedAt: string;
-  readonly skillId?: string;
-  readonly skillVersion?: number;
+  readonly skillId?: string | undefined;
+  readonly skillVersion?: number | undefined;
 }
 
 export interface PlayerSkillActivityEvidence {
@@ -112,7 +113,7 @@ export interface PlayerSkillActivityEvidence {
   readonly summary: string;
   readonly at: string;
   /** Local-only exchange path; never included in model context or public logs. */
-  readonly filePath?: string;
+  readonly filePath?: string | undefined;
 }
 
 export interface PlayerStateNote {
@@ -206,15 +207,15 @@ export interface PlayerRuntimeSnapshot {
   readonly stateFacts: readonly PlayerStateNote[];
   readonly uncertainties: readonly PlayerStateNote[];
   readonly proposals: readonly OwnerProposal[];
-  readonly activeOperation?: ActivePlayerOperation;
-  readonly wait?: PlayerWaitState;
-  readonly lastOutcome?: PlayerOutcomeEvidence;
+  readonly activeOperation?: ActivePlayerOperation | undefined;
+  readonly wait?: PlayerWaitState | undefined;
+  readonly lastOutcome?: PlayerOutcomeEvidence | undefined;
   readonly pendingEventKinds: readonly PlayerWakeKind[];
   readonly recentJudgments: readonly PlayerJudgmentEvidence[];
   readonly recentOutcomes: readonly PlayerTrustedOutcomeEvidence[];
   readonly learningReferences: readonly PlayerLearningEvidence[];
   readonly skillActivity: readonly PlayerSkillActivityEvidence[];
-  readonly lastObservation?: PlayerObservationEvidence;
+  readonly lastObservation?: PlayerObservationEvidence | undefined;
   readonly counters: {
     readonly llmCalls: number;
     readonly inputTokens: number;

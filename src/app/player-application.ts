@@ -138,21 +138,28 @@ export class PlayerCompanionApplication implements CompanionApplication {
           "player application startup cleanup failed",
         );
       }
-      throw error;
+      if (error instanceof Error) throw error;
+      throw new Error("Player application startup failed", { cause: error });
     }
   }
 
   public async shutdown(reason = "shutdown"): Promise<void> {
     if (this.#shutdownPromise !== undefined) return this.#shutdownPromise;
     this.#shutdownPromise = (async () => {
-      let firstError: unknown;
+      const shutdownErrors: Error[] = [];
       const capture = async (
         operation: () => Promise<void> | void,
       ): Promise<void> => {
         try {
           await operation();
         } catch (error) {
-          firstError ??= error;
+          shutdownErrors.push(
+            error instanceof Error
+              ? error
+              : new Error("Player application shutdown operation failed", {
+                  cause: error,
+                }),
+          );
         }
       };
       await capture(() => this.#unsubscribeChat?.());
@@ -164,14 +171,16 @@ export class PlayerCompanionApplication implements CompanionApplication {
       await capture(() => this.#skills.close());
       await capture(() => this.#mind.close());
       await capture(() => this.#memory.close());
-      if (this.#temporarySkillDirectory !== undefined) {
+      const temporarySkillDirectory = this.#temporarySkillDirectory;
+      if (temporarySkillDirectory !== undefined) {
         await capture(() =>
-          rmSync(this.#temporarySkillDirectory!, {
+          rmSync(temporarySkillDirectory, {
             recursive: true,
             force: true,
           }),
         );
       }
+      const firstError = shutdownErrors[0];
       if (firstError !== undefined) throw firstError;
     })();
     return this.#shutdownPromise;
@@ -316,20 +325,22 @@ export function createPlayerApplication(
       };
     },
     recall: (query) => memory.recall({ playerId: owner.id, query, limit: 8 }),
-    persistGoals: (saved) =>
+    persistGoals: (saved) => {
+      const lifeState = memory.getLifeState();
       memory.saveLifeState({
-        currentInterests: memory.getLifeState()?.currentInterests ?? [],
+        currentInterests: lifeState?.currentInterests ?? [],
         longTermGoals: saved
           .filter(
             (goal) => goal.status === "active" || goal.status === "paused",
           )
           .map(({ title }) => title)
           .slice(0, 24),
-        ...(memory.getLifeState()?.homeBase === undefined
+        ...(lifeState?.homeBase === undefined
           ? {}
-          : { homeBase: memory.getLifeState()!.homeBase }),
-        possessions: memory.getLifeState()?.possessions ?? [],
-      }),
+          : { homeBase: lifeState.homeBase }),
+        possessions: lifeState?.possessions ?? [],
+      });
+    },
     recordEpisode: (episode) =>
       memory.recordEpisode({
         playerId: owner.id,
@@ -344,7 +355,7 @@ export function createPlayerApplication(
         },
       }),
   };
-  let runtime: PlayerRuntime;
+  const runtimeRef: { current?: PlayerRuntime } = {};
   const say = (text: string): Promise<void> => minecraft.say(text);
   const conversation = new PlayerConversationAgent({
     client,
@@ -362,9 +373,11 @@ export function createPlayerApplication(
         latencyMs: metrics.latencyMs,
       }),
     say,
-    onProposal: () => runtime.onOwnerProposal(),
-    onStop: async () => runtime.stopNow(),
-    onResume: () => runtime.onResume(),
+    onProposal: () => runtimeRef.current?.onOwnerProposal(),
+    onStop: async () => {
+      await runtimeRef.current?.stopNow();
+    },
+    onResume: () => runtimeRef.current?.onResume(),
   });
   const purpose = new PlayerPurposeAgent({
     client,
@@ -386,9 +399,9 @@ export function createPlayerApplication(
     onObservation: (observation) =>
       mind.recordObservation(toObservationEvidence(observation)),
     onCommitted: (snapshot, decision) =>
-      runtime.handleCommittedDecision(snapshot, decision),
+      runtimeRef.current?.handleCommittedDecision(snapshot, decision),
   });
-  runtime = new PlayerRuntime({
+  const runtime = new PlayerRuntime({
     ownerUsername: config.ownerUsername,
     playerId: owner.id,
     body,
@@ -402,6 +415,7 @@ export function createPlayerApplication(
     say,
     requestReconnect: (reason) => minecraft.disconnect(reason),
   });
+  runtimeRef.current = runtime;
   return new PlayerCompanionApplication({
     config,
     logger,

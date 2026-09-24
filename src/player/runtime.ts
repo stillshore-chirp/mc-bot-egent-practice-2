@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
-import {
+import type {
   McSkillRepository,
-  type McSkillOutcomeStatus,
+  McSkillOutcomeStatus,
 } from "../mc-skills/index.js";
 import type {
   PlayerBody,
@@ -22,7 +22,7 @@ import type {
   PlayerThoughtDecision,
   PlayerWakeKind,
 } from "./contracts.js";
-import { PlayerMindStore } from "./mind-store.js";
+import type { PlayerMindStore } from "./mind-store.js";
 import {
   toObservationEvidence,
   trustedConditions,
@@ -116,16 +116,17 @@ export class PlayerRuntime {
         ? undefined
         : this.options.skills.getEvidence(activeBeforeRecovery.operationId);
     const trustedRecovery =
-      priorReceipt !== undefined &&
-      priorReceipt.operationName === activeBeforeRecovery?.kind &&
-      priorReceipt.skillIdAtUse === activeBeforeRecovery?.skillId &&
-      priorReceipt.skillVersionAtUse === activeBeforeRecovery?.skillVersion
-        ? {
-            status: priorReceipt.observedOutcome,
-            summary: priorReceipt.observationSummary,
-            observedAt: priorReceipt.observedAt,
-          }
-        : undefined;
+      priorReceipt === undefined || activeBeforeRecovery === undefined
+        ? undefined
+        : priorReceipt.operationName === activeBeforeRecovery.kind &&
+            priorReceipt.skillIdAtUse === activeBeforeRecovery.skillId &&
+            priorReceipt.skillVersionAtUse === activeBeforeRecovery.skillVersion
+          ? {
+              status: priorReceipt.observedOutcome,
+              summary: priorReceipt.observationSummary,
+              observedAt: priorReceipt.observedAt,
+            }
+          : undefined;
     const recovered =
       this.options.mind.recoverInterruptedOperation(trustedRecovery);
     if (recovered !== undefined) {
@@ -291,7 +292,7 @@ export class PlayerRuntime {
         typeof bodyEvent.elapsedMs === "number"
           ? Math.max(0, Math.floor(bodyEvent.elapsedMs))
           : 0;
-      this.#enqueueAndWake(
+      this.enqueueAndWake(
         "operation_stalled",
         `${operation} が ${elapsed}ms 以上続き、進捗を再評価`,
         at,
@@ -304,7 +305,7 @@ export class PlayerRuntime {
         status: "observed",
         operationKind: "bot_death",
       });
-      this.#enqueueAndWake(
+      this.enqueueAndWake(
         "bot_death",
         "Bot自身の死亡を観測し、復帰後の目的を再評価",
         at,
@@ -316,7 +317,7 @@ export class PlayerRuntime {
       this.#bodyNeedsRecovery = false;
       void this.#sampleSemanticState();
       this.#startSampler();
-      this.#enqueueAndWake("reconnected", "Minecraftへの再接続を観測", at);
+      this.enqueueAndWake("reconnected", "Minecraftへの再接続を観測", at);
       return;
     }
     if (type === "operation_recovery_required") {
@@ -479,24 +480,25 @@ export class PlayerRuntime {
     expectedOutcome: string,
   ): Promise<void> {
     let result: PlayerOperationResult | undefined;
-    let outcome: McSkillOutcomeStatus = "unverified";
-    let summary = "操作結果を観測できず、未検証として扱う";
     try {
       result = await this.options.body.execute(
         operation,
         run.controller.signal,
       );
-      outcome = result.status;
-      summary = groundedOperationSummary(result);
-      if (result.recoveryRequired)
-        this.#requestBodyRecovery(result.operationId, operation.kind);
     } catch (error) {
-      outcome = run.controller.signal.aborted ? "interrupted" : "unverified";
-      summary = run.controller.signal.aborted
-        ? "操作を中断し、実行終了を確認"
-        : "操作toolが結果を返さず、ゲーム内結果は未検証";
       this.#logFailure("PLAYER_BODY_OPERATION_FAILED", error);
     }
+    if (result?.recoveryRequired)
+      this.#requestBodyRecovery(result.operationId, operation.kind);
+    const outcome: McSkillOutcomeStatus =
+      result?.status ??
+      (run.controller.signal.aborted ? "interrupted" : "unverified");
+    const summary =
+      result === undefined
+        ? run.controller.signal.aborted
+          ? "操作を中断し、実行終了を確認"
+          : "操作toolが結果を返さず、ゲーム内結果は未検証"
+        : groundedOperationSummary(result);
     const observedAt = result?.completedAt ?? new Date().toISOString();
     if (result?.after != null)
       this.options.mind.recordObservation(toObservationEvidence(result.after));
@@ -602,8 +604,7 @@ export class PlayerRuntime {
     if (this.#recoveryRequestedOperationIds.has(operationId)) return;
     this.#recoveryRequestedOperationIds.add(operationId);
     if (this.#recoveryRequestedOperationIds.size > 16) {
-      const oldest = this.#recoveryRequestedOperationIds.values().next()
-        .value as string | undefined;
+      const oldest = this.#recoveryRequestedOperationIds.values().next().value;
       if (oldest !== undefined)
         this.#recoveryRequestedOperationIds.delete(oldest);
     }
@@ -667,7 +668,7 @@ export class PlayerRuntime {
               : meaningful.includes("time")
                 ? 60_000
                 : 12_000;
-            this.#enqueueAndWake(
+            this.enqueueAndWake(
               "state_changed",
               `観測上の意味のある変化: ${meaningful.join(", ")}`,
               observation.observedAt,
@@ -701,7 +702,7 @@ export class PlayerRuntime {
     this.#sampleTimer = setInterval(() => {
       void this.#sampleSemanticState();
     }, 15_000);
-    this.#sampleTimer.unref?.();
+    this.#sampleTimer.unref();
   }
 
   #stopSampler(): void {
@@ -725,7 +726,7 @@ export class PlayerRuntime {
         );
       if (event !== undefined) this.#requestThought(event.kind, event.summary);
     }, delayMs);
-    this.#vitalsWakeTimer.unref?.();
+    this.#vitalsWakeTimer.unref();
   }
 
   #retryThought(): void {
@@ -745,7 +746,7 @@ export class PlayerRuntime {
       );
       this.#requestThought(event.kind, event.summary);
     }, delay);
-    this.#retryTimer.unref?.();
+    this.#retryTimer.unref();
   }
 
   #scheduleDeadline(wakeAt: string | undefined): void {
@@ -770,7 +771,7 @@ export class PlayerRuntime {
       );
       this.#requestThought(event.kind, event.summary);
     }, delay);
-    this.#deadlineTimer.unref?.();
+    this.#deadlineTimer.unref();
   }
 
   async #traceCall<T>(label: string, operation: () => Promise<T>): Promise<T> {
@@ -863,19 +864,22 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
   const beforeAvailable = result.before !== null;
   const afterAvailable = result.after !== null;
   const detail =
-    typeof result.detail === "string"
-      ? result.detail
-          .replace(/[\u0000-\u001f\u007f]/gu, " ")
-          .replace(/\s+/gu, " ")
-          .trim()
-          .slice(0, 180)
-      : "";
-  const observedEffect = (
-    result as PlayerOperationResult & {
-      readonly observedEffect?: { readonly type?: string };
-    }
-  ).observedEffect?.type;
+    result.detail === undefined ? "" : sanitizeDetail(result.detail);
+  const observedEffect = result.observedEffect?.type;
   return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}次の判断では結果の実観測を再確認する。`;
+}
+
+function sanitizeDetail(value: string): string {
+  let sanitized = "";
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    sanitized +=
+      codePoint !== undefined && (codePoint < 32 || codePoint === 127)
+        ? " "
+        : character;
+    if (sanitized.length >= 180) break;
+  }
+  return sanitized.replace(/\s+/gu, " ").trim().slice(0, 180);
 }
 
 function semanticSignatures(

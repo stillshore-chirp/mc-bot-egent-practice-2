@@ -6,18 +6,15 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
-import {
+import type {
   McSkillRepository,
-  type CreateMcSkillInput,
-  type McSkillCategory,
-  type McSkillOutcomeStatus,
+  CreateMcSkillInput,
 } from "../mc-skills/index.js";
 import { playerOperationSchema } from "../minecraft/player-body-schema.js";
 import type {
   PlayerBody,
   PlayerBodyObservation,
 } from "../minecraft/player-body.js";
-import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
 import type { TraceService } from "../trace/service.js";
 import type {
   PlayerGoalChange,
@@ -28,7 +25,7 @@ import type {
   PlayerThoughtDecision,
   PlayerWakeKind,
 } from "./contracts.js";
-import { PlayerMindStore } from "./mind-store.js";
+import type { PlayerMindStore } from "./mind-store.js";
 import {
   createPlayerTool,
   runPlayerAgent,
@@ -36,11 +33,6 @@ import {
   type PlayerResponsesClient,
 } from "./responses.js";
 
-const conversationToolText = z
-  .object({
-    text: z.string().trim().min(1).max(240),
-  })
-  .strict();
 const proposalInput = z
   .object({
     title: z.string().trim().min(1).max(240),
@@ -218,6 +210,18 @@ const goalStateInput = z
   })
   .strict();
 
+const playerWakeKinds = [
+  "startup",
+  "owner_proposal",
+  "body_outcome",
+  "state_changed",
+  "operation_stalled",
+  "bot_death",
+  "reconnected",
+  "deadline",
+  "manual",
+] as const satisfies readonly PlayerWakeKind[];
+
 const actionDecisionInput = z
   .object({
     kind: z.enum(["act", "wait", "continue", "complete"]),
@@ -227,21 +231,7 @@ const actionDecisionInput = z
     skillId: z.string().max(80),
     skillVersion: z.number().int().nonnegative(),
     reason: z.string().max(400),
-    wakeOn: z
-      .array(
-        z.enum([
-          "startup",
-          "owner_proposal",
-          "body_outcome",
-          "state_changed",
-          "operation_stalled",
-          "bot_death",
-          "reconnected",
-          "deadline",
-          "manual",
-        ]),
-      )
-      .max(9),
+    wakeOn: z.array(z.enum(playerWakeKinds)).max(playerWakeKinds.length),
     wakeAt: z.string().max(40),
   })
   .strict();
@@ -254,7 +244,16 @@ const locateOwnerInput = z
   })
   .strict();
 const knowledgeInput = z
-  .object({ query: z.string().trim().min(1).max(180) })
+  .object({
+    query: z
+      .string()
+      .trim()
+      .min(1)
+      .max(180)
+      .describe(
+        "English Minecraft registry ID or keyword, such as oak_planks, crafting_table, zombie, or sharpness.",
+      ),
+  })
   .strict();
 const skillSearchInput = z
   .object({ query: z.string().max(180), limit: z.number().int().min(1).max(8) })
@@ -369,7 +368,7 @@ export class PlayerPurposeAgent {
       createPlayerTool({
         name: "ask_body_knowledge",
         description:
-          "ゲーム内のレシピ、操作方法、可視範囲などを絞って問い合わせる。",
+          "英語のMinecraft registry ID/keywordでitem、block、entity、enchantmentの事実と関連recipeを照会する。例: oak_planks, crafting_table, zombie, sharpness。日本語だけのqueryや可視範囲・操作方法の質問には使わない。可視範囲はobserve_bodyで確認する。",
         schema: knowledgeInput,
         execute: async ({ query }) => this.options.body.knowledge(query),
       }),
@@ -628,7 +627,7 @@ export class PlayerPurposeAgent {
               expectedOutcome: value.expectedOutcome,
               ...(skillId === undefined ? {} : { skillId }),
               ...(skillVersion === undefined ? {} : { skillVersion }),
-              wakeOn: value.wakeOn as PlayerWakeKind[],
+              wakeOn: value.wakeOn,
             };
           } else if (value.kind === "wait") {
             if (value.wakeOn.length === 0)
@@ -637,7 +636,7 @@ export class PlayerPurposeAgent {
               kind: "wait",
               purpose: value.purpose,
               reason: value.reason,
-              wakeOn: value.wakeOn as PlayerWakeKind[],
+              wakeOn: value.wakeOn,
               ...(value.wakeAt.trim().length === 0
                 ? {}
                 : { wakeAt: value.wakeAt }),
@@ -649,7 +648,7 @@ export class PlayerPurposeAgent {
               kind: "complete",
               purpose: value.purpose,
               reason: value.reason,
-              wakeOn: value.wakeOn as PlayerWakeKind[],
+              wakeOn: value.wakeOn,
             };
           } else {
             decision = { kind: "continue", reason: value.reason };
@@ -793,7 +792,7 @@ export class PlayerPurposeAgent {
         return { ok: false, code: "SIMILAR_SKILL_EXISTS" };
       }
       const definition: CreateMcSkillInput = {
-        category: input.category as McSkillCategory,
+        category: input.category,
         title: input.title,
         purpose: input.purpose,
         conditions: input.conditions,
@@ -866,7 +865,7 @@ export class PlayerPurposeAgent {
       runId: evidence.runId,
       skillId: record.id,
       version: record.version,
-      changeKind: input.mode === "create" ? "create" : input.changeKind,
+      changeKind: input.changeKind,
       observedOutcome: evidence.observedOutcome,
       summary: input.changeNote,
     });

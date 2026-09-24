@@ -6,7 +6,6 @@ import { z } from "zod";
 import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
 import type {
-  ActivePlayerOperation,
   OwnerProposal,
   PlayerGoal,
   PlayerGoalChange,
@@ -16,7 +15,6 @@ import type {
   PlayerRuntimeSnapshot,
   PlayerStateNote,
   PlayerThoughtDecision,
-  PlayerWaitState,
   PlayerWakeKind,
 } from "./contracts.js";
 
@@ -40,7 +38,7 @@ const goalSchema = z
     priority: z.number().int().min(1).max(5),
     changeReason: z.string().min(1).max(400),
     source: z.enum(["owner", "persona", "self"]),
-    updatedAt: z.string().datetime(),
+    updatedAt: z.iso.datetime(),
   })
   .strict();
 
@@ -49,7 +47,7 @@ const proposalSchema = z
     id: z.string().min(1).max(80),
     title: z.string().min(1).max(240),
     reason: z.string().min(1).max(400),
-    createdAt: z.string().datetime(),
+    createdAt: z.iso.datetime(),
     priorityPreference: z.number().int().min(1).max(5),
     status: z.enum(["pending", "adopted", "compromised", "declined"]),
     resolution: z.string().max(400).optional(),
@@ -59,7 +57,7 @@ const proposalSchema = z
 const judgmentSchema = z
   .object({
     revision: z.number().int().nonnegative(),
-    decidedAt: z.string().datetime(),
+    decidedAt: z.iso.datetime(),
     kind: z.enum(["act", "wait", "continue", "complete"]),
     summary: z.string().min(1).max(500),
     operationKind: z.enum(playerOperationNames).optional(),
@@ -86,7 +84,7 @@ const learningSchema = z
       "unverified",
     ]),
     summary: z.string().min(1).max(500),
-    updatedAt: z.string().datetime(),
+    updatedAt: z.iso.datetime(),
   })
   .strict();
 
@@ -103,7 +101,7 @@ const outcomeHistorySchema = z
       "unverified",
     ]),
     summary: z.string().min(1).max(700),
-    observedAt: z.string().datetime(),
+    observedAt: z.iso.datetime(),
     skillId: z.string().min(1).max(80).optional(),
     skillVersion: z.number().int().positive().optional(),
   })
@@ -115,7 +113,7 @@ const skillActivitySchema = z
     skillId: z.string().min(1).max(80),
     version: z.number().int().positive(),
     summary: z.string().min(1).max(300),
-    at: z.string().datetime(),
+    at: z.iso.datetime(),
     filePath: z.string().min(1).max(1_024).optional(),
   })
   .strict();
@@ -126,29 +124,29 @@ const stateNoteSchema = z
     kind: z.enum(["fact", "uncertainty"]),
     summary: z.string().min(1).max(400),
     source: z.enum(["owner", "observed", "inferred"]),
-    updatedAt: z.string().datetime(),
+    updatedAt: z.iso.datetime(),
   })
   .strict();
 
 const positionSchema = z
   .object({
-    x: z.number().finite(),
-    y: z.number().finite(),
-    z: z.number().finite(),
+    x: z.number(),
+    y: z.number(),
+    z: z.number(),
     dimension: z.string().min(1).max(80),
   })
   .strict();
 
 const observationSchema = z
   .object({
-    observedAt: z.string().datetime(),
+    observedAt: z.iso.datetime(),
     dimension: z.string().min(1).max(80),
     day: z.number().int().nonnegative().nullable(),
     timeOfDay: z.number().int().min(0).max(24_000).nullable(),
     isDay: z.boolean().nullable(),
-    health: z.number().finite().nullable(),
-    food: z.number().finite().nullable(),
-    oxygen: z.number().finite().nullable(),
+    health: z.number().nullable(),
+    food: z.number().nullable(),
+    oxygen: z.number().nullable(),
     inWater: z.boolean().nullable(),
     inLava: z.boolean().nullable(),
     onFire: z.boolean().nullable(),
@@ -161,7 +159,7 @@ const observationSchema = z
           .object({
             name: z.string().min(1).max(80),
             position: positionSchema,
-            distance: z.number().finite().nonnegative(),
+            distance: z.number().nonnegative(),
           })
           .strict(),
       )
@@ -193,7 +191,7 @@ const stateSchema = z
         operationId: z.string().min(1).max(80),
         kind: z.enum(playerOperationNames),
         actionRevision: z.number().int().nonnegative(),
-        startedAt: z.string().datetime(),
+        startedAt: z.iso.datetime(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
       })
@@ -203,7 +201,7 @@ const stateSchema = z
       .object({
         reason: z.string().min(1).max(400),
         wakeOn: z.array(z.enum(wakeKinds)).min(1).max(wakeKinds.length),
-        wakeAt: z.string().datetime().optional(),
+        wakeAt: z.iso.datetime().optional(),
       })
       .strict()
       .optional(),
@@ -219,7 +217,7 @@ const stateSchema = z
           "unverified",
         ]),
         summary: z.string().min(1).max(700),
-        observedAt: z.string().datetime(),
+        observedAt: z.iso.datetime(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
       })
@@ -332,7 +330,7 @@ export class PlayerMindStore {
       throw new TypeError("event limit must be from 1 to 64");
     }
     return this.database
-      .prepare<[], EventRow>(
+      .prepare<[number], EventRow>(
         "SELECT id, kind, summary, created_at FROM player_runtime_events WHERE consumed_at IS NULL ORDER BY created_at, rowid LIMIT ?",
       )
       .all(limit)
@@ -767,7 +765,7 @@ export class PlayerMindStore {
     const now = isoDate(input.evidence.observedAt);
     const evidence = {
       operationId: bounded(input.evidence.operationId, 80, "operation id"),
-      kind: bounded(input.evidence.kind, 64, "operation kind"),
+      kind: z.enum(playerOperationNames).parse(input.evidence.kind),
       status: input.evidence.status,
       summary: bounded(input.evidence.summary, 700, "outcome summary"),
       observedAt: now,

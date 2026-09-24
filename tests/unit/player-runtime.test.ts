@@ -6,6 +6,7 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { McSkillRepository } from "../../src/mc-skills/index.js";
 import type {
   PlayerBody,
   PlayerBodyEvent,
@@ -14,11 +15,15 @@ import type {
   PlayerOperation,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
+import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
+import type {
+  PlayerMemoryPort,
+  PlayerThoughtDecision,
+} from "../../src/player/contracts.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   PlayerRuntime,
   type PlayerConversationPort,
-  type PlayerMemoryPort,
   type PlayerPurposePort,
 } from "../../src/player/runtime.js";
 import { createPlayerTool } from "../../src/player/responses.js";
@@ -34,11 +39,13 @@ afterEach(() => {
 describe("integrated player runtime", () => {
   it("keeps conversation independent and settles a body action before replacing it", async () => {
     const directory = temporaryDirectory();
-    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
     const body = new DeferredBody();
     const memory = createMemoryPort();
     const actions = [action("action-one"), action("action-two")];
-    let runtime: PlayerRuntime | undefined;
+    const runtimeRef: { current?: PlayerRuntime } = {};
     let thoughtCount = 0;
     let conversationCount = 0;
     const conversation: PlayerConversationPort = {
@@ -57,25 +64,26 @@ describe("integrated player runtime", () => {
           decision,
         });
         if (saved.accepted)
-          runtime?.handleCommittedDecision(saved.snapshot, decision);
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
         return {
           accepted: saved.accepted,
           ...(saved.accepted ? { decision } : {}),
         };
       },
     };
-    runtime = new PlayerRuntime({
+    const runtime = new PlayerRuntime({
       ownerUsername: "owner",
       playerId: "owner-player",
       body,
       mind,
       memory,
-      skills: {} as never,
+      skills,
       conversation,
       purpose,
       logger: pino({ level: "silent" }),
       say: async () => undefined,
     });
+    runtimeRef.current = runtime;
 
     try {
       await runtime.start();
@@ -117,6 +125,7 @@ describe("integrated player runtime", () => {
       expect(body.maxConcurrent).toBe(1);
     } finally {
       await runtime.shutdown();
+      skills.close();
       mind.close();
     }
   });
@@ -135,6 +144,7 @@ describe("integrated player runtime", () => {
     firstMind.close();
 
     const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
     const body = new DeferredBody();
     let thoughtCount = 0;
     const runtime = new PlayerRuntime({
@@ -143,7 +153,7 @@ describe("integrated player runtime", () => {
       body,
       mind,
       memory: createMemoryPort(),
-      skills: {} as never,
+      skills,
       conversation: {
         nextTurn: () => 1,
         handleOwnerMessage: async () => undefined,
@@ -165,6 +175,93 @@ describe("integrated player runtime", () => {
       expect(mind.resume(stopped.stopGeneration - 1)).toBeUndefined();
     } finally {
       await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("deduplicates recovery events and results and keeps stop latched after reconnect", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    body.requireRecoveryOnNextResult();
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let thoughtCount = 0;
+    const reconnectRequests: string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot }) => {
+          thoughtCount += 1;
+          if (thoughtCount === 1) {
+            const decision = action("recovery-action");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            return { accepted: saved.accepted, decision };
+          }
+          return { accepted: false };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+      requestReconnect: (reason) => {
+        reconnectRequests.push(reason);
+      },
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(
+        () =>
+          body.results.length === 1 &&
+          runtime.snapshot.activeOperation === undefined &&
+          runtime.snapshot.wait?.wakeOn.includes("reconnected") === true,
+      );
+      expect(reconnectRequests).toEqual(["player-operation-recovery"]);
+      expect(body.results[0]?.recoveryRequired).toBe(true);
+      expect(body.results[0]?.operationId).toBe("body-1");
+
+      const stopped = mind.stop();
+      if (stopped === undefined)
+        throw new Error("stop latch was not persisted");
+      await runtime.stopNow();
+      const thoughtCountAtStop = thoughtCount;
+      body.emit({ type: "reconnected", at: new Date().toISOString() });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(thoughtCount).toBe(thoughtCountAtStop);
+      expect(runtime.snapshot.stopped).toBe(true);
+      expect(reconnectRequests).toHaveLength(1);
+
+      await runtime.shutdown();
+      mind.close();
+      const restarted = PlayerMindStore.open(databasePath);
+      try {
+        expect(restarted.snapshot().stopped).toBe(true);
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      await runtime.shutdown();
+      skills.close();
       mind.close();
     }
   });
@@ -248,8 +345,13 @@ class DeferredBody implements PlayerBody {
   readonly results: PlayerOperationResult[] = [];
   #listeners = new Set<(event: PlayerBodyEvent) => void>();
   #active = 0;
+  #recoveryOnNextResult = false;
   maxConcurrent = 0;
   stopCalls = 0;
+
+  public requireRecoveryOnNextResult(): void {
+    this.#recoveryOnNextResult = true;
+  }
 
   public async observe(): Promise<PlayerBodyObservation> {
     return observation();
@@ -264,6 +366,8 @@ class DeferredBody implements PlayerBody {
     this.maxConcurrent = Math.max(this.maxConcurrent, this.#active);
     const operationId = `body-${this.started.length}`;
     const startedAt = new Date().toISOString();
+    const recoveryRequired = this.#recoveryOnNextResult;
+    this.#recoveryOnNextResult = false;
     this.emit({
       type: "operation_started",
       at: startedAt,
@@ -285,7 +389,7 @@ class DeferredBody implements PlayerBody {
           completedAt: new Date().toISOString(),
           before: null,
           after: null,
-          recoveryRequired: false,
+          recoveryRequired,
         };
         this.results.push(result);
         resolve(result);
@@ -295,6 +399,17 @@ class DeferredBody implements PlayerBody {
       };
       if (signal?.aborted) onAbort();
       else signal?.addEventListener("abort", onAbort, { once: true });
+      if (recoveryRequired) {
+        this.emit({
+          type: "operation_recovery_required",
+          at: startedAt,
+          operationId,
+          operation: operation.kind,
+          detail: "The native action remains unresolved until reconnection.",
+        });
+        this.emit({ type: "reconnected", at: new Date().toISOString() });
+        setTimeout(() => finish("interrupted"), 15);
+      }
     });
   }
 
@@ -302,7 +417,16 @@ class DeferredBody implements PlayerBody {
     this.stopCalls += 1;
   }
   public knowledge(query: string): PlayerKnowledge {
-    return { query, results: [] } as unknown as PlayerKnowledge;
+    return {
+      source: "minecraft_registry",
+      gameVersion: "test",
+      registryVersion: "test",
+      observedAt: new Date().toISOString(),
+      query,
+      facts: [],
+      inferences: [],
+      truncated: false,
+    };
   }
 
   public onEvent(listener: (event: PlayerBodyEvent) => void): () => void {
@@ -317,14 +441,11 @@ class DeferredBody implements PlayerBody {
 
 function action(
   operationId: string,
-): Extract<
-  import("../../src/player/contracts.js").PlayerThoughtDecision,
-  { kind: "act" }
-> {
+): Extract<PlayerThoughtDecision, { kind: "act" }> {
   return {
     kind: "act",
     purpose: "test purpose",
-    operation: { kind: "look" } as PlayerOperation,
+    operation: { kind: "look", target: { x: 0, y: 64, z: 1 } },
     operationId,
     expectedOutcome: "observe a changed view",
     wakeOn: ["body_outcome"],
@@ -334,17 +455,20 @@ function action(
 function observation(): PlayerBodyObservation {
   return {
     observedAt: new Date().toISOString(),
+    source: "minecraft",
+    gameVersion: "test",
     dimension: "overworld",
     time: { day: 1, timeOfDay: 5_000, isDay: true, raining: false },
     self: {
       username: "bot",
       position: { x: 0, y: 64, z: 0, dimension: "overworld" },
+      eyeHeight: 1.62,
       yaw: 0,
       pitch: 0,
       velocity: { x: 0, y: 0, z: 0 },
       health: 20,
       food: 20,
-      saturation: 5,
+      foodSaturation: 5,
       oxygen: 20,
       inWater: false,
       inLava: false,
@@ -353,18 +477,27 @@ function observation(): PlayerBodyObservation {
       sleeping: false,
       mountedEntityId: null,
       gameMode: "survival",
+      experience: { level: 0, points: 0, progress: 0 },
       inventory: [],
       equipment: {},
     },
     perception: {
-      fov: { horizontalDegrees: 110, verticalDegrees: 80 },
-      range: 16,
+      horizontalFieldOfViewDegrees: 110,
+      verticalFieldOfViewDegrees: 80,
+      maxDistance: 16,
+      coverage: "visible_subset",
+      blockCountLimit: 96,
+      entityCountLimit: 48,
+      blockCandidateLimit: 192,
+      entityCandidateLimit: 128,
+      omittedBlockCandidates: 0,
+      omittedEntityCandidates: 0,
+      candidateSearchMayBeTruncated: false,
       blocks: [],
       entities: [],
-      candidateSearchMayBeTruncated: false,
     },
     window: null,
-  } as unknown as PlayerBodyObservation;
+  };
 }
 
 function createMemoryPort(): PlayerMemoryPort {
@@ -380,6 +513,17 @@ function createMemoryPort(): PlayerMemoryPort {
     persistGoals: () => undefined,
     recordEpisode: () => undefined,
   };
+}
+
+function openSkills(
+  databasePath: string,
+  directory: string,
+): McSkillRepository {
+  return McSkillRepository.open({
+    databasePath,
+    exchangeDirectory: join(directory, "skills"),
+    allowedOperationNames: playerOperationNames,
+  });
 }
 
 function temporaryDirectory(): string {
@@ -405,11 +549,12 @@ function assertStrictObjectNodes(node: unknown): void {
   if (node === null || typeof node !== "object") return;
   const value = node as Record<string, unknown>;
   if (value.type === "object") {
-    const properties = value.properties as Record<string, unknown> | undefined;
+    const properties = z
+      .record(z.string(), z.unknown())
+      .parse(value.properties);
+    const required = z.array(z.string()).parse(value.required);
     expect(value.additionalProperties).toBe(false);
-    expect([...((value.required as string[]) ?? [])].sort()).toEqual(
-      Object.keys(properties ?? {}).sort(),
-    );
+    expect([...required].sort()).toEqual(Object.keys(properties).sort());
   }
   for (const nested of Object.values(value)) assertStrictObjectNodes(nested);
 }

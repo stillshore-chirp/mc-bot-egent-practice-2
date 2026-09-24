@@ -1,4 +1,4 @@
-import OpenAI from "openai";
+import type OpenAI from "openai";
 import type {
   FunctionTool,
   Response,
@@ -45,7 +45,7 @@ export function createPlayerTool<I extends z.ZodType>(input: {
   readonly name: string;
   readonly description: string;
   readonly schema: I;
-  readonly execute: (value: z.output<I>) => Promise<unknown> | unknown;
+  readonly execute: (value: z.output<I>) => unknown;
 }): PlayerAgentTool {
   const parameters = toStrictOpenAISchema(
     z.toJSONSchema(input.schema, { target: "draft-7" }),
@@ -188,6 +188,7 @@ export async function runPlayerAgent(
       latencyMs: elapsed,
       toolCalls: 0,
     });
+    const responseStatus = response.status ?? "unknown";
     input.logger.info(
       {
         category: "llm",
@@ -195,14 +196,14 @@ export async function runPlayerAgent(
         model: input.model,
         latencyMs: elapsed,
         round,
-        outcome: response.status,
+        outcome: responseStatus,
         inputTokens: safeCount(response.usage?.input_tokens),
         outputTokens: safeCount(response.usage?.output_tokens),
       },
       "player agent response completed",
     );
     if (response.status !== "completed") {
-      throw new Error(`PLAYER_AGENT_${response.status.toUpperCase()}`);
+      throw new Error(`PLAYER_AGENT_${responseStatus.toUpperCase()}`);
     }
 
     messages.push(...(response.output as ResponseInputItem[]));
@@ -262,13 +263,13 @@ function safeErrorCode(error: unknown): string {
 function boundedJson(value: unknown): string {
   let serialized: string;
   try {
-    serialized = JSON.stringify(value, (_key, nested: unknown) =>
+    const output = JSON.stringify(value, (_key, nested: unknown) =>
       typeof nested === "bigint" ? nested.toString() : nested,
     );
+    serialized = typeof output === "string" ? output : "null";
   } catch {
     return JSON.stringify({ ok: false, code: "OUTPUT_NOT_SERIALIZABLE" });
   }
-  if (serialized === undefined) return "null";
   if (serialized.length <= 24_000) return serialized;
   return JSON.stringify({
     ok: false,
