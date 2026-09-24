@@ -249,6 +249,27 @@ describe("player body", () => {
         tradeIndex: "first",
       }),
     ).toThrow();
+    expect(() =>
+      playerOperationSchema.parse({
+        kind: "use",
+        target: { kind: "item", holdTicks: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      playerOperationSchema.parse({
+        kind: "use",
+        target: { kind: "item", holdTicks: 201 },
+      }),
+    ).toThrow();
+    expect(
+      playerOperationSchema.parse({
+        kind: "use",
+        target: { kind: "item", holdTicks: 200 },
+      }),
+    ).toMatchObject({
+      kind: "use",
+      target: { kind: "item", holdTicks: 200 },
+    });
   });
 
   it("waits for Mineflayer plugin injection and retains lifecycle events across reconnects", async () => {
@@ -472,6 +493,74 @@ describe("player body", () => {
 
     expect(result.status).toBe("unverified");
     expect(result.observedEffect).toBeUndefined();
+  });
+
+  it("defaults item use to four ticks and keeps unobserved effects unverified", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      fake.bot.inventory.slots[36] = { name: "snowball", count: 1 } as never;
+      let markActivated!: () => void;
+      const activated = new Promise<void>((resolve) => {
+        markActivated = resolve;
+      });
+      vi.mocked(fake.bot.activateItem).mockImplementationOnce(() => {
+        markActivated();
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const operation = playerOperationSchema.parse({
+        kind: "use",
+        target: { kind: "item" },
+      });
+      if (operation.kind !== "use" || operation.target.kind !== "item")
+        throw new Error("Expected a parsed item-use operation");
+      expect(operation.target.holdTicks).toBe(4);
+
+      const resultPromise = body.execute(operation);
+      await activated;
+      await vi.advanceTimersByTimeAsync(199);
+      expect(fake.bot.deactivateItem).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await resultPromise;
+      expect(fake.bot.activateItem).toHaveBeenCalledWith(false);
+      expect(fake.bot.deactivateItem).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe("unverified");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds item use beyond the default and releases it immediately on cancellation", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      fake.bot.inventory.slots[36] = { name: "snowball", count: 1 } as never;
+      let markActivated!: () => void;
+      const activated = new Promise<void>((resolve) => {
+        markActivated = resolve;
+      });
+      vi.mocked(fake.bot.activateItem).mockImplementationOnce(() => {
+        markActivated();
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const controller = new AbortController();
+      const operation = playerOperationSchema.parse({
+        kind: "use",
+        target: { kind: "item", holdTicks: 40 },
+      });
+      const resultPromise = body.execute(operation, controller.signal);
+      await activated;
+      await vi.advanceTimersByTimeAsync(200);
+      expect(fake.bot.deactivateItem).not.toHaveBeenCalled();
+
+      controller.abort(new Error("test stop"));
+      const result = await resultPromise;
+      expect(result.status).toBe("interrupted");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.deactivateItem).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("quarantines an unsettled native action and admits a replacement only after it settles", async () => {

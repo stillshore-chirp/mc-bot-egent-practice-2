@@ -294,6 +294,10 @@ function timeoutFor(operation: PlayerOperation): number {
     case "control":
     case "move_vehicle":
       return Math.min(10_000, operation.ticks * 50 + 3_000);
+    case "use":
+      return operation.target.kind === "item"
+        ? operation.target.holdTicks * 50 + 3_000
+        : 15_000;
     case "elytra_fly":
       return 45_000;
     case "dig":
@@ -1423,7 +1427,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           if (item !== null && item !== undefined)
             active.effectItemName = item.name;
           bot.activateItem(operation.target.offHand);
-          await waitTicks(4, signal);
+          await waitTicks(operation.target.holdTicks, signal);
           return;
         }
         if (operation.target.kind === "block") {

@@ -76,7 +76,7 @@ export const playerOperationDescriptions = {
   control:
     "Hold the selected movement, jump, sprint, or sneak controls for bounded ticks.",
   equip: "Equip an inventory item into a player equipment slot.",
-  use: "Use the held item or interact with a currently visible block or entity.",
+  use: "Use a held item for 1-200 ticks (default 4), or interact with a currently visible block or entity.",
   attack: "Attack a currently visible entity within normal player reach.",
   dig: "Mine a currently visible block within normal player reach.",
   place: "Place an inventory item against a visible supporting block face.",
@@ -142,6 +142,7 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
           .object({
             kind: z.literal("item"),
             offHand: z.boolean().default(false),
+            holdTicks: z.number().int().min(1).max(200).default(4),
           })
           .strict(),
         blockTargetSchema,
