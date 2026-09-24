@@ -35,6 +35,10 @@ function makeBlock(name: string, stateId: number, position: Vec3): FakeBlock {
   };
 }
 
+function pathUpdateListenerCount(bot: Bot): number {
+  return (bot as unknown as EventEmitter).listenerCount("path_update");
+}
+
 function makeWindow(id = 3): Window & EventEmitter {
   const window = new EventEmitter() as Window & EventEmitter;
   Object.assign(window, {
@@ -520,6 +524,126 @@ describe("player body", () => {
     }
   });
 
+  it("fails move_to when an empty noPath update is followed by goto resolution", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.emit("path_update", {
+        status: "noPath",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+    });
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toBe("Error: No path to the goal!");
+    expect(events.at(-1)).toMatchObject({
+      type: "operation_failed",
+      operation: "move_to",
+      operationId: result.operationId,
+    });
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("lets a later path update supersede stale noPath and keeps an unreached move unverified", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.emit("path_update", {
+        status: "noPath",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+      fake.bot.emit("path_update", {
+        status: "success",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+    });
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("unverified");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("keeps a normally resolved but unobserved move_to unverified", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("unverified");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("keeps observed move_to arrival successful after a noPath update", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.emit("path_update", {
+        status: "noPath",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+      fake.bot.entity.position.x = 5;
+    });
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("successful");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("removes the move_to path listener when goto rejects", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(
+      new Error("NoPath: No path to the goal!"),
+    );
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
   it("waits briefly after native dig completion for a delayed target server update", async () => {
     vi.useFakeTimers();
     try {
@@ -859,6 +983,7 @@ describe("player body", () => {
       );
       await started;
       controller.abort(new Error("test stop"));
+      expect(pathUpdateListenerCount(fake.bot)).toBe(0);
       await vi.advanceTimersByTimeAsync(2_000);
       const interrupted = await operation;
       expect(interrupted.status).toBe("interrupted");
@@ -870,6 +995,7 @@ describe("player body", () => {
       resolveNative();
       await Promise.resolve();
       await Promise.resolve();
+      expect(pathUpdateListenerCount(fake.bot)).toBe(0);
       const replacement = await body.execute({
         kind: "look",
         target: { x: 0, y: 65, z: -2 },

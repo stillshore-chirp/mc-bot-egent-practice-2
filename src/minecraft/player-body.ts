@@ -1471,7 +1471,31 @@ export class MineflayerPlayerBody implements PlayerBody {
           operation.position.z,
           operation.range,
         );
-        await bot.pathfinder.goto(goal);
+        let latestPathUpdateStatus: string | undefined;
+        let observingPathUpdates = true;
+        const capturePathUpdate = (results: { readonly status: string }) => {
+          latestPathUpdateStatus = results.status;
+        };
+        const stopObservingPathUpdates = () => {
+          if (!observingPathUpdates) return;
+          observingPathUpdates = false;
+          bot.removeListener("path_update", capturePathUpdate);
+          signal.removeEventListener("abort", stopObservingPathUpdates);
+        };
+        bot.on("path_update", capturePathUpdate);
+        if (signal.aborted) stopObservingPathUpdates();
+        else
+          signal.addEventListener("abort", stopObservingPathUpdates, {
+            once: true,
+          });
+        try {
+          if (signal.aborted) return;
+          await bot.pathfinder.goto(goal);
+          if (latestPathUpdateStatus === "noPath")
+            throw new Error("No path to the goal!");
+        } finally {
+          stopObservingPathUpdates();
+        }
         return;
       }
       case "look":
