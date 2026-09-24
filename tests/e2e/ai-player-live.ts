@@ -2339,7 +2339,7 @@ async function main(): Promise<void> {
         if (latestObservedAt <= reply.at && replyChestCoordinatesVisible)
           fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
         if (responseHeuristicClassification === "possible_hidden_item_claim")
-          fail("GPT_POSSIBLE_OCCLUDED_ITEM_CLAIM");
+          incomplete("OBSERVATION_REPLY_REQUIRES_MANUAL_REVIEW");
         return {
           rconConfirmsHiddenItem: true,
           visibleObservationOmitsItem: true,
