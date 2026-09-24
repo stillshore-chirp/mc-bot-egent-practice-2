@@ -57,6 +57,9 @@ const interactRange = 4.5;
 const attackRange = 3.2;
 const stallCheckMs = 5_000;
 const stallAfterMs = 20_000;
+const minimumDigTimeoutMs = 35_000;
+const digServerUpdateGraceMs = 5_000;
+const maximumDigTimeoutMs = 5 * 60_000;
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -285,7 +288,29 @@ function errorDetail(error: unknown): string {
   return String(error).slice(0, 320);
 }
 
-function timeoutFor(operation: PlayerOperation): number {
+function digTimeoutFor(
+  bot: Bot,
+  position: { readonly x: number; readonly y: number; readonly z: number },
+): number {
+  try {
+    const block = bot.blockAt(blockPosition(position));
+    if (block === null) return minimumDigTimeoutMs;
+    const estimateMs = bot.digTime(block);
+    if (!Number.isFinite(estimateMs) || estimateMs < 0)
+      return minimumDigTimeoutMs;
+    return Math.min(
+      maximumDigTimeoutMs,
+      Math.max(
+        minimumDigTimeoutMs,
+        Math.ceil(estimateMs) + digServerUpdateGraceMs,
+      ),
+    );
+  } catch {
+    return minimumDigTimeoutMs;
+  }
+}
+
+function timeoutFor(operation: PlayerOperation, bot: Bot): number {
   switch (operation.kind) {
     case "move_to":
       return 90_000;
@@ -301,6 +326,7 @@ function timeoutFor(operation: PlayerOperation): number {
     case "elytra_fly":
       return 45_000;
     case "dig":
+      return digTimeoutFor(bot, operation.position);
     case "craft":
     case "trade":
     case "enchant":
@@ -1144,7 +1170,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         : captureServerBlockUpdates(bot, blockTarget);
     const attackEvidence = captureAttackEvidence(bot, operation, active);
     let commandError: unknown;
-    const timeoutMs = timeoutFor(operation);
+    const timeoutMs = timeoutFor(operation, bot);
     const timer = setTimeout(() => {
       active.timedOut = true;
       controller.abort(new ActionTimeoutError(timeoutMs));

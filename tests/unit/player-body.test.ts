@@ -9,6 +9,7 @@ import {
   playerOperationDescriptions,
   playerOperationSchema,
   type PlayerBodyEvent,
+  type PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
 
@@ -218,6 +219,63 @@ function makeFakeBot(options: { deferInventory?: boolean } = {}): {
   };
 }
 
+function beginPendingDig(
+  fake: ReturnType<typeof makeFakeBot>,
+  estimateMs: number,
+  signal?: AbortSignal,
+): {
+  started: Promise<void>;
+  result: Promise<PlayerOperationResult>;
+  completeWithServerUpdate(): void;
+} {
+  const target = new Vec3(0, 64, -2);
+  const key = "0,64,-2";
+  fake.blocks.set(key, makeBlock("stone", 1, target));
+  fake.candidates.push(target);
+  Object.assign(fake.bot, { digTime: vi.fn(() => estimateMs) });
+
+  let markStarted!: () => void;
+  let resolveDig!: () => void;
+  let rejectDig!: (error: Error) => void;
+  let actionSettled = false;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const action = new Promise<void>((resolve, reject) => {
+    resolveDig = resolve;
+    rejectDig = reject;
+  });
+  vi.mocked(fake.bot.dig).mockImplementationOnce(() => {
+    markStarted();
+    return action;
+  });
+  vi.mocked(fake.bot.stopDigging).mockImplementation(() => {
+    if (actionSettled) return;
+    actionSettled = true;
+    rejectDig(new Error("Digging stopped"));
+  });
+
+  const body = new MineflayerPlayerBody(() => fake.bot);
+  const result = body.execute(
+    { kind: "dig", position: { x: 0, y: 64, z: -2 } },
+    signal,
+  );
+  return {
+    started,
+    result,
+    completeWithServerUpdate: () => {
+      if (actionSettled) return;
+      fake.blocks.set(key, makeBlock("air", 0, target));
+      (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+        location: { x: 0, y: 64, z: -2 },
+        type: 0,
+      });
+      actionSettled = true;
+      resolveDig();
+    },
+  };
+}
+
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
     expect(playerOperationNames).toHaveLength(28);
@@ -414,6 +472,94 @@ describe("player body", () => {
       position: { x: 0, y: 64, z: -2 },
     });
     expect(serverConfirmed.status).toBe("successful");
+  });
+
+  it("waits past 35 seconds for a slow dig and requires the server block update", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const dig = beginPendingDig(fake, 37_500);
+      await dig.started;
+      let completed = false;
+      void dig.result.then(() => {
+        completed = true;
+      });
+      setTimeout(() => dig.completeWithServerUpdate(), 40_000);
+
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(fake.bot.stopDigging).not.toHaveBeenCalled();
+      expect(completed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await dig.result;
+      expect(result.status).toBe("successful");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([0, 10_000, Number.NaN, Number.POSITIVE_INFINITY, -1])(
+    "keeps a %s ms or invalid dig estimate at the 35-second floor",
+    async (estimateMs) => {
+      vi.useFakeTimers();
+      try {
+        const fake = makeFakeBot();
+        const dig = beginPendingDig(fake, estimateMs);
+        await dig.started;
+
+        await vi.advanceTimersByTimeAsync(34_999);
+        expect(fake.bot.stopDigging).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        const result = await dig.result;
+
+        expect(result.status).toBe("unverified");
+        expect(result.recoveryRequired).toBe(false);
+        expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("caps a dig estimate at five minutes without treating timeout as success", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const dig = beginPendingDig(fake, 600_000);
+      await dig.started;
+
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(fake.bot.stopDigging).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await dig.result;
+
+      expect(result.status).toBe("unverified");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases a pending dig immediately on abort and keeps it interrupted", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const controller = new AbortController();
+      const dig = beginPendingDig(fake, 37_500, controller.signal);
+      await dig.started;
+
+      controller.abort(new Error("test stop"));
+      const result = await dig.result;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses source-attributed server hit events and distinguishes a hit from target death", async () => {
