@@ -226,6 +226,8 @@ function beginPendingDig(
 ): {
   started: Promise<void>;
   result: Promise<PlayerOperationResult>;
+  resolveNative(): void;
+  sendServerAirUpdate(): void;
   completeWithServerUpdate(): void;
 } {
   const target = new Vec3(0, 64, -2);
@@ -263,15 +265,29 @@ function beginPendingDig(
   return {
     started,
     result,
-    completeWithServerUpdate: () => {
+    resolveNative: () => {
       if (actionSettled) return;
+      fake.blocks.set(key, makeBlock("air", 0, target));
+      actionSettled = true;
+      resolveDig();
+    },
+    sendServerAirUpdate: () => {
       fake.blocks.set(key, makeBlock("air", 0, target));
       (fake.bot._client as unknown as EventEmitter).emit("block_change", {
         location: { x: 0, y: 64, z: -2 },
         type: 0,
       });
-      actionSettled = true;
-      resolveDig();
+    },
+    completeWithServerUpdate: () => {
+      if (!actionSettled) {
+        fake.blocks.set(key, makeBlock("air", 0, target));
+        (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+          location: { x: 0, y: 64, z: -2 },
+          type: 0,
+        });
+        actionSettled = true;
+        resolveDig();
+      }
     },
   };
 }
@@ -444,34 +460,119 @@ describe("player body", () => {
     ).toBe("owner_position_exception");
   });
 
-  it("does not treat a local-only dig mutation as success, but accepts a server block packet", async () => {
-    const fake = makeFakeBot();
-    const target = new Vec3(0, 64, -2);
-    fake.blocks.set("0,64,-2", makeBlock("stone", 1, target));
-    fake.candidates.push(target);
-    const body = new MineflayerPlayerBody(() => fake.bot);
-    vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
-      fake.blocks.set("0,64,-2", makeBlock("air", 0, target));
-    });
-    const localOnly = await body.execute({
-      kind: "dig",
-      position: { x: 0, y: 64, z: -2 },
-    });
-    expect(localOnly.status).toBe("unverified");
-
-    fake.blocks.set("0,64,-2", makeBlock("stone", 1, target));
-    vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
-      fake.blocks.set("0,64,-2", makeBlock("air", 0, target));
-      (fake.bot._client as unknown as EventEmitter).emit("block_change", {
-        location: { x: 0, y: 64, z: -2 },
-        type: 0,
+  it("does not treat local-only dig mutation as success, but accepts a server block packet", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const target = new Vec3(0, 64, -2);
+      fake.blocks.set("0,64,-2", makeBlock("stone", 1, target));
+      fake.candidates.push(target);
+      Object.assign(fake.bot, { digTime: vi.fn(() => 1_000) });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
+        fake.blocks.set("0,64,-2", makeBlock("air", 0, target));
       });
-    });
-    const serverConfirmed = await body.execute({
-      kind: "dig",
-      position: { x: 0, y: 64, z: -2 },
-    });
-    expect(serverConfirmed.status).toBe("successful");
+      const localOnlyPromise = body.execute({
+        kind: "dig",
+        position: { x: 0, y: 64, z: -2 },
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const localOnly = await localOnlyPromise;
+      expect(localOnly.status).toBe("unverified");
+
+      fake.blocks.set("0,64,-2", makeBlock("stone", 1, target));
+      vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
+        fake.blocks.set("0,64,-2", makeBlock("air", 0, target));
+        (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+          location: { x: 0, y: 64, z: -2 },
+          type: 0,
+        });
+      });
+      const serverConfirmed = await body.execute({
+        kind: "dig",
+        position: { x: 0, y: 64, z: -2 },
+      });
+      expect(serverConfirmed.status).toBe("successful");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits briefly after native dig completion for a delayed target server update", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const dig = beginPendingDig(fake, 7_500);
+      await dig.started;
+      let completed = false;
+      void dig.result.then(() => {
+        completed = true;
+      });
+      setTimeout(() => dig.resolveNative(), 7_500);
+      setTimeout(() => dig.sendServerAirUpdate(), 9_500);
+
+      await vi.advanceTimersByTimeAsync(9_499);
+      expect(completed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      const result = await dig.result;
+      expect(result.status).toBe("successful");
+      expect(result.recoveryRequired).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps dig unverified when only an acknowledgement and another block update arrive", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const dig = beginPendingDig(fake, 7_500);
+      await dig.started;
+      setTimeout(() => dig.resolveNative(), 7_500);
+      setTimeout(() => {
+        (fake.bot._client as unknown as EventEmitter).emit(
+          "acknowledge_player_digging",
+          { sequenceId: 1 },
+        );
+      }, 8_000);
+      setTimeout(() => {
+        (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+          location: { x: 10, y: 64, z: 10 },
+          type: 0,
+        });
+      }, 8_500);
+
+      await vi.advanceTimersByTimeAsync(12_500);
+      const result = await dig.result;
+
+      expect(result.status).toBe("unverified");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases the post-dig server update wait immediately on abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const controller = new AbortController();
+      const dig = beginPendingDig(fake, 7_500, controller.signal);
+      await dig.started;
+      dig.resolveNative();
+      await vi.advanceTimersByTimeAsync(100);
+
+      controller.abort(new Error("test stop"));
+      const result = await dig.result;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.recoveryRequired).toBe(false);
+      expect(fake.bot.stopDigging).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits past 35 seconds for a slow dig and requires the server block update", async () => {

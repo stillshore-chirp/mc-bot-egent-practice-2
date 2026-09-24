@@ -881,18 +881,26 @@ function captureServerBlockUpdates(
   target: Vec3,
 ): {
   readonly updates: Map<string, ServerBlockUpdate>;
+  waitForTargetAirUpdate(
+    signal: AbortSignal,
+    timeoutMs: number,
+  ): Promise<boolean>;
   dispose(): void;
 } {
   const updates = new Map<string, ServerBlockUpdate>();
+  const targetAirWaiters = new Set<() => void>();
   const client = bot._client as unknown as PacketClient;
   const accept = (point: Vec3, stateId: number): void => {
     if (blockKey(point) !== blockKey(target) || !Number.isInteger(stateId))
       return;
     const state = bot.registry.blocksByStateId[stateId];
-    updates.set(blockKey(point), {
+    const update = {
       stateId,
       name: state?.name ?? (stateId === 0 ? "air" : "unknown"),
-    });
+    };
+    updates.set(blockKey(point), update);
+    if (["air", "cave_air", "void_air"].includes(update.name))
+      targetAirWaiters.forEach((notify) => notify());
   };
   const single = (raw: unknown): void => {
     if (typeof raw !== "object" || raw === null) return;
@@ -975,11 +983,40 @@ function captureServerBlockUpdates(
   };
   client.on("block_change", single);
   client.on("multi_block_change", multi);
+  const hasTargetAirUpdate = (): boolean => {
+    const update = updates.get(blockKey(target));
+    return (
+      update !== undefined &&
+      ["air", "cave_air", "void_air"].includes(update.name)
+    );
+  };
   return {
     updates,
+    waitForTargetAirUpdate: (signal, timeoutMs) => {
+      if (hasTargetAirUpdate()) return Promise.resolve(true);
+      if (signal.aborted || timeoutMs <= 0) return Promise.resolve(false);
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (confirmed: boolean): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          targetAirWaiters.delete(onTargetAir);
+          resolve(confirmed);
+        };
+        const onTargetAir = (): void => finish(true);
+        const onAbort = (): void => finish(false);
+        targetAirWaiters.add(onTargetAir);
+        signal.addEventListener("abort", onAbort, { once: true });
+        const timer = setTimeout(() => finish(hasTargetAirUpdate()), timeoutMs);
+        if (signal.aborted) finish(false);
+      });
+    },
     dispose: () => {
       client.removeListener("block_change", single);
       client.removeListener("multi_block_change", multi);
+      targetAirWaiters.clear();
     },
   };
 }
@@ -1185,6 +1222,11 @@ export class MineflayerPlayerBody implements PlayerBody {
           () => this.noteActionSettled(active),
         );
         await waitForAction(action, controller.signal);
+        if (operation.kind === "dig" && blockEvidence !== undefined)
+          await blockEvidence.waitForTargetAirUpdate(
+            controller.signal,
+            digServerUpdateGraceMs,
+          );
       }
     } catch (error) {
       commandError = error;
