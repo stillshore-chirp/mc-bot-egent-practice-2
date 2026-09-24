@@ -30,6 +30,7 @@ import { AppError, errorCategories } from "../../src/domain/errors.js";
 import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
+import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -102,6 +103,20 @@ interface SafeCaseResult {
   readonly usageStatus: UsageStatus;
   readonly evidence: Readonly<Record<string, boolean | number | string>>;
   readonly reason?: string;
+}
+
+type PlayerOperationName = (typeof playerOperationNames)[number];
+type PlayerJudgmentKind = "act" | "wait" | "continue" | "complete";
+type PlayerOutcomeStatus =
+  "successful" | "failed" | "interrupted" | "cancelled" | "unverified";
+type SafeEvidence = Readonly<Record<string, boolean | number | string>>;
+
+interface SafeAutonomousProgress {
+  readonly autonomousGoalSeen: boolean;
+  readonly activitySeen: boolean;
+  readonly successfulActionSeen: boolean;
+  readonly worldProgressSeen: boolean;
+  readonly successfulOutcomeCount: number;
 }
 
 type BodyOperationStatus =
@@ -583,6 +598,107 @@ function countersOf(evidence: Evidence): Counters {
   };
 }
 
+function safePlayerDiagnostic(
+  player: PlayerEvidence,
+  counters: Counters,
+): SafeEvidence {
+  const lastJudgment = player.recentJudgments.at(-1);
+  const lastOutcome = player.lastOutcome ?? player.recentOutcomes.at(-1);
+  const activeOperationKind = safeOperationKind(player.activeOperation?.kind);
+  const lastJudgmentKind = safeJudgmentKind(lastJudgment?.kind);
+  const lastJudgmentOperationKind = safeOperationKind(
+    lastJudgment?.operationKind,
+  );
+  const lastOutcomeKind = safeOperationKind(lastOutcome?.kind);
+  const lastOutcomeStatus = safeOutcomeStatus(lastOutcome?.status);
+  return {
+    lastKnownLlmCalls: counters.llmCalls,
+    lastKnownInputTokens: counters.inputTokens,
+    lastKnownOutputTokens: counters.outputTokens,
+    lastKnownLatencyMs: counters.latencyMs,
+    lastKnownThoughts: counters.thoughts,
+    lastKnownLearningUpdates: counters.learningUpdates,
+    lastKnownActionRevision: positiveNumber(player.actionRevision),
+    lastKnownJudgmentCount: player.recentJudgments.length,
+    lastKnownOutcomeCount: player.recentOutcomes.length,
+    lastKnownSuccessfulOutcomeCount: player.recentOutcomes.filter(
+      ({ status }) => status === "successful",
+    ).length,
+    ...(activeOperationKind === undefined
+      ? {}
+      : { lastKnownActiveOperationKind: activeOperationKind }),
+    ...(lastJudgmentKind === undefined
+      ? {}
+      : { lastKnownJudgmentKind: lastJudgmentKind }),
+    ...(lastJudgmentOperationKind === undefined
+      ? {}
+      : { lastKnownJudgmentOperationKind: lastJudgmentOperationKind }),
+    ...(lastOutcomeKind === undefined
+      ? {}
+      : { lastKnownOutcomeKind: lastOutcomeKind }),
+    ...(lastOutcomeStatus === undefined
+      ? {}
+      : { lastKnownOutcomeStatus: lastOutcomeStatus }),
+  };
+}
+
+function safeOperationKind(
+  value: string | undefined,
+): PlayerOperationName | undefined {
+  return value !== undefined &&
+    playerOperationNames.includes(value as PlayerOperationName)
+    ? (value as PlayerOperationName)
+    : undefined;
+}
+
+function safeJudgmentKind(
+  value: string | undefined,
+): PlayerJudgmentKind | undefined {
+  return value === "act" ||
+    value === "wait" ||
+    value === "continue" ||
+    value === "complete"
+    ? value
+    : undefined;
+}
+
+function safeOutcomeStatus(
+  value: string | undefined,
+): PlayerOutcomeStatus | undefined {
+  return value === "successful" ||
+    value === "failed" ||
+    value === "interrupted" ||
+    value === "cancelled" ||
+    value === "unverified"
+    ? value
+    : undefined;
+}
+
+function shouldCollectAfterRun(state: RunState): boolean {
+  return state.abortRequested !== true;
+}
+
+function finalRunCounters(state: RunState): Counters {
+  return state.countersFinal ?? state.countersInitial ?? zeroCounters();
+}
+
+function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
+  const progress =
+    caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
+  return {
+    ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(progress === undefined
+      ? {}
+      : {
+          autonomousGoalSeen: progress.autonomousGoalSeen,
+          autonomousActivitySeen: progress.activitySeen,
+          autonomousSuccessfulActionSeen: progress.successfulActionSeen,
+          autonomousWorldProgressSeen: progress.worldProgressSeen,
+          autonomousSuccessfulOutcomeCount: progress.successfulOutcomeCount,
+        }),
+  };
+}
+
 function subtractCounters(after: Counters, before: Counters): Counters {
   return {
     llmCalls: Math.max(0, after.llmCalls - before.llmCalls),
@@ -837,6 +953,8 @@ interface RunState {
   readonly responses: OwnerResponse[];
   countersInitial?: Counters;
   countersFinal?: Counters;
+  lastKnownPlayerDiagnostic?: SafeEvidence;
+  autonomousLifeProgress?: SafeAutonomousProgress;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -861,6 +979,7 @@ let appForCleanup: CompanionApplication | undefined;
 let serverForCleanup: ChildProcessWithoutNullStreams | undefined;
 let ownerForCleanup: Bot | undefined;
 let guestForCleanup: Bot | undefined;
+let currentRunState: RunState | undefined;
 
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
@@ -871,6 +990,7 @@ async function main(): Promise<void> {
     quiet: true,
   });
   const state = await prepareRun();
+  currentRunState = state;
   const results = state.cases;
   try {
     await startServer(state);
@@ -888,7 +1008,7 @@ async function main(): Promise<void> {
       }
     });
     const operationSmokeResult = await runOperationSmoke(state, rcon);
-    if (state.abortRequested === true)
+    if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
 
     const config = loadConfig({
@@ -955,11 +1075,19 @@ async function main(): Promise<void> {
           incomplete("PRESTART_RUNTIME_SNAPSHOT_MISSING");
         const initialRevision = initial.actionRevision;
         const autonomousProgress = {
+          autonomousGoalSeen: false,
           activitySeen: false,
           successfulActionSeen: false,
         };
         let progressKind: string | undefined;
         let lastWorldCheckAt = 0;
+        state.autonomousLifeProgress = {
+          autonomousGoalSeen: false,
+          activitySeen: false,
+          successfulActionSeen: false,
+          worldProgressSeen: false,
+          successfulOutcomeCount: 0,
+        };
         const result = await observeForPlayer(
           context,
           4 * 60_000,
@@ -967,6 +1095,7 @@ async function main(): Promise<void> {
             const autonomousGoal = player.goals.some(
               (goal) => goal.source === "self",
             );
+            autonomousProgress.autonomousGoalSeen ||= autonomousGoal;
             const hasAction =
               player.actionRevision > initialRevision ||
               isOperationActive(player) ||
@@ -987,6 +1116,15 @@ async function main(): Promise<void> {
               progressKind ??= observedWorldProgress(before, currentWorld);
               lastWorldCheckAt = Date.now();
             }
+            state.autonomousLifeProgress = {
+              autonomousGoalSeen: autonomousProgress.autonomousGoalSeen,
+              activitySeen: autonomousProgress.activitySeen,
+              successfulActionSeen: autonomousProgress.successfulActionSeen,
+              worldProgressSeen: progressKind !== undefined,
+              successfulOutcomeCount: newOutcomes(initial, player).filter(
+                (outcome) => outcome.status === "successful",
+              ).length,
+            };
             return (
               autonomousProgress.activitySeen &&
               autonomousProgress.successfulActionSeen &&
@@ -1957,10 +2095,12 @@ async function main(): Promise<void> {
     );
 
     const finalContext = requireLiveContext();
-    const finalEvidence = await collect(finalContext.runtime.app);
-    state.countersFinal = countersOf(finalEvidence);
+    if (shouldCollectAfterRun(state)) {
+      const finalEvidence = await collect(finalContext.runtime.app);
+      state.countersFinal = countersOf(finalEvidence);
+    }
     const runUsage = subtractCounters(
-      state.countersFinal,
+      finalRunCounters(state),
       state.countersInitial ?? zeroCounters(),
     );
     state.status = results.some((result) => result.status === "fail")
@@ -1974,22 +2114,22 @@ async function main(): Promise<void> {
       totalTokens(runUsage) > state.runBudget.totalTokens
     ) {
       state.status = "incomplete";
-      state.failureCode = "RUN_LLM_BUDGET_EXCEEDED";
+      state.failureCode ??= "RUN_LLM_BUDGET_EXCEEDED";
     } else if (Date.now() > state.runDeadlineAt) {
       state.status = "incomplete";
-      state.failureCode = "RUN_DEADLINE_EXCEEDED";
+      state.failureCode ??= "RUN_DEADLINE_EXCEEDED";
     }
   } catch (error) {
     const status = error instanceof HarnessError ? error.status : "incomplete";
     const code =
       error instanceof HarnessError ? error.code : "HARNESS_SETUP_FAILED";
     state.status = status;
-    state.failureCode = code;
+    state.failureCode ??= code;
     if (state.countersInitial !== undefined && status === "incomplete") {
       state.usageUncertain = true;
     }
   } finally {
-    if (liveContext !== undefined) {
+    if (liveContext !== undefined && shouldCollectAfterRun(state)) {
       try {
         state.countersFinal = countersOf(
           await collect(liveContext.runtime.app),
@@ -2792,11 +2932,14 @@ async function runCase(
 ): Promise<SafeCaseResult> {
   const started = Date.now();
   let initial = zeroCounters();
+  let initialCaptured = false;
   try {
-    if (state.abortRequested === true)
+    if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
-    if (liveContext !== undefined)
+    if (liveContext !== undefined) {
       initial = countersOf(await collect(liveContext.runtime.app));
+      initialCaptured = true;
+    }
     if (Date.now() >= state.runDeadlineAt) incomplete("RUN_DEADLINE_EXCEEDED");
     const timeoutMs = Math.max(
       1,
@@ -2850,11 +2993,13 @@ async function runCase(
     return item;
   } catch (error) {
     const final =
-      liveContext === undefined
+      liveContext === undefined || !shouldCollectAfterRun(state)
         ? initial
         : await collect(liveContext.runtime.app)
             .then(countersOf)
-            .catch(() => initial);
+            .catch(() =>
+              initialCaptured ? (state.countersFinal ?? initial) : initial,
+            );
     const delta = subtractCounters(final, initial);
     const reason =
       error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
@@ -2887,10 +3032,14 @@ async function runCase(
       outputTokens: delta.outputTokens,
       latencyMs: delta.latencyMs,
       usageStatus: usageUncertain ? "partial_or_unknown" : "runtime_reported",
-      evidence:
-        id === "body_operation_smoke"
+      evidence: {
+        ...(id === "body_operation_smoke"
           ? bodySmokeEvidence(state.bodySmokeDiagnostic)
-          : {},
+          : {}),
+        ...(reason === "RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE"
+          ? {}
+          : safeFailureEvidence(state, id)),
+      },
       reason,
     };
     state.cases.push(item);
@@ -2900,7 +3049,22 @@ async function runCase(
 
 async function collect(app: CompanionApplication): Promise<Evidence> {
   try {
-    return (await app.collectLiveEvidence()) as Evidence;
+    const evidence = (await app.collectLiveEvidence()) as Evidence;
+    const state = currentRunState;
+    if (state !== undefined) {
+      try {
+        const player = playerOf(evidence);
+        const counters = countersOf(evidence);
+        state.countersFinal = counters;
+        state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
+          player,
+          counters,
+        );
+      } catch {
+        // Preserve the caller's existing validation and its safe error code.
+      }
+    }
+    return evidence;
   } catch {
     incomplete("LIVE_EVIDENCE_COLLECTION_FAILED");
   }
