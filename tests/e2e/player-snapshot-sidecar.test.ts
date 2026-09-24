@@ -1,6 +1,13 @@
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { projectPlayerSnapshot } from "./player-snapshot-sidecar.js";
+import {
+  projectPlayerSnapshot,
+  writePlayerSnapshotRecord,
+} from "./player-snapshot-sidecar.js";
 
 describe("projectPlayerSnapshot", () => {
   it("copies only the allowlisted top-level fields and bounds arrays", () => {
@@ -46,5 +53,24 @@ describe("projectPlayerSnapshot", () => {
     sourceGoal.title = "Changed";
 
     expect(projected.goals[0]).toEqual({ title: "Explore" });
+  });
+
+  it("writes private JSONL exclusively with mode 0600", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "player-snapshot-test-"));
+    const path = join(directory, "snapshots.jsonl");
+    try {
+      await writePlayerSnapshotRecord(path, { caseId: "first" }, true);
+      await writePlayerSnapshotRecord(path, { caseId: "second" }, false);
+
+      const file = await stat(path);
+      const lines = (await readFile(path, "utf8")).trim().split("\n");
+      expect(file.mode & 0o777).toBe(0o600);
+      expect(lines).toHaveLength(2);
+      await expect(
+        writePlayerSnapshotRecord(path, { caseId: "duplicate" }, true),
+      ).rejects.toMatchObject({ code: "EEXIST" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

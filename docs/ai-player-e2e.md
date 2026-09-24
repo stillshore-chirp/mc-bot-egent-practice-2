@@ -10,6 +10,8 @@
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
+実行caseの終了時に、そのcase内で最後に収集したPlayer snapshotの許可項目を、mode `0600`のrun別private JSONL sidecarへ1件保存します。収集元は`fresh_terminal`または`last_collected`として記録し、`last_collected`は失敗・停止後の状態を必ず表すものではありません。未実行caseにはsnapshotを割り当てず、公開artifactにはsidecar保持boolと固定書込失敗codeだけを出します。sidecar保存失敗は元のcase結果を変更しません。
+
 ## Issue #72 の機械的な確認範囲
 
 | Issue受け入れ条件     | ケースと根拠                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |

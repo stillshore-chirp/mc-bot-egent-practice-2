@@ -65,6 +65,10 @@ import {
   safeUnknownOperationKind,
   type SafeUnknownOperationKind,
 } from "./unknown-composite-diagnostic.js";
+import {
+  projectPlayerSnapshot,
+  writePlayerSnapshotRecord,
+} from "./player-snapshot-sidecar.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -1428,6 +1432,10 @@ interface RunState {
   privateServerLogStream: WriteStream | undefined;
   privateDiagnosticLogPath?: string;
   privateDiagnosticLogRetained?: boolean;
+  privatePlayerSnapshotSidecarPath?: string;
+  playerSnapshotSidecarRetained?: boolean;
+  playerSnapshotSidecarFailureCode?: string;
+  playerSnapshotSidecarRecordCount?: number;
   privateServerLogWriteFailed?: boolean;
   abortRequested?: boolean;
   serverReadyObserved?: boolean;
@@ -1453,6 +1461,7 @@ let serverForCleanup: ChildProcessWithoutNullStreams | undefined;
 let ownerForCleanup: Bot | undefined;
 let guestForCleanup: Bot | undefined;
 let currentRunState: RunState | undefined;
+let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
@@ -4518,11 +4527,16 @@ async function runCase(
   body: () => Promise<Readonly<Record<string, boolean | number | string>>>,
 ): Promise<SafeCaseResult> {
   const started = Date.now();
+  const snapshotCapture: { latestEvidence?: Evidence } = {};
+  const previousSnapshotCapture = activeCaseSnapshotCapture;
+  activeCaseSnapshotCapture = snapshotCapture;
   let initial = zeroCounters();
   let initialCaptured = false;
+  let caseExecuted = false;
   try {
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
+    caseExecuted = true;
     if (liveContext !== undefined) {
       initial = countersOf(await collect(liveContext.runtime.app));
       initialCaptured = true;
@@ -4545,10 +4559,12 @@ async function runCase(
     ]).finally(() => {
       if (timer !== undefined) clearTimeout(timer);
     });
-    const final =
+    const terminalEvidence =
       liveContext === undefined
-        ? initial
-        : countersOf(await collect(liveContext.runtime.app));
+        ? undefined
+        : await collect(liveContext.runtime.app);
+    const final =
+      terminalEvidence === undefined ? initial : countersOf(terminalEvidence);
     const delta = subtractCounters(final, initial);
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
@@ -4576,17 +4592,35 @@ async function runCase(
       usageStatus: "runtime_reported",
       evidence,
     };
+    await retainCasePlayerSnapshot(
+      state,
+      id,
+      item.status,
+      null,
+      terminalEvidence ?? snapshotCapture.latestEvidence,
+      terminalEvidence !== undefined
+        ? "fresh_terminal"
+        : snapshotCapture.latestEvidence !== undefined
+          ? "last_collected"
+          : "unavailable",
+    );
     state.cases.push(item);
     return item;
   } catch (error) {
-    const final =
-      liveContext === undefined || !shouldCollectAfterRun(state)
-        ? initial
-        : await collect(liveContext.runtime.app)
-            .then(countersOf)
-            .catch(() =>
-              initialCaptured ? (state.countersFinal ?? initial) : initial,
-            );
+    let terminalEvidence: Evidence | undefined;
+    let final = initial;
+    if (
+      caseExecuted &&
+      liveContext !== undefined &&
+      shouldCollectAfterRun(state)
+    ) {
+      try {
+        terminalEvidence = await collect(liveContext.runtime.app);
+        final = countersOf(terminalEvidence);
+      } catch {
+        final = initialCaptured ? (state.countersFinal ?? initial) : initial;
+      }
+    }
     const delta = subtractCounters(final, initial);
     const reason =
       error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
@@ -4598,6 +4632,21 @@ async function runCase(
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
         caseStatus === "incomplete");
     if (usageUncertain) state.usageUncertain = true;
+    if (caseExecuted) {
+      const lastEvidence = terminalEvidence ?? snapshotCapture.latestEvidence;
+      await retainCasePlayerSnapshot(
+        state,
+        id,
+        caseStatus,
+        reason,
+        lastEvidence,
+        terminalEvidence !== undefined
+          ? "fresh_terminal"
+          : lastEvidence !== undefined
+            ? "last_collected"
+            : "unavailable",
+      );
+    }
     if (/BUDGET|DEADLINE/u.test(reason)) {
       state.abortRequested = true;
       state.failureCode ??= reason;
@@ -4634,12 +4683,19 @@ async function runCase(
     };
     state.cases.push(item);
     return item;
+  } finally {
+    if (activeCaseSnapshotCapture === snapshotCapture) {
+      activeCaseSnapshotCapture = previousSnapshotCapture;
+    }
   }
 }
 
 async function collect(app: CompanionApplication): Promise<Evidence> {
   try {
     const evidence = (await app.collectLiveEvidence()) as Evidence;
+    if (activeCaseSnapshotCapture !== undefined) {
+      activeCaseSnapshotCapture.latestEvidence = evidence;
+    }
     const state = currentRunState;
     if (state !== undefined) {
       try {
@@ -4657,6 +4713,56 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
     return evidence;
   } catch {
     incomplete("LIVE_EVIDENCE_COLLECTION_FAILED");
+  }
+}
+
+async function retainCasePlayerSnapshot(
+  state: RunState,
+  caseId: string,
+  caseStatus: Status,
+  reason: string | null,
+  evidence: Evidence | undefined,
+  source: "fresh_terminal" | "last_collected" | "unavailable",
+): Promise<void> {
+  let snapshot: Readonly<Record<string, unknown>> | null = null;
+  if (evidence !== undefined) {
+    try {
+      snapshot = projectPlayerSnapshot(playerOf(evidence));
+    } catch {
+      // Keep the case result and retain a row that explicitly has no snapshot.
+    }
+  }
+  const record = {
+    schema: "ai-player-e2e-private-player-snapshots/v1",
+    caseId,
+    caseStatus,
+    reason,
+    source,
+    capturedAt: new Date().toISOString(),
+    snapshot,
+  };
+  const diagnosticsDirectory = join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+  );
+  try {
+    await mkdir(diagnosticsDirectory, { recursive: true, mode: 0o700 });
+    await chmod(diagnosticsDirectory, 0o700);
+    const destination =
+      state.privatePlayerSnapshotSidecarPath ??
+      join(diagnosticsDirectory, `${state.id}-player-snapshots.jsonl`);
+    const isFirstRecord = state.playerSnapshotSidecarRecordCount === undefined;
+    await writePlayerSnapshotRecord(destination, record, isFirstRecord);
+    state.privatePlayerSnapshotSidecarPath = destination;
+    state.playerSnapshotSidecarRecordCount =
+      (state.playerSnapshotSidecarRecordCount ?? 0) + 1;
+    if (state.playerSnapshotSidecarFailureCode === undefined) {
+      state.playerSnapshotSidecarRetained = true;
+    }
+  } catch {
+    state.playerSnapshotSidecarRetained = false;
+    state.playerSnapshotSidecarFailureCode ??=
+      "PLAYER_SNAPSHOT_SIDECAR_WRITE_FAILED";
   }
 }
 
@@ -5503,6 +5609,10 @@ async function writeArtifact(state: RunState): Promise<void> {
             ?.responseHeuristicClassification ?? "not_evaluated",
         manualReviewRequired: true,
         sidecarRetained: state.observationBoundarySidecarRetained === true,
+      },
+      playerSnapshotSidecar: {
+        retained: state.playerSnapshotSidecarRetained === true,
+        failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
     },
     budgets: {
