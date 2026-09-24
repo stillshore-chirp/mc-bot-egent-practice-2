@@ -41,6 +41,7 @@ export const playerAgentToolNames = [
   "commit_goal_state",
   "update_understanding",
   "commit_action_decision",
+  "remember_owner_fact",
 ] as const;
 
 export type PlayerAgentToolName =

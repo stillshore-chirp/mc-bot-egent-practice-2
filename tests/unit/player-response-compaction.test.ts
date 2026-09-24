@@ -65,6 +65,48 @@ describe("Responses server-side compaction", () => {
     });
   });
 
+  it("keeps the owner-fact tool name while excluding its content", () => {
+    const projected = projectSafePlayerAgentActivityTail([
+      {
+        runSequence: 1,
+        role: "conversation",
+        round: 1,
+        responseStatus: "completed",
+        processingStatus: "complete",
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+        requestInputChars: 1,
+        initialInputChars: 1,
+        instructionsChars: 1,
+        toolSchemaChars: 1,
+        initialObservationChars: 0,
+        responseOutputChars: 1,
+        functionCallCount: 1,
+        compactionItemPresent: false,
+        toolCalls: [
+          {
+            name: "remember_owner_fact",
+            resultClass: "ok",
+            outputChars: 42,
+            summary: "private owner fact sentinel",
+            arguments: "private tool arguments sentinel",
+          },
+        ],
+      },
+    ]);
+
+    expect(projected[0]?.toolCalls).toEqual([
+      { name: "remember_owner_fact", resultClass: "ok", outputChars: 42 },
+    ]);
+    expect(JSON.stringify(projected)).not.toContain(
+      "private owner fact sentinel",
+    );
+    expect(JSON.stringify(projected)).not.toContain(
+      "private tool arguments sentinel",
+    );
+  });
+
   it("records only allowlisted action rejection reasons", async () => {
     const activities: unknown[] = [];
     const tool = createPlayerTool({
