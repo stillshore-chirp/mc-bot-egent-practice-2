@@ -135,6 +135,9 @@ type BodyDetailClass =
   | "transport_error"
   | "other";
 
+type FurnaceTargetClass = "furnace" | "other" | "not_observed";
+type WindowTypeClass = "furnace" | "other" | "none";
+
 type ConnectionFailureClass =
   | "schema_validation"
   | "timeout"
@@ -157,6 +160,14 @@ interface BodySmokeDiagnostic {
   readonly digRecoveryRequired?: boolean;
   readonly digDetailClass?: BodyDetailClass;
   readonly serverBlockAirAfterDig?: boolean;
+  readonly furnaceFixtureRconConfirmed?: boolean;
+  readonly furnaceLookStatus?: BodyOperationStatus;
+  readonly furnaceLookDetailClass?: BodyDetailClass;
+  readonly furnaceTargetClassBeforeOpen?: FurnaceTargetClass;
+  readonly furnaceTargetVisibleBeforeOpen?: boolean;
+  readonly furnaceOpenStatus?: BodyOperationStatus;
+  readonly furnaceOpenDetailClass?: BodyDetailClass;
+  readonly furnaceWindowTypeClass?: WindowTypeClass;
 }
 
 interface SafeApplicationStartDiagnostic {
@@ -508,6 +519,16 @@ function classifyBodyOperationDetail(
   return "other";
 }
 
+function classifyFurnaceTarget(name: string | undefined): FurnaceTargetClass {
+  if (name === undefined) return "not_observed";
+  return name === "furnace" || name.endsWith(":furnace") ? "furnace" : "other";
+}
+
+function classifyWindowType(type: string | undefined): WindowTypeClass {
+  if (type === undefined) return "none";
+  return type.toLowerCase().includes("furnace") ? "furnace" : "other";
+}
+
 function bodySmokeEvidence(
   diagnostic: BodySmokeDiagnostic | undefined,
 ): Readonly<Record<string, boolean | number | string>> {
@@ -541,6 +562,37 @@ function bodySmokeEvidence(
     ...(diagnostic.serverBlockAirAfterDig === undefined
       ? {}
       : { serverBlockAirAfterDig: diagnostic.serverBlockAirAfterDig }),
+    ...(diagnostic.furnaceFixtureRconConfirmed === undefined
+      ? {}
+      : {
+          furnaceFixtureRconConfirmed: diagnostic.furnaceFixtureRconConfirmed,
+        }),
+    ...(diagnostic.furnaceLookStatus === undefined
+      ? {}
+      : { furnaceLookStatus: diagnostic.furnaceLookStatus }),
+    ...(diagnostic.furnaceLookDetailClass === undefined
+      ? {}
+      : { furnaceLookDetailClass: diagnostic.furnaceLookDetailClass }),
+    ...(diagnostic.furnaceTargetClassBeforeOpen === undefined
+      ? {}
+      : {
+          furnaceTargetClassBeforeOpen: diagnostic.furnaceTargetClassBeforeOpen,
+        }),
+    ...(diagnostic.furnaceTargetVisibleBeforeOpen === undefined
+      ? {}
+      : {
+          furnaceTargetVisibleBeforeOpen:
+            diagnostic.furnaceTargetVisibleBeforeOpen,
+        }),
+    ...(diagnostic.furnaceOpenStatus === undefined
+      ? {}
+      : { furnaceOpenStatus: diagnostic.furnaceOpenStatus }),
+    ...(diagnostic.furnaceOpenDetailClass === undefined
+      ? {}
+      : { furnaceOpenDetailClass: diagnostic.furnaceOpenDetailClass }),
+    ...(diagnostic.furnaceWindowTypeClass === undefined
+      ? {}
+      : { furnaceWindowTypeClass: diagnostic.furnaceWindowTypeClass }),
   };
 }
 
@@ -2615,7 +2667,7 @@ async function runOperationSmoke(
           observedBlockName(fixtureObservation, target) ?? "not_observed";
         const fixtureTargetVisibleAfterLook =
           fixtureTargetBlockName !== "not_observed";
-        state.bodySmokeDiagnostic = {
+        const fixtureLookDiagnostic: BodySmokeDiagnostic = {
           fixtureLookStatus: fixtureLookResult.status,
           fixtureLookDetailClass: classifyBodyOperationDetail(
             fixtureLookResult.detail,
@@ -2623,6 +2675,7 @@ async function runOperationSmoke(
           fixtureTargetVisibleAfterLook,
           fixtureTargetBlockName,
         };
+        state.bodySmokeDiagnostic = fixtureLookDiagnostic;
         if (fixtureLookResult.status !== "successful")
           incomplete("BODY_SMOKE_LOOK_NOT_CONFIRMED");
         if (!fixtureTargetVisibleAfterLook)
@@ -2635,13 +2688,8 @@ async function runOperationSmoke(
         );
         const digBeforeBlockName = observedBlockName(digResult.before, target);
         const blockIsAir = await isBlock(rcon, target, "air");
-        state.bodySmokeDiagnostic = {
-          fixtureLookStatus: fixtureLookResult.status,
-          fixtureLookDetailClass: classifyBodyOperationDetail(
-            fixtureLookResult.detail,
-          ),
-          fixtureTargetVisibleAfterLook,
-          fixtureTargetBlockName,
+        const digDiagnostic: BodySmokeDiagnostic = {
+          ...fixtureLookDiagnostic,
           targetVisibleInDigBeforeSnapshot: digBeforeBlockName !== undefined,
           targetBlockNameInDigBeforeSnapshot:
             digBeforeBlockName ?? "not_observed",
@@ -2650,22 +2698,87 @@ async function runOperationSmoke(
           digDetailClass: classifyBodyOperationDetail(digResult.detail),
           serverBlockAirAfterDig: blockIsAir,
         };
+        state.bodySmokeDiagnostic = digDiagnostic;
         if (digResult.status !== "successful")
           fail("NON_OP_BODY_DIG_NOT_CONFIRMED_BY_BODY");
         if (!blockIsAir) fail("NON_OP_BODY_DIG_NOT_CONFIRMED_BY_SERVER");
-        await rcon.command(
-          `setblock ${target.x} ${target.y} ${target.z} furnace`,
-        );
-        await rcon.command(
-          `item replace entity ${state.botName} hotbar.0 with minecraft:raw_iron 1`,
-        );
-        const lookResult = await body.execute(
+
+        let furnaceFixtureRconConfirmed = false;
+        try {
+          await rcon.command(
+            `setblock ${target.x} ${target.y} ${target.z} furnace`,
+          );
+          await rcon.command(
+            `item replace entity ${state.botName} hotbar.0 with minecraft:raw_iron 1`,
+          );
+        } catch {
+          state.bodySmokeDiagnostic = {
+            ...digDiagnostic,
+            furnaceFixtureRconConfirmed: false,
+          };
+          incomplete("FURNACE_FIXTURE_SETUP_FAILED");
+        }
+        try {
+          furnaceFixtureRconConfirmed = await isBlock(rcon, target, "furnace");
+        } catch {
+          state.bodySmokeDiagnostic = {
+            ...digDiagnostic,
+            furnaceFixtureRconConfirmed: false,
+          };
+          incomplete("FURNACE_FIXTURE_RCON_READBACK_FAILED");
+        }
+        let furnaceDiagnostic: BodySmokeDiagnostic = {
+          ...digDiagnostic,
+          furnaceFixtureRconConfirmed,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (!furnaceFixtureRconConfirmed)
+          incomplete("FURNACE_FIXTURE_RCON_READBACK_FAILED");
+
+        const furnaceLookResult = await body.execute(
           {
             kind: "look",
             target: { x: target.x + 0.5, y: target.y + 0.5, z: target.z + 0.5 },
           },
           abort.signal,
         );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceLookStatus: furnaceLookResult.status,
+          furnaceLookDetailClass: classifyBodyOperationDetail(
+            furnaceLookResult.detail,
+          ),
+          furnaceTargetClassBeforeOpen: "not_observed",
+          furnaceTargetVisibleBeforeOpen: false,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (furnaceLookResult.status !== "successful")
+          incomplete("FURNACE_LOOK_NOT_CONFIRMED");
+
+        const furnaceVisibilityDeadline = Date.now() + 5_000;
+        do {
+          const observation = await body.observe();
+          const targetBlockName = observedBlockName(observation, target);
+          const targetClass = classifyFurnaceTarget(targetBlockName);
+          furnaceDiagnostic = {
+            ...furnaceDiagnostic,
+            furnaceTargetClassBeforeOpen: targetClass,
+            furnaceTargetVisibleBeforeOpen: targetBlockName !== undefined,
+          };
+          state.bodySmokeDiagnostic = furnaceDiagnostic;
+          if (
+            targetClass === "furnace" ||
+            Date.now() >= furnaceVisibilityDeadline
+          )
+            break;
+          await waitMs(
+            Math.max(1, Math.min(100, furnaceVisibilityDeadline - Date.now())),
+          );
+        } while (!abort.signal.aborted);
+
+        if (furnaceDiagnostic.furnaceTargetClassBeforeOpen !== "furnace")
+          incomplete("FURNACE_TARGET_NOT_CONFIRMED_BEFORE_OPEN");
+
         const openResult = await body.execute(
           {
             kind: "open_window",
@@ -2673,9 +2786,27 @@ async function runOperationSmoke(
           },
           abort.signal,
         );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceOpenStatus: openResult.status,
+          furnaceOpenDetailClass: classifyBodyOperationDetail(
+            openResult.detail,
+          ),
+          furnaceWindowTypeClass: "none",
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
         const opened = await body.observe();
-        if (opened.window === null || !/furnace/iu.test(opened.window.type)) {
-          incomplete("FURNACE_WINDOW_NOT_OBSERVED");
+        const furnaceWindowTypeClass = classifyWindowType(opened.window?.type);
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          furnaceWindowTypeClass,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (
+          openResult.status !== "successful" ||
+          furnaceWindowTypeClass !== "furnace"
+        ) {
+          incomplete("FURNACE_WINDOW_OPEN_NOT_CONFIRMED");
         }
         const transferInResult = await body.execute(
           {
@@ -2730,7 +2861,7 @@ async function runOperationSmoke(
         if (!windowClosed) incomplete("FURNACE_WINDOW_NOT_CLOSED");
         const apiOperationsReportedSuccess = [
           digResult,
-          lookResult,
+          furnaceLookResult,
           openResult,
           transferInResult,
           transferOutResult,

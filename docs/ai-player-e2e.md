@@ -31,13 +31,13 @@
 
 ## 操作群の検証状態
 
-| 能力群                 | 操作                                                                                                                                 | ソース上の接続                        | fixture経由のハーネス確認                                                                               | 実GPTの受け入れ・実測                           |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| 移動・視線・入力       | `move_to`, `look`, `control`                                                                                                         | 28操作schemaとBody dispatchを静的確認 | run5で`look`成功、対象stoneの可視性を確認                                                               | run4の`autonomous_life`は予算超過で未完了       |
-| ブロックと制作         | `attack`, `dig`, `place`, `craft`                                                                                                    | 同上                                  | run5の非OP `dig`は`action_timeout`で未確認。RCONも空気化を確認せず。`place`・`craft`の直接smokeは未実施 | run4の自律生活は未完了。owner依頼の建築は未実施 |
-| 装備・使用・所持品     | `equip`, `use`, `consume`, `toss`, `transfer`                                                                                        | 同上                                  | 直接fixture smokeなし                                                                                   | 未実行・未網羅                                  |
-| 画面と設備             | `open_window`, `window_click`, `window_transfer`, `window_close`                                                                     | 同上                                  | furnace smokeは用意済みだが、run5はdig失敗で未到達                                                      | 未実行                                          |
-| 活動・乗り物・専門画面 | `fish`, `sleep`, `wake`, `mount`, `dismount`, `move_vehicle`, `elytra_fly`, `trade`, `enchant`, `anvil`, `write_book`, `update_sign` | 同上                                  | 専用fixture smokeなし                                                                                   | 未実行・環境差も未確認                          |
+| 能力群                 | 操作                                                                                                                                 | ソース上の接続                        | fixture経由のハーネス確認                                                                         | 実GPTの受け入れ・実測                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| 移動・視線・入力       | `move_to`, `look`, `control`                                                                                                         | 28操作schemaとBody dispatchを静的確認 | run5の`look`成功と対象stone可視性を確認。run6はfurnaceのlook/open段階に到達したがlook結果は未記録 | run4の`autonomous_life`は予算超過で未完了       |
+| ブロックと制作         | `attack`, `dig`, `place`, `craft`                                                                                                    | 同上                                  | run6の非OP `dig`成功とRCONの空気化確認。`place`・`craft`の直接smokeは未実施                       | run4の自律生活は未完了。owner依頼の建築は未実施 |
+| 装備・使用・所持品     | `equip`, `use`, `consume`, `toss`, `transfer`                                                                                        | 同上                                  | 直接fixture smokeなし                                                                             | 未実行・未網羅                                  |
+| 画面と設備             | `open_window`, `window_click`, `window_transfer`, `window_close`                                                                     | 同上                                  | run6でfurnace windowを観測できず未完了。今回、RCON・Body可視状態・操作結果の診断を追加            | GPTによる設備操作は未実行                       |
+| 活動・乗り物・専門画面 | `fish`, `sleep`, `wake`, `mount`, `dismount`, `move_vehicle`, `elytra_fly`, `trade`, `enchant`, `anvil`, `write_book`, `update_sign` | 同上                                  | 専用fixture smokeなし                                                                             | 未実行・環境差も未確認                          |
 
 「ソース上の接続」は実ゲーム実行の証明ではありません。fixture smokeはGPTの自律判断と別case・別usageで記録します。直接のfixture smokeがないことを非対象化や未実装の断定に使いません。能力別の結果はartifactと統合後の受け入れ記録で更新してください。
 
@@ -65,8 +65,10 @@ artifactのrun/case duration、runtime報告call/token/latency、case status、f
 
 ## 現在の検証状況
 
-統合後の型検査・Lint・整形と、`86b64dc`のCIは成功しています。隔離Paperと実GPTを使うrunも実施済みです。run4では`runtime_contract`がpassしましたが、`autonomous_life`はGPTを11回呼び出し、60,055 tokensを消費してcase上限60,000を超えたため未完了です。残りのcaseもこの予算超過による停止で未実施となり、shutdown後の証跡収集失敗によりrun全体も未完了でした。
+run6対象HEAD `daab18f`のCI 7 jobsと、この診断差分のserver typecheck・対象Lint・整形確認は成功しています。隔離Paperと実GPTを使うrunも実施済みです。run4では`runtime_contract`がpassしましたが、`autonomous_life`はGPTを11回呼び出し、60,055 tokensを消費してcase上限60,000を超えたため未完了です。残りのcaseもこの予算超過による停止で未実施となり、shutdown後の証跡収集失敗によりrun全体も未完了でした。
 
 run5では非OP Bodyの`look`が成功し、対象stoneが視界内に入ったことを確認しました。続く`dig`は`action_timeout`で未確認となり、独立したRCON確認でもブロックの空気化を確認できずcase failです。fail-fastにより既定アプリとGPTは起動せず、GPT usageは0でした。server process、loopback listener、一時worldのcleanupはすべて確認済みです。furnace操作にも到達していません。
+
+run6では非OP `dig`がsuccessfulとなり、serverとRCONの双方で対象ブロックの空気化を確認しました。furnace smokeではwindowを観測できず未完了となり、fail-fastでGPTは起動していません。cleanupは確認済みです。run6 artifactにはfurnaceのopen操作結果が保存されていないため、原因は特定できませんでした。今回のハーネス差分はRCONでfurnace fixtureを確認し、look後にBodyが対象furnaceを実際に観測するまで最大5秒の条件待ちを行い、open前後の状態と操作結果を安全な分類値で記録します。この診断差分自体は実ゲーム未確認です。
 
 したがってIssue #72全体の受け入れは未達です。runtime contract以外の受け入れ条件はまだpassしておらず、自律生活、未知状況、観測境界、再起動、並行会話と停止、建築依頼、Skill学習・交換の実測が残っています。未実行の能力群や環境差も未検証のままです。
