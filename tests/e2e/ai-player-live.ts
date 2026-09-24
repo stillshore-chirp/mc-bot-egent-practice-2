@@ -2349,8 +2349,12 @@ async function setAndVerifyGamerule(
     .trim()
     .toLowerCase()
     .replace(/\s+/gu, " ");
+  const ruleTokens = readback.split(/[^a-z0-9_:]+/u);
+  const leafId = id.slice(id.indexOf(":") + 1);
+  const ruleIdDisplayed =
+    ruleTokens.includes(id) || ruleTokens.includes(leafId);
   const reportedValue = /(?:^|\s)(true|false)$/u.exec(readback)?.[1];
-  if (!readback.includes(id) || reportedValue !== String(value))
+  if (!ruleIdDisplayed || reportedValue !== String(value))
     incomplete(readbackFailure);
 }
 
