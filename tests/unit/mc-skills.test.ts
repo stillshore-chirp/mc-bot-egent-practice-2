@@ -137,7 +137,7 @@ function updateMarkdownBody(filePath: string, body: string): void {
   const markerIndex = content.indexOf(bodyMarker);
   if (markerIndex < 0) throw new Error("Markdown body marker is missing");
   writeFileSync(
-    `${filePath}`,
+    filePath,
     `${content.slice(0, markerIndex)}${bodyMarker}${body}\n`,
     "utf8",
   );
@@ -150,7 +150,7 @@ function updateMetadata(
   const content = readFileSync(filePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match === null || match[1] === undefined)
+  if (match?.[1] === undefined)
     throw new Error("Metadata fence is missing");
   const metadata = JSON.parse(match[1]) as Record<string, unknown>;
   update(metadata);
@@ -162,7 +162,7 @@ function readMetadata(filePath: string): Record<string, unknown> {
   const content = readFileSync(filePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match === null || match[1] === undefined)
+  if (match?.[1] === undefined)
     throw new Error("Metadata fence is missing");
   return JSON.parse(match[1]) as Record<string, unknown>;
 }
@@ -175,7 +175,7 @@ function copyMarkdownWithSkillId(
   const content = readFileSync(sourcePath, "utf8");
   const expression = /```mc-bot-skill\n([\s\S]*?)\n```/u;
   const match = expression.exec(content);
-  if (match === null || match[1] === undefined)
+  if (match?.[1] === undefined)
     throw new Error("Metadata fence is missing");
   const metadata = JSON.parse(match[1]) as Record<string, unknown>;
   const skill = metadata.skill as Record<string, unknown>;
@@ -378,7 +378,7 @@ describe("McSkillRepository", () => {
         runId: beforeCreation.runId,
         proposedOutcome: "successful",
       }),
-    ).toThrowError(McSkillRepositoryError);
+    ).toThrow(McSkillRepositoryError);
     const withoutOperation = repository.createSkill({
       id: "missing-operation-skill",
       category: "gathering",
@@ -400,7 +400,7 @@ describe("McSkillRepository", () => {
         runId: secondNovelReceipt.runId,
         proposedOutcome: "successful",
       }),
-    ).toThrowError(/operation/iu);
+    ).toThrow(/operation/iu);
   });
 
   it("derives one immutable hypothesis from a seed success without recounting its outcome", () => {
@@ -412,7 +412,7 @@ describe("McSkillRepository", () => {
         runId: "model-claimed-success",
         input: hypothesisInput("untrusted-hypothesis"),
       }),
-    ).toThrowError(/trusted evidence receipt/iu);
+    ).toThrow(/trusted evidence receipt/iu);
     const receipt = trustedDigEvidence(repository, "seed-hypothesis-run", {
       skillIdAtUse: seed.id,
       skillVersionAtUse: seed.version,
@@ -458,7 +458,7 @@ describe("McSkillRepository", () => {
         runId: receipt.runId,
         input: hypothesisInput("derived-from-seed", "別タイトルの別仮説"),
       }),
-    ).toThrowError(McSkillRepositoryError);
+    ).toThrow(McSkillRepositoryError);
     expect(repository.search({ query: "別タイトルの別仮説" })).toHaveLength(0);
     expect(repository.get(seed.id).nativeStatistics).toEqual(before);
     expect(repository.get(learned.skill.id).nativeStatistics.successful).toBe(
@@ -478,8 +478,8 @@ describe("McSkillRepository", () => {
           operationRefs: ["look"],
         },
       }),
-    ).toThrowError(/operation observed in its trusted receipt/iu);
-    expect(() => repository.get("missing-operation")).toThrowError(
+    ).toThrow(/operation observed in its trusted receipt/iu);
+    expect(() => repository.get("missing-operation")).toThrow(
       McSkillRepositoryError,
     );
 
@@ -495,8 +495,8 @@ describe("McSkillRepository", () => {
         runId: failedReceipt.runId,
         input: hypothesisInput("failed-hypothesis"),
       }),
-    ).toThrowError(/observed successful receipt/iu);
-    expect(() => repository.get("failed-hypothesis")).toThrowError(
+    ).toThrow(/observed successful receipt/iu);
+    expect(() => repository.get("failed-hypothesis")).toThrow(
       McSkillRepositoryError,
     );
   });
@@ -536,7 +536,7 @@ describe("McSkillRepository", () => {
         runId: receipt.runId,
         input: hypothesisInput(undefined, "再試行で別タイトル"),
       }),
-    ).toThrowError(McSkillRepositoryError);
+    ).toThrow(McSkillRepositoryError);
 
     repository.close();
     const reopened = open(options);
@@ -568,7 +568,7 @@ describe("McSkillRepository", () => {
         runId: "hypothesis-rollback-run",
         input: hypothesisInput("rollback-hypothesis"),
       }),
-    ).toThrowError(/injected outcome failure/iu);
+    ).toThrow(/injected outcome failure/iu);
 
     const inspected = new Database(options.databasePath);
     expect(
@@ -627,7 +627,7 @@ describe("McSkillRepository", () => {
         changeNote: "stale edit",
         patch: { body: "stale" },
       }),
-    ).toThrowError(/version conflict/iu);
+    ).toThrow(/version conflict/iu);
   });
 
   it("round-trips edited Markdown and provenance without inflating native experience", () => {
@@ -673,7 +673,7 @@ describe("McSkillRepository", () => {
       const skillMetadata = metadata.skill as Record<string, unknown>;
       skillMetadata.operationRefs = ["not_allowed"];
     });
-    expect(() => recipient.importSkill(invalidExport.fileName)).toThrowError(
+    expect(() => recipient.importSkill(invalidExport.fileName)).toThrow(
       /Unknown operation reference/iu,
     );
   });
@@ -778,8 +778,8 @@ describe("McSkillRepository", () => {
     const skill = repository.get("mc-skill-navigation");
     expect(() =>
       repository.exportSkill(skill.id, "../outside.md"),
-    ).toThrowError(McSkillRepositoryError);
-    expect(() => repository.importSkill("../outside.md")).toThrowError(
+    ).toThrow(McSkillRepositoryError);
+    expect(() => repository.importSkill("../outside.md")).toThrow(
       McSkillRepositoryError,
     );
 
@@ -789,10 +789,10 @@ describe("McSkillRepository", () => {
     const symlinkPath = join(options.exchangeDirectory, "linked.md");
     symlinkSync(outside, symlinkPath);
     expect(existsSync(outside)).toBe(true);
-    expect(() => repository.importSkill("linked.md")).toThrowError(
+    expect(() => repository.importSkill("linked.md")).toThrow(
       McSkillRepositoryError,
     );
-    expect(() => repository.exportSkill(skill.id, "linked.md")).toThrowError(
+    expect(() => repository.exportSkill(skill.id, "linked.md")).toThrow(
       McSkillRepositoryError,
     );
     expect(readFileSync(outside, "utf8")).toBe("not a skill");
@@ -802,6 +802,6 @@ describe("McSkillRepository", () => {
     symlinkSync(movedExchange, options.exchangeDirectory);
     expect(() =>
       repository.exportSkill(skill.id, "after-root-swap.md"),
-    ).toThrowError(McSkillRepositoryError);
+    ).toThrow(McSkillRepositoryError);
   });
 });

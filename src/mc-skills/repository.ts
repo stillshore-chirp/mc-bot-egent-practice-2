@@ -58,11 +58,13 @@ const skillRecordSchema = z
     category: z.enum(mcSkillCategories),
     title: z.string().trim().min(1),
     purpose: z.string().trim().min(1),
-    conditions: z.array(z.string().trim().min(1)),
+    conditions: z.array(z.string().trim().min(1)).readonly(),
     body: z.string().trim().min(1),
-    operationRefs: z.array(z.string().regex(/^[a-z][a-z0-9_]{0,63}$/u)),
+    operationRefs: z
+      .array(z.string().regex(/^[a-z][a-z0-9_]{0,63}$/u))
+      .readonly(),
     expectedOutcome: z.string().trim().min(1),
-    confidence: z.number().finite().min(0).max(1),
+    confidence: z.number().min(0).max(1),
   })
   .strict();
 
@@ -81,18 +83,22 @@ const exchangeMetadataSchema = z
         cancelled: z.number().int().nonnegative(),
         unverified: z.number().int().nonnegative(),
       }),
-      imported: z.array(
-        z.object({
-          sourceSkillId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u),
-          sourceVersion: z.number().int().positive(),
-          successful: z.number().int().nonnegative(),
-          failed: z.number().int().nonnegative(),
-          interrupted: z.number().int().nonnegative(),
-          cancelled: z.number().int().nonnegative(),
-          unverified: z.number().int().nonnegative(),
-          provenance: z.string().trim().min(1),
-        }),
-      ),
+      imported: z
+        .array(
+          z.object({
+            sourceSkillId: z
+              .string()
+              .regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u),
+            sourceVersion: z.number().int().positive(),
+            successful: z.number().int().nonnegative(),
+            failed: z.number().int().nonnegative(),
+            interrupted: z.number().int().nonnegative(),
+            cancelled: z.number().int().nonnegative(),
+            unverified: z.number().int().nonnegative(),
+            provenance: z.string().trim().min(1),
+          }),
+        )
+        .readonly(),
     }),
     provenance: z.string().trim().min(1),
   })
@@ -495,7 +501,7 @@ export class McSkillRepository {
         category: row.category as McSkillCategory,
         title: row.title,
         summary: row.purpose,
-        operationRefs: parseJson<string[]>(row.operation_refs_json),
+        operationRefs: parseStringArray(row.operation_refs_json),
         confidence: row.confidence,
         version: row.version,
         successfulRuns: this.statistics(row.id).successful,
@@ -592,8 +598,7 @@ export class McSkillRepository {
       const expectedOutcomeSkillId =
         receipt.skill_id_at_use ?? existingLink?.skill_id;
       const existingOutcomeMatchesReceipt =
-        existingOutcome !== undefined &&
-        existingOutcome.status === "successful" &&
+        existingOutcome?.status === "successful" &&
         existingOutcome.evidence_receipt_id === receipt.receipt_id &&
         (expectedOutcomeSkillId === undefined ||
           existingOutcome.skill_id === expectedOutcomeSkillId);
@@ -615,7 +620,7 @@ export class McSkillRepository {
       const skillId =
         input.input.id ??
         existingLink?.skill_id ??
-        (reusableOutcome ? existingOutcome?.skill_id : undefined) ??
+        (reusableOutcome ? existingOutcome.skill_id : undefined) ??
         randomUUID();
       const skill = normalizeSkill({ ...input.input, id: skillId });
       this.validateOperationRefs(skill.operationRefs);
@@ -859,9 +864,8 @@ export class McSkillRepository {
         );
       }
       if (
-        receipt !== undefined &&
-        receipt.skill_id_at_use === null &&
-        !parseJson<string[]>(skill.operation_refs_json).includes(
+        receipt?.skill_id_at_use === null &&
+        !parseStringArray(skill.operation_refs_json).includes(
           receipt.operation_name,
         )
       ) {
@@ -871,8 +875,7 @@ export class McSkillRepository {
         );
       }
       if (
-        receipt !== undefined &&
-        receipt.skill_id_at_use === normalized.skillId &&
+        receipt?.skill_id_at_use === normalized.skillId &&
         receipt.skill_version_at_use !== null
       ) {
         const usedRevision = this.database
@@ -882,7 +885,7 @@ export class McSkillRepository {
           .get(normalized.skillId, receipt.skill_version_at_use);
         if (
           usedRevision === undefined ||
-          !parseJson<string[]>(usedRevision.operation_refs_json).includes(
+          !parseStringArray(usedRevision.operation_refs_json).includes(
             receipt.operation_name,
           )
         ) {
@@ -1018,7 +1021,7 @@ export class McSkillRepository {
     try {
       descriptor = openSync(
         target,
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+        constants.O_RDONLY | constants.O_NOFOLLOW,
       );
       const fileStat = fstatSync(descriptor);
       if (!fileStat.isFile()) {
@@ -1388,7 +1391,7 @@ export class McSkillRepository {
       .get(receipt.skill_id_at_use, receipt.skill_version_at_use);
     if (
       revision === undefined ||
-      !parseJson<string[]>(revision.operation_refs_json).includes(
+      !parseStringArray(revision.operation_refs_json).includes(
         receipt.operation_name,
       )
     ) {
@@ -1624,7 +1627,12 @@ function normalizeOutcomeInput(
 function normalizeConditions(conditions: readonly string[]): string[] {
   if (!Array.isArray(conditions))
     throw validationError("conditions must be an array");
-  return conditions.map((condition) => shortText(condition, "condition"));
+  return conditions.map((condition: unknown) => {
+    if (typeof condition !== "string") {
+      throw validationError("condition must be text");
+    }
+    return shortText(condition, "condition");
+  });
 }
 
 function shortText(value: string, field: string): string {
@@ -1648,9 +1656,10 @@ function enumValue<T extends readonly string[]>(
   allowed: T,
   field: string,
 ): T[number] {
-  if (!(allowed as readonly string[]).includes(value))
+  const matched = allowed.find((candidate) => candidate === value);
+  if (matched === undefined)
     throw validationError(`${field} is not supported`);
-  return value as T[number];
+  return matched;
 }
 
 function definitionFromRow(row: SkillRow): McSkillDefinition {
@@ -1659,9 +1668,9 @@ function definitionFromRow(row: SkillRow): McSkillDefinition {
     category: row.category as McSkillCategory,
     title: row.title,
     purpose: row.purpose,
-    conditions: parseJson<string[]>(row.conditions_json),
+    conditions: parseStringArray(row.conditions_json),
     body: row.body,
-    operationRefs: parseJson<string[]>(row.operation_refs_json),
+    operationRefs: parseStringArray(row.operation_refs_json),
     expectedOutcome: row.expected_outcome,
     confidence: row.confidence,
   };
@@ -1673,16 +1682,17 @@ function definitionFromRevisionRow(row: RevisionRow): McSkillDefinition {
     category: row.category as McSkillCategory,
     title: row.title,
     purpose: row.purpose,
-    conditions: parseJson<string[]>(row.conditions_json),
+    conditions: parseStringArray(row.conditions_json),
     body: row.body,
-    operationRefs: parseJson<string[]>(row.operation_refs_json),
+    operationRefs: parseStringArray(row.operation_refs_json),
     expectedOutcome: row.expected_outcome,
     confidence: row.confidence,
   };
 }
 
-function parseJson<T>(source: string): T {
-  return JSON.parse(source) as T;
+function parseStringArray(source: string): string[] {
+  const parsed: unknown = JSON.parse(source);
+  return z.array(z.string()).parse(parsed);
 }
 
 function outcomeFromRow(row: OutcomeRow): McSkillOutcome {
@@ -1722,7 +1732,7 @@ function evidenceFromRow(row: EvidenceRow): TrustedMcSkillEvidenceReceipt {
     runId: row.run_id,
     operationName: row.operation_name,
     inputSummary: row.input_summary,
-    conditions: parseJson<string[]>(row.conditions_json),
+    conditions: parseStringArray(row.conditions_json),
     expectedOutcome: row.expected_outcome,
     observedOutcome: row.observed_outcome as McSkillOutcomeStatus,
     observationSummary: row.observation_summary,
@@ -1824,7 +1834,13 @@ function parseExchangeDocument(content: string): {
     /^# ([^\n]+)\n\n```mc-bot-skill\n([\s\S]*?)\n```\n\n## 本文\n([\s\S]*?)\n?$/u.exec(
       normalized,
     );
-  if (match === null || match[2] === undefined || match[3] === undefined) {
+  if (match === null) {
+    throw new McSkillRepositoryError(
+      "IMPORT_INVALID",
+      "Markdown must contain one mc-bot-skill metadata fence and a body section",
+    );
+  }
+  if (match[2] === undefined || match[3] === undefined) {
     throw new McSkillRepositoryError(
       "IMPORT_INVALID",
       "Markdown must contain one mc-bot-skill metadata fence and a body section",
@@ -1874,6 +1890,7 @@ function safeFileName(fileName: string): string {
     fileName === ".." ||
     fileName.includes("/") ||
     fileName.includes("\\") ||
+    // eslint-disable-next-line no-control-regex -- Reject control characters in exchanged filenames.
     /[\u0000-\u001f\u007f]/u.test(fileName) ||
     !fileName.toLocaleLowerCase("en-US").endsWith(".md") ||
     fileName !== fileName.trim()
