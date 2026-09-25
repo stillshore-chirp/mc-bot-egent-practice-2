@@ -71,6 +71,25 @@ export interface RecoveryObstacleCallbacks<T> {
   readonly onProgress?: (progress: RecoveryObstacleProgress) => void;
 }
 
+export function isNewFailureAfterUnfreeze(
+  outcome: {
+    readonly operationId: string;
+    readonly status?: string;
+    readonly observedAt?: string;
+  },
+  knownOperationIds: ReadonlySet<string>,
+  unfrozenAt: number,
+): boolean {
+  if (
+    knownOperationIds.has(outcome.operationId) ||
+    outcome.status !== "failed" ||
+    outcome.observedAt === undefined
+  )
+    return false;
+  const observedAt = Date.parse(outcome.observedAt);
+  return Number.isFinite(observedAt) && observedAt >= unfrozenAt;
+}
+
 export function recoveryCagePlan(
   position: RecoveryPosition,
   backupOrigin: RecoveryPosition,

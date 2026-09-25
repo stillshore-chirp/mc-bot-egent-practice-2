@@ -1,10 +1,68 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   withRestorableObstacle,
   type RecoveryObstaclePlan,
 } from "./unknown-recovery-obstacle.js";
+
+describe("post-unfreeze failure attribution", () => {
+  const unfrozenAt = Date.parse("2026-01-01T00:00:10.000Z");
+  const known = new Set([
+    "active-before-unfreeze",
+    "completed-before-unfreeze",
+  ]);
+
+  it("counts only a new failed operation observed after unfreezing", () => {
+    expect(
+      isNewFailureAfterUnfreeze(
+        {
+          operationId: "new-operation",
+          status: "failed",
+          observedAt: "2026-01-01T00:00:10.001Z",
+        },
+        known,
+        unfrozenAt,
+      ),
+    ).toBe(true);
+    for (const operationId of known) {
+      expect(
+        isNewFailureAfterUnfreeze(
+          {
+            operationId,
+            status: "failed",
+            observedAt: "2026-01-01T00:00:11.000Z",
+          },
+          known,
+          unfrozenAt,
+        ),
+      ).toBe(false);
+    }
+    expect(
+      isNewFailureAfterUnfreeze(
+        {
+          operationId: "new-operation",
+          status: "failed",
+          observedAt: "2026-01-01T00:00:09.999Z",
+        },
+        known,
+        unfrozenAt,
+      ),
+    ).toBe(false);
+    expect(
+      isNewFailureAfterUnfreeze(
+        {
+          operationId: "new-operation",
+          status: "successful",
+          observedAt: "2026-01-01T00:00:11.000Z",
+        },
+        known,
+        unfrozenAt,
+      ),
+    ).toBe(false);
+  });
+});
 
 class FakeRcon {
   public readonly commands: string[] = [];

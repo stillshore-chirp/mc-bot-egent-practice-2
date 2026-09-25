@@ -55,6 +55,7 @@ import {
 } from "./world-oracle.js";
 import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baseline.js";
 import {
+  isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   withRestorableObstacle,
 } from "./unknown-recovery-obstacle.js";
@@ -296,6 +297,7 @@ interface UnknownCompositeDiagnostic {
   readonly unknownControlledObstacleConfirmedPlacementCount?: number;
   readonly unknownControlledObstacleEligibilityChecks?: number;
   readonly unknownControlledObstacleSameOperationConfirmed?: boolean;
+  readonly unknownControlledObstacleNewOperationFailed?: boolean;
   readonly unknownControlledObstaclePlayerInsideBefore?: boolean;
   readonly unknownControlledObstacleStandingSpaceConfirmed?: boolean;
   readonly unknownControlledObstaclePlayerInsideAtFailure?: boolean;
@@ -3418,6 +3420,7 @@ async function main(): Promise<void> {
                 const operationId = activeOperation.operationId;
                 updateUnknownCompositeDiagnostic(state, {
                   unknownControlledObstacleStatus: "not_attempted",
+                  unknownControlledObstacleNewOperationFailed: false,
                   unknownObstacleTickFreezeConfirmed: false,
                   unknownObstacleTickUnfreezeConfirmed: false,
                 });
@@ -3526,16 +3529,24 @@ async function main(): Promise<void> {
                           unknownControlledObstacleOtherEntitiesClear:
                             otherEntitiesClear,
                         });
-                        return (
-                          sameStartedOperation &&
-                          standingSpaceConfirmed &&
-                          otherEntitiesClear
-                        );
+                        return standingSpaceConfirmed && otherEntitiesClear;
                       },
                       observeWhileApplied: async () => {
-                        const activeBeforeUnfreeze = playerOf(
+                        const playerBeforeUnfreeze = playerOf(
                           await collect(context.runtime.app),
-                        ).activeOperation;
+                        );
+                        const activeBeforeUnfreeze =
+                          playerBeforeUnfreeze.activeOperation;
+                        const knownOutcomeIdsBeforeUnfreeze = new Set(
+                          playerBeforeUnfreeze.recentOutcomes.map(
+                            (outcome) => outcome.operationId,
+                          ),
+                        );
+                        knownOutcomeIdsBeforeUnfreeze.add(operationId);
+                        if (activeBeforeUnfreeze !== undefined)
+                          knownOutcomeIdsBeforeUnfreeze.add(
+                            activeBeforeUnfreeze.operationId,
+                          );
                         const sameOperationBeforeUnfreeze =
                           activeBeforeUnfreeze?.operationId === operationId &&
                           typeof activeBeforeUnfreeze.bodyStartedAt ===
@@ -3545,9 +3556,20 @@ async function main(): Promise<void> {
                             sameOperationBeforeUnfreeze,
                         });
                         await unfreezeObstacleTicks();
-                        if (!sameOperationBeforeUnfreeze)
-                          return { failedInPlace: false };
+                        const unfrozenAt = obstacleUnfrozenAt;
+                        if (unfrozenAt === undefined)
+                          incomplete(
+                            "UNKNOWN_OBSTACLE_TICK_UNFREEZE_NOT_CONFIRMED",
+                          );
                         let lastSampleAt = 0;
+                        const newFailureAfterUnfreeze = (
+                          outcome: PlayerEvidence["recentOutcomes"][number],
+                        ): boolean =>
+                          isNewFailureAfterUnfreeze(
+                            outcome,
+                            knownOutcomeIdsBeforeUnfreeze,
+                            unfrozenAt,
+                          );
                         const failurePlayer = await observeForPlayer(
                           context,
                           30_000,
@@ -3558,27 +3580,15 @@ async function main(): Promise<void> {
                               lastOracleCheckAt = lastSampleAt;
                             }
                             return candidate.recentOutcomes.some(
-                              (outcome) =>
-                                outcome.operationId === operationId &&
-                                outcome.status === "failed" &&
-                                obstacleUnfrozenAt !== undefined &&
-                                typeof outcome.observedAt === "string" &&
-                                Date.parse(outcome.observedAt) >=
-                                  obstacleUnfrozenAt,
+                              newFailureAfterUnfreeze,
                             );
                           },
                         );
-                        const sameOperationFailed =
+                        const newOperationFailed =
                           failurePlayer?.recentOutcomes.some(
-                            (outcome) =>
-                              outcome.operationId === operationId &&
-                              outcome.status === "failed" &&
-                              obstacleUnfrozenAt !== undefined &&
-                              typeof outcome.observedAt === "string" &&
-                              Date.parse(outcome.observedAt) >=
-                                obstacleUnfrozenAt,
+                            newFailureAfterUnfreeze,
                           ) === true;
-                        if (!sameOperationFailed)
+                        if (!newOperationFailed)
                           return { failedInPlace: false };
                         const failurePosition = parsePosition(
                           await rcon.command(
@@ -3591,7 +3601,8 @@ async function main(): Promise<void> {
                         );
                         const confirmed = playerInsideAtFailure;
                         updateUnknownCompositeDiagnostic(state, {
-                          unknownControlledObstacleSameOperationConfirmed: true,
+                          unknownControlledObstacleNewOperationFailed:
+                            newOperationFailed,
                           unknownControlledObstaclePlayerInsideAtFailure:
                             playerInsideAtFailure,
                           ...(confirmed
