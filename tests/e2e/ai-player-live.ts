@@ -162,6 +162,12 @@ const CASE_DEADLINES = {
 
 type Status = "pass" | "fail" | "incomplete";
 type UsageStatus = "runtime_reported" | "partial_or_unknown";
+const TARGETABLE_CASES = [
+  "game_action_discretion",
+  "unknown_composite",
+  "parallel_dialogue_stop",
+] as const;
+type TargetableCase = (typeof TARGETABLE_CASES)[number];
 interface SafeCaseResult {
   readonly id: string;
   readonly status: Status;
@@ -1671,6 +1677,7 @@ interface CaseContext {
 
 interface RunState {
   readonly id: string;
+  readonly targetCase?: TargetableCase;
   readonly startedAt: string;
   readonly seed: string;
   readonly runBudget: RunBudget;
@@ -4026,6 +4033,17 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
+  const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
+  if (
+    requestedTargetCase !== undefined &&
+    requestedTargetCase.length > 0 &&
+    !TARGETABLE_CASES.includes(requestedTargetCase as TargetableCase)
+  )
+    incomplete("E2E_TARGET_CASE_INVALID");
+  const targetCase =
+    requestedTargetCase === undefined || requestedTargetCase.length === 0
+      ? undefined
+      : (requestedTargetCase as TargetableCase);
   const serverJarValue = process.env.AI_PLAYER_E2E_SERVER_JAR;
   if (serverJarValue === undefined || serverJarValue.trim() === "")
     incomplete("SERVER_JAR_REQUIRED");
@@ -4096,6 +4114,7 @@ async function prepareRun(): Promise<RunState> {
   const startedClock = Date.now();
   return {
     id: runId,
+    ...(targetCase === undefined ? {} : { targetCase }),
     startedAt: new Date().toISOString(),
     seed: runSeed,
     runBudget,
@@ -5309,6 +5328,22 @@ async function recordCase(
     context: CaseContext,
   ) => Promise<Readonly<Record<string, boolean | number | string>>>,
 ): Promise<SafeCaseResult> {
+  if (state.targetCase !== undefined && id !== state.targetCase) {
+    const skipped: SafeCaseResult = {
+      id,
+      status: "incomplete",
+      durationMs: 0,
+      llmCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      latencyMs: 0,
+      usageStatus: "runtime_reported",
+      evidence: {},
+      reason: "CASE_NOT_SELECTED",
+    };
+    state.cases.push(skipped);
+    return skipped;
+  }
   const caseBudget = Object.entries(CASE_BUDGETS).find(
     ([caseId]) => caseId === id,
   )?.[1];
@@ -6720,6 +6755,7 @@ async function writeArtifact(state: RunState): Promise<void> {
     startedAt: state.startedAt,
     durationMs: Date.now() - state.startedClock,
     model: MODEL,
+    targetCase: state.targetCase ?? null,
     minecraftVersion: SERVER_VERSION,
     world: {
       fresh: true,

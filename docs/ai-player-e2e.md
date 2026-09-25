@@ -12,6 +12,8 @@
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`game_action_discretion`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。targeted run全体と`integrated_result`はpassにせず、Issue全体の受け入れには通常の全case runを必要とします。
+
 実行caseの終了時に、そのcase内で最後に収集したPlayer snapshotの許可項目を、mode `0600`のrun別private JSONL sidecarへ1件保存します。収集元は`fresh_terminal`または`last_collected`として記録し、`last_collected`は失敗・停止後の状態を必ず表すものではありません。未実行caseにはsnapshotを割り当てず、公開artifactにはsidecar保持boolと固定書込失敗codeだけを出します。sidecar保存失敗は元のcase結果を変更しません。
 
 `game_action_discretion` が予算・期限で停止した場合、case artifactには最後のsnapshotに残る範囲の`place`判断・結果数、本文を保存しない占有失敗数、占有失敗後の配置判断数を追加します。履歴が途中で切れた場合の件数は下限であり、0件は試行がなかった証明にはなりません。失敗summaryや時刻が欠けた場合は欠損件数を記録し、占有判定・時系列判定を未知として扱います。runtime snapshotは操作引数を保持しないため、fixtureの穴との一致と同じ位置の再試行は既知件数0・未知件数として記録します。位置や操作IDをartifactへ加えず、判定できない値を推測で埋めません。この診断は既存のpass条件やworld oracleを変更しません。
@@ -62,6 +64,8 @@ run41（HEAD `a18b351`）はCI 7/7成功、隔離PaperでBody、runtime、自律
 run42（HEAD `d7b9c4a`）はCI 7/7成功、隔離Paperで学習再利用とSkill本文・参照量を含む7 caseがpassしました。Skill交換ではexport tool成功2回とimport tool成功1回を記録しましたが、caseは12 calls・104,973 tokensで10万tokens上限を超えました。tool成功だけでは編集済みMarkdownが同じSkill ID・版・receiptへ反映されたか、重複importが不変かを証明できません。run全体は38 calls・244,985 tokens、usage `partial_or_unknown`、cleanup 3/3です。ゲーム行動・未知状況・並行会話・統合caseは未実施です。
 
 run43（HEAD `c151088`）はCI 7/7成功、隔離PaperでSkill交換を含む8 caseがpassしました。交換は同じSkill IDへの編集反映と重複import後の版・本文・receipt不変性を照合しました。修理caseは8 calls・123,932 tokensで10万tokens上限を超え、最後のsnapshot内の`place`判断・結果は0件、cleanup前の対象穴はRCONで`air`でした。Skill交換で生じた3件のpending owner提案が次のcaseへ残り、修理依頼もpendingのまま終了しました。最後の判断の5 roundにはResponsesのcompaction itemが各1件含まれましたが、報告されたround inputは16,281から25,496 tokensへ増え、効率改善は実証できていません。run全体は62 calls・534,334 tokens、usage `partial_or_unknown`、cleanup 3/3です。未知複合状況・並行会話・統合caseは未実施です。
+
+同じHEAD `7f8b272` のrun44はBody smokeの`look`がsuccessfulでも対象stoneが5秒以内のBody観測に現れず、GPTを呼ばず未完了でした。直後の同HEAD run45ではBody smokeはpassしたため、run44の失敗は再現しませんでした。run45は自発生活caseが16 calls・108,667 tokensで10万tokens上限を超え、修理caseに未到達です。両runともCI 7/7成功、cleanup 3/3です。修理caseの持ち越し提案を待つ新しい境界はまだ実ゲームで未検証です。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 
