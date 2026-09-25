@@ -1152,6 +1152,92 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("keeps an ordinary observation queued without invalidating an in-flight decision", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    let thoughtCount = 0;
+    let firstSignal: AbortSignal | undefined;
+    let firstCommitAccepted = false;
+    let followupKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events, signal }) => {
+          thoughtCount += 1;
+          if (thoughtCount === 1) {
+            firstSignal = signal;
+            await firstThoughtGate;
+            const decision = {
+              kind: "wait" as const,
+              purpose: "observe surroundings",
+              reason: "wait for a meaningful change",
+              wakeOn: ["state_changed" as const],
+            };
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            firstCommitAccepted = saved.accepted;
+            if (saved.accepted) mind.consumeEvents(events.map(({ id }) => id));
+            return { accepted: saved.accepted, decision };
+          }
+          followupKinds = events.map(({ kind }) => kind);
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const revision = mind.snapshot().revision;
+      const before = observation();
+      body.setObservation({
+        ...before,
+        time: { ...before.time, timeOfDay: 16_000, isDay: false },
+      });
+      body.emit({
+        type: "state_changed",
+        reason: "time",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        mind.pendingEvents(64).some(({ kind }) => kind === "state_changed"),
+      );
+      expect(mind.snapshot().revision).toBe(revision);
+      expect(firstSignal?.aborted).toBe(false);
+      expect(thoughtCount).toBe(1);
+
+      releaseFirstThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(firstCommitAccepted).toBe(true);
+      expect(followupKinds).toContain("state_changed");
+    } finally {
+      releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("clears queued thought wakes on stop and does not restart after settlement", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
@@ -1435,8 +1521,16 @@ describe("integrated player runtime", () => {
     const directory = temporaryDirectory();
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     try {
+      const revision = mind.snapshot().revision;
       mind.enqueueEvent("state_changed", "meaningful change: vitals health=18");
-      mind.enqueueEvent("state_changed", "meaningful change: vitals health=16");
+      mind.enqueueEvent(
+        "state_changed",
+        "meaningful change: vitals health=16",
+        {
+          invalidateDecision: false,
+        },
+      );
+      expect(mind.snapshot().revision).toBe(revision + 2);
       const vitalEvents = mind
         .pendingEvents(64)
         .filter(
@@ -1447,6 +1541,28 @@ describe("integrated player runtime", () => {
       expect(vitalEvents[0]?.summary).toContain("health=16");
     } finally {
       mind.close();
+    }
+  });
+
+  it("persists a deferred observation event without advancing decision CAS", () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const revision = mind.snapshot().revision;
+    mind.enqueueEvent("state_changed", "ordinary world change", {
+      invalidateDecision: false,
+    });
+    expect(mind.snapshot().revision).toBe(revision);
+    mind.close();
+
+    const reopened = PlayerMindStore.open(databasePath);
+    try {
+      expect(reopened.snapshot().revision).toBe(revision);
+      expect(
+        reopened.pendingEvents(64).some(({ kind }) => kind === "state_changed"),
+      ).toBe(true);
+    } finally {
+      reopened.close();
     }
   });
 

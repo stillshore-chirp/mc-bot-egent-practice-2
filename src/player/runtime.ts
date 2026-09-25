@@ -416,7 +416,15 @@ export class PlayerRuntime {
       return;
     }
     this.#eventTimes.set(key, Number.isFinite(now) ? now : Date.now());
-    const event = this.options.mind.enqueueEvent(kind, summary);
+    const deferObservation =
+      kind === "state_changed" &&
+      !summary.includes("vitals") &&
+      this.#activeThought !== undefined;
+    const event = this.options.mind.enqueueEvent(
+      kind,
+      summary,
+      deferObservation ? { invalidateDecision: false } : undefined,
+    );
     this.#requestThought(kind, event.summary);
   }
 
@@ -448,9 +456,12 @@ export class PlayerRuntime {
       this.#queueThoughtWake(kind, reason);
       if (kind === "owner_proposal") {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
-      } else if (!this.#activeThoughtCommitted) {
-        // Every queued event advances the CAS revision. Settle an uncommitted
-        // thought early so it can decide from the new snapshot and event set.
+      } else if (
+        !this.#activeThoughtCommitted &&
+        (kind !== "state_changed" || reason.includes("vitals"))
+      ) {
+        // Decision-invalidating events advance CAS. Ordinary observation
+        // changes remain queued for the next thought after this one settles.
         activeThought.abort(new Error("new_event_preempted_thought"));
       }
       return;

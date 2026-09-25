@@ -525,13 +525,21 @@ export class PlayerMindStore {
   public enqueueEvent(
     kind: PlayerWakeKind,
     summary: string,
+    options: { readonly invalidateDecision?: boolean } = {},
   ): PlayerRuntimeEvent {
     const safeSummary = bounded(summary, 400, "event summary");
     const now = new Date().toISOString();
     const id = randomUUID();
     const transaction = this.database.transaction(() => {
-      const current = this.readStored();
-      this.writeStored({ ...current, revision: current.revision + 1 }, now);
+      // Only ordinary observations may be queued behind an in-flight thought.
+      if (
+        kind !== "state_changed" ||
+        safeSummary.includes("vitals") ||
+        options.invalidateDecision !== false
+      ) {
+        const current = this.readStored();
+        this.writeStored({ ...current, revision: current.revision + 1 }, now);
+      }
       if (kind === "state_changed" && safeSummary.includes("vitals")) {
         // Keep the latest urgent-damage signal while coalescing packet bursts.
         this.database
