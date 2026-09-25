@@ -3416,22 +3416,8 @@ async function main(): Promise<void> {
               const remainingCaseMs = context.caseDeadlineAt - Date.now();
               if (remainingCaseMs >= 180_000) {
                 const operationId = activeOperation.operationId;
-                const initialPosition = parsePosition(
-                  await rcon.command(`data get entity ${state.botName} Pos`),
-                );
-                const obstaclePlan = recoveryCagePlan(initialPosition, {
-                  x: 2_000,
-                  y: 64,
-                  z: 2_000,
-                });
-                const obstacleRcon = boundedOracleRcon(rcon);
                 updateUnknownCompositeDiagnostic(state, {
                   unknownControlledObstacleStatus: "not_attempted",
-                  unknownControlledObstaclePlayerInsideBefore:
-                    positionStandingCenteredInCage(
-                      initialPosition,
-                      obstaclePlan.sourceRegion,
-                    ),
                   unknownObstacleTickFreezeConfirmed: false,
                   unknownObstacleTickUnfreezeConfirmed: false,
                 });
@@ -3476,6 +3462,22 @@ async function main(): Promise<void> {
                     incomplete("UNKNOWN_OBSTACLE_TICK_FREEZE_NOT_CONFIRMED");
                   updateUnknownCompositeDiagnostic(state, {
                     unknownObstacleTickFreezeConfirmed: true,
+                  });
+                  const initialPosition = parsePosition(
+                    await rcon.command(`data get entity ${state.botName} Pos`),
+                  );
+                  const obstaclePlan = recoveryCagePlan(initialPosition, {
+                    x: 2_000,
+                    y: 64,
+                    z: 2_000,
+                  });
+                  const obstacleRcon = boundedOracleRcon(rcon);
+                  updateUnknownCompositeDiagnostic(state, {
+                    unknownControlledObstaclePlayerInsideBefore:
+                      positionStandingCenteredInCage(
+                        initialPosition,
+                        obstaclePlan.sourceRegion,
+                      ),
                   });
                   const obstacleResult = await withRestorableObstacle(
                     obstacleRcon,
