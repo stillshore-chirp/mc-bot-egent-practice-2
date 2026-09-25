@@ -232,6 +232,16 @@ describe("McSkillRepository", () => {
       "survival",
     ]);
     expect(summaries[0]).not.toHaveProperty("body");
+    const graphemeCount = (value: string): number =>
+      Array.from(
+        new Intl.Segmenter("ja-JP", { granularity: "grapheme" }).segment(value),
+      ).length;
+    expect(
+      summaries.every(({ bodyPreview }) => graphemeCount(bodyPreview) <= 240),
+    ).toBe(true);
+    expect(
+      summaries.find(({ id }) => id === "mc-skill-exploration")?.bodyPreview,
+    ).toContain("遮る地形");
     expect(repository.get("mc-skill-navigation").body).toContain("目的地");
     expect(repository.get("mc-skill-exploration")).toMatchObject({
       operationRefs: ["look", "move_relative", "move_to"],
@@ -262,6 +272,40 @@ describe("McSkillRepository", () => {
         .all(),
     ).not.toHaveLength(0);
     inspected.close();
+  });
+
+  it("bounds searched Skill previews while retaining the full version for explicit reading", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const body = `${"探".repeat(239)}👩‍🚀${"続行".repeat(60)}`;
+    const skill = repository.createSkill({
+      ...hypothesisInput("long-preview-skill", "長文の探索"),
+      body,
+    });
+
+    const preview = repository.search({ query: "長文の探索" })[0]?.bodyPreview;
+    expect(preview).toBeDefined();
+    expect(
+      Array.from(
+        new Intl.Segmenter("ja-JP", { granularity: "grapheme" }).segment(
+          preview ?? "",
+        ),
+      ),
+    ).toHaveLength(240);
+    expect(preview?.endsWith("👩‍🚀")).toBe(true);
+    expect(repository.get(skill.id).body).toBe(body);
+
+    const emojiSkill = repository.createSkill({
+      ...hypothesisInput("emoji-preview-skill", "絵文字の探索"),
+      body: "👩‍🚀".repeat(200),
+    });
+    const emojiPreview = repository.search({ query: "絵文字の探索" })[0]
+      ?.bodyPreview;
+    expect(Buffer.byteLength(emojiPreview ?? "", "utf8")).toBeLessThanOrEqual(
+      960,
+    );
+    expect(emojiPreview?.endsWith("👩‍🚀")).toBe(true);
+    expect(repository.get(emojiSkill.id).body).toBe("👩‍🚀".repeat(200));
   });
 
   it("keeps claims unverified without receipts and deduplicates observed outcomes", () => {

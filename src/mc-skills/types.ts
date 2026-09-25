@@ -43,6 +43,7 @@ export interface McSkillSummary {
   readonly category: McSkillCategory;
   readonly title: string;
   readonly summary: string;
+  readonly bodyPreview: string;
   readonly operationRefs: readonly string[];
   readonly confidence: number;
   readonly version: number;

@@ -51,6 +51,10 @@ const MAX_SEARCH_LIMIT = 100;
 const MAX_SKILL_PAYLOAD_BYTES = 48 * 1024;
 const MAX_EXCHANGE_FILE_BYTES = 64 * 1024;
 const MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024;
+const MAX_SKILL_PREVIEW_BYTES = 960;
+const skillPreviewSegmenter = new Intl.Segmenter("ja-JP", {
+  granularity: "grapheme",
+});
 
 const skillRecordSchema = z
   .object({
@@ -235,7 +239,7 @@ const initialSkills: readonly McSkillDefinition[] = [
     title: "周囲を調べて探索する",
     purpose: "目的地や資源候補を調べ、探索範囲を状況に合わせて決める。",
     conditions: ["未知の場所や資源候補を調べる"],
-    body: "方角だけ分かるときは相対移動で見通しを変え、実測した進み具合で次の候補を選ぶ。持ち物、帰路、危険と得られる価値を見て、続行、迂回、帰還を判断する。",
+    body: "方角だけ分かるときは相対移動で見通しを変え、実測した進み具合で次の候補を選ぶ。進行を遮る地形は通行できる空間を観測し、迂回・採掘・泳ぎなど実行できる手段を選ぶ。持ち物、帰路、危険と得られる価値を見て続行や帰還を判断する。",
     operationRefs: ["look", "move_relative", "move_to"],
     expectedOutcome: "探索の価値と帰路の見通しを観測し、次の選択肢を判断する。",
     confidence: 0,
@@ -501,6 +505,7 @@ export class McSkillRepository {
         category: row.category as McSkillCategory,
         title: row.title,
         summary: row.purpose,
+        bodyPreview: skillBodyPreview(row.body),
         operationRefs: parseStringArray(row.operation_refs_json),
         confidence: row.confidence,
         version: row.version,
@@ -1503,6 +1508,21 @@ export class McSkillRepository {
       );
     }
   }
+}
+
+function skillBodyPreview(body: string): string {
+  let preview = "";
+  let count = 0;
+  let bytes = 0;
+  for (const { segment } of skillPreviewSegmenter.segment(body)) {
+    if (count >= 240) break;
+    const segmentBytes = Buffer.byteLength(segment, "utf8");
+    if (bytes + segmentBytes > MAX_SKILL_PREVIEW_BYTES) break;
+    preview += segment;
+    count += 1;
+    bytes += segmentBytes;
+  }
+  return preview;
 }
 
 function normalizeSkill(skill: McSkillDefinition): McSkillDefinition {

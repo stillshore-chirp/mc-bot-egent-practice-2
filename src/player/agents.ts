@@ -713,7 +713,7 @@ export class PlayerPurposeAgent {
       createPlayerTool({
         name: "search_skills",
         description:
-          "目的や現在状況に関連する少数の保存済み技能仮説を検索する。",
+          "目的や現在状況に関連する少数の保存済み技能仮説を短い本文プレビュー付きで検索する。詳しい条件や本文が必要ならread_skillで確認する。",
         schema: skillSearchInput,
         execute: async ({ query, limit }) => {
           const found = this.options.skills
