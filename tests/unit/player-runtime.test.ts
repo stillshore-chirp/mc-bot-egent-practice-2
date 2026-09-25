@@ -187,6 +187,10 @@ describe("integrated player runtime", () => {
         decision: actionDecision,
       });
       expect(saved.accepted).toBe(true);
+      expect(mind.snapshot().recentJudgments.at(-1)).toMatchObject({
+        kind: "act",
+        summary: "目的に沿って look を開始",
+      });
       mind.recordOutcome({
         evidence: {
           operationId: actionDecision.operationId,

@@ -932,6 +932,9 @@ export class PlayerPurposeAgent {
               operation: parsedOperation.data,
               operationId: randomUUID(),
               expectedOutcome: value.expectedOutcome,
+              ...(value.reason.trim().length === 0
+                ? {}
+                : { reason: value.reason }),
               ...(skillId === undefined ? {} : { skillId }),
               ...(skillVersion === undefined ? {} : { skillVersion }),
               wakeOn: value.wakeOn,

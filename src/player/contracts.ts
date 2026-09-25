@@ -200,6 +200,7 @@ export type PlayerThoughtDecision =
       readonly operation: PlayerOperation;
       readonly operationId: string;
       readonly expectedOutcome: string;
+      readonly reason?: string;
       readonly skillId?: string;
       readonly skillVersion?: number;
       readonly wakeOn: readonly PlayerWakeKind[];

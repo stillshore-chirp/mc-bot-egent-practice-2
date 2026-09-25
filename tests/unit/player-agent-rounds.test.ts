@@ -117,6 +117,10 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(parameters.properties);
       expect(parameters.required).toContain("stateUpdates");
+      expect(properties.reason).toMatchObject({
+        type: "string",
+        maxLength: 400,
+      });
       expect(JSON.stringify(properties.stateUpdates)).toContain(
         '"type":"null"',
       );
@@ -160,6 +164,101 @@ describe("player agent response rounds", () => {
         afterAction.activeOperation,
       );
       expect(persistedGoals).toHaveLength(1);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("carries the bounded action reason into the next thought and reopened mind", async () => {
+    const reason = "r".repeat(400);
+    const fixture = openPurposeFixture([
+      functionCallResponse("action-with-reason", "commit_action_decision", {
+        ...actionArguments(),
+        reason,
+      }),
+      functionCallResponse("continue-after-action", "commit_action_decision", {
+        ...actionArguments(),
+        kind: "continue",
+        operationJson: "",
+        reason: "Continue observing the result.",
+      }),
+    ]);
+    let fixtureOpen = true;
+
+    try {
+      const acted = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(acted.accepted).toBe(true);
+      const expectedSummary = `目的に沿って look を開始: ${reason}`;
+      expect(fixture.mind.snapshot().recentJudgments.at(-1)).toMatchObject({
+        kind: "act",
+        summary: expectedSummary,
+      });
+      expect(expectedSummary.length).toBeLessThanOrEqual(500);
+
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(continued.decision?.kind).toBe("continue");
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const inputItems = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.input);
+      const userInput = z.record(z.string(), z.unknown()).parse(inputItems[0]);
+      const purposeInput = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(userInput.content)));
+      const runtime = z
+        .record(z.string(), z.unknown())
+        .parse(purposeInput.runtime);
+      expect(runtime.recentJudgments).toContainEqual(
+        expect.objectContaining({
+          kind: "act",
+          summary: expectedSummary,
+        }),
+      );
+
+      fixture.close();
+      fixtureOpen = false;
+      const reopened = PlayerMindStore.open(fixture.databasePath);
+      try {
+        expect(reopened.snapshot().recentJudgments).toContainEqual(
+          expect.objectContaining({
+            kind: "act",
+            summary: expectedSummary,
+          }),
+        );
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      if (fixtureOpen) fixture.close();
+    }
+  });
+
+  it("uses the legacy action summary when the model supplies an empty reason", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse("action-empty-reason", "commit_action_decision", {
+        ...actionArguments(),
+        reason: "   ",
+      }),
+    ]);
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(true);
+      expect(fixture.mind.snapshot().recentJudgments.at(-1)).toMatchObject({
+        kind: "act",
+        summary: "目的に沿って look を開始",
+      });
     } finally {
       fixture.close();
     }
@@ -807,6 +906,7 @@ type ScriptedResponse =
 
 interface PurposeFixture {
   readonly agent: PlayerPurposeAgent;
+  readonly databasePath: string;
   readonly mind: PlayerMindStore;
   readonly requests: unknown[];
   close(): void;
@@ -851,6 +951,7 @@ function openPurposeFixture(
   });
   return {
     agent,
+    databasePath,
     mind,
     requests,
     close: () => {

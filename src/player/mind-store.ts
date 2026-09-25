@@ -1647,8 +1647,12 @@ function nonnegative(value: number | undefined): number {
 
 function summarizeDecision(decision: PlayerThoughtDecision): string {
   switch (decision.kind) {
-    case "act":
-      return `目的に沿って ${decision.operation.kind} を開始`;
+    case "act": {
+      const summary = `目的に沿って ${decision.operation.kind} を開始`;
+      if (decision.reason === undefined || decision.reason.trim().length === 0)
+        return summary;
+      return `${summary}: ${bounded(decision.reason, 400, "act reason")}`;
+    }
     case "wait":
       return `待機: ${bounded(decision.reason, 300, "wait reason")}`;
     case "continue":
