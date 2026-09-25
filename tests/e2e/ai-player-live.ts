@@ -328,6 +328,9 @@ interface BodySmokeDiagnostic {
   readonly fixtureLookDetailClass: BodyDetailClass;
   readonly fixtureTargetVisibleAfterLook: boolean;
   readonly fixtureTargetBlockName: string;
+  readonly resourceTargetRconConfirmed?: boolean;
+  readonly resourceLookStatus?: BodyOperationStatus;
+  readonly resourceLookDetailClass?: BodyDetailClass;
   readonly resourceVisibleAfterSmoke?: boolean;
   readonly targetVisibleInDigBeforeSnapshot?: boolean;
   readonly targetBlockNameInDigBeforeSnapshot?: string;
@@ -862,6 +865,20 @@ function bodySmokeEvidence(
     fixtureLookDetailClass: diagnostic.fixtureLookDetailClass,
     fixtureTargetVisibleAfterLook: diagnostic.fixtureTargetVisibleAfterLook,
     fixtureTargetBlockName: diagnostic.fixtureTargetBlockName,
+    ...(diagnostic.resourceTargetRconConfirmed === undefined
+      ? {}
+      : {
+          resourceTargetRconConfirmed: diagnostic.resourceTargetRconConfirmed,
+        }),
+    ...(diagnostic.resourceLookStatus === undefined
+      ? {}
+      : { resourceLookStatus: diagnostic.resourceLookStatus }),
+    ...(diagnostic.resourceLookDetailClass === undefined
+      ? {}
+      : { resourceLookDetailClass: diagnostic.resourceLookDetailClass }),
+    ...(diagnostic.resourceVisibleAfterSmoke === undefined
+      ? {}
+      : { resourceVisibleAfterSmoke: diagnostic.resourceVisibleAfterSmoke }),
     ...(diagnostic.targetVisibleInDigBeforeSnapshot === undefined
       ? {}
       : {
@@ -4442,6 +4459,44 @@ async function runOperationSmoke(
           incomplete("BODY_OPERATION_EFFECT_NOT_CONFIRMED");
         await rcon.command(`setblock ${target.x} ${target.y} ${target.z} air`);
         await rcon.command(`clear ${state.botName} minecraft:raw_iron`);
+        if (!(await isBlock(rcon, target, "air")))
+          incomplete("BODY_SMOKE_RESOURCE_TARGET_NOT_CLEAR");
+        await rcon.command(
+          `setblock ${target.x} ${target.y} ${target.z} oak_log`,
+        );
+        const resourceTargetRconConfirmed = await isBlock(
+          rcon,
+          target,
+          "oak_log",
+        );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          resourceTargetRconConfirmed,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (!resourceTargetRconConfirmed)
+          incomplete("BODY_SMOKE_RESOURCE_FIXTURE_NOT_CONFIRMED");
+        const resourceLookResult = await body.execute(
+          {
+            kind: "look",
+            target: {
+              x: target.x + 0.5,
+              y: target.y + 0.5,
+              z: target.z + 0.5,
+            },
+          },
+          abort.signal,
+        );
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          resourceLookStatus: resourceLookResult.status,
+          resourceLookDetailClass: classifyBodyOperationDetail(
+            resourceLookResult.detail,
+          ),
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (resourceLookResult.status !== "successful")
+          incomplete("BODY_SMOKE_RESOURCE_LOOK_NOT_CONFIRMED");
         let resourceVisibleAfterSmoke = false;
         const resourceVisibilityDeadline = Date.now() + 5_000;
         while (
@@ -4454,9 +4509,8 @@ async function runOperationSmoke(
           } catch {
             incomplete("BODY_SMOKE_RESOURCE_OBSERVATION_UNAVAILABLE");
           }
-          resourceVisibleAfterSmoke = observation.perception.blocks.some(
-            ({ name }) => name === "oak_log",
-          );
+          resourceVisibleAfterSmoke =
+            observedBlockName(observation, target) === "oak_log";
           if (resourceVisibleAfterSmoke) break;
           await waitMs(
             Math.max(1, Math.min(100, resourceVisibilityDeadline - Date.now())),
@@ -4469,6 +4523,9 @@ async function runOperationSmoke(
         state.bodySmokeDiagnostic = furnaceDiagnostic;
         if (!resourceVisibleAfterSmoke)
           incomplete("BODY_SMOKE_RESOURCE_NOT_VISIBLE");
+        await rcon.command(`setblock ${target.x} ${target.y} ${target.z} air`);
+        if (!(await isBlock(rcon, target, "air")))
+          incomplete("BODY_SMOKE_RESOURCE_FIXTURE_CLEANUP_UNVERIFIED");
         const smokeEndPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
