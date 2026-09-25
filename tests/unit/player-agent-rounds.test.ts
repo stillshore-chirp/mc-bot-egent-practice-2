@@ -953,7 +953,10 @@ describe("player agent response rounds", () => {
 
   it("allows repairable operation errors and consumes wake events after commit", async () => {
     const invalidAction = actionArguments();
-    invalidAction.operationJson = JSON.stringify({ kind: "look" });
+    invalidAction.operationJson = JSON.stringify({
+      kind: "look",
+      untrusted: "opaque-argument-sentinel",
+    });
     const fixture = openPurposeFixture([
       functionCallResponse(
         "invalid-action",
@@ -981,6 +984,26 @@ describe("player agent response rounds", () => {
       expect(fixture.requests).toHaveLength(2);
       expect(JSON.stringify(fixture.requests[1])).toContain(
         "INVALID_PLAYER_OPERATION",
+      );
+      const secondRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const inputItems = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(secondRequest.input);
+      const errorOutput = inputItems.find(
+        (item) => item.type === "function_call_output",
+      );
+      const errorResult = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(errorOutput?.output)));
+      expect(errorResult).toMatchObject({
+        ok: false,
+        code: "INVALID_PLAYER_OPERATION",
+        operationSchema: { kind: "look", schema: { type: "object" } },
+      });
+      expect(JSON.stringify(errorResult)).not.toContain(
+        "opaque-argument-sentinel",
       );
       expect(fixture.mind.pendingEvents()).not.toContainEqual(
         expect.objectContaining({ id: event.id }),
