@@ -185,4 +185,6 @@ HEAD `dc72c09` の対象試験run71では、検索結果に限定したSkill本�
 
 HEAD `41319ff` のrun72は`request_error`の原因分類を読むため、全体の上限を24 calls・150,000 tokensへ下げた診断試験です。Body smokeと自発生活はpassしました。未知複合状況は18 calls・既知103,155 input / 7,131 output tokensで全体予算に達し、標的への進展、破壊、取得、帰還を確認できませんでした。safe activityの`request_error`4件は`body_outcome`2件、`stop`1件、`owner_proposal`1件で、`request_failed`は0件です。これは序盤の分類だけで、run71後半のエラー原因を示しません。同じ18 callsで`describe_operation`5件と判断入力の最大13,570文字を観測しました。後続の基本操作向け短い入力署名は、この実行結果に含まれず、呼び出し数や費用の改善は未検証です。run全体の既知使用量は139,004 tokens、usageは`partial_or_unknown`、cleanupは3/3です。
 
+HEAD `a1d1ff7` のrun73では基本4操作の短い入力署名を現行schemaから提示し、Body smokeと自発生活がpassしました。未知複合状況は30 calls・既知196,599 tokensで全体予算に達しました。別々の`move_relative`成功とサーバー上の位置変化を確認しましたが、標的への距離短縮、可視化、破壊・取得、取得物を持った帰還は未確認です。`search_skills`2件、`read_skill`3件、`describe_operation`5件を記録し、署名による照会削減は確認できませんでした。`commit_action_decision`拒否2件はこのHEADのsafe activityでは原因コードを残さず、1回の判断で6 roundを使いました。`request_error`8件は`body_outcome`4件、`stop`1件、`owner_proposal`1件、`state_changed`2件で、記録範囲に`request_failed`はありません。制御障害は適格な`move_to`が始まらず未実施です。run全体は39 calls・既知250,539 tokens、usageは`partial_or_unknown`、cleanupは3/3です。この結果だけで入力署名の費用効果や未知状況の達成を主張しません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
