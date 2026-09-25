@@ -24,6 +24,7 @@ import type {
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   PlayerRuntime,
+  semanticSignatures,
   type PlayerConversationPort,
   type PlayerPurposePort,
 } from "../../src/player/runtime.js";
@@ -41,6 +42,28 @@ afterEach(() => {
 });
 
 describe("integrated player runtime", () => {
+  it("keeps ordinary breathing and water transitions from invalidating a thought", () => {
+    const base = observation();
+    const signature = (changes: Partial<PlayerBodyObservation["self"]>) =>
+      semanticSignatures({
+        ...base,
+        self: { ...base.self, ...changes },
+      });
+    const dry = signature({ inWater: false, oxygen: 20 });
+    const dryUnknown = signature({ inWater: false, oxygen: null });
+    const wet = signature({ inWater: true, oxygen: 20 });
+    const wetBreathing = signature({ inWater: true, oxygen: 19 });
+    const wetLow = signature({ inWater: true, oxygen: 5 });
+
+    expect(dryUnknown.vitals).toBe(dry.vitals);
+    expect(wet.vitals).toBe(dry.vitals);
+    expect(wetBreathing.vitals).toBe(wet.vitals);
+    expect(wetBreathing.environment).toBe(wet.environment);
+    expect(wet.environment).not.toBe(dry.environment);
+    expect(wetLow.vitals).not.toBe(wet.vitals);
+    expect(signature({ health: 19 }).vitals).not.toBe(dry.vitals);
+  });
+
   it("persists only the bounded safe activity tail across restart", () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");

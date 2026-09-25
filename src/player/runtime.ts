@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import { oxygenObservationState } from "../domain/snapshot.js";
 import type {
   McSkillRepository,
   McSkillOutcomeStatus,
@@ -1039,7 +1040,7 @@ function sanitizeDetail(value: string): string {
   return sanitized.replace(/\s+/gu, " ").trim().slice(0, 180);
 }
 
-function semanticSignatures(
+export function semanticSignatures(
   observation: Awaited<ReturnType<PlayerBody["observe"]>>,
 ): Record<string, string> {
   const timeOfDay = observation.time.timeOfDay;
@@ -1051,15 +1052,19 @@ function semanticSignatures(
         : timeOfDay < 12_000
           ? "day"
           : "night";
+  const inWater = observation.self.inWater === true;
+  const oxygenState = oxygenObservationState(observation.self.oxygen, inWater);
   const vitals = [
     observation.self.health,
     observation.self.food,
-    observation.self.oxygen,
-    observation.self.inWater,
-    observation.self.inLava,
-    observation.self.onFire,
-    observation.self.suffocating,
+    inWater && oxygenState === "low" ? "low_oxygen" : "oxygen_not_low",
+    observation.self.inLava === true,
+    observation.self.onFire === true,
+    observation.self.suffocating === true,
   ].join("|");
+  const environment = [inWater, inWater ? oxygenState : "not_applicable"].join(
+    "|",
+  );
   const inventory = observation.self.inventory
     .map(({ name, count }) => `${name}:${count}`)
     .sort()
@@ -1089,6 +1094,7 @@ function semanticSignatures(
   const { x, y, z } = observation.self.position;
   return {
     vitals,
+    environment,
     inventory,
     entities,
     blocks: relevantBlocks,
