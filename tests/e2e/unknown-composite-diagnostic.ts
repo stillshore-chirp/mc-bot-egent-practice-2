@@ -61,7 +61,7 @@ export function classifyUnknownTaskVisibility(
 
 export function parseEntityRotation(reply: string): EntityRotation | undefined {
   const match =
-    /\[\s*(-?(?:\d+(?:\.\d*)?|\.\d+))(?:[fFdD])?\s*,\s*(-?(?:\d+(?:\.\d*)?|\.\d+))(?:[fFdD])?\s*\]\s*$/u.exec(
+    /\[\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?:[fFdD])?\s*,\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?:[fFdD])?\s*\]\s*$/u.exec(
       reply.trim(),
     );
   if (match === null) return undefined;

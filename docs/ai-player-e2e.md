@@ -39,6 +39,8 @@
 
 run36では配置先の占有、run37では配置確認後のBody可視条件未成立で未完了でした。run37の観測は占有が解消していたことを示しますが、pitch・高さ・遮蔽・観測時機のどれが原因かは区別できません。位置/yawを維持したpitch調整と高さ追従は次の検証に向けた仮説であり、実機では未確認です。新しいBody観測、RCON world判定、cleanup readbackの条件は維持します。
 
+run38は最初のRotation読取で固定code `LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE` となり、GPT呼び出し前に停止しました。安全artifactにRCON返信原文がないため、指数表記などの形式差か一時的な読取失敗かは未確定です。parserは有限な指数表記とNBT数値suffixを扱い、読み取りは限定回数だけ再試行します。raw返信はartifactに保存せず、再試行後も解釈できない場合は未完了のまま停止し、0度を仮定しません。この対応は次の実機runまで未検証です。
+
 `learning_reuse` 開始後に未完了停止したartifactには、最後に確認した段階を固定enumの `learningReuseStage` として記録します（初回fixture可視、初回dig確認、仮説作成、再利用fixture可視、再利用結果確認、版・receipt更新確認）。この値は進捗の診断だけを示し、既存のBody・DB・RCON条件を満たしたpass判定は変えません。Skill本文・IDや会話内容は含めません。
 
 隔離実行で初回の成功と仮説作成を確認し、再利用用fixtureの可視確認までに学習caseが約16万トークンを使用したため、このcaseの上限を30 calls / 30万トークンにしています。run全体の80万トークン上限と、ゲーム内結果・Skill版・receiptのpass条件は維持します。

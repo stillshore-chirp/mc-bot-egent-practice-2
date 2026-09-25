@@ -128,6 +128,8 @@ const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 500;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
+const ROTATION_READ_MAX_ATTEMPTS = 3;
+const ROTATION_READ_RETRY_DELAY_MS = 100;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
@@ -5721,9 +5723,7 @@ async function orientForLearningLogFixture(
   botName: string,
   position: Position,
 ): Promise<Position> {
-  const previousRotation = parseEntityRotation(
-    await rcon.command(`data get entity ${botName} Rotation`),
-  );
+  const previousRotation = await readLearningFixtureRotation(rcon, botName);
   if (previousRotation === undefined)
     incomplete("LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
   await rcon.command(
@@ -5741,17 +5741,40 @@ async function orientForLearningLogFixture(
   ) {
     incomplete("LEARNING_LOG_FIXTURE_POSITION_READBACK_MISMATCH");
   }
-  const rotation = parseEntityRotation(
-    await rcon.command(`data get entity ${botName} Rotation`),
-  );
+  const rotation = await readLearningFixtureRotation(rcon, botName);
+  if (rotation === undefined)
+    incomplete("LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
   if (
-    rotation === undefined ||
     angularDistance(rotation.yaw, previousRotation.yaw) > 2 ||
     Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
   ) {
     incomplete("LEARNING_LOG_FIXTURE_FACING_NOT_CONFIRMED");
   }
   return confirmedPosition;
+}
+
+async function readLearningFixtureRotation(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<ReturnType<typeof parseEntityRotation>> {
+  for (let attempt = 1; attempt <= ROTATION_READ_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const rotation = parseEntityRotation(
+        await rcon.command(`data get entity ${botName} Rotation`),
+      );
+      if (rotation !== undefined) return rotation;
+    } catch (error) {
+      const retryableRconFailure =
+        error instanceof HarnessError &&
+        (error.code === "RCON_TIMEOUT" ||
+          error.code === "RCON_UNAVAILABLE" ||
+          error.code === "RCON_COMMAND_FAILED");
+      if (!retryableRconFailure) throw error;
+    }
+    if (attempt < ROTATION_READ_MAX_ATTEMPTS)
+      await waitMs(ROTATION_READ_RETRY_DELAY_MS);
+  }
+  return undefined;
 }
 
 async function removeLearningLogFixture(

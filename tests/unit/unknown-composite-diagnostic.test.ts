@@ -49,6 +49,14 @@ describe("unknown fixture facing evidence", () => {
     expect(isFacingUnknownFixture(rotation)).toBe(true);
   });
 
+  it("parses finite scientific notation with optional NBT suffixes", () => {
+    const rotation = parseEntityRotation("Entity data: [2.7E+2f, 0e0d]");
+
+    expect(rotation).toEqual({ yaw: 270, pitch: 0 });
+    expect(isFacingUnknownFixture(rotation)).toBe(true);
+    expect(parseEntityRotation("Entity data: [1e999, 0]")).toBeUndefined();
+  });
+
   it("rejects unparsable or misdirected rotation readback", () => {
     expect(parseEntityRotation("Entity data unavailable")).toBeUndefined();
     expect(parseEntityRotation("Entity data [270, 0], readback failed")).toBe(
