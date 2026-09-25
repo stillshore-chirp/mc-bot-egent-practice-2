@@ -59,6 +59,7 @@ const stallCheckMs = 5_000;
 const stallAfterMs = 20_000;
 const minimumDigTimeoutMs = 35_000;
 const digServerUpdateGraceMs = 5_000;
+const placeServerUpdateGraceMs = 5_000;
 const maximumDigTimeoutMs = 5 * 60_000;
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
@@ -327,6 +328,8 @@ function timeoutFor(operation: PlayerOperation, bot: Bot): number {
       return 45_000;
     case "dig":
       return digTimeoutFor(bot, operation.position);
+    case "place":
+      return 15_000 + placeServerUpdateGraceMs;
     case "craft":
     case "trade":
     case "enchant":
@@ -883,10 +886,15 @@ function captureServerBlockUpdates(
     signal: AbortSignal,
     timeoutMs: number,
   ): Promise<boolean>;
+  waitForTargetNamedUpdate(
+    signal: AbortSignal,
+    timeoutMs: number,
+    expectedName: string,
+  ): Promise<boolean>;
   dispose(): void;
 } {
   const updates = new Map<string, ServerBlockUpdate>();
-  const targetAirWaiters = new Set<() => void>();
+  const targetUpdateWaiters = new Set<() => void>();
   const client = bot._client as unknown as PacketClient;
   const accept = (point: Vec3, stateId: number): void => {
     if (blockKey(point) !== blockKey(target) || !Number.isInteger(stateId))
@@ -897,8 +905,7 @@ function captureServerBlockUpdates(
       name: state?.name ?? (stateId === 0 ? "air" : "unknown"),
     };
     updates.set(blockKey(point), update);
-    if (["air", "cave_air", "void_air"].includes(update.name))
-      targetAirWaiters.forEach((notify) => notify());
+    targetUpdateWaiters.forEach((notify) => notify());
   };
   const single = (raw: unknown): void => {
     if (typeof raw !== "object" || raw === null) return;
@@ -981,40 +988,53 @@ function captureServerBlockUpdates(
   };
   client.on("block_change", single);
   client.on("multi_block_change", multi);
-  const hasTargetAirUpdate = (): boolean => {
-    const update = updates.get(blockKey(target));
-    return (
-      update !== undefined &&
-      ["air", "cave_air", "void_air"].includes(update.name)
-    );
+  const waitForMatchingTargetUpdate = (
+    signal: AbortSignal,
+    timeoutMs: number,
+    matches: (update: ServerBlockUpdate) => boolean,
+  ): Promise<boolean> => {
+    const hasMatchingUpdate = (): boolean => {
+      const update = updates.get(blockKey(target));
+      return update !== undefined && matches(update);
+    };
+    if (hasMatchingUpdate()) return Promise.resolve(true);
+    if (signal.aborted || timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (confirmed: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        targetUpdateWaiters.delete(onTargetUpdate);
+        resolve(confirmed);
+      };
+      const onTargetUpdate = (): void => {
+        if (hasMatchingUpdate()) finish(true);
+      };
+      const onAbort = (): void => finish(false);
+      targetUpdateWaiters.add(onTargetUpdate);
+      signal.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(() => finish(hasMatchingUpdate()), timeoutMs);
+      if (signal.aborted) finish(false);
+    });
   };
   return {
     updates,
-    waitForTargetAirUpdate: (signal, timeoutMs) => {
-      if (hasTargetAirUpdate()) return Promise.resolve(true);
-      if (signal.aborted || timeoutMs <= 0) return Promise.resolve(false);
-      return new Promise((resolve) => {
-        let settled = false;
-        const finish = (confirmed: boolean): void => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          signal.removeEventListener("abort", onAbort);
-          targetAirWaiters.delete(onTargetAir);
-          resolve(confirmed);
-        };
-        const onTargetAir = (): void => finish(true);
-        const onAbort = (): void => finish(false);
-        targetAirWaiters.add(onTargetAir);
-        signal.addEventListener("abort", onAbort, { once: true });
-        const timer = setTimeout(() => finish(hasTargetAirUpdate()), timeoutMs);
-        if (signal.aborted) finish(false);
-      });
-    },
+    waitForTargetAirUpdate: (signal, timeoutMs) =>
+      waitForMatchingTargetUpdate(signal, timeoutMs, (update) =>
+        ["air", "cave_air", "void_air"].includes(update.name),
+      ),
+    waitForTargetNamedUpdate: (signal, timeoutMs, expectedName) =>
+      waitForMatchingTargetUpdate(
+        signal,
+        timeoutMs,
+        (update) => update.name === expectedName,
+      ),
     dispose: () => {
       client.removeListener("block_change", single);
       client.removeListener("multi_block_change", multi);
-      targetAirWaiters.clear();
+      targetUpdateWaiters.clear();
     },
   };
 }
@@ -1225,6 +1245,16 @@ export class MineflayerPlayerBody implements PlayerBody {
             controller.signal,
             digServerUpdateGraceMs,
           );
+        if (operation.kind === "place" && blockEvidence !== undefined) {
+          const expectedBlockName = operation.item.endsWith("_bucket")
+            ? operation.item.slice(0, -"_bucket".length)
+            : operation.item;
+          await blockEvidence.waitForTargetNamedUpdate(
+            controller.signal,
+            placeServerUpdateGraceMs,
+            expectedBlockName,
+          );
+        }
       }
     } catch (error) {
       commandError = error;

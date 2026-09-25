@@ -423,6 +423,34 @@ function beginPendingDig(
   };
 }
 
+function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
+  const target = new Vec3(0, 64, -2);
+  const support = new Vec3(0, 64, -3);
+  const supportBlock = makeBlock("stone", 1, support);
+  fake.blocks.set("0,64,-3", supportBlock);
+  fake.candidates.push(support);
+  fake.setCrosshairRaycastResult(supportBlock);
+  const inventory = fake.bot.inventory as unknown as {
+    slots: (Record<string, unknown> | null)[];
+  };
+  inventory.slots[36] = {
+    type: 4,
+    name: "oak_planks",
+    count: 1,
+    metadata: 0,
+    enchants: [],
+    nbt: null,
+  };
+  const registry = fake.bot.registry as unknown as {
+    blocksByStateId: Record<number, { name: string }>;
+    blocksByName: Record<string, { id: number; name: string }>;
+  };
+  registry.blocksByStateId[4] = { name: "oak_planks" };
+  registry.blocksByName.oak_planks = { id: 4, name: "oak_planks" };
+  Object.assign(fake.bot, { equip: vi.fn(async () => undefined) });
+  return target;
+}
+
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
     expect(playerOperationNames).toHaveLength(28);
@@ -864,6 +892,86 @@ describe("player body", () => {
         position: { x: 0, y: 64, z: -2 },
       });
       expect(serverConfirmed.status).toBe("successful");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for the target's server block update after native placement resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const target = preparePlaceFixture(fake);
+      let markStarted!: () => void;
+      let resolvePlace!: (position: Vec3) => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const nativePlace = new Promise<Vec3>((resolve) => {
+        resolvePlace = resolve;
+      });
+      Object.assign(fake.bot, {
+        _genericPlace: vi.fn(() => {
+          markStarted();
+          return nativePlace;
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const resultPromise = body.execute({
+        kind: "place",
+        position: { x: 0, y: 64, z: -2 },
+        item: "oak_planks",
+        face: "south",
+      });
+      await Promise.race([
+        started,
+        resultPromise.then((result) => {
+          throw new Error(
+            `Placement ended before native call: ${result.detail}`,
+          );
+        }),
+      ]);
+      resolvePlace(target);
+      let completed = false;
+      void resultPromise.then(() => {
+        completed = true;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(completed).toBe(false);
+
+      fake.blocks.set("0,64,-2", makeBlock("oak_planks", 4, target));
+      (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+        location: { x: 0, y: 64, z: -2 },
+        type: 4,
+      });
+      const result = await resultPromise;
+      expect(result.status).toBe("successful");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a locally changed placement unverified without a server block update", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const target = preparePlaceFixture(fake);
+      Object.assign(fake.bot, {
+        _genericPlace: vi.fn(async () => {
+          fake.blocks.set("0,64,-2", makeBlock("oak_planks", 4, target));
+          return target;
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const resultPromise = body.execute({
+        kind: "place",
+        position: { x: 0, y: 64, z: -2 },
+        item: "oak_planks",
+        face: "south",
+      });
+      await vi.advanceTimersByTimeAsync(5_001);
+      const result = await resultPromise;
+      expect(result.status).toBe("unverified");
     } finally {
       vi.useRealTimers();
     }

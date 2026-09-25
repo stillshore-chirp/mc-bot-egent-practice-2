@@ -28,6 +28,8 @@ Skill交換caseが停止した時は、export依頼・export確認・import依�
 
 連続caseで以前のowner提案がまだpendingなら、`game_action_discretion`のfixture準備前に最大45秒だけ自然な解決を待ちます。残れば固定code `PRIOR_OWNER_PROPOSALS_UNRESOLVED` で未完了とし、新しい修理依頼を重ねません。対象は既に存在するproposalの状態だけで、ハーネスが採用・辞退やgoal完了を代理で決めることはありません。待機中のusageもrun全体の上限に含めます。
 
+設置操作ではMineflayerのnative place完了後、対象セルへ期待したブロック名のサーバー更新が届くまで最大5秒待ってからBody結果を確定します。更新packetとクライアントの読取状態が一致しなければ従来どおり`unverified`です。E2EのRCON readbackは別のgame oracleであり、Bodyの未検証結果を自動的に成功へ変えません。
+
 `persistent_memory_restart` の失敗artifactは、記憶依頼へのconversation完了、`remember_owner_fact`の呼出しと固定結果分類、owner reply受信、DB保存のstageを示します。terminal conversationが保存toolを呼ばなければ`OWNER_FACT_TOOL_NOT_CALLED`、保存拒否なら`OWNER_FACT_SAVE_REJECTED`でcaseを未完了にし、その後の自律thoughtでcase予算を使い切る前に原因を分けます。再起動後のDB欠落と回答不一致は既存の固定failure codeで識別します。予算停止をpassへ変えず、DB保存・同一DB再起動・合成phrase回答の条件も変えません。事実本文、tool引数、会話本文はartifactへ出しません。
 
 ## Issue #72 の機械的な確認範囲
@@ -66,6 +68,8 @@ run42（HEAD `d7b9c4a`）はCI 7/7成功、隔離Paperで学習再利用とSkill
 run43（HEAD `c151088`）はCI 7/7成功、隔離PaperでSkill交換を含む8 caseがpassしました。交換は同じSkill IDへの編集反映と重複import後の版・本文・receipt不変性を照合しました。修理caseは8 calls・123,932 tokensで10万tokens上限を超え、最後のsnapshot内の`place`判断・結果は0件、cleanup前の対象穴はRCONで`air`でした。Skill交換で生じた3件のpending owner提案が次のcaseへ残り、修理依頼もpendingのまま終了しました。最後の判断の5 roundにはResponsesのcompaction itemが各1件含まれましたが、報告されたround inputは16,281から25,496 tokensへ増え、効率改善は実証できていません。run全体は62 calls・534,334 tokens、usage `partial_or_unknown`、cleanup 3/3です。未知複合状況・並行会話・統合caseは未実施です。
 
 同じHEAD `7f8b272` のrun44はBody smokeの`look`がsuccessfulでも対象stoneが5秒以内のBody観測に現れず、GPTを呼ばず未完了でした。直後の同HEAD run45ではBody smokeはpassしたため、run44の失敗は再現しませんでした。run45は自発生活caseが16 calls・108,667 tokensで10万tokens上限を超え、修理caseに未到達です。両runともCI 7/7成功、cleanup 3/3です。修理caseの持ち越し提案を待つ新しい境界はまだ実ゲームで未検証です。
+
+run46（HEAD `9c94326`）は後段の修理caseだけを選び、非OP Body smokeはpass、未選択10 caseと統合結果は未完了として保存しました。CI 7/7成功です。修理caseでは先行pending提案0件、`place`判断・結果各1件を記録し、cleanup前の穴はRCONで`oak_planks`でした。しかしBodyの`place`結果は`unverified`で、16 calls・103,883 tokensで10万tokens上限を超えたためcaseは未完了です。private診断の固定分類はnative place受付後の効果未観測で、timeoutではありません。設置のサーバー更新待機を加え、遅延更新なら成功、クライアント内だけの変更なら未検証のままとする単体テストを追加しました。新しい待機は次の実ゲームrunまで未検証です。run46のcleanupは3/3です。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 
