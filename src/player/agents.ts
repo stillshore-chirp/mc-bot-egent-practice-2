@@ -1256,6 +1256,7 @@ export class PlayerPurposeAgent {
       "身体操作は常に一つだけです。実行中なら観測と新提案を見てcontinue、switch、waitから判断してください。新しい操作が確定すると前の操作を中断してsettle後に置換します。不要な操作や何もしない実行を重ねないでください。",
       "activeな目的の対象がまだ見えない時は、視線を変える、見通せる場所へ移動するなど、自分で情報を増やせる操作を検討してください。対象が未確認という理由だけで利用者の追加指示を待ち続けず、waitは時間や外部イベントで状況が変わる見込みがある時に選んでください。",
       "runtime.recentMovementは保持されたBody結果の正味変位で、対象との距離や経路の成否ではありません。迂回で一時的に遠ざかる場合も、通過する目印と元の目的方向へ戻る契機を判断してください。",
+      "runtime.recentActionPatternは保持された操作結果の短い並びです。視線変更や近距離移動が続いた時は、目的について新しく確認できたことと次の手段を見直してください。操作の成功だけを目的の進捗とみなさないでください。",
       "観測のcoordinateAxesはMinecraft座標の東西南北、self.facingCardinalは可視判定と同じyawから導いた現在の向きです。可視blockのpositionは絶対座標で、まだ見えていない対象の位置を補う情報ではありません。",
       "spatialHistoryは以前の視点で実際に見えた同名ブロックの最小・最大座標です。間に連続した壁があるとは限らず、今も同じ状態とは限りません。見えなかった場所を通路や障害物と断定せず、迂回後は過去の視点と現在位置を比べて目的方向への進路を見直してください。",
       "body操作がfailed、unverified、interrupted、cancelledになったら、結果詳細と最新の可視観測を照合し、目的が残っているか判断してください。目的が残るなら失敗原因に応じて空き位置・材料・経路などを変えた実行可能な案を選び、根拠なく同じ引数を繰り返さないでください。owner goalはゲーム内の達成結果を観測で確認してからcompletedにし、続行できない場合は未達のままactive/pausedに保つか、妥協・辞退を選んでください。",
@@ -1567,6 +1568,7 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
       .slice(-8)
       .map(compactMovementOutcome),
     recentMovement: compactRecentMovement(snapshot),
+    recentActionPattern: compactRecentActionPattern(snapshot),
     learningReferences: snapshot.learningReferences.slice(-8),
     skillActivity: snapshot.skillActivity
       .slice(-12)
@@ -1575,23 +1577,7 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
 }
 
 function compactRecentMovement(snapshot: PlayerRuntimeSnapshot): unknown {
-  const activeOwnerProposalTimes = snapshot.goals
-    .filter(
-      ({ source, status, ownerProposalId }) =>
-        source === "owner" &&
-        status === "active" &&
-        ownerProposalId !== undefined,
-    )
-    .map(
-      ({ ownerProposalId }) =>
-        snapshot.proposals.find(({ id }) => id === ownerProposalId)?.createdAt,
-    )
-    .map((createdAt) => Date.parse(createdAt ?? ""))
-    .filter(Number.isFinite);
-  const latestOwnerProposalAt =
-    activeOwnerProposalTimes.length === 0
-      ? undefined
-      : Math.max(...activeOwnerProposalTimes);
+  const latestOwnerProposalAt = latestActiveOwnerProposalAt(snapshot);
   const movement = snapshot.recentOutcomes.filter(
     ({ movementDelta, observedAt }) =>
       movementDelta !== undefined &&
@@ -1619,6 +1605,47 @@ function compactRecentMovement(snapshot: PlayerRuntimeSnapshot): unknown {
       z: approximate(net.z),
     },
   };
+}
+
+function compactRecentActionPattern(snapshot: PlayerRuntimeSnapshot): unknown {
+  const latestOwnerProposalAt = latestActiveOwnerProposalAt(snapshot);
+  const relevant = snapshot.recentOutcomes.filter(
+    ({ observedAt }) =>
+      latestOwnerProposalAt === undefined ||
+      Date.parse(observedAt) >= latestOwnerProposalAt,
+  );
+  const recent = relevant.slice(-12);
+  return {
+    scope:
+      latestOwnerProposalAt === undefined
+        ? "retained_outcomes"
+        : "since_latest_active_owner_proposal_in_retained_outcomes",
+    omittedCount: Math.max(0, relevant.length - recent.length),
+    sequence: recent.map(({ kind, status }) => ({ kind, status })),
+  };
+}
+
+function latestActiveOwnerProposalAt(
+  snapshot: PlayerRuntimeSnapshot,
+): number | undefined {
+  const activeOwnerProposalTimes = snapshot.goals
+    .filter(
+      ({ source, status, ownerProposalId }) =>
+        source === "owner" &&
+        status === "active" &&
+        ownerProposalId !== undefined,
+    )
+    .map(
+      ({ ownerProposalId }) =>
+        snapshot.proposals.find(({ id }) => id === ownerProposalId)?.createdAt,
+    )
+    .map((createdAt) => Date.parse(createdAt ?? ""))
+    .filter(Number.isFinite);
+  const latestOwnerProposalAt =
+    activeOwnerProposalTimes.length === 0
+      ? undefined
+      : Math.max(...activeOwnerProposalTimes);
+  return latestOwnerProposalAt;
 }
 
 function compactMovementOutcome(

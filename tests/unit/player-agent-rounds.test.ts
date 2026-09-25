@@ -140,6 +140,18 @@ describe("player agent response rounds", () => {
         sampleCount: 2,
         netApproxBlocks: { x: 2, y: 0, z: -1 },
       });
+      expect(compactedRuntime.recentActionPattern).toEqual({
+        scope: "retained_outcomes",
+        omittedCount: 0,
+        sequence: [
+          { kind: "move_to", status: "successful" },
+          { kind: "move_relative", status: "failed" },
+          ...Array.from({ length: 4 }, () => ({
+            kind: "look",
+            status: "successful",
+          })),
+        ],
+      });
       expect(compactedRuntime.recentJudgments).toEqual(
         longHistory.recentJudgments.slice(-4),
       );
@@ -208,6 +220,11 @@ describe("player agent response rounds", () => {
         scope: "since_latest_active_owner_proposal_in_retained_outcomes",
         sampleCount: 1,
         netApproxBlocks: { x: -0.1, y: 0, z: 4.1 },
+      });
+      expect(compacted.recentActionPattern).toEqual({
+        scope: "since_latest_active_owner_proposal_in_retained_outcomes",
+        omittedCount: 0,
+        sequence: [{ kind: "move_relative", status: "successful" }],
       });
     } finally {
       fixture.close();
