@@ -183,4 +183,6 @@ HEAD `058735f` の対象試験run70では、通常観測を進行中思考の後
 
 HEAD `dc72c09` の対象試験run71では、検索結果に限定したSkill本文プレビューを追加した状態でBody smokeと自発生活がpassしました。未知複合状況では`search_skills`と`read_skill`をそれぞれ1回実行し、Skill本文へ到達する経路を確認しました。サーバー観測では標的への距離短縮とworld変化を確認しましたが、標的は見えず、破壊・取得も未確認です。障害物の介入は適格条件を満たさず、失敗後の回復は確認できませんでした。34 calls・既知108,066 input / 7,740 output tokensでcase呼び出し上限となりました。safe activityの`request_error`は19件で、プレビューによる達成率・使用量改善は断定できません。case usageは`partial_or_unknown`、cleanupは3/3です。
 
+HEAD `41319ff` のrun72は`request_error`の原因分類を読むため、全体の上限を24 calls・150,000 tokensへ下げた診断試験です。Body smokeと自発生活はpassしました。未知複合状況は18 calls・既知103,155 input / 7,131 output tokensで全体予算に達し、標的への進展、破壊、取得、帰還を確認できませんでした。safe activityの`request_error`4件は`body_outcome`2件、`stop`1件、`owner_proposal`1件で、`request_failed`は0件です。これは序盤の分類だけで、run71後半のエラー原因を示しません。同じ18 callsで`describe_operation`5件と判断入力の最大13,570文字を観測しました。後続の基本操作向け短い入力署名は、この実行結果に含まれず、呼び出し数や費用の改善は未検証です。run全体の既知使用量は139,004 tokens、usageは`partial_or_unknown`、cleanupは3/3です。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
