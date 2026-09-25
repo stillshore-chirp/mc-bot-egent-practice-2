@@ -64,6 +64,27 @@ function passage(doorName: "oak_door" | "iron_door", open: boolean) {
 }
 
 describe("navigation through doors", () => {
+  it("avoids a diagonal through a blocked corner while retaining a clear detour", () => {
+    const { movements } = passage("iron_door", false);
+    const neighbors = movements.getNeighbors({
+      x: 0,
+      y: 64,
+      z: 0,
+      remainingBlocks: 0,
+      cost: 0,
+      toBreak: [],
+      toPlace: [],
+      parkour: false,
+      hash: "0,64,0",
+    });
+    expect(
+      neighbors.some(({ x, y, z }) => x === 1 && y === 64 && z === 1),
+    ).toBe(false);
+    expect(
+      neighbors.some(({ x, y, z }) => x === 0 && y === 64 && z === 1),
+    ).toBe(true);
+  });
+
   it("keeps unloaded cells impassable without crashing path search", () => {
     const { movements, bot } = passage("oak_door", false);
     vi.spyOn(bot, "blockAt").mockReturnValueOnce(null);

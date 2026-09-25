@@ -23,6 +23,8 @@
 
 目的エージェントには29種類のoperation kindと短い説明を提示します。`look`、`move_to`、`move_relative`、`dig`には現行schemaから生成した短い入力署名も添え、参照済みの現行schemaは直近4種・合計4,096文字以内で再提示します。未提示または引数が不明なschemaは必要時に `describe_operation` で取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証し、既知kindの入力不正ならそのschemaを返して同じ判断内で修正できるようにします。`move_relative` は現在位置を起点とする有界な相対移動で、方角は分かるが目標座標が未観測の探索に使えます。指定offsetが到達許容range以下なら移動せずに到達済みと判定されうるため入力を拒否し、成功は実際のBody前後観測で到達と移動の両方を確認します。
 
+経路追従はMineflayer pathfinderへ委ねます。`NavigationMovements`は平地の斜め移動で両脇の足元と頭上に通行空間を要求し、壁の角を抜ける実行不能な経路を避けます。Bodyは`path_update`の状態と経路長を座標なしの内部eventとして通知できます。このeventだけで到着や操作成功とは判定せず、Bodyの前後観測とサーバー側の確認を用います。
+
 行動判断時のgoal変更、owner proposal解決、fact/uncertainty更新は、必要なものを`commit_action_decision.stateUpdates`へ含めると同じrevision CAS transactionで確定します。更新なしは`null`で表し、`commit_goal_state`と`update_understanding`も判断途中の単独更新用に残しています。`continue`と状態更新を同時に確定しても、進行中body操作の`actionRevision`は変わりません。goal mirrorの外部記憶保存に失敗した場合もMindStoreのcommitとaction dispatchは維持し、tool結果の`goalMemoryPersisted: false`で区別します。run13までの統合試験では自律生活の完了に至っておらず、各修正によるAPI呼び出し・token削減効果も比較条件を揃えて検証していません。
 
 目的エージェントは `commit_action_decision` の永続commitが成功した時点で判断を完了し、余分な最終LLM roundを要求しません。CAS不一致はtool code `STALE_REVISION` と理由 `CAS_STALE`、停止は `STOPPED` で同じthought内の再試行を終え、次回の判断へ渡します。進行中操作がない`continue`とpendingでないproposalはそれぞれ `NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` として返し、同じthought内で修正できます。未commitのthoughtでは受領eventを消費せず、commit後にだけ消費します。会話エージェントは返答文を必要とするため、tool後の最終応答を引き続き取得します。
