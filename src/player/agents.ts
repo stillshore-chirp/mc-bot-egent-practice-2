@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import { mcSkillCategories } from "../mc-skills/index.js";
 import type {
   McSkillRepository,
   CreateMcSkillInput,
@@ -760,20 +761,32 @@ export class PlayerPurposeAgent {
       createPlayerTool({
         name: "search_skills",
         description:
-          "目的や現在状況に関連する少数の保存済み技能仮説を短い本文プレビュー付きで検索する。詳しい条件や本文が必要ならread_skillで確認する。",
+          "目的や現在状況に関連する保存済み技能仮説を短い本文プレビュー付きで検索する。語句が一致しない場合は基礎Skillのカテゴリ候補を最大7件返す。使うSkillはread_skillで本文と版を確認する。",
         schema: skillSearchInput,
         execute: async ({ query, limit }) => {
-          const found = this.options.skills
-            .search({ query, limit })
-            .slice(0, 8);
+          const directMatches = this.options.skills.search({ query, limit });
+          const found =
+            directMatches.length > 0
+              ? directMatches.slice(0, 8)
+              : mcSkillCategories.flatMap((category) => {
+                  const seeded = this.options.skills
+                    .search({ categories: [category], limit: 100 })
+                    .find((skill) => skill.id === `mc-skill-${category}`);
+                  return seeded === undefined ? [] : [seeded];
+                });
           for (const skill of found)
             this.options.mind.recordSkillActivity({
               kind: "consulted",
               skillId: skill.id,
               version: skill.version,
-              summary: "目的に関連する技能候補を検索",
+              summary:
+                directMatches.length > 0
+                  ? "目的に関連する技能候補を検索"
+                  : "語句不一致のため基礎技能のカテゴリ候補を提示",
             });
-          return found;
+          return directMatches.length > 0
+            ? found
+            : { matchMode: "category_fallback", candidates: found };
         },
       }),
       createPlayerTool({

@@ -112,6 +112,45 @@ afterEach(() => {
 });
 
 describe("on-demand player operation schemas", () => {
+  it("offers base skill categories when a full task phrase has no literal match", async () => {
+    const { agent, mind, requests, close } = createPurposeAgent([
+      completedResponse([
+        {
+          type: "function_call",
+          call_id: "search-task-skill",
+          name: "search_skills",
+          arguments: JSON.stringify({
+            query: "見知らぬ島で資材を探して戻る",
+            limit: 3,
+          }),
+        },
+      ]),
+      completedResponse(),
+    ]);
+    try {
+      await agent.think({ snapshot: mind.snapshot(), events: [] });
+      const request = z.record(z.string(), z.unknown()).parse(requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.input);
+      const output = input.find((item) => item.type === "function_call_output");
+      const result = z
+        .object({
+          matchMode: z.literal("category_fallback"),
+          candidates: z.array(
+            z.object({ id: z.string(), category: z.string() }),
+          ),
+        })
+        .parse(JSON.parse(String(output?.output)));
+      expect(result.candidates).toHaveLength(7);
+      expect(result.candidates.map(({ id }) => id)).toContain(
+        "mc-skill-navigation",
+      );
+    } finally {
+      close();
+    }
+  });
+
   it("discovers every operation and returns its exact execution schema branch", async () => {
     const parameters = z
       .record(z.string(), z.unknown())
