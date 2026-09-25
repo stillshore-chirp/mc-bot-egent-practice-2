@@ -65,9 +65,11 @@ import {
   isFacingUnknownFixture,
   parseEntityRotation,
   safeUnknownOperationKind,
+  unknownHandoffCaseBlockCode,
   UNKNOWN_FIXTURE_PITCH,
   UNKNOWN_FIXTURE_YAW,
   type SafeUnknownOperationKind,
+  type UnknownHandoffDependencyState,
 } from "./unknown-composite-diagnostic.js";
 import {
   projectPlayerSnapshot,
@@ -253,6 +255,7 @@ interface UnknownCompositeDiagnostic {
   readonly unknownHandoffResumed?: boolean;
   readonly unknownHandoffActiveAfterResume?: boolean;
   readonly unknownHandoffTaskSent?: boolean;
+  readonly unknownHandoffDependencyBlocked?: boolean;
 }
 
 type BodyOperationStatus =
@@ -1439,6 +1442,7 @@ interface RunState {
   autonomousBaseline?: WorldSnapshot;
   autonomousSmokeBaseline?: WorldSnapshot;
   autonomousRegion?: BlockRegion;
+  unknownHandoffDependency?: UnknownHandoffDependencyState;
   copiedServerCacheAreas?: string[];
   privateServerLogStream: WriteStream | undefined;
   privateDiagnosticLogPath?: string;
@@ -1718,6 +1722,10 @@ async function main(): Promise<void> {
       CASE_DEADLINES.unknown_composite,
       requireLiveContext(),
       async (context) => {
+        state.unknownHandoffDependency = "pending";
+        updateUnknownCompositeDiagnostic(state, {
+          unknownHandoffDependencyBlocked: true,
+        });
         const handoff = await stopAndRestartForUnknownCase(state, context);
         context = handoff.context;
         const stopGeneration = handoff.stopGeneration;
@@ -1889,6 +1897,10 @@ async function main(): Promise<void> {
           beforePlayer.stopGeneration <= stopGeneration
         )
           incomplete("UNKNOWN_AUTONOMY_RESUME_NOT_CONFIRMED");
+        state.unknownHandoffDependency = "resumed";
+        updateUnknownCompositeDiagnostic(state, {
+          unknownHandoffDependencyBlocked: false,
+        });
         const beforeRevision = beforePlayer.actionRevision;
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffActiveAfterResume: isOperationActive(beforePlayer),
@@ -4596,6 +4608,11 @@ async function runCase(
   try {
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
+    const dependencyFailure = unknownHandoffCaseBlockCode(
+      id,
+      state.unknownHandoffDependency ?? "not_started",
+    );
+    if (dependencyFailure !== undefined) incomplete(dependencyFailure);
     caseExecuted = true;
     if (liveContext !== undefined) {
       initial = countersOf(await collect(liveContext.runtime.app));

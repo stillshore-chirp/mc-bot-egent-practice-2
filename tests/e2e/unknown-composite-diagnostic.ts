@@ -15,6 +15,9 @@ export interface EntityRotation {
   readonly pitch: number;
 }
 
+export type UnknownHandoffDependencyState =
+  "not_started" | "pending" | "resumed";
+
 // The fixture wall and task target are along +X; Java yaw -90 faces east (+X).
 export const UNKNOWN_FIXTURE_YAW = -90;
 export const UNKNOWN_FIXTURE_PITCH = 0;
@@ -28,6 +31,15 @@ export function safeUnknownOperationKind(
   return value !== undefined && knownOperationNames.has(value)
     ? (value as SafeUnknownOperationKind)
     : "unknown";
+}
+
+export function unknownHandoffCaseBlockCode(
+  caseId: string,
+  state: UnknownHandoffDependencyState,
+): "UNKNOWN_HANDOFF_DEPENDENCY_FAILED" | undefined {
+  return caseId !== "unknown_composite" && state === "pending"
+    ? "UNKNOWN_HANDOFF_DEPENDENCY_FAILED"
+    : undefined;
 }
 
 export function classifyUnknownTaskVisibility(
