@@ -191,4 +191,6 @@ HEAD `8a9dd4a` のrun74ではBody smokeと自発生活がpassしました。未�
 
 HEAD `b0a6312` のrun75ではBody smokeと自発生活がpassしました。未知複合状況は33 calls・既知158,765 tokens、run全体は41 calls・既知195,994 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。1件の採用されたowner proposalに紐付くactive owner goalは1件で、紐付かないowner goalは0件となり、run74で見つかった重複保存の解消を隔離実環境でも確認しました。`move_to`成功5件とサーバー上の移動はありましたが、採集対象への距離短縮・破壊・取得・帰還は未確認です。最初の課題後観測では壁材だけが見え、標的と水は見えていませんでした。制御障害は適格条件を満たさずskipされ、失敗後の回復は未確認です。`describe_operation`4件、判断commit成功11件、学習提案成功2件を記録しました。対象へ近づかなかった理由はこの診断だけでは確定できず、同条件の再試行を完了証拠にはしません。
 
+HEAD `4f87077` のrun76では現在の方角と座標軸を判断入力へ加え、Body smokeと自発生活がpassしました。未知複合状況は33 calls・既知199,751 tokens、run全体は41 calls・既知245,487 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。複数の相対移動成功とサーバー上で開始地点から10ブロック以上の移動を確認しましたが、標的への距離短縮、破壊・取得・帰還は未確認です。最初の課題後観測では壁材は見え、標的と水は見えませんでした。制御障害は適格な操作が始まらず未実施です。方角の提示が進捗を改善したとは主張しません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
