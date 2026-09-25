@@ -175,6 +175,13 @@ type PlayerOperationName = (typeof playerOperationNames)[number];
 type PlayerJudgmentKind = "act" | "wait" | "continue" | "complete";
 type PlayerOutcomeStatus =
   "successful" | "failed" | "interrupted" | "cancelled" | "unverified";
+type LearningReuseStage =
+  | "initial_fixture_visible"
+  | "first_dig_confirmed"
+  | "hypothesis_created"
+  | "reuse_fixture_visible"
+  | "reuse_result_confirmed"
+  | "revision_verified";
 type SafeEvidenceValue =
   boolean | number | string | readonly PlayerAgentRoundActivity[];
 type SafeEvidence = Readonly<Record<string, SafeEvidenceValue>>;
@@ -1136,6 +1143,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
             state.persistentMemoryDiagnostic.factPersisted,
         }
       : {}),
+    ...(caseId === "learning_reuse" && state.learningReuseStage !== undefined
+      ? { learningReuseStage: state.learningReuseStage }
+      : {}),
   };
 }
 
@@ -1493,6 +1503,7 @@ interface RunState {
   countersFinal?: Counters;
   lastKnownPlayerDiagnostic?: SafeEvidence;
   autonomousLifeProgress?: SafeAutonomousProgress;
+  learningReuseStage?: LearningReuseStage;
   unknownCompositeDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
   failureCode?: string;
@@ -2068,6 +2079,7 @@ async function main(): Promise<void> {
         );
         if (firstFixtureObservation === undefined)
           incomplete("LEARNING_LOG_FIXTURE_NOT_VISIBLE");
+        state.learningReuseStage = "initial_fixture_visible";
         const before = playerOf(await collect(context.runtime.app));
         const beforeActions = before.actionRevision;
         const responseStart = context.responseQueue.length;
@@ -2112,6 +2124,7 @@ async function main(): Promise<void> {
         ) {
           incomplete("LEARNING_ACTION_NOT_CONFIRMED_BY_SERVER");
         }
+        state.learningReuseStage = "first_dig_confirmed";
         await removeLearningLogFixture(rcon, firstLogs);
         activeLearningLogs = [];
         let learned = readSkillSnapshot(state.databasePath);
@@ -2143,6 +2156,7 @@ async function main(): Promise<void> {
             learned.successfulDerivedSkillIds.has(skillId) &&
             !learnedBaseline.successfulDerivedSkillIds.has(skillId),
         );
+        state.learningReuseStage = "hypothesis_created";
 
         const beforeReuse = readSkillSnapshot(state.databasePath);
         const reuseOrigin = parsePosition(
@@ -2166,6 +2180,7 @@ async function main(): Promise<void> {
         );
         if (reuseFixtureObservation === undefined)
           incomplete("LEARNING_REUSE_LOG_FIXTURE_NOT_VISIBLE");
+        state.learningReuseStage = "reuse_fixture_visible";
         const reuseRegion = await captureBlockBaseline(rcon, reuseOrigin);
         const beforeReuseWorld = await readWorldSnapshot(
           rcon,
@@ -2243,12 +2258,14 @@ async function main(): Promise<void> {
         ) {
           incomplete("REUSED_SKILL_HAS_NO_OBSERVED_RESULT");
         }
+        state.learningReuseStage = "reuse_result_confirmed";
         if (
           !consultedLearnedSkillRevisionAdvanced ||
           afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
         ) {
           incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
         }
+        state.learningReuseStage = "revision_verified";
         await removeLearningLogFixture(rcon, reuseLogs);
         activeLearningLogs = [];
         return {
