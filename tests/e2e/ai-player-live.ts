@@ -186,6 +186,14 @@ type LearningReuseStage =
   | "reuse_fixture_visible"
   | "reuse_result_confirmed"
   | "revision_verified";
+type LearningFixturePhase = "initial" | "reuse";
+type GameActionFixtureHoleReadback = "oak_planks" | "air" | "unknown";
+interface LearningFixtureDiagnostic {
+  readonly phase: LearningFixturePhase;
+  readonly placementConfirmedCount: number;
+  readonly freshBodyObservationSeen: boolean;
+  readonly oakLogVisibleInFreshObservation: boolean;
+}
 type SafeEvidenceValue =
   boolean | number | string | readonly PlayerAgentRoundActivity[];
 type SafeEvidence = Readonly<Record<string, SafeEvidenceValue>>;
@@ -1151,6 +1159,18 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "learning_reuse" && state.learningReuseStage !== undefined
       ? { learningReuseStage: state.learningReuseStage }
       : {}),
+    ...(caseId === "learning_reuse" &&
+    state.learningFixtureDiagnostic !== undefined
+      ? {
+          learningFixturePhase: state.learningFixtureDiagnostic.phase,
+          learningFixturePlacementConfirmedCount:
+            state.learningFixtureDiagnostic.placementConfirmedCount,
+          learningFixtureFreshBodyObservationSeen:
+            state.learningFixtureDiagnostic.freshBodyObservationSeen,
+          learningFixtureOakLogVisible:
+            state.learningFixtureDiagnostic.oakLogVisibleInFreshObservation,
+        }
+      : {}),
   };
 }
 
@@ -1164,6 +1184,8 @@ function safeGameActionFailureEvidence(
     return {
       gameActionSnapshotAvailable: false,
       gameActionOperationArgumentsAvailable: false,
+      gameActionFixtureHoleReadback:
+        state.gameActionFixtureHoleReadback ?? "unknown",
     };
   }
 
@@ -1220,6 +1242,8 @@ function safeGameActionFailureEvidence(
   return {
     gameActionSnapshotAvailable: true,
     gameActionOperationArgumentsAvailable: false,
+    gameActionFixtureHoleReadback:
+      state.gameActionFixtureHoleReadback ?? "unknown",
     gameActionPlaceDecisionCount: placeDecisions.length,
     gameActionPlaceOutcomeCount: placeOutcomes.length,
     gameActionPlaceFailedOutcomeCount: failedPlaceOutcomes.length,
@@ -1258,6 +1282,42 @@ function updateUnknownCompositeDiagnostic(
   };
 }
 
+function beginLearningFixtureDiagnostic(
+  state: RunState,
+  phase: LearningFixturePhase,
+): void {
+  state.learningFixtureDiagnostic = {
+    phase,
+    placementConfirmedCount: 0,
+    freshBodyObservationSeen: false,
+    oakLogVisibleInFreshObservation: false,
+  };
+}
+
+function recordLearningFixtureObservation(
+  state: RunState,
+  configuredAt: number,
+  player: PlayerEvidence,
+): boolean {
+  const diagnostic = state.learningFixtureDiagnostic;
+  if (diagnostic === undefined) return false;
+  const observedAt = player.lastObservation?.observedAt;
+  const isFresh =
+    observedAt !== undefined &&
+    Number.isFinite(Date.parse(observedAt)) &&
+    Date.parse(observedAt) >= configuredAt;
+  const oakLogVisible =
+    isFresh &&
+    player.lastObservation?.visibleBlockNames?.includes("oak_log") === true;
+  state.learningFixtureDiagnostic = {
+    ...diagnostic,
+    freshBodyObservationSeen: diagnostic.freshBodyObservationSeen || isFresh,
+    oakLogVisibleInFreshObservation:
+      diagnostic.oakLogVisibleInFreshObservation || oakLogVisible,
+  };
+  return isFresh && oakLogVisible;
+}
+
 function boundedOracleRcon(rcon: LocalRcon): OracleRcon {
   return {
     command: (command, timeoutMs) =>
@@ -1269,6 +1329,21 @@ function boundedOracleRcon(rcon: LocalRcon): OracleRcon {
         ),
       ),
   };
+}
+
+async function readGameActionFixtureHoleReadback(
+  rcon: LocalRcon,
+  target: BlockPosition,
+): Promise<GameActionFixtureHoleReadback> {
+  const boundedRcon = boundedOracleRcon(rcon);
+  try {
+    if (await blockIs(boundedRcon, target, "oak_planks", incomplete))
+      return "oak_planks";
+    if (await blockIs(boundedRcon, target, "air", incomplete)) return "air";
+  } catch {
+    // Keep private RCON replies and coordinates out of failure evidence.
+  }
+  return "unknown";
 }
 
 async function nearbyEntitiesClear(
@@ -1603,6 +1678,8 @@ interface RunState {
   lastKnownPlayerDiagnostic?: SafeEvidence;
   autonomousLifeProgress?: SafeAutonomousProgress;
   learningReuseStage?: LearningReuseStage;
+  learningFixtureDiagnostic?: LearningFixtureDiagnostic;
+  gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
   unknownCompositeDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
   failureCode?: string;
@@ -2155,6 +2232,7 @@ async function main(): Promise<void> {
       requireLiveContext(),
       async (context) => {
         const learnedBaseline = readSkillSnapshot(state.databasePath);
+        beginLearningFixtureDiagnostic(state, "initial");
         const initialPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -2165,7 +2243,14 @@ async function main(): Promise<void> {
         );
         const firstLogs = await availableLogFixtureSites(rcon, origin);
         activeLearningLogs = firstLogs;
-        await configureLogFixture(rcon, firstLogs, state.botName);
+        await configureLogFixture(rcon, firstLogs, state.botName, (count) => {
+          const diagnostic = state.learningFixtureDiagnostic;
+          if (diagnostic !== undefined)
+            state.learningFixtureDiagnostic = {
+              ...diagnostic,
+              placementConfirmedCount: count,
+            };
+        });
         const firstLogsConfiguredAt = Date.now();
         const firstRegion = await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
@@ -2176,14 +2261,12 @@ async function main(): Promise<void> {
         const firstFixtureObservation = await observeForPlayer(
           context,
           15_000,
-          (player) => {
-            const observation = player.lastObservation;
-            return (
-              observation?.observedAt !== undefined &&
-              Date.parse(observation.observedAt) >= firstLogsConfiguredAt &&
-              observation.visibleBlockNames?.includes("oak_log") === true
-            );
-          },
+          (player) =>
+            recordLearningFixtureObservation(
+              state,
+              firstLogsConfiguredAt,
+              player,
+            ),
         );
         if (firstFixtureObservation === undefined)
           incomplete("LEARNING_LOG_FIXTURE_NOT_VISIBLE");
@@ -2267,6 +2350,7 @@ async function main(): Promise<void> {
         state.learningReuseStage = "hypothesis_created";
 
         const beforeReuse = readSkillSnapshot(state.databasePath);
+        beginLearningFixtureDiagnostic(state, "reuse");
         const reusePosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -2277,19 +2361,24 @@ async function main(): Promise<void> {
         );
         const reuseLogs = await availableLogFixtureSites(rcon, reuseOrigin);
         activeLearningLogs = reuseLogs;
-        await configureLogFixture(rcon, reuseLogs, state.botName);
+        await configureLogFixture(rcon, reuseLogs, state.botName, (count) => {
+          const diagnostic = state.learningFixtureDiagnostic;
+          if (diagnostic !== undefined)
+            state.learningFixtureDiagnostic = {
+              ...diagnostic,
+              placementConfirmedCount: count,
+            };
+        });
         const reuseLogsConfiguredAt = Date.now();
         const reuseFixtureObservation = await observeForPlayer(
           context,
           15_000,
-          (player) => {
-            const observation = player.lastObservation;
-            return (
-              observation?.observedAt !== undefined &&
-              Date.parse(observation.observedAt) >= reuseLogsConfiguredAt &&
-              observation.visibleBlockNames?.includes("oak_log") === true
-            );
-          },
+          (player) =>
+            recordLearningFixtureObservation(
+              state,
+              reuseLogsConfiguredAt,
+              player,
+            ),
         );
         if (reuseFixtureObservation === undefined)
           incomplete("LEARNING_REUSE_LOG_FIXTURE_NOT_VISIBLE");
@@ -2713,28 +2802,46 @@ async function main(): Promise<void> {
           "近くにある木の板の壁の目線の高さに1マスの穴があります。持たせた板材で埋めて修理し、配置結果を確かめてください。手順は自分で判断してください。ブロックごとに確認を求める必要はありません。危険を感じた場合も、取るかどうかは自分で判断してください。",
         );
         const checkedPlaceOutcomeIds = new Set<string>();
-        const after = await waitForPlayer(
-          context,
-          CASE_DEADLINES.game_action_discretion - 60_000,
-          async (player) => {
-            if (player.actionRevision <= beforeActionRevision) return false;
-            const newSuccessfulPlacements = newOutcomes(before, player).filter(
-              (outcome) =>
-                outcome.kind === "place" && outcome.status === "successful",
-            );
-            for (const outcome of newSuccessfulPlacements) {
-              if (checkedPlaceOutcomeIds.has(outcome.operationId)) continue;
-              checkedPlaceOutcomeIds.add(outcome.operationId);
-              const readbackDeadline = Date.now() + 1_500;
-              do {
-                if (await isBlock(rcon, buildingFixture.target, "oak_planks"))
-                  return true;
-                if (Date.now() < readbackDeadline) await waitMs(250);
-              } while (Date.now() < readbackDeadline);
-            }
-            return false;
-          },
-        );
+        let after: PlayerEvidence;
+        try {
+          after = await waitForPlayer(
+            context,
+            CASE_DEADLINES.game_action_discretion - 60_000,
+            async (player) => {
+              if (player.actionRevision <= beforeActionRevision) return false;
+              const newSuccessfulPlacements = newOutcomes(
+                before,
+                player,
+              ).filter(
+                (outcome) =>
+                  outcome.kind === "place" && outcome.status === "successful",
+              );
+              for (const outcome of newSuccessfulPlacements) {
+                if (checkedPlaceOutcomeIds.has(outcome.operationId)) continue;
+                checkedPlaceOutcomeIds.add(outcome.operationId);
+                const readbackDeadline = Date.now() + 1_500;
+                do {
+                  if (await isBlock(rcon, buildingFixture.target, "oak_planks"))
+                    return true;
+                  if (Date.now() < readbackDeadline) await waitMs(250);
+                } while (Date.now() < readbackDeadline);
+              }
+              return false;
+            },
+          );
+        } catch (error) {
+          if (
+            error instanceof HarnessError &&
+            error.code.includes("BUDGET_EXCEEDED")
+          ) {
+            state.gameActionFixtureHoleReadback =
+              await readGameActionFixtureHoleReadback(
+                rcon,
+                buildingFixture.target,
+              );
+          }
+          throw error;
+        }
         const afterWorld = await readWorldSnapshot(
           rcon,
           state.botName,
@@ -5705,6 +5812,7 @@ async function configureLogFixture(
   rcon: LocalRcon,
   logs: readonly BlockPosition[],
   botName: string,
+  onPlacementConfirmed: (confirmedCount: number) => void,
 ): Promise<void> {
   await rcon.command(`clear ${botName} minecraft:oak_log`);
   for (const log of logs) {
@@ -5712,9 +5820,12 @@ async function configureLogFixture(
       incomplete("LEARNING_LOG_FIXTURE_SITE_OCCUPIED");
     await rcon.command(`setblock ${log.x} ${log.y} ${log.z} oak_log`);
   }
+  let confirmedCount = 0;
   for (const log of logs) {
     if (!(await isBlock(rcon, log, "oak_log")))
       incomplete("LEARNING_LOG_FIXTURE_NOT_CONFIRMED");
+    confirmedCount += 1;
+    onPlacementConfirmed(confirmedCount);
   }
 }
 
