@@ -43,7 +43,7 @@ body eventを種類ごとにまとめ、意味のあるvitals、inventory、enti
 
 ## 技能と学習
 
-技能は一度の全件投入ではなく、現在の目的に合わせて `McSkillRepository.search()`、個別skill、履歴を必要時だけ検索します。操作前のtrusted観測条件とbodyの実際の前後観測から結果receiptを作ります。モデル自身はtrusted receiptを作れません。成功観測は経験から新しい技能仮説を作る材料にでき、失敗・成功観測は使用したskill revisionの条件や手順を改訂する材料にできます。同じrunからの仮説作成は冪等です。後の実行はskill/versionをreceiptへ固定し、統計に一度だけ結び付けます。skills、receipts、outcomes、MindStoreは同じ設定済みSQLite databaseに保存されるため、再起動後も学習と参照が残ります。
+技能は一度の全件投入ではなく、現在の目的に合わせて `McSkillRepository.search()`、個別skill、履歴を必要時だけ検索します。操作前のtrusted観測条件とbodyの実際の前後観測から結果receiptを作ります。モデル自身はtrusted receiptを作れません。未登録で他の場面にも使える方法を得た成功なら、一度の成功だけで仮説Skillを作成し、同じ仕事を無検討に続ける前に保存します。真に一度限りの操作や同等の既存Skillは除き、重複・日誌的な技能を避けます。作成した仮説Skillを後の操作で使った場合は、そのskill/versionに一致する次のtrusted receiptの成功・失敗を反映して改訂します。同じrunからの仮説作成は冪等です。後の実行はskill/versionをreceiptへ固定し、統計に一度だけ結び付けます。skills、receipts、outcomes、MindStoreは同じ設定済みSQLite databaseに保存されるため、再起動後も学習と参照が残ります。
 
 Markdown import/exportは専用の `mc-skills` exchange directoryを使います。importした本文は未信頼の知識で、system指示、認可、停止境界を変更しません。export結果はownerへローカルのファイル位置を返します。
 
