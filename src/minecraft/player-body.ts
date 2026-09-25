@@ -600,14 +600,12 @@ function operationEvidence(
       afterPos.z - beforePos.z,
     ) > 0.15;
   switch (operation.kind) {
-    case "move_to":
-      return (
-        Math.hypot(
-          afterPos.x - operation.position.x,
-          afterPos.y - operation.position.y,
-          afterPos.z - operation.position.z,
-        ) <= operation.range
-      );
+    case "move_to": {
+      const dx = Math.floor(afterPos.x) - Math.floor(operation.position.x);
+      const dy = Math.floor(afterPos.y) - Math.floor(operation.position.y);
+      const dz = Math.floor(afterPos.z) - Math.floor(operation.position.z);
+      return dx * dx + dy * dy + dz * dz <= operation.range * operation.range;
+    }
     case "look": {
       const target = positionVector(operation.target);
       const eye = new Vec3(

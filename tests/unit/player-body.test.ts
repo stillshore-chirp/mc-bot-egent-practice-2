@@ -787,6 +787,23 @@ describe("player body", () => {
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
+  it("confirms move_to using GoalNear's floored block range", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.entity.position.x = 4;
+    });
+
+    const result = await body.execute({
+      kind: "move_to",
+      position: { x: 5.9, y: 64, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("successful");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
   it("removes the move_to path listener when goto rejects", async () => {
     const fake = makeFakeBot();
     const body = new MineflayerPlayerBody(() => fake.bot);
