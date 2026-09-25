@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import minecraftData from "minecraft-data";
 import prismarineBlock from "prismarine-block";
 import type { Bot } from "mineflayer";
@@ -64,6 +64,15 @@ function passage(doorName: "oak_door" | "iron_door", open: boolean) {
 }
 
 describe("navigation through doors", () => {
+  it("keeps unloaded cells impassable without crashing path search", () => {
+    const { movements, bot } = passage("oak_door", false);
+    vi.spyOn(bot, "blockAt").mockReturnValueOnce(null);
+
+    const unknown = movements.getBlock(new Vec3(0, 64, 0), 4, 0, 0);
+    expect(unknown.safe).toBe(false);
+    expect(unknown.physical).toBe(false);
+  });
+
   it("plans an interaction through a closed wooden door without digging or placing", () => {
     const { movements } = passage("oak_door", false);
     const neighbors = movements.getNeighbors({

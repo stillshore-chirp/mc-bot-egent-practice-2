@@ -3,8 +3,10 @@ import type { Block } from "prismarine-block";
 import { Movements, type SafeBlock } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 
-export function isHandOperableDoor(name: string): boolean {
-  return name.endsWith("_door") && name !== "iron_door";
+export function isHandOperableDoor(name: unknown): boolean {
+  return (
+    typeof name === "string" && name.endsWith("_door") && name !== "iron_door"
+  );
 }
 
 /** Resolve either half of a door to the lower block used for interaction. */
