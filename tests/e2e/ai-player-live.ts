@@ -1973,7 +1973,7 @@ async function main(): Promise<void> {
         );
         const firstLogs = await configureLogFixture(
           rcon,
-          4,
+          1,
           origin,
           state.botName,
         );
@@ -2003,7 +2003,7 @@ async function main(): Promise<void> {
         const responseStart = context.responseQueue.length;
         sendChat(
           context.owner,
-          "すぐ近くに置いたオークの原木を4本集めてください。方法と順序は自分で選び、実際に集め終わったかを確かめてください。",
+          "すぐ近くに置いたオークの原木を1本集めてください。方法と順序は自分で選び、実際に集め終わったかを確かめてください。",
         );
         let firstFixtureCheckAt = 0;
         let firstFixtureGone = false;
@@ -2042,7 +2042,20 @@ async function main(): Promise<void> {
         ) {
           incomplete("LEARNING_ACTION_NOT_CONFIRMED_BY_SERVER");
         }
-        const learned = readSkillSnapshot(state.databasePath);
+        let learned = readSkillSnapshot(state.databasePath);
+        const hasNewTrustedHypothesis = (snapshot: SkillSnapshot): boolean =>
+          [...snapshot.skillIds].some(
+            (skillId) =>
+              !learnedBaseline.skillIds.has(skillId) &&
+              snapshot.successfulDerivedSkillIds.has(skillId) &&
+              !learnedBaseline.successfulDerivedSkillIds.has(skillId),
+          );
+        if (!hasNewTrustedHypothesis(learned)) {
+          await observeForPlayer(context, 30_000, () => {
+            learned = readSkillSnapshot(state.databasePath);
+            return hasNewTrustedHypothesis(learned);
+          });
+        }
         const newSkillIds = [...learned.skillIds].filter(
           (id) => !learnedBaseline.skillIds.has(id),
         );
@@ -2065,7 +2078,7 @@ async function main(): Promise<void> {
         );
         const reuseLogs = await configureLogFixture(
           rcon,
-          2,
+          1,
           reuseOrigin,
           state.botName,
         );
@@ -2083,7 +2096,7 @@ async function main(): Promise<void> {
         const consultedLearnedSkillIds = new Set<string>();
         sendChat(
           context.owner,
-          "近くに少量のオークの原木を用意しました。集めてください。前回の方法が今も役立つと判断したら自分で選んで活用してください。",
+          "近くにオークの原木を1本用意しました。集めてください。前回の方法が今も役立つと判断したら自分で選んで活用してください。",
         );
         let reuseFixtureCheckAt = 0;
         let reuseFixtureGone = false;
@@ -5329,18 +5342,15 @@ async function configureLogFixture(
   botName: string,
 ): Promise<readonly BlockPosition[]> {
   const base = fixturePoint(origin, 5, 4);
-  await rcon.command(`clear ${botName} minecraft:oak_log`);
-  await rcon.command(
-    `fill ${base.x} ${base.y} ${base.z} ${base.x} ${base.y + 3} ${base.z} oak_log`,
-  );
-  const allLogs = Array.from({ length: 4 }, (_, offset) => ({
+  const logs = Array.from({ length: count }, (_, offset) => ({
     ...base,
     y: base.y + offset,
   }));
-  for (const log of allLogs.slice(count)) {
-    await rcon.command(`setblock ${log.x} ${log.y} ${log.z} air`);
-  }
-  return allLogs.slice(0, count);
+  await rcon.command(`clear ${botName} minecraft:oak_log`);
+  await rcon.command(
+    `fill ${base.x} ${base.y} ${base.z} ${base.x} ${base.y + count - 1} ${base.z} oak_log`,
+  );
+  return logs;
 }
 
 async function configureBuildingFixture(

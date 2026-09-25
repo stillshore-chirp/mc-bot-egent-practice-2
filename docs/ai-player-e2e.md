@@ -31,7 +31,7 @@
 | DBとMarkdownの往復    | `skill_exchange` はexportしたファイル名と同一Skill IDをimport活動・DBで照合し、合成編集marker、同IDの版・receipt更新、同じファイルの再import試行後に同IDの本文・版・receiptが変わらないことを確認します。                                                                                                                                                                                                                                                                                               |
 | 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                                                                                                                                                                                                                                                                                      |
 
-`observation_boundary` は返信とoracleの確認後、合成の壁・チェストをRCONで除去し、空気のreadbackを確認して後続caseへ進みます。`learning_reuse` は原木fixture設置後15秒以内に取得した新しいBody観測へ`oak_log`が含まれることをowner依頼前に確認します。見えなければ固定codeで未完了停止し、GPT依頼を送りません。
+`observation_boundary` は返信とoracleの確認後、合成の壁・チェストをRCONで除去し、空気のreadbackを確認して後続caseへ進みます。`learning_reuse` は原木fixture設置後15秒以内に取得した新しいBody観測へ`oak_log`が含まれることをowner依頼前に確認します。見えなければ固定codeで未完了停止し、GPT依頼を送りません。学習fixtureは初回と再利用時に原木を1本ずつ用意し、初回の成功結果後は既存のcase/run期限と使用量上限の範囲内で最大30秒だけ新しい検証済み仮説を確認します。確認できなければ固定codeで未完了停止します。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 
