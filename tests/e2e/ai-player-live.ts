@@ -501,6 +501,7 @@ interface PlayerEvidence {
     readonly operationId: string;
     readonly kind?: string;
     readonly status?: string;
+    readonly summary?: string;
     readonly observedAt?: string;
     readonly skillId?: string;
     readonly skillVersion?: number;
@@ -1151,6 +1152,100 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
   };
 }
 
+function safeGameActionFailureEvidence(
+  state: RunState,
+  evidence: Evidence | undefined,
+): SafeEvidence {
+  const player = evidence?.player;
+  const baseline = state.gameActionEvidenceBaseline;
+  if (player === undefined || baseline === undefined) {
+    return {
+      gameActionSnapshotAvailable: false,
+      gameActionOperationArgumentsAvailable: false,
+    };
+  }
+
+  const placeDecisions = player.recentJudgments.filter(
+    (judgment) =>
+      judgment.revision > baseline.revision &&
+      judgment.kind === "act" &&
+      judgment.operationKind === "place",
+  );
+  const placeOutcomes = player.recentOutcomes.filter(
+    (outcome) =>
+      !baseline.outcomeOperationIds.has(outcome.operationId) &&
+      outcome.kind === "place",
+  );
+  const failedPlaceOutcomes = placeOutcomes.filter(
+    (outcome) => Reflect.get(outcome, "status") === "failed",
+  );
+  let failureSummaryMissingCount = 0;
+  const occupiedFailures: typeof failedPlaceOutcomes = [];
+  for (const outcome of failedPlaceOutcomes) {
+    const summary: unknown = Reflect.get(outcome, "summary");
+    if (typeof summary !== "string" || summary.trim() === "") {
+      failureSummaryMissingCount += 1;
+    } else if (
+      summary.toLocaleLowerCase("en-US").includes("target position is occupied")
+    ) {
+      occupiedFailures.push(outcome);
+    }
+  }
+  const decisionTimes = placeDecisions.map((decision) => {
+    const decidedAt: unknown = Reflect.get(decision, "decidedAt");
+    return typeof decidedAt === "string" ? Date.parse(decidedAt) : Number.NaN;
+  });
+  const occupiedFailureTimes = occupiedFailures.map((outcome) => {
+    const observedAt: unknown = Reflect.get(outcome, "observedAt");
+    return typeof observedAt === "string" ? Date.parse(observedAt) : Number.NaN;
+  });
+  const placeDecisionTimestampMissingCount = decisionTimes.filter(
+    (timestamp) => !Number.isFinite(timestamp),
+  ).length;
+  const occupiedFailureTimestampMissingCount = occupiedFailureTimes.filter(
+    (timestamp) => !Number.isFinite(timestamp),
+  ).length;
+  const orderingAvailable =
+    failureSummaryMissingCount === 0 &&
+    placeDecisionTimestampMissingCount === 0 &&
+    occupiedFailureTimestampMissingCount === 0;
+  const decisionsAfterOccupiedFailure = orderingAvailable
+    ? decisionTimes.filter((decisionAt) =>
+        occupiedFailureTimes.some((failureAt) => failureAt < decisionAt),
+      ).length
+    : 0;
+
+  return {
+    gameActionSnapshotAvailable: true,
+    gameActionOperationArgumentsAvailable: false,
+    gameActionPlaceDecisionCount: placeDecisions.length,
+    gameActionPlaceOutcomeCount: placeOutcomes.length,
+    gameActionPlaceFailedOutcomeCount: failedPlaceOutcomes.length,
+    gameActionOccupiedPlaceFailureCount: occupiedFailures.length,
+    gameActionPlaceFailureSummaryMissingCount: failureSummaryMissingCount,
+    gameActionPlaceDecisionTimestampMissingCount:
+      placeDecisionTimestampMissingCount,
+    gameActionOccupiedFailureTimestampMissingCount:
+      occupiedFailureTimestampMissingCount,
+    gameActionPlaceDecisionOrderingAvailable: orderingAvailable,
+    ...(orderingAvailable
+      ? {
+          gameActionPlaceDecisionAfterOccupiedFailureCount:
+            decisionsAfterOccupiedFailure,
+        }
+      : {}),
+    gameActionPlaceDecisionAfterOccupiedFailureUnknownCount: orderingAvailable
+      ? 0
+      : placeDecisions.length,
+    gameActionFixtureHoleMatchKnownCount: 0,
+    gameActionFixtureHoleMatchUnknownCount: placeDecisions.length,
+    gameActionSameTargetRetryKnownCount: 0,
+    gameActionSameTargetRetryUnknownCount: orderingAvailable
+      ? decisionsAfterOccupiedFailure
+      : placeDecisions.length,
+  };
+}
+
 function updateUnknownCompositeDiagnostic(
   state: RunState,
   diagnostic: UnknownCompositeDiagnostic,
@@ -1514,6 +1609,10 @@ interface RunState {
   serverProcessExited?: boolean;
   loopbackListenersClosed?: boolean;
   preStartPlayer?: PlayerEvidence;
+  gameActionEvidenceBaseline?: {
+    readonly revision: number;
+    readonly outcomeOperationIds: ReadonlySet<string>;
+  };
   autonomousBaseline?: WorldSnapshot;
   autonomousSmokeBaseline?: WorldSnapshot;
   autonomousRegion?: BlockRegion;
@@ -2600,6 +2699,12 @@ async function main(): Promise<void> {
         if (wallObservation === undefined)
           incomplete("BUILDING_WALL_NOT_VISIBLE");
         const before = playerOf(await collect(context.runtime.app));
+        state.gameActionEvidenceBaseline = {
+          revision: before.revision,
+          outcomeOperationIds: new Set(
+            before.recentOutcomes.map(({ operationId }) => operationId),
+          ),
+        };
         const beforeActionRevision = before.actionRevision;
         sendChat(
           context.owner,
@@ -5099,8 +5204,8 @@ async function runCase(
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
         caseStatus === "incomplete");
     if (usageUncertain) state.usageUncertain = true;
+    const lastEvidence = terminalEvidence ?? snapshotCapture.latestEvidence;
     if (caseExecuted) {
-      const lastEvidence = terminalEvidence ?? snapshotCapture.latestEvidence;
       await retainCasePlayerSnapshot(
         state,
         id,
@@ -5144,6 +5249,9 @@ async function runCase(
           : safeFailureEvidence(state, id)),
         ...(id === "unknown_composite"
           ? (state.unknownCompositeDiagnostic ?? {})
+          : {}),
+        ...(id === "game_action_discretion" && /BUDGET|DEADLINE/u.test(reason)
+          ? safeGameActionFailureEvidence(state, lastEvidence)
           : {}),
       },
       reason,

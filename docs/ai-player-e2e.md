@@ -14,6 +14,8 @@
 
 実行caseの終了時に、そのcase内で最後に収集したPlayer snapshotの許可項目を、mode `0600`のrun別private JSONL sidecarへ1件保存します。収集元は`fresh_terminal`または`last_collected`として記録し、`last_collected`は失敗・停止後の状態を必ず表すものではありません。未実行caseにはsnapshotを割り当てず、公開artifactにはsidecar保持boolと固定書込失敗codeだけを出します。sidecar保存失敗は元のcase結果を変更しません。
 
+`game_action_discretion` が予算・期限で停止した場合、case artifactには最後のsnapshotに残る範囲の`place`判断・結果数、本文を保存しない占有失敗数、占有失敗後の配置判断数を追加します。履歴が途中で切れた場合の件数は下限であり、0件は試行がなかった証明にはなりません。失敗summaryや時刻が欠けた場合は欠損件数を記録し、占有判定・時系列判定を未知として扱います。runtime snapshotは操作引数を保持しないため、fixtureの穴との一致と同じ位置の再試行は既知件数0・未知件数として記録します。位置や操作IDをartifactへ加えず、判定できない値を推測で埋めません。この診断は既存のpass条件やworld oracleを変更しません。
+
 `persistent_memory_restart` の失敗artifactは、記憶依頼へのconversation完了、`remember_owner_fact`の呼出しと固定結果分類、owner reply受信、DB保存のstageを示します。terminal conversationが保存toolを呼ばなければ`OWNER_FACT_TOOL_NOT_CALLED`、保存拒否なら`OWNER_FACT_SAVE_REJECTED`でcaseを未完了にし、その後の自律thoughtでcase予算を使い切る前に原因を分けます。再起動後のDB欠落と回答不一致は既存の固定failure codeで識別します。予算停止をpassへ変えず、DB保存・同一DB再起動・合成phrase回答の条件も変えません。事実本文、tool引数、会話本文はartifactへ出しません。
 
 ## Issue #72 の機械的な確認範囲
