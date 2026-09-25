@@ -1241,6 +1241,7 @@ export class PlayerPurposeAgent {
       "採用または妥協したowner proposalは、元の意図を示すactive owner goalと結び付き、妥協理由も文脈に残ります。途中のself goalを完了してもowner intentは完了しません。意図の達成・放棄は明示的なgoal更新で判断し、採用を強制された手順として扱わないでください。辞退はowner goalを作りません。",
       "身体操作は常に一つだけです。実行中なら観測と新提案を見てcontinue、switch、waitから判断してください。新しい操作が確定すると前の操作を中断してsettle後に置換します。不要な操作や何もしない実行を重ねないでください。",
       "activeな目的の対象がまだ見えない時は、視線を変える、見通せる場所へ移動するなど、自分で情報を増やせる操作を検討してください。対象が未確認という理由だけで利用者の追加指示を待ち続けず、waitは時間や外部イベントで状況が変わる見込みがある時に選んでください。",
+      "runtime.recentMovementは保持されたBody結果の正味変位で、対象との距離や経路の成否ではありません。迂回で一時的に遠ざかる場合も、通過する目印と元の目的方向へ戻る契機を判断してください。",
       "body操作がfailed、unverified、interrupted、cancelledになったら、結果詳細と最新の可視観測を照合し、目的が残っているか判断してください。目的が残るなら失敗原因に応じて空き位置・材料・経路などを変えた実行可能な案を選び、根拠なく同じ引数を繰り返さないでください。owner goalはゲーム内の達成結果を観測で確認してからcompletedにし、続行できない場合は未達のままactive/pausedに保つか、妥協・辞退を選んでください。",
       "各操作のexpectedOutcomeは目的達成へ向けたstepで確認したい結果です。successfulは操作単体の効果確認であり、owner goalの達成確認ではありません。body_outcome後はexpectedOutcomeと最新の観測を照合し、lookなど視点・情報取得だけで目的が進んでいなければ、目的につながる実行可能な次stepを選んでください。",
       "危険や建築は固定禁止ではありません。目的、周囲、影響、可逆性、別案の釣り合いを考えて規模・手順を調整してください。危険を見つけても自動退避ルールはありません。停止指示、実server permission、外部アクセス/credential境界だけが固定です。",
@@ -1541,10 +1542,58 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
       )
       .slice(-8)
       .map(compactMovementOutcome),
+    recentMovement: compactRecentMovement(snapshot),
     learningReferences: snapshot.learningReferences.slice(-8),
     skillActivity: snapshot.skillActivity
       .slice(-12)
       .map(({ filePath: _filePath, ...activity }) => activity),
+  };
+}
+
+function compactRecentMovement(snapshot: PlayerRuntimeSnapshot): unknown {
+  const activeOwnerProposalTimes = snapshot.goals
+    .filter(
+      ({ source, status, ownerProposalId }) =>
+        source === "owner" &&
+        status === "active" &&
+        ownerProposalId !== undefined,
+    )
+    .map(
+      ({ ownerProposalId }) =>
+        snapshot.proposals.find(({ id }) => id === ownerProposalId)?.createdAt,
+    )
+    .map((createdAt) => Date.parse(createdAt ?? ""))
+    .filter(Number.isFinite);
+  const latestOwnerProposalAt =
+    activeOwnerProposalTimes.length === 0
+      ? undefined
+      : Math.max(...activeOwnerProposalTimes);
+  const movement = snapshot.recentOutcomes.filter(
+    ({ movementDelta, observedAt }) =>
+      movementDelta !== undefined &&
+      (latestOwnerProposalAt === undefined ||
+        Date.parse(observedAt) >= latestOwnerProposalAt),
+  );
+  const net = movement.reduce(
+    (sum, { movementDelta }) => ({
+      x: sum.x + (movementDelta?.x ?? 0),
+      y: sum.y + (movementDelta?.y ?? 0),
+      z: sum.z + (movementDelta?.z ?? 0),
+    }),
+    { x: 0, y: 0, z: 0 },
+  );
+  const approximate = (value: number): number => Math.round(value * 10) / 10;
+  return {
+    scope:
+      latestOwnerProposalAt === undefined
+        ? "retained_outcomes"
+        : "since_latest_active_owner_proposal_in_retained_outcomes",
+    sampleCount: movement.length,
+    netApproxBlocks: {
+      x: approximate(net.x),
+      y: approximate(net.y),
+      z: approximate(net.z),
+    },
   };
 }
 

@@ -134,11 +134,80 @@ describe("player agent response rounds", () => {
           displacement: { x: 0, y: 0, z: 0 },
         },
       ]);
+      expect(compactedRuntime.recentMovement).toEqual({
+        scope: "retained_outcomes",
+        sampleCount: 2,
+        netApproxBlocks: { x: 2, y: 0, z: -1 },
+      });
       expect(compactedRuntime.recentJudgments).toEqual(
         longHistory.recentJudgments.slice(-4),
       );
       expect(longHistory.recentJudgments).toHaveLength(7);
       expect(longHistory.recentOutcomes).toHaveLength(6);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("summarizes only retained movement after the latest active owner proposal", () => {
+    const fixture = openPurposeFixture([]);
+    try {
+      const snapshot = fixture.mind.snapshot();
+      const proposalId = "owner-proposal-movement";
+      const withOwnerGoal: PlayerRuntimeSnapshot = {
+        ...snapshot,
+        goals: [
+          {
+            id: "owner-goal-movement",
+            ownerProposalId: proposalId,
+            title: "目的地へ進む",
+            status: "active",
+            priority: 4,
+            changeReason: "依頼を採用",
+            source: "owner",
+            updatedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+        proposals: [
+          {
+            id: proposalId,
+            title: "目的地へ進む",
+            reason: "合成fixture",
+            createdAt: "2026-01-02T00:00:00.000Z",
+            priorityPreference: 4,
+            status: "adopted",
+            resolution: "採用",
+          },
+        ],
+        recentOutcomes: [
+          {
+            runId: "before-proposal",
+            operationId: "before-proposal",
+            kind: "move_relative",
+            status: "successful",
+            summary: "earlier movement",
+            observedAt: "2026-01-01T00:00:00.000Z",
+            movementDelta: { x: 5, y: 0, z: 0 },
+          },
+          {
+            runId: "after-proposal",
+            operationId: "after-proposal",
+            kind: "move_relative",
+            status: "successful",
+            summary: "later movement",
+            observedAt: "2026-01-02T00:01:00.000Z",
+            movementDelta: { x: -0.14, y: 0, z: 4.06 },
+          },
+        ],
+      };
+      const compacted = z
+        .record(z.string(), z.unknown())
+        .parse(compactSnapshot(withOwnerGoal));
+      expect(compacted.recentMovement).toEqual({
+        scope: "since_latest_active_owner_proposal_in_retained_outcomes",
+        sampleCount: 1,
+        netApproxBlocks: { x: -0.1, y: 0, z: 4.1 },
+      });
     } finally {
       fixture.close();
     }
