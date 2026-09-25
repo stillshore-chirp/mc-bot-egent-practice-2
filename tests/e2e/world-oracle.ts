@@ -13,6 +13,14 @@ export interface OracleRcon {
 
 export type OracleFailure = (code: string) => never;
 export type RconReplyClass = "success" | "unloaded" | "syntax" | "error";
+export type TickStatus = "frozen" | "running" | "unknown";
+
+export interface TickFreezeHooks {
+  readonly onFrozen?: () => void;
+  readonly onUnfreezeAttempt?: () => void;
+  readonly onUnfrozen?: () => void;
+  readonly onUnfreezeFailure?: (operationFailed: boolean) => void;
+}
 
 const LOAD_TIMEOUT_MS = 5_000;
 const LOAD_POLL_MS = 100;
@@ -49,6 +57,103 @@ export function classifyRconReply(reply: string): RconReplyClass {
     return "success";
   }
   return "error";
+}
+
+export function classifyTickStatus(reply: string): TickStatus {
+  const lines = reply.split(/\r?\n/u).map((line) => line.trim());
+  const statuses = [
+    "The game is frozen",
+    "The game is running normally",
+    "The game is running, but can't keep up with the target tick rate",
+  ] as const;
+  const frozen = hasTickStatus(reply, lines, statuses[0]);
+  const running = statuses
+    .slice(1)
+    .some((status) => hasTickStatus(reply, lines, status));
+  if (frozen === running) return "unknown";
+  return frozen ? "frozen" : "running";
+}
+
+function hasTickStatus(
+  reply: string,
+  lines: readonly string[],
+  status: string,
+): boolean {
+  if (lines.includes(status)) return true;
+
+  // Some server replies concatenate the translated status and tick details
+  // without a separator. Accept only the complete, numeric query payload.
+  const escapedStatus = status.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const number = "[0-9]+(?:\\.[0-9]+)?";
+  const queryDetails = new RegExp(
+    `^${escapedStatus}Target tick rate: ${number} per second\\.\\n` +
+      `Average time per tick: ${number}ms \\(Target: ${number}ms\\)` +
+      `Percentiles: P[0-9]+: ${number}ms P[0-9]+: ${number}ms ` +
+      `P[0-9]+: ${number}ms\\. Sample: [0-9]+(?=\\n|$)`,
+    "u",
+  );
+  return queryDetails.test(reply);
+}
+
+export async function withFrozenTicks<T>(
+  rcon: OracleRcon,
+  operation: () => Promise<T>,
+  fail: OracleFailure,
+  hooks: TickFreezeHooks = {},
+): Promise<T> {
+  let freezeAttempted = false;
+  let operationFailed = false;
+  try {
+    freezeAttempted = true;
+    await rcon.command("tick freeze");
+    const freezeStatus = await rcon.command("tick query");
+    if (classifyTickStatus(freezeStatus) !== "frozen")
+      fail("WORLD_ORACLE_TICK_FREEZE_NOT_CONFIRMED");
+    try {
+      hooks.onFrozen?.();
+    } catch {
+      // Diagnostics must not interfere with the guarded operation.
+    }
+    return await operation();
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    if (freezeAttempted) {
+      try {
+        hooks.onUnfreezeAttempt?.();
+      } catch {
+        // Diagnostics must not prevent the unfreeze command.
+      }
+      try {
+        await rcon.command("tick unfreeze");
+      } catch {
+        // Read back the game state even if the command transport failed.
+      }
+      let unfreezeStatus: string | undefined;
+      try {
+        unfreezeStatus = await rcon.command("tick query");
+      } catch {
+        // The fixed failure below records that the world could not be resumed.
+      }
+      if (
+        unfreezeStatus === undefined ||
+        classifyTickStatus(unfreezeStatus) !== "running"
+      ) {
+        try {
+          hooks.onUnfreezeFailure?.(operationFailed);
+        } catch {
+          // Preserve the unfreeze failure as the primary diagnostic.
+        }
+        fail("WORLD_ORACLE_TICK_UNFREEZE_NOT_CONFIRMED");
+      }
+      try {
+        hooks.onUnfrozen?.();
+      } catch {
+        // Diagnostics must not interfere with the caller's result.
+      }
+    }
+  }
 }
 
 export function parseScore(

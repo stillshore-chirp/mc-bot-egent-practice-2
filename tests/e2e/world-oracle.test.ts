@@ -11,9 +11,208 @@ import {
   regionChunkChecks,
   regionsEqual,
   forceLoadRegion,
+  classifyTickStatus,
+  withFrozenTicks,
 } from "./world-oracle.js";
 
+function fakeTickRcon(
+  commands: string[],
+  freezeAccepted = true,
+  unfreezeAccepted = true,
+) {
+  let frozen = false;
+  return {
+    command: async (command: string): Promise<string> => {
+      commands.push(command);
+      if (command === "tick freeze") {
+        if (freezeAccepted) frozen = true;
+        return "";
+      }
+      if (command === "tick unfreeze") {
+        if (unfreezeAccepted) frozen = false;
+        return "";
+      }
+      if (command === "tick query")
+        return frozen ? "The game is frozen" : "The game is running normally";
+      return "";
+    },
+  };
+}
+
 describe("world oracle command evidence", () => {
+  it("uses only complete known status lines from tick query", () => {
+    expect(classifyTickStatus("The game is frozen")).toBe("frozen");
+    expect(
+      classifyTickStatus(
+        "The game is running normally\nTarget tick rate: 20 per second.",
+      ),
+    ).toBe("running");
+    expect(
+      classifyTickStatus(
+        "The game is running, but can't keep up with the target tick rate\nAverage time per tick: 60ms",
+      ),
+    ).toBe("running");
+    expect(classifyTickStatus("Unknown command")).toBe("unknown");
+    expect(
+      classifyTickStatus("The game is frozen\nThe game is running normally"),
+    ).toBe("unknown");
+    expect(classifyTickStatus("The game is now frozen")).toBe("unknown");
+  });
+
+  it("accepts the complete concatenated status and numeric tick-query payload", () => {
+    const details =
+      "Target tick rate: 20 per second.\n" +
+      "Average time per tick: 1.25ms (Target: 50.00ms)" +
+      "Percentiles: P50: 1.00ms P95: 2.50ms P99: 3.75ms. Sample: 100";
+
+    expect(classifyTickStatus(`The game is frozen${details}`)).toBe("frozen");
+    expect(classifyTickStatus(`The game is running normally${details}`)).toBe(
+      "running",
+    );
+    expect(
+      classifyTickStatus(
+        `The game is running, but can't keep up with the target tick rate${details}`,
+      ),
+    ).toBe("running");
+    expect(
+      classifyTickStatus(
+        "The game is frozenTarget tick rate: unknown per second.",
+      ),
+    ).toBe("unknown");
+    expect(
+      classifyTickStatus(
+        `The game is frozen${details}\nThe game is running normally`,
+      ),
+    ).toBe("unknown");
+  });
+
+  it("unfreezes after the protected comparison succeeds", async () => {
+    const commands: string[] = [];
+    const phases: string[] = [];
+    const rcon = fakeTickRcon(commands);
+    const result = await withFrozenTicks(
+      rcon,
+      async () => {
+        phases.push("comparison");
+        return "equal";
+      },
+      (code): never => {
+        throw new Error(code);
+      },
+      {
+        onFrozen: () => phases.push("frozen"),
+        onUnfreezeAttempt: () => phases.push("unfreeze_attempt"),
+        onUnfrozen: () => phases.push("unfrozen"),
+      },
+    );
+    expect(result).toBe("equal");
+    expect(commands).toEqual([
+      "tick freeze",
+      "tick query",
+      "tick unfreeze",
+      "tick query",
+    ]);
+    expect(phases).toEqual([
+      "frozen",
+      "comparison",
+      "unfreeze_attempt",
+      "unfrozen",
+    ]);
+  });
+
+  it("keeps callback failures from skipping the unfreeze command", async () => {
+    const commands: string[] = [];
+    const result = await withFrozenTicks(
+      fakeTickRcon(commands),
+      async () => "equal",
+      (code): never => {
+        throw new Error(code);
+      },
+      {
+        onUnfreezeAttempt: () => {
+          throw new Error("diagnostic callback failed");
+        },
+      },
+    );
+    expect(result).toBe("equal");
+    expect(commands).toEqual([
+      "tick freeze",
+      "tick query",
+      "tick unfreeze",
+      "tick query",
+    ]);
+  });
+
+  it("unfreezes when the strict comparison fails and preserves its failure", async () => {
+    const commands: string[] = [];
+    const rcon = fakeTickRcon(commands);
+    await expect(
+      withFrozenTicks(
+        rcon,
+        async () => {
+          throw new Error("WORLD_ORACLE_INITIAL_BASELINE_MISMATCH");
+        },
+        (code): never => {
+          throw new Error(code);
+        },
+      ),
+    ).rejects.toThrow("WORLD_ORACLE_INITIAL_BASELINE_MISMATCH");
+    expect(commands).toEqual([
+      "tick freeze",
+      "tick query",
+      "tick unfreeze",
+      "tick query",
+    ]);
+  });
+
+  it("tries to unfreeze after a rejected freeze and after an unfreeze failure", async () => {
+    const rejectedFreezeCommands: string[] = [];
+    await expect(
+      withFrozenTicks(
+        {
+          ...fakeTickRcon(rejectedFreezeCommands, false),
+        },
+        async () => "unused",
+        (code): never => {
+          throw new Error(code);
+        },
+      ),
+    ).rejects.toThrow("WORLD_ORACLE_TICK_FREEZE_NOT_CONFIRMED");
+    expect(rejectedFreezeCommands).toEqual([
+      "tick freeze",
+      "tick query",
+      "tick unfreeze",
+      "tick query",
+    ]);
+
+    const unfreezeFailureCommands: string[] = [];
+    const failedOperationStates: boolean[] = [];
+    await expect(
+      withFrozenTicks(
+        {
+          ...fakeTickRcon(unfreezeFailureCommands, true, false),
+        },
+        async () => {
+          throw new Error("comparison failed");
+        },
+        (code): never => {
+          throw new Error(code);
+        },
+        {
+          onUnfreezeFailure: (operationFailed) =>
+            failedOperationStates.push(operationFailed),
+        },
+      ),
+    ).rejects.toThrow("WORLD_ORACLE_TICK_UNFREEZE_NOT_CONFIRMED");
+    expect(unfreezeFailureCommands).toEqual([
+      "tick freeze",
+      "tick query",
+      "tick unfreeze",
+      "tick query",
+    ]);
+    expect(failedOperationStates).toEqual([true]);
+  });
+
   it("uses the explicit replace mask before force mode", () => {
     expect(
       cloneCommand(
