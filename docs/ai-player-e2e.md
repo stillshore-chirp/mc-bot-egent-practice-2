@@ -195,4 +195,8 @@ HEAD `4f87077` のrun76では現在の方角と座標軸を判断入力へ加え
 
 HEAD `9deb9b0` のrun77では過去の可視位置を最大6視点まで判断入力に加え、Body smokeと自発生活がpassしました。未知複合状況は32 calls・既知27,979 tokens、run全体は41 calls・既知76,862 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。サーバー上で標的への距離短縮を一度確認しましたが、標的の破壊・取得・帰還は未確認です。run終了時のsafe activityでは41 round中28 roundが中断され、原因分類は`state_changed`24件、`body_outcome`2件、`stop`1件、`owner_proposal`1件でした。行動commit成功は3件に留まりました。過去視点の効果と中断増加の原因はこの1試行から断定できません。状態変化で判断が繰り返し中断される条件を調査し、同条件の再試行は増やしません。
 
+HEAD `469ddca` のrun78では通常の呼吸や入水を緊急な状態変化と分け、Body smokeと自発生活がpassしました。未知複合状況は27 calls・既知207,109 tokens、run全体は34 calls・既知247,241 tokensでcase上限となり、usageは`partial_or_unknown`、cleanupは3/3です。safe activityの中断6件に`state_changed`はなく、`body_outcome`4件、`stop`1件、`owner_proposal`1件でした。行動commit成功14件とサーバー上の標的への距離短縮を一度確認しましたが、破壊・取得・取得物を持った帰還は未確認です。進行中操作への`continue`判断が9件あり、移動の完了前に再判断が繰り返されました。単一試行から原因や変更の効果を断定しません。
+
+HEAD `b5cd1ec` のrun79では移動中のstall判定を本人の有意な移動に限定し、同種の可視ブロックの変化を最短距離帯へ集約しました。Body smokeと自発生活がpassし、未知複合状況は32 calls・既知205,583 tokens、run全体は37 calls・既知228,186 tokensでcase上限となりました。usageは`partial_or_unknown`、cleanupは3/3です。safe activityの中断8件は`body_outcome`6件、`stop`1件、`owner_proposal`1件で、`state_changed`は0件でした。保存済み判断では`continue`2件、行動commit成功12件、複数の相対移動成功を確認しました。サーバー上では標的への距離短縮を一度確認しましたが、最大変位は2以上5未満の区分で、標的の破壊・取得・持帰りは未確認です。障害物注入は適格条件がなく未実施、失敗後の回復も未確認です。run78と行動経路が異なり、再判断回数やtoken数の差を実装修正の効果とは断定しません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
