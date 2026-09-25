@@ -538,6 +538,90 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("restarts an uncommitted thought after a body outcome with fresh evidence", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let thoughtCount = 0;
+    let pendingSignal: AbortSignal | undefined;
+    let resumedOutcome: string | undefined;
+    let resumedEventKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events, signal }) => {
+          thoughtCount += 1;
+          if (thoughtCount === 1) {
+            const decision = action("begin observation");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            return { accepted: saved.accepted, decision };
+          }
+          if (thoughtCount === 2) {
+            pendingSignal = signal;
+            await new Promise<void>((resolve) => {
+              if (signal?.aborted) resolve();
+              else
+                signal?.addEventListener("abort", () => resolve(), {
+                  once: true,
+                });
+            });
+            return { accepted: false };
+          }
+          resumedOutcome = snapshot.lastOutcome?.status;
+          resumedEventKinds = events.map(({ kind }) => kind);
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "look",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      await waitFor(() => thoughtCount === 2);
+      expect(pendingSignal?.aborted).toBe(false);
+
+      body.completeActive("failed");
+      await waitFor(() => pendingSignal?.aborted === true);
+      await waitFor(() => thoughtCount === 3);
+      expect(resumedOutcome).toBe("failed");
+      expect(resumedEventKinds).toContain("body_outcome");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it.each(["successful", "failed"] as const)(
     "starts a fresh purpose thought after a %s body outcome and one completion",
     async (outcome) => {

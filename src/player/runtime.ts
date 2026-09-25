@@ -86,6 +86,7 @@ export class PlayerRuntime {
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
   #activeThought: AbortController | undefined;
+  #activeThoughtCommitted = false;
   #pendingThoughtWake: PendingThoughtWake | undefined;
   #replacementTail: Promise<void> = Promise.resolve();
   #retryTimer: NodeJS.Timeout | undefined;
@@ -269,6 +270,7 @@ export class PlayerRuntime {
     snapshot: PlayerRuntimeSnapshot,
     decision: PlayerThoughtDecision,
   ): void {
+    if (this.#activeThought !== undefined) this.#activeThoughtCommitted = true;
     this.#retryDelayMs = 5_000;
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     this.#retryTimer = undefined;
@@ -443,12 +445,18 @@ export class PlayerRuntime {
     const activeThought = this.#activeThought;
     if (activeThought !== undefined) {
       this.#queueThoughtWake(kind, reason);
-      if (kind === "owner_proposal")
+      if (kind === "owner_proposal") {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
+      } else if (kind === "body_outcome" && !this.#activeThoughtCommitted) {
+        // A result changed the evidence for an uncommitted decision. Restart
+        // with the new snapshot instead of spending a round on stale CAS.
+        activeThought.abort(new Error("body_outcome_preempted_thought"));
+      }
       return;
     }
     const controller = new AbortController();
     this.#activeThought = controller;
+    this.#activeThoughtCommitted = false;
     const events = this.options.mind.pendingEvents(32);
     let retry = false;
     void this.#traceCall("autonomous purpose thought", async () => {
@@ -507,6 +515,7 @@ export class PlayerRuntime {
   #finishThought(controller: AbortController, retry: boolean): void {
     if (this.#activeThought !== controller) return;
     this.#activeThought = undefined;
+    this.#activeThoughtCommitted = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
       return;
@@ -726,6 +735,7 @@ export class PlayerRuntime {
   #cancelThought(reason: string): void {
     const thought = this.#activeThought;
     this.#pendingThoughtWake = undefined;
+    this.#activeThoughtCommitted = false;
     thought?.abort(new Error(reason));
   }
 
