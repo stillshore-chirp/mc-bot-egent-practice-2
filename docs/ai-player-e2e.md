@@ -193,4 +193,6 @@ HEAD `b0a6312` のrun75ではBody smokeと自発生活がpassしました。未�
 
 HEAD `4f87077` のrun76では現在の方角と座標軸を判断入力へ加え、Body smokeと自発生活がpassしました。未知複合状況は33 calls・既知199,751 tokens、run全体は41 calls・既知245,487 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。複数の相対移動成功とサーバー上で開始地点から10ブロック以上の移動を確認しましたが、標的への距離短縮、破壊・取得・帰還は未確認です。最初の課題後観測では壁材は見え、標的と水は見えませんでした。制御障害は適格な操作が始まらず未実施です。方角の提示が進捗を改善したとは主張しません。
 
+HEAD `9deb9b0` のrun77では過去の可視位置を最大6視点まで判断入力に加え、Body smokeと自発生活がpassしました。未知複合状況は32 calls・既知27,979 tokens、run全体は41 calls・既知76,862 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。サーバー上で標的への距離短縮を一度確認しましたが、標的の破壊・取得・帰還は未確認です。run終了時のsafe activityでは41 round中28 roundが中断され、原因分類は`state_changed`24件、`body_outcome`2件、`stop`1件、`owner_proposal`1件でした。行動commit成功は3件に留まりました。過去視点の効果と中断増加の原因はこの1試行から断定できません。状態変化で判断が繰り返し中断される条件を調査し、同条件の再試行は増やしません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
