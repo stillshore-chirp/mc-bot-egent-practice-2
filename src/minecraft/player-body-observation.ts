@@ -153,9 +153,9 @@ export const playerBodyLookSweepEntityLimit = 2;
 
 const lookSweepPositionSchema = z
   .object({
-    x: z.number().finite(),
-    y: z.number().finite(),
-    z: z.number().finite(),
+    x: z.number(),
+    y: z.number(),
+    z: z.number(),
   })
   .strict();
 
@@ -163,7 +163,7 @@ const lookSweepBlockSchema = z
   .object({
     name: z.string().min(1).max(80),
     position: lookSweepPositionSchema,
-    distance: z.number().finite().min(0),
+    distance: z.number().min(0),
   })
   .strict();
 
@@ -173,7 +173,7 @@ const lookSweepEntitySchema = z
     kind: z.string().min(1).max(80),
     category: z.string().max(80).nullable(),
     position: lookSweepPositionSchema,
-    distance: z.number().finite().min(0),
+    distance: z.number().min(0),
   })
   .strict();
 

@@ -584,7 +584,9 @@ describe("integrated player runtime", () => {
         "期待したstep=observe a changed view",
       );
       expect(followupSnapshot?.lastOutcome?.lookSweep).toEqual(scanEvidence);
-      const compacted = compactSnapshot(followupSnapshot!) as {
+      if (followupSnapshot === undefined)
+        throw new Error("follow-up snapshot was not delivered");
+      const compacted = compactSnapshot(followupSnapshot) as {
         lastOutcome?: { lookSweep?: PlayerBodyLookSweep };
         recentOutcomes?: readonly {
           operationId: string;
@@ -601,7 +603,7 @@ describe("integrated player runtime", () => {
       expect(JSON.stringify(compacted).match(/blue_wool/g) ?? []).toHaveLength(
         1,
       );
-      expect(followupSnapshot?.lastObservation?.timeOfDay).toBe(16_000);
+      expect(followupSnapshot.lastObservation?.timeOfDay).toBe(16_000);
     } finally {
       releaseFirstThought?.();
       await runtime.shutdown();
