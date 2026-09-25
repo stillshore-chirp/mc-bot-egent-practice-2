@@ -132,6 +132,7 @@ const horizontalFovDegrees = 110;
 const verticalFovDegrees = 80;
 const maxVisibleDistance = 16;
 const blockCandidateLimit = 192;
+const blockCandidateSearchPassLimit = 3;
 const entityCandidateLimit = 128;
 const blockOutputLimit = 96;
 const entityOutputLimit = 64;
@@ -276,21 +277,57 @@ function entityHealth(entity: Entity): number | null {
     : null;
 }
 
-export function observePlayerBody(
+function blockPositionKey(position: Vec3): string {
+  return `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
+}
+
+function visibleBlockCandidates(
   bot: Bot,
-  ownerUsername: string | undefined,
-  options: PlayerBodyObservationOptions = {},
-): PlayerBodyObservation {
-  const observedAt = new Date().toISOString();
-  const dimension = bot.game.dimension;
-  const origin = bot.entity.position;
-  const blockCandidates = bot.findBlocks({
-    matching: (block) => !["air", "cave_air", "void_air"].includes(block.name),
-    maxDistance: maxVisibleDistance,
-    count: blockCandidateLimit,
-  });
-  const visibleBlocks: BodyVisibleBlock[] = [];
-  for (const candidate of blockCandidates) {
+  origin: Vec3,
+  dimension: string,
+): { blocks: BodyVisibleBlock[]; mayBeTruncated: boolean } {
+  const excludedNames = new Set<string>();
+  const seenPositions = new Set<string>();
+  const candidates: Vec3[] = [];
+  let mayBeTruncated = false;
+
+  for (let pass = 0; pass < blockCandidateSearchPassLimit; pass += 1) {
+    const searchResults = bot.findBlocks({
+      matching: (block) =>
+        !["air", "cave_air", "void_air"].includes(block.name) &&
+        !excludedNames.has(block.name),
+      maxDistance: maxVisibleDistance,
+      count: blockCandidateLimit,
+    });
+    if (searchResults.length >= blockCandidateLimit) mayBeTruncated = true;
+
+    const nameCounts = new Map<string, number>();
+    for (const candidate of searchResults) {
+      const block = bot.blockAt(candidate);
+      if (block === null) continue;
+      const key = blockPositionKey(block.position);
+      if (seenPositions.has(key)) continue;
+      seenPositions.add(key);
+      candidates.push(candidate);
+      nameCounts.set(block.name, (nameCounts.get(block.name) ?? 0) + 1);
+    }
+
+    if (searchResults.length < blockCandidateLimit) break;
+
+    let dominantName: string | undefined;
+    let dominantCount = 0;
+    for (const [name, count] of nameCounts) {
+      if (count > dominantCount) {
+        dominantName = name;
+        dominantCount = count;
+      }
+    }
+    if (dominantName === undefined) break;
+    excludedNames.add(dominantName);
+  }
+
+  const blocks: BodyVisibleBlock[] = [];
+  for (const candidate of candidates) {
     const block = bot.blockAt(candidate);
     if (block === null) continue;
     const target = block.position.offset(0.5, 0.5, 0.5);
@@ -304,7 +341,7 @@ export function observePlayerBody(
     const signText = block.name.endsWith("sign")
       ? block.getSignText()
       : undefined;
-    visibleBlocks.push({
+    blocks.push({
       name: block.name,
       stateId: block.stateId,
       position: positionOf(block.position, dimension),
@@ -320,7 +357,56 @@ export function observePlayerBody(
           }),
     });
   }
-  visibleBlocks.sort((left, right) => left.distance - right.distance);
+
+  blocks.sort((left, right) => left.distance - right.distance);
+  return { blocks, mayBeTruncated };
+}
+
+function balancedVisibleBlocks(
+  blocks: readonly BodyVisibleBlock[],
+  limit: number,
+): BodyVisibleBlock[] {
+  const blocksByName = new Map<string, BodyVisibleBlock[]>();
+  for (const block of blocks) {
+    const sameName = blocksByName.get(block.name) ?? [];
+    sameName.push(block);
+    blocksByName.set(block.name, sameName);
+  }
+  const groups = [...blocksByName.values()].sort((left, right) => {
+    const leftFirst = left[0];
+    const rightFirst = right[0];
+    if (leftFirst === undefined) return rightFirst === undefined ? 0 : 1;
+    if (rightFirst === undefined) return -1;
+    return (
+      leftFirst.distance - rightFirst.distance ||
+      leftFirst.name.localeCompare(rightFirst.name)
+    );
+  });
+  const selected: BodyVisibleBlock[] = [];
+  for (let index = 0; selected.length < limit; index += 1) {
+    let found = false;
+    for (const group of groups) {
+      const block = group[index];
+      if (block === undefined) continue;
+      selected.push(block);
+      found = true;
+      if (selected.length === limit) break;
+    }
+    if (!found) break;
+  }
+  return selected.sort((left, right) => left.distance - right.distance);
+}
+
+export function observePlayerBody(
+  bot: Bot,
+  ownerUsername: string | undefined,
+  options: PlayerBodyObservationOptions = {},
+): PlayerBodyObservation {
+  const observedAt = new Date().toISOString();
+  const dimension = bot.game.dimension;
+  const origin = bot.entity.position;
+  const blockObservation = visibleBlockCandidates(bot, origin, dimension);
+  const visibleBlocks = blockObservation.blocks;
 
   const entityCandidates = Object.values(bot.entities)
     .filter((entity) => entity.id !== bot.entity.id)
@@ -473,9 +559,9 @@ export function observePlayerBody(
         visibleEntities.length - entityOutputLimit,
       ),
       candidateSearchMayBeTruncated:
-        blockCandidates.length >= blockCandidateLimit ||
+        blockObservation.mayBeTruncated ||
         entityCandidates.length > entityCandidateLimit,
-      blocks: visibleBlocks.slice(0, blockOutputLimit),
+      blocks: balancedVisibleBlocks(visibleBlocks, blockOutputLimit),
       entities: visibleEntities.slice(0, entityOutputLimit),
       ...(ownerPositionException === undefined
         ? {}

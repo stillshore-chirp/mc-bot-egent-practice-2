@@ -65,6 +65,7 @@ function makeFakeBot(
   blocks: Map<string, FakeBlock>;
   candidates: Vec3[];
   hiddenBlockKeys: Set<string>;
+  findBlockSearches: { count: number; resultCount: number }[];
   setWindow(window: Window): void;
   emitWindowOpen(): void;
   resumeWindowOpen(): void;
@@ -76,6 +77,7 @@ function makeFakeBot(
   const blocks = new Map<string, FakeBlock>();
   const candidates: Vec3[] = [];
   const hiddenBlockKeys = new Set<string>();
+  const findBlockSearches: { count: number; resultCount: number }[] = [];
   let pendingWindow: (Window & EventEmitter) | undefined;
   let deferWindowOpen = options.deferWindowOpen === true;
   const key = (position: Vec3): string =>
@@ -157,10 +159,27 @@ function makeFakeBot(
       setGoal: vi.fn(),
     },
     supportFeature: (feature: string) => feature === "blockPlaceHasInsideBlock",
-    findBlocks: ({ matching }: { matching: (block: FakeBlock) => boolean }) =>
-      candidates.filter((point) =>
-        matching(blocks.get(key(point)) ?? airAt(point)),
-      ),
+    findBlocks: ({
+      matching,
+      maxDistance = Number.POSITIVE_INFINITY,
+      count = Number.POSITIVE_INFINITY,
+      point = entity.position,
+    }: {
+      matching: (block: FakeBlock) => boolean;
+      maxDistance?: number;
+      count?: number;
+      point?: Vec3;
+    }) => {
+      const results = candidates
+        .filter(
+          (candidate) =>
+            point.distanceTo(candidate) <= maxDistance &&
+            matching(blocks.get(key(candidate)) ?? airAt(candidate)),
+        )
+        .slice(0, count);
+      findBlockSearches.push({ count, resultCount: results.length });
+      return results;
+    },
     findBlock: () => null,
     blockAt: (point: Vec3) => blocks.get(key(point)) ?? airAt(point),
     canSeeBlock: (block: FakeBlock) =>
@@ -229,6 +248,7 @@ function makeFakeBot(
     blocks,
     candidates,
     hiddenBlockKeys,
+    findBlockSearches,
     setWindow: (window) => {
       pendingWindow = window as Window & EventEmitter;
     },
@@ -484,6 +504,43 @@ describe("player body", () => {
       observePlayerBody(fake.bot, "owner", { ownerPositionException: true })
         .perception.ownerPositionException?.source,
     ).toBe("owner_position_exception");
+  });
+
+  it("searches past a dominant block name and balances the capped visible list", () => {
+    const fake = makeFakeBot();
+    for (let z = -6; z >= -15 && fake.candidates.length < 192; z -= 1) {
+      for (let x = -5; x <= 5 && fake.candidates.length < 192; x += 1) {
+        for (let y = 63; y <= 65 && fake.candidates.length < 192; y += 1) {
+          const point = new Vec3(x, y, z);
+          fake.blocks.set(`${x},${y},${z}`, makeBlock("stone", 1, point));
+          fake.candidates.push(point);
+        }
+      }
+    }
+    const oakLogA = new Vec3(0, 64, -5);
+    const oakLogB = new Vec3(1, 64, -5);
+    const hiddenChest = new Vec3(0, 64, -4);
+    fake.blocks.set("0,64,-5", makeBlock("oak_log", 4, oakLogA));
+    fake.blocks.set("1,64,-5", makeBlock("oak_log", 4, oakLogB));
+    fake.blocks.set("0,64,-4", makeBlock("chest", 3, hiddenChest));
+    fake.candidates.push(oakLogA, oakLogB, hiddenChest);
+    fake.hiddenBlockKeys.add("0,64,-4");
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    const visibleNames = observation.perception.blocks.map(
+      (block) => block.name,
+    );
+
+    expect(fake.candidates).toHaveLength(195);
+    expect(fake.findBlockSearches).toEqual([
+      { count: 192, resultCount: 192 },
+      { count: 192, resultCount: 3 },
+    ]);
+    expect(observation.perception.blocks).toHaveLength(96);
+    expect(visibleNames).toContain("oak_log");
+    expect(visibleNames).not.toContain("chest");
+    expect(observation.perception.omittedBlockCandidates).toBe(98);
+    expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
   });
 
   it("does not treat local-only dig mutation as success, but accepts a server block packet", async () => {
