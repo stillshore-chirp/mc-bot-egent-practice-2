@@ -78,6 +78,12 @@ import {
   projectPlayerSnapshot,
   writePlayerSnapshotRecord,
 } from "./player-snapshot-sidecar.js";
+import {
+  recordUnknownTaskProgressSample,
+  type UnknownDistanceBucket,
+  type UnknownTaskProgressAggregate,
+  type UnknownTaskProgressSampleStatus,
+} from "./unknown-task-progress.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -208,6 +214,15 @@ interface UnknownCompositeDiagnostic {
   readonly unknownTaskTargetBlockVisible?: boolean;
   readonly unknownTaskWaterBlockVisible?: boolean;
   readonly unknownTaskWallMaterialVisible?: boolean;
+  readonly unknownPostTaskProgressSampleStatus?: UnknownTaskProgressSampleStatus;
+  readonly unknownPostTaskProgressSampleCount?: number;
+  readonly unknownPostTaskProgressSampleLimitReached?: boolean;
+  readonly unknownPostTaskMaxDisplacementBucket?: UnknownDistanceBucket;
+  readonly unknownPostTaskNearestTargetDistanceBucket?: UnknownDistanceBucket;
+  readonly unknownPostTaskMovedCloserToTarget?: boolean;
+  readonly unknownPostTaskBlocksProgressObserved?: boolean;
+  readonly unknownPostTaskPositionProgressObserved?: boolean;
+  readonly unknownPostTaskInventoryProgressObserved?: boolean;
   readonly unknownFixtureFacingCommanded?: boolean;
   readonly unknownFixtureFacingReadbackAvailable?: boolean;
   readonly unknownFixtureFacingConfirmed?: boolean;
@@ -1851,6 +1866,11 @@ async function main(): Promise<void> {
         let postFailureObservationSeen = false;
         let postFailureJudgmentSeen = false;
         let lastOracleCheckAt = 0;
+        const unknownTaskSentAt: { value: number | undefined } = {
+          value: undefined,
+        };
+        let unknownProgressAggregate: UnknownTaskProgressAggregate | undefined;
+        let unknownPostTaskSampleFailureSeen = false;
         let controlledObstacleAttempted = false;
         let controlledObstacleRestoredAt: number | undefined;
         updateUnknownCompositeDiagnostic(state, {
@@ -1876,6 +1896,7 @@ async function main(): Promise<void> {
               fixtureRegion,
             );
             const dayTime = await readSafeDayTime(rcon);
+            const sampledAt = Date.now();
             const itemReturned = /minecraft:blue_wool/iu.test(inventory);
             const returnedToSpawn =
               Math.hypot(
@@ -1896,12 +1917,71 @@ async function main(): Promise<void> {
                 observedWorldProgress(beforeWorld, currentWorld) !== undefined,
               ...(dayTime === undefined ? {} : { unknownDayTime: dayTime }),
             });
+            if (
+              unknownTaskSentAt.value !== undefined &&
+              Number.isFinite(unknownTaskSentAt.value) &&
+              sampledAt > unknownTaskSentAt.value
+            ) {
+              unknownProgressAggregate = recordUnknownTaskProgressSample(
+                unknownProgressAggregate,
+                {
+                  taskSentAt: unknownTaskSentAt.value,
+                  sampledAt,
+                  startingPosition: beforeWorld.position,
+                  targetPosition: target,
+                  currentPosition: currentWorld.position,
+                  beforeWorld,
+                  currentWorld,
+                },
+              );
+              if (unknownProgressAggregate !== undefined) {
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownPostTaskProgressSampleStatus:
+                    unknownPostTaskSampleFailureSeen
+                      ? "partial"
+                      : unknownProgressAggregate.sampleLimitReached
+                        ? "capped"
+                        : "available",
+                  unknownPostTaskProgressSampleCount:
+                    unknownProgressAggregate.sampleCount,
+                  unknownPostTaskProgressSampleLimitReached:
+                    unknownProgressAggregate.sampleLimitReached,
+                  unknownPostTaskMaxDisplacementBucket:
+                    unknownProgressAggregate.maxDisplacementBucket,
+                  unknownPostTaskNearestTargetDistanceBucket:
+                    unknownProgressAggregate.nearestTargetDistanceBucket,
+                  unknownPostTaskMovedCloserToTarget:
+                    unknownProgressAggregate.movedCloserToTarget,
+                  unknownPostTaskBlocksProgressObserved:
+                    unknownProgressAggregate.blocksObserved,
+                  unknownPostTaskPositionProgressObserved:
+                    unknownProgressAggregate.positionObserved,
+                  unknownPostTaskInventoryProgressObserved:
+                    unknownProgressAggregate.inventoryObserved,
+                });
+              }
+            }
           } catch {
             serverGoalObserved = false;
             updateUnknownCompositeDiagnostic(state, {
               unknownOracleReadStatus: "incomplete",
               unknownOracleReadCount: currentCount + 1,
+              ...(unknownTaskSentAt.value === undefined ||
+              !Number.isFinite(unknownTaskSentAt.value)
+                ? {}
+                : {
+                    unknownPostTaskProgressSampleStatus:
+                      unknownProgressAggregate === undefined
+                        ? "unavailable"
+                        : "partial",
+                  }),
             });
+            if (
+              unknownTaskSentAt.value !== undefined &&
+              Number.isFinite(unknownTaskSentAt.value)
+            ) {
+              unknownPostTaskSampleFailureSeen = true;
+            }
           }
         };
         await sampleUnknownOracle();
@@ -1930,14 +2010,15 @@ async function main(): Promise<void> {
           context.caseDeadlineAt - Date.now() - 60_000;
         if (unknownObservationBudgetMs < 1)
           incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
-        const unknownTaskSentAt = Date.now();
         sendChat(
           context.owner,
           "日没が近づいています。水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
+        unknownTaskSentAt.value = Date.now();
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffTaskSent: true,
           unknownTaskObservationStatus: "unknown",
+          unknownPostTaskProgressSampleStatus: "not_sampled",
         });
         let taskObservationCaptured = false;
         const afterPlayer = await waitForPlayer(
@@ -1950,10 +2031,13 @@ async function main(): Promise<void> {
               taskObservation?.observedAt === undefined
                 ? Number.NaN
                 : Date.parse(taskObservation.observedAt);
+            const taskSentAt = unknownTaskSentAt.value;
             if (
               !taskObservationCaptured &&
+              taskSentAt !== undefined &&
+              Number.isFinite(taskSentAt) &&
               Number.isFinite(taskObservedAt) &&
-              taskObservedAt > unknownTaskSentAt
+              taskObservedAt > taskSentAt
             ) {
               taskObservationCaptured = true;
               const visibility = classifyUnknownTaskVisibility(
