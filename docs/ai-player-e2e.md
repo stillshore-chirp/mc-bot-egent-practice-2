@@ -169,4 +169,8 @@ handoffが明示resume確認前に失敗した場合は、runtimeを停止状態
 
 unknown fixtureのbaseline準備では、sourceとclone先のchunkを先にforce-loadし、最大6回の500ms比較窓から連続2回一致する組を要求します。各窓はbaseline clone、tick進行、sourceとの比較で構成し、一致が得られた後にtick freezeをreadback確認してbaselineを再cloneし、もう一度比較します。未一致・freeze/unfreeze未確認はいずれも未完了として残り、依存blockを解除しません。独立GPT0 probe2ではfreeze/query、clone比較、unfreeze/queryの往復を確認しましたが、統合harnessの実機実行は未実施です。連続一致は有限窓での比較再現性を示すだけで、sourceとclone先が同時に自然更新する可能性や、その後の水流変化を排除しません。既存region差分の進捗診断に自然な水変化が含まれる余地があり、target cleared・item returned・spawn returnの条件は引き続き別に確認します。
 
-Issue #72全体の受け入れは未達です。`unknown_composite`と後続caseは未完了で、自律生活のpassはrun10・14、予算未完了はrun11・13・15と差があります。case遷移の新しい停止・再起動境界も実ゲームでは未検証です。
+その後の隔離実ゲーム検証では、run43で自発生活からSkill再利用・Markdown往復までの8 case、run48で設置を伴う修理、run59で身体操作中の会話・owner要請後の接近・停止を確認しました。これらはそれぞれの実行で観測した範囲の結果で、全caseを一度にpassした証拠ではありません。
+
+HEAD `0bd7656` の対象試験run65では、非OP Bodyの`move_relative`到達とサーバー上の変位、自発生活を確認しました。未知複合状況は26 calls・既知211,202 tokensで予算停止し、GPTは`move_relative`を選ばず、標的への接近・採集・持帰りは未確認でした。HEAD `f4db801` のrun66では判断初期入力の履歴・可視ブロック重複を縮約した状態で、Body smokeと自発生活がpassしました。未知複合状況ではGPTが`move_relative`を選び、実操作の失敗、後続判断と別の成功操作を観測しました。一方、標的への接近は確認できず、31 calls・既知203,916 tokensで予算停止しました。caseのusageはどちらも`partial_or_unknown`で、cleanupは双方3/3です。run65/66の初期入力文字数は同じ履歴・world状態で比較したものではないため、圧縮による使用量・達成率の改善は未確定です。
+
+Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
