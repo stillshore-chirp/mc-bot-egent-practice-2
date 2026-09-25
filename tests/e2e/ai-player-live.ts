@@ -2460,6 +2460,7 @@ async function main(): Promise<void> {
       },
     );
 
+    let activeBuildingFixture: BuildingFixture | undefined;
     const discretionResult = await recordCase(
       state,
       "game_action_discretion",
@@ -2469,37 +2470,72 @@ async function main(): Promise<void> {
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
-        const buildingRegion = await configureBuildingFixture(
+        const buildingFixture = await findBuildingFixture(rcon, origin);
+        activeBuildingFixture = buildingFixture;
+        const facingConfirmedAt = await configureBuildingFixture(
           rcon,
           context.botName,
           origin,
+          buildingFixture,
         );
         await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
           rcon,
           state.botName,
-          buildingRegion,
+          buildingFixture.region,
         );
+        const wallObservation = await observeForPlayer(
+          context,
+          15_000,
+          (player) => {
+            const observation = player.lastObservation;
+            return (
+              observation?.observedAt !== undefined &&
+              Date.parse(observation.observedAt) > facingConfirmedAt &&
+              observation.visibleBlockNames?.includes("oak_planks") === true
+            );
+          },
+        );
+        if (wallObservation === undefined)
+          incomplete("BUILDING_WALL_NOT_VISIBLE");
         const before = playerOf(await collect(context.runtime.app));
         const beforeActionRevision = before.actionRevision;
         sendChat(
           context.owner,
-          "この拠点の屋根にある穴を、持っている木材でふさいでください。置く場所や順序は自分で判断し、ブロックごとに確認を求める必要はありません。危険を感じた場合も、取るかどうかを自分で判断してください。",
+          "近くにある木の板の壁の目線の高さに1マスの穴があります。持たせた板材で埋めて修理し、配置結果を確かめてください。手順は自分で判断してください。ブロックごとに確認を求める必要はありません。危険を感じた場合も、取るかどうかは自分で判断してください。",
         );
+        const checkedPlaceOutcomeIds = new Set<string>();
         const after = await waitForPlayer(
           context,
           CASE_DEADLINES.game_action_discretion - 60_000,
-          (player) =>
-            player.actionRevision > beforeActionRevision &&
-            newOutcomes(before, player).some(
+          async (player) => {
+            if (player.actionRevision <= beforeActionRevision) return false;
+            const newSuccessfulPlacements = newOutcomes(before, player).filter(
               (outcome) =>
                 outcome.kind === "place" && outcome.status === "successful",
-            ),
+            );
+            for (const outcome of newSuccessfulPlacements) {
+              if (checkedPlaceOutcomeIds.has(outcome.operationId)) continue;
+              checkedPlaceOutcomeIds.add(outcome.operationId);
+              const readbackDeadline = Date.now() + 1_500;
+              do {
+                if (await isBlock(rcon, buildingFixture.target, "oak_planks"))
+                  return true;
+                if (Date.now() < readbackDeadline) await waitMs(250);
+              } while (Date.now() < readbackDeadline);
+            }
+            return false;
+          },
         );
         const afterWorld = await readWorldSnapshot(
           rcon,
           state.botName,
-          buildingRegion,
+          buildingFixture.region,
+        );
+        const targetGapFilled = await isBlock(
+          rcon,
+          buildingFixture.target,
+          "oak_planks",
         );
         const selectedPlacement = newOutcomes(before, after).some(
           (outcome) =>
@@ -2509,15 +2545,25 @@ async function main(): Promise<void> {
           beforeWorld.blockRegionChanged,
           afterWorld.blockRegionChanged,
         );
-        if (!selectedPlacement || !stateChanged)
+        if (!selectedPlacement || !stateChanged || !targetGapFilled)
           incomplete("BUILDING_DISCRETION_NOT_OBSERVED");
+        await removeBuildingFixture(rcon, buildingFixture);
+        activeBuildingFixture = undefined;
         return {
           selectedBuildingOperation: selectedPlacement,
+          fixtureFacingConfirmed: true,
+          bodyObservedWallMaterial: true,
           serverConfirmedWorldChange: stateChanged,
+          serverConfirmedTargetGapFilled: targetGapFilled,
           ownerApprovalPerBlockNotRequired: true,
         };
       },
-    );
+    ).finally(async () => {
+      if (activeBuildingFixture !== undefined) {
+        await removeBuildingFixture(rcon, activeBuildingFixture);
+        activeBuildingFixture = undefined;
+      }
+    });
 
     const unknownResult = await recordCase(
       state,
@@ -5190,6 +5236,13 @@ interface BlockPosition {
   readonly z: number;
 }
 
+interface BuildingFixture {
+  readonly cells: readonly BlockPosition[];
+  readonly region: BlockRegion;
+  readonly target: BlockPosition;
+  readonly yaw: number;
+}
+
 function regionAround(position: Position): BlockRegion {
   const x = Math.floor(position.x);
   const z = Math.floor(position.z);
@@ -5416,20 +5469,137 @@ async function removeLearningLogFixture(
   }
 }
 
+async function findBuildingFixture(
+  rcon: LocalRcon,
+  origin: Position,
+): Promise<BuildingFixture> {
+  const directions = [
+    { x: 1, z: 0, yaw: -90 },
+    { x: -1, z: 0, yaw: 90 },
+    { x: 0, z: 1, yaw: 0 },
+    { x: 0, z: -1, yaw: 180 },
+  ] as const;
+  const originX = Math.floor(origin.x);
+  const originZ = Math.floor(origin.z);
+  for (const direction of directions) {
+    const centerX = originX + direction.x * 4;
+    const centerZ = originZ + direction.z * 4;
+    const cells: BlockPosition[] = [];
+    for (const y of [64, 65, 66]) {
+      for (const across of [-1, 0, 1]) {
+        const position = {
+          x: centerX + (direction.x === 0 ? across : 0),
+          y,
+          z: centerZ + (direction.z === 0 ? across : 0),
+        };
+        cells.push(position);
+      }
+    }
+    const target = cells.find(
+      (cell) => cell.y === 65 && cell.x === centerX && cell.z === centerZ,
+    );
+    if (target === undefined) incomplete("BUILDING_FIXTURE_SITE_UNAVAILABLE");
+    const clearLine = [];
+    for (let distance = 1; distance < 4; distance += 1) {
+      clearLine.push({
+        x: originX + direction.x * distance,
+        y: 65,
+        z: originZ + direction.z * distance,
+      });
+    }
+    let siteAvailable = true;
+    for (const position of [...cells, ...clearLine]) {
+      if (!(await isBlock(rcon, position, "air"))) {
+        siteAvailable = false;
+        break;
+      }
+    }
+    if (siteAvailable) {
+      return {
+        cells,
+        region: regionAround(origin),
+        target,
+        yaw: direction.yaw,
+      };
+    }
+  }
+  incomplete("BUILDING_FIXTURE_SITE_UNAVAILABLE");
+}
+
 async function configureBuildingFixture(
   rcon: LocalRcon,
   botName: string,
   origin: Position,
-): Promise<BlockRegion> {
-  const center = fixturePoint(origin, 0, 0);
-  await rcon.command(
-    `fill ${center.x - 2} 64 ${center.z + 3} ${center.x + 2} 66 ${center.z + 7} oak_planks hollow`,
-  );
-  await rcon.command(`setblock ${center.x} 66 ${center.z + 5} air`);
+  fixture: BuildingFixture,
+): Promise<number> {
+  const targetKey = `${fixture.target.x},${fixture.target.y},${fixture.target.z}`;
+  for (const cell of fixture.cells) {
+    if (`${cell.x},${cell.y},${cell.z}` === targetKey) continue;
+    await rcon.command(`setblock ${cell.x} ${cell.y} ${cell.z} oak_planks`);
+  }
+  for (const cell of fixture.cells) {
+    const expected =
+      `${cell.x},${cell.y},${cell.z}` === targetKey ? "air" : "oak_planks";
+    if (!(await isBlock(rcon, cell, expected)))
+      incomplete("BUILDING_FIXTURE_NOT_CONFIRMED");
+  }
   await rcon.command(
     `item replace entity ${botName} hotbar.0 with oak_planks 16`,
   );
-  return regionAround(origin);
+  await rcon.command(
+    `tp ${botName} ${origin.x} ${origin.y} ${origin.z} ${fixture.yaw} ${UNKNOWN_FIXTURE_PITCH}`,
+  );
+  const facingPosition = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  if (
+    Math.hypot(
+      facingPosition.x - origin.x,
+      facingPosition.y - origin.y,
+      facingPosition.z - origin.z,
+    ) > 1.5
+  ) {
+    incomplete("BUILDING_FIXTURE_POSITION_READBACK_MISMATCH");
+  }
+  const rotation = parseEntityRotation(
+    await rcon.command(`data get entity ${botName} Rotation`),
+  );
+  if (
+    rotation === undefined ||
+    angularDistance(rotation.yaw, fixture.yaw) > 2 ||
+    Math.abs(rotation.pitch - UNKNOWN_FIXTURE_PITCH) > 2
+  ) {
+    incomplete("BUILDING_FIXTURE_FACING_NOT_CONFIRMED");
+  }
+  return Date.now();
+}
+
+async function removeBuildingFixture(
+  rcon: LocalRcon,
+  fixture: BuildingFixture,
+): Promise<void> {
+  for (const cell of fixture.cells) {
+    try {
+      await rcon.command(
+        `fill ${cell.x} ${cell.y} ${cell.z} ${cell.x} ${cell.y} ${cell.z} air replace oak_planks`,
+      );
+    } catch {
+      incomplete("BUILDING_FIXTURE_CLEANUP_UNVERIFIED");
+    }
+  }
+  for (const cell of fixture.cells) {
+    let isAir: boolean;
+    try {
+      isAir = await isBlock(rcon, cell, "air");
+    } catch {
+      incomplete("BUILDING_FIXTURE_CLEANUP_UNVERIFIED");
+    }
+    if (!isAir) incomplete("BUILDING_FIXTURE_CLEANUP_UNVERIFIED");
+  }
+}
+
+function angularDistance(left: number, right: number): number {
+  return Math.abs(((((left - right) % 360) + 540) % 360) - 180);
 }
 
 async function configureParallelFixture(
