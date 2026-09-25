@@ -108,6 +108,10 @@ const E2E_GAMERULES = {
     id: "minecraft:keep_inventory",
     readbackFailure: "WORLD_KEEP_INVENTORY_READBACK_MISMATCH",
   },
+  respawnRadius: {
+    id: "minecraft:respawn_radius",
+    readbackFailure: "WORLD_RESPAWN_RADIUS_READBACK_MISMATCH",
+  },
 } as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
@@ -1833,6 +1837,17 @@ async function main(): Promise<void> {
     state.countersInitial = countersOf(preStartEvidence);
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
     await connectApplication(activeApp, state);
+    const autonomousSpawn = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    if (
+      Math.hypot(
+        autonomousSpawn.x - 0.5,
+        autonomousSpawn.y - 64,
+        autonomousSpawn.z - 0.5,
+      ) > 1.5
+    )
+      incomplete("AUTONOMOUS_SPAWN_POSITION_NOT_CONFIRMED");
     const connectedWorld = await readWorldSnapshot(
       rcon,
       state.botName,
@@ -4351,6 +4366,7 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   await setAndVerifyGamerule(rcon, "advanceTime", false);
   await setAndVerifyGamerule(rcon, "spawnMobs", false);
   await setAndVerifyGamerule(rcon, "keepInventory", true);
+  await setAndVerifyGamerule(rcon, "respawnRadius", 0);
   await rcon.command("scoreboard objectives add ai_e2e dummy");
   await rcon.command("scoreboard players set #diff ai_e2e 0");
   await forceLoadRegion(rcon, REGION, incomplete);
@@ -4378,7 +4394,7 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
 async function setAndVerifyGamerule(
   rcon: LocalRcon,
   rule: keyof typeof E2E_GAMERULES,
-  value: boolean,
+  value: boolean | number,
 ): Promise<void> {
   const { id, readbackFailure } = E2E_GAMERULES[rule];
   await rcon.command(`gamerule ${id} ${value}`);
@@ -4390,7 +4406,7 @@ async function setAndVerifyGamerule(
   const leafId = id.slice(id.indexOf(":") + 1);
   const ruleIdDisplayed =
     ruleTokens.includes(id) || ruleTokens.includes(leafId);
-  const reportedValue = /(?:^|\s)(true|false)$/u.exec(readback)?.[1];
+  const reportedValue = /(?:^|\s)(true|false|\d+)$/u.exec(readback)?.[1];
   if (!ruleIdDisplayed || reportedValue !== String(value))
     incomplete(readbackFailure);
 }

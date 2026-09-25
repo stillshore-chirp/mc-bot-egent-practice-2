@@ -6,7 +6,7 @@
 
 ## 隔離と公開境界
 
-ハーネスはNode.jsの `os.tmpdir()` が返すOS一時領域の下に一時ディレクトリを作り、Paper 1.21.11 の新規flat worldだけを起動します。固定値 `720926` は合成fixtureのseedです。既存worldや利用者のMinecraft環境には接続しません。接続先はloopbackに限定し、RCONはfixtureの作成・状態確認専用です。`ops.json` は空で、AIプレイヤー、owner、guestの3接続は通常の非OPプレイヤーとして動きます。Console相当のfixture操作はハーネスだけが行います。server jarが初回起動時に既存のPaper依存を必要とする環境では、任意の`AI_PLAYER_E2E_SERVER_CACHE_DIR`を指定できます。そこから`libraries`、`versions`、`cache`だけを新しい一時serverへコピーします。コピー元のworldやprocessには触れず、コピー中はsymlinkを除外します。
+ハーネスはNode.jsの `os.tmpdir()` が返すOS一時領域の下に一時ディレクトリを作り、Paper 1.21.11 の新規flat worldだけを起動します。固定値 `720926` は合成fixtureのseedです。既存worldや利用者のMinecraft環境には接続しません。接続先はloopbackに限定し、RCONはfixtureの作成・状態確認専用です。`ops.json` は空で、AIプレイヤー、owner、guestの3接続は通常の非OPプレイヤーとして動きます。Console相当のfixture操作はハーネスだけが行います。server jarが初回起動時に既存のPaper依存を必要とする環境では、任意の`AI_PLAYER_E2E_SERVER_CACHE_DIR`を指定できます。そこから`libraries`、`versions`、`cache`だけを新しい一時serverへコピーします。コピー元のworldやprocessには触れず、コピー中はsymlinkを除外します。自発行動fixtureの開始位置がspawnの乱数で変わらないよう、`minecraft:respawn_radius`を0へ設定・読み戻し、アプリ接続後のBot位置も確認します。
 
 `prepareWorld` はbaseline取得前にspawn周辺の水平視野全体へ5個の合成`oak_log`を分散して置き、自律caseの資源fixtureに使います。Body smokeの最後には、操作確認に使った近距離セルを一時的な`oak_log`へ置き換え、Bodyの視線をそのセルへ向けた新しい観測に同じセル・同じblock nameが含まれることを確認します。原木のRCON設置を先に確認し、観測後はbaseline取得前に空へ戻してreadbackします。fixtureや観測に失敗した場合は固定codeで停止し、GPTを起動しません。これは資源の可視性fixtureであり、owner指示や自律goalを追加しません。静的な資源fixtureは既存fixtureやsmoke targetと位置を重ねず、`autonomous_life`終了後に残った`oak_log`だけをRCONで除去してreadback確認してから後続caseへ進みます。これは自律caseの成功判定後に行うcleanupです。
 
