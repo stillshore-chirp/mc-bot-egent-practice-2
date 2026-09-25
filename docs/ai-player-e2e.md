@@ -189,4 +189,6 @@ HEAD `a1d1ff7` のrun73では基本4操作の短い入力署名を現行schema�
 
 HEAD `8a9dd4a` のrun74ではBody smokeと自発生活がpassしました。未知複合状況は33 calls・既知197,271 tokensで上限に達し、run全体は39 calls・既知220,352 tokens、usageは`partial_or_unknown`、cleanupは3/3です。成功した移動操作を複数確認しましたが、サーバー判定では標的への距離短縮、採集、帰還を確認できず、障害物注入と失敗後の回復も未実施です。`commit_action_decision`は9件で拒否0件、`describe_operation`は3件、`propose_skill_learning`は4件で版照合拒否1件でした。`request_error`10件は`body_outcome`6件、`stop`1件、`owner_proposal`1件、`state_changed`2件で、記録範囲に`request_failed`はありません。前runとは世界内の進路が異なるため、照会数やtoken数の差を実装変更の効果とは断定しません。終了時の保存状態では、1件の妥協したowner proposalからactiveなowner goalが2件作られ、片方だけがproposalへ紐付いていました。異なる題名の妥協案を同時に保存すると重複する経路を特定して修正し、両commit経路の単体テストを追加しました。この修正後の実ゲーム結果は未確認です。
 
+HEAD `b0a6312` のrun75ではBody smokeと自発生活がpassしました。未知複合状況は33 calls・既知158,765 tokens、run全体は41 calls・既知195,994 tokensで全体calls上限となり、usageは`partial_or_unknown`、cleanupは3/3です。1件の採用されたowner proposalに紐付くactive owner goalは1件で、紐付かないowner goalは0件となり、run74で見つかった重複保存の解消を隔離実環境でも確認しました。`move_to`成功5件とサーバー上の移動はありましたが、採集対象への距離短縮・破壊・取得・帰還は未確認です。最初の課題後観測では壁材だけが見え、標的と水は見えていませんでした。制御障害は適格条件を満たさずskipされ、失敗後の回復は未確認です。`describe_operation`4件、判断commit成功11件、学習提案成功2件を記録しました。対象へ近づかなかった理由はこの診断だけでは確定できず、同条件の再試行を完了証拠にはしません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
