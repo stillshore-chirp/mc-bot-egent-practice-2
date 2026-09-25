@@ -676,6 +676,37 @@ describe("player body", () => {
     expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
   });
 
+  it("searches past several saturated ordinary block types for a visible rare target", () => {
+    const fake = makeFakeBot();
+    const ordinaryNames = ["stone", "dirt", "grass_block"];
+    for (let z = -5; z >= -15 && fake.candidates.length < 576; z -= 1) {
+      for (let x = -8; x <= 8 && fake.candidates.length < 576; x += 1) {
+        for (let y = 62; y <= 66 && fake.candidates.length < 576; y += 1) {
+          const point = new Vec3(x, y, z);
+          if (
+            point.distanceTo(new Vec3(0, 64, 0)) > 16 ||
+            (x === 0 && y === 65 && z === -15)
+          )
+            continue;
+          const name = ordinaryNames[fake.candidates.length % 3] ?? "stone";
+          fake.blocks.set(`${x},${y},${z}`, makeBlock(name, 1, point));
+          fake.candidates.push(point);
+        }
+      }
+    }
+    const target = new Vec3(0, 65, -15);
+    fake.blocks.set("0,65,-15", makeBlock("blue_wool", 2, target));
+    fake.candidates.push(target);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    expect(fake.candidates).toHaveLength(577);
+    expect(fake.findBlockSearches).toHaveLength(2);
+    expect(observation.perception.blocks.map(({ name }) => name)).toContain(
+      "blue_wool",
+    );
+    expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
+  });
+
   it("reserves the first crosshair hit when a common block type fills the search cap", () => {
     const fake = makeFakeBot();
     addOffAxisStoneCandidates(fake, 192);

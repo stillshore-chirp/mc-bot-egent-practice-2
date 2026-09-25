@@ -438,16 +438,10 @@ function visibleBlockCandidates(
 
     if (searchResults.length < blockCandidateLimit) break;
 
-    let dominantName: string | undefined;
-    let dominantCount = 0;
-    for (const [name, count] of nameCounts) {
-      if (count > dominantCount) {
-        dominantName = name;
-        dominantCount = count;
-      }
-    }
-    if (dominantName === undefined) break;
-    excludedNames.add(dominantName);
+    if (nameCounts.size === 0) break;
+    // Every name in this saturated batch already has sampled candidates.
+    // Search the remaining kinds before using another bounded pass.
+    for (const name of nameCounts.keys()) excludedNames.add(name);
   }
 
   const blocks: BodyVisibleBlock[] = [];
