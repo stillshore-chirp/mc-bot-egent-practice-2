@@ -453,11 +453,12 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
 
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
-    expect(playerOperationNames).toHaveLength(28);
+    expect(playerOperationNames).toHaveLength(29);
     expect(Object.keys(playerOperationDescriptions).sort()).toEqual(
       [...playerOperationNames].sort(),
     );
     expect(playerOperationNames).toContain("move_to");
+    expect(playerOperationNames).toContain("move_relative");
     expect(playerOperationNames).toContain("window_transfer");
     expect(playerOperationNames).toContain("elytra_fly");
     expect(() =>
@@ -465,6 +466,18 @@ describe("player body", () => {
         kind: "dig",
         position: { x: 1, y: 64, z: 2 },
         permission: "allow",
+      }),
+    ).toThrow();
+    expect(() =>
+      playerOperationSchema.parse({
+        kind: "move_relative",
+        offset: { x: 0, y: 0, z: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      playerOperationSchema.parse({
+        kind: "move_relative",
+        offset: { x: 33, y: 0, z: 0 },
       }),
     ).toThrow();
     expect(() =>
@@ -1094,6 +1107,47 @@ describe("player body", () => {
     });
 
     expect(result.status).toBe("successful");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("resolves a relative move from the observed start and verifies arrival", async () => {
+    const fake = makeFakeBot();
+    fake.bot.entity.position.x = 4.2;
+    fake.bot.entity.position.z = 2.4;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    let plannedGoal: unknown;
+    const goto = vi
+      .spyOn(fake.bot.pathfinder, "goto")
+      .mockImplementationOnce(async (goal) => {
+        plannedGoal = goal;
+        fake.bot.entity.position.x = 8;
+        fake.bot.entity.position.z = 1.1;
+      });
+
+    const result = await body.execute({
+      kind: "move_relative",
+      offset: { x: 3.8, y: 0, z: -1.3 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("successful");
+    expect(result.operation.kind).toBe("move_relative");
+    expect(goto).toHaveBeenCalledOnce();
+    expect(plannedGoal).toMatchObject({ x: 8, y: 64, z: 1 });
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("does not claim a relative move succeeded without observed arrival", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "move_relative",
+      offset: { x: 6, y: 0, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("unverified");
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 

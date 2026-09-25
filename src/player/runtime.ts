@@ -982,6 +982,7 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
 function observedMovementSummary(result: PlayerOperationResult): string {
   if (
     result.operation.kind !== "move_to" &&
+    result.operation.kind !== "move_relative" &&
     result.operation.kind !== "control"
   )
     return "";

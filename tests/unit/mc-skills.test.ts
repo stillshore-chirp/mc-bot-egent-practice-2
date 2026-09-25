@@ -47,6 +47,7 @@ const allowedOperationNames = [
   "write_book",
   "update_sign",
   "move_to",
+  "move_relative",
   "open_window",
   "window_click",
   "window_transfer",
@@ -232,6 +233,9 @@ describe("McSkillRepository", () => {
     ]);
     expect(summaries[0]).not.toHaveProperty("body");
     expect(repository.get("mc-skill-navigation").body).toContain("目的地");
+    expect(repository.get("mc-skill-exploration")).toMatchObject({
+      operationRefs: ["look", "move_relative", "move_to"],
+    });
     const custom = createDigSkill(repository, "restart-skill");
     repository.close();
 

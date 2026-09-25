@@ -215,6 +215,7 @@ interface ActiveOperation {
   readonly bot: Bot;
   readonly startedAt: string;
   readonly startedAtMs: number;
+  resolvedMoveTarget?: Vec3;
   done: Promise<PlayerOperationResult>;
   timedOut: boolean;
   lastProgressAt: number;
@@ -314,6 +315,7 @@ function digTimeoutFor(
 function timeoutFor(operation: PlayerOperation, bot: Bot): number {
   switch (operation.kind) {
     case "move_to":
+    case "move_relative":
       return 90_000;
     case "fish":
       return 60_000;
@@ -603,10 +605,19 @@ function operationEvidence(
       afterPos.z - beforePos.z,
     ) > 0.15;
   switch (operation.kind) {
-    case "move_to": {
-      const dx = Math.floor(afterPos.x) - Math.floor(operation.position.x);
-      const dy = Math.floor(afterPos.y) - Math.floor(operation.position.y);
-      const dz = Math.floor(afterPos.z) - Math.floor(operation.position.z);
+    case "move_to":
+    case "move_relative": {
+      const target =
+        operation.kind === "move_to"
+          ? operation.position
+          : {
+              x: beforePos.x + operation.offset.x,
+              y: beforePos.y + operation.offset.y,
+              z: beforePos.z + operation.offset.z,
+            };
+      const dx = Math.floor(afterPos.x) - Math.floor(target.x);
+      const dy = Math.floor(afterPos.y) - Math.floor(target.y);
+      const dz = Math.floor(afterPos.z) - Math.floor(target.z);
       return dx * dx + dy * dy + dz * dz <= operation.range * operation.range;
     }
     case "look": {
@@ -1210,6 +1221,14 @@ export class MineflayerPlayerBody implements PlayerBody {
   ): Promise<PlayerOperationResult> {
     const { bot, operation, controller } = active;
     const before = this.safeObserve(bot);
+    if (operation.kind === "move_relative") {
+      const origin = before?.self.position ?? bot.entity.position;
+      active.resolvedMoveTarget = new Vec3(
+        origin.x + operation.offset.x,
+        origin.y + operation.offset.y,
+        origin.z + operation.offset.z,
+      );
+    }
     active.lastProgressSignature =
       before === null ? "" : stableSignature(before);
     this.startStallMonitor(active);
@@ -1454,7 +1473,8 @@ export class MineflayerPlayerBody implements PlayerBody {
   ): void {
     const { bot, operation } = active;
     try {
-      if (operation.kind === "move_to") bot.pathfinder.setGoal(null);
+      if (operation.kind === "move_to" || operation.kind === "move_relative")
+        bot.pathfinder.setGoal(null);
       if (operation.kind === "control") bot.clearControlStates();
       if (operation.kind === "move_vehicle") bot.moveVehicle(0, 0);
       if (operation.kind === "dig") bot.stopDigging();
@@ -1492,11 +1512,18 @@ export class MineflayerPlayerBody implements PlayerBody {
     active: ActiveOperation,
   ): Promise<void> {
     switch (operation.kind) {
-      case "move_to": {
+      case "move_to":
+      case "move_relative": {
+        const target =
+          operation.kind === "move_to"
+            ? operation.position
+            : active.resolvedMoveTarget;
+        if (target === undefined)
+          throw new Error("Relative movement target was not initialized");
         const goal = new goals.GoalNear(
-          operation.position.x,
-          operation.position.y,
-          operation.position.z,
+          target.x,
+          target.y,
+          target.z,
           operation.range,
         );
         let latestPathUpdateStatus: string | undefined;

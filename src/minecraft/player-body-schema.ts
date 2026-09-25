@@ -38,6 +38,7 @@ const signLineSchema = z
 
 export const playerOperationNames = [
   "move_to",
+  "move_relative",
   "look",
   "control",
   "equip",
@@ -72,6 +73,8 @@ export type PlayerOperationName = (typeof playerOperationNames)[number];
 export const playerOperationDescriptions = {
   move_to:
     "Move near a world position using normal pathfinding and server physics.",
+  move_relative:
+    "Move by a bounded offset from the current position using pathfinding. Positive X is east and positive Z is south; use when direction is known but the destination is not visible.",
   look: "Turn the player's view toward a world position.",
   control:
     "Hold the selected movement, jump, sprint, or sneak controls for bounded ticks.",
@@ -110,6 +113,19 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
     .object({
       kind: z.literal("move_to"),
       position: vectorSchema,
+      range: z.number().min(0.25).max(8).default(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("move_relative"),
+      offset: z
+        .object({
+          x: z.number().min(-32).max(32),
+          y: z.number().min(-32).max(32),
+          z: z.number().min(-32).max(32),
+        })
+        .strict(),
       range: z.number().min(0.25).max(8).default(1),
     })
     .strict(),
@@ -284,6 +300,18 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
 
 export const playerOperationSchema = playerOperationBaseSchema.superRefine(
   (operation, context) => {
+    if (
+      operation.kind === "move_relative" &&
+      operation.offset.x === 0 &&
+      operation.offset.y === 0 &&
+      operation.offset.z === 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["offset"],
+        message: "move_relative requires a nonzero offset",
+      });
+    }
     if (operation.kind !== "anvil") return;
     if (operation.operation === "combine" && operation.secondItem === undefined)
       context.addIssue({
