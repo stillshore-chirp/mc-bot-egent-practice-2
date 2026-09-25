@@ -1961,6 +1961,7 @@ async function main(): Promise<void> {
       },
     );
 
+    let activeLearningLogs: readonly BlockPosition[] = [];
     const learningResult = await recordCase(
       state,
       "learning_reuse",
@@ -1971,12 +1972,9 @@ async function main(): Promise<void> {
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
-        const firstLogs = await configureLogFixture(
-          rcon,
-          1,
-          origin,
-          state.botName,
-        );
+        const firstLogs = await availableLogFixtureSites(rcon, origin);
+        activeLearningLogs = firstLogs;
+        await configureLogFixture(rcon, firstLogs, state.botName);
         const firstLogsConfiguredAt = Date.now();
         const firstRegion = await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
@@ -2003,14 +2001,14 @@ async function main(): Promise<void> {
         const responseStart = context.responseQueue.length;
         sendChat(
           context.owner,
-          "すぐ近くに置いたオークの原木を1本集めてください。方法と順序は自分で選び、実際に集め終わったかを確かめてください。",
+          "すぐ近くに置いたオークの原木を1本採掘し、結果を確かめてください。方法と順序は自分で選んでください。",
         );
         let firstFixtureCheckAt = 0;
-        let firstFixtureGone = false;
+        let firstFixtureLogRemoved = false;
         const after = await waitForPlayer(context, 240_000, async (player) => {
           if (Date.now() - firstFixtureCheckAt > 3_000) {
-            firstFixtureGone =
-              (await fixtureLogsRemaining(rcon, firstLogs)) === 0;
+            firstFixtureLogRemoved =
+              (await fixtureLogsRemaining(rcon, firstLogs)) < firstLogs.length;
             firstFixtureCheckAt = Date.now();
           }
           return (
@@ -2020,7 +2018,7 @@ async function main(): Promise<void> {
                 outcome.kind === "dig" && outcome.status === "successful",
             ) &&
             !isOperationActive(player) &&
-            firstFixtureGone
+            firstFixtureLogRemoved
           );
         });
         const afterWorld = await readWorldSnapshot(
@@ -2042,6 +2040,8 @@ async function main(): Promise<void> {
         ) {
           incomplete("LEARNING_ACTION_NOT_CONFIRMED_BY_SERVER");
         }
+        await removeLearningLogFixture(rcon, firstLogs);
+        activeLearningLogs = [];
         let learned = readSkillSnapshot(state.databasePath);
         const hasNewTrustedHypothesis = (snapshot: SkillSnapshot): boolean =>
           [...snapshot.skillIds].some(
@@ -2076,12 +2076,24 @@ async function main(): Promise<void> {
         const reuseOrigin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
-        const reuseLogs = await configureLogFixture(
-          rcon,
-          1,
-          reuseOrigin,
-          state.botName,
+        const reuseLogs = await availableLogFixtureSites(rcon, reuseOrigin);
+        activeLearningLogs = reuseLogs;
+        await configureLogFixture(rcon, reuseLogs, state.botName);
+        const reuseLogsConfiguredAt = Date.now();
+        const reuseFixtureObservation = await observeForPlayer(
+          context,
+          15_000,
+          (player) => {
+            const observation = player.lastObservation;
+            return (
+              observation?.observedAt !== undefined &&
+              Date.parse(observation.observedAt) >= reuseLogsConfiguredAt &&
+              observation.visibleBlockNames?.includes("oak_log") === true
+            );
+          },
         );
+        if (reuseFixtureObservation === undefined)
+          incomplete("LEARNING_REUSE_LOG_FIXTURE_NOT_VISIBLE");
         const reuseRegion = await captureBlockBaseline(rcon, reuseOrigin);
         const beforeReuseWorld = await readWorldSnapshot(
           rcon,
@@ -2096,10 +2108,10 @@ async function main(): Promise<void> {
         const consultedLearnedSkillIds = new Set<string>();
         sendChat(
           context.owner,
-          "近くにオークの原木を1本用意しました。集めてください。前回の方法が今も役立つと判断したら自分で選んで活用してください。",
+          "近くにオークの原木を1本用意しました。前回の方法が今も役立つと判断したら自分で選んで活用し、採掘して結果を確かめてください。",
         );
         let reuseFixtureCheckAt = 0;
-        let reuseFixtureGone = false;
+        let reuseFixtureLogRemoved = false;
         const reused = await waitForPlayer(context, 150_000, async (player) => {
           const newConsultedSkills = player.skillActivity.filter(
             (activity) =>
@@ -2111,8 +2123,8 @@ async function main(): Promise<void> {
             consultedLearnedSkillIds.add(activity.skillId);
           }
           if (Date.now() - reuseFixtureCheckAt > 3_000) {
-            reuseFixtureGone =
-              (await fixtureLogsRemaining(rcon, reuseLogs)) === 0;
+            reuseFixtureLogRemoved =
+              (await fixtureLogsRemaining(rcon, reuseLogs)) < reuseLogs.length;
             reuseFixtureCheckAt = Date.now();
           }
           return (
@@ -2123,7 +2135,7 @@ async function main(): Promise<void> {
             ) &&
             !isOperationActive(player) &&
             newConsultedSkills.length > 0 &&
-            reuseFixtureGone
+            reuseFixtureLogRemoved
           );
         });
         const reusedWorld = await readWorldSnapshot(
@@ -2165,6 +2177,8 @@ async function main(): Promise<void> {
         ) {
           incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
         }
+        await removeLearningLogFixture(rcon, reuseLogs);
+        activeLearningLogs = [];
         return {
           oneSuccessCreatedHypothesis: true,
           trustedEvidenceReceipt: true,
@@ -2178,7 +2192,12 @@ async function main(): Promise<void> {
           ownerReplyObserved: context.responseQueue.length > responseStart,
         };
       },
-    );
+    ).finally(async () => {
+      if (activeLearningLogs.length > 0) {
+        await removeLearningLogFixture(rcon, activeLearningLogs);
+        activeLearningLogs = [];
+      }
+    });
 
     const skillQualityResult = await recordCase(
       state,
@@ -5335,22 +5354,66 @@ async function removeAutonomousResourceFixture(rcon: LocalRcon): Promise<void> {
   }
 }
 
+async function availableLogFixtureSites(
+  rcon: LocalRcon,
+  origin: Position,
+): Promise<readonly BlockPosition[]> {
+  for (const radius of [3, 4, 5, 6]) {
+    const logs = [
+      fixturePoint(origin, radius, 0),
+      fixturePoint(origin, -radius, 0),
+      fixturePoint(origin, 0, radius),
+      fixturePoint(origin, 0, -radius),
+    ];
+    let available = true;
+    for (const log of logs) {
+      if (!(await isBlock(rcon, log, "air"))) {
+        available = false;
+        break;
+      }
+    }
+    if (available) return logs;
+  }
+  incomplete("LEARNING_LOG_FIXTURE_SITE_OCCUPIED");
+}
+
 async function configureLogFixture(
   rcon: LocalRcon,
-  count: number,
-  origin: Position,
+  logs: readonly BlockPosition[],
   botName: string,
-): Promise<readonly BlockPosition[]> {
-  const base = fixturePoint(origin, 5, 4);
-  const logs = Array.from({ length: count }, (_, offset) => ({
-    ...base,
-    y: base.y + offset,
-  }));
+): Promise<void> {
   await rcon.command(`clear ${botName} minecraft:oak_log`);
-  await rcon.command(
-    `fill ${base.x} ${base.y} ${base.z} ${base.x} ${base.y + count - 1} ${base.z} oak_log`,
-  );
-  return logs;
+  for (const log of logs) {
+    await rcon.command(`setblock ${log.x} ${log.y} ${log.z} oak_log`);
+  }
+  for (const log of logs) {
+    if (!(await isBlock(rcon, log, "oak_log")))
+      incomplete("LEARNING_LOG_FIXTURE_NOT_CONFIRMED");
+  }
+}
+
+async function removeLearningLogFixture(
+  rcon: LocalRcon,
+  logs: readonly BlockPosition[],
+): Promise<void> {
+  for (const log of logs) {
+    try {
+      await rcon.command(
+        `fill ${log.x} ${log.y} ${log.z} ${log.x} ${log.y} ${log.z} air replace oak_log`,
+      );
+    } catch {
+      incomplete("LEARNING_LOG_FIXTURE_CLEANUP_UNVERIFIED");
+    }
+  }
+  for (const log of logs) {
+    let stillPresent: boolean;
+    try {
+      stillPresent = await isBlock(rcon, log, "oak_log");
+    } catch {
+      incomplete("LEARNING_LOG_FIXTURE_CLEANUP_UNVERIFIED");
+    }
+    if (stillPresent) incomplete("LEARNING_LOG_FIXTURE_CLEANUP_UNVERIFIED");
+  }
 }
 
 async function configureBuildingFixture(
