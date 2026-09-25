@@ -1158,7 +1158,10 @@ export class PlayerPurposeAgent {
     ) {
       return { ok: false, code: "OUTCOME_NOT_LEARNABLE" };
     }
-    if (!input.operationRefs.includes(evidence.operationName)) {
+    if (
+      input.mode !== "create" &&
+      !input.operationRefs.includes(evidence.operationName)
+    ) {
       return { ok: false, code: "OPERATION_REFERENCE_MISMATCH" };
     }
     let record: ReturnType<McSkillRepository["get"]>;
@@ -1192,7 +1195,7 @@ export class PlayerPurposeAgent {
         purpose: input.purpose,
         conditions: input.conditions,
         body: input.body,
-        operationRefs: input.operationRefs,
+        operationRefs: [evidence.operationName],
         expectedOutcome: input.expectedOutcome,
         confidence: input.confidence,
       };

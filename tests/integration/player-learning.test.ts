@@ -362,6 +362,7 @@ describe("player skill learning", () => {
     const operationName = seed.operationRefs[0];
     if (operationName === undefined)
       throw new Error("seed operation reference is missing");
+    const modelOperationRef = operationName === "dig" ? "look" : "dig";
     const runId = "learning-run-observed-success";
     const seedStatisticsBefore = skills.get(seed.id).nativeStatistics;
     skills.recordTrustedEvidence({
@@ -382,7 +383,7 @@ describe("player skill learning", () => {
       functionCallResponse(
         "learn-1",
         "propose_skill_learning",
-        learningArguments(runId, title, operationName),
+        learningArguments(runId, title, operationName, modelOperationRef),
       ),
       functionCallResponse(
         "learn-2",
@@ -429,6 +430,7 @@ describe("player skill learning", () => {
     const created = skills.search({ query: title, limit: 4 })[0];
     expect(created).toBeDefined();
     if (created === undefined) throw new Error("hypothesis was not created");
+    expect(created.operationRefs).toEqual([operationName]);
     expect(skills.listDerivedHypotheses(created.id)).toHaveLength(1);
     expect(skills.listDerivedHypotheses(created.id)[0]?.runId).toBe(runId);
     expect(
@@ -468,6 +470,7 @@ function learningArguments(
   runId: string,
   title: string,
   operationName: string,
+  modelOperationRef = operationName,
 ): Record<string, unknown> {
   return {
     runId,
@@ -479,7 +482,7 @@ function learningArguments(
     purpose: "reach a chosen landmark using the current visible route",
     conditions: ["A landmark is selected and a route is visible."],
     body: "Compare the visible route to the landmark, select a suitable path, and verify arrival from the next body observation.",
-    operationRefs: [operationName],
+    operationRefs: [modelOperationRef],
     expectedOutcome: "The next observation confirms arrival at the landmark.",
     confidence: 0.65,
     changeKind: "revise",
