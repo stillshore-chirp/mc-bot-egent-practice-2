@@ -3844,6 +3844,7 @@ async function main(): Promise<void> {
           (player) =>
             isOperationActive(player) &&
             player.activeOperation?.kind === "move_to" &&
+            typeof player.activeOperation.bodyStartedAt === "string" &&
             player.activeOperation.operationId !==
               before.activeOperation?.operationId &&
             player.actionRevision > beforeActions,
@@ -3858,7 +3859,7 @@ async function main(): Promise<void> {
           context.guest,
           "今の行動を停止して、所有者の依頼を取り消してください。",
         );
-        await waitMs(2_000);
+        await waitMs(500);
         const afterGuest = playerOf(await collect(context.runtime.app));
         if (
           afterGuest.stopped ||
