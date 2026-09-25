@@ -440,13 +440,44 @@ describe("restorable unknown-scenario obstacle", () => {
     const plan = makePlan();
     const rcon = new FakeRcon(plan);
     rcon.failRestore = true;
+    let failureStage: string | undefined;
     await expect(
       withRestorableObstacle(
         rcon,
         plan,
-        { eligible: async () => true, observeWhileApplied: async () => "done" },
+        {
+          eligible: async () => true,
+          observeWhileApplied: async () => "done",
+          onRestoreFailure: (stage) => {
+            failureStage = stage;
+          },
+        },
         fail,
       ),
     ).rejects.toThrow("UNKNOWN_OBSTACLE_RESTORE_FAILED");
+    expect(failureStage).toBe("clone");
+  });
+
+  it("runs restoration inside the supplied stable-world boundary", async () => {
+    const plan = makePlan();
+    const rcon = new FakeRcon(plan);
+    const phases: string[] = [];
+    const result = await withRestorableObstacle(
+      rcon,
+      plan,
+      {
+        eligible: async () => true,
+        observeWhileApplied: async () => "observed",
+        restoreInStableWorld: async (restore) => {
+          phases.push("stabilize");
+          await restore();
+          phases.push("restored");
+        },
+      },
+      fail,
+    );
+    expect(result.status).toBe("applied");
+    expect(phases).toEqual(["stabilize", "restored"]);
+    expect(rcon.equalRegions(plan.sourceRegion, plan.backupOrigin)).toBe(true);
   });
 });

@@ -69,6 +69,12 @@ export interface RecoveryObstacleCallbacks<T> {
   readonly eligible: () => Promise<boolean>;
   readonly observeWhileApplied: () => Promise<T>;
   readonly onProgress?: (progress: RecoveryObstacleProgress) => void;
+  readonly restoreInStableWorld?: (
+    restore: () => Promise<void>,
+  ) => Promise<void>;
+  readonly onRestoreFailure?: (
+    stage: "stabilize" | "clone" | "compare",
+  ) => void;
 }
 
 export function isNewFailureAfterUnfreeze(
@@ -207,19 +213,11 @@ export async function withRestorableObstacle<T>(
         confirmedPlacementCount,
         false,
       );
+      let restoreStage: "stabilize" | "clone" | "compare" = "stabilize";
       try {
-        await cloneBaseline(
-          rcon,
-          backupRegion,
-          {
-            x: plan.sourceRegion.minX,
-            y: plan.sourceRegion.minY,
-            z: plan.sourceRegion.minZ,
-          },
-          fail,
-        );
-        if (
-          !(await regionsEqual(
+        const restore = async (): Promise<void> => {
+          restoreStage = "clone";
+          await cloneBaseline(
             rcon,
             backupRegion,
             {
@@ -228,10 +226,24 @@ export async function withRestorableObstacle<T>(
               z: plan.sourceRegion.minZ,
             },
             fail,
-          ))
-        ) {
-          fail("UNKNOWN_OBSTACLE_RESTORE_NOT_CONFIRMED");
-        }
+          );
+          restoreStage = "compare";
+          if (
+            !(await regionsEqual(
+              rcon,
+              backupRegion,
+              {
+                x: plan.sourceRegion.minX,
+                y: plan.sourceRegion.minY,
+                z: plan.sourceRegion.minZ,
+              },
+              fail,
+            ))
+          )
+            fail("UNKNOWN_OBSTACLE_RESTORE_NOT_CONFIRMED");
+        };
+        if (callbacks.restoreInStableWorld === undefined) await restore();
+        else await callbacks.restoreInStableWorld(restore);
         report(
           callbacks,
           plan,
@@ -240,6 +252,11 @@ export async function withRestorableObstacle<T>(
           true,
         );
       } catch {
+        try {
+          callbacks.onRestoreFailure?.(restoreStage);
+        } catch {
+          // Diagnostics cannot replace the restoration failure.
+        }
         fail("UNKNOWN_OBSTACLE_RESTORE_FAILED");
       }
     }

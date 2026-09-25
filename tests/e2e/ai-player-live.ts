@@ -294,6 +294,8 @@ interface UnknownCompositeDiagnostic {
   readonly unknownDistinctRecoveryOperation?: boolean;
   readonly unknownControlledObstacleStatus?: UnknownObstacleStatus;
   readonly unknownControlledObstacleAttemptCount?: number;
+  readonly unknownControlledObstacleRestoreFailureStage?:
+    "stabilize" | "clone" | "compare";
   readonly unknownControlledObstaclePhase?: UnknownObstaclePhase;
   readonly unknownControlledObstaclePlacementCount?: number;
   readonly unknownControlledObstacleConfirmedPlacementCount?: number;
@@ -388,6 +390,8 @@ interface BodySmokeDiagnostic {
   readonly obstacleRoutePathStatus?: BodyPathStatus;
   readonly obstacleRoutePathUpdateCount?: number;
   readonly obstacleRouteMaxPathBand?: "none" | "short" | "long";
+  readonly obstacleRestoreProbeVerified?: boolean;
+  readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
   readonly resourceLookDetailClass?: BodyDetailClass;
@@ -3564,6 +3568,12 @@ async function main(): Promise<void> {
                     obstacleRcon,
                     obstaclePlan,
                     {
+                      restoreInStableWorld: (restore) =>
+                        withFrozenTicks(obstacleRcon, restore, incomplete),
+                      onRestoreFailure: (stage) =>
+                        updateUnknownCompositeDiagnostic(state, {
+                          unknownControlledObstacleRestoreFailureStage: stage,
+                        }),
                       eligible: async () => {
                         const eligibilityChecks =
                           (state.unknownCompositeDiagnostic
@@ -5432,6 +5442,56 @@ async function runOperationSmoke(
           };
           if (!obstacleRouteVerifiedByServer)
             incomplete("BODY_NAVIGATION_PROBE_ROUTE_NOT_CONFIRMED");
+          if (process.env.AI_PLAYER_E2E_OBSTACLE_RESTORE_PROBE_ONLY === "YES") {
+            await rcon.command(
+              `tp ${state.botName} ${smokeSpawn.x} ${smokeSpawn.y} ${smokeSpawn.z} 0 0`,
+            );
+            if (
+              !positionMatchesSmokeSpawn(
+                parsePosition(
+                  await rcon.command(`data get entity ${state.botName} Pos`),
+                ),
+              )
+            )
+              incomplete("BODY_OBSTACLE_RESTORE_PROBE_CLEARANCE_NOT_CONFIRMED");
+            const probeCenter = {
+              x: fixtureTarget.x + 0.5,
+              y: fixtureTarget.y,
+              z: fixtureTarget.z + 0.5,
+            };
+            const probePlan = recoveryCagePlan(probeCenter, {
+              x: 2_000,
+              y: 64,
+              z: 2_000,
+            });
+            const probeRcon = boundedOracleRcon(rcon);
+            const probeDiagnostic = state.bodySmokeDiagnostic;
+            const restoreResult = await withRestorableObstacle(
+              probeRcon,
+              probePlan,
+              {
+                eligible: () =>
+                  nearbyEntitiesClear(probeRcon, probeCenter, state.botName),
+                observeWhileApplied: async () => true,
+                restoreInStableWorld: (restore) =>
+                  withFrozenTicks(probeRcon, restore, incomplete),
+                onRestoreFailure: (stage) => {
+                  state.bodySmokeDiagnostic = {
+                    ...probeDiagnostic,
+                    obstacleRestoreProbeFailureStage: stage,
+                  };
+                },
+              },
+              incomplete,
+            );
+            const verified = restoreResult.status === "applied";
+            state.bodySmokeDiagnostic = {
+              ...probeDiagnostic,
+              obstacleRestoreProbeVerified: verified,
+            };
+            if (!verified)
+              incomplete("BODY_OBSTACLE_RESTORE_PROBE_NOT_APPLIED");
+          }
         }
         state.autonomousRegion = await captureBlockBaseline(
           rcon,
@@ -5457,6 +5517,9 @@ async function runOperationSmoke(
           relativeMoveVerifiedByServer: relativeMoveServerDisplacementObserved,
           ...(process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES"
             ? { obstacleRouteVerifiedByServer }
+            : {}),
+          ...(state.bodySmokeDiagnostic.obstacleRestoreProbeVerified === true
+            ? { obstacleRestoreProbeVerified: true }
             : {}),
           gptCalls: 0,
           apiOperationsReportedSuccess,
