@@ -333,6 +333,7 @@ interface UnknownCompositeDiagnostic {
 
 type BodyOperationStatus =
   "successful" | "failed" | "interrupted" | "unverified";
+type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 
 type BodyDetailClass =
   | "none"
@@ -377,6 +378,15 @@ interface BodySmokeDiagnostic {
   readonly fixtureTargetBlockName: string;
   readonly relativeMoveStatus?: BodyOperationStatus;
   readonly relativeMoveServerDisplacementObserved?: boolean;
+  readonly obstacleRouteStatus?: BodyOperationStatus;
+  readonly obstacleRouteDistanceBand?: "near" | "middle" | "far";
+  readonly obstacleRouteVerifiedByServer?: boolean;
+  readonly obstacleRouteClientSpawnConfirmed?: boolean;
+  readonly obstacleRouteEastProgress?: boolean;
+  readonly obstacleRouteLateralProgress?: boolean;
+  readonly obstacleRoutePathStatus?: BodyPathStatus;
+  readonly obstacleRoutePathUpdateCount?: number;
+  readonly obstacleRouteMaxPathBand?: "none" | "short" | "long";
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
   readonly resourceLookDetailClass?: BodyDetailClass;
@@ -925,6 +935,43 @@ function bodySmokeEvidence(
           relativeMoveServerDisplacementObserved:
             diagnostic.relativeMoveServerDisplacementObserved,
         }),
+    ...(diagnostic.obstacleRouteStatus === undefined
+      ? {}
+      : { obstacleRouteStatus: diagnostic.obstacleRouteStatus }),
+    ...(diagnostic.obstacleRouteDistanceBand === undefined
+      ? {}
+      : { obstacleRouteDistanceBand: diagnostic.obstacleRouteDistanceBand }),
+    ...(diagnostic.obstacleRouteVerifiedByServer === undefined
+      ? {}
+      : {
+          obstacleRouteVerifiedByServer:
+            diagnostic.obstacleRouteVerifiedByServer,
+        }),
+    ...(diagnostic.obstacleRouteClientSpawnConfirmed === undefined
+      ? {}
+      : {
+          obstacleRouteClientSpawnConfirmed:
+            diagnostic.obstacleRouteClientSpawnConfirmed,
+        }),
+    ...(diagnostic.obstacleRouteEastProgress === undefined
+      ? {}
+      : { obstacleRouteEastProgress: diagnostic.obstacleRouteEastProgress }),
+    ...(diagnostic.obstacleRouteLateralProgress === undefined
+      ? {}
+      : {
+          obstacleRouteLateralProgress: diagnostic.obstacleRouteLateralProgress,
+        }),
+    ...(diagnostic.obstacleRoutePathStatus === undefined
+      ? {}
+      : { obstacleRoutePathStatus: diagnostic.obstacleRoutePathStatus }),
+    ...(diagnostic.obstacleRoutePathUpdateCount === undefined
+      ? {}
+      : {
+          obstacleRoutePathUpdateCount: diagnostic.obstacleRoutePathUpdateCount,
+        }),
+    ...(diagnostic.obstacleRouteMaxPathBand === undefined
+      ? {}
+      : { obstacleRouteMaxPathBand: diagnostic.obstacleRouteMaxPathBand }),
     ...(diagnostic.resourceTargetRconConfirmed === undefined
       ? {}
       : {
@@ -1845,6 +1892,10 @@ async function main(): Promise<void> {
       state.status = operationSmokeResult.status;
       state.failureCode ??= failureCode;
       throw new HarnessError(operationSmokeResult.status, failureCode);
+    }
+    if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
+      state.status = "pass";
+      return;
     }
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
@@ -4212,19 +4263,21 @@ async function main(): Promise<void> {
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
     await writeArtifact(state);
-  }
-  process.stdout.write(`${state.status.toUpperCase()} ${state.artifactPath}\n`);
-  if (state.privateDiagnosticLogPath !== undefined) {
     process.stdout.write(
-      `PRIVATE_DIAGNOSTIC_LOG ${state.privateDiagnosticLogPath}\n`,
+      `${(state.status ?? "incomplete").toUpperCase()} ${state.artifactPath}\n`,
     );
+    if (state.privateDiagnosticLogPath !== undefined) {
+      process.stdout.write(
+        `PRIVATE_DIAGNOSTIC_LOG ${state.privateDiagnosticLogPath}\n`,
+      );
+    }
+    if (state.observationBoundarySidecarRetained === true) {
+      process.stdout.write(
+        `PRIVATE_OBSERVATION_REPLIES ${observationBoundarySidecarPath(state)}\n`,
+      );
+    }
+    process.exitCode = state.status === "pass" ? 0 : 1;
   }
-  if (state.observationBoundarySidecarRetained === true) {
-    process.stdout.write(
-      `PRIVATE_OBSERVATION_REPLIES ${observationBoundarySidecarPath(state)}\n`,
-    );
-  }
-  process.exitCode = state.status === "pass" ? 0 : 1;
 }
 
 async function prepareRun(): Promise<RunState> {
@@ -5282,6 +5335,97 @@ async function runOperationSmoke(
         );
         if (!positionMatchesSmokeSpawn(smokeEndPosition))
           incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
+        let obstacleRouteVerifiedByServer = false;
+        if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
+          await configureUnknownFixture(rcon, smokeSpawn, state.botName);
+          const fixtureTarget = unknownFixtureTarget(smokeSpawn);
+          if (!(await isBlock(rcon, fixtureTarget, "blue_wool")))
+            incomplete("BODY_NAVIGATION_PROBE_FIXTURE_NOT_CONFIRMED");
+          const navigationClientReadyBy = Date.now() + 5_000;
+          let navigationClientSpawnConfirmed = false;
+          while (Date.now() < navigationClientReadyBy) {
+            navigationClientSpawnConfirmed = positionMatchesSmokeSpawn(
+              (await body.observe()).self.position,
+            );
+            if (navigationClientSpawnConfirmed) break;
+            await waitMs(100);
+          }
+          state.bodySmokeDiagnostic = {
+            ...furnaceDiagnostic,
+            ...state.bodySmokeDiagnostic,
+            obstacleRouteClientSpawnConfirmed: navigationClientSpawnConfirmed,
+          };
+          if (!navigationClientSpawnConfirmed)
+            incomplete("BODY_NAVIGATION_PROBE_CLIENT_SPAWN_NOT_CONFIRMED");
+          const navigationStart = parsePosition(
+            await rcon.command(`data get entity ${state.botName} Pos`),
+          );
+          let pathUpdateCount = 0;
+          let lastPathStatus: BodyPathStatus = "none";
+          let maxPathLength = 0;
+          const unsubscribePathUpdates = body.onEvent((event) => {
+            if (event.type !== "operation_path_updated") return;
+            pathUpdateCount += 1;
+            lastPathStatus = event.status;
+            maxPathLength = Math.max(maxPathLength, event.pathLength);
+          });
+          const navigationAbort = new AbortController();
+          const navigationTimer = setTimeout(
+            () => navigationAbort.abort(new Error("navigation probe deadline")),
+            20_000,
+          );
+          let navigationResult: Awaited<ReturnType<typeof body.execute>>;
+          try {
+            navigationResult = await body.execute(
+              {
+                kind: "move_relative",
+                offset: { x: 8, y: 0, z: 0 },
+                range: 1,
+              },
+              navigationAbort.signal,
+            );
+          } finally {
+            clearTimeout(navigationTimer);
+            unsubscribePathUpdates();
+          }
+          const navigationPosition = parsePosition(
+            await rcon.command(`data get entity ${state.botName} Pos`),
+          );
+          const distanceToTarget = Math.hypot(
+            navigationPosition.x - fixtureTarget.x,
+            navigationPosition.y - fixtureTarget.y,
+            navigationPosition.z - fixtureTarget.z,
+          );
+          obstacleRouteVerifiedByServer =
+            navigationResult.status === "successful" &&
+            distanceToTarget <= 1.75;
+          state.bodySmokeDiagnostic = {
+            ...furnaceDiagnostic,
+            ...state.bodySmokeDiagnostic,
+            obstacleRouteStatus: navigationResult.status,
+            obstacleRouteDistanceBand:
+              distanceToTarget <= 1.75
+                ? "near"
+                : distanceToTarget < 5
+                  ? "middle"
+                  : "far",
+            obstacleRouteVerifiedByServer,
+            obstacleRouteEastProgress:
+              navigationPosition.x - navigationStart.x >= 1.5,
+            obstacleRouteLateralProgress:
+              Math.abs(navigationPosition.z - navigationStart.z) >= 1.5,
+            obstacleRoutePathStatus: lastPathStatus,
+            obstacleRoutePathUpdateCount: pathUpdateCount,
+            obstacleRouteMaxPathBand:
+              maxPathLength === 0
+                ? "none"
+                : maxPathLength < 5
+                  ? "short"
+                  : "long",
+          };
+          if (!obstacleRouteVerifiedByServer)
+            incomplete("BODY_NAVIGATION_PROBE_ROUTE_NOT_CONFIRMED");
+        }
         state.autonomousRegion = await captureBlockBaseline(
           rcon,
           smokeEndPosition,
@@ -5304,6 +5448,9 @@ async function runOperationSmoke(
           gameKnowledgeAvailable: registryKnowledgeAvailable,
           resourceVisibleAfterSmoke,
           relativeMoveVerifiedByServer: relativeMoveServerDisplacementObserved,
+          ...(process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES"
+            ? { obstacleRouteVerifiedByServer }
+            : {}),
           gptCalls: 0,
           apiOperationsReportedSuccess,
         };
@@ -7116,7 +7263,11 @@ async function writeArtifact(state: RunState): Promise<void> {
   );
 }
 
-void main().catch(() => {
-  process.stderr.write("INCOMPLETE AI_PLAYER_E2E_UNEXPECTED_FAILURE\n");
+void main().catch((error: unknown) => {
+  const code =
+    error instanceof HarnessError && /^[A-Z0-9_]+$/u.test(error.code)
+      ? error.code
+      : "UNEXPECTED_FAILURE";
+  process.stderr.write(`INCOMPLETE AI_PLAYER_E2E_${code}\n`);
   process.exitCode = 1;
 });

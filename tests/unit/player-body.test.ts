@@ -1052,6 +1052,14 @@ describe("player body", () => {
 
     expect(result.status).toBe("failed");
     expect(result.detail).toBe("Error: No path to the goal!");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "operation_path_updated",
+        operationId: result.operationId,
+        status: "noPath",
+        pathLength: 0,
+      }),
+    );
     expect(events.at(-1)).toMatchObject({
       type: "operation_failed",
       operation: "move_to",

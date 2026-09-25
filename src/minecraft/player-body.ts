@@ -188,6 +188,14 @@ export type PlayerBodyEvent =
       readonly elapsedMs: number;
     }
   | {
+      readonly type: "operation_path_updated";
+      readonly at: string;
+      readonly operationId: string;
+      readonly operation: "move_to" | "move_relative";
+      readonly status: "noPath" | "timeout" | "success" | "partial";
+      readonly pathLength: number;
+    }
+  | {
       readonly type: "operation_recovery_required";
       readonly at: string;
       readonly operationId: string;
@@ -1559,8 +1567,26 @@ export class MineflayerPlayerBody implements PlayerBody {
         );
         let latestPathUpdateStatus: string | undefined;
         let observingPathUpdates = true;
-        const capturePathUpdate = (results: { readonly status: string }) => {
+        const capturePathUpdate = (results: {
+          readonly status: string;
+          readonly path?: readonly unknown[];
+        }) => {
           latestPathUpdateStatus = results.status;
+          if (
+            results.status === "noPath" ||
+            results.status === "timeout" ||
+            results.status === "success" ||
+            results.status === "partial"
+          ) {
+            this.emit({
+              type: "operation_path_updated",
+              at: new Date().toISOString(),
+              operationId: active.id,
+              operation: operation.kind,
+              status: results.status,
+              pathLength: Array.isArray(results.path) ? results.path.length : 0,
+            });
+          }
         };
         const stopObservingPathUpdates = () => {
           if (!observingPathUpdates) return;
