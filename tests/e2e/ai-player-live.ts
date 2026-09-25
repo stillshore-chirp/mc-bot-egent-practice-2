@@ -140,7 +140,7 @@ const ROTATION_READ_RETRY_DELAY_MS = 100;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
-  unknown_composite: { llmCalls: 32, totalTokens: 200_000 },
+  unknown_composite: { llmCalls: 48, totalTokens: 330_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
   learning_reuse: { llmCalls: 30, totalTokens: 300_000 },
@@ -293,6 +293,7 @@ interface UnknownCompositeDiagnostic {
   readonly unknownRecoveryAfterRestore?: boolean;
   readonly unknownDistinctRecoveryOperation?: boolean;
   readonly unknownControlledObstacleStatus?: UnknownObstacleStatus;
+  readonly unknownControlledObstacleAttemptCount?: number;
   readonly unknownControlledObstaclePhase?: UnknownObstaclePhase;
   readonly unknownControlledObstaclePlacementCount?: number;
   readonly unknownControlledObstacleConfirmedPlacementCount?: number;
@@ -3286,7 +3287,7 @@ async function main(): Promise<void> {
         };
         let unknownProgressAggregate: UnknownTaskProgressAggregate | undefined;
         let unknownPostTaskSampleFailureSeen = false;
-        let controlledObstacleAttempted = false;
+        const attemptedObstacleOperationIds = new Set<string>();
         let controlledObstacleRestoredAt: number | undefined;
         updateUnknownCompositeDiagnostic(state, {
           unknownTargetInitiallyPresent: true,
@@ -3298,7 +3299,8 @@ async function main(): Promise<void> {
             (state.unknownCompositeDiagnostic?.unknownOracleReadCount as
               number | undefined) ?? 0;
           try {
-            const targetCleared = await isBlock(rcon, target, "air");
+            // Flowing water can occupy the target cell after the wool is mined.
+            const targetCleared = !(await isBlock(rcon, target, "blue_wool"));
             const inventory = await rcon.command(
               `data get entity ${state.botName} Inventory`,
             );
@@ -3478,14 +3480,19 @@ async function main(): Promise<void> {
             );
             const activeOperation = currentPlayer.activeOperation;
             if (
-              !controlledObstacleAttempted &&
+              attemptedObstacleOperationIds.size < 3 &&
               !naturalFailureAlreadySeen &&
               (activeOperation?.kind === "move_to" ||
                 activeOperation?.kind === "move_relative") &&
               typeof activeOperation.bodyStartedAt === "string" &&
-              activeOperation.operationId.length > 0
+              activeOperation.operationId.length > 0 &&
+              !attemptedObstacleOperationIds.has(activeOperation.operationId)
             ) {
-              controlledObstacleAttempted = true;
+              attemptedObstacleOperationIds.add(activeOperation.operationId);
+              updateUnknownCompositeDiagnostic(state, {
+                unknownControlledObstacleAttemptCount:
+                  attemptedObstacleOperationIds.size,
+              });
               const remainingCaseMs = context.caseDeadlineAt - Date.now();
               if (remainingCaseMs >= 180_000) {
                 const operationId = activeOperation.operationId;
