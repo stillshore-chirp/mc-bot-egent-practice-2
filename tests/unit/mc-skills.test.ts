@@ -242,7 +242,14 @@ describe("McSkillRepository", () => {
     expect(
       summaries.find(({ id }) => id === "mc-skill-exploration")?.bodyPreview,
     ).toContain("遮る地形");
-    expect(repository.get("mc-skill-navigation").body).toContain("目的地");
+    const navigation = repository.get("mc-skill-navigation");
+    expect(navigation.body).toContain("元の目的方向");
+    expect(navigation.operationRefs).toEqual([
+      "look",
+      "move_relative",
+      "move_to",
+      "control",
+    ]);
     expect(repository.get("mc-skill-exploration")).toMatchObject({
       operationRefs: ["look", "move_relative", "move_to"],
     });
