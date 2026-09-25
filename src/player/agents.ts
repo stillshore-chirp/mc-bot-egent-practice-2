@@ -68,6 +68,7 @@ export const playerOperationCatalog = playerOperationNames
 const operationSchemaByName = indexPlayerOperationSchemas();
 const cachedOperationSchemaLimit = 4;
 const cachedOperationSchemaCharsLimit = 4_096;
+const maxRelatedLearningHypotheses = 6;
 const cachedOperationSchemaInstructionsPrefix =
   "以前に確認した操作schema（現在の定義）:\n";
 
@@ -1077,16 +1078,32 @@ export class PlayerPurposeAgent {
           receipt.skillIdAtUse === undefined
             ? undefined
             : this.options.skills.get(receipt.skillIdAtUse);
+        const relatedSkillIds = new Set<string>();
+        const relatedSkillTitles = new Set<string>();
         const relatedSkills = this.options.skills
-          .search({
-            query: `${receipt.operationName} ${receipt.expectedOutcome}`,
-            limit: 6,
+          .search({ limit: 100 })
+          .filter((skill) => {
+            const normalizedTitle = skill.title
+              .trim()
+              .toLocaleLowerCase("ja-JP");
+            if (
+              !skill.operationRefs.includes(receipt.operationName) ||
+              skill.id === usedSkill?.id ||
+              relatedSkillIds.has(skill.id) ||
+              relatedSkillTitles.has(normalizedTitle)
+            )
+              return false;
+            relatedSkillIds.add(skill.id);
+            relatedSkillTitles.add(normalizedTitle);
+            return true;
           })
-          .map(({ category, title, summary, operationRefs }) => ({
+          .slice(0, maxRelatedLearningHypotheses)
+          .map(({ category, title, summary, operationRefs, version }) => ({
             category,
             title,
             summary,
             operationRefs,
+            version,
           }));
         const learningInstructions = [
           "あなたは独立した技能学習評価役です。提示されたtrusted successful receipt一件から、他の場面にも移せる再利用可能な方法が得られたか評価してください。",

@@ -186,6 +186,164 @@ describe("player skill learning", () => {
     mind.close();
   });
 
+  it("supplies bounded current hypotheses that reference the successful operation", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "player-learning-related-hypotheses-"),
+    );
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory: join(directory, "exchange"),
+      allowedOperationNames: playerOperationNames,
+    });
+    const mind = PlayerMindStore.open(databasePath);
+    const usedSkill = createLearningTestSkill(
+      skills,
+      "learning-used-skill",
+      "Used operation method",
+      "gathering",
+    );
+    const duplicateTitle = "A reusable operation method";
+    const relatedSkills = [
+      createLearningTestSkill(
+        skills,
+        "learning-related-duplicate-a",
+        duplicateTitle,
+      ),
+      createLearningTestSkill(
+        skills,
+        "learning-related-duplicate-b",
+        duplicateTitle,
+      ),
+      ...Array.from({ length: 7 }, (_, index) =>
+        createLearningTestSkill(
+          skills,
+          `learning-related-${index}`,
+          `${String.fromCharCode(66 + index)} related operation method`,
+        ),
+      ),
+    ];
+    const revisedCandidate = relatedSkills[2];
+    if (revisedCandidate === undefined)
+      throw new Error("related candidate is missing");
+    const revised = skills.revise({
+      skillId: revisedCandidate.id,
+      expectedVersion: revisedCandidate.version,
+      changeKind: "revise",
+      changeNote: "Keep only the current version in learning context.",
+      patch: { confidence: 0.72 },
+    });
+
+    const runId = "learning-related-hypothesis-current-run";
+    const observedAt = new Date().toISOString();
+    const expectedOutcome = "The selected block is removed from view.";
+    skills.recordTrustedEvidence({
+      runId,
+      operationName: "dig",
+      inputSummary: "operation=dig against a visible target",
+      conditions: ["The selected target is visible and within reach."],
+      expectedOutcome,
+      observedOutcome: "successful",
+      observationSummary: "The next observation confirmed the block change.",
+      skillIdAtUse: usedSkill.id,
+      skillVersionAtUse: usedSkill.version,
+      observedAt,
+    });
+    mind.recordOutcome({
+      evidence: {
+        operationId: runId,
+        kind: "dig",
+        status: "successful",
+        summary: "The observed result matched the expected outcome.",
+        expectedOutcome,
+        skillId: usedSkill.id,
+        skillVersion: usedSkill.version,
+        observedAt,
+      },
+    });
+    const outcomeEvent = mind.enqueueEvent(
+      "body_outcome",
+      "A successful body outcome needs purpose review.",
+    );
+    const requests: unknown[] = [];
+    const agent = new PlayerPurposeAgent({
+      client: scriptedClient([
+        (request) => {
+          requests.push(request);
+          return textResponse("review-skip", "No new method needs saving.");
+        },
+        (request) => {
+          requests.push(request);
+          return functionCallResponse(
+            "action-after-related-review",
+            "commit_action_decision",
+            waitArguments(),
+          );
+        },
+      ]),
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationOnlyBody(),
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: () => undefined,
+    });
+
+    const result = await agent.think({
+      snapshot: mind.snapshot(),
+      events: [outcomeEvent],
+    });
+    expect(result.accepted).toBe(true);
+
+    const learningInput = requestUserPayload(requests[0]);
+    const usedHypothesis = recordOf(learningInput.usedHypothesis);
+    expect(usedHypothesis).toMatchObject({
+      id: usedSkill.id,
+      version: usedSkill.version,
+    });
+    const candidates = learningInput.relatedHypotheses;
+    expect(Array.isArray(candidates)).toBe(true);
+    if (!Array.isArray(candidates))
+      throw new Error("related hypotheses were not supplied");
+    expect(candidates).toHaveLength(6);
+    const candidateRecords = candidates.map((candidate) => recordOf(candidate));
+    expect(candidateRecords.every((candidate) => candidate !== undefined)).toBe(
+      true,
+    );
+    const candidateTitles = candidateRecords.map(
+      (candidate) => candidate?.title,
+    );
+    expect(new Set(candidateTitles).size).toBe(6);
+    expect(
+      candidateTitles.filter((title) => title === duplicateTitle),
+    ).toHaveLength(1);
+    expect(candidateTitles).not.toContain(usedSkill.title);
+    expect(
+      candidateRecords.every(
+        (candidate) =>
+          Array.isArray(candidate?.operationRefs) &&
+          candidate.operationRefs.includes("dig"),
+      ),
+    ).toBe(true);
+    expect(
+      candidateRecords.filter(
+        (candidate) => candidate?.title === revisedCandidate.title,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        title: revisedCandidate.title,
+        version: revised.version,
+      }),
+    ]);
+
+    skills.close();
+    mind.close();
+  });
+
   it("requires a trusted receipt and avoids review on stale or stopped state", async () => {
     const directory = mkdtempSync(join(tmpdir(), "player-learning-guard-"));
     temporaryDirectories.push(directory);
@@ -968,6 +1126,43 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     return undefined;
   return value as Record<string, unknown>;
+}
+
+function requestUserPayload(request: unknown): Record<string, unknown> {
+  const messages = recordOf(request)?.input;
+  if (!Array.isArray(messages))
+    throw new Error("purpose request does not contain messages");
+  const userMessage = messages
+    .map(recordOf)
+    .find(
+      (message) =>
+        message?.role === "user" && typeof message.content === "string",
+    );
+  if (typeof userMessage?.content !== "string")
+    throw new Error("purpose request does not contain user content");
+  const payload = recordOf(JSON.parse(userMessage.content));
+  if (payload === undefined)
+    throw new Error("purpose user content is not an object");
+  return payload;
+}
+
+function createLearningTestSkill(
+  skills: McSkillRepository,
+  id: string,
+  title: string,
+  category: "combat" | "gathering" = "combat",
+) {
+  return skills.createSkill({
+    id,
+    category,
+    title,
+    purpose: `Reusable method: ${title}.`,
+    conditions: ["A target is visible."],
+    body: "Check the observed outcome after the operation.",
+    operationRefs: ["dig"],
+    expectedOutcome: `The next observation confirms ${title}.`,
+    confidence: 0.6,
+  });
 }
 
 function toolOutput(request: unknown, responseId: string): unknown {
