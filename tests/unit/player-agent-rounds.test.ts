@@ -88,14 +88,23 @@ describe("player agent response rounds", () => {
           ...judgment,
           revision: index + 1,
         })),
-        recentOutcomes: Array.from({ length: 6 }, (_, index) => ({
-          runId: `run-${index}`,
-          operationId: `run-${index}`,
-          kind: "look" as const,
-          status: "successful" as const,
-          summary: "view changed",
-          observedAt: observation.observedAt,
-        })),
+        recentOutcomes: Array.from(
+          { length: 6 },
+          (_, index): PlayerRuntimeSnapshot["recentOutcomes"][number] => ({
+            runId: `run-${index}`,
+            operationId: `run-${index}`,
+            kind:
+              index === 0 ? "move_to" : index === 1 ? "move_relative" : "look",
+            status: index === 1 ? "failed" : "successful",
+            summary:
+              index === 0
+                ? "move_to は successful。観測した移動差分=Δx:2.0,Δy:0.0,Δz:-1.0,距離:2.2。"
+                : index === 1
+                  ? "move_relative は failed。結果概要=経路が塞がれている。観測した移動差分=Δx:0.0,Δy:0.0,Δz:0.0,距離:0.0。"
+                  : "view changed",
+            observedAt: observation.observedAt,
+          }),
+        ),
       };
       const compactedRuntime = z
         .record(z.string(), z.unknown())
@@ -106,6 +115,21 @@ describe("player agent response rounds", () => {
         longHistory.recentOutcomes.slice(-4),
       );
       expect(compactedRuntime.omittedOutcomeCount).toBe(2);
+      expect(compactedRuntime.olderMovementOutcomes).toEqual([
+        {
+          kind: "move_to",
+          status: "successful",
+          observedAt: observation.observedAt,
+          displacement: { x: 2, y: 0, z: -1 },
+        },
+        {
+          kind: "move_relative",
+          status: "failed",
+          observedAt: observation.observedAt,
+          displacement: { x: 0, y: 0, z: 0 },
+          detail: "経路が塞がれている",
+        },
+      ]);
       expect(compactedRuntime.recentJudgments).toEqual(
         longHistory.recentJudgments.slice(-4),
       );

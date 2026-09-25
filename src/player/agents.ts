@@ -1475,10 +1475,43 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
     omittedJudgmentCount: Math.max(0, snapshot.recentJudgments.length - 4),
     recentOutcomes: snapshot.recentOutcomes.slice(-4),
     omittedOutcomeCount: Math.max(0, snapshot.recentOutcomes.length - 4),
+    olderMovementOutcomes: snapshot.recentOutcomes
+      .slice(0, -4)
+      .filter(
+        ({ kind }) =>
+          kind === "move_to" || kind === "move_relative" || kind === "control",
+      )
+      .slice(-8)
+      .map(compactMovementOutcome),
     learningReferences: snapshot.learningReferences.slice(-8),
     skillActivity: snapshot.skillActivity
       .slice(-12)
       .map(({ filePath: _filePath, ...activity }) => activity),
+  };
+}
+
+function compactMovementOutcome(
+  outcome: PlayerRuntimeSnapshot["recentOutcomes"][number],
+): unknown {
+  const displacement =
+    /観測した移動差分=Δx:(-?\d+(?:\.\d+)?),Δy:(-?\d+(?:\.\d+)?),Δz:(-?\d+(?:\.\d+)?),距離:/u.exec(
+      outcome.summary,
+    );
+  const detail = /結果概要=([^。]{1,180})。/u.exec(outcome.summary)?.[1];
+  return {
+    kind: outcome.kind,
+    status: outcome.status,
+    observedAt: outcome.observedAt,
+    ...(displacement === null
+      ? {}
+      : {
+          displacement: {
+            x: Number(displacement[1]),
+            y: Number(displacement[2]),
+            z: Number(displacement[3]),
+          },
+        }),
+    ...(detail === undefined ? {} : { detail }),
   };
 }
 
