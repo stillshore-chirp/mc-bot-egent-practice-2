@@ -117,6 +117,59 @@ describe("owner proposal goals", () => {
     }
   });
 
+  it.each(["commitThought", "commitGoalState"] as const)(
+    "links a differently worded compromise goal through %s without duplicating owner intent",
+    (path) => {
+      const { mind } = openMind();
+      try {
+        const proposal = mind.addProposal({
+          title: "Find a path to the village",
+          reason: "The owner wants to reach the village.",
+        });
+        const compromisedGoal = goal({
+          title: "Survey a safe route before entering the village",
+          source: "owner",
+        });
+        const proposalResolution = {
+          proposalId: proposal.id,
+          disposition: "compromised" as const,
+          resolution: "Survey first, then approach the village.",
+        };
+        const result =
+          path === "commitThought"
+            ? mind.commitThought({
+                expectedRevision: mind.snapshot().revision,
+                decision: action("survey-route"),
+                goal: compromisedGoal,
+                proposalResolution,
+              })
+            : mind.commitGoalState({
+                expectedRevision: mind.snapshot().revision,
+                goal: compromisedGoal,
+                proposalResolution,
+              });
+
+        expect(result.accepted).toBe(true);
+        expect(
+          result.snapshot.goals.filter(({ source }) => source === "owner"),
+        ).toHaveLength(1);
+        expect(result.snapshot.goals).toContainEqual(
+          expect.objectContaining({
+            ownerProposalId: proposal.id,
+            title: compromisedGoal.title,
+            status: "active",
+            source: "owner",
+          }),
+        );
+        expect(result.snapshot.proposals).toContainEqual(
+          expect.objectContaining({ id: proposal.id, status: "compromised" }),
+        );
+      } finally {
+        mind.close();
+      }
+    },
+  );
+
   it("keeps different proposal links and honors an explicit terminal linked goal", () => {
     const { mind } = openMind();
     try {

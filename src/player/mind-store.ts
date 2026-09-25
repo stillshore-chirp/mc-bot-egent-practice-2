@@ -1482,15 +1482,7 @@ function applyGoalAndProposalResolution(
     proposal !== undefined &&
     resolution !== undefined &&
     resolution.disposition !== "declined" &&
-    goalChangeForLink?.source === "owner" &&
-    (currentGoals.some(
-      (goal) =>
-        goal.ownerProposalId === proposal.id &&
-        goalChangeForLink.id !== undefined &&
-        goal.id === goalChangeForLink.id,
-    ) ||
-      normalizeGoalTitle(goalChangeForLink.title) ===
-        normalizeGoalTitle(proposal.title));
+    goalChangeForLink?.source === "owner";
   if (goalChange !== undefined) {
     const merged = mergeGoal(
       goals,
@@ -1511,13 +1503,7 @@ function applyGoalAndProposalResolution(
 
   const proposalTitle = bounded(proposal.title, 240, "goal title");
   const linkedGoal = goals.find((goal) => goal.ownerProposalId === proposal.id);
-  const explicitOwnerGoal =
-    goalChangeForLink?.source === "owner" &&
-    ((linkedGoal !== undefined &&
-      goalChangeForLink.id !== undefined &&
-      linkedGoal.id === goalChangeForLink.id) ||
-      normalizeGoalTitle(goalChangeForLink.title) ===
-        normalizeGoalTitle(proposalTitle));
+  const explicitOwnerGoal = shouldLinkExplicitGoal;
   const explicitlySelectedGoal =
     goalChangeForLink?.id === undefined
       ? undefined
