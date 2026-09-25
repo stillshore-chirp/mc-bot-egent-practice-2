@@ -9,7 +9,10 @@ import type { Response } from "openai/resources/responses/responses.js";
 
 import { McSkillRepository } from "../../src/mc-skills/index.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
-import type { PlayerBody } from "../../src/minecraft/player-body.js";
+import type {
+  PlayerBody,
+  PlayerBodyObservation,
+} from "../../src/minecraft/player-body.js";
 import type {
   PlayerMemoryPort,
   PlayerThoughtDecision,
@@ -30,6 +33,95 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
+  it("uses the fresh initial observation without exposing a duplicate observe tool", async () => {
+    const observation = bodyObservationFixture();
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "fresh-observation-action",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => observation,
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(1);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      expect(tools.map((tool) => tool.name)).not.toContain("observe_body");
+      const knowledgeTool = tools.find(
+        (tool) => tool.name === "ask_body_knowledge",
+      );
+      expect(knowledgeTool?.description).toContain("初回観測");
+      const inputItems = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.input);
+      const userInput = z.record(z.string(), z.unknown()).parse(inputItems[0]);
+      const purposeInput = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(userInput.content)));
+      expect(purposeInput.observation).toEqual(observation);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("retains observe_body as recovery when the initial observation is unavailable", async () => {
+    const observation = bodyObservationFixture();
+    let observationAttempts = 0;
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse("recover-observation", "observe_body", {}),
+        functionCallResponse(
+          "action-after-recovery",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => {
+        observationAttempts += 1;
+        if (observationAttempts === 1)
+          throw new Error("INITIAL_OBSERVATION_UNAVAILABLE");
+        return observation;
+      },
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(2);
+      const firstRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(firstRequest.tools);
+      expect(tools.map((tool) => tool.name)).toContain("observe_body");
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("commits action, goal, proposal resolution, and understanding in one CAS", async () => {
     const persistedGoals: unknown[] = [];
     const memory = createMemoryPort();
@@ -1138,6 +1230,7 @@ interface PurposeFixture {
   readonly agent: PlayerPurposeAgent;
   readonly databasePath: string;
   readonly mind: PlayerMindStore;
+  readonly observationCalls: number;
   readonly requests: unknown[];
   close(): void;
 }
@@ -1149,6 +1242,7 @@ function openPurposeFixture(
     decision: PlayerThoughtDecision,
   ) => void = () => undefined,
   memory: PlayerMemoryPort = createMemoryPort(),
+  observeBody?: () => Promise<PlayerBodyObservation>,
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-agent-rounds-"));
   temporaryDirectories.push(directory);
@@ -1160,9 +1254,13 @@ function openPurposeFixture(
     allowedOperationNames: playerOperationNames,
   });
   const requests: unknown[] = [];
+  let observationCalls = 0;
   const body = {
     observe: async () => {
-      throw new Error("observation fixture unavailable");
+      observationCalls += 1;
+      if (observeBody === undefined)
+        throw new Error("observation fixture unavailable");
+      return observeBody();
     },
   } as unknown as PlayerBody;
   const client = scriptedClient(responses, requests);
@@ -1183,11 +1281,62 @@ function openPurposeFixture(
     agent,
     databasePath,
     mind,
+    get observationCalls() {
+      return observationCalls;
+    },
     requests,
     close: () => {
       skills.close();
       mind.close();
     },
+  };
+}
+
+function bodyObservationFixture(): PlayerBodyObservation {
+  return {
+    observedAt: "2026-09-25T00:00:00.000Z",
+    source: "minecraft",
+    gameVersion: "1.21.11",
+    dimension: "overworld",
+    time: { day: 1, timeOfDay: 0, isDay: true, raining: false },
+    self: {
+      username: "fixture-player",
+      position: { x: 0, y: 64, z: 0, dimension: "overworld" },
+      eyeHeight: 1.62,
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 0, y: 0, z: 0 },
+      health: 20,
+      food: 20,
+      foodSaturation: 5,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+      mountedEntityId: null,
+      gameMode: "survival",
+      experience: { level: 0, points: 0, progress: 0 },
+      inventory: [],
+      equipment: {},
+    },
+    perception: {
+      horizontalFieldOfViewDegrees: 90,
+      verticalFieldOfViewDegrees: 60,
+      maxDistance: 12,
+      coverage: "visible_subset",
+      blockCountLimit: 64,
+      entityCountLimit: 16,
+      blockCandidateLimit: 128,
+      entityCandidateLimit: 32,
+      omittedBlockCandidates: 0,
+      omittedEntityCandidates: 0,
+      candidateSearchMayBeTruncated: false,
+      blocks: [],
+      entities: [],
+    },
+    window: null,
   };
 }
 

@@ -687,7 +687,7 @@ export class PlayerPurposeAgent {
       createPlayerTool({
         name: "ask_body_knowledge",
         description:
-          "英語のMinecraft registry ID/keywordでitem、block、entity、enchantmentの事実と関連recipeを照会する。例: oak_planks, crafting_table, zombie, sharpness。日本語だけのqueryや可視範囲・操作方法の質問には使わない。可視範囲はobserve_bodyで確認する。",
+          "英語のMinecraft registry ID/keywordでitem、block、entity、enchantmentの事実と関連recipeを照会する。例: oak_planks, crafting_table, zombie, sharpness。日本語だけのqueryや可視範囲・操作方法の質問には使わない。可視範囲はこの判断に渡された初回観測で確認し、観測を取得できなかった場合だけobserve_bodyで補ってください。",
         schema: knowledgeInput,
         execute: async ({ query }) => this.options.body.knowledge(query),
       }),
@@ -1041,6 +1041,10 @@ export class PlayerPurposeAgent {
     ) {
       return { accepted: false };
     }
+    const availableTools =
+      bodyObservation === undefined
+        ? tools
+        : tools.filter((tool) => tool.definition.name !== "observe_body");
     const latestOutcome = latest.lastOutcome;
     const shouldReviewLatestSuccess =
       input.events.some(({ kind }) => kind === "body_outcome") &&
@@ -1193,7 +1197,7 @@ export class PlayerPurposeAgent {
         model: this.options.model,
         instructions,
         input: inputText,
-        tools,
+        tools: availableTools,
         logger: this.options.logger,
         role: "purpose",
         initialObservationChars: safeSerializedLength(bodyObservation),
