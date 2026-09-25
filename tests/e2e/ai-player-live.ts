@@ -1145,6 +1145,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "unknown_composite"
       ? (state.unknownCompositeDiagnostic ?? {})
       : {}),
+    ...(caseId === "parallel_dialogue_stop"
+      ? (state.parallelDiagnostic ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -1314,6 +1317,16 @@ function updateUnknownCompositeDiagnostic(
 ): void {
   state.unknownCompositeDiagnostic = {
     ...(state.unknownCompositeDiagnostic ?? {}),
+    ...diagnostic,
+  };
+}
+
+function updateParallelDiagnostic(
+  state: RunState,
+  diagnostic: SafeEvidence,
+): void {
+  state.parallelDiagnostic = {
+    ...(state.parallelDiagnostic ?? {}),
     ...diagnostic,
   };
 }
@@ -1722,6 +1735,7 @@ interface RunState {
   gameActionPriorProposalsSettled?: boolean;
   gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
   unknownCompositeDiagnostic?: SafeEvidence;
+  parallelDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -3809,6 +3823,17 @@ async function main(): Promise<void> {
         const beforeLlm = before.counters.llmCalls;
         const beforeResponses = context.responseQueue.length;
         const promptSentAt = Date.now();
+        updateParallelDiagnostic(state, {
+          parallelTaskSent: true,
+          parallelActiveMoveObserved: false,
+          parallelGuestNoMutationConfirmed: false,
+          parallelOwnerPreferenceSent: false,
+          parallelOwnerRequestResolved: false,
+          parallelActionChangedAfterOwnerPreference: false,
+          parallelOwnerApproachCheckCount: 0,
+          parallelOwnerApproachWorldObserved: false,
+          parallelStopRequested: false,
+        });
         sendChat(
           context.owner,
           "東側の遠くの目印にあるレッドストーンブロックを回収して、ここへ戻ってください。移動方法は自分で選んでください。",
@@ -3826,6 +3851,7 @@ async function main(): Promise<void> {
         const activeOperationId = active.activeOperation?.operationId;
         if (activeOperationId === undefined)
           incomplete("PARALLEL_TEST_NEVER_ENTERED_ACTIVE_OPERATION");
+        updateParallelDiagnostic(state, { parallelActiveMoveObserved: true });
         const beforeGuest = active;
         const guestProposalState = proposalState(active);
         sendChat(
@@ -3841,6 +3867,9 @@ async function main(): Promise<void> {
         ) {
           fail("UNAUTHORIZED_PLAYER_CHANGED_RUNTIME_STATE");
         }
+        updateParallelDiagnostic(state, {
+          parallelGuestNoMutationConfirmed: true,
+        });
         if (afterGuest.activeOperation?.operationId !== activeOperationId) {
           incomplete("ACTION_FINISHED_BEFORE_OWNER_PARALLEL_CHAT");
         }
@@ -3861,6 +3890,7 @@ async function main(): Promise<void> {
           context.owner,
           "強くお願いします。レッドストーンは後回しにして、いったん私のところへ戻ってください。あなたの意見も伝え、今の目的と折り合いをつけてください。",
         );
+        updateParallelDiagnostic(state, { parallelOwnerPreferenceSent: true });
         const changed = await waitForPlayer(context, 90_000, (player) =>
           ownerPreferenceWasResolved(afterGuest, player, ownerPreferenceSentAt),
         );
@@ -3874,8 +3904,14 @@ async function main(): Promise<void> {
         );
         if (!ownerOpinionReceived || !ownerRequestChangedGoal)
           incomplete("OWNER_DIALOGUE_NOT_HANDLED_DURING_ACTION");
+        updateParallelDiagnostic(state, {
+          parallelOwnerOpinionReceived: ownerOpinionReceived,
+          parallelOwnerRequestResolved: ownerRequestChangedGoal,
+        });
         let lastOwnerApproachCheckAt = 0;
         let ownerApproachWorldObserved = false;
+        let ownerApproachCheckCount = 0;
+        let bestApproachBucket = "none";
         const ownerApproach = await waitForPlayer(
           context,
           75_000,
@@ -3898,13 +3934,24 @@ async function main(): Promise<void> {
               botPosition.y - ownerPosition.y,
               botPosition.z - ownerPosition.z,
             );
-            ownerApproachWorldObserved ||=
-              remainingDistance <= ownerDistanceBeforeRequest - 1.5;
+            const reduction = ownerDistanceBeforeRequest - remainingDistance;
+            ownerApproachCheckCount += 1;
+            if (reduction >= 1.5) bestApproachBucket = "at_least_1_5";
+            else if (reduction > 0 && bestApproachBucket === "none")
+              bestApproachBucket = "under_1_5";
+            ownerApproachWorldObserved ||= reduction >= 1.5;
+            updateParallelDiagnostic(state, {
+              parallelOwnerApproachCheckCount: ownerApproachCheckCount,
+              parallelOwnerApproachReductionBucket: bestApproachBucket,
+              parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
+              parallelActionChangedAfterOwnerPreference: actionChanged,
+            });
             lastOwnerApproachCheckAt = Date.now();
             return ownerApproachWorldObserved;
           },
         );
         sendChat(context.owner, "今の行動を停止してください。");
+        updateParallelDiagnostic(state, { parallelStopRequested: true });
         const stopped = await waitForPlayer(
           context,
           45_000,
@@ -3914,6 +3961,7 @@ async function main(): Promise<void> {
             player.stopGeneration > ownerApproach.stopGeneration,
         );
         const stopGeneration = stopped.stopGeneration;
+        updateParallelDiagnostic(state, { parallelStopLatchConfirmed: true });
         const revisionAtStop = stopped.actionRevision;
         const quietUntil = Math.min(Date.now() + 8_000, context.runDeadlineAt);
         while (Date.now() < quietUntil) {
