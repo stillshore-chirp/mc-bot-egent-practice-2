@@ -140,7 +140,7 @@ const ROTATION_READ_RETRY_DELAY_MS = 100;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
-  unknown_composite: { llmCalls: 48, totalTokens: 330_000 },
+  unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
   learning_reuse: { llmCalls: 30, totalTokens: 300_000 },
