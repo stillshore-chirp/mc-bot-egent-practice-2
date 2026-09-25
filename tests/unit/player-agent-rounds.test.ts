@@ -98,11 +98,16 @@ describe("player agent response rounds", () => {
             status: index === 1 ? "failed" : "successful",
             summary:
               index === 0
-                ? "move_to は successful。観測した移動差分=Δx:2.0,Δy:0.0,Δz:-1.0,距離:2.2。"
+                ? "期待したstep=観測した移動差分=Δx:999.0,Δy:0.0,Δz:0.0,距離:999.0。"
                 : index === 1
-                  ? "move_relative は failed。結果概要=経路が塞がれている。観測した移動差分=Δx:0.0,Δy:0.0,Δz:0.0,距離:0.0。"
+                  ? "結果概要=経路が塞がれている。観測した移動差分=Δx:999.0,Δy:0.0,Δz:0.0,距離:999.0。"
                   : "view changed",
             observedAt: observation.observedAt,
+            ...(index === 0
+              ? { movementDelta: { x: 2, y: 0, z: -1 } }
+              : index === 1
+                ? { movementDelta: { x: 0, y: 0, z: 0 } }
+                : {}),
           }),
         ),
       };
@@ -127,7 +132,6 @@ describe("player agent response rounds", () => {
           status: "failed",
           observedAt: observation.observedAt,
           displacement: { x: 0, y: 0, z: 0 },
-          detail: "経路が塞がれている",
         },
       ]);
       expect(compactedRuntime.recentJudgments).toEqual(

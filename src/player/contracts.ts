@@ -92,9 +92,16 @@ export interface PlayerOutcomeEvidence {
   readonly status: McSkillOutcomeStatus;
   readonly summary: string;
   readonly observedAt: string;
+  readonly movementDelta?: PlayerObservedDisplacement | undefined;
   readonly expectedOutcome?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
+}
+
+export interface PlayerObservedDisplacement {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
 }
 
 export interface PlayerProposalResolution {
@@ -133,6 +140,7 @@ export interface PlayerTrustedOutcomeEvidence {
   readonly status: McSkillOutcomeStatus;
   readonly summary: string;
   readonly observedAt: string;
+  readonly movementDelta?: PlayerObservedDisplacement | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }

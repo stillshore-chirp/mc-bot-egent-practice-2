@@ -665,7 +665,8 @@ describe("integrated player runtime", () => {
               position: { x: 4, y: 64, z: 0 },
               range: 1,
             },
-            expectedOutcome: "move toward an unknown destination",
+            expectedOutcome:
+              "move toward an unknown destination; 観測した移動差分=Δx:999.0,Δy:0.0,Δz:0.0,距離:999.0",
           };
           const saved = mind.commitThought({
             expectedRevision: snapshot.revision,
@@ -692,10 +693,31 @@ describe("integrated player runtime", () => {
       expect(followupSummary).toContain("Δx:3.2");
       expect(followupSummary).toContain("Δz:-1.4");
       expect(followupSummary).toContain("距離:3.5");
+      expect(mind.snapshot().lastOutcome?.movementDelta).toEqual({
+        x: 3.2,
+        y: 0,
+        z: -1.4,
+      });
+      expect(mind.snapshot().recentOutcomes.at(-1)?.movementDelta).toEqual({
+        x: 3.2,
+        y: 0,
+        z: -1.4,
+      });
     } finally {
       await runtime.shutdown();
       skills.close();
       mind.close();
+    }
+
+    const reopened = PlayerMindStore.open(databasePath);
+    try {
+      expect(reopened.snapshot().recentOutcomes.at(-1)?.movementDelta).toEqual({
+        x: 3.2,
+        y: 0,
+        z: -1.4,
+      });
+    } finally {
+      reopened.close();
     }
   });
 

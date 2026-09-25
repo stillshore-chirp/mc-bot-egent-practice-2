@@ -17,6 +17,7 @@ import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
 import type { TraceService, TraceSession } from "../trace/service.js";
 import type {
   PlayerMemoryPort,
+  PlayerObservedDisplacement,
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
   PlayerThoughtDecision,
@@ -602,6 +603,8 @@ export class PlayerRuntime {
           : "操作toolが結果を返さず、ゲーム内結果は未検証"
         : `期待したstep=${sanitizeDetail(expectedOutcome)}。${groundedOperationSummary(result)}`;
     const observedAt = result?.completedAt ?? new Date().toISOString();
+    const movementDelta =
+      result === undefined ? undefined : observedMovementDelta(result);
     if (result?.after != null)
       this.options.mind.recordObservation(toObservationEvidence(result.after));
     const evidenceInput = {
@@ -648,6 +651,7 @@ export class PlayerRuntime {
         status: outcome,
         summary,
         observedAt,
+        ...(movementDelta === undefined ? {} : { movementDelta }),
         expectedOutcome,
         ...(skillId === undefined ? {} : { skillId }),
         ...(skillVersion === undefined ? {} : { skillVersion }),
@@ -980,22 +984,35 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
 }
 
 function observedMovementSummary(result: PlayerOperationResult): string {
+  const movement = observedMovementDelta(result);
+  if (movement === undefined) return "";
+  const { x, y, z } = movement;
+  return `観測した移動差分=Δx:${x.toFixed(1)},Δy:${y.toFixed(1)},Δz:${z.toFixed(1)},距離:${Math.hypot(x, y, z).toFixed(1)}。`;
+}
+
+function observedMovementDelta(
+  result: PlayerOperationResult,
+): PlayerObservedDisplacement | undefined {
   if (
     result.operation.kind !== "move_to" &&
     result.operation.kind !== "move_relative" &&
     result.operation.kind !== "control"
   )
-    return "";
+    return undefined;
   const { before, after } = result;
-  if (before === null || after === null) return "";
-  if (before.dimension !== after.dimension) return "";
+  if (before === null || after === null) return undefined;
+  if (before.dimension !== after.dimension) return undefined;
   const beforePosition = before.self.position;
   const afterPosition = after.self.position;
   const dx = afterPosition.x - beforePosition.x;
   const dy = afterPosition.y - beforePosition.y;
   const dz = afterPosition.z - beforePosition.z;
-  if (![dx, dy, dz].every(Number.isFinite)) return "";
-  return `観測した移動差分=Δx:${dx.toFixed(1)},Δy:${dy.toFixed(1)},Δz:${dz.toFixed(1)},距離:${Math.hypot(dx, dy, dz).toFixed(1)}。`;
+  if (![dx, dy, dz].every(Number.isFinite)) return undefined;
+  return {
+    x: Number(dx.toFixed(1)),
+    y: Number(dy.toFixed(1)),
+    z: Number(dz.toFixed(1)),
+  };
 }
 
 function sanitizeDetail(value: string): string {

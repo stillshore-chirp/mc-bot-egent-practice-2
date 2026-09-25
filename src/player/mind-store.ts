@@ -16,6 +16,7 @@ import type {
   PlayerGoalChange,
   PlayerProposalResolution,
   PlayerObservationEvidence,
+  PlayerObservedDisplacement,
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
   PlayerStateNote,
@@ -101,6 +102,14 @@ const learningSchema = z
   })
   .strict();
 
+const movementDeltaSchema = z
+  .object({
+    x: z.number(),
+    y: z.number(),
+    z: z.number(),
+  })
+  .strict();
+
 const outcomeHistorySchema = z
   .object({
     runId: z.string().min(1).max(80),
@@ -115,6 +124,7 @@ const outcomeHistorySchema = z
     ]),
     summary: z.string().min(1).max(700),
     observedAt: z.iso.datetime(),
+    movementDelta: movementDeltaSchema.optional(),
     expectedOutcome: z.string().min(1).max(400).optional(),
     skillId: z.string().min(1).max(80).optional(),
     skillVersion: z.number().int().positive().optional(),
@@ -286,6 +296,7 @@ const stateSchema = z
         ]),
         summary: z.string().min(1).max(700),
         observedAt: z.iso.datetime(),
+        movementDelta: movementDeltaSchema.optional(),
         expectedOutcome: z.string().min(1).max(400).optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
@@ -996,6 +1007,7 @@ export class PlayerMindStore {
       readonly status: McSkillOutcomeStatus;
       readonly summary: string;
       readonly observedAt: string;
+      readonly movementDelta?: PlayerObservedDisplacement;
       readonly expectedOutcome?: string;
       readonly skillId?: string;
       readonly skillVersion?: number;
@@ -1008,6 +1020,13 @@ export class PlayerMindStore {
       status: input.evidence.status,
       summary: bounded(input.evidence.summary, 700, "outcome summary"),
       observedAt: now,
+      ...(input.evidence.movementDelta === undefined
+        ? {}
+        : {
+            movementDelta: movementDeltaSchema.parse(
+              input.evidence.movementDelta,
+            ),
+          }),
       ...(input.evidence.expectedOutcome === undefined
         ? {}
         : {
@@ -1037,6 +1056,9 @@ export class PlayerMindStore {
         status: evidence.status,
         summary: evidence.summary,
         observedAt: now,
+        ...(evidence.movementDelta === undefined
+          ? {}
+          : { movementDelta: evidence.movementDelta }),
         ...(evidence.expectedOutcome === undefined
           ? {}
           : { expectedOutcome: evidence.expectedOutcome }),

@@ -1493,25 +1493,13 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
 function compactMovementOutcome(
   outcome: PlayerRuntimeSnapshot["recentOutcomes"][number],
 ): unknown {
-  const displacement =
-    /観測した移動差分=Δx:(-?\d+(?:\.\d+)?),Δy:(-?\d+(?:\.\d+)?),Δz:(-?\d+(?:\.\d+)?),距離:/u.exec(
-      outcome.summary,
-    );
-  const detail = /結果概要=([^。]{1,180})。/u.exec(outcome.summary)?.[1];
   return {
     kind: outcome.kind,
     status: outcome.status,
     observedAt: outcome.observedAt,
-    ...(displacement === null
+    ...(outcome.movementDelta === undefined
       ? {}
-      : {
-          displacement: {
-            x: Number(displacement[1]),
-            y: Number(displacement[2]),
-            z: Number(displacement[3]),
-          },
-        }),
-    ...(detail === undefined ? {} : { detail }),
+      : { displacement: outcome.movementDelta }),
   };
 }
 
