@@ -126,6 +126,8 @@ const RUN_BUDGET_LIMITS = {
 } as const;
 const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 500;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
+// Logs are placed near the player's feet, so observe with a modest downward pitch.
+const LEARNING_FIXTURE_PITCH = 15;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
@@ -2052,8 +2054,13 @@ async function main(): Promise<void> {
       requireLiveContext(),
       async (context) => {
         const learnedBaseline = readSkillSnapshot(state.databasePath);
-        const origin = parsePosition(
+        const initialPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const origin = await orientForLearningLogFixture(
+          rcon,
+          state.botName,
+          initialPosition,
         );
         const firstLogs = await availableLogFixtureSites(rcon, origin);
         activeLearningLogs = firstLogs;
@@ -2159,8 +2166,13 @@ async function main(): Promise<void> {
         state.learningReuseStage = "hypothesis_created";
 
         const beforeReuse = readSkillSnapshot(state.databasePath);
-        const reuseOrigin = parsePosition(
+        const reusePosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const reuseOrigin = await orientForLearningLogFixture(
+          rcon,
+          state.botName,
+          reusePosition,
         );
         const reuseLogs = await availableLogFixtureSites(rcon, reuseOrigin);
         activeLearningLogs = reuseLogs;
@@ -5389,10 +5401,11 @@ function fixturePoint(
   origin: Position,
   offsetX: number,
   offsetZ: number,
+  y = 64,
 ): BlockPosition {
   return {
     x: Math.floor(origin.x) + offsetX,
-    y: 64,
+    y,
     z: Math.floor(origin.z) + offsetZ,
   };
 }
@@ -5557,6 +5570,7 @@ async function availableLogFixtureSites(
         origin,
         direction.x * radius,
         direction.z * radius,
+        Math.floor(origin.y),
       );
       if (await isBlock(rcon, position, "air")) {
         available.push({ index, position });
@@ -5584,12 +5598,52 @@ async function configureLogFixture(
 ): Promise<void> {
   await rcon.command(`clear ${botName} minecraft:oak_log`);
   for (const log of logs) {
+    if (!(await isBlock(rcon, log, "air")))
+      incomplete("LEARNING_LOG_FIXTURE_SITE_OCCUPIED");
     await rcon.command(`setblock ${log.x} ${log.y} ${log.z} oak_log`);
   }
   for (const log of logs) {
     if (!(await isBlock(rcon, log, "oak_log")))
       incomplete("LEARNING_LOG_FIXTURE_NOT_CONFIRMED");
   }
+}
+
+async function orientForLearningLogFixture(
+  rcon: LocalRcon,
+  botName: string,
+  position: Position,
+): Promise<Position> {
+  const previousRotation = parseEntityRotation(
+    await rcon.command(`data get entity ${botName} Rotation`),
+  );
+  if (previousRotation === undefined)
+    incomplete("LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
+  await rcon.command(
+    `tp ${botName} ${position.x} ${position.y} ${position.z} ${previousRotation.yaw} ${LEARNING_FIXTURE_PITCH}`,
+  );
+  const confirmedPosition = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  if (
+    Math.hypot(
+      confirmedPosition.x - position.x,
+      confirmedPosition.y - position.y,
+      confirmedPosition.z - position.z,
+    ) > 0.5
+  ) {
+    incomplete("LEARNING_LOG_FIXTURE_POSITION_READBACK_MISMATCH");
+  }
+  const rotation = parseEntityRotation(
+    await rcon.command(`data get entity ${botName} Rotation`),
+  );
+  if (
+    rotation === undefined ||
+    angularDistance(rotation.yaw, previousRotation.yaw) > 2 ||
+    Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
+  ) {
+    incomplete("LEARNING_LOG_FIXTURE_FACING_NOT_CONFIRMED");
+  }
+  return confirmedPosition;
 }
 
 async function removeLearningLogFixture(
