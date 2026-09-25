@@ -1846,6 +1846,7 @@ async function main(): Promise<void> {
         }
         if (latestObservedAt <= reply.at && replyChestCoordinatesVisible)
           fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
+        await removeHiddenContainerFixture(rcon, origin, fixture);
         if (responseHeuristicClassification === "possible_hidden_item_claim")
           incomplete("OBSERVATION_REPLY_REQUIRES_MANUAL_REVIEW");
         return {
@@ -1966,12 +1967,27 @@ async function main(): Promise<void> {
           origin,
           state.botName,
         );
+        const firstLogsConfiguredAt = Date.now();
         const firstRegion = await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
           rcon,
           state.botName,
           firstRegion,
         );
+        const firstFixtureObservation = await observeForPlayer(
+          context,
+          15_000,
+          (player) => {
+            const observation = player.lastObservation;
+            return (
+              observation?.observedAt !== undefined &&
+              Date.parse(observation.observedAt) >= firstLogsConfiguredAt &&
+              observation.visibleBlockNames?.includes("oak_log") === true
+            );
+          },
+        );
+        if (firstFixtureObservation === undefined)
+          incomplete("LEARNING_LOG_FIXTURE_NOT_VISIBLE");
         const before = playerOf(await collect(context.runtime.app));
         const beforeActions = before.actionRevision;
         const responseStart = context.responseQueue.length;
@@ -5197,6 +5213,29 @@ async function configureHiddenContainer(
     `item replace block ${chest.x} ${chest.y} ${chest.z} container.0 with emerald 1`,
   );
   return { chest };
+}
+
+async function removeHiddenContainerFixture(
+  rcon: LocalRcon,
+  origin: Position,
+  fixture: { readonly chest: BlockPosition },
+): Promise<void> {
+  const wallX = Math.floor(origin.x) + 2;
+  const z = Math.floor(origin.z);
+  await rcon.command(
+    `fill ${wallX} 64 ${z - 2} ${wallX} 67 ${z + 2} air replace stone`,
+  );
+  await rcon.command(
+    `setblock ${fixture.chest.x} ${fixture.chest.y} ${fixture.chest.z} air`,
+  );
+  for (let y = 64; y <= 67; y += 1) {
+    for (let wallZ = z - 2; wallZ <= z + 2; wallZ += 1) {
+      if (!(await isBlock(rcon, { x: wallX, y, z: wallZ }, "air")))
+        incomplete("OCCLUSION_FIXTURE_CLEANUP_UNVERIFIED");
+    }
+  }
+  if (!(await isBlock(rcon, fixture.chest, "air")))
+    incomplete("OCCLUSION_FIXTURE_CLEANUP_UNVERIFIED");
 }
 
 async function configureAutonomousBuildFixture(rcon: LocalRcon): Promise<void> {
