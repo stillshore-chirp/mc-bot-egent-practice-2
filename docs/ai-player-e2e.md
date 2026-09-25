@@ -10,6 +10,8 @@
 
 `prepareWorld` はbaseline取得前にspawn周辺の水平視野全体へ5個の合成`oak_log`を分散して置き、自律caseの資源fixtureに使います。Body smokeの最後には、操作確認に使った近距離セルを一時的な`oak_log`へ置き換え、Bodyの視線をそのセルへ向けた新しい観測に同じセル・同じblock nameが含まれることを確認します。原木のRCON設置を先に確認し、観測後はbaseline取得前に空へ戻してreadbackします。fixtureや観測に失敗した場合は固定codeで停止し、GPTを起動しません。これは資源の可視性fixtureであり、owner指示や自律goalを追加しません。静的な資源fixtureは既存fixtureやsmoke targetと位置を重ねず、`autonomous_life`終了後に残った`oak_log`だけをRCONで除去してreadback確認してから後続caseへ進みます。これは自律caseの成功判定後に行うcleanupです。
 
+Body smokeでは非OP Botを隔離world内の固定された安全な開始位置へRCONで配置し、serverとBody双方の位置を確認します。採掘fixtureの対象セルが`air`であることを確認してから一時的な`stone`を置き、RCONで設置を読み戻してからBodyの可視・採掘条件を調べます。RCONはfixture設定だけに使い、Body操作の成功判定は従来どおりBot観測とserver oracleで行います。
+
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
 後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`game_action_discretion`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。targeted run全体と`integrated_result`はpassにせず、Issue全体の受け入れには通常の全case runを必要とします。
@@ -70,6 +72,8 @@ run43（HEAD `c151088`）はCI 7/7成功、隔離PaperでSkill交換を含む8 c
 同じHEAD `7f8b272` のrun44はBody smokeの`look`がsuccessfulでも対象stoneが5秒以内のBody観測に現れず、GPTを呼ばず未完了でした。直後の同HEAD run45ではBody smokeはpassしたため、run44の失敗は再現しませんでした。run45は自発生活caseが16 calls・108,667 tokensで10万tokens上限を超え、修理caseに未到達です。両runともCI 7/7成功、cleanup 3/3です。修理caseの持ち越し提案を待つ新しい境界はまだ実ゲームで未検証です。
 
 run46（HEAD `9c94326`）は後段の修理caseだけを選び、非OP Body smokeはpass、未選択10 caseと統合結果は未完了として保存しました。CI 7/7成功です。修理caseでは先行pending提案0件、`place`判断・結果各1件を記録し、cleanup前の穴はRCONで`oak_planks`でした。しかしBodyの`place`結果は`unverified`で、16 calls・103,883 tokensで10万tokens上限を超えたためcaseは未完了です。private診断の固定分類はnative place受付後の効果未観測で、timeoutではありません。設置のサーバー更新待機を加え、遅延更新なら成功、クライアント内だけの変更なら未検証のままとする単体テストを追加しました。新しい待機は次の実ゲームrunまで未検証です。run46のcleanupは3/3です。
+
+run47（HEAD `c90d40b`）はBody smoke中に`look`が成功した一方、採掘対象セルのBody観測が`chest`であり、`stone`のfixture確認前に停止しました。GPT呼び出しは0、cleanup 3/3です。乱数を含むspawn位置から対象セルを決めていたため、隔離world内の既設宝箱へ重なる場合がありました。固定開始位置と空セル・設置readbackの変更はこの結果に対応します。設置後のサーバー更新待機はrun47では未実施です。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 

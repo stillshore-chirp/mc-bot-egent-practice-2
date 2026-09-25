@@ -4456,7 +4456,32 @@ async function runOperationSmoke(
         ) {
           fail("PLAYER_OPERATION_CAPABILITY_LIST_INCOMPLETE");
         }
-        const visibleBefore = await body.observe();
+        const smokeSpawn = { x: 0.5, y: 64, z: 0.5 };
+        await rcon.command(
+          `tp ${state.botName} ${smokeSpawn.x} ${smokeSpawn.y} ${smokeSpawn.z} 0 0`,
+        );
+        const serverSmokePosition = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const positionMatchesSmokeSpawn = (position: Position): boolean =>
+          Math.hypot(
+            position.x - smokeSpawn.x,
+            position.y - smokeSpawn.y,
+            position.z - smokeSpawn.z,
+          ) <= 0.5;
+        if (!positionMatchesSmokeSpawn(serverSmokePosition))
+          incomplete("BODY_SMOKE_SERVER_POSITION_NOT_CONFIRMED");
+        let visibleBefore = await body.observe();
+        const smokePositionDeadline = Date.now() + 5_000;
+        while (
+          !positionMatchesSmokeSpawn(visibleBefore.self.position) &&
+          Date.now() < smokePositionDeadline
+        ) {
+          await waitMs(100);
+          visibleBefore = await body.observe();
+        }
+        if (!positionMatchesSmokeSpawn(visibleBefore.self.position))
+          incomplete("BODY_SMOKE_CLIENT_POSITION_NOT_CONFIRMED");
         const hiddenItemOmitted = !JSON.stringify(visibleBefore)
           .toLowerCase()
           .includes("emerald");
@@ -4489,9 +4514,13 @@ async function runOperationSmoke(
           incomplete("BODY_SMOKE_TARGET_OVERLAPS_RESOURCE_FIXTURE");
         }
         target = smokeTarget;
+        if (!(await isBlock(rcon, target, "air")))
+          incomplete("BODY_SMOKE_TARGET_NOT_AIR");
         await rcon.command(
           `setblock ${target.x} ${target.y} ${target.z} stone`,
         );
+        if (!(await isBlock(rcon, target, "stone")))
+          incomplete("BODY_SMOKE_TARGET_STONE_NOT_CONFIRMED");
         const fixtureLookResult = await body.execute(
           {
             kind: "look",
