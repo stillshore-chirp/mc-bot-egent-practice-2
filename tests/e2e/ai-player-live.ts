@@ -1188,6 +1188,15 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "skill_exchange" && state.skillExchangeStage !== undefined
       ? { skillExchangeStage: state.skillExchangeStage }
       : {}),
+    ...(caseId === "game_action_discretion" &&
+    state.gameActionPriorProposalsSettled !== undefined
+      ? {
+          gameActionPriorPendingProposalCount:
+            state.gameActionPriorPendingProposalCount ?? 0,
+          gameActionPriorProposalsSettled:
+            state.gameActionPriorProposalsSettled,
+        }
+      : {}),
   };
 }
 
@@ -1698,6 +1707,8 @@ interface RunState {
   learningReuseOwnerProposalRecorded?: boolean;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
   skillExchangeStage?: SkillExchangeStage;
+  gameActionPriorPendingProposalCount?: number;
+  gameActionPriorProposalsSettled?: boolean;
   gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
   unknownCompositeDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
@@ -2875,6 +2886,25 @@ async function main(): Promise<void> {
       },
     );
 
+    const beforeDiscretionHandoff = playerOf(
+      await collect(requireLiveContext().runtime.app),
+    );
+    const pendingBeforeDiscretion = new Set(
+      beforeDiscretionHandoff.proposals
+        .filter(({ status }) => status === "pending")
+        .map(({ id }) => id),
+    );
+    state.gameActionPriorPendingProposalCount = pendingBeforeDiscretion.size;
+    state.gameActionPriorProposalsSettled =
+      pendingBeforeDiscretion.size === 0 ||
+      (await observeForPlayer(requireLiveContext(), 45_000, (player) =>
+        [...pendingBeforeDiscretion].every((id) =>
+          player.proposals.some(
+            (proposal) => proposal.id === id && proposal.status !== "pending",
+          ),
+        ),
+      )) !== undefined;
+
     let activeBuildingFixture: BuildingFixture | undefined;
     const discretionResult = await recordCase(
       state,
@@ -2882,6 +2912,8 @@ async function main(): Promise<void> {
       CASE_DEADLINES.game_action_discretion,
       requireLiveContext(),
       async (context) => {
+        if (!state.gameActionPriorProposalsSettled)
+          incomplete("PRIOR_OWNER_PROPOSALS_UNRESOLVED");
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -2989,6 +3021,7 @@ async function main(): Promise<void> {
         await removeBuildingFixture(rcon, buildingFixture);
         activeBuildingFixture = undefined;
         return {
+          priorOwnerProposalsSettled: true,
           selectedBuildingOperation: selectedPlacement,
           fixtureFacingConfirmed: true,
           bodyObservedWallMaterial: true,
