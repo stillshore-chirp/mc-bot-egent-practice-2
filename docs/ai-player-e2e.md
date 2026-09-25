@@ -173,4 +173,6 @@ unknown fixtureのbaseline準備では、sourceとclone先のchunkを先にforce
 
 HEAD `0bd7656` の対象試験run65では、非OP Bodyの`move_relative`到達とサーバー上の変位、自発生活を確認しました。未知複合状況は26 calls・既知211,202 tokensで予算停止し、GPTは`move_relative`を選ばず、標的への接近・採集・持帰りは未確認でした。HEAD `f4db801` のrun66では判断初期入力の履歴・可視ブロック重複を縮約した状態で、Body smokeと自発生活がpassしました。未知複合状況ではGPTが`move_relative`を選び、実操作の失敗、後続判断と別の成功操作を観測しました。一方、標的への接近は確認できず、31 calls・既知203,916 tokensで予算停止しました。caseのusageはどちらも`partial_or_unknown`で、cleanupは双方3/3です。run65/66の初期入力文字数は同じ履歴・world状態で比較したものではないため、圧縮による使用量・達成率の改善は未確定です。
 
+HEAD `57d9385` の対象試験run67では、圧縮後の古い移動結果を短い履歴として渡しました。Body smokeと自発生活はpassし、未知複合状況では標的方向への距離短縮をサーバー観測で確認しました。標的は未採集で、28 calls・既知205,800 tokensで予算停止です。障害物の介入は適格条件を満たさず、失敗後の回復は未確認でした。case usageは`partial_or_unknown`、cleanupは3/3です。run66と行動・world状態は異なるため、履歴追加の効果と断定しません。その後、古い移動履歴の相対変位を結果文から抽出する実装に偽の形式文字列を拾う余地を見つけ、観測時に保存した構造化値だけを使うよう修正しました。この後続修正は実ゲーム未検証です。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
