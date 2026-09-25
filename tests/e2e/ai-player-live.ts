@@ -374,6 +374,8 @@ interface BodySmokeDiagnostic {
   readonly fixtureLookDetailClass: BodyDetailClass;
   readonly fixtureTargetVisibleAfterLook: boolean;
   readonly fixtureTargetBlockName: string;
+  readonly relativeMoveStatus?: BodyOperationStatus;
+  readonly relativeMoveServerDisplacementObserved?: boolean;
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
   readonly resourceLookDetailClass?: BodyDetailClass;
@@ -913,6 +915,15 @@ function bodySmokeEvidence(
     fixtureLookDetailClass: diagnostic.fixtureLookDetailClass,
     fixtureTargetVisibleAfterLook: diagnostic.fixtureTargetVisibleAfterLook,
     fixtureTargetBlockName: diagnostic.fixtureTargetBlockName,
+    ...(diagnostic.relativeMoveStatus === undefined
+      ? {}
+      : { relativeMoveStatus: diagnostic.relativeMoveStatus }),
+    ...(diagnostic.relativeMoveServerDisplacementObserved === undefined
+      ? {}
+      : {
+          relativeMoveServerDisplacementObserved:
+            diagnostic.relativeMoveServerDisplacementObserved,
+        }),
     ...(diagnostic.resourceTargetRconConfirmed === undefined
       ? {}
       : {
@@ -1009,6 +1020,7 @@ function playerOf(evidence: Evidence): PlayerEvidence {
   if (!isRecord(counters)) incomplete("PLAYER_RUNTIME_COUNTERS_MISSING");
   const counterFields = [
     "llmCalls",
+    "usageUnknownCalls",
     "inputTokens",
     "outputTokens",
     "latencyMs",
@@ -4630,7 +4642,8 @@ async function runOperationSmoke(
         body = client.createPlayerBody();
         const names = new Set(playerOperationNames);
         if (
-          names.size !== 28 ||
+          names.size !== 29 ||
+          !names.has("move_relative") ||
           !names.has("dig") ||
           !names.has("open_window") ||
           !names.has("window_transfer") ||
@@ -5211,9 +5224,60 @@ async function runOperationSmoke(
         await rcon.command(`setblock ${target.x} ${target.y} ${target.z} air`);
         if (!(await isBlock(rcon, target, "air")))
           incomplete("BODY_SMOKE_RESOURCE_FIXTURE_CLEANUP_UNVERIFIED");
+        const beforeRelativeMove = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const relativeDestination = {
+          x: Math.floor(beforeRelativeMove.x),
+          y: Math.floor(beforeRelativeMove.y),
+          z: Math.floor(beforeRelativeMove.z) + 3,
+        };
+        if (
+          !(await isBlock(rcon, relativeDestination, "air")) ||
+          !(await isBlock(
+            rcon,
+            { ...relativeDestination, y: relativeDestination.y + 1 },
+            "air",
+          )) ||
+          !(await isBlock(
+            rcon,
+            { ...relativeDestination, y: relativeDestination.y - 1 },
+            "stone",
+          ))
+        )
+          incomplete("BODY_RELATIVE_MOVE_FIXTURE_NOT_CLEAR");
+        const relativeMove = await body.execute(
+          {
+            kind: "move_relative",
+            offset: { x: 0, y: 0, z: 3 },
+            range: 1,
+          },
+          abort.signal,
+        );
+        const afterRelativeMove = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const relativeMoveServerDisplacementObserved =
+          afterRelativeMove.z - beforeRelativeMove.z >= 1.5 &&
+          Math.abs(afterRelativeMove.x - beforeRelativeMove.x) <= 1.5;
+        state.bodySmokeDiagnostic = {
+          ...furnaceDiagnostic,
+          relativeMoveStatus: relativeMove.status,
+          relativeMoveServerDisplacementObserved,
+        };
+        if (
+          relativeMove.status !== "successful" ||
+          !relativeMoveServerDisplacementObserved
+        )
+          incomplete("BODY_RELATIVE_MOVE_NOT_CONFIRMED");
+        await rcon.command(
+          `tp ${state.botName} ${smokeSpawn.x} ${smokeSpawn.y} ${smokeSpawn.z} 0 0`,
+        );
         const smokeEndPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
+        if (!positionMatchesSmokeSpawn(smokeEndPosition))
+          incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
         state.autonomousRegion = await captureBlockBaseline(
           rcon,
           smokeEndPosition,
@@ -5235,6 +5299,7 @@ async function runOperationSmoke(
           occludedFixtureItemOmitted: hiddenItemOmitted,
           gameKnowledgeAvailable: registryKnowledgeAvailable,
           resourceVisibleAfterSmoke,
+          relativeMoveVerifiedByServer: relativeMoveServerDisplacementObserved,
           gptCalls: 0,
           apiOperationsReportedSuccess,
         };
