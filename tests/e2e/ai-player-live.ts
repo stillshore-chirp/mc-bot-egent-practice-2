@@ -5540,23 +5540,41 @@ async function availableLogFixtureSites(
   rcon: LocalRcon,
   origin: Position,
 ): Promise<readonly BlockPosition[]> {
-  for (const radius of [3, 4, 5, 6]) {
-    const logs = [
-      fixturePoint(origin, radius, 0),
-      fixturePoint(origin, -radius, 0),
-      fixturePoint(origin, 0, radius),
-      fixturePoint(origin, 0, -radius),
-    ];
-    let available = true;
-    for (const log of logs) {
-      if (!(await isBlock(rcon, log, "air"))) {
-        available = false;
+  const directions = [
+    { x: 1, z: 0 },
+    { x: 1, z: 1 },
+    { x: 0, z: 1 },
+    { x: -1, z: 1 },
+    { x: -1, z: 0 },
+    { x: -1, z: -1 },
+    { x: 0, z: -1 },
+    { x: 1, z: -1 },
+  ] as const;
+  const available: { index: number; position: BlockPosition }[] = [];
+  for (const [index, direction] of directions.entries()) {
+    for (const radius of [3, 4, 5, 6]) {
+      const position = fixturePoint(
+        origin,
+        direction.x * radius,
+        direction.z * radius,
+      );
+      if (await isBlock(rcon, position, "air")) {
+        available.push({ index, position });
         break;
       }
     }
-    if (available) return logs;
   }
-  incomplete("LEARNING_LOG_FIXTURE_SITE_OCCUPIED");
+  // A gap of at most 90 degrees leaves a log in every 110-degree view cone.
+  const allAnglesCovered = available.every((entry, index) => {
+    const next = available[(index + 1) % available.length];
+    return (
+      next !== undefined &&
+      (next.index - entry.index + directions.length) % directions.length <= 2
+    );
+  });
+  if (available.length < 4 || !allAnglesCovered)
+    incomplete("LEARNING_LOG_FIXTURE_SITE_OCCUPIED");
+  return available.map(({ position }) => position);
 }
 
 async function configureLogFixture(
