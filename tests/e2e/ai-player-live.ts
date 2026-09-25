@@ -84,6 +84,10 @@ import {
   type UnknownTaskProgressAggregate,
   type UnknownTaskProgressSampleStatus,
 } from "./unknown-task-progress.js";
+import {
+  inspectPersistentMemoryProgress,
+  type PersistentMemoryProgress,
+} from "./persistent-memory-diagnostic.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -1118,6 +1122,20 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
           autonomousActiveBodyStarted: progress.activeBodyStarted,
           autonomousActiveBodyElapsedBucket: progress.activeBodyElapsedBucket,
         }),
+    ...(caseId === "persistent_memory_restart" &&
+    state.persistentMemoryDiagnostic !== undefined
+      ? {
+          persistentMemoryStage: state.persistentMemoryDiagnostic.stage,
+          persistentMemoryReplyObserved:
+            state.persistentMemoryDiagnostic.ownerReplyObserved,
+          persistentMemoryRememberToolCalled:
+            state.persistentMemoryDiagnostic.rememberToolCalled,
+          persistentMemoryRememberToolResult:
+            state.persistentMemoryDiagnostic.rememberToolResult,
+          persistentMemoryFactPersisted:
+            state.persistentMemoryDiagnostic.factPersisted,
+        }
+      : {}),
   };
 }
 
@@ -1513,6 +1531,7 @@ interface RunState {
     readonly observationBeforeReply?: boolean;
   };
   observationBoundarySidecarRetained?: boolean;
+  persistentMemoryDiagnostic?: PersistentMemoryProgress;
 }
 
 let appForCleanup: CompanionApplication | undefined;
@@ -1896,18 +1915,50 @@ async function main(): Promise<void> {
       async (context) => {
         const beforeResponses = context.responseQueue.length;
         const durableFact = "maple-47";
+        const beforeMemory = playerOf(await collect(context.runtime.app));
+        const afterRunSequence =
+          beforeMemory.recentAgentActivity?.at(-1)?.runSequence ?? 0;
+        state.persistentMemoryDiagnostic = {
+          stage: "request_sent",
+          ownerReplyObserved: false,
+          rememberToolCalled: false,
+          rememberToolResult: "none",
+          factPersisted: false,
+        };
         sendChat(
           context.owner,
           `次のセッションでも覚えておいてください。合成テスト用の合言葉は「${durableFact}」です。私から教わった事実として記録してください。`,
         );
-        await waitForPlayer(
-          context,
-          120_000,
-          (player) =>
+        await waitForPlayer(context, 120_000, (player) => {
+          const ownerReplyObserved =
+            context.responseQueue.length > beforeResponses;
+          const factPersisted = readDbContainsOwnerFact(
+            state.databasePath,
+            durableFact,
+          );
+          const progress = inspectPersistentMemoryProgress({
+            activity: player.recentAgentActivity ?? [],
+            afterRunSequence,
+            ownerReplyObserved,
+            factPersisted,
+          });
+          state.persistentMemoryDiagnostic = {
+            ...(state.persistentMemoryDiagnostic ?? progress),
+            ...progress,
+          };
+          if (progress.stage === "conversation_finished_without_save_tool")
+            incomplete("OWNER_FACT_TOOL_NOT_CALLED");
+          if (progress.stage === "save_tool_rejected")
+            incomplete("OWNER_FACT_SAVE_REJECTED");
+          if (progress.stage === "save_tool_not_verified")
+            incomplete("OWNER_FACT_SAVE_NOT_VERIFIED");
+          return (
             player.counters.llmCalls > context.usageAtStart.llmCalls &&
-            context.responseQueue.length > beforeResponses &&
-            readDbContainsOwnerFact(state.databasePath, durableFact),
-        );
+            ownerReplyObserved &&
+            progress.rememberToolCalled &&
+            progress.factPersisted
+          );
+        });
         const beforeRestart = readDbTableCount(
           state.databasePath,
           "player_runtime_state",
@@ -1944,7 +1995,11 @@ async function main(): Promise<void> {
         const afterRestart = await collect(nextApp);
         const restartPlayer = playerOf(afterRestart);
         if (beforeRestart < 1) incomplete("PERSISTENT_RUNTIME_ROW_MISSING");
-        if (!readDbContainsOwnerFact(state.databasePath, durableFact))
+        const factAfterRestart = readDbContainsOwnerFact(
+          state.databasePath,
+          durableFact,
+        );
+        if (!factAfterRestart)
           incomplete("SYNTHETIC_FACT_MISSING_AFTER_RESTART");
         const responseStart = context.responseQueue.length;
         const restartCallsBefore = restartPlayer.counters.llmCalls;
