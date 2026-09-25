@@ -448,10 +448,10 @@ export class PlayerRuntime {
       this.#queueThoughtWake(kind, reason);
       if (kind === "owner_proposal") {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
-      } else if (kind === "body_outcome" && !this.#activeThoughtCommitted) {
-        // A result changed the evidence for an uncommitted decision. Restart
-        // with the new snapshot instead of spending a round on stale CAS.
-        activeThought.abort(new Error("body_outcome_preempted_thought"));
+      } else if (!this.#activeThoughtCommitted) {
+        // Every queued event advances the CAS revision. Settle an uncommitted
+        // thought early so it can decide from the new snapshot and event set.
+        activeThought.abort(new Error("new_event_preempted_thought"));
       }
       return;
     }

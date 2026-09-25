@@ -1074,6 +1074,84 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("preempts an uncommitted thought when a state event advances the revision", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    let thoughtCount = 0;
+    let activeThoughts = 0;
+    let maxActiveThoughts = 0;
+    let firstSignal: AbortSignal | undefined;
+    let followupKinds: readonly string[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events, signal }) => {
+          thoughtCount += 1;
+          activeThoughts += 1;
+          maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+          try {
+            if (thoughtCount === 1) {
+              firstSignal = signal;
+              await firstThoughtGate;
+              return { accepted: false };
+            }
+            followupKinds = events.map(({ kind }) => kind);
+            return { accepted: true };
+          } finally {
+            activeThoughts -= 1;
+          }
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const hurt = observation();
+      body.setObservation({
+        ...hurt,
+        self: { ...hurt.self, health: 15 },
+      });
+      body.emit({
+        type: "state_changed",
+        reason: "vitals",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        mind.pendingEvents(64).some(({ kind }) => kind === "state_changed"),
+      );
+      expect(firstSignal?.aborted).toBe(true);
+      expect(thoughtCount).toBe(1);
+      releaseFirstThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(maxActiveThoughts).toBe(1);
+      expect(followupKinds).toContain("state_changed");
+    } finally {
+      releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("clears queued thought wakes on stop and does not restart after settlement", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
