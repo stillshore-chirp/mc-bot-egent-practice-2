@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
-import type { Vec3 } from "vec3";
+import { Vec3 } from "vec3";
 
 export interface BodyPosition {
   readonly x: number;
@@ -277,18 +277,104 @@ function entityHealth(entity: Entity): number | null {
     : null;
 }
 
-function blockPositionKey(position: Vec3): string {
+function blockPositionKey(position: {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}): string {
   return `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
+}
+
+function raycastHitPosition(hit: unknown): Vec3 | null {
+  if (typeof hit !== "object" || hit === null) return null;
+  const result = hit as {
+    readonly position?: unknown;
+    readonly x?: unknown;
+    readonly y?: unknown;
+    readonly z?: unknown;
+  };
+  const position = result.position;
+  if (typeof position === "object" && position !== null) {
+    const point = position as {
+      readonly x?: unknown;
+      readonly y?: unknown;
+      readonly z?: unknown;
+    };
+    if (
+      typeof point.x === "number" &&
+      Number.isFinite(point.x) &&
+      typeof point.y === "number" &&
+      Number.isFinite(point.y) &&
+      typeof point.z === "number" &&
+      Number.isFinite(point.z)
+    )
+      return new Vec3(point.x, point.y, point.z);
+  }
+  if (
+    typeof result.x === "number" &&
+    Number.isFinite(result.x) &&
+    typeof result.y === "number" &&
+    Number.isFinite(result.y) &&
+    typeof result.z === "number" &&
+    Number.isFinite(result.z)
+  )
+    return new Vec3(result.x, result.y, result.z);
+  return null;
+}
+
+function crosshairBlockPosition(bot: Bot, origin: Vec3): Vec3 | null {
+  const { yaw, pitch } = bot.entity;
+  if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) return null;
+  const direction = new Vec3(
+    -Math.sin(yaw) * Math.cos(pitch),
+    Math.sin(pitch),
+    -Math.cos(yaw) * Math.cos(pitch),
+  );
+  const directionLength = direction.norm();
+  if (!Number.isFinite(directionLength) || directionLength === 0) return null;
+
+  const hit = bot.world.raycast(
+    eyePosition(bot),
+    direction.scaled(1 / directionLength),
+    maxVisibleDistance,
+  );
+  const hitPosition = raycastHitPosition(hit);
+  if (hitPosition === null) return null;
+  const block = bot.blockAt(hitPosition);
+  if (
+    block === null ||
+    ["air", "cave_air", "void_air"].includes(block.name) ||
+    block.boundingBox !== "block"
+  )
+    return null;
+  const target = block.position.offset(0.5, 0.5, 0.5);
+  if (
+    origin.distanceTo(target) > maxVisibleDistance ||
+    !insideViewCone(bot, target)
+  )
+    return null;
+  return block.position;
 }
 
 function visibleBlockCandidates(
   bot: Bot,
   origin: Vec3,
   dimension: string,
-): { blocks: BodyVisibleBlock[]; mayBeTruncated: boolean } {
+): {
+  blocks: BodyVisibleBlock[];
+  mayBeTruncated: boolean;
+  priorityPositionKey: string | undefined;
+} {
   const excludedNames = new Set<string>();
   const seenPositions = new Set<string>();
   const candidates: Vec3[] = [];
+  const priorityPosition = crosshairBlockPosition(bot, origin);
+  const priorityPositionKey =
+    priorityPosition === null ? undefined : blockPositionKey(priorityPosition);
+  if (priorityPosition !== null) {
+    seenPositions.add(blockPositionKey(priorityPosition));
+    candidates.push(priorityPosition);
+  }
   let mayBeTruncated = false;
 
   for (let pass = 0; pass < blockCandidateSearchPassLimit; pass += 1) {
@@ -332,10 +418,14 @@ function visibleBlockCandidates(
     if (block === null) continue;
     const target = block.position.offset(0.5, 0.5, 0.5);
     const distance = origin.distanceTo(target);
+    const isPriority = blockPositionKey(block.position) === priorityPositionKey;
     if (
       distance > maxVisibleDistance ||
       !insideViewCone(bot, target) ||
-      !bot.canSeeBlock(block)
+      (isPriority
+        ? block.boundingBox !== "block" ||
+          ["air", "cave_air", "void_air"].includes(block.name)
+        : !bot.canSeeBlock(block))
     )
       continue;
     const signText = block.name.endsWith("sign")
@@ -359,15 +449,29 @@ function visibleBlockCandidates(
   }
 
   blocks.sort((left, right) => left.distance - right.distance);
-  return { blocks, mayBeTruncated };
+  return { blocks, mayBeTruncated, priorityPositionKey };
 }
 
 function balancedVisibleBlocks(
   blocks: readonly BodyVisibleBlock[],
   limit: number,
+  priorityPositionKey?: string,
 ): BodyVisibleBlock[] {
+  if (limit <= 0) return [];
+  const priorityBlock =
+    priorityPositionKey === undefined
+      ? undefined
+      : blocks.find(
+          (block) => blockPositionKey(block.position) === priorityPositionKey,
+        );
+  const remainingBlocks =
+    priorityBlock === undefined
+      ? blocks
+      : blocks.filter(
+          (block) => blockPositionKey(block.position) !== priorityPositionKey,
+        );
   const blocksByName = new Map<string, BodyVisibleBlock[]>();
-  for (const block of blocks) {
+  for (const block of remainingBlocks) {
     const sameName = blocksByName.get(block.name) ?? [];
     sameName.push(block);
     blocksByName.set(block.name, sameName);
@@ -382,7 +486,8 @@ function balancedVisibleBlocks(
       leftFirst.name.localeCompare(rightFirst.name)
     );
   });
-  const selected: BodyVisibleBlock[] = [];
+  const selected: BodyVisibleBlock[] =
+    priorityBlock === undefined ? [] : [priorityBlock];
   for (let index = 0; selected.length < limit; index += 1) {
     let found = false;
     for (const group of groups) {
@@ -561,7 +666,11 @@ export function observePlayerBody(
       candidateSearchMayBeTruncated:
         blockObservation.mayBeTruncated ||
         entityCandidates.length > entityCandidateLimit,
-      blocks: balancedVisibleBlocks(visibleBlocks, blockOutputLimit),
+      blocks: balancedVisibleBlocks(
+        visibleBlocks,
+        blockOutputLimit,
+        blockObservation.priorityPositionKey,
+      ),
       entities: visibleEntities.slice(0, entityOutputLimit),
       ...(ownerPositionException === undefined
         ? {}

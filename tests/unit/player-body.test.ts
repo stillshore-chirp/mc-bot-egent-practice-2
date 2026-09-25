@@ -66,6 +66,7 @@ function makeFakeBot(
   candidates: Vec3[];
   hiddenBlockKeys: Set<string>;
   findBlockSearches: { count: number; resultCount: number }[];
+  setCrosshairRaycastResult(result: unknown): void;
   setWindow(window: Window): void;
   emitWindowOpen(): void;
   resumeWindowOpen(): void;
@@ -78,6 +79,7 @@ function makeFakeBot(
   const candidates: Vec3[] = [];
   const hiddenBlockKeys = new Set<string>();
   const findBlockSearches: { count: number; resultCount: number }[] = [];
+  let crosshairRaycastResult: unknown = null;
   let pendingWindow: (Window & EventEmitter) | undefined;
   let deferWindowOpen = options.deferWindowOpen === true;
   const key = (position: Vec3): string =>
@@ -151,8 +153,17 @@ function makeFakeBot(
       particlesByName: {},
     },
     world: {
-      raycast: (_origin: Vec3, direction: Vec3) =>
-        direction.x > 0.2 ? makeBlock("stone", 1, new Vec3(1, 64, -2)) : null,
+      raycast: (
+        _origin: Vec3,
+        direction: Vec3,
+        _range: number,
+        matching?: (block: FakeBlock) => boolean,
+      ) =>
+        matching === undefined
+          ? crosshairRaycastResult
+          : direction.x > 0.2
+            ? makeBlock("stone", 1, new Vec3(1, 64, -2))
+            : null,
     },
     pathfinder: {
       goto: vi.fn(async () => undefined),
@@ -249,6 +260,9 @@ function makeFakeBot(
     candidates,
     hiddenBlockKeys,
     findBlockSearches,
+    setCrosshairRaycastResult: (result) => {
+      crosshairRaycastResult = result;
+    },
     setWindow: (window) => {
       pendingWindow = window as Window & EventEmitter;
     },
@@ -263,6 +277,26 @@ function makeFakeBot(
       deferWindowOpen = false;
     },
   };
+}
+
+function addOffAxisStoneCandidates(
+  fake: ReturnType<typeof makeFakeBot>,
+  count: number,
+): void {
+  let added = 0;
+  for (let z = -5; z >= -14 && added < count; z -= 1) {
+    for (let x = -5; x <= 5 && added < count; x += 1) {
+      if (Math.abs(x) < 2) continue;
+      for (let y = 63; y <= 65 && added < count; y += 1) {
+        const point = new Vec3(x, y, z);
+        fake.blocks.set(`${x},${y},${z}`, makeBlock("stone", 1, point));
+        fake.candidates.push(point);
+        added += 1;
+      }
+    }
+  }
+  if (added !== count)
+    throw new Error(`Only added ${added} of ${count} stone candidates`);
 }
 
 function beginPendingDig(
@@ -541,6 +575,75 @@ describe("player body", () => {
     expect(visibleNames).not.toContain("chest");
     expect(observation.perception.omittedBlockCandidates).toBe(98);
     expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
+  });
+
+  it("reserves the first crosshair hit when a common block type fills the search cap", () => {
+    const fake = makeFakeBot();
+    addOffAxisStoneCandidates(fake, 192);
+    const target = new Vec3(0, 65, -15);
+    const targetBlock = makeBlock("stone", 1, target);
+    fake.blocks.set("0,65,-15", targetBlock);
+    fake.setCrosshairRaycastResult(targetBlock);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    const targetKey = "0,65,-15";
+    const observedKeys = observation.perception.blocks.map(
+      ({ position }) =>
+        `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`,
+    );
+
+    expect(fake.findBlockSearches[0]).toEqual({
+      count: 192,
+      resultCount: 192,
+    });
+    expect(observation.perception.blocks).toHaveLength(96);
+    expect(observedKeys).toContain(targetKey);
+    expect(new Set(observedKeys).size).toBe(96);
+    expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
+  });
+
+  it("does not expose a block behind the first crosshair hit", () => {
+    const fake = makeFakeBot();
+    const blockerPosition = new Vec3(0, 65, -6);
+    const hiddenTarget = new Vec3(0, 65, -9);
+    const blocker = makeBlock("stone", 1, blockerPosition);
+    fake.blocks.set("0,65,-6", blocker);
+    fake.blocks.set("0,65,-9", makeBlock("chest", 3, hiddenTarget));
+    fake.candidates.push(blockerPosition, hiddenTarget);
+    fake.hiddenBlockKeys.add("0,65,-9");
+    fake.setCrosshairRaycastResult(blocker);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    const observedNames = observation.perception.blocks.map(({ name }) => name);
+    const blockerCount = observation.perception.blocks.filter(
+      ({ position }) =>
+        position.x === blockerPosition.x &&
+        position.y === blockerPosition.y &&
+        position.z === blockerPosition.z,
+    ).length;
+
+    expect(observedNames).toContain("stone");
+    expect(observedNames).not.toContain("chest");
+    expect(blockerCount).toBe(1);
+  });
+
+  it("ignores null, malformed, and air crosshair raycast results", () => {
+    const fake = makeFakeBot();
+    const airPosition = new Vec3(0, 65, -5);
+    const invalidResults: unknown[] = [
+      null,
+      undefined,
+      42,
+      { x: Number.NaN, y: 65, z: -5 },
+      makeBlock("air", 0, airPosition),
+    ];
+
+    for (const result of invalidResults) {
+      fake.setCrosshairRaycastResult(result);
+      expect(observePlayerBody(fake.bot, "owner").perception.blocks).toEqual(
+        [],
+      );
+    }
   });
 
   it("does not treat local-only dig mutation as success, but accepts a server block packet", async () => {
