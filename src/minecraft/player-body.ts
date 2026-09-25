@@ -220,6 +220,7 @@ interface ActiveOperation {
   timedOut: boolean;
   lastProgressAt: number;
   lastProgressSignature: string;
+  lastTravelPosition: PlayerBodyObservation["self"]["position"] | undefined;
   stallReported: boolean;
   stallTimer: ReturnType<typeof setInterval> | undefined;
   actionSettled: boolean;
@@ -419,8 +420,27 @@ function stableSignature(observation: PlayerBodyObservation): string {
       block.name,
       block.position,
     ]),
-    time: observation.time,
   });
+}
+
+function isTravelOperation(operation: PlayerOperation): boolean {
+  return (
+    operation.kind === "move_to" ||
+    operation.kind === "move_relative" ||
+    operation.kind === "control" ||
+    operation.kind === "move_vehicle" ||
+    operation.kind === "elytra_fly"
+  );
+}
+
+function travelProgressed(
+  previous: PlayerBodyObservation["self"]["position"],
+  current: PlayerBodyObservation["self"]["position"],
+): boolean {
+  const dx = current.x - previous.x;
+  const dy = current.y - previous.y;
+  const dz = current.z - previous.z;
+  return dx * dx + dy * dy + dz * dz >= 0.75 * 0.75;
 }
 
 function semanticSignature(
@@ -1209,6 +1229,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       timedOut: false,
       lastProgressAt: Date.now(),
       lastProgressSignature: "",
+      lastTravelPosition: undefined,
       stallReported: false,
       stallTimer: undefined,
       actionSettled: true,
@@ -1233,6 +1254,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
     active.lastProgressSignature =
       before === null ? "" : stableSignature(before);
+    active.lastTravelPosition = before?.self.position;
     this.startStallMonitor(active);
     const blockTarget =
       operation.kind === "dig" || operation.kind === "place"
@@ -1443,9 +1465,16 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (this.active !== active || active.controller.signal.aborted) return;
       const observation = this.safeObserve(active.bot);
       if (observation === null) return;
-      const signature = stableSignature(observation);
-      if (signature !== active.lastProgressSignature) {
-        active.lastProgressSignature = signature;
+      const isTravel = isTravelOperation(active.operation);
+      const lastTravelPosition = active.lastTravelPosition;
+      const signature = isTravel ? undefined : stableSignature(observation);
+      const progressed = isTravel
+        ? lastTravelPosition === undefined ||
+          travelProgressed(lastTravelPosition, observation.self.position)
+        : signature !== active.lastProgressSignature;
+      if (progressed) {
+        if (isTravel) active.lastTravelPosition = observation.self.position;
+        else active.lastProgressSignature = signature ?? "";
         active.lastProgressAt = Date.now();
         active.stallReported = false;
       } else if (

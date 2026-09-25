@@ -1029,6 +1029,48 @@ describe("player body", () => {
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
+  it("reports travel stalls despite changing world time and resets after real movement", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      let finishGoto: (() => void) | undefined;
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishGoto = resolve;
+          }),
+      );
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const resultPromise = body.execute({
+        kind: "move_to",
+        position: { x: 8, y: 64, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      for (let tick = 0; tick < 4; tick += 1) {
+        fake.bot.time.timeOfDay += 100;
+        await vi.advanceTimersByTimeAsync(5_000);
+      }
+      expect(
+        events.filter(({ type }) => type === "operation_stalled"),
+      ).toHaveLength(1);
+
+      fake.bot.entity.position.x = 0.8;
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(
+        events.filter(({ type }) => type === "operation_stalled"),
+      ).toHaveLength(2);
+
+      finishGoto?.();
+      await resultPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("lets a later path update supersede stale noPath and keeps an unreached move unverified", async () => {
     const fake = makeFakeBot();
     const body = new MineflayerPlayerBody(() => fake.bot);
