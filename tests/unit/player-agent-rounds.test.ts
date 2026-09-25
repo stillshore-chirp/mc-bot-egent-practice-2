@@ -19,6 +19,8 @@ import type {
   PlayerRuntimeSnapshot,
 } from "../../src/player/contracts.js";
 import {
+  compactDecisionObservation,
+  compactSnapshot,
   PlayerConversationAgent,
   PlayerPurposeAgent,
 } from "../../src/player/agents.js";
@@ -74,10 +76,96 @@ describe("player agent response rounds", () => {
       const purposeInput = z
         .record(z.string(), z.unknown())
         .parse(JSON.parse(String(userInput.content)));
-      expect(purposeInput.observation).toEqual(observation);
+      expect(purposeInput.observation).toEqual(
+        compactDecisionObservation(observation),
+      );
+      const fullSnapshot = fixture.mind.snapshot();
+      const judgment = fullSnapshot.recentJudgments.at(-1);
+      if (judgment === undefined) throw new Error("judgment missing");
+      const longHistory = {
+        ...fullSnapshot,
+        recentJudgments: Array.from({ length: 7 }, (_, index) => ({
+          ...judgment,
+          revision: index + 1,
+        })),
+        recentOutcomes: Array.from({ length: 6 }, (_, index) => ({
+          runId: `run-${index}`,
+          operationId: `run-${index}`,
+          kind: "look" as const,
+          status: "successful" as const,
+          summary: "view changed",
+          observedAt: observation.observedAt,
+        })),
+      };
+      const compactedRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(compactSnapshot(longHistory));
+      expect(compactedRuntime.recentJudgments).toHaveLength(4);
+      expect(compactedRuntime.omittedJudgmentCount).toBe(3);
+      expect(compactedRuntime.recentOutcomes).toEqual(
+        longHistory.recentOutcomes.slice(-4),
+      );
+      expect(compactedRuntime.omittedOutcomeCount).toBe(2);
+      expect(compactedRuntime.recentJudgments).toEqual(
+        longHistory.recentJudgments.slice(-4),
+      );
+      expect(longHistory.recentJudgments).toHaveLength(7);
+      expect(longHistory.recentOutcomes).toHaveLength(6);
     } finally {
       fixture.close();
     }
+  });
+
+  it("compacts repeated block metadata without hiding visible evidence", () => {
+    const base = bodyObservationFixture();
+    const blocks = Array.from({ length: 96 }, (_, index) => ({
+      name: index === 95 ? "oak_log" : "stone",
+      stateId: index + 1,
+      position: {
+        x: index,
+        y: 64,
+        z: index % 8,
+        dimension: "overworld",
+      },
+      distance: index / 10,
+      properties: index === 95 ? { axis: "x" } : {},
+    }));
+    const observation: PlayerBodyObservation = {
+      ...base,
+      perception: {
+        ...base.perception,
+        blocks,
+        omittedBlockCandidates: 17,
+        candidateSearchMayBeTruncated: true,
+      },
+    };
+
+    const compacted = z
+      .record(z.string(), z.unknown())
+      .parse(compactDecisionObservation(observation));
+    const perception = z
+      .record(z.string(), z.unknown())
+      .parse(compacted.perception);
+    const visibleBlocks = z
+      .array(z.record(z.string(), z.unknown()))
+      .parse(perception.blocks);
+
+    expect(compacted.dimension).toBe("overworld");
+    expect(visibleBlocks).toHaveLength(96);
+    expect(visibleBlocks[95]).toEqual({
+      name: "oak_log",
+      position: { x: 95, y: 64, z: 7 },
+      distance: 9.5,
+      properties: { axis: "x" },
+    });
+    expect(visibleBlocks[0]).not.toHaveProperty("stateId");
+    expect(visibleBlocks[0]?.position).not.toHaveProperty("dimension");
+    expect(perception.omittedBlockCandidates).toBe(17);
+    expect(perception.candidateSearchMayBeTruncated).toBe(true);
+    expect(observation.perception.blocks[95]?.stateId).toBe(96);
+    expect(JSON.stringify(compacted).length).toBeLessThan(
+      JSON.stringify(observation).length,
+    );
   });
 
   it("retains observe_body as recovery when the initial observation is unavailable", async () => {

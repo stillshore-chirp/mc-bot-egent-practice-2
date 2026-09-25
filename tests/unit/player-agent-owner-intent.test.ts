@@ -446,7 +446,10 @@ function openPurposeFixture(
     observe: async (options?: { ownerPositionException?: boolean }) => {
       if (options?.ownerPositionException === true)
         ownerPositionExceptions.push(true);
-      return {} as PlayerBodyObservation;
+      return {
+        dimension: "overworld",
+        perception: { blocks: [] },
+      } as unknown as PlayerBodyObservation;
     },
   } as unknown as PlayerBody;
   const agent = new PlayerPurposeAgent({
