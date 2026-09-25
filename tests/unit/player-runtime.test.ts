@@ -288,10 +288,20 @@ describe("integrated player runtime", () => {
       expect(reopened.snapshot().activeOperation).toMatchObject({
         operationId: active.operationId,
         startedAt: "2026-09-25T03:00:00.000Z",
+        expectedOutcome: "observe a changed view",
       });
       expect(
         reopened.snapshot().activeOperation?.bodyStartedAt,
       ).toBeUndefined();
+      const recovered = reopened.recoverInterruptedOperation();
+      expect(recovered).toMatchObject({
+        status: "unverified",
+        expectedOutcome: "observe a changed view",
+      });
+      expect(reopened.snapshot().lastOutcome).toMatchObject({
+        status: "unverified",
+        expectedOutcome: "observe a changed view",
+      });
     } finally {
       reopened.close();
     }
@@ -513,6 +523,12 @@ describe("integrated player runtime", () => {
         ]),
       );
       expect(followupSnapshot?.lastOutcome?.status).toBe("successful");
+      expect(followupSnapshot?.lastOutcome?.expectedOutcome).toBe(
+        "observe a changed view",
+      );
+      expect(followupSnapshot?.lastOutcome?.summary).toContain(
+        "期待したstep=observe a changed view",
+      );
       expect(followupSnapshot?.lastObservation?.timeOfDay).toBe(16_000);
     } finally {
       releaseFirstThought?.();

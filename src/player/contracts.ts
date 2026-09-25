@@ -81,6 +81,7 @@ export interface ActivePlayerOperation {
   readonly actionRevision: number;
   readonly startedAt: string;
   readonly bodyStartedAt?: string | undefined;
+  readonly expectedOutcome?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }
@@ -91,6 +92,7 @@ export interface PlayerOutcomeEvidence {
   readonly status: McSkillOutcomeStatus;
   readonly summary: string;
   readonly observedAt: string;
+  readonly expectedOutcome?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }

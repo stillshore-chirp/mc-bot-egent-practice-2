@@ -115,6 +115,7 @@ const outcomeHistorySchema = z
     ]),
     summary: z.string().min(1).max(700),
     observedAt: z.iso.datetime(),
+    expectedOutcome: z.string().min(1).max(400).optional(),
     skillId: z.string().min(1).max(80).optional(),
     skillVersion: z.number().int().positive().optional(),
   })
@@ -258,6 +259,7 @@ const stateSchema = z
         actionRevision: z.number().int().nonnegative(),
         startedAt: z.iso.datetime(),
         bodyStartedAt: z.iso.datetime().optional(),
+        expectedOutcome: z.string().min(1).max(400).optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
       })
@@ -284,6 +286,7 @@ const stateSchema = z
         ]),
         summary: z.string().min(1).max(700),
         observedAt: z.iso.datetime(),
+        expectedOutcome: z.string().min(1).max(400).optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
       })
@@ -759,6 +762,11 @@ export class PlayerMindStore {
             kind: input.decision.operation.kind,
             actionRevision: current.actionRevision + 1,
             startedAt: now,
+            expectedOutcome: bounded(
+              input.decision.expectedOutcome,
+              400,
+              "expected outcome",
+            ),
             ...(input.decision.skillId === undefined
               ? {}
               : { skillId: bounded(input.decision.skillId, 80, "skill id") }),
@@ -986,6 +994,7 @@ export class PlayerMindStore {
       readonly status: McSkillOutcomeStatus;
       readonly summary: string;
       readonly observedAt: string;
+      readonly expectedOutcome?: string;
       readonly skillId?: string;
       readonly skillVersion?: number;
     };
@@ -997,6 +1006,15 @@ export class PlayerMindStore {
       status: input.evidence.status,
       summary: bounded(input.evidence.summary, 700, "outcome summary"),
       observedAt: now,
+      ...(input.evidence.expectedOutcome === undefined
+        ? {}
+        : {
+            expectedOutcome: bounded(
+              input.evidence.expectedOutcome,
+              400,
+              "expected outcome",
+            ),
+          }),
       ...(input.evidence.skillId === undefined
         ? {}
         : { skillId: bounded(input.evidence.skillId, 80, "skill id") }),
@@ -1017,6 +1035,9 @@ export class PlayerMindStore {
         status: evidence.status,
         summary: evidence.summary,
         observedAt: now,
+        ...(evidence.expectedOutcome === undefined
+          ? {}
+          : { expectedOutcome: evidence.expectedOutcome }),
         ...(evidence.skillId === undefined
           ? {}
           : { skillId: evidence.skillId }),
@@ -1133,6 +1154,7 @@ export class PlayerMindStore {
         readonly status: McSkillOutcomeStatus;
         readonly summary: string;
         readonly observedAt: string;
+        readonly expectedOutcome?: string;
         readonly skillId?: string;
         readonly skillVersion?: number;
       }
@@ -1159,6 +1181,9 @@ export class PlayerMindStore {
             status,
             summary,
             observedAt,
+            ...(active.expectedOutcome === undefined
+              ? {}
+              : { expectedOutcome: active.expectedOutcome }),
             ...(active.skillId === undefined
               ? {}
               : { skillId: active.skillId }),
@@ -1175,6 +1200,9 @@ export class PlayerMindStore {
               status,
               summary,
               observedAt,
+              ...(active.expectedOutcome === undefined
+                ? {}
+                : { expectedOutcome: active.expectedOutcome }),
               ...(active.skillId === undefined
                 ? {}
                 : { skillId: active.skillId }),
@@ -1201,6 +1229,9 @@ export class PlayerMindStore {
         status,
         summary,
         observedAt,
+        ...(active.expectedOutcome === undefined
+          ? {}
+          : { expectedOutcome: active.expectedOutcome }),
         ...(active.skillId === undefined ? {} : { skillId: active.skillId }),
         ...(active.skillVersion === undefined
           ? {}

@@ -493,6 +493,107 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("shows a successful look's expected step and observed result to the next judgment", async () => {
+    const expectedOutcome =
+      "The view exposes the wall gap for the next repair step.";
+    const outcomeSummary =
+      "look は successful。視点変更を確認。ブロック変更は観測されていない。";
+    const alternateTarget = { x: 5, y: 65, z: 2 };
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "plan-after-successful-look",
+        "commit_action_decision",
+        {
+          ...actionArguments(),
+          purpose: "Repair the visible wall gap",
+          operationJson: JSON.stringify({
+            kind: "place",
+            item: "oak_planks",
+            position: alternateTarget,
+          }),
+          expectedOutcome: "The visible gap is filled.",
+          reason: "The view step succeeded; continue the active repair goal.",
+        },
+      ),
+    ]);
+    const proposal = fixture.mind.addProposal({
+      title: "Repair the visible wall gap",
+      reason: "The owner asked to repair a gap in the nearby wall.",
+      priority: 4,
+    });
+    const accepted = fixture.mind.commitGoalState({
+      expectedRevision: fixture.mind.snapshot().revision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "Keep the repair as an active owner goal.",
+      },
+    });
+    expect(accepted.accepted).toBe(true);
+    const ownerGoal = accepted.snapshot.goals.find(
+      (goal) => goal.ownerProposalId === proposal.id,
+    );
+    const observedAt = new Date().toISOString();
+    fixture.mind.recordOutcome({
+      evidence: {
+        operationId: "successful-look-step",
+        kind: "look",
+        status: "successful",
+        summary: outcomeSummary,
+        observedAt,
+        expectedOutcome,
+      },
+    });
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "successful-look-event",
+            kind: "body_outcome",
+            summary: outcomeSummary,
+            createdAt: observedAt,
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "place", position: alternateTarget },
+      });
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal?.id,
+          ownerProposalId: proposal.id,
+          status: "active",
+        }),
+      );
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const inputItems = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.input);
+      const userInput = z.record(z.string(), z.unknown()).parse(inputItems[0]);
+      const purposeInput = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(userInput.content)));
+      const runtime = z
+        .record(z.string(), z.unknown())
+        .parse(purposeInput.runtime);
+      expect(runtime.lastOutcome).toMatchObject({
+        kind: "look",
+        status: "successful",
+        expectedOutcome,
+        summary: outcomeSummary,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("returns a successful purpose commit on the sixth tool round", async () => {
     const responses = [
       ...Array.from({ length: 5 }, (_, index) =>

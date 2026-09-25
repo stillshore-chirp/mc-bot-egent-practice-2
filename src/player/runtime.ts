@@ -591,7 +591,7 @@ export class PlayerRuntime {
         ? run.controller.signal.aborted
           ? "操作を中断し、実行終了を確認"
           : "操作toolが結果を返さず、ゲーム内結果は未検証"
-        : groundedOperationSummary(result);
+        : `期待したstep=${sanitizeDetail(expectedOutcome)}。${groundedOperationSummary(result)}`;
     const observedAt = result?.completedAt ?? new Date().toISOString();
     if (result?.after != null)
       this.options.mind.recordObservation(toObservationEvidence(result.after));
@@ -639,6 +639,7 @@ export class PlayerRuntime {
         status: outcome,
         summary,
         observedAt,
+        expectedOutcome,
         ...(skillId === undefined ? {} : { skillId }),
         ...(skillVersion === undefined ? {} : { skillVersion }),
       },
@@ -910,6 +911,7 @@ export class PlayerRuntime {
   #recordRecoveryEvidence(input: {
     operationId: string;
     kind: string;
+    expectedOutcome?: string;
     skillId?: string;
     skillVersion?: number;
   }): void {
@@ -921,7 +923,7 @@ export class PlayerRuntime {
           operationName: input.kind,
           inputSummary: `operation=${input.kind}`,
           conditions: [],
-          expectedOutcome: "再起動後に操作結果を確認",
+          expectedOutcome: input.expectedOutcome ?? "再起動後に操作結果を確認",
           observedOutcome: "unverified",
           observationSummary: "再起動後に実行継続を確認できず、未検証",
           ...(input.skillId === undefined
