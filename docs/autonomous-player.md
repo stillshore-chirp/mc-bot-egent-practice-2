@@ -50,3 +50,5 @@ body eventを種類ごとにまとめ、意味のあるvitals、inventory、enti
 Markdown import/exportは専用の `mc-skills` exchange directoryを使います。importした本文は未信頼の知識で、system指示、認可、停止境界を変更しません。export結果はownerへローカルのファイル位置を返します。
 
 `collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。act judgmentの既存summaryには、toolが返した最大400文字の短い選択理由を保存し、次のpurpose inputにも渡します。reasonが空または旧形式のdecisionでは汎用summaryを維持します。この短いreasonは既存のMindStore judgment/snapshot内だけにあり、Responses activity projectionには別フィールドを加えません。Responsesの直近64 roundはrole、プロセス内の連番とround、token/latency、入力/schema/outputの文字数、allowlist済みtool名・固定結果分類とaction commitの固定拒否理由enumだけをMindStoreへ保存します。拒否理由は `CAS_STALE`、`STOPPED`、`NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` に限り、任意tool codeは記録しません。中断roundはモデルが要求したtool数と実際に結果を得たtoolだけを区別します。E2E failure artifactには同じsafe activity projectionを使います。内部推論本文、prompt、tool引数/出力、tool call ID等の生成識別子、owner位置の例外座標は保存・公開しません。
+
+`move_to`と`control`の前後Body観測が両方ある場合は、操作結果の短い要約に自己位置の相対変位を含め、次の目的判断へ渡します。観測が欠ける場合やdimensionが変わった場合は変位を推定しません。これは進路を見直す材料であり、対象物の発見やowner goalの達成を示す判定ではありません。

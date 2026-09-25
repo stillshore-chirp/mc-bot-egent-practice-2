@@ -975,7 +975,26 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
   const detail =
     result.detail === undefined ? "" : sanitizeDetail(result.detail);
   const observedEffect = result.observedEffect?.type;
-  return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}次の判断では結果の実観測を再確認する。`;
+  const movement = observedMovementSummary(result);
+  return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}${movement}次の判断では結果の実観測を再確認する。`;
+}
+
+function observedMovementSummary(result: PlayerOperationResult): string {
+  if (
+    result.operation.kind !== "move_to" &&
+    result.operation.kind !== "control"
+  )
+    return "";
+  const { before, after } = result;
+  if (before === null || after === null) return "";
+  if (before.dimension !== after.dimension) return "";
+  const beforePosition = before.self.position;
+  const afterPosition = after.self.position;
+  const dx = afterPosition.x - beforePosition.x;
+  const dy = afterPosition.y - beforePosition.y;
+  const dz = afterPosition.z - beforePosition.z;
+  if (![dx, dy, dz].every(Number.isFinite)) return "";
+  return `観測した移動差分=Δx:${dx.toFixed(1)},Δy:${dy.toFixed(1)},Δz:${dz.toFixed(1)},距離:${Math.hypot(dx, dy, dz).toFixed(1)}。`;
 }
 
 function sanitizeDetail(value: string): string {

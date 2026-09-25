@@ -622,6 +622,83 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("retains observed movement delta for the next purpose decision", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const before = observation();
+    body.setResultObservations(before, {
+      ...before,
+      observedAt: new Date().toISOString(),
+      self: {
+        ...before.self,
+        position: { x: 3.2, y: 64, z: -1.4, dimension: "overworld" },
+      },
+    });
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let followupSummary: string | undefined;
+    let thoughtCount = 0;
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot }) => {
+          thoughtCount += 1;
+          if (thoughtCount > 1) {
+            followupSummary = snapshot.lastOutcome?.summary;
+            return { accepted: true };
+          }
+          const decision: Extract<PlayerThoughtDecision, { kind: "act" }> = {
+            ...action("move-east"),
+            operation: {
+              kind: "move_to",
+              position: { x: 4, y: 64, z: 0 },
+              range: 1,
+            },
+            expectedOutcome: "move toward an unknown destination",
+          };
+          const saved = mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision,
+          });
+          if (saved.accepted)
+            runtimeRef.current?.handleCommittedDecision(
+              saved.snapshot,
+              decision,
+            );
+          return { accepted: saved.accepted, decision };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started[0] === "move_to");
+      body.completeActive("successful");
+      await waitFor(() => followupSummary !== undefined);
+      expect(followupSummary).toContain("Δx:3.2");
+      expect(followupSummary).toContain("Δz:-1.4");
+      expect(followupSummary).toContain("距離:3.5");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it.each(["successful", "failed"] as const)(
     "starts a fresh purpose thought after a %s body outcome and one completion",
     async (outcome) => {
@@ -1337,6 +1414,8 @@ class DeferredBody implements PlayerBody {
   #finishActive:
     ((status: PlayerOperationResult["status"]) => void) | undefined;
   #observation = observation();
+  #resultBefore: PlayerBodyObservation | null = null;
+  #resultAfter: PlayerBodyObservation | null = null;
   maxConcurrent = 0;
   stopCalls = 0;
 
@@ -1350,6 +1429,14 @@ class DeferredBody implements PlayerBody {
 
   public setObservation(value: PlayerBodyObservation): void {
     this.#observation = value;
+  }
+
+  public setResultObservations(
+    before: PlayerBodyObservation,
+    after: PlayerBodyObservation,
+  ): void {
+    this.#resultBefore = before;
+    this.#resultAfter = after;
   }
 
   public completeActive(status: PlayerOperationResult["status"]): void {
@@ -1386,8 +1473,8 @@ class DeferredBody implements PlayerBody {
           status,
           startedAt,
           completedAt: new Date().toISOString(),
-          before: null,
-          after: null,
+          before: this.#resultBefore,
+          after: this.#resultAfter,
           recoveryRequired,
         };
         if (this.#finishActive === finish) this.#finishActive = undefined;
