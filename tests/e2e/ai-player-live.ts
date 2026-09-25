@@ -43,6 +43,7 @@ import {
 import {
   blockIs,
   classifyRconReply,
+  classifyTickStatus,
   cloneBaseline,
   destinationRegion,
   establishBaseline,
@@ -300,6 +301,9 @@ interface UnknownCompositeDiagnostic {
   readonly unknownControlledObstaclePlayerInsideAtFailure?: boolean;
   readonly unknownControlledObstacleOtherEntitiesClear?: boolean;
   readonly unknownControlledObstacleRestored?: boolean;
+  readonly unknownObstacleTickFreezeConfirmed?: boolean;
+  readonly unknownObstacleTickUnfreezeConfirmed?: boolean;
+  readonly unknownObstacleOperationActiveBeforeUnfreeze?: boolean;
   readonly unknownHandoffMilestoneConfirmed?: boolean;
   readonly unknownHandoffStopRequested?: boolean;
   readonly unknownHandoffStopLatchConfirmed?: boolean;
@@ -3428,8 +3432,51 @@ async function main(): Promise<void> {
                       initialPosition,
                       obstaclePlan.sourceRegion,
                     ),
+                  unknownObstacleTickFreezeConfirmed: false,
+                  unknownObstacleTickUnfreezeConfirmed: false,
                 });
+                let obstacleTickFreezeAttempted = false;
+                let obstacleTickUnfreezeConfirmed = false;
+                let obstacleUnfrozenAt: number | undefined;
+                const unfreezeObstacleTicks = async (): Promise<void> => {
+                  if (
+                    !obstacleTickFreezeAttempted ||
+                    obstacleTickUnfreezeConfirmed
+                  )
+                    return;
+                  try {
+                    await rcon.command("tick unfreeze");
+                  } catch {
+                    // Read back the state even if the command reply was lost.
+                  }
+                  let tickStatus: string | undefined;
+                  try {
+                    tickStatus = await rcon.command("tick query");
+                  } catch {
+                    // The fixed failure below keeps this run incomplete.
+                  }
+                  if (
+                    tickStatus === undefined ||
+                    classifyTickStatus(tickStatus) !== "running"
+                  )
+                    incomplete("UNKNOWN_OBSTACLE_TICK_UNFREEZE_NOT_CONFIRMED");
+                  obstacleTickUnfreezeConfirmed = true;
+                  obstacleUnfrozenAt = Date.now();
+                  updateUnknownCompositeDiagnostic(state, {
+                    unknownObstacleTickUnfreezeConfirmed: true,
+                  });
+                };
                 try {
+                  obstacleTickFreezeAttempted = true;
+                  await rcon.command("tick freeze");
+                  if (
+                    classifyTickStatus(await rcon.command("tick query")) !==
+                    "frozen"
+                  )
+                    incomplete("UNKNOWN_OBSTACLE_TICK_FREEZE_NOT_CONFIRMED");
+                  updateUnknownCompositeDiagnostic(state, {
+                    unknownObstacleTickFreezeConfirmed: true,
+                  });
                   const obstacleResult = await withRestorableObstacle(
                     obstacleRcon,
                     obstaclePlan,
@@ -3484,6 +3531,20 @@ async function main(): Promise<void> {
                         );
                       },
                       observeWhileApplied: async () => {
+                        const activeBeforeUnfreeze = playerOf(
+                          await collect(context.runtime.app),
+                        ).activeOperation;
+                        const sameOperationBeforeUnfreeze =
+                          activeBeforeUnfreeze?.operationId === operationId &&
+                          typeof activeBeforeUnfreeze.bodyStartedAt ===
+                            "string";
+                        updateUnknownCompositeDiagnostic(state, {
+                          unknownObstacleOperationActiveBeforeUnfreeze:
+                            sameOperationBeforeUnfreeze,
+                        });
+                        await unfreezeObstacleTicks();
+                        if (!sameOperationBeforeUnfreeze)
+                          return { failedInPlace: false };
                         let lastSampleAt = 0;
                         const failurePlayer = await observeForPlayer(
                           context,
@@ -3497,7 +3558,11 @@ async function main(): Promise<void> {
                             return candidate.recentOutcomes.some(
                               (outcome) =>
                                 outcome.operationId === operationId &&
-                                outcome.status === "failed",
+                                outcome.status === "failed" &&
+                                obstacleUnfrozenAt !== undefined &&
+                                typeof outcome.observedAt === "string" &&
+                                Date.parse(outcome.observedAt) >=
+                                  obstacleUnfrozenAt,
                             );
                           },
                         );
@@ -3505,7 +3570,11 @@ async function main(): Promise<void> {
                           failurePlayer?.recentOutcomes.some(
                             (outcome) =>
                               outcome.operationId === operationId &&
-                              outcome.status === "failed",
+                              outcome.status === "failed" &&
+                              obstacleUnfrozenAt !== undefined &&
+                              typeof outcome.observedAt === "string" &&
+                              Date.parse(outcome.observedAt) >=
+                                obstacleUnfrozenAt,
                           ) === true;
                         if (!sameOperationFailed)
                           return { failedInPlace: false };
@@ -3578,6 +3647,8 @@ async function main(): Promise<void> {
                         : "incomplete_before_mutation",
                   });
                   throw error;
+                } finally {
+                  await unfreezeObstacleTicks();
                 }
                 currentPlayer = playerOf(await collect(context.runtime.app));
               } else {
@@ -5938,7 +6009,7 @@ function fixturePoint(
 }
 
 function unknownFixtureTarget(origin: Position): BlockPosition {
-  return fixturePoint(origin, 12, 0);
+  return fixturePoint(origin, 8, 0);
 }
 
 async function configureUnknownFixture(
@@ -5946,13 +6017,13 @@ async function configureUnknownFixture(
   origin: Position,
   botName: string,
 ): Promise<void> {
-  const wallX = Math.floor(origin.x) + 4;
+  const wallX = Math.floor(origin.x) + 2;
   const z = Math.floor(origin.z);
   const target = unknownFixtureTarget(origin);
   await rcon.command(`clear ${botName}`);
-  await rcon.command(`fill ${wallX} 64 ${z - 4} ${wallX} 67 ${z + 4} stone`);
+  await rcon.command(`fill ${wallX} 64 ${z - 3} ${wallX} 67 ${z + 3} stone`);
   await rcon.command(
-    `fill ${target.x - 5} 64 ${z - 2} ${target.x - 2} 64 ${z + 2} water`,
+    `fill ${target.x - 4} 64 ${z - 2} ${target.x - 2} 64 ${z + 2} water`,
   );
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
   await setAndVerifyGamerule(rcon, "advanceTime", true);
