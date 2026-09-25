@@ -1085,30 +1085,16 @@ function scriptedClient(responses: ScriptedResponse[]): PlayerResponsesClient {
 }
 
 function proposalResolutionResponse(request: unknown): Response {
-  const requestRecord = recordOf(request);
-  if (requestRecord === undefined)
-    throw new Error("purpose request is not an object");
-  const input = requestRecord.input;
-  if (!Array.isArray(input))
-    throw new Error("purpose input is not a message list");
-  const userMessage: unknown = input.find((item: unknown) => {
-    const message = recordOf(item);
-    return message?.role === "user" && typeof message.content === "string";
-  });
-  const userMessageRecord = recordOf(userMessage);
-  if (typeof userMessageRecord?.content !== "string")
-    throw new Error("purpose user message was not supplied");
-  const payload: unknown = JSON.parse(userMessageRecord.content);
-  const payloadRecord = recordOf(payload);
-  if (payloadRecord === undefined)
-    throw new Error("purpose user payload is invalid");
-  const proposals = payloadRecord.pendingProposals;
-  if (!Array.isArray(proposals) || proposals.length === 0)
-    throw new Error("pending owner proposal was not supplied");
-  const proposal: unknown = proposals[0];
+  const runtime = recordOf(requestUserPayload(request).runtime);
+  const proposals = runtime?.proposals;
+  if (!Array.isArray(proposals))
+    throw new Error("owner proposals were not supplied");
+  const proposal: unknown = proposals.find(
+    (candidate: unknown) => recordOf(candidate)?.status === "pending",
+  );
   const proposalId = recordOf(proposal)?.id;
   if (typeof proposalId !== "string")
-    throw new Error("pending owner proposal has no id");
+    throw new Error("pending owner proposal was not supplied");
   return functionCallResponse("resolution-1", "commit_goal_state", {
     proposalId,
     proposalDisposition: "adopted",
