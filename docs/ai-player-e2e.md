@@ -199,4 +199,6 @@ HEAD `469ddca` のrun78では通常の呼吸や入水を緊急な状態変化と
 
 HEAD `b5cd1ec` のrun79では移動中のstall判定を本人の有意な移動に限定し、同種の可視ブロックの変化を最短距離帯へ集約しました。Body smokeと自発生活がpassし、未知複合状況は32 calls・既知205,583 tokens、run全体は37 calls・既知228,186 tokensでcase上限となりました。usageは`partial_or_unknown`、cleanupは3/3です。safe activityの中断8件は`body_outcome`6件、`stop`1件、`owner_proposal`1件で、`state_changed`は0件でした。保存済み判断では`continue`2件、行動commit成功12件、複数の相対移動成功を確認しました。サーバー上では標的への距離短縮を一度確認しましたが、最大変位は2以上5未満の区分で、標的の破壊・取得・持帰りは未確認です。障害物注入は適格条件がなく未実施、失敗後の回復も未確認です。run78と行動経路が異なり、再判断回数やtoken数の差を実装修正の効果とは断定しません。
 
+HEAD `d46f9fd` のrun80は受け入れartifactを生成する前に経路探索中の未捕捉例外で終了したため、caseの成功・失敗として集計しません。`NavigationMovements`が未読み込みセルを名前のあるブロックと仮定し、ドア判定時に例外を起こす経路を特定しました。隔離runのserver processがないことと一時directoryに開いたfileがないことを確認し、このrunの一時worldだけを削除しました。HEAD `a0caf7d` で名前のないセルを通行不可のまま扱う修正と回帰テストを追加し、局所単体5件・server型検査・変更fileのlint・formatが成功しました。修正後の実ゲーム結果は未確認です。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
