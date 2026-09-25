@@ -141,7 +141,7 @@ const CASE_BUDGETS = {
     llmCalls: 2,
     totalTokens: 25_000,
   },
-  skill_exchange: { llmCalls: 20, totalTokens: 100_000 },
+  skill_exchange: { llmCalls: 20, totalTokens: 150_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
@@ -187,6 +187,13 @@ type LearningReuseStage =
   | "reuse_result_confirmed"
   | "revision_verified";
 type LearningFixturePhase = "initial" | "reuse";
+type SkillExchangeStage =
+  | "export_requested"
+  | "export_confirmed"
+  | "import_requested"
+  | "import_confirmed"
+  | "duplicate_requested"
+  | "duplicate_confirmed";
 type GameActionFixtureHoleReadback = "oak_planks" | "air" | "unknown";
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
@@ -1178,6 +1185,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
             state.learningFixtureDiagnostic.oakLogVisibleInFreshObservation,
         }
       : {}),
+    ...(caseId === "skill_exchange" && state.skillExchangeStage !== undefined
+      ? { skillExchangeStage: state.skillExchangeStage }
+      : {}),
   };
 }
 
@@ -1687,6 +1697,7 @@ interface RunState {
   learningReuseStage?: LearningReuseStage;
   learningReuseOwnerProposalRecorded?: boolean;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
+  skillExchangeStage?: SkillExchangeStage;
   gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
   unknownCompositeDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
@@ -2591,6 +2602,7 @@ async function main(): Promise<void> {
           context.owner,
           "直近で覚えた採集方法を、専用のMarkdown交換機能でファイルに書き出し、ファイル名を教えてください。",
         );
+        state.skillExchangeStage = "export_requested";
         const exportOwnerTurn = await observeForPlayer(
           context,
           20_000,
@@ -2665,6 +2677,7 @@ async function main(): Promise<void> {
         }
         if (exportedFile === undefined || exportedSkillId === undefined)
           fail("LEARNED_SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
+        state.skillExchangeStage = "export_confirmed";
         const filePath = resolve(state.exchangeDirectory, exportedFile);
         const exported = await readFile(filePath, "utf8");
         const editedName = `e2e-edited-${randomBytes(3).toString("hex")}.md`;
@@ -2687,6 +2700,7 @@ async function main(): Promise<void> {
           context.owner,
           `編集したSkillファイル「${editedName}」を専用の取り込み機能で読み込み、再利用する手順に反映してください。`,
         );
+        state.skillExchangeStage = "import_requested";
         const importOwnerTurn = await observeForPlayer(
           context,
           20_000,
@@ -2778,6 +2792,7 @@ async function main(): Promise<void> {
           importedSkillReceiptCount <= beforeSkillReceiptCount
         )
           incomplete("EXPORTED_SKILL_EDIT_NOT_CONFIRMED_FOR_SAME_ID");
+        state.skillExchangeStage = "import_confirmed";
         const receiptsBeforeDuplicate =
           afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
         const duplicateImportStart = playerOf(
@@ -2786,11 +2801,33 @@ async function main(): Promise<void> {
         const duplicateActivityKeys = new Set(
           duplicateImportStart.skillActivity.map(skillActivityKey),
         );
+        const duplicateProposalIds = new Set(
+          duplicateImportStart.proposals.map(({ id }) => id),
+        );
         const duplicateResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
           `同じ編集済みSkillファイル「${editedName}」をもう一度読み込み、重複処理が安全か確かめてください。`,
         );
+        state.skillExchangeStage = "duplicate_requested";
+        const duplicateOwnerTurn = await observeForPlayer(
+          context,
+          20_000,
+          (player) =>
+            player.proposals.some(({ id }) => !duplicateProposalIds.has(id)) ||
+            context.responseQueue.length > duplicateResponseStart,
+        );
+        if (duplicateOwnerTurn === undefined)
+          incomplete("SKILL_DUPLICATE_IMPORT_OWNER_TURN_UNOBSERVED");
+        const duplicateProposalReadback = playerOf(
+          await collect(context.runtime.app),
+        );
+        if (
+          !duplicateProposalReadback.proposals.some(
+            ({ id }) => !duplicateProposalIds.has(id),
+          )
+        )
+          incomplete("SKILL_DUPLICATE_IMPORT_OWNER_PROPOSAL_MISSING");
         await waitForPlayer(
           context,
           60_000,
@@ -2826,6 +2863,7 @@ async function main(): Promise<void> {
             afterImport.learnedBodiesBySkill.get(exportedSkillId)
         )
           fail("DUPLICATE_IMPORT_CHANGED_SKILL_REVISION");
+        state.skillExchangeStage = "duplicate_confirmed";
         return {
           markdownExportCreated: true,
           humanEditImported: true,

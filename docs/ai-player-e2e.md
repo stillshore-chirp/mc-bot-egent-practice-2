@@ -22,6 +22,8 @@
 
 再利用した採掘結果が出た直後、学習評価とDB改訂が非同期で続くことがあります。版とreceiptがその時点で見えない場合は最大30秒だけ観測を続け、対象Skillの新しい版とreceipt増加を両方確認します。Skill交換のexport/import依頼にも新しいowner proposalの短いreadbackを設け、会話側で目的提案に渡されない場合は固定codeで未完了にします。
 
+Skill交換caseが停止した時は、export依頼・export確認・import依頼・同一Skillのimport確認・重複import依頼・重複不変性確認の最後の段階を固定enumで保存します。重複import依頼もowner proposalのreadbackを要求します。run42でimport tool成功までに10万tokensを少し超えたため、同caseの上限を15万tokensに設定し、run全体の80万tokens上限は維持します。予算増加自体を成功根拠にはしません。
+
 `persistent_memory_restart` の失敗artifactは、記憶依頼へのconversation完了、`remember_owner_fact`の呼出しと固定結果分類、owner reply受信、DB保存のstageを示します。terminal conversationが保存toolを呼ばなければ`OWNER_FACT_TOOL_NOT_CALLED`、保存拒否なら`OWNER_FACT_SAVE_REJECTED`でcaseを未完了にし、その後の自律thoughtでcase予算を使い切る前に原因を分けます。再起動後のDB欠落と回答不一致は既存の固定failure codeで識別します。予算停止をpassへ変えず、DB保存・同一DB再起動・合成phrase回答の条件も変えません。事実本文、tool引数、会話本文はartifactへ出しません。
 
 ## Issue #72 の機械的な確認範囲
@@ -54,6 +56,8 @@ run38は最初のRotation読取で固定code `LEARNING_LOG_FIXTURE_ROTATION_READ
 run40（HEAD `7466742`）はCI 7/7成功、隔離PaperでBody、runtime、自律行動、観測境界、永続記憶の5 caseがpassしました。学習fixtureは再利用段階で8個の原木設置、更新後のBody観測と原木可視性を確認しましたが、再利用結果を確認する前に学習caseの30 calls上限を31 callsで超え、約25.0万トークンで未完了でした。run全体は42 calls・304,653 tokensでusageは`partial_or_unknown`です。後続caseは未実施、server・listener・一時worldのcleanupは3/3確認済みです。終了時snapshotではowner proposalは初回依頼の1件だけで、再利用依頼後の新規proposalを確認できませんでした。この事実から再利用依頼が目的提案として伝わらなかった可能性が高いものの、LLM内部の理由は未確認です。
 
 run41（HEAD `a18b351`）はCI 7/7成功、隔離PaperでBody、runtime、自律行動、観測境界、永続記憶、Skill本文・参照量の6 caseがpassしました。再利用依頼では新しいowner proposalを確認し、Skillを参照した採掘とRCON上の結果まで成立しました。採掘後約3秒のDB読取では版・receipt更新を確認できず、学習caseは17 calls・102,857 tokensで未完了です。その後のactivityに学習tool成功が現れましたが、対象Skillの版とreceiptはまだ照合できていません。Skill交換caseはexport活動を観測できないまま9 calls・102,205 tokensで10万tokens上限を超えました。終了時snapshotのproposalは学習用の2件で、Skill export依頼の新規提案は確認できません。run全体は41 calls・288,498 tokens、usage `partial_or_unknown`、cleanup 3/3です。後続のゲーム行動・未知状況・並行会話・統合caseは未実施です。
+
+run42（HEAD `d7b9c4a`）はCI 7/7成功、隔離Paperで学習再利用とSkill本文・参照量を含む7 caseがpassしました。Skill交換ではexport tool成功2回とimport tool成功1回を記録しましたが、caseは12 calls・104,973 tokensで10万tokens上限を超えました。tool成功だけでは編集済みMarkdownが同じSkill ID・版・receiptへ反映されたか、重複importが不変かを証明できません。run全体は38 calls・244,985 tokens、usage `partial_or_unknown`、cleanup 3/3です。ゲーム行動・未知状況・並行会話・統合caseは未実施です。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 
