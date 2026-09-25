@@ -5357,7 +5357,13 @@ async function recordCase(
     context: CaseContext,
   ) => Promise<Readonly<Record<string, boolean | number | string>>>,
 ): Promise<SafeCaseResult> {
-  if (state.targetCase !== undefined && id !== state.targetCase) {
+  const requiredAutonomousHandoff =
+    state.targetCase === "unknown_composite" && id === "autonomous_life";
+  if (
+    state.targetCase !== undefined &&
+    id !== state.targetCase &&
+    !requiredAutonomousHandoff
+  ) {
     const skipped: SafeCaseResult = {
       id,
       status: "incomplete",
