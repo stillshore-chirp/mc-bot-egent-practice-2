@@ -3913,14 +3913,13 @@ async function main(): Promise<void> {
         )
           incomplete("OWNER_PARALLEL_MOVE_ENDED_BEFORE_CHAT");
         const ownerReplyStart = context.responseQueue.length;
-        const ownerPreferenceSentAt = Date.now();
         sendChat(
           context.owner,
           "強くお願いします。レッドストーンは後回しにして、いったん私のところへ戻ってください。あなたの意見も伝え、今の目的と折り合いをつけてください。",
         );
         updateParallelDiagnostic(state, { parallelOwnerPreferenceSent: true });
         const changed = await waitForPlayer(context, 90_000, (player) =>
-          ownerPreferenceWasResolved(ownerMove, player, ownerPreferenceSentAt),
+          ownerPreferenceWasResolved(ownerMove, player),
         );
         const ownerOpinionReceived =
           changed.counters.llmCalls > ownerMove.counters.llmCalls ||
@@ -3928,7 +3927,6 @@ async function main(): Promise<void> {
         const ownerRequestChangedGoal = ownerPreferenceWasResolved(
           ownerMove,
           changed,
-          ownerPreferenceSentAt,
         );
         if (!ownerOpinionReceived || !ownerRequestChangedGoal)
           incomplete("OWNER_DIALOGUE_NOT_HANDLED_DURING_ACTION");
@@ -5869,23 +5867,15 @@ function proposalState(player: PlayerEvidence): string {
 function ownerPreferenceWasResolved(
   before: PlayerEvidence,
   after: PlayerEvidence,
-  sentAt: number,
 ): boolean {
-  const previousStatuses = new Map(
-    before.proposals.map((proposal) => [proposal.id, proposal.status]),
+  const previousProposalIds = new Set(
+    before.proposals.map((proposal) => proposal.id),
   );
-  const compromisedProposal = after.proposals.some(
+  return after.proposals.some(
     (proposal) =>
-      proposal.status === "compromised" &&
-      previousStatuses.get(proposal.id) !== "compromised",
+      !previousProposalIds.has(proposal.id) &&
+      (proposal.status === "adopted" || proposal.status === "compromised"),
   );
-  const compromisedJudgment = after.recentJudgments.some(
-    (judgment) =>
-      judgment.proposalDisposition === "compromised" &&
-      typeof judgment.decidedAt === "string" &&
-      Date.parse(judgment.decidedAt) >= sentAt,
-  );
-  return compromisedProposal || compromisedJudgment;
 }
 
 function safeObservationText(
