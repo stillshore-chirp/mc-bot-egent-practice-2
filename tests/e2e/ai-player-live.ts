@@ -43,13 +43,16 @@ import {
 import {
   blockIs,
   classifyRconReply,
+  cloneBaseline,
   destinationRegion,
   establishBaseline,
   forceLoadRegion,
   parseScore,
   regionsEqual,
+  withFrozenTicks,
   type OracleRcon,
 } from "./world-oracle.js";
+import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baseline.js";
 import {
   recoveryCagePlan,
   withRestorableObstacle,
@@ -1751,7 +1754,25 @@ async function main(): Promise<void> {
           context.ownerName,
           state.guestName,
         );
-        const fixtureRegion = await captureBlockBaseline(rcon, origin);
+        const fixtureRegion = regionAround(origin);
+        await captureReproducibleUnknownWorldBaseline({
+          forceLoadSource: () =>
+            forceLoadRegion(rcon, fixtureRegion, incomplete),
+          forceLoadDestination: () =>
+            forceLoadRegion(
+              rcon,
+              destinationRegion(fixtureRegion, REGION_BASELINE),
+              incomplete,
+            ),
+          withFrozenTicks: (operation) =>
+            withFrozenTicks(rcon, operation, incomplete),
+          waitForTickWindow: () => delay(500),
+          captureBaseline: () =>
+            cloneBaseline(rcon, fixtureRegion, REGION_BASELINE, incomplete),
+          compareBaseline: () =>
+            regionsEqual(rcon, fixtureRegion, REGION_BASELINE, incomplete),
+          fail: incomplete,
+        });
         const beforeWorld = await readWorldSnapshot(
           rcon,
           state.botName,

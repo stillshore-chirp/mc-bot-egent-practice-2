@@ -105,4 +105,6 @@ run15はHEAD `1d60721`で実施し、Body smokeと`runtime_contract`がpassし�
 
 handoffが明示resume確認前に失敗した場合は、runtimeを停止状態のまま保ち、後続caseのbodyを起動せず`UNKNOWN_HANDOFF_DEPENDENCY_FAILED`として未実行境界を記録します。
 
+unknown fixtureのbaseline準備では、sourceとclone先のchunkを先にforce-loadし、最大6回の500ms比較窓から連続2回一致する組を要求します。各窓はbaseline clone、tick進行、sourceとの比較で構成し、一致が得られた後にtick freezeをreadback確認してbaselineを再cloneし、もう一度比較します。未一致・freeze/unfreeze未確認はいずれも未完了として残り、依存blockを解除しません。独立GPT0 probe2ではfreeze/query、clone比較、unfreeze/queryの往復を確認しましたが、統合harnessの実機実行は未実施です。連続一致は有限窓での比較再現性を示すだけで、sourceとclone先が同時に自然更新する可能性や、その後の水流変化を排除しません。既存region差分の進捗診断に自然な水変化が含まれる余地があり、target cleared・item returned・spawn returnの条件は引き続き別に確認します。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`と後続caseは未完了で、自律生活のpassはrun10・14、予算未完了はrun11・13・15と差があります。case遷移の新しい停止・再起動境界も実ゲームでは未検証です。
