@@ -230,8 +230,15 @@ describe("on-demand player operation schemas", () => {
       expect(instructions).toContain(playerOperationCatalog);
       expect(instructions).toContain("describe_operation({kind})");
       expect(instructions).toContain(
-        "提示済みの現行schemaは再利用してください。schemaが未提示、または引数が不明な操作はdescribe_operation({kind})で確認し、引数を省略せず",
+        "入力署名がある操作は、そのkindと署名に示す引数をoperationJsonへ入れられます。",
       );
+      expect(playerOperationCatalog).toContain(
+        '入力: {kind:"move_to",position:{x:number,y:number,z:number},range:number[0.25..8]}',
+      );
+      expect(playerOperationCatalog).toContain(
+        '入力: {kind:"move_relative",offset:{x:number[-32..32],y:number[-32..32],z:number[-32..32]},range:number[0.25..8]}',
+      );
+      expect(playerOperationCatalog.match(/入力:/gu)).toHaveLength(4);
       expect(instructions.length).toBeLessThan(
         instructions.replace(playerOperationCatalog, fullSchemaText).length,
       );

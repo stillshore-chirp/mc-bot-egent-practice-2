@@ -60,12 +60,24 @@ const ownerFactInput = z
   .strict();
 const emptyInput = z.object({}).strict();
 
-/** Compact operation index shown every round; full parameter schemas are fetched on demand. */
+const operationSchemaByName = indexPlayerOperationSchemas();
+const conciseArgumentHintKinds = new Set<string>([
+  "look",
+  "move_to",
+  "move_relative",
+  "dig",
+]);
+/** Compact operation index shown every round; complex schemas remain on demand. */
 export const playerOperationCatalog = playerOperationNames
-  .map((name) => `${name}: ${playerOperationDescriptions[name]}`)
+  .map(
+    (name) =>
+      `${name}: ${playerOperationDescriptions[name]}` +
+      (conciseArgumentHintKinds.has(name)
+        ? ` 入力: ${conciseOperationArguments(name)}`
+        : ""),
+  )
   .join("\n");
 
-const operationSchemaByName = indexPlayerOperationSchemas();
 const cachedOperationSchemaLimit = 4;
 const cachedOperationSchemaCharsLimit = 4_096;
 const maxRelatedLearningHypotheses = 6;
@@ -86,6 +98,40 @@ function canonicalOperationDescription(
     description: playerOperationDescriptions[kind],
     schema: structuredClone(schema),
   };
+}
+
+function conciseOperationArguments(
+  kind: (typeof playerOperationNames)[number],
+): string {
+  const schema = canonicalOperationDescription(kind).schema;
+  const properties = asRecord(schema.properties);
+  const required = schema.required;
+  if (properties === undefined || !Array.isArray(required))
+    throw new Error("PLAYER_OPERATION_ARGUMENT_HINT_UNAVAILABLE");
+  const render = (name: string, value: unknown): string => {
+    const property = asRecord(value);
+    if (property?.type === "object") {
+      const children = asRecord(property.properties);
+      const childRequired = property.required;
+      if (children === undefined || !Array.isArray(childRequired))
+        throw new Error("PLAYER_OPERATION_ARGUMENT_HINT_UNAVAILABLE");
+      return `${name}:{${childRequired
+        .map((child) => render(String(child), children[String(child)]))
+        .join(",")}}`;
+    }
+    if (property?.type !== "number")
+      throw new Error("PLAYER_OPERATION_ARGUMENT_HINT_UNAVAILABLE");
+    const limits =
+      typeof property.minimum === "number" &&
+      typeof property.maximum === "number"
+        ? `[${property.minimum}..${property.maximum}]`
+        : "";
+    return `${name}:number${limits}`;
+  };
+  return `{kind:"${kind}",${required
+    .filter((name) => name !== "kind")
+    .map((name) => render(String(name), properties[String(name)]))
+    .join(",")}}`;
 }
 
 /** Read-only discovery tool used by the purpose agent before it commits an operation. */
@@ -1189,7 +1235,7 @@ export class PlayerPurposeAgent {
       "待機する場合は必ず短い理由と具体的なwake eventを指定し、必要な時だけdeadlineを設定してください。変化のないtickや同じ観測ごとに考え直さず、完了・失敗・stall・meaningful delta・提案・deadlineで起動します。",
       "利用可能な操作kindと短い説明:\n" +
         playerOperationCatalog +
-        "\n提示済みの現行schemaは再利用してください。schemaが未提示、または引数が不明な操作はdescribe_operation({kind})で確認し、引数を省略せずcommit_action_decision.operationJsonへ入れてください。",
+        "\n入力署名がある操作は、そのkindと署名に示す引数をoperationJsonへ入れられます。提示済みの現行schemaは再利用してください。署名もschemaも未提示、または引数が不明な操作はdescribe_operation({kind})で確認し、引数を省略せずcommit_action_decision.operationJsonへ入れてください。",
       this.#renderDescribedOperationSchemas(),
       "goal、pending owner proposalの解決、観測factとinference由来のuncertaintyがあればstateUpdatesへ含め、commit_action_decisionで行動判断と同じCASにより確定してください。更新がなければstateUpdatesをnullにし、片方だけの更新ならgoalStateかunderstandingの不要側をnullにします。proposalは必ず採用・妥協・辞退のいずれかを理由付きで解決してください。判断途中で確定が必要な場合はcommit_goal_stateとupdate_understandingも使えます。factとuncertaintyを混ぜず、推測をfactとして記録しないでください。",
       "技能は再利用候補の仮説で、成功の記録を並べる日誌ではありません。各trusted operation receiptの結果を確認し、未登録で他の場面にも使える方法を得た成功なら、一度の成功だけで十分なのでpropose_skill_learning(mode=create)ですぐ仮説Skillを作成し、同じ仕事を無検討に続ける前に保存してください。真に一度限りの操作、他の場面へ移せない結果、同等の既存Skillがある場合は作成せず、重複や日誌的Skillを避けてください。作成した仮説Skillを後の操作で実際に使ったら、そのskillId/versionに一致する次のtrusted receiptから成功・失敗を反映してpropose_skill_learning(mode=revise)で改訂してください。改訂はreceiptが使用skillと版に一致する場合だけ行います。receipt作成toolは存在せず、未観測の結果や成功判定を捏造できません。",
