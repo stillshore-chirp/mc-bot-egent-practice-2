@@ -22,6 +22,7 @@ import { PlayerMindStore } from "../player/mind-store.js";
 import { toObservationEvidence } from "../player/observation-evidence.js";
 import type { PlayerResponsesClient } from "../player/responses.js";
 import { PlayerRuntime } from "../player/runtime.js";
+import { toSpatialView } from "../player/spatial-view.js";
 import { TraceService } from "../trace/service.js";
 import { TraceStore } from "../trace/store.js";
 import type { CompanionApplication, LiveEvidence } from "./application.js";
@@ -417,8 +418,18 @@ export function createPlayerApplication(
         ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
-    onObservation: (observation) =>
-      mind.recordObservation(toObservationEvidence(observation)),
+    onObservation: (observation) => {
+      mind.recordObservation(toObservationEvidence(observation));
+      try {
+        const spatialView = toSpatialView(observation);
+        if (spatialView !== undefined) mind.recordSpatialView(spatialView);
+      } catch {
+        logger.warn(
+          { category: "player_memory", code: "SPATIAL_VIEW_PERSIST_FAILED" },
+          "spatial view persistence failed after observation",
+        );
+      }
+    },
     onCommitted: (snapshot, decision) =>
       runtimeRef.current?.handleCommittedDecision(snapshot, decision),
   });

@@ -41,6 +41,7 @@ import {
   type PlayerAgentRoundActivity,
   type PlayerResponsesClient,
 } from "./responses.js";
+import { cardinalFacingFromYaw } from "./spatial-view.js";
 
 const proposalInput = z
   .object({
@@ -1243,6 +1244,7 @@ export class PlayerPurposeAgent {
       "activeな目的の対象がまだ見えない時は、視線を変える、見通せる場所へ移動するなど、自分で情報を増やせる操作を検討してください。対象が未確認という理由だけで利用者の追加指示を待ち続けず、waitは時間や外部イベントで状況が変わる見込みがある時に選んでください。",
       "runtime.recentMovementは保持されたBody結果の正味変位で、対象との距離や経路の成否ではありません。迂回で一時的に遠ざかる場合も、通過する目印と元の目的方向へ戻る契機を判断してください。",
       "観測のcoordinateAxesはMinecraft座標の東西南北、self.facingCardinalは可視判定と同じyawから導いた現在の向きです。可視blockのpositionは絶対座標で、まだ見えていない対象の位置を補う情報ではありません。",
+      "spatialHistoryは以前の視点で実際に見えた同名ブロックの最小・最大座標です。間に連続した壁があるとは限らず、今も同じ状態とは限りません。見えなかった場所を通路や障害物と断定せず、迂回後は過去の視点と現在位置を比べて目的方向への進路を見直してください。",
       "body操作がfailed、unverified、interrupted、cancelledになったら、結果詳細と最新の可視観測を照合し、目的が残っているか判断してください。目的が残るなら失敗原因に応じて空き位置・材料・経路などを変えた実行可能な案を選び、根拠なく同じ引数を繰り返さないでください。owner goalはゲーム内の達成結果を観測で確認してからcompletedにし、続行できない場合は未達のままactive/pausedに保つか、妥協・辞退を選んでください。",
       "各操作のexpectedOutcomeは目的達成へ向けたstepで確認したい結果です。successfulは操作単体の効果確認であり、owner goalの達成確認ではありません。body_outcome後はexpectedOutcomeと最新の観測を照合し、lookなど視点・情報取得だけで目的が進んでいなければ、目的につながる実行可能な次stepを選んでください。",
       "危険や建築は固定禁止ではありません。目的、周囲、影響、可逆性、別案の釣り合いを考えて規模・手順を調整してください。危険を見つけても自動退避ルールはありません。停止指示、実server permission、外部アクセス/credential境界だけが固定です。",
@@ -1271,6 +1273,14 @@ export class PlayerPurposeAgent {
       runtime: compactSnapshot(input.snapshot),
       memory: compactMemory(memoryContext),
       observation: decisionObservation,
+      spatialHistory: this.options.mind
+        .recentSpatialViews()
+        .filter(
+          ({ observedAt, dimension }) =>
+            bodyObservation === undefined ||
+            (observedAt !== bodyObservation.observedAt &&
+              dimension === bodyObservation.dimension),
+        ),
     });
     try {
       await runPlayerAgent({
@@ -1625,7 +1635,7 @@ export function compactDecisionObservation(
     },
     self: {
       ...observation.self,
-      facingCardinal: facingCardinalFromYaw(observation.self.yaw),
+      facingCardinal: cardinalFacingFromYaw(observation.self.yaw),
     },
     perception: {
       ...observation.perception,
@@ -1640,21 +1650,6 @@ export function compactDecisionObservation(
       ),
     },
   };
-}
-
-function facingCardinalFromYaw(
-  yaw: number,
-): "east" | "west" | "south" | "north" | "unknown" {
-  if (!Number.isFinite(yaw)) return "unknown";
-  const x = -Math.sin(yaw);
-  const z = -Math.cos(yaw);
-  return Math.abs(x) >= Math.abs(z)
-    ? x >= 0
-      ? "east"
-      : "west"
-    : z >= 0
-      ? "south"
-      : "north";
 }
 
 function ownerProposalIdOf(goal: PlayerGoal): string | undefined {

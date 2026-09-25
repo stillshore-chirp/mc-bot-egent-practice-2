@@ -30,6 +30,7 @@ import {
   playerThoughtStaleChangeComponents,
   type PlayerThoughtCommitRejectionCode,
 } from "./contracts.js";
+import { spatialViewSchema, type PlayerSpatialView } from "./spatial-view.js";
 
 const wakeKinds = [
   "startup",
@@ -429,6 +430,10 @@ export class PlayerMindStore {
         );
         CREATE INDEX IF NOT EXISTS player_runtime_events_pending_idx
           ON player_runtime_events(consumed_at, created_at);
+        CREATE TABLE IF NOT EXISTS player_spatial_views (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          payload_json TEXT NOT NULL
+        );
       `);
       database
         .prepare(
@@ -1371,6 +1376,53 @@ export class PlayerMindStore {
       return this.snapshot();
     });
     return transaction.immediate();
+  }
+
+  public recordSpatialView(view: PlayerSpatialView): void {
+    const validated = spatialViewSchema.parse(view);
+    const transaction = this.database.transaction(() => {
+      const latest = this.database
+        .prepare<[], { id: number; payload_json: string }>(
+          "SELECT id, payload_json FROM player_spatial_views ORDER BY id DESC LIMIT 1",
+        )
+        .get();
+      if (latest !== undefined) {
+        const previous = spatialViewSchema.parse(
+          JSON.parse(latest.payload_json),
+        );
+        const { observedAt: _previousAt, ...previousScene } = previous;
+        const { observedAt: _currentAt, ...currentScene } = validated;
+        if (JSON.stringify(previousScene) === JSON.stringify(currentScene)) {
+          this.database
+            .prepare(
+              "UPDATE player_spatial_views SET payload_json = ? WHERE id = ?",
+            )
+            .run(JSON.stringify(validated), latest.id);
+          return;
+        }
+      }
+      this.database
+        .prepare("INSERT INTO player_spatial_views(payload_json) VALUES(?)")
+        .run(JSON.stringify(validated));
+      this.database.exec(`
+        DELETE FROM player_spatial_views WHERE id IN (
+          SELECT id FROM player_spatial_views ORDER BY id DESC LIMIT -1 OFFSET 7
+        )
+      `);
+    });
+    transaction.immediate();
+  }
+
+  public recentSpatialViews(): readonly PlayerSpatialView[] {
+    return this.database
+      .prepare<[], { payload_json: string }>(
+        "SELECT payload_json FROM player_spatial_views ORDER BY id DESC LIMIT 7",
+      )
+      .all()
+      .reverse()
+      .map(({ payload_json }) =>
+        spatialViewSchema.parse(JSON.parse(payload_json)),
+      );
   }
 
   public recordCall(metrics: {

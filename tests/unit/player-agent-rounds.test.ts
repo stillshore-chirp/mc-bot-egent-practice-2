@@ -26,6 +26,7 @@ import {
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import type { PlayerResponsesClient } from "../../src/player/responses.js";
+import { toSpatialView } from "../../src/player/spatial-view.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -208,6 +209,68 @@ describe("player agent response rounds", () => {
         sampleCount: 1,
         netApproxBlocks: { x: -0.1, y: 0, z: 4.1 },
       });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("shows prior visible positions without duplicating the current view", async () => {
+    const current = bodyObservationFixture();
+    const prior: PlayerBodyObservation = {
+      ...current,
+      observedAt: "2026-09-24T23:59:00.000Z",
+      self: {
+        ...current.self,
+        position: { ...current.self.position, x: 3 },
+      },
+      perception: {
+        ...current.perception,
+        blocks: [
+          {
+            name: "stone",
+            stateId: 1,
+            position: { x: 5, y: 64, z: 2, dimension: "overworld" },
+            distance: 2,
+            properties: {},
+          },
+        ],
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "act-after-history",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => current,
+    );
+    try {
+      const priorView = toSpatialView(prior);
+      const currentView = toSpatialView(current);
+      if (priorView === undefined || currentView === undefined)
+        throw new Error("spatial test view missing");
+      fixture.mind.recordSpatialView(priorView);
+      fixture.mind.recordSpatialView(currentView);
+
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(true);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const inputItem = z
+        .record(z.string(), z.unknown())
+        .parse(z.array(z.unknown()).parse(request.input)[0]);
+      const input = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(inputItem.content)));
+      expect(input.spatialHistory).toEqual([priorView]);
     } finally {
       fixture.close();
     }
