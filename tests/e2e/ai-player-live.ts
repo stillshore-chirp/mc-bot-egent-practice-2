@@ -1160,6 +1160,13 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
       ? { learningReuseStage: state.learningReuseStage }
       : {}),
     ...(caseId === "learning_reuse" &&
+    state.learningReuseOwnerProposalRecorded !== undefined
+      ? {
+          learningReuseOwnerProposalRecorded:
+            state.learningReuseOwnerProposalRecorded,
+        }
+      : {}),
+    ...(caseId === "learning_reuse" &&
     state.learningFixtureDiagnostic !== undefined
       ? {
           learningFixturePhase: state.learningFixtureDiagnostic.phase,
@@ -1678,6 +1685,7 @@ interface RunState {
   lastKnownPlayerDiagnostic?: SafeEvidence;
   autonomousLifeProgress?: SafeAutonomousProgress;
   learningReuseStage?: LearningReuseStage;
+  learningReuseOwnerProposalRecorded?: boolean;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
   gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
   unknownCompositeDiagnostic?: SafeEvidence;
@@ -2394,11 +2402,34 @@ async function main(): Promise<void> {
         const existingActivityKeys = new Set(
           reuseStart.skillActivity.map(skillActivityKey),
         );
+        const existingProposalIds = new Set(
+          reuseStart.proposals.map(({ id }) => id),
+        );
         const consultedLearnedSkillIds = new Set<string>();
+        const reuseResponseStart = context.responseQueue.length;
+        state.learningReuseOwnerProposalRecorded = false;
         sendChat(
           context.owner,
           "近くにオークの原木を1本用意しました。前回の方法が今も役立つと判断したら自分で選んで活用し、採掘して結果を確かめてください。",
         );
+        const reuseOwnerTurn = await observeForPlayer(
+          context,
+          20_000,
+          (player) =>
+            player.proposals.some(({ id }) => !existingProposalIds.has(id)) ||
+            context.responseQueue.length > reuseResponseStart,
+        );
+        if (reuseOwnerTurn === undefined)
+          incomplete("LEARNING_REUSE_OWNER_TURN_UNOBSERVED");
+        const reuseProposalReadback = playerOf(
+          await collect(context.runtime.app),
+        );
+        state.learningReuseOwnerProposalRecorded =
+          reuseProposalReadback.proposals.some(
+            ({ id }) => !existingProposalIds.has(id),
+          );
+        if (!state.learningReuseOwnerProposalRecorded)
+          incomplete("LEARNING_REUSE_OWNER_PROPOSAL_MISSING");
         let reuseFixtureCheckAt = 0;
         let reuseFixtureLogRemoved = false;
         const reused = await waitForPlayer(context, 150_000, async (player) => {

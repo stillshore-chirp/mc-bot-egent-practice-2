@@ -18,6 +18,8 @@
 
 `game_action_discretion` がLLM予算超過でfixture判定中に停止した場合は、cleanup前に対象穴をbounded RCONで読み、artifactへ`oak_planks`、`air`、`unknown`の固定enumを記録します。`learning_reuse` のfixture可視失敗では、initial/reuse段階、RCONで確認した配置数、新しいBody観測を得たか、その観測で`oak_log`が一度でも見えたかを記録します。これらは原因切り分け用で、座標・本文・ID・生RCON返信は含まず、合格条件を変更しません。
 
+再利用依頼後は、新しいowner proposalが記録されたことを短い待機窓で確かめます。owner返信後もproposalが増えない場合は固定code `LEARNING_REUSE_OWNER_PROPOSAL_MISSING` で未完了にし、学習結果が出るまで漫然とLLM予算を使い続けません。合格には従来どおりSkill参照、採掘のゲーム内結果、版とreceiptの更新を要求します。
+
 `persistent_memory_restart` の失敗artifactは、記憶依頼へのconversation完了、`remember_owner_fact`の呼出しと固定結果分類、owner reply受信、DB保存のstageを示します。terminal conversationが保存toolを呼ばなければ`OWNER_FACT_TOOL_NOT_CALLED`、保存拒否なら`OWNER_FACT_SAVE_REJECTED`でcaseを未完了にし、その後の自律thoughtでcase予算を使い切る前に原因を分けます。再起動後のDB欠落と回答不一致は既存の固定failure codeで識別します。予算停止をpassへ変えず、DB保存・同一DB再起動・合成phrase回答の条件も変えません。事実本文、tool引数、会話本文はartifactへ出しません。
 
 ## Issue #72 の機械的な確認範囲
@@ -46,6 +48,8 @@ run38は最初のRotation読取で固定code `LEARNING_LOG_FIXTURE_ROTATION_READ
 `learning_reuse` 開始後に未完了停止したartifactには、最後に確認した段階を固定enumの `learningReuseStage` として記録します（初回fixture可視、初回dig確認、仮説作成、再利用fixture可視、再利用結果確認、版・receipt更新確認）。この値は進捗の診断だけを示し、既存のBody・DB・RCON条件を満たしたpass判定は変えません。Skill本文・IDや会話内容は含めません。
 
 隔離実行で初回の成功と仮説作成を確認し、再利用用fixtureの可視確認までに学習caseが約16万トークンを使用したため、このcaseの上限を30 calls / 30万トークンにしています。run全体の80万トークン上限と、ゲーム内結果・Skill版・receiptのpass条件は維持します。
+
+run40（HEAD `7466742`）はCI 7/7成功、隔離PaperでBody、runtime、自律行動、観測境界、永続記憶の5 caseがpassしました。学習fixtureは再利用段階で8個の原木設置、更新後のBody観測と原木可視性を確認しましたが、再利用結果を確認する前に学習caseの30 calls上限を31 callsで超え、約25.0万トークンで未完了でした。run全体は42 calls・304,653 tokensでusageは`partial_or_unknown`です。後続caseは未実施、server・listener・一時worldのcleanupは3/3確認済みです。終了時snapshotではowner proposalは初回依頼の1件だけで、再利用依頼後の新規proposalを確認できませんでした。この事実から再利用依頼が目的提案として伝わらなかった可能性が高いものの、LLM内部の理由は未確認です。
 
 `unknown_composite` の固定診断には失敗・回復操作のkindと、課題送信後に初めて得た可視観測で青い羊毛・水・壁材(stone)が現れたかを含めます。この観測は課題送信時点の視界を示すとは限らず、可視観測が得られない場合はvisibilityを`unknown`として保持します。現在の保存用観測はブロック名のみで一般ブロックの位置を持たないため、stoneの有無は壁そのものの視認証明ではなく、壁材名の検出です。これらの診断は既存の達成・回復判定を変更しません。
 
