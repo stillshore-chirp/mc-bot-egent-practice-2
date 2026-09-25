@@ -265,6 +265,30 @@ describe("player agent response rounds", () => {
     );
   });
 
+  it.each([
+    [0, "north"],
+    [-Math.PI / 2, "east"],
+    [Math.PI, "south"],
+    [Math.PI / 2, "west"],
+  ] as const)("adds the observed cardinal facing for yaw %s", (yaw, facing) => {
+    const base = bodyObservationFixture();
+    const compacted = z.record(z.string(), z.unknown()).parse(
+      compactDecisionObservation({
+        ...base,
+        self: { ...base.self, yaw },
+      }),
+    );
+    expect(compacted.coordinateAxes).toEqual({
+      east: "+x",
+      west: "-x",
+      south: "+z",
+      north: "-z",
+    });
+    expect(
+      z.record(z.string(), z.unknown()).parse(compacted.self),
+    ).toMatchObject({ facingCardinal: facing, yaw });
+  });
+
   it("retains observe_body as recovery when the initial observation is unavailable", async () => {
     const observation = bodyObservationFixture();
     let observationAttempts = 0;
