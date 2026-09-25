@@ -257,6 +257,9 @@ interface UnknownCompositeDiagnostic {
   readonly unknownOracleChecked?: boolean;
   readonly unknownOracleReadCount?: number;
   readonly unknownTargetCleared?: boolean;
+  readonly unknownNearTargetServerSampleSeen?: boolean;
+  readonly unknownNearTargetFreshBodyObservationSeen?: boolean;
+  readonly unknownNearTargetVisibleInBodyObservation?: boolean;
   readonly unknownItemReturned?: boolean;
   readonly unknownReturnedToSpawn?: boolean;
   readonly unknownServerProgressObserved?: boolean;
@@ -3320,6 +3323,12 @@ async function main(): Promise<void> {
             );
             const dayTime = await readSafeDayTime(rcon);
             const sampledAt = Date.now();
+            const nearTarget =
+              Math.hypot(
+                position.x - target.x,
+                position.y - target.y,
+                position.z - target.z,
+              ) < 2;
             const itemReturned = /minecraft:blue_wool/iu.test(inventory);
             const returnedToSpawn =
               Math.hypot(
@@ -3334,12 +3343,42 @@ async function main(): Promise<void> {
               unknownOracleReadStatus: "available",
               unknownOracleReadCount: currentCount + 1,
               unknownTargetCleared: targetCleared,
+              unknownNearTargetServerSampleSeen:
+                state.unknownCompositeDiagnostic
+                  ?.unknownNearTargetServerSampleSeen === true ||
+                (unknownTaskSentAt.value !== undefined && nearTarget),
               unknownItemReturned: itemReturned,
               unknownReturnedToSpawn: returnedToSpawn,
               unknownServerProgressObserved:
                 observedWorldProgress(beforeWorld, currentWorld) !== undefined,
               ...(dayTime === undefined ? {} : { unknownDayTime: dayTime }),
             });
+            if (unknownTaskSentAt.value !== undefined && nearTarget) {
+              try {
+                const observation = playerOf(
+                  await collect(context.runtime.app),
+                ).lastObservation;
+                const observationAt = Date.parse(observation?.observedAt ?? "");
+                const fresh =
+                  Number.isFinite(observationAt) &&
+                  observationAt >= unknownTaskSentAt.value &&
+                  sampledAt - observationAt <= 2_000;
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownNearTargetFreshBodyObservationSeen:
+                    state.unknownCompositeDiagnostic
+                      ?.unknownNearTargetFreshBodyObservationSeen === true ||
+                    fresh,
+                  unknownNearTargetVisibleInBodyObservation:
+                    state.unknownCompositeDiagnostic
+                      ?.unknownNearTargetVisibleInBodyObservation === true ||
+                    (fresh &&
+                      observation?.visibleBlockNames?.includes("blue_wool") ===
+                        true),
+                });
+              } catch {
+                // A player snapshot failure does not erase the RCON oracle.
+              }
+            }
             if (
               unknownTaskSentAt.value !== undefined &&
               Number.isFinite(unknownTaskSentAt.value) &&
