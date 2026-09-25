@@ -128,7 +128,7 @@ const RUN_BUDGET_LIMITS = {
   llmCalls: 160,
   totalTokens: 800_000,
 } as const;
-const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 500;
+const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 2_000;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
