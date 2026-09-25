@@ -67,6 +67,7 @@ import {
 import { classifyObservationReply } from "./observation-reply-classifier.js";
 import {
   classifyUnknownTaskVisibility,
+  isSameStartedTravelOperation,
   isFacingUnknownFixture,
   parseEntityRotation,
   safeUnknownOperationKind,
@@ -3428,7 +3429,8 @@ async function main(): Promise<void> {
             if (
               !controlledObstacleAttempted &&
               !naturalFailureAlreadySeen &&
-              activeOperation?.kind === "move_to" &&
+              (activeOperation?.kind === "move_to" ||
+                activeOperation?.kind === "move_relative") &&
               typeof activeOperation.bodyStartedAt === "string" &&
               activeOperation.operationId.length > 0
             ) {
@@ -3514,9 +3516,7 @@ async function main(): Promise<void> {
                         );
                         const active = freshPlayer.activeOperation;
                         const sameStartedOperation =
-                          active?.kind === "move_to" &&
-                          active.operationId === operationId &&
-                          typeof active.bodyStartedAt === "string";
+                          isSameStartedTravelOperation(active, operationId);
                         const position = parsePosition(
                           await obstacleRcon.command(
                             `data get entity ${state.botName} Pos`,
@@ -3547,7 +3547,11 @@ async function main(): Promise<void> {
                           unknownControlledObstacleOtherEntitiesClear:
                             otherEntitiesClear,
                         });
-                        return standingSpaceConfirmed && otherEntitiesClear;
+                        return (
+                          sameStartedOperation &&
+                          standingSpaceConfirmed &&
+                          otherEntitiesClear
+                        );
                       },
                       observeWhileApplied: async () => {
                         const playerBeforeUnfreeze = playerOf(

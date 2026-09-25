@@ -3,11 +3,41 @@ import { describe, expect, it } from "vitest";
 import {
   classifyUnknownTaskVisibility,
   isFacingUnknownFixture,
+  isSameStartedTravelOperation,
   parseEntityRotation,
   safeUnknownOperationKind,
 } from "../e2e/unknown-composite-diagnostic.js";
 
 describe("unknown composite operation-kind evidence", () => {
+  it("injects an obstacle only for the same running movement operation", () => {
+    for (const kind of ["move_to", "move_relative"]) {
+      const active = {
+        kind,
+        operationId: "movement-1",
+        bodyStartedAt: "2026-01-01T00:00:00.000Z",
+      };
+      expect(isSameStartedTravelOperation(active, "movement-1")).toBe(true);
+      expect(isSameStartedTravelOperation(active, "movement-2")).toBe(false);
+      expect(
+        isSameStartedTravelOperation(
+          { kind, operationId: "movement-1" },
+          "movement-1",
+        ),
+      ).toBe(false);
+    }
+    expect(
+      isSameStartedTravelOperation(
+        {
+          kind: "dig",
+          operationId: "movement-1",
+          bodyStartedAt: "2026-01-01T00:00:00.000Z",
+        },
+        "movement-1",
+      ),
+    ).toBe(false);
+    expect(isSameStartedTravelOperation(undefined, "movement-1")).toBe(false);
+  });
+
   it("retains only a known player operation name", () => {
     expect(safeUnknownOperationKind("move_to")).toBe("move_to");
   });

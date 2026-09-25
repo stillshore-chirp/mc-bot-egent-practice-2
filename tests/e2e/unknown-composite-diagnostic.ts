@@ -33,6 +33,24 @@ export function safeUnknownOperationKind(
     : "unknown";
 }
 
+/** Keep the controlled obstacle tied to the movement that made it eligible. */
+export function isSameStartedTravelOperation(
+  active:
+    | {
+        readonly kind: string;
+        readonly operationId: string;
+        readonly bodyStartedAt?: string;
+      }
+    | undefined,
+  operationId: string,
+): boolean {
+  return (
+    (active?.kind === "move_to" || active?.kind === "move_relative") &&
+    active.operationId === operationId &&
+    typeof active.bodyStartedAt === "string"
+  );
+}
+
 export function unknownHandoffCaseBlockCode(
   caseId: string,
   state: UnknownHandoffDependencyState,
