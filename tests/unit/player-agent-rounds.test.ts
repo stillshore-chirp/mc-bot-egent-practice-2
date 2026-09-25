@@ -573,6 +573,12 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "successfulは操作単体の効果確認であり、owner goalの達成確認ではありません。",
+      );
+      expect(request.instructions).toContain(
+        "expectedOutcomeと最新の観測を照合",
+      );
       const inputItems = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.input);
