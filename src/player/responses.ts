@@ -48,13 +48,28 @@ export const playerAgentToolNames = [
   "remember_owner_fact",
 ] as const;
 
+export const playerSkillLearningRejectionCodes = [
+  "TRUSTED_RECEIPT_NOT_FOUND",
+  "OUTCOME_NOT_LEARNABLE",
+  "OPERATION_REFERENCE_MISMATCH",
+  "CREATE_REQUIRES_SUCCESSFUL_RECEIPT",
+  "SIMILAR_SKILL_EXISTS",
+  "SKILL_VERSION_RECEIPT_MISMATCH",
+] as const;
+
+export type PlayerSkillLearningRejectionCode =
+  (typeof playerSkillLearningRejectionCodes)[number];
+
 export type PlayerAgentToolName =
   (typeof playerAgentToolNames)[number] | "unknown";
 
 export interface PlayerAgentToolRoundActivity {
   readonly name: PlayerAgentToolName;
   readonly resultClass: PlayerAgentToolResultClass;
-  readonly resultCode?: PlayerThoughtCommitRejectionCode | undefined;
+  readonly resultCode?:
+    | PlayerThoughtCommitRejectionCode
+    | PlayerSkillLearningRejectionCode
+    | undefined;
   readonly staleChangedComponents?:
     readonly PlayerThoughtStaleChangeComponent[] | undefined;
   readonly outputChars: number;
@@ -385,7 +400,10 @@ export async function runPlayerAgent(
       const tool = byName.get(call.name);
       let result: unknown;
       let resultClass: PlayerAgentToolResultClass;
-      let resultCode: PlayerThoughtCommitRejectionCode | undefined;
+      let resultCode:
+        | PlayerThoughtCommitRejectionCode
+        | PlayerSkillLearningRejectionCode
+        | undefined;
       let staleChangedComponents:
         PlayerThoughtStaleChangeComponent[] | undefined;
       if (tool === undefined) {
@@ -396,7 +414,7 @@ export async function runPlayerAgent(
           const parsed: unknown = JSON.parse(call.arguments);
           result = await tool.execute(parsed);
           resultClass = classifyToolResult(result);
-          resultCode = safeCommitRejectionCode(call.name, result);
+          resultCode = safeToolResultCode(call.name, result);
           staleChangedComponents = safeStaleChangedComponents(
             call.name,
             result,
@@ -508,6 +526,24 @@ function safeCommitRejectionCode(
     : undefined;
 }
 
+function safeToolResultCode(
+  toolName: string,
+  value: unknown,
+):
+  | PlayerThoughtCommitRejectionCode
+  | PlayerSkillLearningRejectionCode
+  | undefined {
+  if (!isRecord(value) || value.ok !== false) return undefined;
+  if (toolName === "propose_skill_learning") {
+    const code = value.code;
+    return typeof code === "string" &&
+      (playerSkillLearningRejectionCodes as readonly string[]).includes(code)
+      ? (code as PlayerSkillLearningRejectionCode)
+      : undefined;
+  }
+  return safeCommitRejectionCode(toolName, value);
+}
+
 function safeStaleChangedComponents(
   toolName: string,
   value: unknown,
@@ -583,8 +619,9 @@ export function projectSafePlayerAgentActivityTail(
             const resultClass = safeToolResultClass(tool.resultClass);
             const resultCode =
               resultClass === "rejected"
-                ? safeCommitRejectionCode(name, {
+                ? safeToolResultCode(name, {
                     ok: false,
+                    code: tool.resultCode,
                     rejectionCode: tool.resultCode,
                   })
                 : undefined;

@@ -7,6 +7,7 @@ import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
 import {
   playerAgentToolNames,
+  playerSkillLearningRejectionCodes,
   type PlayerAgentRoundActivity,
 } from "./responses.js";
 import type {
@@ -160,7 +161,12 @@ const agentActivitySchema = z
           .object({
             name: z.union([z.enum(playerAgentToolNames), z.literal("unknown")]),
             resultClass: z.enum(["ok", "rejected", "error", "unknown"]),
-            resultCode: z.enum(playerThoughtCommitRejectionCodes).optional(),
+            resultCode: z
+              .union([
+                z.enum(playerThoughtCommitRejectionCodes),
+                z.enum(playerSkillLearningRejectionCodes),
+              ])
+              .optional(),
             staleChangedComponents: z
               .array(z.enum(playerThoughtStaleChangeComponents))
               .max(playerThoughtStaleChangeComponents.length)

@@ -10,6 +10,7 @@ import {
   runPlayerAgent,
   type PlayerResponsesClient,
 } from "../../src/player/responses.js";
+import { PlayerMindStore } from "../../src/player/mind-store.js";
 
 describe("Responses server-side compaction", () => {
   it("projects a bounded content-free activity tail for failure evidence", () => {
@@ -111,6 +112,85 @@ describe("Responses server-side compaction", () => {
     expect(JSON.stringify(projected)).not.toContain(
       "private tool arguments sentinel",
     );
+  });
+
+  it("retains only allowlisted learning rejection codes in private activity", async () => {
+    const activities: unknown[] = [];
+    const tool = createPlayerTool({
+      name: "propose_skill_learning",
+      description: "Record a hypothesis from trusted evidence.",
+      schema: z.object({ kind: z.enum(["known", "unknown"]) }).strict(),
+      execute: ({ kind }) => ({
+        ok: false,
+        code:
+          kind === "known" ? "SIMILAR_SKILL_EXISTS" : "private-code-sentinel",
+        privateDetail: "private output sentinel",
+      }),
+    });
+
+    await runPlayerAgent({
+      client: scriptedClient(
+        [
+          outputResponse([
+            {
+              type: "function_call",
+              call_id: "private-call-id",
+              name: "propose_skill_learning",
+              arguments: JSON.stringify({ kind: "known" }),
+            },
+            {
+              type: "function_call",
+              call_id: "private-call-id-2",
+              name: "propose_skill_learning",
+              arguments: JSON.stringify({ kind: "unknown" }),
+            },
+          ]),
+          terminalResponse("Done."),
+        ],
+        [],
+      ),
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Private conversation sentinel.",
+      tools: [tool],
+      logger: silentLogger(),
+      onRoundActivity: (activity) => activities.push(activity),
+    });
+
+    expect(activities[0]).toMatchObject({
+      toolCalls: [
+        {
+          name: "propose_skill_learning",
+          resultClass: "rejected",
+          resultCode: "SIMILAR_SKILL_EXISTS",
+        },
+        { name: "propose_skill_learning", resultClass: "rejected" },
+      ],
+    });
+    const projected = projectSafePlayerAgentActivityTail(activities);
+    expect(projected[0]?.toolCalls).toMatchObject([
+      {
+        resultCode: "SIMILAR_SKILL_EXISTS",
+      },
+      {
+        resultClass: "rejected",
+      },
+    ]);
+
+    const mind = PlayerMindStore.open(":memory:");
+    try {
+      const activity = projected[0];
+      if (activity === undefined) throw new Error("activity was not projected");
+      const snapshot = mind.recordAgentActivity(activity);
+      const serialized = JSON.stringify(snapshot.recentAgentActivity);
+      expect(serialized).toContain("SIMILAR_SKILL_EXISTS");
+      expect(serialized).not.toContain("private-code-sentinel");
+      expect(serialized).not.toContain("private output sentinel");
+      expect(serialized).not.toContain("Private conversation sentinel");
+      expect(serialized).not.toContain("private-call-id");
+    } finally {
+      mind.close();
+    }
   });
 
   it("records only allowlisted action rejection reasons", async () => {
