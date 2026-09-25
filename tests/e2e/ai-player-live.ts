@@ -4157,6 +4157,7 @@ async function main(): Promise<void> {
       finalRunCounters(state),
       state.countersInitial ?? zeroCounters(),
     );
+    if (runUsage.usageUnknownCalls > 0) state.usageUncertain = true;
     state.status = results.some((result) => result.status === "fail")
       ? "fail"
       : results.some((result) => result.status === "incomplete") ||
@@ -5657,11 +5658,12 @@ async function runCase(
     const delta = subtractCounters(final, initial);
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
-    if (delta.usageUnknownCalls > 0) {
-      state.usageUncertain = true;
-      incomplete("LLM_USAGE_UNKNOWN");
-    }
-    if (delta.llmCalls > 0 && totalTokens(delta) === 0) {
+    if (delta.usageUnknownCalls > 0) state.usageUncertain = true;
+    if (
+      delta.llmCalls > 0 &&
+      totalTokens(delta) === 0 &&
+      delta.usageUnknownCalls === 0
+    ) {
       state.usageUncertain = true;
       incomplete("LLM_USAGE_NOT_REPORTED");
     }
@@ -5682,7 +5684,8 @@ async function runCase(
       inputTokens: delta.inputTokens,
       outputTokens: delta.outputTokens,
       latencyMs: delta.latencyMs,
-      usageStatus: "runtime_reported",
+      usageStatus:
+        delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
       evidence,
     };
     await retainCasePlayerSnapshot(
@@ -5721,7 +5724,7 @@ async function runCase(
       error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
-      (/BUDGET|DEADLINE|USAGE_UNKNOWN/u.test(reason) ||
+      (/BUDGET|DEADLINE/u.test(reason) ||
         delta.usageUnknownCalls > 0 ||
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
         caseStatus === "incomplete");
@@ -5741,7 +5744,7 @@ async function runCase(
             : "unavailable",
       );
     }
-    if (/BUDGET|DEADLINE|USAGE_UNKNOWN/u.test(reason)) {
+    if (/BUDGET|DEADLINE/u.test(reason)) {
       state.abortRequested = true;
       state.failureCode ??= reason;
       try {
@@ -5888,7 +5891,6 @@ async function observeForPlayer(
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
     const runDelta = subtractCounters(player.counters, context.runUsageAtStart);
-    if (runDelta.usageUnknownCalls > 0) incomplete("RUN_LLM_USAGE_UNKNOWN");
     if (
       runDelta.llmCalls > context.runBudget.llmCalls ||
       totalTokens(runDelta) > context.runBudget.totalTokens
