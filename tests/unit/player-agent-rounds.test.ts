@@ -379,6 +379,120 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("replans after a failed owner-goal action without marking the goal complete", async () => {
+    const failedTarget = { x: 4, y: 65, z: 2 };
+    const alternateTarget = { x: 5, y: 65, z: 2 };
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "replan-after-occupied-place",
+        "commit_action_decision",
+        {
+          ...actionArguments(),
+          purpose: "Repair the nearby wall",
+          operationJson: JSON.stringify({
+            kind: "place",
+            item: "oak_planks",
+            position: alternateTarget,
+          }),
+          expectedOutcome: "The visible wall gap is filled.",
+          reason:
+            "The last target was occupied, so inspect the wall and choose an empty position.",
+        },
+      ),
+    ]);
+    const proposal = fixture.mind.addProposal({
+      title: "Repair the nearby wall",
+      reason: "The owner asked to fill a visible gap in the wall.",
+      priority: 4,
+    });
+    const accepted = fixture.mind.commitGoalState({
+      expectedRevision: fixture.mind.snapshot().revision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "Keep the wall repair as an active owner goal.",
+      },
+    });
+    expect(accepted.accepted).toBe(true);
+    const ownerGoal = accepted.snapshot.goals.find(
+      (goal) => goal.ownerProposalId === proposal.id,
+    );
+    expect(ownerGoal).toMatchObject({ source: "owner", status: "active" });
+    const failedAt = new Date().toISOString();
+    const failureSummary =
+      "place は failed: Error: Target position is occupied by oak_planks";
+    fixture.mind.recordOutcome({
+      evidence: {
+        operationId: "failed-wall-placement",
+        kind: "place",
+        status: "failed",
+        summary: failureSummary,
+        observedAt: failedAt,
+      },
+    });
+    const beforeReplan = fixture.mind.snapshot();
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: beforeReplan,
+        events: [
+          {
+            id: "failed-place-event",
+            kind: "body_outcome",
+            summary: failureSummary,
+            createdAt: failedAt,
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "place", position: alternateTarget },
+      });
+      expect(alternateTarget).not.toEqual(failedTarget);
+      expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+        kind: "place",
+        status: "failed",
+      });
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal?.id,
+          ownerProposalId: proposal.id,
+          status: "active",
+        }),
+      );
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "body操作がfailed、unverified、interrupted、cancelledになったら",
+      );
+      expect(JSON.stringify(request.input)).toContain(
+        "Target position is occupied by oak_planks",
+      );
+      const inputItems = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.input);
+      const userInput = z.record(z.string(), z.unknown()).parse(inputItems[0]);
+      const purposeInput = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(userInput.content)));
+      const runtime = z
+        .record(z.string(), z.unknown())
+        .parse(purposeInput.runtime);
+      expect(runtime.lastOutcome).toMatchObject({
+        kind: "place",
+        status: "failed",
+      });
+      expect(purposeInput.events).toContainEqual(
+        expect.objectContaining({ kind: "body_outcome" }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("returns a successful purpose commit on the sixth tool round", async () => {
     const responses = [
       ...Array.from({ length: 5 }, (_, index) =>
