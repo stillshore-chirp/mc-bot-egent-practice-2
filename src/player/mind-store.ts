@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
 import {
+  playerActionDecisionValidationCodes,
   playerAgentRequestErrorCauses,
   playerAgentToolNames,
   playerSkillLearningRejectionCodes,
@@ -178,6 +179,7 @@ const agentActivitySchema = z
               .union([
                 z.enum(playerThoughtCommitRejectionCodes),
                 z.enum(playerSkillLearningRejectionCodes),
+                z.enum(playerActionDecisionValidationCodes),
               ])
               .optional(),
             staleChangedComponents: z

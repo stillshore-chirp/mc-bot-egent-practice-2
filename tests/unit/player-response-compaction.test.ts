@@ -279,15 +279,19 @@ describe("Responses server-side compaction", () => {
     const tool = createPlayerTool({
       name: "commit_action_decision",
       description: "Test action commit.",
-      schema: z.object({ reason: z.enum(["known", "unknown"]) }).strict(),
+      schema: z
+        .object({ reason: z.enum(["known", "validation", "unknown"]) })
+        .strict(),
       execute: ({ reason }) =>
         reason === "known"
           ? { ok: false, code: "STALE_REVISION", rejectionCode: "CAS_STALE" }
-          : {
-              ok: false,
-              code: "private-code-sentinel",
-              rejectionCode: "private-code-sentinel",
-            },
+          : reason === "validation"
+            ? { ok: false, code: "INVALID_PLAYER_OPERATION" }
+            : {
+                ok: false,
+                code: "private-code-sentinel",
+                rejectionCode: "private-code-sentinel",
+              },
     });
 
     await runPlayerAgent({
@@ -299,6 +303,12 @@ describe("Responses server-side compaction", () => {
               call_id: "call-known",
               name: "commit_action_decision",
               arguments: JSON.stringify({ reason: "known" }),
+            },
+            {
+              type: "function_call",
+              call_id: "call-validation",
+              name: "commit_action_decision",
+              arguments: JSON.stringify({ reason: "validation" }),
             },
             {
               type: "function_call",
@@ -322,9 +332,25 @@ describe("Responses server-side compaction", () => {
     expect(activities[0]).toMatchObject({
       toolCalls: [
         { resultClass: "rejected", resultCode: "CAS_STALE" },
+        { resultClass: "rejected", resultCode: "INVALID_PLAYER_OPERATION" },
         { resultClass: "rejected" },
       ],
     });
+    const projected = projectSafePlayerAgentActivityTail(activities);
+    const mind = PlayerMindStore.open(":memory:");
+    try {
+      const activity = projected[0];
+      if (activity === undefined) throw new Error("activity was not projected");
+      const saved = mind.recordAgentActivity(activity);
+      expect(saved.recentAgentActivity[0]?.toolCalls).toEqual(
+        projected[0]?.toolCalls,
+      );
+      expect(JSON.stringify(saved.recentAgentActivity)).not.toContain(
+        "private-code-sentinel",
+      );
+    } finally {
+      mind.close();
+    }
     expect(JSON.stringify(activities)).not.toContain("private-code-sentinel");
   });
 

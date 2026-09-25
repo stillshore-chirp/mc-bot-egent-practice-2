@@ -76,6 +76,17 @@ export const playerSkillLearningRejectionCodes = [
 export type PlayerSkillLearningRejectionCode =
   (typeof playerSkillLearningRejectionCodes)[number];
 
+export const playerActionDecisionValidationCodes = [
+  "THOUGHT_CANCELLED",
+  "INVALID_OPERATION_JSON",
+  "INVALID_PLAYER_OPERATION",
+  "SKILL_REFERENCE_REQUIRES_ID_AND_VERSION",
+  "WAIT_REQUIRES_WAKE_REASON",
+  "COMPLETION_REQUIRES_WAKE_REASON",
+] as const;
+export type PlayerActionDecisionValidationCode =
+  (typeof playerActionDecisionValidationCodes)[number];
+
 export type PlayerAgentToolName =
   (typeof playerAgentToolNames)[number] | "unknown";
 
@@ -85,6 +96,7 @@ export interface PlayerAgentToolRoundActivity {
   readonly resultCode?:
     | PlayerThoughtCommitRejectionCode
     | PlayerSkillLearningRejectionCode
+    | PlayerActionDecisionValidationCode
     | undefined;
   readonly staleChangedComponents?:
     readonly PlayerThoughtStaleChangeComponent[] | undefined;
@@ -425,6 +437,7 @@ export async function runPlayerAgent(
       let resultCode:
         | PlayerThoughtCommitRejectionCode
         | PlayerSkillLearningRejectionCode
+        | PlayerActionDecisionValidationCode
         | undefined;
       let staleChangedComponents:
         PlayerThoughtStaleChangeComponent[] | undefined;
@@ -554,6 +567,7 @@ function safeToolResultCode(
 ):
   | PlayerThoughtCommitRejectionCode
   | PlayerSkillLearningRejectionCode
+  | PlayerActionDecisionValidationCode
   | undefined {
   if (!isRecord(value) || value.ok !== false) return undefined;
   if (toolName === "propose_skill_learning") {
@@ -563,7 +577,14 @@ function safeToolResultCode(
       ? (code as PlayerSkillLearningRejectionCode)
       : undefined;
   }
-  return safeCommitRejectionCode(toolName, value);
+  const committed = safeCommitRejectionCode(toolName, value);
+  if (committed !== undefined) return committed;
+  if (toolName !== "commit_action_decision") return undefined;
+  const code = value.code;
+  return typeof code === "string" &&
+    (playerActionDecisionValidationCodes as readonly string[]).includes(code)
+    ? (code as PlayerActionDecisionValidationCode)
+    : undefined;
 }
 
 function safeStaleChangedComponents(
