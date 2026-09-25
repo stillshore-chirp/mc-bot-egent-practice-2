@@ -177,4 +177,6 @@ HEAD `57d9385` の対象試験run67では、圧縮後の古い移動結果を短
 
 HEAD `a1f844d` の対象試験run68では、構造化変位の履歴と未確定思考の新イベントによる先行中断を含む状態で、Body smokeと自発生活がpassしました。未知複合状況は33 calls・既知169,389 input / 9,686 output tokensでcase呼び出し上限となり、標的の破壊・取得は未確認です。サーバー上の位置とworldには変化がありましたが、標的への距離短縮は未確認でした。safe activityでは`commit_action_decision`の拒否0件、`request_error`13件を記録しました。run67の拒否12件・`request_error`4件から思考中断による改善とは判断できず、provider usage不明の呼び出しもあるため費用の比較はできません。結果上は`move_relative`のsuccessful outcomeが3件ありましたが、保存されたBody前後変位はいずれも0.2ブロック未満でした。このため、開始時点で到達済みとみなされる相対移動入力を拒否し、相対移動の成功には実移動を要求する修正を追加しました。この修正はユニット検証済みで、実ゲームでは未検証です。run68のusageは`partial_or_unknown`、cleanupは3/3です。
 
+HEAD `d360a76` の対象試験run69では、空振りの相対移動を成功と扱わない修正を含む状態でBody smokeと自発生活がpassしました。未知複合状況は33 calls・既知114,843 input / 6,631 output tokensでcase呼び出し上限となり、標的の破壊・取得は未確認です。相対移動のsuccessful outcome 2件はいずれも保存したBody前後変位が1ブロック以上で、サーバー観測でも標的への距離短縮を確認しました。失敗後の回復は未確認です。safe activityには`commit_action_decision`拒否2件と`request_error`19件があり、先行中断の効率改善は主張できません。run68とは行動とworld状態が異なり、既知token量だけで修正の費用効果も断定できません。case usageは`partial_or_unknown`、cleanupは3/3です。同じ高コストcaseの反復はここで止め、思考中断の頻度と進捗の関係を次の設計判断に使います。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
