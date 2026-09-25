@@ -109,7 +109,7 @@ unknown fixtureは壁と対象をspawnの+X側に配置するため、停止中�
 
 ## 実行条件と上限
 
-実行にはNode.js環境、Java 21、Paper 1.21.11 jar、利用者が同意済みのEULAファイル、利用可能な`OPENAI_API_KEY`が必要です。ユーザーが実API・server実行を指定した節目に、専用環境で次のように呼び出します。
+実行にはNode.js環境、Java 21、Paper 1.21.11の起動用jar（manifestの`Main-Class`は`io.papermc.paperclip.Main`）、利用者が同意済みのEULAファイルが必要です。GPTを使うcaseでは利用可能な`OPENAI_API_KEY`も必要です。ユーザーが実API・server実行を指定した節目に、専用環境で次のように呼び出します。
 
 ```sh
 AI_PLAYER_E2E_CONFIRMED=YES \
@@ -125,7 +125,9 @@ Paper cache copyを使う場合は、上の環境変数行へ次を加えます�
 AI_PLAYER_E2E_SERVER_CACHE_DIR=/path/to/paper-cache
 ```
 
-既定上限は45分、160回のGPT呼び出し、合計800,000 tokensです。case上限は合計178 calls / 1,305,000 tokensで、各caseに独立したdeadlineがあります。`autonomous_life` は18 calls / 100,000 tokens、case deadlineは5分です。run18では11 calls・input 63,832・output 2,607・計66,439 tokensで旧60,000-token上限を超え、最後に記録された`commit_action_decision`はokでした。その後のsnapshotはusage gateでpredicate評価前に止まり、最後のsafe player診断と自律milestone進捗は異なる観測時点を示しています。artifact上のfollow-up判断未確認は「判断がなかった」証拠ではなく、判断時刻と成功outcome時刻の詳細はsafe artifactにありません。100,000 tokens / 18 callsは、run18の計測点から次の有限な判断・観測一巡を測る余裕（最大33,561追加tokens・7 calls）として設定します。これは測定上限でありIssueの達成条件ではありません。`unknown_composite` は48 calls / 390,000 tokens、case deadlineは7分です。run17では125,200 tokens消費時点で最低2つのterminal actionが不足していました。直近のround規模（1 actionあたり2–3 round、最大約8,500 input tokens）から、残る2 actionに約34,000–51,000 tokensが必要と見積もり、当初200,000を一回の測定上限として設定しました。後続runで採集物の所持が旧上限付近に初めて観測され、帰還と回復を測るため330,000へ変更しました。HEAD a724e6e の対象試験では標的の破壊と所持を確認し、帰還のmove_to失敗直後に39 calls・330,348 tokensで停止しました。回復判断と帰還を一度測るためcaseのtoken上限だけ60,000増やし、call上限は48のまま保ちます。達成保証や同条件の反復延長には使いません。case上限のtoken合計はrun上限を505,000超え、calls合計も18回超えるため、run全体の上限を維持したままでは後続caseがglobal budgetで未完了停止する場合があります。成功条件とrun全体160/800,000/45分の上限は変更しません。`AI_PLAYER_E2E_MAX_DURATION_MINUTES`、`AI_PLAYER_E2E_MAX_LLM_CALLS`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS`で既定値以下へ下げられます。上限の超過やdeadlineはrun/caseを未完了にし、そこで停止します。偶然passするまで同じ高コストcaseを反復しません。GPT usageが取得できなかったAPI失敗や中断を0消費とはみなさず、既知合計と`partial_or_unknown`を分けます。
+`AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY=YES`を加えると、Body smoke後に既存の未知状況fixtureで採掘後のドロップ品への移動とspawnへの移動を別々に測ります。この診断はGPTを呼ばず、APIキーも要求しません。`AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY`とは同時指定できません。artifactの`returnPathProbe`には経路更新の固定状態とサーバー上の到着・拾得判定だけを保存します。runの`pass`は診断手順の完了であり、拾得やIssue受け入れの合格を意味しません。
+
+既定上限は45分、160回のGPT呼び出し、合計800,000 tokensです。case上限は合計178 calls / 1,305,000 tokensで、各caseに独立したdeadlineがあります。`autonomous_life` は18 calls / 100,000 tokens、case deadlineは5分です。run18では11 calls・input 63,832・output 2,607・計66,439 tokensで旧60,000-token上限を超え、最後に記録された`commit_action_decision`はokでした。その後のsnapshotはusage gateでpredicate評価前に止まり、最後のsafe player診断と自律milestone進捗は異なる観測時点を示しています。artifact上のfollow-up判断未確認は「判断がなかった」証拠ではなく、判断時刻と成功outcome時刻の詳細はsafe artifactにありません。100,000 tokens / 18 callsは、run18の計測点から次の有限な判断・観測一巡を測る余裕（最大33,561追加tokens・7 calls）として設定します。これは測定上限でありIssueの達成条件ではありません。`unknown_composite` は48 calls / 390,000 tokens、case deadlineは7分です。run17では125,200 tokens消費時点で最低2つのterminal actionが不足していました。直近のround規模（1 actionあたり2–3 round、最大約8,500 input tokens）から、残る2 actionに約34,000–51,000 tokensが必要と見積もり、当初200,000を一回の測定上限として設定しました。後続runで採集物の所持が旧上限付近に初めて観測され、帰還と回復を測るため330,000へ変更しました。HEAD a724e6e の対象試験では標的の破壊と所持を確認し、採掘後のドロップ品へ接近するmove_toの失敗直後に39 calls・330,348 tokensで停止しました。回復判断と帰還を一度測るためcaseのtoken上限だけ60,000増やし、call上限は48のまま保ちます。達成保証や同条件の反復延長には使いません。case上限のtoken合計はrun上限を505,000超え、calls合計も18回超えるため、run全体の上限を維持したままでは後続caseがglobal budgetで未完了停止する場合があります。成功条件とrun全体160/800,000/45分の上限は変更しません。`AI_PLAYER_E2E_MAX_DURATION_MINUTES`、`AI_PLAYER_E2E_MAX_LLM_CALLS`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS`で既定値以下へ下げられます。上限の超過やdeadlineはrun/caseを未完了にし、そこで停止します。偶然passするまで同じ高コストcaseを反復しません。GPT usageが取得できなかったAPI失敗や中断を0消費とはみなさず、既知合計と`partial_or_unknown`を分けます。
 
 実行順は`runtime_contract`、`autonomous_life`、`observation_boundary`、`persistent_memory_restart`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`game_action_discretion`、`unknown_composite`、`parallel_dialogue_stop`、`integrated_result`です。unknownのcase budget/deadlineでrunが停止する前に独立した6 caseを測り、unknown handoff後の停止検証をparallelのまま最後に保ちます。同一runtime・DB・goal/skill履歴を引き継ぐため、unknown開始前に蓄積する判断履歴は従来順と異なります。各caseのpredicate・fixtureはこの順序変更では変えません。学習caseの予算変更は前述の実測に基づきます。unknownまでの各caseがそれぞれ上限まで消費した場合、parallelの前にrun全体のtoken上限へ達します。unknownがbudget/deadline停止すれば`parallel_dialogue_stop`と、それら全結果を要求する`integrated_result`は未実行のままです。
 
@@ -232,5 +234,7 @@ HEAD `155bc01` の対象試験ではBody smokeと自発生活がpassしました
 HEAD `a724e6e` の対象試験ではBody smokeと自発生活がpassし、未知caseは39 calls・既知330,348 tokensで上限停止、run全体は48 calls・既知380,735 tokens、cleanup 3/3です。GPTは探索Skillを参照し、走査を選択しましたが、その走査結果自体には標的がありませんでした。後続の視線変更と採掘を経て、サーバー上で標的の除去と青い羊毛の所持を確認しました。採掘後、ドロップ品へ接近して取得を確かめる`move_to`が失敗した直後に上限へ達しました。この実行では帰還操作は確認されておらず、帰還と失敗後の回復は未確認です。走査が採集に寄与したという因果関係や、採集の再現性はこの一回から断定しません。
 
 この実測に基づき未知caseのtoken上限だけを390,000へ変更した一回の対象試験では、Body smokeと自発生活はpassし、未知caseは45 calls・既知396,685 tokensで上限停止、run全体は52 calls・既知437,416 tokens、cleanup 3/3でした。自然な移動失敗後の再観測・別操作の成功は確認しましたが、標的への最短距離は5〜10ブロックで、採集・所持・帰還はありません。4回の走査はすべて完了したものの標的を含まず、最後のBody観測には標的が見えました。走査と相対移動が交互に続いた行動経路のため、前回の採集成功を再現できませんでした。同条件の高コストな再試行や上限再延長は行いません。
+
+0 GPTの隔離Paper帰路診断では、同じ壁・水路fixtureで標的の可視確認と採掘、地上dropの存在を確認しました。採掘直後の位置ずれがあったため乾地の待機位置へ戻した後、drop付近への`move_to`とspawnへの`move_to`はともに経路探索成功・サーバー到着を確認しました。拾得は確認できず、帰還時にも所持していません。診断手順はpass、API呼び出し0、cleanup 3/3です。この一回は経路が存在することを示しますが、実GPT試験での移動失敗原因、拾得・持帰り、再現性は未確認です。
 
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集後の帰還と全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。

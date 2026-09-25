@@ -29,6 +29,7 @@ import { ZodError } from "zod";
 import { AppError, errorCategories } from "../../src/domain/errors.js";
 import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
+import type { PlayerBody } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
@@ -341,6 +342,144 @@ type BodyOperationStatus =
   "successful" | "failed" | "interrupted" | "unverified";
 type LookSweepStatusDiagnostic = BodyOperationStatus | "unavailable";
 type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
+type BodyMoveErrorClass =
+  "none" | "no_path" | "timeout" | "probe_deadline" | "interrupted" | "other";
+type BodyDigErrorClass =
+  "out_of_view" | "occluded" | "out_of_reach" | "unloaded" | "other";
+type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
+
+interface BodyMovePathDiagnostic {
+  readonly status: BodyOperationStatus;
+  readonly errorClass: BodyMoveErrorClass;
+  readonly pathStatus: BodyPathStatus;
+  readonly pathLength: number;
+  readonly pathUpdateCount: number;
+  readonly probeDeadlineReached: boolean;
+  readonly recoveryRequired: boolean;
+}
+
+interface ReturnPathProbeDiagnostic {
+  readonly interpretation?: "diagnostic_only_move_outcomes_not_gated";
+  readonly fixtureConfirmed?: boolean;
+  readonly digStageRconConfirmed?: boolean;
+  readonly dropStageRconConfirmed?: boolean;
+  readonly digStatus?: BodyOperationStatus;
+  readonly digErrorClass?: BodyDigErrorClass;
+  readonly digLookStatus?: BodyOperationStatus;
+  readonly targetVisibleAfterLook?: boolean;
+  readonly digPositionDriftBucket?: BodyPositionDriftBucket;
+  readonly itemPresentAfterDig?: boolean;
+  readonly dropItemEntityPresentAfterDig?: boolean;
+  readonly targetClearedAfterDig?: boolean;
+  readonly dropItemEntityPresentBeforeMove?: boolean;
+  readonly itemPresentBeforeDropMove?: boolean;
+  readonly dropStageBodyConfirmed?: boolean;
+  readonly dropMove?: BodyMovePathDiagnostic;
+  readonly dropMoveRconArrivalConfirmed?: boolean;
+  readonly itemPresentAfterDropMove?: boolean;
+  readonly itemPickupConfirmed?: boolean;
+  readonly returnMoveSkippedRecoveryRequired?: boolean;
+  readonly returnMove?: BodyMovePathDiagnostic;
+  readonly returnRconArrivalConfirmed?: boolean;
+  readonly itemPresentAfterReturn?: boolean;
+}
+
+function isNoGptDiagnosticProbeOnly(): boolean {
+  return (
+    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+  );
+}
+
+function classifyBodyMoveError(
+  status: BodyOperationStatus,
+  detail: string | undefined,
+  probeDeadlineReached: boolean,
+): BodyMoveErrorClass {
+  if (probeDeadlineReached) return "probe_deadline";
+  if (status === "successful") return "none";
+  const normalized = detail?.toLowerCase() ?? "";
+  if (/no path|pathfinder_failed/u.test(normalized)) return "no_path";
+  if (/timeout|timed out|time limit/u.test(normalized)) return "timeout";
+  if (
+    status === "interrupted" ||
+    /cancel|abort|interrupted/u.test(normalized)
+  ) {
+    return "interrupted";
+  }
+  return "other";
+}
+
+function classifyReturnPathDigError(
+  detail: string | undefined,
+): BodyDigErrorClass {
+  const normalized = detail?.toLowerCase() ?? "";
+  if (normalized.includes("outside the current field of view"))
+    return "out_of_view";
+  if (normalized.includes("occluded")) return "occluded";
+  if (normalized.includes("outside normal player reach")) return "out_of_reach";
+  if (normalized.includes("outside loaded world data")) return "unloaded";
+  return "other";
+}
+
+function positionDriftBucket(distance: number): BodyPositionDriftBucket {
+  if (distance < 1) return "<1";
+  if (distance < 2) return "1-2";
+  return "2+";
+}
+
+async function executeBodyMovePathProbe(
+  body: PlayerBody,
+  operation: {
+    readonly kind: "move_to";
+    readonly position: Position;
+    readonly range: number;
+  },
+  parentSignal: AbortSignal,
+  deadlineMs = 20_000,
+): Promise<BodyMovePathDiagnostic> {
+  let pathStatus: BodyPathStatus = "none";
+  let pathLength = 0;
+  let pathUpdateCount = 0;
+  let probeDeadlineReached = false;
+  let detail: string | undefined;
+  let status: BodyOperationStatus;
+  let recoveryRequired = false;
+  const probeAbort = new AbortController();
+  const timer = setTimeout(() => {
+    probeDeadlineReached = true;
+    probeAbort.abort(new Error("return path probe deadline"));
+  }, deadlineMs);
+  const signal = AbortSignal.any([parentSignal, probeAbort.signal]);
+  const unsubscribe = body.onEvent((event) => {
+    if (event.type !== "operation_path_updated") return;
+    pathStatus = event.status;
+    pathLength = event.pathLength;
+    pathUpdateCount += 1;
+  });
+  try {
+    const result = await body.execute(operation, signal);
+    status = result.status;
+    detail = result.detail;
+    recoveryRequired = result.recoveryRequired;
+  } catch (error) {
+    detail =
+      error instanceof Error ? `${error.name}: ${error.message}` : undefined;
+    status = parentSignal.aborted ? "interrupted" : "failed";
+  } finally {
+    clearTimeout(timer);
+    unsubscribe();
+  }
+  return {
+    status,
+    errorClass: classifyBodyMoveError(status, detail, probeDeadlineReached),
+    pathStatus,
+    pathLength,
+    pathUpdateCount,
+    probeDeadlineReached,
+    recoveryRequired,
+  };
+}
 
 type BodyDetailClass =
   | "none"
@@ -404,6 +543,7 @@ interface BodySmokeDiagnostic {
   readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
   readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
+  readonly returnPathProbe?: ReturnPathProbeDiagnostic;
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
   readonly resourceLookDetailClass?: BodyDetailClass;
@@ -1450,6 +1590,21 @@ function updateUnknownCompositeDiagnostic(
   };
 }
 
+function updateReturnPathProbeDiagnostic(
+  state: RunState,
+  diagnostic: Partial<ReturnPathProbeDiagnostic>,
+): void {
+  const current = state.bodySmokeDiagnostic;
+  if (current === undefined) incomplete("BODY_SMOKE_DIAGNOSTIC_MISSING");
+  state.bodySmokeDiagnostic = {
+    ...current,
+    returnPathProbe: {
+      ...(current.returnPathProbe ?? {}),
+      ...diagnostic,
+    },
+  };
+}
+
 function updateParallelDiagnostic(
   state: RunState,
   diagnostic: SafeEvidence,
@@ -1954,7 +2109,7 @@ async function main(): Promise<void> {
       state.failureCode ??= failureCode;
       throw new HarnessError(operationSmokeResult.status, failureCode);
     }
-    if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
+    if (isNoGptDiagnosticProbeOnly()) {
       state.status = "pass";
       return;
     }
@@ -4392,6 +4547,14 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
+  if (
+    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+  ) {
+    incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
+  }
+  const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
+  if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
   if (
     requestedTargetCase !== undefined &&
@@ -4410,9 +4573,10 @@ async function prepareRun(): Promise<RunState> {
   const eulaFile = process.env.AI_PLAYER_E2E_EULA_FILE;
   if (eulaFile === undefined || eulaFile.trim() === "")
     incomplete("EULA_FILE_REQUIRED");
+  const openAiApiKey = process.env.OPENAI_API_KEY;
   if (
-    process.env.OPENAI_API_KEY === undefined ||
-    process.env.OPENAI_API_KEY.trim() === ""
+    !noGptProbeOnly &&
+    (openAiApiKey === undefined || openAiApiKey.trim() === "")
   ) {
     incomplete("OPENAI_API_KEY_NOT_CONFIGURED");
   }
@@ -4767,10 +4931,13 @@ async function runOperationSmoke(
   state: RunState,
   rcon: LocalRcon,
 ): Promise<SafeCaseResult> {
+  const returnPathProbeOnly =
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES";
+  const smokeDeadlineMs = returnPathProbeOnly ? 150_000 : 90_000;
   const result = await runCase(
     state,
     "body_operation_smoke",
-    90_000,
+    smokeDeadlineMs,
     0,
     0,
     async () => {
@@ -4799,7 +4966,7 @@ async function runOperationSmoke(
       const abort = new AbortController();
       const abortTimer = setTimeout(
         () => abort.abort(new Error("body smoke deadline")),
-        80_000,
+        smokeDeadlineMs - 10_000,
       );
       let body: Awaited<ReturnType<typeof client.createPlayerBody>> | undefined;
       let target: Position | undefined;
@@ -5658,6 +5825,16 @@ async function runOperationSmoke(
           if (!targetObservedInLookSweep)
             incomplete("BODY_NAVIGATION_PROBE_LOOK_SWEEP_TARGET_NOT_OBSERVED");
         }
+        if (returnPathProbeOnly) {
+          await runUnknownReturnPathProbe(
+            state,
+            rcon,
+            body,
+            state.botName,
+            smokeSpawn,
+            abort.signal,
+          );
+        }
         state.autonomousRegion = await captureBlockBaseline(
           rcon,
           smokeEndPosition,
@@ -5687,6 +5864,7 @@ async function runOperationSmoke(
             ? { obstacleRestoreProbeVerified: true }
             : {}),
           gptCalls: 0,
+          ...(returnPathProbeOnly ? { diagnosticOnly: true } : {}),
           apiOperationsReportedSuccess,
         };
       } finally {
@@ -5705,6 +5883,302 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runUnknownReturnPathProbe(
+  state: RunState,
+  rcon: LocalRcon,
+  body: PlayerBody,
+  botName: string,
+  spawn: Position,
+  signal: AbortSignal,
+): Promise<void> {
+  await configureUnknownFixture(rcon, spawn, botName);
+  updateReturnPathProbeDiagnostic(state, {
+    interpretation: "diagnostic_only_move_outcomes_not_gated",
+  });
+  const target = unknownFixtureTarget(spawn);
+  const wallPoint = {
+    x: Math.floor(spawn.x) + 2,
+    y: 64,
+    z: Math.floor(spawn.z),
+  };
+  const waterPoint = {
+    x: target.x - 3,
+    y: 64,
+    z: Math.floor(spawn.z),
+  };
+  const fixtureConfirmed =
+    (await isBlock(rcon, target, "blue_wool")) &&
+    (await isBlock(rcon, wallPoint, "stone")) &&
+    (await isBlock(rcon, waterPoint, "water"));
+  updateReturnPathProbeDiagnostic(state, { fixtureConfirmed });
+  if (!fixtureConfirmed) incomplete("RETURN_PATH_PROBE_FIXTURE_NOT_CONFIRMED");
+
+  // Keep the bot outside pickup range until the separate drop-approach move.
+  const digStage = {
+    x: target.x + 0.5,
+    y: target.y,
+    z: target.z + 3.5,
+  };
+  await rcon.command(
+    `tp ${botName} ${digStage.x} ${digStage.y} ${digStage.z} 0 0`,
+  );
+  const digStagePosition = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const digStageRconConfirmed =
+    Math.hypot(
+      digStagePosition.x - digStage.x,
+      digStagePosition.y - digStage.y,
+      digStagePosition.z - digStage.z,
+    ) <= 0.75;
+  updateReturnPathProbeDiagnostic(state, { digStageRconConfirmed });
+  if (
+    !digStageRconConfirmed ||
+    !(await waitForBodyAtPosition(body, digStage, signal))
+  ) {
+    incomplete("RETURN_PATH_PROBE_DIG_STAGE_NOT_CONFIRMED");
+  }
+
+  const digLookResult = await body.execute(
+    {
+      kind: "look",
+      target: {
+        x: target.x + 0.5,
+        y: target.y + 0.5,
+        z: target.z + 0.5,
+      },
+    },
+    signal,
+  );
+  let targetVisibleAfterLook = false;
+  const targetVisibilityDeadline = Date.now() + 5_000;
+  while (!signal.aborted && Date.now() < targetVisibilityDeadline) {
+    targetVisibleAfterLook =
+      observedBlockName(await body.observe(), target) === "blue_wool";
+    if (targetVisibleAfterLook) break;
+    await waitMs(100);
+  }
+  updateReturnPathProbeDiagnostic(state, {
+    digLookStatus: digLookResult.status,
+    targetVisibleAfterLook,
+  });
+  if (digLookResult.status !== "successful")
+    incomplete("RETURN_PATH_PROBE_DIG_LOOK_NOT_SUCCESSFUL");
+  if (!targetVisibleAfterLook)
+    incomplete("RETURN_PATH_PROBE_DIG_TARGET_NOT_VISIBLE");
+
+  const digResult = await body.execute(
+    { kind: "dig", position: target },
+    signal,
+  );
+  const positionAfterDig = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const digPositionDriftBucket = positionDriftBucket(
+    Math.hypot(
+      positionAfterDig.x - digStage.x,
+      positionAfterDig.y - digStage.y,
+      positionAfterDig.z - digStage.z,
+    ),
+  );
+  const itemPresentAfterDig = await rconInventoryHasBlueWool(rcon, botName);
+  const dropItemEntityPresentAfterDig = await rconHasBlueWoolDropNear(
+    rcon,
+    target,
+  );
+  const targetClearedAfterDig = !(await isBlock(rcon, target, "blue_wool"));
+  updateReturnPathProbeDiagnostic(state, {
+    digStatus: digResult.status,
+    digPositionDriftBucket,
+    itemPresentAfterDig,
+    dropItemEntityPresentAfterDig,
+    targetClearedAfterDig,
+    ...(digResult.status === "successful"
+      ? {}
+      : { digErrorClass: classifyReturnPathDigError(digResult.detail) }),
+  });
+  if (digResult.status !== "successful")
+    incomplete("RETURN_PATH_PROBE_DIG_NOT_SUCCESSFUL");
+  if (!targetClearedAfterDig)
+    incomplete("RETURN_PATH_PROBE_TARGET_NOT_CLEARED");
+  if (itemPresentAfterDig)
+    incomplete("RETURN_PATH_PROBE_ITEM_PICKED_UP_AFTER_DIG");
+  if (!dropItemEntityPresentAfterDig)
+    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_FOUND_AFTER_DIG");
+
+  await rcon.command(
+    `tp ${botName} ${digStage.x} ${digStage.y} ${digStage.z} 0 0`,
+  );
+
+  const dropStagePosition = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const dropStageRconConfirmed =
+    Math.hypot(
+      dropStagePosition.x - digStage.x,
+      dropStagePosition.y - digStage.y,
+      dropStagePosition.z - digStage.z,
+    ) <= 0.75;
+  const dropStageBodyConfirmed = await waitForBodyAtPosition(
+    body,
+    digStage,
+    signal,
+  );
+  updateReturnPathProbeDiagnostic(state, {
+    dropStageRconConfirmed,
+    dropStageBodyConfirmed,
+  });
+  if (!dropStageRconConfirmed || !dropStageBodyConfirmed) {
+    incomplete("RETURN_PATH_PROBE_DROP_STAGE_NOT_CONFIRMED");
+  }
+
+  const itemPresentBeforeDropMove = await rconInventoryHasBlueWool(
+    rcon,
+    botName,
+  );
+  const dropItemEntityPresentBeforeMove = await rconHasBlueWoolDropNear(
+    rcon,
+    target,
+  );
+  updateReturnPathProbeDiagnostic(state, {
+    dropItemEntityPresentBeforeMove,
+    itemPresentBeforeDropMove,
+  });
+  if (itemPresentBeforeDropMove)
+    incomplete("RETURN_PATH_PROBE_ITEM_ALREADY_IN_INVENTORY");
+  if (!dropItemEntityPresentBeforeMove)
+    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_FOUND");
+  const dropMove = await executeBodyMovePathProbe(
+    body,
+    {
+      kind: "move_to",
+      position: {
+        x: target.x + 0.5,
+        y: target.y,
+        z: target.z + 0.5,
+      },
+      range: 1,
+    },
+    signal,
+  );
+  updateReturnPathProbeDiagnostic(state, { dropMove });
+  const afterDropMove = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const dropMoveRconArrivalConfirmed =
+    Math.hypot(
+      afterDropMove.x - (target.x + 0.5),
+      afterDropMove.y - target.y,
+      afterDropMove.z - (target.z + 0.5),
+    ) <= 1.75;
+  const itemPresentAfterDropMove = await waitForRconInventoryBlueWool(
+    rcon,
+    botName,
+    2_500,
+  );
+  // Preconditions above guarantee a fresh ground drop with no prior pickup.
+  const itemPickupConfirmed = itemPresentAfterDropMove;
+  updateReturnPathProbeDiagnostic(state, {
+    dropMoveRconArrivalConfirmed,
+    itemPresentAfterDropMove,
+    itemPickupConfirmed,
+  });
+
+  if (dropMove.recoveryRequired) {
+    const currentPosition = parsePosition(
+      await rcon.command(`data get entity ${botName} Pos`),
+    );
+    updateReturnPathProbeDiagnostic(state, {
+      returnMoveSkippedRecoveryRequired: true,
+      returnRconArrivalConfirmed:
+        Math.hypot(
+          currentPosition.x - spawn.x,
+          currentPosition.y - spawn.y,
+          currentPosition.z - spawn.z,
+        ) <= 4.5,
+      itemPresentAfterReturn: await rconInventoryHasBlueWool(rcon, botName),
+    });
+    return;
+  }
+
+  const returnMove = await executeBodyMovePathProbe(
+    body,
+    { kind: "move_to", position: spawn, range: 4.5 },
+    signal,
+  );
+  updateReturnPathProbeDiagnostic(state, { returnMove });
+  const returnedPosition = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  updateReturnPathProbeDiagnostic(state, {
+    returnRconArrivalConfirmed:
+      Math.hypot(
+        returnedPosition.x - spawn.x,
+        returnedPosition.y - spawn.y,
+        returnedPosition.z - spawn.z,
+      ) <= 4.5,
+    itemPresentAfterReturn: await rconInventoryHasBlueWool(rcon, botName),
+  });
+}
+
+async function waitForBodyAtPosition(
+  body: PlayerBody,
+  expected: Position,
+  signal: AbortSignal,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !signal.aborted) {
+    const position = (await body.observe()).self.position;
+    if (
+      Math.hypot(
+        position.x - expected.x,
+        position.y - expected.y,
+        position.z - expected.z,
+      ) <= 0.75
+    ) {
+      return true;
+    }
+    await waitMs(100);
+  }
+  return false;
+}
+
+async function rconInventoryHasBlueWool(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<boolean> {
+  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  return /minecraft:blue_wool/iu.test(inventory);
+}
+
+async function rconHasBlueWoolDropNear(
+  rcon: LocalRcon,
+  target: BlockPosition,
+): Promise<boolean> {
+  const selector =
+    '@e[type=minecraft:item,limit=1,distance=..2,nbt={Item:{id:"minecraft:blue_wool"}}]';
+  const reply = await rcon.command(
+    `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
+  );
+  return /\[\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*\]/u.test(
+    reply,
+  );
+}
+
+async function waitForRconInventoryBlueWool(
+  rcon: LocalRcon,
+  botName: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await rconInventoryHasBlueWool(rcon, botName)) return true;
+    if (Date.now() < deadline) await waitMs(100);
+  } while (Date.now() < deadline);
+  return false;
 }
 
 async function connectApplication(
@@ -7422,7 +7896,7 @@ async function writeArtifact(state: RunState): Promise<void> {
     status: state.status ?? "incomplete",
     startedAt: state.startedAt,
     durationMs: Date.now() - state.startedClock,
-    model: MODEL,
+    model: isNoGptDiagnosticProbeOnly() ? "not_used" : MODEL,
     targetCase: state.targetCase ?? null,
     minecraftVersion: SERVER_VERSION,
     world: {
