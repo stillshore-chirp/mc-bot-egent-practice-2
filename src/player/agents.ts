@@ -635,7 +635,7 @@ export class PlayerPurposeAgent {
     const learningTool = createPlayerTool({
       name: "propose_skill_learning",
       description:
-        "実際の観測結果のreceiptを照合して技能仮説を作成または改訂する。成功receiptから新規作成、既存技能の使用receiptから版照合した改訂を行う。",
+        "実際の観測結果のreceiptを照合して技能仮説を作成または改訂する。createではreceiptから派生させ、skillId/version入力は使わない。reviseは使用receiptとSkill版を照合する。",
       schema: learningInput,
       execute: async (inputValue) => this.recordLearning(inputValue),
     });
@@ -1290,10 +1290,9 @@ export class PlayerPurposeAgent {
     }
     let record: ReturnType<McSkillRepository["get"]>;
     if (input.mode === "create") {
-      if (
-        evidence.observedOutcome !== "successful" ||
-        input.skillId.length > 0
-      ) {
+      // Create provenance comes only from the receipt; model target fields are
+      // revision-only and must not reject or redirect a valid derived hypothesis.
+      if (evidence.observedOutcome !== "successful") {
         return { ok: false, code: "CREATE_REQUIRES_SUCCESSFUL_RECEIPT" };
       }
       const duplicates = this.options.skills.search({

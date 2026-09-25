@@ -626,38 +626,52 @@ describe("player skill learning", () => {
     });
 
     const title = "Reach a landmark using an observed route";
-    const responses = [
+    const modelCreateArguments = learningArguments(
+      runId,
+      title,
+      operationName,
+      modelOperationRef,
+    );
+    modelCreateArguments.skillId = "model-provided-untrusted-target";
+    modelCreateArguments.expectedVersion = seed.version + 7;
+    const client = scriptedClient([
       functionCallResponse(
         "learn-1",
         "propose_skill_learning",
-        learningArguments(runId, title, operationName, modelOperationRef),
+        modelCreateArguments,
       ),
-      functionCallResponse(
-        "learn-2",
-        "commit_action_decision",
-        waitArguments(),
-      ),
+      (request) => {
+        expect(toolOutput(request, "learn-1")).toMatchObject({
+          ok: true,
+          outcome: "successful",
+          idempotent: false,
+          derivedFromSkillId: seed.id,
+        });
+        return functionCallResponse(
+          "learn-2",
+          "commit_action_decision",
+          waitArguments(),
+        );
+      },
       functionCallResponse(
         "retry-1",
         "propose_skill_learning",
         learningArguments(runId, title, operationName),
       ),
-      functionCallResponse(
-        "retry-2",
-        "commit_action_decision",
-        waitArguments(),
-      ),
-    ];
-    const client = {
-      responses: {
-        create: async () => {
-          const response = responses.shift();
-          if (response === undefined)
-            throw new Error("test response queue is empty");
-          return response;
-        },
+      (request) => {
+        expect(toolOutput(request, "retry-1")).toMatchObject({
+          ok: true,
+          outcome: "successful",
+          idempotent: true,
+          derivedFromSkillId: seed.id,
+        });
+        return functionCallResponse(
+          "retry-2",
+          "commit_action_decision",
+          waitArguments(),
+        );
       },
-    } as unknown as PlayerResponsesClient;
+    ]);
     const committed: string[] = [];
     const agent = new PlayerPurposeAgent({
       client,
@@ -710,6 +724,90 @@ describe("player skill learning", () => {
     expect(mind.snapshot().counters.learningUpdates).toBe(1);
     skills.close();
     mind.close();
+  });
+
+  it("rejects create from a failed skill-use receipt even when model target fields are set", async () => {
+    const directory = mkdtempSync(
+      join(tmpdir(), "player-learning-invalid-create-"),
+    );
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory: join(directory, "exchange"),
+      allowedOperationNames: playerOperationNames,
+    });
+    const mind = PlayerMindStore.open(databasePath);
+    const seed = skills.search({ limit: 1 })[0];
+    if (seed === undefined) throw new Error("seed skill is missing");
+    const operationName = seed.operationRefs[0];
+    if (operationName === undefined)
+      throw new Error("seed operation reference is missing");
+    const runId = "learning-failed-used-skill-receipt";
+    skills.recordTrustedEvidence({
+      runId,
+      operationName,
+      inputSummary: `operation=${operationName}`,
+      conditions: ["dimension:overworld", "time:day"],
+      expectedOutcome: "reach the selected landmark",
+      observedOutcome: "failed",
+      observationSummary: "The observed action did not reach the landmark.",
+      skillIdAtUse: seed.id,
+      skillVersionAtUse: seed.version,
+      observedAt: new Date().toISOString(),
+    });
+    const title = "Failed receipt must not create a new hypothesis";
+    const modelCreateArguments = learningArguments(runId, title, operationName);
+    modelCreateArguments.skillId = seed.id;
+    modelCreateArguments.expectedVersion = seed.version;
+    const client = scriptedClient([
+      functionCallResponse(
+        "invalid-create",
+        "propose_skill_learning",
+        modelCreateArguments,
+      ),
+      (request) => {
+        expect(toolOutput(request, "invalid-create")).toMatchObject({
+          ok: false,
+          code: "CREATE_REQUIRES_SUCCESSFUL_RECEIPT",
+        });
+        return functionCallResponse(
+          "invalid-create-wait",
+          "commit_action_decision",
+          waitArguments(),
+        );
+      },
+    ]);
+    const agent = new PlayerPurposeAgent({
+      client,
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationOnlyBody(),
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: () => undefined,
+    });
+
+    try {
+      const result = await agent.think({
+        snapshot: mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(true);
+      expect(
+        skills
+          .search({ query: title, limit: 4 })
+          .some((skill) => skill.title === title),
+      ).toBe(false);
+      expect(mind.snapshot().learningReferences).toHaveLength(0);
+      expect(mind.snapshot().counters.learningUpdates).toBe(0);
+    } finally {
+      skills.close();
+      mind.close();
+    }
   });
 });
 
