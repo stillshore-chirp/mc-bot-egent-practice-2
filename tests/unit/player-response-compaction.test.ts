@@ -13,6 +13,40 @@ import {
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 
 describe("Responses server-side compaction", () => {
+  it("persists requests whose token usage was not returned", async () => {
+    const mind = PlayerMindStore.open(":memory:");
+    const requestError = new Error("TEST_REQUEST_INTERRUPTED");
+    const client = {
+      responses: { create: async () => Promise.reject(requestError) },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        onCall: (metrics) =>
+          mind.recordCall({
+            inputTokens: metrics.inputTokens,
+            outputTokens: metrics.outputTokens,
+            latencyMs: metrics.latencyMs,
+            ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+          }),
+      }),
+    ).rejects.toBe(requestError);
+
+    expect(mind.snapshot().counters).toMatchObject({
+      llmCalls: 1,
+      usageUnknownCalls: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+    mind.close();
+  });
+
   it("projects a bounded content-free activity tail for failure evidence", () => {
     const unsafeActivities = Array.from({ length: 70 }, (_, index) => ({
       runSequence: index + 1,

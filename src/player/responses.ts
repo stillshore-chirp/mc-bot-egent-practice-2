@@ -111,6 +111,8 @@ export interface PlayerAgentCallResult {
   readonly outputTokens: number;
   readonly latencyMs: number;
   readonly toolCalls: number;
+  /** True when no provider usage was returned; token totals are only a lower bound. */
+  readonly usageUnknown?: boolean;
 }
 
 export interface RunPlayerAgentInput {
@@ -296,6 +298,7 @@ export async function runPlayerAgent(
         outputTokens: 0,
         latencyMs: Math.round(performance.now() - started),
         toolCalls,
+        usageUnknown: true,
       });
       throw error;
     }
@@ -310,6 +313,7 @@ export async function runPlayerAgent(
       outputTokens: safeCount(response.usage?.output_tokens),
       latencyMs: elapsed,
       toolCalls: 0,
+      ...(response.usage === undefined ? { usageUnknown: true } : {}),
     });
     const responseStatus = response.status ?? "unknown";
     const activityToolCalls: PlayerAgentToolRoundActivity[] = [];

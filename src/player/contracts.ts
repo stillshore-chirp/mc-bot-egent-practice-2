@@ -251,6 +251,7 @@ export interface PlayerRuntimeSnapshot {
   readonly recentAgentActivity: readonly PlayerAgentRoundActivity[];
   readonly counters: {
     readonly llmCalls: number;
+    readonly usageUnknownCalls: number;
     readonly inputTokens: number;
     readonly outputTokens: number;
     readonly latencyMs: number;

@@ -295,6 +295,7 @@ const stateSchema = z
     counters: z
       .object({
         llmCalls: z.number().int().nonnegative(),
+        usageUnknownCalls: z.number().int().nonnegative().default(0),
         inputTokens: z.number().int().nonnegative(),
         outputTokens: z.number().int().nonnegative(),
         latencyMs: z.number().int().nonnegative(),
@@ -374,6 +375,7 @@ const initialState: StoredState = {
   recentAgentActivity: [],
   counters: {
     llmCalls: 0,
+    usageUnknownCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,
@@ -1342,6 +1344,7 @@ export class PlayerMindStore {
     readonly outputTokens?: number;
     readonly latencyMs: number;
     readonly learningUpdate?: boolean;
+    readonly usageUnknown?: boolean;
   }): void {
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
@@ -1351,6 +1354,9 @@ export class PlayerMindStore {
           counters: {
             ...current.counters,
             llmCalls: current.counters.llmCalls + 1,
+            usageUnknownCalls:
+              current.counters.usageUnknownCalls +
+              (metrics.usageUnknown === true ? 1 : 0),
             inputTokens:
               current.counters.inputTokens + nonnegative(metrics.inputTokens),
             outputTokens:

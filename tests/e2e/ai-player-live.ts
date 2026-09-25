@@ -466,6 +466,7 @@ interface SafeApplicationStartDiagnostic {
 
 interface Counters {
   readonly llmCalls: number;
+  readonly usageUnknownCalls: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
@@ -1041,6 +1042,7 @@ function countersOf(evidence: Evidence): Counters {
   const counters = playerOf(evidence).counters;
   return {
     llmCalls: positiveNumber(counters.llmCalls),
+    usageUnknownCalls: positiveNumber(counters.usageUnknownCalls),
     inputTokens: positiveNumber(counters.inputTokens),
     outputTokens: positiveNumber(counters.outputTokens),
     latencyMs: positiveNumber(counters.latencyMs),
@@ -1479,6 +1481,10 @@ async function readSafeDayTime(rcon: LocalRcon): Promise<number | undefined> {
 function subtractCounters(after: Counters, before: Counters): Counters {
   return {
     llmCalls: Math.max(0, after.llmCalls - before.llmCalls),
+    usageUnknownCalls: Math.max(
+      0,
+      after.usageUnknownCalls - before.usageUnknownCalls,
+    ),
     inputTokens: Math.max(0, after.inputTokens - before.inputTokens),
     outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
     latencyMs: Math.max(0, after.latencyMs - before.latencyMs),
@@ -5651,6 +5657,10 @@ async function runCase(
     const delta = subtractCounters(final, initial);
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
+    if (delta.usageUnknownCalls > 0) {
+      state.usageUncertain = true;
+      incomplete("LLM_USAGE_UNKNOWN");
+    }
     if (delta.llmCalls > 0 && totalTokens(delta) === 0) {
       state.usageUncertain = true;
       incomplete("LLM_USAGE_NOT_REPORTED");
@@ -5711,7 +5721,8 @@ async function runCase(
       error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
-      (/BUDGET|DEADLINE/u.test(reason) ||
+      (/BUDGET|DEADLINE|USAGE_UNKNOWN/u.test(reason) ||
+        delta.usageUnknownCalls > 0 ||
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
         caseStatus === "incomplete");
     if (usageUncertain) state.usageUncertain = true;
@@ -5730,7 +5741,7 @@ async function runCase(
             : "unavailable",
       );
     }
-    if (/BUDGET|DEADLINE/u.test(reason)) {
+    if (/BUDGET|DEADLINE|USAGE_UNKNOWN/u.test(reason)) {
       state.abortRequested = true;
       state.failureCode ??= reason;
       try {
@@ -5877,6 +5888,7 @@ async function observeForPlayer(
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
     const runDelta = subtractCounters(player.counters, context.runUsageAtStart);
+    if (runDelta.usageUnknownCalls > 0) incomplete("RUN_LLM_USAGE_UNKNOWN");
     if (
       runDelta.llmCalls > context.runBudget.llmCalls ||
       totalTokens(runDelta) > context.runBudget.totalTokens
@@ -6553,6 +6565,7 @@ function observedWorldProgress(
 function zeroCounters(): Counters {
   return {
     llmCalls: 0,
+    usageUnknownCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,

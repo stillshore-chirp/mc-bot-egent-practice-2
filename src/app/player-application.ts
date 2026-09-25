@@ -388,6 +388,7 @@ export function createPlayerApplication(
         inputTokens: metrics.inputTokens,
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
+        ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     say,
@@ -413,6 +414,7 @@ export function createPlayerApplication(
         inputTokens: metrics.inputTokens,
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
+        ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     onObservation: (observation) =>
