@@ -3827,6 +3827,7 @@ async function main(): Promise<void> {
           parallelTaskSent: true,
           parallelActiveMoveObserved: false,
           parallelGuestNoMutationConfirmed: false,
+          parallelOwnerMoveReacquired: false,
           parallelOwnerPreferenceSent: false,
           parallelOwnerRequestResolved: false,
           parallelActionChangedAfterOwnerPreference: false,
@@ -3871,9 +3872,26 @@ async function main(): Promise<void> {
         updateParallelDiagnostic(state, {
           parallelGuestNoMutationConfirmed: true,
         });
-        if (afterGuest.activeOperation?.operationId !== activeOperationId) {
-          incomplete("ACTION_FINISHED_BEFORE_OWNER_PARALLEL_CHAT");
-        }
+        const ownerMove =
+          afterGuest.activeOperation?.operationId === activeOperationId
+            ? afterGuest
+            : await waitForPlayer(
+                context,
+                90_000,
+                (player) =>
+                  isOperationActive(player) &&
+                  player.activeOperation?.kind === "move_to" &&
+                  typeof player.activeOperation.bodyStartedAt === "string" &&
+                  player.activeOperation.operationId !== activeOperationId &&
+                  player.actionRevision > afterGuest.actionRevision,
+              );
+        const ownerMoveOperationId = ownerMove.activeOperation?.operationId;
+        if (ownerMoveOperationId === undefined)
+          incomplete("OWNER_PARALLEL_MOVE_NOT_ACTIVE");
+        updateParallelDiagnostic(state, {
+          parallelOwnerMoveReacquired:
+            ownerMoveOperationId !== activeOperationId,
+        });
         const botBeforeOwnerRequest = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -3885,6 +3903,15 @@ async function main(): Promise<void> {
           botBeforeOwnerRequest.y - ownerPosition.y,
           botBeforeOwnerRequest.z - ownerPosition.z,
         );
+        const liveBeforeOwnerChat = playerOf(
+          await collect(context.runtime.app),
+        );
+        if (
+          liveBeforeOwnerChat.activeOperation?.operationId !==
+            ownerMoveOperationId ||
+          typeof liveBeforeOwnerChat.activeOperation.bodyStartedAt !== "string"
+        )
+          incomplete("OWNER_PARALLEL_MOVE_ENDED_BEFORE_CHAT");
         const ownerReplyStart = context.responseQueue.length;
         const ownerPreferenceSentAt = Date.now();
         sendChat(
@@ -3893,13 +3920,13 @@ async function main(): Promise<void> {
         );
         updateParallelDiagnostic(state, { parallelOwnerPreferenceSent: true });
         const changed = await waitForPlayer(context, 90_000, (player) =>
-          ownerPreferenceWasResolved(afterGuest, player, ownerPreferenceSentAt),
+          ownerPreferenceWasResolved(ownerMove, player, ownerPreferenceSentAt),
         );
         const ownerOpinionReceived =
-          changed.counters.llmCalls > afterGuest.counters.llmCalls ||
+          changed.counters.llmCalls > ownerMove.counters.llmCalls ||
           context.responseQueue.length > ownerReplyStart;
         const ownerRequestChangedGoal = ownerPreferenceWasResolved(
-          afterGuest,
+          ownerMove,
           changed,
           ownerPreferenceSentAt,
         );
@@ -3918,9 +3945,9 @@ async function main(): Promise<void> {
           75_000,
           async (player) => {
             const actionChanged =
-              player.actionRevision > afterGuest.actionRevision &&
-              (player.activeOperation?.operationId !== activeOperationId ||
-                newOutcomes(afterGuest, player).some(
+              player.actionRevision > ownerMove.actionRevision &&
+              (player.activeOperation?.operationId !== ownerMoveOperationId ||
+                newOutcomes(ownerMove, player).some(
                   (outcome) =>
                     outcome.kind === "move_to" &&
                     outcome.status === "successful",
@@ -3980,9 +4007,9 @@ async function main(): Promise<void> {
         return {
           actionWasInFlight: true,
           ownerChatReceivedDuringLiveMove:
-            active.activeOperation?.kind === "move_to" &&
-            active.activeOperation.startedAt !== undefined &&
-            Date.parse(active.activeOperation.startedAt) >= promptSentAt,
+            ownerMove.activeOperation?.kind === "move_to" &&
+            ownerMove.activeOperation.startedAt !== undefined &&
+            Date.parse(ownerMove.activeOperation.startedAt) >= promptSentAt,
           unauthorizedChatDidNotMutateState: true,
           ownerOpinionProcessedDuringAction: true,
           ownerRequestChangedOrResolvedGoal: ownerRequestChangedGoal,

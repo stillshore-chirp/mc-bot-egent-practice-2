@@ -36,7 +36,7 @@ Skill交換caseが停止した時は、export依頼・export確認・import依�
 
 `persistent_memory_restart` の失敗artifactは、記憶依頼へのconversation完了、`remember_owner_fact`の呼出しと固定結果分類、owner reply受信、DB保存のstageを示します。terminal conversationが保存toolを呼ばなければ`OWNER_FACT_TOOL_NOT_CALLED`、保存拒否なら`OWNER_FACT_SAVE_REJECTED`でcaseを未完了にし、その後の自律thoughtでcase予算を使い切る前に原因を分けます。再起動後のDB欠落と回答不一致は既存の固定failure codeで識別します。予算停止をpassへ変えず、DB保存・同一DB再起動・合成phrase回答の条件も変えません。事実本文、tool引数、会話本文はartifactへ出しません。
 
-`parallel_dialogue_stop`が未完了の場合は、操作開始、guestの状態不変、owner依頼の解決、ownerへの接近、停止ラッチを固定boolで記録します。接近の照会回数と距離短縮の区分だけをartifactへ載せ、プレイヤー座標や会話本文は保存しません。guest依頼はBody開始済みの移動中に送り、500ms後の状態を確認してからowner依頼を続けます。
+`parallel_dialogue_stop`が未完了の場合は、操作開始、guestの状態不変、owner依頼の解決、ownerへの接近、停止ラッチを固定boolで記録します。接近の照会回数と距離短縮の区分だけをartifactへ載せ、プレイヤー座標や会話本文は保存しません。guest依頼はBody開始済みの移動中に送り、500ms後の状態を確認します。その移動が自然終了した場合は次のBody開始済み移動を待ち、owner依頼は稼働中の移動へ送ります。
 
 ## Issue #72 の機械的な確認範囲
 
