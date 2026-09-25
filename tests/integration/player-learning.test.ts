@@ -22,7 +22,10 @@ import {
   PlayerConversationAgent,
   PlayerPurposeAgent,
 } from "../../src/player/agents.js";
-import type { PlayerMemoryPort } from "../../src/player/contracts.js";
+import type {
+  PlayerMemoryPort,
+  PlayerRuntimeEvent,
+} from "../../src/player/contracts.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import { PlayerRuntime } from "../../src/player/runtime.js";
 import type { PlayerResponsesClient } from "../../src/player/responses.js";
@@ -36,6 +39,250 @@ afterEach(() => {
 });
 
 describe("player skill learning", () => {
+  it("reviews a new trusted success before action and retries from the saved learning state", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-learning-review-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory: join(directory, "exchange"),
+      allowedOperationNames: playerOperationNames,
+    });
+    const mind = PlayerMindStore.open(databasePath);
+    const runId = "learning-review-one-success";
+    const outcomeEvent = recordTrustedSuccessfulOutcome(mind, skills, runId);
+    const requests: unknown[] = [];
+    const client = scriptedClient([
+      (request) => {
+        requests.push(request);
+        return functionCallResponse(
+          "review-success",
+          "propose_skill_learning",
+          learningArguments(
+            runId,
+            "Reach a landmark using an observed route",
+            "dig",
+          ),
+        );
+      },
+      (request) => {
+        requests.push(request);
+        return functionCallResponse(
+          "action-after-review",
+          "commit_action_decision",
+          waitArguments(),
+        );
+      },
+    ]);
+    const committed: string[] = [];
+    const agent = new PlayerPurposeAgent({
+      client,
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationOnlyBody(),
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: (_snapshot, decision) => committed.push(decision.kind),
+    });
+
+    const first = await agent.think({
+      snapshot: mind.snapshot(),
+      events: [outcomeEvent],
+    });
+    expect(first.accepted).toBe(false);
+    expect(mind.snapshot().learningReferences).toHaveLength(1);
+    expect(mind.snapshot().counters.learningUpdates).toBe(1);
+    expect(requestToolNames(requests[0])).toEqual(["propose_skill_learning"]);
+    expect(mind.pendingEvents()).toHaveLength(1);
+
+    const retry = await agent.think({
+      snapshot: mind.snapshot(),
+      events: mind.pendingEvents(),
+    });
+    expect(retry.accepted).toBe(true);
+    expect(requests).toHaveLength(2);
+    expect(requestToolNames(requests[1])).toContain("commit_action_decision");
+    expect(committed).toEqual(["wait"]);
+    expect(mind.pendingEvents()).toHaveLength(0);
+    expect(mind.snapshot().counters.learningUpdates).toBe(1);
+
+    skills.close();
+    mind.close();
+  });
+
+  it("lets a non-reusable success skip learning and does not review the same run repeatedly", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-learning-skip-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory: join(directory, "exchange"),
+      allowedOperationNames: playerOperationNames,
+    });
+    const mind = PlayerMindStore.open(databasePath);
+    const outcomeEvent = recordTrustedSuccessfulOutcome(
+      mind,
+      skills,
+      "learning-review-skip-once",
+    );
+    const requests: unknown[] = [];
+    const client = scriptedClient([
+      (request) => {
+        requests.push(request);
+        return textResponse("review-skipped", "No reusable method was found.");
+      },
+      (request) => {
+        requests.push(request);
+        return functionCallResponse(
+          "action-after-skip",
+          "commit_action_decision",
+          waitArguments(),
+        );
+      },
+      (request) => {
+        requests.push(request);
+        return functionCallResponse(
+          "same-run-retry",
+          "commit_action_decision",
+          waitArguments(),
+        );
+      },
+    ]);
+    const agent = new PlayerPurposeAgent({
+      client,
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationOnlyBody(),
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: () => undefined,
+    });
+
+    const first = await agent.think({
+      snapshot: mind.snapshot(),
+      events: [outcomeEvent],
+    });
+    expect(first.accepted).toBe(true);
+    expect(requestToolNames(requests[0])).toEqual(["propose_skill_learning"]);
+    expect(requestToolNames(requests[1])).toContain("commit_action_decision");
+    expect(mind.snapshot().counters.learningUpdates).toBe(0);
+
+    const retry = await agent.think({
+      snapshot: mind.snapshot(),
+      events: [outcomeEvent],
+    });
+    expect(retry.accepted).toBe(true);
+    expect(requests).toHaveLength(3);
+    expect(requestToolNames(requests[2])).toContain("commit_action_decision");
+    expect(mind.snapshot().counters.learningUpdates).toBe(0);
+
+    skills.close();
+    mind.close();
+  });
+
+  it("requires a trusted receipt and avoids review on stale or stopped state", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-learning-guard-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "player.sqlite");
+    const skills = McSkillRepository.open({
+      databasePath,
+      exchangeDirectory: join(directory, "exchange"),
+      allowedOperationNames: playerOperationNames,
+    });
+    const mind = PlayerMindStore.open(databasePath);
+    const observedAt = new Date().toISOString();
+    mind.recordOutcome({
+      evidence: {
+        operationId: "runtime-success-without-receipt",
+        kind: "dig",
+        status: "successful",
+        summary: "The runtime recorded a success without a trusted receipt.",
+        observedAt,
+      },
+    });
+    const outcomeEvent = mind.enqueueEvent(
+      "body_outcome",
+      "A body outcome needs review.",
+    );
+    const requests: unknown[] = [];
+    const agent = new PlayerPurposeAgent({
+      client: scriptedClient([
+        (request) => {
+          requests.push(request);
+          return functionCallResponse(
+            "action-after-missing-receipt",
+            "commit_action_decision",
+            waitArguments(),
+          );
+        },
+        (request) => {
+          requests.push(request);
+          return functionCallResponse(
+            "action-after-stale-snapshot",
+            "commit_action_decision",
+            waitArguments(),
+          );
+        },
+      ]),
+      apiKey: "test-only",
+      model: "gpt-6-luna",
+      body: observationOnlyBody(),
+      skills,
+      mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onCommitted: () => undefined,
+    });
+
+    const withoutReceipt = await agent.think({
+      snapshot: mind.snapshot(),
+      events: [outcomeEvent],
+    });
+    expect(withoutReceipt.accepted).toBe(true);
+    expect(requestToolNames(requests[0])).toContain("commit_action_decision");
+
+    const staleEvent = recordTrustedSuccessfulOutcome(
+      mind,
+      skills,
+      "learning-review-stale-outcome",
+    );
+    const staleSnapshot = mind.snapshot();
+    mind.recordOutcome({
+      evidence: {
+        operationId: "newer-runtime-outcome",
+        kind: "dig",
+        status: "failed",
+        summary: "A newer outcome replaced the old success.",
+        observedAt: new Date(Date.now() + 1).toISOString(),
+      },
+    });
+    const currentSnapshot = mind.snapshot();
+    const stale = await agent.think({
+      snapshot: staleSnapshot,
+      events: [staleEvent],
+    });
+    expect(stale.accepted).toBe(false);
+    expect(requests).toHaveLength(1);
+
+    mind.stop();
+    const stopped = await agent.think({
+      snapshot: currentSnapshot,
+      events: [staleEvent],
+    });
+    expect(stopped.accepted).toBe(false);
+    expect(requests).toHaveLength(1);
+
+    skills.close();
+    mind.close();
+  });
+
   it("turns an owner chat proposal into a reasoned body operation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "player-proposal-test-"));
     temporaryDirectories.push(directory);
@@ -491,6 +738,48 @@ function learningArguments(
   };
 }
 
+function recordTrustedSuccessfulOutcome(
+  mind: PlayerMindStore,
+  skills: McSkillRepository,
+  runId: string,
+): PlayerRuntimeEvent {
+  const observedAt = new Date().toISOString();
+  const expectedOutcome = "The selected block is removed from view.";
+  skills.recordTrustedEvidence({
+    runId,
+    operationName: "dig",
+    inputSummary: "operation=dig against the selected visible block",
+    conditions: ["The target block is visible and within reach."],
+    expectedOutcome,
+    observedOutcome: "successful",
+    observationSummary: "The next body observation confirmed the block change.",
+    observedAt,
+  });
+  mind.recordOutcome({
+    evidence: {
+      operationId: runId,
+      kind: "dig",
+      status: "successful",
+      summary: "The body observation confirmed the expected change.",
+      expectedOutcome,
+      observedAt,
+    },
+  });
+  return mind.enqueueEvent(
+    "body_outcome",
+    "A successful body outcome needs purpose review.",
+  );
+}
+
+function requestToolNames(request: unknown): string[] {
+  const tools = recordOf(request)?.tools;
+  if (!Array.isArray(tools))
+    throw new Error("Responses request does not contain tools");
+  return tools
+    .map((tool) => recordOf(tool)?.name)
+    .filter((name): name is string => typeof name === "string");
+}
+
 function waitArguments(): Record<string, unknown> {
   return {
     kind: "wait",
@@ -499,7 +788,7 @@ function waitArguments(): Record<string, unknown> {
     expectedOutcome: "",
     skillId: "",
     skillVersion: 0,
-    reason: "The learning proposal has been recorded; wait for a new event.",
+    reason: "Wait for the next meaningful world change before acting.",
     wakeOn: ["state_changed"],
     wakeAt: "",
   };
