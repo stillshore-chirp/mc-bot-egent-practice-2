@@ -1557,7 +1557,9 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
     counters: snapshot.counters,
     recentJudgments: snapshot.recentJudgments.slice(-4),
     omittedJudgmentCount: Math.max(0, snapshot.recentJudgments.length - 4),
-    recentOutcomes: snapshot.recentOutcomes.slice(-4),
+    recentOutcomes: snapshot.recentOutcomes
+      .slice(-4)
+      .map(({ lookSweep: _lookSweep, ...outcome }) => outcome),
     omittedOutcomeCount: Math.max(0, snapshot.recentOutcomes.length - 4),
     olderMovementOutcomes: snapshot.recentOutcomes
       .slice(0, -4)

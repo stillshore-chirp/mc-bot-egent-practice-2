@@ -11,12 +11,14 @@ import { McSkillRepository } from "../../src/mc-skills/index.js";
 import type {
   PlayerBody,
   PlayerBodyEvent,
+  PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerKnowledge,
   PlayerOperation,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
+import { compactSnapshot } from "../../src/player/agents.js";
 import type {
   PlayerMemoryPort,
   PlayerThoughtDecision,
@@ -486,7 +488,7 @@ describe("integrated player runtime", () => {
           try {
             if (thoughtCount === 1) {
               firstSignal = signal;
-              const decision = action("slow-action");
+              const decision = action("slow-action", { kind: "look_sweep" });
               const saved = mind.commitThought({
                 expectedRevision: snapshot.revision,
                 decision,
@@ -554,6 +556,8 @@ describe("integrated player runtime", () => {
         elapsedMs: 30_000,
         at: new Date().toISOString(),
       });
+      const scanEvidence = makeLookSweepEvidence();
+      body.setLookSweepOnNextResult(scanEvidence);
       body.completeActive("successful");
       await waitFor(() => body.results.length === 1);
       expect(firstSignal?.aborted).toBe(false);
@@ -578,6 +582,24 @@ describe("integrated player runtime", () => {
       );
       expect(followupSnapshot?.lastOutcome?.summary).toContain(
         "期待したstep=observe a changed view",
+      );
+      expect(followupSnapshot?.lastOutcome?.lookSweep).toEqual(scanEvidence);
+      const compacted = compactSnapshot(followupSnapshot!) as {
+        lastOutcome?: { lookSweep?: PlayerBodyLookSweep };
+        recentOutcomes?: readonly {
+          operationId: string;
+          kind: string;
+          lookSweep?: PlayerBodyLookSweep;
+        }[];
+      };
+      expect(compacted.lastOutcome?.lookSweep).toEqual(scanEvidence);
+      expect(compacted.recentOutcomes?.at(-1)).toMatchObject({
+        operationId: "slow-action",
+        kind: "look_sweep",
+      });
+      expect(compacted.recentOutcomes?.at(-1)).not.toHaveProperty("lookSweep");
+      expect(JSON.stringify(compacted).match(/blue_wool/g) ?? []).toHaveLength(
+        1,
       );
       expect(followupSnapshot?.lastObservation?.timeOfDay).toBe(16_000);
     } finally {
@@ -1682,6 +1704,7 @@ class DeferredBody implements PlayerBody {
   #observation = observation();
   #resultBefore: PlayerBodyObservation | null = null;
   #resultAfter: PlayerBodyObservation | null = null;
+  #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
 
@@ -1707,6 +1730,10 @@ class DeferredBody implements PlayerBody {
 
   public completeActive(status: PlayerOperationResult["status"]): void {
     this.#finishActive?.(status);
+  }
+
+  public setLookSweepOnNextResult(value: PlayerBodyLookSweep): void {
+    this.#lookSweepOnNextResult = value;
   }
 
   public execute(
@@ -1742,7 +1769,11 @@ class DeferredBody implements PlayerBody {
           before: this.#resultBefore,
           after: this.#resultAfter,
           recoveryRequired,
+          ...(this.#lookSweepOnNextResult === undefined
+            ? {}
+            : { lookSweep: this.#lookSweepOnNextResult }),
         };
+        this.#lookSweepOnNextResult = undefined;
         if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);
         resolve(result);
@@ -1795,14 +1826,58 @@ class DeferredBody implements PlayerBody {
 
 function action(
   operationId: string,
+  operation: PlayerOperation = {
+    kind: "look",
+    target: { x: 0, y: 64, z: 1 },
+  },
 ): Extract<PlayerThoughtDecision, { kind: "act" }> {
   return {
     kind: "act",
     purpose: "test purpose",
-    operation: { kind: "look", target: { x: 0, y: 64, z: 1 } },
+    operation,
     operationId,
     expectedOutcome: "observe a changed view",
     wakeOn: ["body_outcome"],
+  };
+}
+
+function makeLookSweepEvidence(): PlayerBodyLookSweep {
+  const emptyView = (
+    directionIndex: number | null,
+  ): PlayerBodyLookSweep["current"] => ({
+    directionIndex,
+    yawDegrees:
+      directionIndex === null ? 0 : ((directionIndex * 45 + 180) % 360) - 180,
+    pitchDegrees: 0,
+    dimension: "overworld",
+    visibleBlocks: [],
+    visibleEntities: [],
+    omittedBlockCandidates: 0,
+    omittedEntityCandidates: 0,
+    candidateSearchMayBeTruncated: false,
+  });
+  const directions = Array.from({ length: 8 }, (_, directionIndex) => {
+    const view = { ...emptyView(directionIndex), directionIndex };
+    return directionIndex === 6
+      ? {
+          ...view,
+          visibleBlocks: [
+            {
+              name: "blue_wool",
+              position: { x: 3, y: 64, z: 0 },
+              distance: 3,
+            },
+          ],
+        }
+      : view;
+  });
+  return {
+    current: emptyView(null),
+    directions,
+    plannedDirectionCount: 8,
+    complete: true,
+    candidateSearchMayBeTruncated: false,
+    worldAbsenceEstablished: false,
   };
 }
 

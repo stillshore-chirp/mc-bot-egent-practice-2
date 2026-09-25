@@ -251,8 +251,17 @@ describe("McSkillRepository", () => {
       "control",
     ]);
     expect(repository.get("mc-skill-exploration")).toMatchObject({
-      operationRefs: ["look", "move_relative", "move_to"],
+      operationRefs: ["look", "look_sweep", "move_relative", "move_to"],
     });
+    expect(repository.get("mc-skill-exploration").body).toContain(
+      "同じ移動の反復前にlook_sweep",
+    );
+    expect(repository.get("mc-skill-exploration").body).toContain(
+      "下向きの-25度",
+    );
+    expect(repository.get("mc-skill-exploration").body).toContain(
+      "上方は正のpitchDegrees",
+    );
     const custom = createDigSkill(repository, "restart-skill");
     repository.close();
 

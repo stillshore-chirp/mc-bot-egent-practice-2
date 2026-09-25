@@ -4,6 +4,10 @@ import Database from "better-sqlite3";
 import { z } from "zod";
 
 import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
+import {
+  playerBodyLookSweepSchema,
+  type PlayerBodyLookSweep,
+} from "../minecraft/player-body-observation.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
 import {
   playerActionDecisionValidationCodes,
@@ -128,6 +132,7 @@ const outcomeHistorySchema = z
     summary: z.string().min(1).max(700),
     observedAt: z.iso.datetime(),
     movementDelta: movementDeltaSchema.optional(),
+    lookSweep: playerBodyLookSweepSchema.optional(),
     expectedOutcome: z.string().min(1).max(400).optional(),
     skillId: z.string().min(1).max(80).optional(),
     skillVersion: z.number().int().positive().optional(),
@@ -302,6 +307,7 @@ const stateSchema = z
         summary: z.string().min(1).max(700),
         observedAt: z.iso.datetime(),
         movementDelta: movementDeltaSchema.optional(),
+        lookSweep: playerBodyLookSweepSchema.optional(),
         expectedOutcome: z.string().min(1).max(400).optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
@@ -1025,6 +1031,7 @@ export class PlayerMindStore {
       readonly summary: string;
       readonly observedAt: string;
       readonly movementDelta?: PlayerObservedDisplacement;
+      readonly lookSweep?: PlayerBodyLookSweep;
       readonly expectedOutcome?: string;
       readonly skillId?: string;
       readonly skillVersion?: number;
@@ -1042,6 +1049,13 @@ export class PlayerMindStore {
         : {
             movementDelta: movementDeltaSchema.parse(
               input.evidence.movementDelta,
+            ),
+          }),
+      ...(input.evidence.lookSweep === undefined
+        ? {}
+        : {
+            lookSweep: playerBodyLookSweepSchema.parse(
+              input.evidence.lookSweep,
             ),
           }),
       ...(input.evidence.expectedOutcome === undefined
@@ -1076,6 +1090,9 @@ export class PlayerMindStore {
         ...(evidence.movementDelta === undefined
           ? {}
           : { movementDelta: evidence.movementDelta }),
+        ...(evidence.lookSweep === undefined
+          ? {}
+          : { lookSweep: evidence.lookSweep }),
         ...(evidence.expectedOutcome === undefined
           ? {}
           : { expectedOutcome: evidence.expectedOutcome }),

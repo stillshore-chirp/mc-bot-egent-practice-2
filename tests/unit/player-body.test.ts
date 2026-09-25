@@ -453,14 +453,30 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
 
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
-    expect(playerOperationNames).toHaveLength(29);
+    expect(playerOperationNames).toHaveLength(30);
     expect(Object.keys(playerOperationDescriptions).sort()).toEqual(
       [...playerOperationNames].sort(),
     );
     expect(playerOperationNames).toContain("move_to");
     expect(playerOperationNames).toContain("move_relative");
+    expect(playerOperationNames).toContain("look_sweep");
     expect(playerOperationNames).toContain("window_transfer");
     expect(playerOperationNames).toContain("elytra_fly");
+    expect(playerOperationSchema.parse({ kind: "look_sweep" })).toEqual({
+      kind: "look_sweep",
+    });
+    expect(
+      playerOperationSchema.parse({ kind: "look_sweep", pitchDegrees: -60 }),
+    ).toMatchObject({ kind: "look_sweep", pitchDegrees: -60 });
+    expect(
+      playerOperationSchema.parse({ kind: "look_sweep", pitchDegrees: 60 }),
+    ).toMatchObject({ kind: "look_sweep", pitchDegrees: 60 });
+    expect(() =>
+      playerOperationSchema.parse({ kind: "look_sweep", pitchDegrees: -60.1 }),
+    ).toThrow();
+    expect(() =>
+      playerOperationSchema.parse({ kind: "look_sweep", pitchDegrees: 60.1 }),
+    ).toThrow();
     expect(() =>
       playerOperationSchema.parse({
         kind: "dig",
@@ -523,6 +539,87 @@ describe("player body", () => {
       kind: "use",
       target: { kind: "item", holdTicks: 200 },
     });
+  });
+
+  it("physically sweeps bounded views and reports blocks found only after turning", async () => {
+    const fake = makeFakeBot();
+    const eastBlock = new Vec3(3, 64, 0);
+    fake.blocks.set("3,64,0", makeBlock("blue_wool", 3, eastBlock));
+    fake.candidates.push(eastBlock);
+    const before = observePlayerBody(fake.bot, "owner");
+    expect(before.perception.blocks.map(({ name }) => name)).not.toContain(
+      "blue_wool",
+    );
+
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const result = await body.execute({ kind: "look_sweep" });
+    const sweep = result.lookSweep;
+
+    expect(result.status).toBe("successful");
+    expect(fake.bot.lookAt).toHaveBeenCalledTimes(8);
+    expect(sweep?.complete).toBe(true);
+    expect(sweep?.current.visibleBlocks.map(({ name }) => name)).not.toContain(
+      "blue_wool",
+    );
+    expect(
+      sweep?.directions.some(({ visibleBlocks }) =>
+        visibleBlocks.some(({ name }) => name === "blue_wool"),
+      ),
+    ).toBe(true);
+    expect(sweep?.directions).toHaveLength(8);
+    expect(sweep?.directions.map(({ pitchDegrees }) => pitchDegrees)).toEqual(
+      Array(8).fill(-25),
+    );
+    expect(sweep?.worldAbsenceEstablished).toBe(false);
+    const allViews = [sweep?.current, ...(sweep?.directions ?? [])].filter(
+      (view) => view !== undefined,
+    );
+    expect(allViews.every((view) => view.visibleBlocks.length <= 8)).toBe(true);
+    expect(allViews.every((view) => view.visibleEntities.length <= 2)).toBe(
+      true,
+    );
+    expect(
+      allViews.reduce((total, view) => total + view.visibleBlocks.length, 0),
+    ).toBeLessThanOrEqual(72);
+    expect(
+      allViews.reduce((total, view) => total + view.visibleEntities.length, 0),
+    ).toBeLessThanOrEqual(18);
+  });
+
+  it("sweeps at a requested upward pitch and reports observed pitch", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const result = await body.execute({
+      kind: "look_sweep",
+      pitchDegrees: 35,
+    });
+
+    expect(result.status).toBe("successful");
+    expect(fake.bot.lookAt).toHaveBeenCalledTimes(8);
+    expect(result.lookSweep?.directions).toHaveLength(8);
+    expect(
+      result.lookSweep?.directions.map(({ pitchDegrees }) => pitchDegrees),
+    ).toEqual(Array(8).fill(35));
+  });
+
+  it("stops a look sweep after an abort and keeps its partial result explicitly incomplete", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(async () => {
+      controller.abort(new Error("stop scan"));
+    });
+
+    const result = await body.execute(
+      { kind: "look_sweep" },
+      controller.signal,
+    );
+
+    expect(result.status).toBe("interrupted");
+    expect(fake.bot.lookAt).toHaveBeenCalledTimes(1);
+    expect(result.lookSweep?.complete).toBe(false);
+    expect(result.lookSweep?.directions).toHaveLength(0);
+    expect(result.lookSweep?.worldAbsenceEstablished).toBe(false);
   });
 
   it("waits for Mineflayer plugin injection and retains lifecycle events across reconnects", async () => {

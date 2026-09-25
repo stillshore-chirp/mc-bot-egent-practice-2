@@ -40,6 +40,7 @@ export const playerOperationNames = [
   "move_to",
   "move_relative",
   "look",
+  "look_sweep",
   "control",
   "equip",
   "use",
@@ -76,6 +77,8 @@ export const playerOperationDescriptions = {
   move_relative:
     "Move by a bounded offset from the current position using pathfinding. Positive X is east and positive Z is south; use when direction is known but the destination is not visible.",
   look: "Turn the player's view toward a world position.",
+  look_sweep:
+    "Physically look in eight directions at pitchDegrees from -60 (down) to 60 (up); omitted pitchDegrees defaults to -25. Each view reports its observed pitch and only the blocks and non-player entities visible from that view. The result is a bounded visible subset; a missing target is not proof of absence.",
   control:
     "Hold the selected movement, jump, sprint, or sneak controls for bounded ticks.",
   equip: "Equip an inventory item into a player equipment slot.",
@@ -130,6 +133,12 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
   z.object({ kind: z.literal("look"), target: vectorSchema }).strict(),
+  z
+    .object({
+      kind: z.literal("look_sweep"),
+      pitchDegrees: z.number().min(-60).max(60).optional(),
+    })
+    .strict(),
   z
     .object({
       kind: z.literal("control"),

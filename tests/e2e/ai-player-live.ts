@@ -339,6 +339,7 @@ interface UnknownCompositeDiagnostic {
 
 type BodyOperationStatus =
   "successful" | "failed" | "interrupted" | "unverified";
+type LookSweepStatusDiagnostic = BodyOperationStatus | "unavailable";
 type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 
 type BodyDetailClass =
@@ -393,6 +394,12 @@ interface BodySmokeDiagnostic {
   readonly obstacleRoutePathStatus?: BodyPathStatus;
   readonly obstacleRoutePathUpdateCount?: number;
   readonly obstacleRouteMaxPathBand?: "none" | "short" | "long";
+  readonly obstacleRouteTargetObservedInSweep?: boolean;
+  readonly obstacleRouteLookSweepStatus?: LookSweepStatusDiagnostic;
+  readonly obstacleRouteLookSweepComplete?: boolean;
+  readonly obstacleRouteLookSweepAnyViewTargetName?: boolean;
+  readonly obstacleRouteLookSweepAnyTruncation?: boolean;
+  readonly obstacleRouteLookSweepDistinctYawCount?: number;
   readonly obstacleRouteLookStatus?: BodyOperationStatus;
   readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
@@ -982,6 +989,50 @@ function bodySmokeEvidence(
     ...(diagnostic.obstacleRouteMaxPathBand === undefined
       ? {}
       : { obstacleRouteMaxPathBand: diagnostic.obstacleRouteMaxPathBand }),
+    ...(diagnostic.obstacleRouteTargetObservedInSweep === undefined
+      ? {}
+      : {
+          obstacleRouteTargetObservedInSweep:
+            diagnostic.obstacleRouteTargetObservedInSweep,
+        }),
+    ...(diagnostic.obstacleRouteLookSweepStatus === undefined
+      ? {}
+      : {
+          obstacleRouteLookSweepStatus: diagnostic.obstacleRouteLookSweepStatus,
+        }),
+    ...(diagnostic.obstacleRouteLookSweepComplete === undefined
+      ? {}
+      : {
+          obstacleRouteLookSweepComplete:
+            diagnostic.obstacleRouteLookSweepComplete,
+        }),
+    ...(diagnostic.obstacleRouteLookSweepAnyViewTargetName === undefined
+      ? {}
+      : {
+          obstacleRouteLookSweepAnyViewTargetName:
+            diagnostic.obstacleRouteLookSweepAnyViewTargetName,
+        }),
+    ...(diagnostic.obstacleRouteLookSweepAnyTruncation === undefined
+      ? {}
+      : {
+          obstacleRouteLookSweepAnyTruncation:
+            diagnostic.obstacleRouteLookSweepAnyTruncation,
+        }),
+    ...(diagnostic.obstacleRouteLookSweepDistinctYawCount === undefined
+      ? {}
+      : {
+          obstacleRouteLookSweepDistinctYawCount:
+            diagnostic.obstacleRouteLookSweepDistinctYawCount,
+        }),
+    ...(diagnostic.obstacleRouteLookStatus === undefined
+      ? {}
+      : { obstacleRouteLookStatus: diagnostic.obstacleRouteLookStatus }),
+    ...(diagnostic.obstacleRouteTargetVisibleAfterLook === undefined
+      ? {}
+      : {
+          obstacleRouteTargetVisibleAfterLook:
+            diagnostic.obstacleRouteTargetVisibleAfterLook,
+        }),
     ...(diagnostic.resourceTargetRconConfirmed === undefined
       ? {}
       : {
@@ -4757,8 +4808,9 @@ async function runOperationSmoke(
         body = client.createPlayerBody();
         const names = new Set(playerOperationNames);
         if (
-          names.size !== 29 ||
+          names.size !== 30 ||
           !names.has("move_relative") ||
+          !names.has("look_sweep") ||
           !names.has("dig") ||
           !names.has("open_window") ||
           !names.has("window_transfer") ||
@@ -5483,6 +5535,51 @@ async function runOperationSmoke(
           };
           if (!obstacleRouteVerifiedByServer)
             incomplete("BODY_NAVIGATION_PROBE_ROUTE_NOT_CONFIRMED");
+          const lookSweepResult = await body
+            .execute({ kind: "look_sweep" }, abort.signal)
+            .catch(() => undefined);
+          const lookSweep = lookSweepResult?.lookSweep;
+          const lookSweepViews =
+            lookSweep === undefined
+              ? []
+              : [lookSweep.current, ...lookSweep.directions];
+          const lookSweepAnyViewTargetName = lookSweepViews.some(
+            ({ visibleBlocks }) =>
+              visibleBlocks.some(({ name }) => name === "blue_wool"),
+          );
+          const lookSweepAnyTruncation =
+            lookSweep?.candidateSearchMayBeTruncated === true ||
+            lookSweepViews.some(
+              (view) =>
+                view.candidateSearchMayBeTruncated ||
+                view.omittedBlockCandidates > 0 ||
+                view.omittedEntityCandidates > 0,
+            );
+          const lookSweepDistinctYawCount = new Set(
+            (lookSweep?.directions ?? []).map(({ yawDegrees }) => yawDegrees),
+          ).size;
+          const targetObservedInLookSweep =
+            lookSweepResult?.status === "successful" &&
+            lookSweep?.complete === true &&
+            lookSweep.directions.some(({ visibleBlocks }) =>
+              visibleBlocks.some(
+                ({ name, position }) =>
+                  name === "blue_wool" &&
+                  position.x === fixtureTarget.x &&
+                  position.y === fixtureTarget.y &&
+                  position.z === fixtureTarget.z,
+              ),
+            );
+          state.bodySmokeDiagnostic = {
+            ...state.bodySmokeDiagnostic,
+            obstacleRouteTargetObservedInSweep: targetObservedInLookSweep,
+            obstacleRouteLookSweepStatus:
+              lookSweepResult?.status ?? "unavailable",
+            obstacleRouteLookSweepComplete: lookSweep?.complete === true,
+            obstacleRouteLookSweepAnyViewTargetName: lookSweepAnyViewTargetName,
+            obstacleRouteLookSweepAnyTruncation: lookSweepAnyTruncation,
+            obstacleRouteLookSweepDistinctYawCount: lookSweepDistinctYawCount,
+          };
           const targetLook = await body.execute(
             {
               kind: "look",
@@ -5558,6 +5655,8 @@ async function runOperationSmoke(
             if (!verified)
               incomplete("BODY_OBSTACLE_RESTORE_PROBE_NOT_APPLIED");
           }
+          if (!targetObservedInLookSweep)
+            incomplete("BODY_NAVIGATION_PROBE_LOOK_SWEEP_TARGET_NOT_OBSERVED");
         }
         state.autonomousRegion = await captureBlockBaseline(
           rcon,

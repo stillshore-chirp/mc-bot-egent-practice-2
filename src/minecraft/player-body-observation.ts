@@ -2,6 +2,7 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
+import { z } from "zod";
 import { Vec3 } from "vec3";
 
 export interface BodyBlockCoordinates {
@@ -144,6 +145,142 @@ export interface PlayerBodyObservation {
     };
   };
   readonly window: BodyWindowSnapshot | null;
+}
+
+export const playerBodyLookSweepDirectionCount = 8;
+export const playerBodyLookSweepBlockLimit = 8;
+export const playerBodyLookSweepEntityLimit = 2;
+
+const lookSweepPositionSchema = z
+  .object({
+    x: z.number().finite(),
+    y: z.number().finite(),
+    z: z.number().finite(),
+  })
+  .strict();
+
+const lookSweepBlockSchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    position: lookSweepPositionSchema,
+    distance: z.number().finite().min(0),
+  })
+  .strict();
+
+const lookSweepEntitySchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    kind: z.string().min(1).max(80),
+    category: z.string().max(80).nullable(),
+    position: lookSweepPositionSchema,
+    distance: z.number().finite().min(0),
+  })
+  .strict();
+
+const lookSweepViewSchema = z
+  .object({
+    directionIndex: z
+      .number()
+      .int()
+      .min(0)
+      .max(playerBodyLookSweepDirectionCount - 1)
+      .nullable(),
+    yawDegrees: z.number().min(-180).max(180),
+    pitchDegrees: z.number().min(-90).max(90),
+    dimension: z.string().min(1).max(80),
+    visibleBlocks: z
+      .array(lookSweepBlockSchema)
+      .max(playerBodyLookSweepBlockLimit),
+    visibleEntities: z
+      .array(lookSweepEntitySchema)
+      .max(playerBodyLookSweepEntityLimit),
+    omittedBlockCandidates: z.number().int().nonnegative(),
+    omittedEntityCandidates: z.number().int().nonnegative(),
+    candidateSearchMayBeTruncated: z.boolean(),
+  })
+  .strict();
+
+export const playerBodyLookSweepSchema = z
+  .object({
+    current: lookSweepViewSchema,
+    directions: z
+      .array(
+        lookSweepViewSchema.omit({ directionIndex: true }).extend({
+          directionIndex: z
+            .number()
+            .int()
+            .min(0)
+            .max(playerBodyLookSweepDirectionCount - 1),
+        }),
+      )
+      .max(playerBodyLookSweepDirectionCount),
+    plannedDirectionCount: z.literal(playerBodyLookSweepDirectionCount),
+    complete: z.boolean(),
+    candidateSearchMayBeTruncated: z.boolean(),
+    worldAbsenceEstablished: z.literal(false),
+  })
+  .strict()
+  .refine(
+    (sweep) =>
+      !sweep.complete ||
+      (sweep.directions.length === playerBodyLookSweepDirectionCount &&
+        sweep.directions.every(
+          (direction, index) => direction.directionIndex === index,
+        )),
+    "A complete look sweep must observe each planned direction once in order",
+  );
+
+type PlayerBodyLookSweepView = z.infer<typeof lookSweepViewSchema>;
+export type PlayerBodyLookSweep = z.infer<typeof playerBodyLookSweepSchema>;
+
+export function summarizeLookSweepView(
+  observation: PlayerBodyObservation,
+  directionIndex: number | null,
+): PlayerBodyLookSweepView {
+  const blocks = observation.perception.blocks;
+  const entities = observation.perception.entities.filter(
+    ({ isPlayer }) => !isPlayer,
+  );
+  const omittedBlockCandidates =
+    observation.perception.omittedBlockCandidates +
+    Math.max(0, blocks.length - playerBodyLookSweepBlockLimit);
+  const omittedEntityCandidates =
+    observation.perception.omittedEntityCandidates +
+    Math.max(0, entities.length - playerBodyLookSweepEntityLimit);
+  return {
+    directionIndex,
+    yawDegrees: normalizeDegrees(observation.self.yaw),
+    pitchDegrees:
+      Math.round(((observation.self.pitch * 180) / Math.PI) * 10) / 10,
+    dimension: observation.dimension.slice(0, 80),
+    visibleBlocks: blocks
+      .slice(0, playerBodyLookSweepBlockLimit)
+      .map(({ name, position, distance }) => ({
+        name: name.slice(0, 80),
+        position: { x: position.x, y: position.y, z: position.z },
+        distance,
+      })),
+    visibleEntities: entities
+      .slice(0, playerBodyLookSweepEntityLimit)
+      .map(({ name, kind, category, position, distance }) => ({
+        name: name.slice(0, 80),
+        kind: kind.slice(0, 80),
+        category: category?.slice(0, 80) ?? null,
+        position: { x: position.x, y: position.y, z: position.z },
+        distance,
+      })),
+    omittedBlockCandidates,
+    omittedEntityCandidates,
+    candidateSearchMayBeTruncated:
+      observation.perception.candidateSearchMayBeTruncated ||
+      omittedBlockCandidates > 0 ||
+      omittedEntityCandidates > 0,
+  };
+}
+
+function normalizeDegrees(radians: number): number {
+  const degrees = (radians * 180) / Math.PI;
+  return Math.round((((((degrees + 180) % 360) + 360) % 360) - 180) * 10) / 10;
 }
 
 export interface PlayerBodyObservationOptions {

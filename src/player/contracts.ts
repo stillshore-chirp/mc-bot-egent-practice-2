@@ -1,5 +1,6 @@
 import type {
   PlayerBodyEvent,
+  PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerKnowledge,
   PlayerOperation,
@@ -93,6 +94,7 @@ export interface PlayerOutcomeEvidence {
   readonly summary: string;
   readonly observedAt: string;
   readonly movementDelta?: PlayerObservedDisplacement | undefined;
+  readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly expectedOutcome?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
@@ -141,6 +143,7 @@ export interface PlayerTrustedOutcomeEvidence {
   readonly summary: string;
   readonly observedAt: string;
   readonly movementDelta?: PlayerObservedDisplacement | undefined;
+  readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }

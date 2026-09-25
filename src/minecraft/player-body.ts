@@ -15,7 +15,11 @@ import {
 import {
   entityEyeHeight,
   observePlayerBody,
+  playerBodyLookSweepDirectionCount,
+  playerBodyLookSweepSchema,
+  summarizeLookSweepView,
   type BodyItemStack,
+  type PlayerBodyLookSweep,
   type PlayerBodyObservation,
   type PlayerBodyObservationOptions,
 } from "./player-body-observation.js";
@@ -35,6 +39,7 @@ export type {
   PlayerOperationName,
 } from "./player-body-schema.js";
 export type {
+  PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerBodyObservationOptions,
 } from "./player-body-observation.js";
@@ -137,6 +142,7 @@ export interface PlayerOperationResult {
     readonly type: "entity_hit" | "entity_died";
     readonly entityId: number;
   };
+  readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly detail?: string;
 }
 
@@ -236,6 +242,7 @@ interface ActiveOperation {
   runFinished: boolean;
   botDisconnected: boolean;
   effectItemName?: string;
+  lookSweep?: PlayerBodyLookSweep;
   expectedTrade?: {
     readonly input1Name: string;
     readonly input1Count: number;
@@ -669,6 +676,8 @@ function operationEvidence(
         Math.abs(after.self.pitch - expectedPitch) < 0.12
       );
     }
+    case "look_sweep":
+      return active.lookSweep?.complete === true;
     case "control":
     case "move_vehicle":
     case "elytra_fly":
@@ -1384,6 +1393,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       after,
       recoveryRequired,
       ...(observedEffect === undefined ? {} : { observedEffect }),
+      ...(active.lookSweep === undefined
+        ? {}
+        : { lookSweep: active.lookSweep }),
       detail,
     };
     if (recoveryRequired) {
@@ -1612,6 +1624,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       case "look":
         await bot.lookAt(positionVector(operation.target), true);
+        return;
+      case "look_sweep":
+        await this.runLookSweep(bot, operation, signal, active);
         return;
       case "control":
         for (const control of bodyControls)
@@ -1986,6 +2001,71 @@ export class MineflayerPlayerBody implements PlayerBody {
         return;
       }
     }
+  }
+
+  private async runLookSweep(
+    bot: Bot,
+    operation: Extract<PlayerOperation, { kind: "look_sweep" }>,
+    signal: AbortSignal,
+    active: ActiveOperation,
+  ): Promise<void> {
+    const current = this.safeObserve(bot);
+    if (current === null)
+      throw new Error("Current view is unavailable for a look sweep");
+    const currentView = summarizeLookSweepView(current, null);
+    let lookSweep = playerBodyLookSweepSchema.parse({
+      current: currentView,
+      directions: [],
+      plannedDirectionCount: playerBodyLookSweepDirectionCount,
+      complete: false,
+      candidateSearchMayBeTruncated: currentView.candidateSearchMayBeTruncated,
+      worldAbsenceEstablished: false,
+    });
+    active.lookSweep = lookSweep;
+
+    const baseYaw = current.self.yaw;
+    if (!Number.isFinite(baseYaw) || !Number.isFinite(current.self.pitch))
+      throw new Error("Current view angles are unavailable for a look sweep");
+    const origin = current.self.position;
+    const eye = new Vec3(origin.x, origin.y + current.self.eyeHeight, origin.z);
+    const horizontalDistance = 8;
+    const pitchRadians = ((operation.pitchDegrees ?? -25) * Math.PI) / 180;
+    const verticalOffset = Math.tan(pitchRadians) * horizontalDistance;
+
+    for (
+      let directionIndex = 0;
+      directionIndex < playerBodyLookSweepDirectionCount;
+      directionIndex += 1
+    ) {
+      throwIfAborted(signal);
+      const yaw =
+        baseYaw +
+        (directionIndex * Math.PI * 2) / playerBodyLookSweepDirectionCount;
+      const target = eye.offset(
+        -Math.sin(yaw) * horizontalDistance,
+        verticalOffset,
+        -Math.cos(yaw) * horizontalDistance,
+      );
+      await bot.lookAt(target, true);
+      throwIfAborted(signal);
+      const observation = this.safeObserve(bot);
+      if (observation === null)
+        throw new Error("View observation is unavailable during look sweep");
+      const view = summarizeLookSweepView(observation, directionIndex);
+      lookSweep = playerBodyLookSweepSchema.parse({
+        ...lookSweep,
+        directions: [...lookSweep.directions, view],
+        candidateSearchMayBeTruncated:
+          lookSweep.candidateSearchMayBeTruncated ||
+          view.candidateSearchMayBeTruncated,
+      });
+      active.lookSweep = lookSweep;
+    }
+
+    active.lookSweep = playerBodyLookSweepSchema.parse({
+      ...lookSweep,
+      complete: true,
+    });
   }
 
   private bindBot(bot: Bot): void {

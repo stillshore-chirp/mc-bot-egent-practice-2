@@ -664,6 +664,9 @@ export class PlayerRuntime {
         summary,
         observedAt,
         ...(movementDelta === undefined ? {} : { movementDelta }),
+        ...(result?.lookSweep === undefined
+          ? {}
+          : { lookSweep: result.lookSweep }),
         expectedOutcome,
         ...(skillId === undefined ? {} : { skillId }),
         ...(skillVersion === undefined ? {} : { skillVersion }),
