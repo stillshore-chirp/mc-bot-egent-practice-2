@@ -181,4 +181,6 @@ HEAD `d360a76` の対象試験run69では、空振りの相対移動を成功と
 
 HEAD `058735f` の対象試験run70では、通常観測を進行中思考の後へ繰り越す変更を含む状態でBody smokeと自発生活がpassしました。未知複合状況では制御した障害による`move_to`失敗、障害の復元後に行われた新しい行動判断、別IDの`move_relative`成功をゲーム内で確認しました。サーバー観測では標的への距離短縮も確認しましたが、標的の破壊・取得は未確認です。33 calls・既知162,571 input / 12,444 output tokensでcase呼び出し上限となりました。safe activityの`request_error`は11件、`commit_action_decision`拒否は1件です。run69の19件・2件より少ないものの、world状態と行動経路が異なるため、観測繰り越しによる削減とは断定しません。case usageは`partial_or_unknown`、cleanupは3/3です。
 
+HEAD `dc72c09` の対象試験run71では、検索結果に限定したSkill本文プレビューを追加した状態でBody smokeと自発生活がpassしました。未知複合状況では`search_skills`と`read_skill`をそれぞれ1回実行し、Skill本文へ到達する経路を確認しました。サーバー観測では標的への距離短縮とworld変化を確認しましたが、標的は見えず、破壊・取得も未確認です。障害物の介入は適格条件を満たさず、失敗後の回復は確認できませんでした。34 calls・既知108,066 input / 7,740 output tokensでcase呼び出し上限となりました。safe activityの`request_error`は19件で、プレビューによる達成率・使用量改善は断定できません。case usageは`partial_or_unknown`、cleanupは3/3です。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
