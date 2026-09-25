@@ -874,6 +874,15 @@ describe("player agent response rounds", () => {
         )
         .find((entry) => entry.name === "remember_owner_fact");
       expect(tool).toBeDefined();
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "返答を作る前にremember_owner_factを必ず呼び",
+      );
+      expect(request.instructions).toContain(
+        "toolを呼ばなかった、または成功を確認できなかった場合は、保存した・覚えたと表現しない",
+      );
       expect(JSON.stringify(tool?.parameters)).toContain(
         '"required":["summary"]',
       );
