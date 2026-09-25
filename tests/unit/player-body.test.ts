@@ -67,6 +67,7 @@ function makeFakeBot(
   hiddenBlockKeys: Set<string>;
   findBlockSearches: { count: number; resultCount: number }[];
   setCrosshairRaycastResult(result: unknown): void;
+  setPlacementRaycastBlocker(targetPosition: Vec3, blockerPosition: Vec3): void;
   setWindow(window: Window): void;
   emitWindowOpen(): void;
   resumeWindowOpen(): void;
@@ -80,6 +81,8 @@ function makeFakeBot(
   const hiddenBlockKeys = new Set<string>();
   const findBlockSearches: { count: number; resultCount: number }[] = [];
   let crosshairRaycastResult: unknown = null;
+  let placementRaycastBlocker:
+    { targetPosition: Vec3; block: FakeBlock } | undefined;
   let pendingWindow: (Window & EventEmitter) | undefined;
   let deferWindowOpen = options.deferWindowOpen === true;
   const key = (position: Vec3): string =>
@@ -154,16 +157,46 @@ function makeFakeBot(
     },
     world: {
       raycast: (
-        _origin: Vec3,
+        origin: Vec3,
         direction: Vec3,
-        _range: number,
+        range: number,
         matching?: (block: FakeBlock) => boolean,
-      ) =>
-        matching === undefined
-          ? crosshairRaycastResult
-          : direction.x > 0.2
-            ? makeBlock("stone", 1, new Vec3(1, 64, -2))
-            : null,
+      ) => {
+        if (placementRaycastBlocker !== undefined) {
+          const targetCenter = placementRaycastBlocker.targetPosition.offset(
+            0.5,
+            0.5,
+            0.5,
+          );
+          const targetOffset = targetCenter.minus(origin);
+          const targetDistance = targetOffset.norm();
+          const targetDirection = targetOffset.scaled(1 / targetDistance);
+          if (direction.minus(targetDirection).norm() < 0.001) {
+            const blockerCenter = placementRaycastBlocker.block.position.offset(
+              0.5,
+              0.5,
+              0.5,
+            );
+            const blockerOffset = blockerCenter.minus(origin);
+            const blockerDistance = blockerOffset.dot(direction);
+            const lateralDistance = blockerOffset
+              .minus(direction.scaled(blockerDistance))
+              .norm();
+            if (
+              blockerDistance > 0 &&
+              blockerDistance < range &&
+              lateralDistance < 0.75 &&
+              (matching === undefined ||
+                matching(placementRaycastBlocker.block))
+            )
+              return placementRaycastBlocker.block;
+          }
+        }
+        if (matching === undefined) return crosshairRaycastResult;
+        return direction.x > 0.2
+          ? makeBlock("stone", 1, new Vec3(1, 64, -2))
+          : null;
+      },
     },
     pathfinder: {
       goto: vi.fn(async () => undefined),
@@ -263,6 +296,12 @@ function makeFakeBot(
     setCrosshairRaycastResult: (result) => {
       crosshairRaycastResult = result;
     },
+    setPlacementRaycastBlocker: (targetPosition, blockerPosition) => {
+      const block =
+        blocks.get(key(blockerPosition)) ??
+        makeBlock("stone", 1, blockerPosition.floored());
+      placementRaycastBlocker = { targetPosition, block };
+    },
     setWindow: (window) => {
       pendingWindow = window as Window & EventEmitter;
     },
@@ -297,6 +336,18 @@ function addOffAxisStoneCandidates(
   }
   if (added !== count)
     throw new Error(`Only added ${added} of ${count} stone candidates`);
+}
+
+function addWallWithOpening(fake: ReturnType<typeof makeFakeBot>): Vec3 {
+  for (let x = -1; x <= 1; x += 1) {
+    for (let y = 64; y <= 66; y += 1) {
+      if (x === 0 && y === 65) continue;
+      const position = new Vec3(x, y, -4);
+      fake.blocks.set(`${x},${y},-4`, makeBlock("oak_planks", 4, position));
+      fake.candidates.push(position);
+    }
+  }
+  return new Vec3(0, 65, -4);
 }
 
 function beginPendingDig(
@@ -625,6 +676,140 @@ describe("player body", () => {
     expect(observedNames).toContain("stone");
     expect(observedNames).not.toContain("chest");
     expect(blockerCount).toBe(1);
+  });
+
+  it("reports a visible, reachable air opening with its supporting face", () => {
+    const fake = makeFakeBot();
+    const opening = addWallWithOpening(fake);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    const candidate = observation.perception.placementCandidates.find(
+      ({ position }) =>
+        position.x === opening.x &&
+        position.y === opening.y &&
+        position.z === opening.z,
+    );
+
+    expect(candidate).toBeDefined();
+    expect(candidate).toMatchObject({
+      position: { x: opening.x, y: opening.y, z: opening.z },
+      supportingBlock: { name: "oak_planks" },
+    });
+    expect(candidate?.distance).toBeLessThanOrEqual(4.5);
+    expect(
+      playerOperationSchema.parse({
+        kind: "place",
+        item: "oak_planks",
+        position: candidate?.position,
+        face: candidate?.face,
+      }),
+    ).toMatchObject({ kind: "place", position: candidate?.position });
+    expect(observation.perception.placementCandidateLimit).toBe(24);
+    expect(observation.perception.placementCandidatesMayBeTruncated).toBe(
+      false,
+    );
+    expect(
+      observation.perception.placementCandidates.some(({ position }) =>
+        fake.blocks.has(`${position.x},${position.y},${position.z}`),
+      ),
+    ).toBe(false);
+
+    const faceNormals = {
+      up: [0, 1, 0],
+      down: [0, -1, 0],
+      north: [0, 0, -1],
+      south: [0, 0, 1],
+      east: [1, 0, 0],
+      west: [-1, 0, 0],
+    } as const;
+    const normal =
+      candidate?.face === undefined ? undefined : faceNormals[candidate.face];
+    expect(normal).toBeDefined();
+    expect(candidate?.supportingBlock.position).toEqual({
+      x: opening.x - (normal?.[0] ?? 0),
+      y: opening.y - (normal?.[1] ?? 0),
+      z: opening.z - (normal?.[2] ?? 0),
+    });
+  });
+
+  it("omits an otherwise valid opening hidden behind a solid block", () => {
+    const fake = makeFakeBot();
+    const opening = addWallWithOpening(fake);
+    const blockerPosition = new Vec3(0, 65, -2);
+    const blocker = makeBlock("stone", 1, blockerPosition);
+    fake.blocks.set("0,65,-2", blocker);
+    fake.candidates.push(blockerPosition);
+    fake.setPlacementRaycastBlocker(opening, blockerPosition);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+
+    expect(
+      observation.perception.placementCandidates.some(
+        ({ position }) =>
+          position.x === opening.x &&
+          position.y === opening.y &&
+          position.z === opening.z,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not report air cells outside the normal placement interaction range", () => {
+    const fake = makeFakeBot();
+    const distantSupport = new Vec3(0, 65, -6);
+    fake.blocks.set("0,65,-6", makeBlock("stone", 1, distantSupport));
+    fake.candidates.push(distantSupport);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+
+    expect(
+      observation.perception.placementCandidates.some(
+        ({ position }) =>
+          position.x === 0 && position.y === 65 && position.z === -5,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not report a reachable air cell outside the body view cone", () => {
+    const fake = makeFakeBot();
+    const support = new Vec3(2, 65, -1);
+    fake.blocks.set("2,65,-1", makeBlock("stone", 1, support));
+    fake.candidates.push(support);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+
+    expect(
+      observation.perception.placementCandidates.some(
+        ({ position }) =>
+          position.x === 3 && position.y === 65 && position.z === -1,
+      ),
+    ).toBe(false);
+  });
+
+  it("caps placement candidates and marks incomplete coverage", () => {
+    const fake = makeFakeBot();
+    for (let x = -2; x <= 2; x += 1) {
+      for (let y = 64; y <= 67; y += 1) {
+        const position = new Vec3(x, y, -3);
+        fake.blocks.set(`${x},${y},-3`, makeBlock("stone", 1, position));
+        fake.candidates.push(position);
+      }
+    }
+
+    const observation = observePlayerBody(fake.bot, "owner");
+
+    expect(observation.perception.placementCandidateLimit).toBe(24);
+    expect(observation.perception.placementCandidates).toHaveLength(24);
+    expect(observation.perception.omittedPlacementCandidates).toBeGreaterThan(
+      0,
+    );
+    expect(observation.perception.placementCandidatesMayBeTruncated).toBe(true);
+    expect(
+      new Set(
+        observation.perception.placementCandidates.map(
+          ({ position }) => `${position.x},${position.y},${position.z}`,
+        ),
+      ).size,
+    ).toBe(24);
   });
 
   it("ignores null, malformed, and air crosshair raycast results", () => {

@@ -4,10 +4,13 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import { Vec3 } from "vec3";
 
-export interface BodyPosition {
+export interface BodyBlockCoordinates {
   readonly x: number;
   readonly y: number;
   readonly z: number;
+}
+
+export interface BodyPosition extends BodyBlockCoordinates {
   readonly dimension: string;
 }
 
@@ -34,6 +37,22 @@ export interface BodyVisibleBlock {
   readonly distance: number;
   readonly properties: Readonly<Record<string, unknown>>;
   readonly signText?: readonly string[];
+}
+
+export type BodyPlacementFace =
+  "up" | "down" | "north" | "south" | "east" | "west";
+
+export interface BodyPlacementCandidate {
+  /** The currently loaded air cell to pass as the place operation position. */
+  readonly position: BodyBlockCoordinates;
+  /** A visible, reachable support block and the face normal to pass to place. */
+  readonly supportingBlock: {
+    readonly name: string;
+    readonly position: BodyBlockCoordinates;
+  };
+  /** Eye-to-cell-center distance; candidates stay inside default block reach. */
+  readonly distance: number;
+  readonly face: BodyPlacementFace;
 }
 
 export interface BodyVisibleEntity {
@@ -112,6 +131,10 @@ export interface PlayerBodyObservation {
     readonly omittedEntityCandidates: number;
     readonly candidateSearchMayBeTruncated: boolean;
     readonly blocks: readonly BodyVisibleBlock[];
+    readonly placementCandidateLimit: number;
+    readonly omittedPlacementCandidates: number;
+    readonly placementCandidatesMayBeTruncated: boolean;
+    readonly placementCandidates: readonly BodyPlacementCandidate[];
     readonly entities: readonly BodyVisibleEntity[];
     readonly ownerPositionException?: {
       readonly username: string;
@@ -136,6 +159,21 @@ const blockCandidateSearchPassLimit = 3;
 const entityCandidateLimit = 128;
 const blockOutputLimit = 96;
 const entityOutputLimit = 64;
+const placementCandidateLimit = 24;
+const placementInteractionRange = 4.5;
+const airBlockNames = new Set(["air", "cave_air", "void_air"]);
+
+const placementFaces: readonly {
+  readonly face: BodyPlacementFace;
+  readonly normal: Vec3;
+}[] = [
+  { face: "up", normal: new Vec3(0, 1, 0) },
+  { face: "north", normal: new Vec3(0, 0, -1) },
+  { face: "south", normal: new Vec3(0, 0, 1) },
+  { face: "east", normal: new Vec3(1, 0, 0) },
+  { face: "west", normal: new Vec3(-1, 0, 0) },
+  { face: "down", normal: new Vec3(0, -1, 0) },
+];
 
 interface EntityWithEyeHeight extends Entity {
   readonly eyeHeight?: number;
@@ -502,6 +540,128 @@ function balancedVisibleBlocks(
   return selected.sort((left, right) => left.distance - right.distance);
 }
 
+function placementCandidates(
+  bot: Bot,
+  dimension: string,
+  supports: readonly BodyVisibleBlock[],
+  searchMayBeTruncated: boolean,
+): {
+  readonly candidates: readonly BodyPlacementCandidate[];
+  readonly omitted: number;
+  readonly mayBeTruncated: boolean;
+} {
+  const eye = eyePosition(bot);
+  const candidatesByPosition = new Map<
+    string,
+    {
+      candidate: BodyPlacementCandidate;
+      alignment: number;
+      supportDistance: number;
+    }
+  >();
+  const forward = new Vec3(
+    -Math.sin(bot.entity.yaw) * Math.cos(bot.entity.pitch),
+    Math.sin(bot.entity.pitch),
+    -Math.cos(bot.entity.yaw) * Math.cos(bot.entity.pitch),
+  );
+
+  for (const support of supports) {
+    if (support.position.dimension !== dimension) continue;
+    const supportPosition = new Vec3(
+      support.position.x,
+      support.position.y,
+      support.position.z,
+    ).floored();
+    const supportCenter = supportPosition.offset(0.5, 0.5, 0.5);
+    const supportDistance = eye.distanceTo(supportCenter);
+    if (supportDistance > placementInteractionRange) continue;
+    const supportBlock = bot.blockAt(supportPosition);
+    if (
+      supportBlock?.name !== support.name ||
+      supportBlock.boundingBox !== "block" ||
+      !bot.canSeeBlock(supportBlock)
+    )
+      continue;
+
+    for (const { face, normal } of placementFaces) {
+      const targetPosition = supportPosition.plus(normal);
+      const targetBlock = bot.blockAt(targetPosition);
+      if (
+        targetBlock === null ||
+        !airBlockNames.has(targetBlock.name) ||
+        targetBlock.boundingBox !== "empty"
+      )
+        continue;
+
+      const targetCenter = targetPosition.offset(0.5, 0.5, 0.5);
+      const targetOffset = targetCenter.minus(eye);
+      const targetDistance = targetOffset.norm();
+      if (
+        targetDistance === 0 ||
+        targetDistance > placementInteractionRange ||
+        !insideViewCone(bot, targetCenter)
+      )
+        continue;
+
+      const rayDistance = Math.max(0, targetDistance - 0.05);
+      if (rayDistance > 0) {
+        const blocker = bot.world.raycast(
+          eye,
+          targetOffset.scaled(1 / targetDistance),
+          rayDistance,
+        );
+        if (blocker !== null) continue;
+      }
+
+      const alignment = targetOffset.scaled(1 / targetDistance).dot(forward);
+      const key = blockPositionKey(targetPosition);
+      const current = candidatesByPosition.get(key);
+      const candidate: BodyPlacementCandidate = {
+        position: {
+          x: targetPosition.x,
+          y: targetPosition.y,
+          z: targetPosition.z,
+        },
+        supportingBlock: {
+          name: support.name,
+          position: {
+            x: supportPosition.x,
+            y: supportPosition.y,
+            z: supportPosition.z,
+          },
+        },
+        distance: targetDistance,
+        face,
+      };
+      if (current === undefined || supportDistance < current.supportDistance) {
+        candidatesByPosition.set(key, {
+          candidate,
+          alignment,
+          supportDistance,
+        });
+      }
+    }
+  }
+
+  const ranked = [...candidatesByPosition.values()].sort(
+    (left, right) =>
+      right.alignment - left.alignment ||
+      left.candidate.distance - right.candidate.distance ||
+      left.candidate.position.x - right.candidate.position.x ||
+      left.candidate.position.y - right.candidate.position.y ||
+      left.candidate.position.z - right.candidate.position.z,
+  );
+  const candidates = ranked
+    .slice(0, placementCandidateLimit)
+    .map(({ candidate }) => candidate);
+  const omitted = Math.max(0, ranked.length - candidates.length);
+  return {
+    candidates,
+    omitted,
+    mayBeTruncated: searchMayBeTruncated || omitted > 0,
+  };
+}
+
 export function observePlayerBody(
   bot: Bot,
   ownerUsername: string | undefined,
@@ -512,6 +672,12 @@ export function observePlayerBody(
   const origin = bot.entity.position;
   const blockObservation = visibleBlockCandidates(bot, origin, dimension);
   const visibleBlocks = blockObservation.blocks;
+  const placementObservation = placementCandidates(
+    bot,
+    dimension,
+    visibleBlocks,
+    blockObservation.mayBeTruncated,
+  );
 
   const entityCandidates = Object.values(bot.entities)
     .filter((entity) => entity.id !== bot.entity.id)
@@ -671,6 +837,10 @@ export function observePlayerBody(
         blockOutputLimit,
         blockObservation.priorityPositionKey,
       ),
+      placementCandidateLimit,
+      omittedPlacementCandidates: placementObservation.omitted,
+      placementCandidatesMayBeTruncated: placementObservation.mayBeTruncated,
+      placementCandidates: placementObservation.candidates,
       entities: visibleEntities.slice(0, entityOutputLimit),
       ...(ownerPositionException === undefined
         ? {}
