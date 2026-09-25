@@ -477,6 +477,13 @@ describe("player body", () => {
     expect(() =>
       playerOperationSchema.parse({
         kind: "move_relative",
+        offset: { x: 1, y: 0, z: 0 },
+        range: 1,
+      }),
+    ).toThrow(/offset must exceed the arrival range/);
+    expect(() =>
+      playerOperationSchema.parse({
+        kind: "move_relative",
         offset: { x: 33, y: 0, z: 0 },
       }),
     ).toThrow();
@@ -1144,6 +1151,20 @@ describe("player body", () => {
     const result = await body.execute({
       kind: "move_relative",
       offset: { x: 6, y: 0, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("unverified");
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("does not claim a relative move succeeded when already within arrival range without moving", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "move_relative",
+      offset: { x: 1.1, y: 0, z: 0 },
       range: 1,
     });
 

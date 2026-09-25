@@ -618,7 +618,9 @@ function operationEvidence(
       const dx = Math.floor(afterPos.x) - Math.floor(target.x);
       const dy = Math.floor(afterPos.y) - Math.floor(target.y);
       const dz = Math.floor(afterPos.z) - Math.floor(target.z);
-      return dx * dx + dy * dy + dz * dz <= operation.range * operation.range;
+      const arrived =
+        dx * dx + dy * dy + dz * dz <= operation.range * operation.range;
+      return operation.kind === "move_relative" ? arrived && moved : arrived;
     }
     case "look": {
       const target = positionVector(operation.target);

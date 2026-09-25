@@ -302,14 +302,13 @@ export const playerOperationSchema = playerOperationBaseSchema.superRefine(
   (operation, context) => {
     if (
       operation.kind === "move_relative" &&
-      operation.offset.x === 0 &&
-      operation.offset.y === 0 &&
-      operation.offset.z === 0
+      Math.hypot(operation.offset.x, operation.offset.y, operation.offset.z) <=
+        operation.range
     ) {
       context.addIssue({
         code: "custom",
         path: ["offset"],
-        message: "move_relative requires a nonzero offset",
+        message: "move_relative offset must exceed the arrival range",
       });
     }
     if (operation.kind !== "anvil") return;
