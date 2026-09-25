@@ -64,6 +64,33 @@ describe("integrated player runtime", () => {
     expect(signature({ health: 19 }).vitals).not.toBe(dry.vitals);
   });
 
+  it("wakes on the nearest relevant block band without counting duplicate blocks", () => {
+    const base = observation();
+    const log = {
+      name: "oak_log",
+      stateId: 1,
+      position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+      distance: 2,
+      properties: {},
+    };
+    const signature = (blocks: PlayerBodyObservation["perception"]["blocks"]) =>
+      semanticSignatures({
+        ...base,
+        perception: { ...base.perception, blocks },
+      }).blocks;
+
+    expect(signature([log])).toBe(
+      signature([
+        { ...log, distance: 2 },
+        { ...log, distance: 10 },
+      ]),
+    );
+    expect(signature([log])).not.toBe(signature([{ ...log, distance: 4 }]));
+    expect(signature([log])).not.toBe(
+      signature([log, { ...log, name: "diamond_ore", distance: 8 }]),
+    );
+  });
+
   it("persists only the bounded safe activity tail across restart", () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");

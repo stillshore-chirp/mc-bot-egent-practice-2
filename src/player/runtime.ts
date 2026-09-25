@@ -1077,13 +1077,20 @@ export function semanticSignatures(
     .sort()
     .slice(0, 32)
     .join(",");
-  const relevantBlocks = observation.perception.blocks
-    .filter(({ name }) =>
-      /chest|barrel|shulker|ore|log|crafting_table|furnace|bed|door|portal|water|lava/u.test(
+  const nearestRelevantBlocks = new Map<string, number>();
+  for (const { name, distance } of observation.perception.blocks) {
+    if (
+      !/chest|barrel|shulker|ore|log|crafting_table|furnace|bed|door|portal|water|lava/u.test(
         name,
-      ),
+      )
     )
-    .map(({ name, distance }) => `${name}:${distanceBand(distance)}`)
+      continue;
+    const previous = nearestRelevantBlocks.get(name);
+    if (previous === undefined || distance < previous)
+      nearestRelevantBlocks.set(name, distance);
+  }
+  const relevantBlocks = [...nearestRelevantBlocks]
+    .map(([name, distance]) => `${name}:${distanceBand(distance)}`)
     .sort()
     .slice(0, 48)
     .join(",");
