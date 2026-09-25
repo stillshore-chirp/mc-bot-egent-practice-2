@@ -2463,20 +2463,33 @@ async function main(): Promise<void> {
           state.botName,
           reuseRegion,
         );
-        const afterReuse = readSkillSnapshot(state.databasePath);
-        const consultedLearnedSkillRevisionAdvanced = [
-          ...consultedLearnedSkillIds,
-        ].some((skillId) => {
-          const priorVersions =
-            beforeReuse.revisionVersionsBySkill.get(skillId) ??
-            new Set<number>();
-          const currentVersions =
-            afterReuse.revisionVersionsBySkill.get(skillId) ??
-            new Set<number>();
-          return [...currentVersions].some(
-            (version) => !priorVersions.has(version),
-          );
-        });
+        let afterReuse = readSkillSnapshot(state.databasePath);
+        const consultedRevisionAdvanced = (snapshot: SkillSnapshot): boolean =>
+          [...consultedLearnedSkillIds].some((skillId) => {
+            const priorVersions =
+              beforeReuse.revisionVersionsBySkill.get(skillId) ??
+              new Set<number>();
+            const currentVersions =
+              snapshot.revisionVersionsBySkill.get(skillId) ??
+              new Set<number>();
+            return [...currentVersions].some(
+              (version) => !priorVersions.has(version),
+            );
+          });
+        if (
+          !consultedRevisionAdvanced(afterReuse) ||
+          afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
+        ) {
+          await observeForPlayer(context, 30_000, () => {
+            afterReuse = readSkillSnapshot(state.databasePath);
+            return (
+              consultedRevisionAdvanced(afterReuse) &&
+              afterReuse.evidenceReceiptCount > beforeReuse.evidenceReceiptCount
+            );
+          });
+        }
+        const consultedLearnedSkillRevisionAdvanced =
+          consultedRevisionAdvanced(afterReuse);
         const repeatedOutcomes = newOutcomes(reuseStart, reused);
         const repeatedDig = repeatedOutcomes.some(
           (outcome) =>
@@ -2569,12 +2582,33 @@ async function main(): Promise<void> {
         const exportActivityKeys = new Set(
           beforeExport.skillActivity.map(skillActivityKey),
         );
+        const exportProposalIds = new Set(
+          beforeExport.proposals.map(({ id }) => id),
+        );
         const exportedLearnedSkillIds = new Set<string>();
         const exportResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
           "直近で覚えた採集方法を、専用のMarkdown交換機能でファイルに書き出し、ファイル名を教えてください。",
         );
+        const exportOwnerTurn = await observeForPlayer(
+          context,
+          20_000,
+          (player) =>
+            player.proposals.some(({ id }) => !exportProposalIds.has(id)) ||
+            context.responseQueue.length > exportResponseStart,
+        );
+        if (exportOwnerTurn === undefined)
+          incomplete("SKILL_EXPORT_OWNER_TURN_UNOBSERVED");
+        const exportProposalReadback = playerOf(
+          await collect(context.runtime.app),
+        );
+        if (
+          !exportProposalReadback.proposals.some(
+            ({ id }) => !exportProposalIds.has(id),
+          )
+        )
+          incomplete("SKILL_EXPORT_OWNER_PROPOSAL_MISSING");
         await waitForPlayer(context, 120_000, async () => {
           const current = await exchangeMarkdownFiles(state.exchangeDirectory);
           const exportedActivity = playerOf(
@@ -2645,11 +2679,32 @@ async function main(): Promise<void> {
         const importActivityKeys = new Set(
           importPlayer.skillActivity.map(skillActivityKey),
         );
+        const importProposalIds = new Set(
+          importPlayer.proposals.map(({ id }) => id),
+        );
         const importResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
           `編集したSkillファイル「${editedName}」を専用の取り込み機能で読み込み、再利用する手順に反映してください。`,
         );
+        const importOwnerTurn = await observeForPlayer(
+          context,
+          20_000,
+          (player) =>
+            player.proposals.some(({ id }) => !importProposalIds.has(id)) ||
+            context.responseQueue.length > importResponseStart,
+        );
+        if (importOwnerTurn === undefined)
+          incomplete("SKILL_IMPORT_OWNER_TURN_UNOBSERVED");
+        const importProposalReadback = playerOf(
+          await collect(context.runtime.app),
+        );
+        if (
+          !importProposalReadback.proposals.some(
+            ({ id }) => !importProposalIds.has(id),
+          )
+        )
+          incomplete("SKILL_IMPORT_OWNER_PROPOSAL_MISSING");
         await waitForPlayer(context, 120_000, async () => {
           const now = readSkillSnapshot(state.databasePath);
           const currentPlayer = playerOf(await collect(context.runtime.app));
