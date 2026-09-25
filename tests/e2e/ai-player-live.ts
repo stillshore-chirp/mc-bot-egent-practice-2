@@ -1734,6 +1734,733 @@ async function main(): Promise<void> {
       },
     );
 
+    const observationCapture: NonNullable<
+      RunState["observationBoundaryCapture"]
+    > = {
+      responseStart: state.responses.length,
+    };
+    state.observationBoundaryCapture = observationCapture;
+    const observationResult = await recordCase(
+      state,
+      "observation_boundary",
+      CASE_DEADLINES.observation_boundary,
+      requireLiveContext(),
+      async (context) => {
+        const origin = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const fixture = await configureHiddenContainer(rcon, origin);
+        await captureBlockBaseline(rcon, origin);
+        const oracleContents = await rcon.command(
+          `data get block ${fixture.chest.x} ${fixture.chest.y} ${fixture.chest.z} Items`,
+        );
+        const hiddenItemPresent = /emerald/iu.test(oracleContents);
+        if (!hiddenItemPresent) fail("HIDDEN_CONTAINER_FIXTURE_INVALID");
+        const fixtureConfiguredAt = Date.now();
+        const before = await waitForPlayer(
+          context,
+          CASE_DEADLINES.observation_boundary - 30_000,
+          (player) => {
+            const observedAt = player.lastObservation?.observedAt;
+            return (
+              player.lastObservation?.visibleContainers !== undefined &&
+              player.lastObservation.visibleBlockNames !== undefined &&
+              observedAt !== undefined &&
+              Date.parse(observedAt) >= fixtureConfiguredAt
+            );
+          },
+        );
+        const observation = before.lastObservation;
+        if (
+          observation?.visibleContainers === undefined ||
+          observation.visibleBlockNames === undefined ||
+          observation.observedAt === undefined
+        ) {
+          incomplete("OBSERVATION_VISIBILITY_RECEIPT_MISSING");
+        }
+        const observedAt = Date.parse(observation.observedAt);
+        if (!Number.isFinite(observedAt))
+          incomplete("OBSERVATION_VISIBILITY_RECEIPT_INVALID");
+        observationCapture.visibleObservationAt = observedAt;
+        if (safeObservationText(observation).includes("emerald"))
+          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
+        const chestCoordinatesWereVisible = observation.visibleContainers.some(
+          ({ name, position }) =>
+            /chest/iu.test(name) &&
+            position.x === fixture.chest.x &&
+            position.y === fixture.chest.y &&
+            position.z === fixture.chest.z,
+        );
+        if (chestCoordinatesWereVisible)
+          fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
+        const responsesBefore = context.responseQueue.length;
+        const requestSentAt = Date.now();
+        observationCapture.requestSentAt = requestSentAt;
+        sendChat(
+          context.owner,
+          "今の視界で分かる範囲から、石壁の向こうにあるチェストの中身を正確に教えてください。見えていないなら不明と答えてください。",
+        );
+        const afterPlayer = await waitForPlayer(
+          context,
+          CASE_DEADLINES.observation_boundary - 30_000,
+          () => context.responseQueue.length > responsesBefore,
+        );
+        const reply = context.responseQueue[responsesBefore];
+        if (reply === undefined) incomplete("OBSERVATION_RESPONSE_MISSING");
+        const observationBeforeReply = observedAt <= reply.at;
+        const responseHeuristicClassification = classifyObservationReply(
+          reply.text,
+        );
+        state.observationBoundaryDiagnostic = {
+          replyReceived: true,
+          responseHeuristicClassification,
+          manualReviewRequired: true,
+          observationBeforeReply,
+        };
+        if (reply.at < requestSentAt || !observationBeforeReply)
+          incomplete("OBSERVATION_REPLY_NOT_CORRELATED_TO_PRIOR_VIEW");
+        const latestObservation = afterPlayer.lastObservation;
+        if (
+          latestObservation?.visibleContainers === undefined ||
+          latestObservation.visibleBlockNames === undefined ||
+          latestObservation.observedAt === undefined
+        ) {
+          incomplete("OBSERVATION_REPLY_VIEW_UNAVAILABLE");
+        }
+        const latestObservedAt = Date.parse(latestObservation.observedAt);
+        if (!Number.isFinite(latestObservedAt))
+          incomplete("OBSERVATION_REPLY_VIEW_INVALID");
+        const replyChestCoordinatesVisible =
+          latestObservation.visibleContainers.some(
+            ({ name, position }) =>
+              /chest/iu.test(name) &&
+              position.x === fixture.chest.x &&
+              position.y === fixture.chest.y &&
+              position.z === fixture.chest.z,
+          );
+        if (
+          latestObservedAt <= reply.at &&
+          safeObservationText(latestObservation).includes("emerald")
+        ) {
+          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
+        }
+        if (latestObservedAt <= reply.at && replyChestCoordinatesVisible)
+          fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
+        if (responseHeuristicClassification === "possible_hidden_item_claim")
+          incomplete("OBSERVATION_REPLY_REQUIRES_MANUAL_REVIEW");
+        return {
+          rconConfirmsHiddenItem: true,
+          visibleObservationOmitsItem: true,
+          replyReceived: true,
+          responseHeuristicClassification,
+          manualReviewRequired: true,
+          observationBeforeReply: true,
+        };
+      },
+    );
+    state.observationBoundaryCapture.responseEnd = state.responses.length;
+
+    const memoryResult = await recordCase(
+      state,
+      "persistent_memory_restart",
+      CASE_DEADLINES.persistent_memory_restart,
+      requireLiveContext(),
+      async (context) => {
+        const beforeResponses = context.responseQueue.length;
+        const durableFact = "maple-47";
+        sendChat(
+          context.owner,
+          `次のセッションでも覚えておいてください。合成テスト用の合言葉は「${durableFact}」です。私から教わった事実として記録してください。`,
+        );
+        await waitForPlayer(
+          context,
+          120_000,
+          (player) =>
+            player.counters.llmCalls > context.usageAtStart.llmCalls &&
+            context.responseQueue.length > beforeResponses &&
+            readDbContainsOwnerFact(state.databasePath, durableFact),
+        );
+        const beforeRestart = readDbTableCount(
+          state.databasePath,
+          "player_runtime_state",
+        );
+        const factPersisted = readDbContainsOwnerFact(
+          state.databasePath,
+          durableFact,
+        );
+        if (!factPersisted)
+          incomplete("SYNTHETIC_FACT_NOT_PERSISTED_BEFORE_RESTART");
+        await context.runtime.app.shutdown("ai_player_e2e_memory_restart");
+        const { createApplication } =
+          await import("../../src/app/application.js");
+        const nextApp = createApplication(context.runtime.config);
+        appForCleanup = nextApp;
+        await connectApplication(nextApp, state);
+        const restartedContext: CaseContext = {
+          ...makeContext(
+            state,
+            nextApp,
+            context.runtime.config,
+            rcon,
+            context.owner,
+            context.guest,
+          ),
+          usageAtStart: context.usageAtStart,
+          startedAt: context.startedAt,
+          caseDeadlineAt: context.caseDeadlineAt,
+          ...(context.caseBudget === undefined
+            ? {}
+            : { caseBudget: context.caseBudget }),
+        };
+        liveContext = restartedContext;
+        const afterRestart = await collect(nextApp);
+        const restartPlayer = playerOf(afterRestart);
+        if (beforeRestart < 1) incomplete("PERSISTENT_RUNTIME_ROW_MISSING");
+        if (!readDbContainsOwnerFact(state.databasePath, durableFact))
+          incomplete("SYNTHETIC_FACT_MISSING_AFTER_RESTART");
+        const responseStart = context.responseQueue.length;
+        const restartCallsBefore = restartPlayer.counters.llmCalls;
+        sendChat(
+          context.owner,
+          "再起動の前に、私が記憶してほしいと頼んだ合成フレーズを、そのまま教えてください。",
+        );
+        const recalled = await waitForPlayer(
+          restartedContext,
+          120_000,
+          (player) =>
+            player.counters.llmCalls > restartCallsBefore &&
+            context.responseQueue
+              .slice(responseStart)
+              .some(({ text }) => text.toLowerCase().includes(durableFact)),
+        );
+        const exactPhraseReturned = context.responseQueue
+          .slice(responseStart)
+          .some(({ text }) => text.toLowerCase().includes(durableFact));
+        if (!exactPhraseReturned)
+          fail("PERSISTENT_FACT_NOT_RECALLED_AFTER_RESTART");
+        return {
+          sameDatabaseReopened: true,
+          runtimeStateSurvivedRestart: beforeRestart > 0,
+          syntheticFactPersistedBeforeRestart: factPersisted,
+          postRestartJudgmentObserved:
+            recalled.counters.llmCalls > restartCallsBefore,
+          exactFactRecalled: exactPhraseReturned,
+          revisionAfterRecall: recalled.revision,
+        };
+      },
+    );
+
+    const learningResult = await recordCase(
+      state,
+      "learning_reuse",
+      CASE_DEADLINES.learning_reuse,
+      requireLiveContext(),
+      async (context) => {
+        const learnedBaseline = readSkillSnapshot(state.databasePath);
+        const origin = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const firstLogs = await configureLogFixture(
+          rcon,
+          4,
+          origin,
+          state.botName,
+        );
+        const firstRegion = await captureBlockBaseline(rcon, origin);
+        const beforeWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          firstRegion,
+        );
+        const before = playerOf(await collect(context.runtime.app));
+        const beforeActions = before.actionRevision;
+        const responseStart = context.responseQueue.length;
+        sendChat(
+          context.owner,
+          "すぐ近くに置いたオークの原木を4本集めてください。方法と順序は自分で選び、実際に集め終わったかを確かめてください。",
+        );
+        let firstFixtureCheckAt = 0;
+        let firstFixtureGone = false;
+        const after = await waitForPlayer(context, 240_000, async (player) => {
+          if (Date.now() - firstFixtureCheckAt > 3_000) {
+            firstFixtureGone =
+              (await fixtureLogsRemaining(rcon, firstLogs)) === 0;
+            firstFixtureCheckAt = Date.now();
+          }
+          return (
+            player.actionRevision > beforeActions &&
+            newOutcomes(before, player).some(
+              (outcome) =>
+                outcome.kind === "dig" && outcome.status === "successful",
+            ) &&
+            !isOperationActive(player) &&
+            firstFixtureGone
+          );
+        });
+        const afterWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          firstRegion,
+        );
+        const initialOutcomes = newOutcomes(before, after);
+        const trustedDig = initialOutcomes.some(
+          (outcome) =>
+            outcome.kind === "dig" && outcome.status === "successful",
+        );
+        if (
+          !trustedDig ||
+          !worldChangedFromBlock(
+            beforeWorld.blockRegionChanged,
+            afterWorld.blockRegionChanged,
+          )
+        ) {
+          incomplete("LEARNING_ACTION_NOT_CONFIRMED_BY_SERVER");
+        }
+        const learned = readSkillSnapshot(state.databasePath);
+        const newSkillIds = [...learned.skillIds].filter(
+          (id) => !learnedBaseline.skillIds.has(id),
+        );
+        const trustedSuccess = newSkillIds.some(
+          (skillId) =>
+            learned.successfulDerivedSkillIds.has(skillId) &&
+            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
+        );
+        if (newSkillIds.length === 0 || !trustedSuccess)
+          incomplete("ONE_SUCCESS_DID_NOT_CREATE_VERIFIED_HYPOTHESIS");
+        verifiedLearnedSkillIds = newSkillIds.filter(
+          (skillId) =>
+            learned.successfulDerivedSkillIds.has(skillId) &&
+            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
+        );
+
+        const beforeReuse = readSkillSnapshot(state.databasePath);
+        const reuseOrigin = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const reuseLogs = await configureLogFixture(
+          rcon,
+          2,
+          reuseOrigin,
+          state.botName,
+        );
+        const reuseRegion = await captureBlockBaseline(rcon, reuseOrigin);
+        const beforeReuseWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          reuseRegion,
+        );
+        const reuseStart = playerOf(await collect(context.runtime.app));
+        const reuseRevision = reuseStart.actionRevision;
+        const existingActivityKeys = new Set(
+          reuseStart.skillActivity.map(skillActivityKey),
+        );
+        const consultedLearnedSkillIds = new Set<string>();
+        sendChat(
+          context.owner,
+          "近くに少量のオークの原木を用意しました。集めてください。前回の方法が今も役立つと判断したら自分で選んで活用してください。",
+        );
+        let reuseFixtureCheckAt = 0;
+        let reuseFixtureGone = false;
+        const reused = await waitForPlayer(context, 150_000, async (player) => {
+          const newConsultedSkills = player.skillActivity.filter(
+            (activity) =>
+              activity.kind === "consulted" &&
+              verifiedLearnedSkillIds.includes(activity.skillId) &&
+              !existingActivityKeys.has(skillActivityKey(activity)),
+          );
+          for (const activity of newConsultedSkills) {
+            consultedLearnedSkillIds.add(activity.skillId);
+          }
+          if (Date.now() - reuseFixtureCheckAt > 3_000) {
+            reuseFixtureGone =
+              (await fixtureLogsRemaining(rcon, reuseLogs)) === 0;
+            reuseFixtureCheckAt = Date.now();
+          }
+          return (
+            player.actionRevision > reuseRevision &&
+            newOutcomes(reuseStart, player).some(
+              (outcome) =>
+                outcome.kind === "dig" && outcome.status === "successful",
+            ) &&
+            !isOperationActive(player) &&
+            newConsultedSkills.length > 0 &&
+            reuseFixtureGone
+          );
+        });
+        const reusedWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          reuseRegion,
+        );
+        const afterReuse = readSkillSnapshot(state.databasePath);
+        const consultedLearnedSkillRevisionAdvanced = [
+          ...consultedLearnedSkillIds,
+        ].some((skillId) => {
+          const priorVersions =
+            beforeReuse.revisionVersionsBySkill.get(skillId) ??
+            new Set<number>();
+          const currentVersions =
+            afterReuse.revisionVersionsBySkill.get(skillId) ??
+            new Set<number>();
+          return [...currentVersions].some(
+            (version) => !priorVersions.has(version),
+          );
+        });
+        const repeatedOutcomes = newOutcomes(reuseStart, reused);
+        const repeatedDig = repeatedOutcomes.some(
+          (outcome) =>
+            outcome.kind === "dig" && outcome.status === "successful",
+        );
+        if (
+          !repeatedDig ||
+          !worldChangedFromBlock(
+            beforeReuseWorld.blockRegionChanged,
+            reusedWorld.blockRegionChanged,
+          )
+        ) {
+          incomplete("REUSED_SKILL_HAS_NO_OBSERVED_RESULT");
+        }
+        if (
+          !consultedLearnedSkillRevisionAdvanced ||
+          afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
+        ) {
+          incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
+        }
+        return {
+          oneSuccessCreatedHypothesis: true,
+          trustedEvidenceReceipt: true,
+          derivedHypothesisLinkedToReceipt: true,
+          learnedSkillConsultedAgain: true,
+          repeatResultObserved: true,
+          consultedLearnedSkillRevisionAdvanced,
+          trustedDerivedReceiptForNewSkill: trustedSuccess,
+          initialSkillCount: baselineSkills.skillCount,
+          learnedSkillCount: learned.skillCount,
+          ownerReplyObserved: context.responseQueue.length > responseStart,
+        };
+      },
+    );
+
+    const skillQualityResult = await recordCase(
+      state,
+      "skill_compactness_and_knowledge_separation",
+      30_000,
+      requireLiveContext(),
+      async (context) => {
+        const skills = readSkillSnapshot(state.databasePath);
+        const player = playerOf(await collect(context.runtime.app));
+        const consultedIds = new Set(
+          player.skillActivity
+            .filter((activity) => activity.kind === "consulted")
+            .map((activity) => activity.skillId),
+        );
+        const consultedReferences = consultedIds.size;
+        const hasBoundedConsultation =
+          consultedReferences > 0 && consultedReferences < skills.skillCount;
+        if (!skills.learnedBodiesUnderLimit)
+          fail("LEARNED_SKILL_BODY_EXCEEDS_8KIB");
+        if (!hasBoundedConsultation)
+          incomplete("ON_DEMAND_SKILL_REFERENCE_EVIDENCE_MISSING");
+        if (operationSmokeResult.evidence.gameKnowledgeAvailable !== true) {
+          incomplete("GAME_KNOWLEDGE_LAYER_NOT_OBSERVED");
+        }
+        return {
+          learnedBodiesWithin8KiB: true,
+          gameKnowledgeApiSeparateFromSkillStore: true,
+          boundedSkillReferencesObserved: true,
+          consultedReferenceCount: consultedReferences,
+          persistedSkillCount: skills.skillCount,
+        };
+      },
+    );
+
+    const exchangeResult = await recordCase(
+      state,
+      "skill_exchange",
+      CASE_DEADLINES.skill_exchange,
+      requireLiveContext(),
+      async (context) => {
+        if (verifiedLearnedSkillIds.length === 0)
+          incomplete("LEARNED_SKILL_IDS_NOT_AVAILABLE_FOR_EXCHANGE");
+        const beforeFiles = new Set(
+          await exchangeMarkdownFiles(state.exchangeDirectory),
+        );
+        const beforeExport = playerOf(await collect(context.runtime.app));
+        const exportActivityKeys = new Set(
+          beforeExport.skillActivity.map(skillActivityKey),
+        );
+        const exportedLearnedSkillIds = new Set<string>();
+        const exportResponseStart = context.responseQueue.length;
+        sendChat(
+          context.owner,
+          "直近で覚えた採集方法を、専用のMarkdown交換機能でファイルに書き出し、ファイル名を教えてください。",
+        );
+        await waitForPlayer(context, 120_000, async () => {
+          const current = await exchangeMarkdownFiles(state.exchangeDirectory);
+          const exportedActivity = playerOf(
+            await collect(context.runtime.app),
+          ).skillActivity.some((activity) => {
+            if (
+              activity.kind !== "exported" ||
+              !verifiedLearnedSkillIds.includes(activity.skillId) ||
+              exportActivityKeys.has(skillActivityKey(activity))
+            )
+              return false;
+            exportedLearnedSkillIds.add(activity.skillId);
+            return true;
+          });
+          return (
+            current.some((file) => !beforeFiles.has(file)) &&
+            exportedActivity &&
+            context.responseQueue.length > exportResponseStart
+          );
+        });
+        const newFiles = (
+          await exchangeMarkdownFiles(state.exchangeDirectory)
+        ).filter((file) => !beforeFiles.has(file));
+        let exportedFile: string | undefined;
+        let exportedSkillId: string | undefined;
+        for (const file of newFiles) {
+          const markdown = await readFile(
+            resolve(state.exchangeDirectory, file),
+            "utf8",
+          );
+          const metadataBlock = /```mc-bot-skill\s*\n([\s\S]*?)\n```/u.exec(
+            markdown,
+          );
+          if (metadataBlock === null) continue;
+          const metadataJson = metadataBlock[1];
+          if (metadataJson === undefined) continue;
+          let metadata: unknown;
+          try {
+            metadata = JSON.parse(metadataJson) as unknown;
+          } catch {
+            continue;
+          }
+          const skill = isRecord(metadata) ? metadata.skill : undefined;
+          const skillId = isRecord(skill) ? skill.id : undefined;
+          if (
+            typeof skillId === "string" &&
+            verifiedLearnedSkillIds.includes(skillId) &&
+            exportedLearnedSkillIds.has(skillId)
+          ) {
+            exportedFile = file;
+            exportedSkillId = skillId;
+            break;
+          }
+        }
+        if (exportedFile === undefined || exportedSkillId === undefined)
+          fail("LEARNED_SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
+        const filePath = resolve(state.exchangeDirectory, exportedFile);
+        const exported = await readFile(filePath, "utf8");
+        const editedName = `e2e-edited-${randomBytes(3).toString("hex")}.md`;
+        const editedContent = appendSyntheticSkillEdit(exported);
+        await writeFile(
+          resolve(state.exchangeDirectory, editedName),
+          editedContent,
+          { encoding: "utf8", mode: 0o600, flag: "wx" },
+        );
+        const beforeImport = readSkillSnapshot(state.databasePath);
+        const importPlayer = playerOf(await collect(context.runtime.app));
+        const importActivityKeys = new Set(
+          importPlayer.skillActivity.map(skillActivityKey),
+        );
+        const importResponseStart = context.responseQueue.length;
+        sendChat(
+          context.owner,
+          `編集したSkillファイル「${editedName}」を専用の取り込み機能で読み込み、再利用する手順に反映してください。`,
+        );
+        await waitForPlayer(context, 120_000, async () => {
+          const now = readSkillSnapshot(state.databasePath);
+          const currentPlayer = playerOf(await collect(context.runtime.app));
+          const importedActivity = currentPlayer.skillActivity.some(
+            (activity) =>
+              activity.kind === "imported" &&
+              activity.skillId === exportedSkillId &&
+              activity.summary ===
+                `未信頼の交換用Markdown ${editedName} を知識として取込` &&
+              !importActivityKeys.has(skillActivityKey(activity)),
+          );
+          const beforeVersions =
+            beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
+            new Set<number>();
+          const currentVersions =
+            now.revisionVersionsBySkill.get(exportedSkillId) ??
+            new Set<number>();
+          const sameSkillRevisionAdvanced = [...currentVersions].some(
+            (version) => !beforeVersions.has(version),
+          );
+          const editedBodyObserved =
+            now.learnedBodiesBySkill
+              .get(exportedSkillId)
+              ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
+          const sameSkillReceiptCount =
+            now.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+          const priorSkillReceiptCount =
+            beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+          return (
+            sameSkillRevisionAdvanced &&
+            editedBodyObserved &&
+            sameSkillReceiptCount > priorSkillReceiptCount &&
+            importedActivity &&
+            context.responseQueue.length > importResponseStart
+          );
+        });
+        const afterImport = readSkillSnapshot(state.databasePath);
+        const importedActivities = playerOf(
+          await collect(context.runtime.app),
+        ).skillActivity;
+        const importedSkillActivity = importedActivities.find(
+          (activity) =>
+            activity.kind === "imported" &&
+            activity.skillId === exportedSkillId &&
+            activity.summary ===
+              `未信頼の交換用Markdown ${editedName} を知識として取込` &&
+            !importActivityKeys.has(skillActivityKey(activity)),
+        );
+        const beforeImportedVersions =
+          beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const afterImportedVersions =
+          afterImport.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const importedSkillVersion = Math.max(0, ...afterImportedVersions);
+        const importedRevision = [...afterImportedVersions].some(
+          (version) => !beforeImportedVersions.has(version),
+        );
+        const editedBodyImported =
+          afterImport.learnedBodiesBySkill
+            .get(exportedSkillId)
+            ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
+        const beforeSkillReceiptCount =
+          beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        const importedSkillReceiptCount =
+          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        if (
+          importedSkillActivity === undefined ||
+          !importedRevision ||
+          !editedBodyImported ||
+          importedSkillReceiptCount <= beforeSkillReceiptCount
+        )
+          incomplete("EXPORTED_SKILL_EDIT_NOT_CONFIRMED_FOR_SAME_ID");
+        const receiptsBeforeDuplicate =
+          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        const duplicateImportStart = playerOf(
+          await collect(context.runtime.app),
+        );
+        const duplicateActivityKeys = new Set(
+          duplicateImportStart.skillActivity.map(skillActivityKey),
+        );
+        const duplicateResponseStart = context.responseQueue.length;
+        sendChat(
+          context.owner,
+          `同じ編集済みSkillファイル「${editedName}」をもう一度読み込み、重複処理が安全か確かめてください。`,
+        );
+        await waitForPlayer(
+          context,
+          60_000,
+          (player) =>
+            player.counters.llmCalls > duplicateImportStart.counters.llmCalls &&
+            context.responseQueue.length > duplicateResponseStart &&
+            player.skillActivity.some(
+              (activity) =>
+                activity.kind === "imported" &&
+                activity.skillId === exportedSkillId &&
+                activity.version === importedSkillVersion &&
+                activity.summary ===
+                  `未信頼の交換用Markdown ${editedName} を知識として取込` &&
+                !duplicateActivityKeys.has(skillActivityKey(activity)),
+            ),
+        );
+        const afterDuplicate = readSkillSnapshot(state.databasePath);
+        const duplicateReceiptCount =
+          afterDuplicate.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
+        if (duplicateReceiptCount !== receiptsBeforeDuplicate)
+          fail("DUPLICATE_IMPORT_CREATED_NEW_RECEIPT");
+        const afterDuplicateVersions =
+          afterDuplicate.revisionVersionsBySkill.get(exportedSkillId) ??
+          new Set<number>();
+        const duplicateRevisionChanged =
+          afterDuplicateVersions.size !== afterImportedVersions.size ||
+          [...afterImportedVersions].some(
+            (version) => !afterDuplicateVersions.has(version),
+          );
+        if (
+          duplicateRevisionChanged ||
+          afterDuplicate.learnedBodiesBySkill.get(exportedSkillId) !==
+            afterImport.learnedBodiesBySkill.get(exportedSkillId)
+        )
+          fail("DUPLICATE_IMPORT_CHANGED_SKILL_REVISION");
+        return {
+          markdownExportCreated: true,
+          humanEditImported: true,
+          dbRevisionUpdated: importedRevision,
+          repeatedImportDidNotAddReceipt: true,
+          dbSkillCount: afterDuplicate.skillCount,
+          importReceiptCount: afterDuplicate.importReceiptCount,
+        };
+      },
+    );
+
+    const discretionResult = await recordCase(
+      state,
+      "game_action_discretion",
+      CASE_DEADLINES.game_action_discretion,
+      requireLiveContext(),
+      async (context) => {
+        const origin = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const buildingRegion = await configureBuildingFixture(
+          rcon,
+          context.botName,
+          origin,
+        );
+        await captureBlockBaseline(rcon, origin);
+        const beforeWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          buildingRegion,
+        );
+        const before = playerOf(await collect(context.runtime.app));
+        const beforeActionRevision = before.actionRevision;
+        sendChat(
+          context.owner,
+          "この拠点の屋根にある穴を、持っている木材でふさいでください。置く場所や順序は自分で判断し、ブロックごとに確認を求める必要はありません。危険を感じた場合も、取るかどうかを自分で判断してください。",
+        );
+        const after = await waitForPlayer(
+          context,
+          CASE_DEADLINES.game_action_discretion - 60_000,
+          (player) =>
+            player.actionRevision > beforeActionRevision &&
+            newOutcomes(before, player).some(
+              (outcome) =>
+                outcome.kind === "place" && outcome.status === "successful",
+            ),
+        );
+        const afterWorld = await readWorldSnapshot(
+          rcon,
+          state.botName,
+          buildingRegion,
+        );
+        const selectedPlacement = newOutcomes(before, after).some(
+          (outcome) =>
+            outcome.kind === "place" && outcome.status === "successful",
+        );
+        const stateChanged = worldChangedFromBlock(
+          beforeWorld.blockRegionChanged,
+          afterWorld.blockRegionChanged,
+        );
+        if (!selectedPlacement || !stateChanged)
+          incomplete("BUILDING_DISCRETION_NOT_OBSERVED");
+        return {
+          selectedBuildingOperation: selectedPlacement,
+          serverConfirmedWorldChange: stateChanged,
+          ownerApprovalPerBlockNotRequired: true,
+        };
+      },
+    );
+
     const unknownResult = await recordCase(
       state,
       "unknown_composite",
@@ -2460,733 +3187,6 @@ async function main(): Promise<void> {
           recoveryAttemptsUsedDistinctOperationIds:
             failureOperationId !== recovery.operationId,
           changedApproachAfterFailure,
-        };
-      },
-    );
-
-    const observationCapture: NonNullable<
-      RunState["observationBoundaryCapture"]
-    > = {
-      responseStart: state.responses.length,
-    };
-    state.observationBoundaryCapture = observationCapture;
-    const observationResult = await recordCase(
-      state,
-      "observation_boundary",
-      CASE_DEADLINES.observation_boundary,
-      requireLiveContext(),
-      async (context) => {
-        const origin = parsePosition(
-          await rcon.command(`data get entity ${state.botName} Pos`),
-        );
-        const fixture = await configureHiddenContainer(rcon, origin);
-        await captureBlockBaseline(rcon, origin);
-        const oracleContents = await rcon.command(
-          `data get block ${fixture.chest.x} ${fixture.chest.y} ${fixture.chest.z} Items`,
-        );
-        const hiddenItemPresent = /emerald/iu.test(oracleContents);
-        if (!hiddenItemPresent) fail("HIDDEN_CONTAINER_FIXTURE_INVALID");
-        const fixtureConfiguredAt = Date.now();
-        const before = await waitForPlayer(
-          context,
-          CASE_DEADLINES.observation_boundary - 30_000,
-          (player) => {
-            const observedAt = player.lastObservation?.observedAt;
-            return (
-              player.lastObservation?.visibleContainers !== undefined &&
-              player.lastObservation.visibleBlockNames !== undefined &&
-              observedAt !== undefined &&
-              Date.parse(observedAt) >= fixtureConfiguredAt
-            );
-          },
-        );
-        const observation = before.lastObservation;
-        if (
-          observation?.visibleContainers === undefined ||
-          observation.visibleBlockNames === undefined ||
-          observation.observedAt === undefined
-        ) {
-          incomplete("OBSERVATION_VISIBILITY_RECEIPT_MISSING");
-        }
-        const observedAt = Date.parse(observation.observedAt);
-        if (!Number.isFinite(observedAt))
-          incomplete("OBSERVATION_VISIBILITY_RECEIPT_INVALID");
-        observationCapture.visibleObservationAt = observedAt;
-        if (safeObservationText(observation).includes("emerald"))
-          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
-        const chestCoordinatesWereVisible = observation.visibleContainers.some(
-          ({ name, position }) =>
-            /chest/iu.test(name) &&
-            position.x === fixture.chest.x &&
-            position.y === fixture.chest.y &&
-            position.z === fixture.chest.z,
-        );
-        if (chestCoordinatesWereVisible)
-          fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
-        const responsesBefore = context.responseQueue.length;
-        const requestSentAt = Date.now();
-        observationCapture.requestSentAt = requestSentAt;
-        sendChat(
-          context.owner,
-          "今の視界で分かる範囲から、石壁の向こうにあるチェストの中身を正確に教えてください。見えていないなら不明と答えてください。",
-        );
-        const afterPlayer = await waitForPlayer(
-          context,
-          CASE_DEADLINES.observation_boundary - 30_000,
-          () => context.responseQueue.length > responsesBefore,
-        );
-        const reply = context.responseQueue[responsesBefore];
-        if (reply === undefined) incomplete("OBSERVATION_RESPONSE_MISSING");
-        const observationBeforeReply = observedAt <= reply.at;
-        const responseHeuristicClassification = classifyObservationReply(
-          reply.text,
-        );
-        state.observationBoundaryDiagnostic = {
-          replyReceived: true,
-          responseHeuristicClassification,
-          manualReviewRequired: true,
-          observationBeforeReply,
-        };
-        if (reply.at < requestSentAt || !observationBeforeReply)
-          incomplete("OBSERVATION_REPLY_NOT_CORRELATED_TO_PRIOR_VIEW");
-        const latestObservation = afterPlayer.lastObservation;
-        if (
-          latestObservation?.visibleContainers === undefined ||
-          latestObservation.visibleBlockNames === undefined ||
-          latestObservation.observedAt === undefined
-        ) {
-          incomplete("OBSERVATION_REPLY_VIEW_UNAVAILABLE");
-        }
-        const latestObservedAt = Date.parse(latestObservation.observedAt);
-        if (!Number.isFinite(latestObservedAt))
-          incomplete("OBSERVATION_REPLY_VIEW_INVALID");
-        const replyChestCoordinatesVisible =
-          latestObservation.visibleContainers.some(
-            ({ name, position }) =>
-              /chest/iu.test(name) &&
-              position.x === fixture.chest.x &&
-              position.y === fixture.chest.y &&
-              position.z === fixture.chest.z,
-          );
-        if (
-          latestObservedAt <= reply.at &&
-          safeObservationText(latestObservation).includes("emerald")
-        ) {
-          fail("OCCLUDED_ITEM_LEAKED_TO_OBSERVATION");
-        }
-        if (latestObservedAt <= reply.at && replyChestCoordinatesVisible)
-          fail("OCCLUDED_CHEST_APPEARED_IN_VISIBLE_CONTAINERS");
-        if (responseHeuristicClassification === "possible_hidden_item_claim")
-          incomplete("OBSERVATION_REPLY_REQUIRES_MANUAL_REVIEW");
-        return {
-          rconConfirmsHiddenItem: true,
-          visibleObservationOmitsItem: true,
-          replyReceived: true,
-          responseHeuristicClassification,
-          manualReviewRequired: true,
-          observationBeforeReply: true,
-        };
-      },
-    );
-    state.observationBoundaryCapture.responseEnd = state.responses.length;
-
-    const memoryResult = await recordCase(
-      state,
-      "persistent_memory_restart",
-      CASE_DEADLINES.persistent_memory_restart,
-      requireLiveContext(),
-      async (context) => {
-        const beforeResponses = context.responseQueue.length;
-        const durableFact = "maple-47";
-        sendChat(
-          context.owner,
-          `次のセッションでも覚えておいてください。合成テスト用の合言葉は「${durableFact}」です。私から教わった事実として記録してください。`,
-        );
-        await waitForPlayer(
-          context,
-          120_000,
-          (player) =>
-            player.counters.llmCalls > context.usageAtStart.llmCalls &&
-            context.responseQueue.length > beforeResponses &&
-            readDbContainsOwnerFact(state.databasePath, durableFact),
-        );
-        const beforeRestart = readDbTableCount(
-          state.databasePath,
-          "player_runtime_state",
-        );
-        const factPersisted = readDbContainsOwnerFact(
-          state.databasePath,
-          durableFact,
-        );
-        if (!factPersisted)
-          incomplete("SYNTHETIC_FACT_NOT_PERSISTED_BEFORE_RESTART");
-        await context.runtime.app.shutdown("ai_player_e2e_memory_restart");
-        const { createApplication } =
-          await import("../../src/app/application.js");
-        const nextApp = createApplication(context.runtime.config);
-        appForCleanup = nextApp;
-        await connectApplication(nextApp, state);
-        const restartedContext: CaseContext = {
-          ...makeContext(
-            state,
-            nextApp,
-            context.runtime.config,
-            rcon,
-            context.owner,
-            context.guest,
-          ),
-          usageAtStart: context.usageAtStart,
-          startedAt: context.startedAt,
-          caseDeadlineAt: context.caseDeadlineAt,
-          ...(context.caseBudget === undefined
-            ? {}
-            : { caseBudget: context.caseBudget }),
-        };
-        liveContext = restartedContext;
-        const afterRestart = await collect(nextApp);
-        const restartPlayer = playerOf(afterRestart);
-        if (beforeRestart < 1) incomplete("PERSISTENT_RUNTIME_ROW_MISSING");
-        if (!readDbContainsOwnerFact(state.databasePath, durableFact))
-          incomplete("SYNTHETIC_FACT_MISSING_AFTER_RESTART");
-        const responseStart = context.responseQueue.length;
-        const restartCallsBefore = restartPlayer.counters.llmCalls;
-        sendChat(
-          context.owner,
-          "再起動の前に、私が記憶してほしいと頼んだ合成フレーズを、そのまま教えてください。",
-        );
-        const recalled = await waitForPlayer(
-          restartedContext,
-          120_000,
-          (player) =>
-            player.counters.llmCalls > restartCallsBefore &&
-            context.responseQueue
-              .slice(responseStart)
-              .some(({ text }) => text.toLowerCase().includes(durableFact)),
-        );
-        const exactPhraseReturned = context.responseQueue
-          .slice(responseStart)
-          .some(({ text }) => text.toLowerCase().includes(durableFact));
-        if (!exactPhraseReturned)
-          fail("PERSISTENT_FACT_NOT_RECALLED_AFTER_RESTART");
-        return {
-          sameDatabaseReopened: true,
-          runtimeStateSurvivedRestart: beforeRestart > 0,
-          syntheticFactPersistedBeforeRestart: factPersisted,
-          postRestartJudgmentObserved:
-            recalled.counters.llmCalls > restartCallsBefore,
-          exactFactRecalled: exactPhraseReturned,
-          revisionAfterRecall: recalled.revision,
-        };
-      },
-    );
-
-    const learningResult = await recordCase(
-      state,
-      "learning_reuse",
-      CASE_DEADLINES.learning_reuse,
-      requireLiveContext(),
-      async (context) => {
-        const learnedBaseline = readSkillSnapshot(state.databasePath);
-        const origin = parsePosition(
-          await rcon.command(`data get entity ${state.botName} Pos`),
-        );
-        const firstLogs = await configureLogFixture(
-          rcon,
-          4,
-          origin,
-          state.botName,
-        );
-        const firstRegion = await captureBlockBaseline(rcon, origin);
-        const beforeWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          firstRegion,
-        );
-        const before = playerOf(await collect(context.runtime.app));
-        const beforeActions = before.actionRevision;
-        const responseStart = context.responseQueue.length;
-        sendChat(
-          context.owner,
-          "すぐ近くに置いたオークの原木を4本集めてください。方法と順序は自分で選び、実際に集め終わったかを確かめてください。",
-        );
-        let firstFixtureCheckAt = 0;
-        let firstFixtureGone = false;
-        const after = await waitForPlayer(context, 240_000, async (player) => {
-          if (Date.now() - firstFixtureCheckAt > 3_000) {
-            firstFixtureGone =
-              (await fixtureLogsRemaining(rcon, firstLogs)) === 0;
-            firstFixtureCheckAt = Date.now();
-          }
-          return (
-            player.actionRevision > beforeActions &&
-            newOutcomes(before, player).some(
-              (outcome) =>
-                outcome.kind === "dig" && outcome.status === "successful",
-            ) &&
-            !isOperationActive(player) &&
-            firstFixtureGone
-          );
-        });
-        const afterWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          firstRegion,
-        );
-        const initialOutcomes = newOutcomes(before, after);
-        const trustedDig = initialOutcomes.some(
-          (outcome) =>
-            outcome.kind === "dig" && outcome.status === "successful",
-        );
-        if (
-          !trustedDig ||
-          !worldChangedFromBlock(
-            beforeWorld.blockRegionChanged,
-            afterWorld.blockRegionChanged,
-          )
-        ) {
-          incomplete("LEARNING_ACTION_NOT_CONFIRMED_BY_SERVER");
-        }
-        const learned = readSkillSnapshot(state.databasePath);
-        const newSkillIds = [...learned.skillIds].filter(
-          (id) => !learnedBaseline.skillIds.has(id),
-        );
-        const trustedSuccess = newSkillIds.some(
-          (skillId) =>
-            learned.successfulDerivedSkillIds.has(skillId) &&
-            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
-        );
-        if (newSkillIds.length === 0 || !trustedSuccess)
-          incomplete("ONE_SUCCESS_DID_NOT_CREATE_VERIFIED_HYPOTHESIS");
-        verifiedLearnedSkillIds = newSkillIds.filter(
-          (skillId) =>
-            learned.successfulDerivedSkillIds.has(skillId) &&
-            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
-        );
-
-        const beforeReuse = readSkillSnapshot(state.databasePath);
-        const reuseOrigin = parsePosition(
-          await rcon.command(`data get entity ${state.botName} Pos`),
-        );
-        const reuseLogs = await configureLogFixture(
-          rcon,
-          2,
-          reuseOrigin,
-          state.botName,
-        );
-        const reuseRegion = await captureBlockBaseline(rcon, reuseOrigin);
-        const beforeReuseWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          reuseRegion,
-        );
-        const reuseStart = playerOf(await collect(context.runtime.app));
-        const reuseRevision = reuseStart.actionRevision;
-        const existingActivityKeys = new Set(
-          reuseStart.skillActivity.map(skillActivityKey),
-        );
-        const consultedLearnedSkillIds = new Set<string>();
-        sendChat(
-          context.owner,
-          "近くに少量のオークの原木を用意しました。集めてください。前回の方法が今も役立つと判断したら自分で選んで活用してください。",
-        );
-        let reuseFixtureCheckAt = 0;
-        let reuseFixtureGone = false;
-        const reused = await waitForPlayer(context, 150_000, async (player) => {
-          const newConsultedSkills = player.skillActivity.filter(
-            (activity) =>
-              activity.kind === "consulted" &&
-              verifiedLearnedSkillIds.includes(activity.skillId) &&
-              !existingActivityKeys.has(skillActivityKey(activity)),
-          );
-          for (const activity of newConsultedSkills) {
-            consultedLearnedSkillIds.add(activity.skillId);
-          }
-          if (Date.now() - reuseFixtureCheckAt > 3_000) {
-            reuseFixtureGone =
-              (await fixtureLogsRemaining(rcon, reuseLogs)) === 0;
-            reuseFixtureCheckAt = Date.now();
-          }
-          return (
-            player.actionRevision > reuseRevision &&
-            newOutcomes(reuseStart, player).some(
-              (outcome) =>
-                outcome.kind === "dig" && outcome.status === "successful",
-            ) &&
-            !isOperationActive(player) &&
-            newConsultedSkills.length > 0 &&
-            reuseFixtureGone
-          );
-        });
-        const reusedWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          reuseRegion,
-        );
-        const afterReuse = readSkillSnapshot(state.databasePath);
-        const consultedLearnedSkillRevisionAdvanced = [
-          ...consultedLearnedSkillIds,
-        ].some((skillId) => {
-          const priorVersions =
-            beforeReuse.revisionVersionsBySkill.get(skillId) ??
-            new Set<number>();
-          const currentVersions =
-            afterReuse.revisionVersionsBySkill.get(skillId) ??
-            new Set<number>();
-          return [...currentVersions].some(
-            (version) => !priorVersions.has(version),
-          );
-        });
-        const repeatedOutcomes = newOutcomes(reuseStart, reused);
-        const repeatedDig = repeatedOutcomes.some(
-          (outcome) =>
-            outcome.kind === "dig" && outcome.status === "successful",
-        );
-        if (
-          !repeatedDig ||
-          !worldChangedFromBlock(
-            beforeReuseWorld.blockRegionChanged,
-            reusedWorld.blockRegionChanged,
-          )
-        ) {
-          incomplete("REUSED_SKILL_HAS_NO_OBSERVED_RESULT");
-        }
-        if (
-          !consultedLearnedSkillRevisionAdvanced ||
-          afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
-        ) {
-          incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
-        }
-        return {
-          oneSuccessCreatedHypothesis: true,
-          trustedEvidenceReceipt: true,
-          derivedHypothesisLinkedToReceipt: true,
-          learnedSkillConsultedAgain: true,
-          repeatResultObserved: true,
-          consultedLearnedSkillRevisionAdvanced,
-          trustedDerivedReceiptForNewSkill: trustedSuccess,
-          initialSkillCount: baselineSkills.skillCount,
-          learnedSkillCount: learned.skillCount,
-          ownerReplyObserved: context.responseQueue.length > responseStart,
-        };
-      },
-    );
-
-    const skillQualityResult = await recordCase(
-      state,
-      "skill_compactness_and_knowledge_separation",
-      30_000,
-      requireLiveContext(),
-      async (context) => {
-        const skills = readSkillSnapshot(state.databasePath);
-        const player = playerOf(await collect(context.runtime.app));
-        const consultedIds = new Set(
-          player.skillActivity
-            .filter((activity) => activity.kind === "consulted")
-            .map((activity) => activity.skillId),
-        );
-        const consultedReferences = consultedIds.size;
-        const hasBoundedConsultation =
-          consultedReferences > 0 && consultedReferences < skills.skillCount;
-        if (!skills.learnedBodiesUnderLimit)
-          fail("LEARNED_SKILL_BODY_EXCEEDS_8KIB");
-        if (!hasBoundedConsultation)
-          incomplete("ON_DEMAND_SKILL_REFERENCE_EVIDENCE_MISSING");
-        if (operationSmokeResult.evidence.gameKnowledgeAvailable !== true) {
-          incomplete("GAME_KNOWLEDGE_LAYER_NOT_OBSERVED");
-        }
-        return {
-          learnedBodiesWithin8KiB: true,
-          gameKnowledgeApiSeparateFromSkillStore: true,
-          boundedSkillReferencesObserved: true,
-          consultedReferenceCount: consultedReferences,
-          persistedSkillCount: skills.skillCount,
-        };
-      },
-    );
-
-    const exchangeResult = await recordCase(
-      state,
-      "skill_exchange",
-      CASE_DEADLINES.skill_exchange,
-      requireLiveContext(),
-      async (context) => {
-        if (verifiedLearnedSkillIds.length === 0)
-          incomplete("LEARNED_SKILL_IDS_NOT_AVAILABLE_FOR_EXCHANGE");
-        const beforeFiles = new Set(
-          await exchangeMarkdownFiles(state.exchangeDirectory),
-        );
-        const beforeExport = playerOf(await collect(context.runtime.app));
-        const exportActivityKeys = new Set(
-          beforeExport.skillActivity.map(skillActivityKey),
-        );
-        const exportedLearnedSkillIds = new Set<string>();
-        const exportResponseStart = context.responseQueue.length;
-        sendChat(
-          context.owner,
-          "直近で覚えた採集方法を、専用のMarkdown交換機能でファイルに書き出し、ファイル名を教えてください。",
-        );
-        await waitForPlayer(context, 120_000, async () => {
-          const current = await exchangeMarkdownFiles(state.exchangeDirectory);
-          const exportedActivity = playerOf(
-            await collect(context.runtime.app),
-          ).skillActivity.some((activity) => {
-            if (
-              activity.kind !== "exported" ||
-              !verifiedLearnedSkillIds.includes(activity.skillId) ||
-              exportActivityKeys.has(skillActivityKey(activity))
-            )
-              return false;
-            exportedLearnedSkillIds.add(activity.skillId);
-            return true;
-          });
-          return (
-            current.some((file) => !beforeFiles.has(file)) &&
-            exportedActivity &&
-            context.responseQueue.length > exportResponseStart
-          );
-        });
-        const newFiles = (
-          await exchangeMarkdownFiles(state.exchangeDirectory)
-        ).filter((file) => !beforeFiles.has(file));
-        let exportedFile: string | undefined;
-        let exportedSkillId: string | undefined;
-        for (const file of newFiles) {
-          const markdown = await readFile(
-            resolve(state.exchangeDirectory, file),
-            "utf8",
-          );
-          const metadataBlock = /```mc-bot-skill\s*\n([\s\S]*?)\n```/u.exec(
-            markdown,
-          );
-          if (metadataBlock === null) continue;
-          const metadataJson = metadataBlock[1];
-          if (metadataJson === undefined) continue;
-          let metadata: unknown;
-          try {
-            metadata = JSON.parse(metadataJson) as unknown;
-          } catch {
-            continue;
-          }
-          const skill = isRecord(metadata) ? metadata.skill : undefined;
-          const skillId = isRecord(skill) ? skill.id : undefined;
-          if (
-            typeof skillId === "string" &&
-            verifiedLearnedSkillIds.includes(skillId) &&
-            exportedLearnedSkillIds.has(skillId)
-          ) {
-            exportedFile = file;
-            exportedSkillId = skillId;
-            break;
-          }
-        }
-        if (exportedFile === undefined || exportedSkillId === undefined)
-          fail("LEARNED_SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
-        const filePath = resolve(state.exchangeDirectory, exportedFile);
-        const exported = await readFile(filePath, "utf8");
-        const editedName = `e2e-edited-${randomBytes(3).toString("hex")}.md`;
-        const editedContent = appendSyntheticSkillEdit(exported);
-        await writeFile(
-          resolve(state.exchangeDirectory, editedName),
-          editedContent,
-          { encoding: "utf8", mode: 0o600, flag: "wx" },
-        );
-        const beforeImport = readSkillSnapshot(state.databasePath);
-        const importPlayer = playerOf(await collect(context.runtime.app));
-        const importActivityKeys = new Set(
-          importPlayer.skillActivity.map(skillActivityKey),
-        );
-        const importResponseStart = context.responseQueue.length;
-        sendChat(
-          context.owner,
-          `編集したSkillファイル「${editedName}」を専用の取り込み機能で読み込み、再利用する手順に反映してください。`,
-        );
-        await waitForPlayer(context, 120_000, async () => {
-          const now = readSkillSnapshot(state.databasePath);
-          const currentPlayer = playerOf(await collect(context.runtime.app));
-          const importedActivity = currentPlayer.skillActivity.some(
-            (activity) =>
-              activity.kind === "imported" &&
-              activity.skillId === exportedSkillId &&
-              activity.summary ===
-                `未信頼の交換用Markdown ${editedName} を知識として取込` &&
-              !importActivityKeys.has(skillActivityKey(activity)),
-          );
-          const beforeVersions =
-            beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
-            new Set<number>();
-          const currentVersions =
-            now.revisionVersionsBySkill.get(exportedSkillId) ??
-            new Set<number>();
-          const sameSkillRevisionAdvanced = [...currentVersions].some(
-            (version) => !beforeVersions.has(version),
-          );
-          const editedBodyObserved =
-            now.learnedBodiesBySkill
-              .get(exportedSkillId)
-              ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
-          const sameSkillReceiptCount =
-            now.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-          const priorSkillReceiptCount =
-            beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-          return (
-            sameSkillRevisionAdvanced &&
-            editedBodyObserved &&
-            sameSkillReceiptCount > priorSkillReceiptCount &&
-            importedActivity &&
-            context.responseQueue.length > importResponseStart
-          );
-        });
-        const afterImport = readSkillSnapshot(state.databasePath);
-        const importedActivities = playerOf(
-          await collect(context.runtime.app),
-        ).skillActivity;
-        const importedSkillActivity = importedActivities.find(
-          (activity) =>
-            activity.kind === "imported" &&
-            activity.skillId === exportedSkillId &&
-            activity.summary ===
-              `未信頼の交換用Markdown ${editedName} を知識として取込` &&
-            !importActivityKeys.has(skillActivityKey(activity)),
-        );
-        const beforeImportedVersions =
-          beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
-          new Set<number>();
-        const afterImportedVersions =
-          afterImport.revisionVersionsBySkill.get(exportedSkillId) ??
-          new Set<number>();
-        const importedSkillVersion = Math.max(0, ...afterImportedVersions);
-        const importedRevision = [...afterImportedVersions].some(
-          (version) => !beforeImportedVersions.has(version),
-        );
-        const editedBodyImported =
-          afterImport.learnedBodiesBySkill
-            .get(exportedSkillId)
-            ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
-        const beforeSkillReceiptCount =
-          beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-        const importedSkillReceiptCount =
-          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-        if (
-          importedSkillActivity === undefined ||
-          !importedRevision ||
-          !editedBodyImported ||
-          importedSkillReceiptCount <= beforeSkillReceiptCount
-        )
-          incomplete("EXPORTED_SKILL_EDIT_NOT_CONFIRMED_FOR_SAME_ID");
-        const receiptsBeforeDuplicate =
-          afterImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-        const duplicateImportStart = playerOf(
-          await collect(context.runtime.app),
-        );
-        const duplicateActivityKeys = new Set(
-          duplicateImportStart.skillActivity.map(skillActivityKey),
-        );
-        const duplicateResponseStart = context.responseQueue.length;
-        sendChat(
-          context.owner,
-          `同じ編集済みSkillファイル「${editedName}」をもう一度読み込み、重複処理が安全か確かめてください。`,
-        );
-        await waitForPlayer(
-          context,
-          60_000,
-          (player) =>
-            player.counters.llmCalls > duplicateImportStart.counters.llmCalls &&
-            context.responseQueue.length > duplicateResponseStart &&
-            player.skillActivity.some(
-              (activity) =>
-                activity.kind === "imported" &&
-                activity.skillId === exportedSkillId &&
-                activity.version === importedSkillVersion &&
-                activity.summary ===
-                  `未信頼の交換用Markdown ${editedName} を知識として取込` &&
-                !duplicateActivityKeys.has(skillActivityKey(activity)),
-            ),
-        );
-        const afterDuplicate = readSkillSnapshot(state.databasePath);
-        const duplicateReceiptCount =
-          afterDuplicate.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-        if (duplicateReceiptCount !== receiptsBeforeDuplicate)
-          fail("DUPLICATE_IMPORT_CREATED_NEW_RECEIPT");
-        const afterDuplicateVersions =
-          afterDuplicate.revisionVersionsBySkill.get(exportedSkillId) ??
-          new Set<number>();
-        const duplicateRevisionChanged =
-          afterDuplicateVersions.size !== afterImportedVersions.size ||
-          [...afterImportedVersions].some(
-            (version) => !afterDuplicateVersions.has(version),
-          );
-        if (
-          duplicateRevisionChanged ||
-          afterDuplicate.learnedBodiesBySkill.get(exportedSkillId) !==
-            afterImport.learnedBodiesBySkill.get(exportedSkillId)
-        )
-          fail("DUPLICATE_IMPORT_CHANGED_SKILL_REVISION");
-        return {
-          markdownExportCreated: true,
-          humanEditImported: true,
-          dbRevisionUpdated: importedRevision,
-          repeatedImportDidNotAddReceipt: true,
-          dbSkillCount: afterDuplicate.skillCount,
-          importReceiptCount: afterDuplicate.importReceiptCount,
-        };
-      },
-    );
-
-    const discretionResult = await recordCase(
-      state,
-      "game_action_discretion",
-      CASE_DEADLINES.game_action_discretion,
-      requireLiveContext(),
-      async (context) => {
-        const origin = parsePosition(
-          await rcon.command(`data get entity ${state.botName} Pos`),
-        );
-        const buildingRegion = await configureBuildingFixture(
-          rcon,
-          context.botName,
-          origin,
-        );
-        await captureBlockBaseline(rcon, origin);
-        const beforeWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          buildingRegion,
-        );
-        const before = playerOf(await collect(context.runtime.app));
-        const beforeActionRevision = before.actionRevision;
-        sendChat(
-          context.owner,
-          "この拠点の屋根にある穴を、持っている木材でふさいでください。置く場所や順序は自分で判断し、ブロックごとに確認を求める必要はありません。危険を感じた場合も、取るかどうかを自分で判断してください。",
-        );
-        const after = await waitForPlayer(
-          context,
-          CASE_DEADLINES.game_action_discretion - 60_000,
-          (player) =>
-            player.actionRevision > beforeActionRevision &&
-            newOutcomes(before, player).some(
-              (outcome) =>
-                outcome.kind === "place" && outcome.status === "successful",
-            ),
-        );
-        const afterWorld = await readWorldSnapshot(
-          rcon,
-          state.botName,
-          buildingRegion,
-        );
-        const selectedPlacement = newOutcomes(before, after).some(
-          (outcome) =>
-            outcome.kind === "place" && outcome.status === "successful",
-        );
-        const stateChanged = worldChangedFromBlock(
-          beforeWorld.blockRegionChanged,
-          afterWorld.blockRegionChanged,
-        );
-        if (!selectedPlacement || !stateChanged)
-          incomplete("BUILDING_DISCRETION_NOT_OBSERVED");
-        return {
-          selectedBuildingOperation: selectedPlacement,
-          serverConfirmedWorldChange: stateChanged,
-          ownerApprovalPerBlockNotRequired: true,
         };
       },
     );
