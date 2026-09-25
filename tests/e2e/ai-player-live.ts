@@ -390,6 +390,8 @@ interface BodySmokeDiagnostic {
   readonly obstacleRoutePathStatus?: BodyPathStatus;
   readonly obstacleRoutePathUpdateCount?: number;
   readonly obstacleRouteMaxPathBand?: "none" | "short" | "long";
+  readonly obstacleRouteLookStatus?: BodyOperationStatus;
+  readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
   readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
   readonly resourceTargetRconConfirmed?: boolean;
@@ -5442,6 +5444,31 @@ async function runOperationSmoke(
           };
           if (!obstacleRouteVerifiedByServer)
             incomplete("BODY_NAVIGATION_PROBE_ROUTE_NOT_CONFIRMED");
+          const targetLook = await body.execute(
+            {
+              kind: "look",
+              target: {
+                x: fixtureTarget.x + 0.5,
+                y: fixtureTarget.y + 0.5,
+                z: fixtureTarget.z + 0.5,
+              },
+            },
+            abort.signal,
+          );
+          let targetVisibleAfterLook = false;
+          const targetVisibilityDeadline = Date.now() + 5_000;
+          while (Date.now() < targetVisibilityDeadline) {
+            targetVisibleAfterLook =
+              observedBlockName(await body.observe(), fixtureTarget) ===
+              "blue_wool";
+            if (targetVisibleAfterLook) break;
+            await waitMs(100);
+          }
+          state.bodySmokeDiagnostic = {
+            ...state.bodySmokeDiagnostic,
+            obstacleRouteLookStatus: targetLook.status,
+            obstacleRouteTargetVisibleAfterLook: targetVisibleAfterLook,
+          };
           if (process.env.AI_PLAYER_E2E_OBSTACLE_RESTORE_PROBE_ONLY === "YES") {
             await rcon.command(
               `tp ${state.botName} ${smokeSpawn.x} ${smokeSpawn.y} ${smokeSpawn.z} 0 0`,

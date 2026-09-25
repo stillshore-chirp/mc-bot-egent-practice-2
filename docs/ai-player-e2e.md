@@ -213,4 +213,6 @@ HEAD `82211ab` の同じ対象caseではBody smokeと自発生活がpassし、�
 
 HEAD `fccca5c` の対象caseではBody smokeと自発生活がpassしました。制御障害は2件目の開始済み移動を対象に安全確認を通過し、57ブロックの設置を読戻しました。一方、復元を確認できず、`UNKNOWN_OBSTACLE_RESTORE_FAILED`でcaseを未完了として停止しました。未知状況は24 calls・既知154,178 tokens、run全体は31 calls・既知191,543 tokens、usageは`partial_or_unknown`、隔離server・listener・一時worldのcleanupは3/3です。復元失敗の内部段階はこのrunでは記録されず、原因は未特定です。試験fixtureの復元時にtickを停止してからclone・比較し、終了時に再開する処理と、失敗段階の固定分類を追加しました。GPT不要の隔離Paper probeでは、経路移動と水路を含む領域での障害物設置・復元がpassし、API呼び出し0回、cleanup 3/3でした。このprobeは復元経路の局所検証であり、未知複合状況での標的の採集・持帰り、失敗後の回復は未確認です。
 
+HEAD `26893c5` の対象caseではBody smokeと自発生活がpassし、未知状況は43 calls・既知333,088 tokensでcase上限、run全体は50 calls・既知370,647 tokens、usageは`partial_or_unknown`、cleanup 3/3でした。成功した`move_to`と`look`は複数ありましたが、サーバー観測では標的への距離短縮、採集、持帰りを確認できません。制御障害は2件の開始済み移動が二度目の適格性確認で終わったため設置せず、失敗後の回復も未確認です。終了時のBody観測には石と水があり、青い羊毛は見えていませんでした。別のGPT不要な隔離Paper probeでは、同じ壁・水路を迂回して標的近傍へ移動した後、標的へ視線を向けると青い羊毛をBodyで観測できました。API呼び出し0回、cleanup 3/3です。これにより近傍での可視経路は確認しましたが、実GPTがそこへ達する判断はまだ実証できません。保存済みのtool活動では、新しいowner目的が届いた後に関連Skillを検索した証跡がありません。新しい目的へ初めて着手する時のSkill検索・本文参照を判断入力で明示しました。この変更後の実GPT効果は未確認です。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集・持帰りと全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
