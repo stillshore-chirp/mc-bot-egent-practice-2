@@ -107,6 +107,14 @@ const E2E_GAMERULES = {
 } as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
+// The spread covers the 110-degree horizontal view cone; east stays in front of the hidden wall.
+const AUTONOMOUS_RESOURCE_FIXTURE = [
+  { x: 1, y: 64, z: 0 },
+  { x: 0, y: 64, z: -6 },
+  { x: 0, y: 64, z: 6 },
+  { x: -4, y: 64, z: -1 },
+  { x: -1, y: 64, z: 1 },
+] as const;
 const RUN_BUDGET_LIMITS = {
   durationMs: 45 * 60_000,
   llmCalls: 160,
@@ -320,6 +328,7 @@ interface BodySmokeDiagnostic {
   readonly fixtureLookDetailClass: BodyDetailClass;
   readonly fixtureTargetVisibleAfterLook: boolean;
   readonly fixtureTargetBlockName: string;
+  readonly resourceVisibleAfterSmoke?: boolean;
   readonly targetVisibleInDigBeforeSnapshot?: boolean;
   readonly targetBlockNameInDigBeforeSnapshot?: string;
   readonly digStatus?: BodyOperationStatus;
@@ -1733,6 +1742,7 @@ async function main(): Promise<void> {
         };
       },
     );
+    await removeAutonomousResourceFixture(rcon);
 
     const observationCapture: NonNullable<
       RunState["observationBoundaryCapture"]
@@ -3791,6 +3801,7 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   );
   await configureHiddenContainer(rcon);
   await configureAutonomousBuildFixture(rcon);
+  await configureAutonomousResourceFixture(rcon);
   await establishBaseline(rcon, REGION, REGION_BASELINE, incomplete);
   await mkdir(dirname(state.databasePath), { recursive: true, mode: 0o700 });
 }
@@ -3893,11 +3904,22 @@ async function runOperationSmoke(
         if (!registryKnowledgeAvailable)
           incomplete("GAME_REGISTRY_KNOWLEDGE_FIXTURE_MISSING");
         const playerSnapshot = await readWorldSnapshot(rcon, state.botName);
-        target = {
+        const smokeTarget = {
           x: Math.floor(playerSnapshot.position.x) + 1,
           y: Math.floor(playerSnapshot.position.y),
           z: Math.floor(playerSnapshot.position.z) + 2,
         };
+        if (
+          AUTONOMOUS_RESOURCE_FIXTURE.some(
+            (block) =>
+              block.x === smokeTarget.x &&
+              block.y === smokeTarget.y &&
+              block.z === smokeTarget.z,
+          )
+        ) {
+          incomplete("BODY_SMOKE_TARGET_OVERLAPS_RESOURCE_FIXTURE");
+        }
+        target = smokeTarget;
         await rcon.command(
           `setblock ${target.x} ${target.y} ${target.z} stone`,
         );
@@ -4342,6 +4364,33 @@ async function runOperationSmoke(
           incomplete("BODY_OPERATION_EFFECT_NOT_CONFIRMED");
         await rcon.command(`setblock ${target.x} ${target.y} ${target.z} air`);
         await rcon.command(`clear ${state.botName} minecraft:raw_iron`);
+        let resourceVisibleAfterSmoke = false;
+        const resourceVisibilityDeadline = Date.now() + 5_000;
+        while (
+          !abort.signal.aborted &&
+          Date.now() < resourceVisibilityDeadline
+        ) {
+          let observation: PlayerBodyObservation;
+          try {
+            observation = await body.observe();
+          } catch {
+            incomplete("BODY_SMOKE_RESOURCE_OBSERVATION_UNAVAILABLE");
+          }
+          resourceVisibleAfterSmoke = observation.perception.blocks.some(
+            ({ name }) => name === "oak_log",
+          );
+          if (resourceVisibleAfterSmoke) break;
+          await waitMs(
+            Math.max(1, Math.min(100, resourceVisibilityDeadline - Date.now())),
+          );
+        }
+        furnaceDiagnostic = {
+          ...furnaceDiagnostic,
+          resourceVisibleAfterSmoke,
+        };
+        state.bodySmokeDiagnostic = furnaceDiagnostic;
+        if (!resourceVisibleAfterSmoke)
+          incomplete("BODY_SMOKE_RESOURCE_NOT_VISIBLE");
         const smokeEndPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -4365,6 +4414,7 @@ async function runOperationSmoke(
           bodyObservationAvailable: isRecord(visibleBefore),
           occludedFixtureItemOmitted: hiddenItemOmitted,
           gameKnowledgeAvailable: registryKnowledgeAvailable,
+          resourceVisibleAfterSmoke,
           gptCalls: 0,
           apiOperationsReportedSuccess,
         };
@@ -5246,6 +5296,30 @@ async function configureAutonomousBuildFixture(rcon: LocalRcon): Promise<void> {
   await rcon.command(
     "item replace block -7 64 0 container.0 with oak_planks 16",
   );
+}
+
+async function configureAutonomousResourceFixture(
+  rcon: LocalRcon,
+): Promise<void> {
+  for (const block of AUTONOMOUS_RESOURCE_FIXTURE) {
+    await rcon.command(`setblock ${block.x} ${block.y} ${block.z} oak_log`);
+  }
+  for (const block of AUTONOMOUS_RESOURCE_FIXTURE) {
+    if (!(await isBlock(rcon, block, "oak_log")))
+      incomplete("AUTONOMOUS_RESOURCE_FIXTURE_NOT_CONFIRMED");
+  }
+}
+
+async function removeAutonomousResourceFixture(rcon: LocalRcon): Promise<void> {
+  for (const block of AUTONOMOUS_RESOURCE_FIXTURE) {
+    await rcon.command(
+      `fill ${block.x} ${block.y} ${block.z} ${block.x} ${block.y} ${block.z} air replace oak_log`,
+    );
+  }
+  for (const block of AUTONOMOUS_RESOURCE_FIXTURE) {
+    if (await isBlock(rcon, block, "oak_log"))
+      incomplete("AUTONOMOUS_RESOURCE_FIXTURE_CLEANUP_UNVERIFIED");
+  }
 }
 
 async function configureLogFixture(
