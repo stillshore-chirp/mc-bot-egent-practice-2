@@ -448,6 +448,7 @@ function openPurposeFixture(
         ownerPositionExceptions.push(true);
       return {
         dimension: "overworld",
+        self: { yaw: 0 },
         perception: { blocks: [] },
       } as unknown as PlayerBodyObservation;
     },
