@@ -23,6 +23,22 @@ export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 export const playerResponseCompactionThreshold = 16_000;
 
 export type PlayerAgentRole = "purpose" | "conversation";
+export const playerAgentRequestErrorCauses = [
+  "request_failed",
+  "owner_proposal",
+  "body_outcome",
+  "state_changed",
+  "operation_stalled",
+  "bot_death",
+  "reconnected",
+  "deadline",
+  "manual",
+  "startup",
+  "stop",
+  "other_abort",
+] as const;
+export type PlayerAgentRequestErrorCause =
+  (typeof playerAgentRequestErrorCauses)[number];
 export type PlayerAgentToolResultClass =
   "ok" | "rejected" | "error" | "unknown";
 
@@ -83,6 +99,7 @@ export interface PlayerAgentRoundActivity {
   readonly responseStatus:
     "completed" | "incomplete" | "failed" | "unknown" | "request_error";
   readonly processingStatus: "complete" | "interrupted";
+  readonly requestErrorCause?: PlayerAgentRequestErrorCause | undefined;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
@@ -279,6 +296,7 @@ export async function runPlayerAgent(
         round: round + 1,
         responseStatus: "request_error",
         processingStatus: "interrupted",
+        requestErrorCause: classifyRequestErrorCause(input.signal),
         inputTokens: 0,
         outputTokens: 0,
         latencyMs: Math.round(performance.now() - started),
@@ -576,6 +594,32 @@ function safeSerializedLength(value: unknown): number {
   }
 }
 
+function classifyRequestErrorCause(
+  signal: AbortSignal | undefined,
+): PlayerAgentRequestErrorCause {
+  if (signal?.aborted !== true) return "request_failed";
+  const reason: unknown = signal.reason;
+  const message = reason instanceof Error ? reason.message : "";
+  if (message === "owner_proposal_preempted_thought") return "owner_proposal";
+  if (
+    message === "owner_stop" ||
+    message === "autonomy_stopped" ||
+    message === "shutdown"
+  )
+    return "stop";
+  const prefix = "new_event_preempted_thought:";
+  if (message.startsWith(prefix))
+    return safeRequestErrorCause(message.slice(prefix.length)) ?? "other_abort";
+  return "other_abort";
+}
+
+function safeRequestErrorCause(
+  value: unknown,
+): PlayerAgentRequestErrorCause | undefined {
+  if (typeof value !== "string") return undefined;
+  return playerAgentRequestErrorCauses.find((cause) => cause === value);
+}
+
 /** Projects unknown snapshot data into a bounded, content-free activity tail. */
 export function projectSafePlayerAgentActivityTail(
   value: unknown,
@@ -646,12 +690,18 @@ export function projectSafePlayerAgentActivityTail(
             ];
           })
       : [];
+    const responseStatus = safeActivityResponseStatus(candidate.responseStatus);
+    const requestErrorCause =
+      responseStatus === "request_error"
+        ? safeRequestErrorCause(candidate.requestErrorCause)
+        : undefined;
     result.push({
       runSequence,
       role,
       round,
-      responseStatus: safeActivityResponseStatus(candidate.responseStatus),
+      responseStatus,
       processingStatus: candidate.processingStatus,
+      ...(requestErrorCause === undefined ? {} : { requestErrorCause }),
       inputTokens: safeNonnegativeInteger(candidate.inputTokens),
       outputTokens: safeNonnegativeInteger(candidate.outputTokens),
       latencyMs: safeNonnegativeInteger(candidate.latencyMs),

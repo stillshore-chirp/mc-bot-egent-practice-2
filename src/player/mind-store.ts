@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { McSkillOutcomeStatus } from "../mc-skills/index.js";
 import { playerOperationNames } from "../minecraft/player-body-schema.js";
 import {
+  playerAgentRequestErrorCauses,
   playerAgentToolNames,
   playerSkillLearningRejectionCodes,
   type PlayerAgentRoundActivity,
@@ -155,6 +156,7 @@ const agentActivitySchema = z
       "request_error",
     ]),
     processingStatus: z.enum(["complete", "interrupted"]),
+    requestErrorCause: z.enum(playerAgentRequestErrorCauses).optional(),
     inputTokens: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
     latencyMs: z.number().int().nonnegative(),

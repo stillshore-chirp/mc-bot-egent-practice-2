@@ -462,7 +462,7 @@ export class PlayerRuntime {
       ) {
         // Decision-invalidating events advance CAS. Ordinary observation
         // changes remain queued for the next thought after this one settles.
-        activeThought.abort(new Error("new_event_preempted_thought"));
+        activeThought.abort(new Error(`new_event_preempted_thought:${kind}`));
       }
       return;
     }

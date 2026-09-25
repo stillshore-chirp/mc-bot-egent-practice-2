@@ -28,6 +28,7 @@ describe("Responses server-side compaction", () => {
         input: "Input.",
         tools: [],
         logger: silentLogger(),
+        onRoundActivity: (activity) => mind.recordAgentActivity(activity),
         onCall: (metrics) =>
           mind.recordCall({
             inputTokens: metrics.inputTokens,
@@ -44,6 +45,50 @@ describe("Responses server-side compaction", () => {
       inputTokens: 0,
       outputTokens: 0,
     });
+    expect(mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+      responseStatus: "request_error",
+      requestErrorCause: "request_failed",
+    });
+    mind.close();
+  });
+
+  it("classifies a thought preemption using only a fixed wake kind", async () => {
+    const mind = PlayerMindStore.open(":memory:");
+    const controller = new AbortController();
+    const reason = new Error("new_event_preempted_thought:body_outcome");
+    const client = {
+      responses: {
+        create: async () => {
+          controller.abort(reason);
+          throw reason;
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        signal: controller.signal,
+        onRoundActivity: (activity) => mind.recordAgentActivity(activity),
+      }),
+    ).rejects.toBe(reason);
+
+    const activity = mind.snapshot().recentAgentActivity.at(-1);
+    expect(activity).toMatchObject({
+      responseStatus: "request_error",
+      requestErrorCause: "body_outcome",
+    });
+    expect(JSON.stringify(activity)).not.toContain(
+      "new_event_preempted_thought",
+    );
+    expect(projectSafePlayerAgentActivityTail([activity])).toMatchObject([
+      { requestErrorCause: "body_outcome" },
+    ]);
     mind.close();
   });
 
@@ -52,8 +97,9 @@ describe("Responses server-side compaction", () => {
       runSequence: index + 1,
       role: "purpose",
       round: 1,
-      responseStatus: "completed",
+      responseStatus: index === 69 ? "request_error" : "completed",
       processingStatus: "complete",
+      requestErrorCause: "private-cause-sentinel",
       inputTokens: 7,
       outputTokens: 2,
       latencyMs: 30,
@@ -98,6 +144,7 @@ describe("Responses server-side compaction", () => {
     expect(serialized).not.toContain("private output sentinel");
     expect(serialized).not.toContain("private-code-sentinel");
     expect(serialized).not.toContain("private-component-sentinel");
+    expect(serialized).not.toContain("private-cause-sentinel");
     expect(serialized).not.toContain("arguments");
     expect(serialized).not.toContain("prompt");
     expect(projected.at(-1)?.toolCalls[1]).toMatchObject({
