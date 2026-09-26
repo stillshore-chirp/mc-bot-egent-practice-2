@@ -31,6 +31,7 @@ import {
   type ImportedMcSkillStatistics,
   type McSkillCategory,
   type McSkillDefinition,
+  type McSkillEvidenceRevisionLink,
   type McSkillHypothesisEvidenceLink,
   type McSkillOutcome,
   type McSkillOutcomeStatus,
@@ -42,6 +43,8 @@ import {
   type RecordMcSkillOutcomeInput,
   type RecordTrustedMcSkillEvidenceInput,
   type ReviseMcSkillInput,
+  type ReviseMcSkillFromEvidenceInput,
+  type ReviseMcSkillFromEvidenceResult,
   type SearchMcSkillsOptions,
   type TrustedMcSkillEvidenceReceipt,
 } from "./types.js";
@@ -197,6 +200,19 @@ interface DerivedHypothesisRow {
   readonly created_at: string;
 }
 
+interface EvidenceRevisionRow {
+  readonly run_id: string;
+  readonly receipt_id: string;
+  readonly skill_id: string;
+  readonly skill_version_at_use: number;
+  readonly revision_version: number;
+  readonly definition_digest: string;
+  readonly request_digest: string;
+  readonly created_at: string;
+  readonly operation_name: string;
+  readonly observed_outcome: string;
+}
+
 interface OutcomeCountRow {
   readonly status: string;
   readonly count: number;
@@ -211,6 +227,7 @@ export class McSkillRepositoryError extends Error {
       | "ID_CONFLICT"
       | "OUTCOME_CONFLICT"
       | "EVIDENCE_CONFLICT"
+      | "EVIDENCE_REVISION_CONFLICT"
       | "UNSAFE_EXCHANGE_PATH"
       | "IMPORT_INVALID",
     message: string,
@@ -362,6 +379,45 @@ const schemaSql = `
   CREATE TRIGGER IF NOT EXISTS mc_bot_skill_receipts_no_delete
     BEFORE DELETE ON mc_bot_skill_evidence_receipts BEGIN
       SELECT RAISE(ABORT, 'skill evidence receipts are immutable');
+    END;
+  CREATE TABLE IF NOT EXISTS mc_bot_skill_evidence_revisions (
+    run_id TEXT PRIMARY KEY REFERENCES mc_bot_skill_evidence_receipts(run_id) ON DELETE RESTRICT,
+    receipt_id TEXT NOT NULL UNIQUE REFERENCES mc_bot_skill_evidence_receipts(receipt_id) ON DELETE RESTRICT,
+    skill_id TEXT NOT NULL,
+    skill_version_at_use INTEGER NOT NULL CHECK (skill_version_at_use > 0),
+    revision_version INTEGER NOT NULL CHECK (revision_version > skill_version_at_use),
+    definition_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (skill_id, revision_version),
+    FOREIGN KEY (skill_id, skill_version_at_use)
+      REFERENCES mc_bot_skill_revisions(skill_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (skill_id, revision_version)
+      REFERENCES mc_bot_skill_revisions(skill_id, version) ON DELETE RESTRICT
+  );
+  CREATE TRIGGER IF NOT EXISTS mc_bot_skill_evidence_revisions_validate_insert
+    BEFORE INSERT ON mc_bot_skill_evidence_revisions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM mc_bot_skill_evidence_receipts AS receipt
+      INNER JOIN mc_bot_skills AS skill ON skill.id = NEW.skill_id
+      WHERE receipt.run_id = NEW.run_id
+        AND receipt.receipt_id = NEW.receipt_id
+        AND receipt.observed_outcome IN ('successful', 'failed')
+        AND receipt.skill_id_at_use = NEW.skill_id
+        AND receipt.skill_version_at_use = NEW.skill_version_at_use
+        AND NEW.revision_version = NEW.skill_version_at_use + 1
+        AND skill.version = NEW.revision_version
+    ) BEGIN
+      SELECT RAISE(ABORT, 'evidence revision does not match trusted receipt');
+    END;
+  CREATE TRIGGER IF NOT EXISTS mc_bot_skill_evidence_revisions_no_update
+    BEFORE UPDATE ON mc_bot_skill_evidence_revisions BEGIN
+      SELECT RAISE(ABORT, 'evidence revisions are immutable');
+    END;
+  CREATE TRIGGER IF NOT EXISTS mc_bot_skill_evidence_revisions_no_delete
+    BEFORE DELETE ON mc_bot_skill_evidence_revisions BEGIN
+      SELECT RAISE(ABORT, 'evidence revisions are immutable');
     END;
   CREATE TABLE IF NOT EXISTS mc_bot_skill_derived_hypotheses (
     run_id TEXT PRIMARY KEY REFERENCES mc_bot_skill_evidence_receipts(run_id) ON DELETE RESTRICT,
@@ -770,6 +826,193 @@ export class McSkillRepository {
   }
 
   /**
+   * Revises an existing Skill from its exact trusted receipt and atomically
+   * records immutable provenance for the resulting definition version.
+   */
+  public reviseFromEvidence(
+    input: ReviseMcSkillFromEvidenceInput,
+  ): ReviseMcSkillFromEvidenceResult {
+    const runId = shortText(input.runId, "runId");
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/u.test(runId)) {
+      throw validationError("runId must be an opaque alphanumeric identifier");
+    }
+    const transaction = this.database.transaction(() => {
+      const receipt = this.database
+        .prepare<[string], EvidenceRow>(
+          "SELECT * FROM mc_bot_skill_evidence_receipts WHERE run_id = ?",
+        )
+        .get(runId);
+      if (receipt === undefined) {
+        throw new McSkillRepositoryError(
+          "NOT_FOUND",
+          "A trusted evidence receipt for this run was not found",
+        );
+      }
+      if (
+        receipt.observed_outcome !== "successful" &&
+        receipt.observed_outcome !== "failed"
+      ) {
+        throw validationError(
+          "Only an observed successful or failed receipt can revise a skill",
+        );
+      }
+      if (
+        receipt.skill_id_at_use !== input.skillId ||
+        receipt.skill_version_at_use !== input.expectedVersion ||
+        input.expectedVersion < 1
+      ) {
+        throw new McSkillRepositoryError(
+          "EVIDENCE_REVISION_CONFLICT",
+          "The trusted receipt does not match the skill version being revised",
+        );
+      }
+
+      const usedRevision = this.database
+        .prepare<[string, number], RevisionRow>(
+          "SELECT * FROM mc_bot_skill_revisions WHERE skill_id = ? AND version = ?",
+        )
+        .get(input.skillId, input.expectedVersion);
+      if (usedRevision === undefined) {
+        throw versionConflict(
+          input.expectedVersion,
+          this.skillRow(input.skillId).version,
+        );
+      }
+      const usedDefinition = definitionFromRevisionRow(usedRevision);
+      if (!usedDefinition.operationRefs.includes(receipt.operation_name)) {
+        throw new McSkillRepositoryError(
+          "EVIDENCE_REVISION_CONFLICT",
+          "The trusted receipt operation is absent from the referenced skill revision",
+        );
+      }
+
+      const candidate = normalizeSkill({
+        ...usedDefinition,
+        ...input.patch,
+        id: input.skillId,
+      });
+      this.validateOperationRefs(candidate.operationRefs);
+      if (!candidate.operationRefs.includes(receipt.operation_name)) {
+        throw validationError(
+          "A receipt-grounded revision must retain its observed operation reference",
+        );
+      }
+      if (!materialEvidenceDefinitionChanged(usedDefinition, candidate)) {
+        throw validationError(
+          "An evidence revision must materially change conditions, body, expected outcome, or confidence",
+        );
+      }
+      const note = shortText(input.changeNote, "changeNote");
+      const definitionDigestValue = definitionDigest(candidate);
+      const requestDigest = digest(
+        JSON.stringify({
+          skillId: input.skillId,
+          expectedVersion: input.expectedVersion,
+          changeKind: input.changeKind,
+          changeNote: note,
+          definitionDigest: definitionDigestValue,
+        }),
+      );
+      const existing = this.database
+        .prepare<[string], EvidenceRevisionRow>(
+          `SELECT evidence_revision.*, receipt.operation_name, receipt.observed_outcome
+           FROM mc_bot_skill_evidence_revisions AS evidence_revision
+           INNER JOIN mc_bot_skill_evidence_receipts AS receipt
+             ON receipt.receipt_id = evidence_revision.receipt_id
+           WHERE evidence_revision.run_id = ?`,
+        )
+        .get(runId);
+      if (existing !== undefined) {
+        if (
+          existing.receipt_id !== receipt.receipt_id ||
+          existing.skill_id !== input.skillId ||
+          existing.skill_version_at_use !== input.expectedVersion ||
+          existing.definition_digest !== definitionDigestValue ||
+          existing.request_digest !== requestDigest
+        ) {
+          throw new McSkillRepositoryError(
+            "EVIDENCE_REVISION_CONFLICT",
+            "This trusted receipt already attributes a different skill revision",
+          );
+        }
+        return {
+          skill: this.get(input.skillId),
+          evidenceRevision: evidenceRevisionFromRow(existing),
+          idempotent: true,
+        };
+      }
+
+      const current = this.skillRow(input.skillId);
+      if (current.version !== input.expectedVersion) {
+        throw versionConflict(input.expectedVersion, current.version);
+      }
+      const revisionVersion = input.expectedVersion + 1;
+      const now = new Date().toISOString();
+      const result = this.database
+        .prepare(
+          "UPDATE mc_bot_skills SET category = ?, title = ?, purpose = ?, conditions_json = ?, body = ?, operation_refs_json = ?, expected_outcome = ?, confidence = ?, version = ?, updated_at = ? WHERE id = ? AND version = ?",
+        )
+        .run(
+          candidate.category,
+          candidate.title,
+          candidate.purpose,
+          JSON.stringify(candidate.conditions),
+          candidate.body,
+          JSON.stringify(candidate.operationRefs),
+          candidate.expectedOutcome,
+          candidate.confidence,
+          revisionVersion,
+          now,
+          input.skillId,
+          input.expectedVersion,
+        );
+      if (result.changes !== 1) {
+        const observed = this.skillRow(input.skillId).version;
+        throw versionConflict(input.expectedVersion, observed);
+      }
+      this.insertRevision(
+        candidate,
+        revisionVersion,
+        input.changeKind,
+        note,
+        now,
+      );
+      this.database
+        .prepare(
+          "INSERT INTO mc_bot_skill_evidence_revisions (run_id, receipt_id, skill_id, skill_version_at_use, revision_version, definition_digest, request_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          runId,
+          receipt.receipt_id,
+          input.skillId,
+          input.expectedVersion,
+          revisionVersion,
+          definitionDigestValue,
+          requestDigest,
+          now,
+        );
+      const stored = this.database
+        .prepare<[string], EvidenceRevisionRow>(
+          `SELECT evidence_revision.*, receipt.operation_name, receipt.observed_outcome
+           FROM mc_bot_skill_evidence_revisions AS evidence_revision
+           INNER JOIN mc_bot_skill_evidence_receipts AS receipt
+             ON receipt.receipt_id = evidence_revision.receipt_id
+           WHERE evidence_revision.run_id = ?`,
+        )
+        .get(runId);
+      if (stored === undefined) {
+        throw new Error("Evidence revision attribution did not persist");
+      }
+      return {
+        skill: this.get(input.skillId),
+        evidenceRevision: evidenceRevisionFromRow(stored),
+        idempotent: false,
+      };
+    });
+    return transaction.immediate();
+  }
+
+  /**
    * Only game-observation/verification code may call this writer. Never issue
    * a trusted receipt from GPT/model input or expose this method as a GPT tool.
    * Model-proposed outcomes use recordOutcome instead.
@@ -945,6 +1188,45 @@ export class McSkillRepository {
       )
       .get(runId);
     return row === undefined ? undefined : evidenceFromRow(row);
+  }
+
+  public getEvidenceRevision(
+    runId: string,
+  ): McSkillEvidenceRevisionLink | undefined {
+    const row = this.database
+      .prepare<[string], EvidenceRevisionRow>(
+        `SELECT evidence_revision.*, receipt.operation_name, receipt.observed_outcome
+         FROM mc_bot_skill_evidence_revisions AS evidence_revision
+         INNER JOIN mc_bot_skill_evidence_receipts AS receipt
+           ON receipt.receipt_id = evidence_revision.receipt_id
+         WHERE evidence_revision.run_id = ?`,
+      )
+      .get(runId);
+    return row === undefined ? undefined : evidenceRevisionFromRow(row);
+  }
+
+  public listEvidenceRevisions(
+    skillId: string,
+    limit = 50,
+  ): McSkillEvidenceRevisionLink[] {
+    this.skillRow(skillId);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH_LIMIT) {
+      throw validationError(
+        `Evidence revision limit must be from 1 to ${MAX_SEARCH_LIMIT}`,
+      );
+    }
+    return this.database
+      .prepare<[string, number], EvidenceRevisionRow>(
+        `SELECT evidence_revision.*, receipt.operation_name, receipt.observed_outcome
+         FROM mc_bot_skill_evidence_revisions AS evidence_revision
+         INNER JOIN mc_bot_skill_evidence_receipts AS receipt
+           ON receipt.receipt_id = evidence_revision.receipt_id
+         WHERE evidence_revision.skill_id = ?
+         ORDER BY evidence_revision.created_at DESC, evidence_revision.run_id DESC
+         LIMIT ?`,
+      )
+      .all(skillId, limit)
+      .map(evidenceRevisionFromRow);
   }
 
   public listDerivedHypotheses(
@@ -1740,6 +2022,40 @@ function derivedHypothesisFromRow(
     nativeOutcomeRecorded: row.native_outcome_recorded === 1,
     createdAt: row.created_at,
   };
+}
+
+function evidenceRevisionFromRow(
+  row: EvidenceRevisionRow,
+): McSkillEvidenceRevisionLink {
+  if (
+    row.observed_outcome !== "successful" &&
+    row.observed_outcome !== "failed"
+  ) {
+    throw new Error("Evidence revision has a non-learnable outcome");
+  }
+  return {
+    runId: row.run_id,
+    receiptId: row.receipt_id,
+    operationName: row.operation_name,
+    observedOutcome: row.observed_outcome,
+    skillId: row.skill_id,
+    skillVersionAtUse: row.skill_version_at_use,
+    revisionVersion: row.revision_version,
+    definitionDigest: row.definition_digest,
+    createdAt: row.created_at,
+  };
+}
+
+function materialEvidenceDefinitionChanged(
+  before: McSkillDefinition,
+  after: McSkillDefinition,
+): boolean {
+  return (
+    JSON.stringify(before.conditions) !== JSON.stringify(after.conditions) ||
+    before.body !== after.body ||
+    before.expectedOutcome !== after.expectedOutcome ||
+    before.confidence !== after.confidence
+  );
 }
 
 function evidenceFromRow(row: EvidenceRow): TrustedMcSkillEvidenceReceipt {

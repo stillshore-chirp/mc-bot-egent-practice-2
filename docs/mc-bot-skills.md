@@ -4,7 +4,7 @@ MC Bot Skill は、Minecraftで繰り返し使える行動の要点を、目的�
 
 ## 保存と公開API
 
-`McSkillRepository.open({ databasePath, exchangeDirectory, allowedOperationNames })` で開きます。リポジトリは独自の `mc_bot_skill_*` テーブルだけを `CREATE TABLE IF NOT EXISTS` で作るため、既存SQLite DBと同じファイルを使っても既存の記憶schemaを変更しません。通常の検索、取得、編集は `search`、`get`、`getHistory`、`createSkill`、`revise`、`listOutcomes`、`getEvidence` を使います。
+`McSkillRepository.open({ databasePath, exchangeDirectory, allowedOperationNames })` で開きます。リポジトリは独自の `mc_bot_skill_*` テーブルだけを `CREATE TABLE IF NOT EXISTS` で作るため、既存SQLite DBと同じファイルを使っても既存の記憶schemaを変更しません。通常の検索、取得、編集は `search`、`get`、`getHistory`、`createSkill`、`revise`、`reviseFromEvidence`、`listOutcomes`、`getEvidence` を使います。
 
 `revise` は `expectedVersion` を受け取り、現在versionが一致しない編集を拒否します。変更前の本文・条件・操作参照・期待結果・confidenceはrevisionテーブルに残り、更新・削除できないDB triggerで保護します。`changeKind` は `revise`、`merge`、`weaken` を記録する分類です。初期Skillのconfidenceは実績がないため0です。confidenceはnative outcomeの件数と証跡を見てrevisionとして更新しますが、その値で新しい試行を拒否しません。
 
@@ -13,6 +13,8 @@ MC Bot Skill は、Minecraftで繰り返し使える行動の要点を、目的�
 `recordTrustedEvidence` はゲーム観測・検証のコード経路からのみ呼びます。このwriterをGPT/model inputから発行したり、GPT toolとして公開したりしません。GPTの成功申告や失敗申告はtrusted receiptになりません。receiptにはrun ID、許可されたoperation名、簡潔な入力要約、条件、期待結果、観測結果を保存します。Skillの実行中であればskill IDとその時に使ったversionも渡します。receiptがSkill実行時のversionを持つ場合は、そのrevisionのoperation参照も照合します。新規Skillへの接続では、そのSkillがreceiptのoperation名を参照している必要があります。
 
 `recordOutcome` の `proposedOutcome` は呼び出し側の申告です。一致するreceiptがなければ提案が成功・失敗・中断・cancelのどれでも保存statusは `unverified` になり、native統計へ成功・失敗を加えません。receiptに観測された結果が正本です。最初のverified successful runだけをSkillごとの `successHypothesis` として記録し、後続の成功試行は独立した証跡として残します。run IDはreceiptとoutcomeそれぞれで一意なので、同一runの再送で件数は増えません。cancelledとinterruptedは別statusです。
+
+`reviseFromEvidence({ runId, ...revision })` は、成功または失敗を観測したtrusted receiptが実際に使ったSkillとversionを同一transaction内で照合し、そのreceiptを直後のimmutable revisionへ結びます。条件、本文、期待結果、confidenceのいずれかに実質的な変更が必要です。receipt/run、Skill/version、改訂版の不一致、古いversion、同一receiptへの異なる改訂は拒否されます。同じrunと同じ改訂内容の再送は既存の証跡リンクを返し、revisionやlearning counterを重ねて増やしません。改訂保存と証跡リンク挿入は一体でcommitまたはrollbackされ、リンクは更新・削除できません。`getEvidenceRevision(runId)` と `listEvidenceRevisions(skillId)` で対応を検証できます。通常の `revise` は引き続き利用できますが、trusted receiptに基づく学習ではこのAPIを使います。
 
 `createHypothesisFromEvidence({ runId, input })` は、GPTの提案を受け取った学習facadeから呼べます。repositoryは既存のtrusted successful receiptを読み直し、receiptのoperation参照とrun単位の重複をtransaction内で検証してから新しいSkill仮説を作ります。GPTが申告した結果だけでreceiptを作る経路はありません。receiptのoperationを新Skillの`operationRefs`に含める必要があります。既存Skillの使用receiptなら証跡とのimmutableな関連だけを追加し、使用Skillのnative outcomeや件数を変更しません。事前にSkillが割り当てられていないreceiptなら、新Skill、初回revision、最初のnative successful outcome、証跡関連を一つのtransactionで保存します。同じrun・同じ内容の再要求は初回のSkill IDを返し、タイトルなど内容を変えて同じrunを再利用するとconflictになります。`listDerivedHypotheses(skillId)`で関連IDを取得し、`getEvidence(runId)`でreceiptを参照できます。`recordTrustedEvidence`は引き続きモデル入力から隔離されたゲーム観測・検証経路専用writerです。
 

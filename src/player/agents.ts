@@ -1460,6 +1460,8 @@ export class PlayerPurposeAgent {
       return { ok: false, code: "OPERATION_REFERENCE_MISMATCH" };
     }
     let record: ReturnType<McSkillRepository["get"]>;
+    let learningVersion: number;
+    let idempotent: boolean;
     if (input.mode === "create") {
       // Create provenance comes only from the receipt; model target fields are
       // revision-only and must not reject or redirect a valid derived hypothesis.
@@ -1530,7 +1532,8 @@ export class PlayerPurposeAgent {
         input.expectedVersion < 1
       )
         return { ok: false, code: "SKILL_VERSION_RECEIPT_MISMATCH" };
-      record = this.options.skills.revise({
+      const revised = this.options.skills.reviseFromEvidence({
+        runId: evidence.runId,
         skillId: input.skillId,
         expectedVersion: input.expectedVersion,
         changeKind: input.changeKind,
@@ -1546,27 +1549,35 @@ export class PlayerPurposeAgent {
           confidence: input.confidence,
         },
       });
-      this.options.mind.recordSkillActivity({
-        kind: "revised",
-        skillId: record.id,
-        version: record.version,
-        summary: `trusted receiptに基づき改訂: ${input.changeNote}`,
-      });
+      record = revised.skill;
+      learningVersion = revised.evidenceRevision.revisionVersion;
+      idempotent = revised.idempotent;
+      if (!idempotent) {
+        this.options.mind.recordSkillActivity({
+          kind: "revised",
+          skillId: record.id,
+          version: learningVersion,
+          summary: `trusted receiptに基づき改訂: ${input.changeNote}`,
+        });
+      }
     }
-    this.options.mind.recordLearning({
-      runId: evidence.runId,
-      skillId: record.id,
-      version: record.version,
-      changeKind: input.changeKind,
-      observedOutcome: evidence.observedOutcome,
-      summary: input.changeNote,
-    });
-    this.options.onLearningUpdate?.();
+    if (!idempotent) {
+      this.options.mind.recordLearning({
+        runId: evidence.runId,
+        skillId: record.id,
+        version: learningVersion,
+        changeKind: input.changeKind,
+        observedOutcome: evidence.observedOutcome,
+        summary: input.changeNote,
+      });
+      this.options.onLearningUpdate?.();
+    }
     return {
       ok: true,
       skillId: record.id,
-      version: record.version,
+      version: learningVersion,
       outcome: evidence.observedOutcome,
+      idempotent,
     };
   }
 }

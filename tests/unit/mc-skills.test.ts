@@ -691,6 +691,184 @@ describe("McSkillRepository", () => {
     ).toThrow(/version conflict/iu);
   });
 
+  it("atomically links trusted successful and failed receipts to material revisions", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const skill = repository.get("mc-skill-gathering");
+    const successful = trustedDigEvidence(repository, "revision-success-run", {
+      skillIdAtUse: skill.id,
+      skillVersionAtUse: skill.version,
+    });
+    const successInput = {
+      runId: successful.runId,
+      skillId: skill.id,
+      expectedVersion: skill.version,
+      changeKind: "revise" as const,
+      changeNote: "採掘の前後で変化を確かめる",
+      patch: {
+        body: "採掘前に対象と足場を確かめ、採掘後は対象と所持品の変化を確認する。",
+      },
+    };
+    const first = repository.reviseFromEvidence(successInput);
+    expect(first).toMatchObject({
+      skill: { id: skill.id, version: 2 },
+      evidenceRevision: {
+        runId: successful.runId,
+        receiptId: successful.receiptId,
+        operationName: "dig",
+        observedOutcome: "successful",
+        skillId: skill.id,
+        skillVersionAtUse: 1,
+        revisionVersion: 2,
+      },
+      idempotent: false,
+    });
+    expect(repository.getEvidenceRevision(successful.runId)).toEqual(
+      first.evidenceRevision,
+    );
+    expect(repository.listEvidenceRevisions(skill.id)).toEqual([
+      first.evidenceRevision,
+    ]);
+
+    const unrelatedReceipt = trustedDigEvidence(
+      repository,
+      "revision-wrong-pair-run",
+      { skillIdAtUse: skill.id, skillVersionAtUse: skill.version },
+    );
+    const database = new Database(options.databasePath);
+    expect(() =>
+      database
+        .prepare(
+          "INSERT INTO mc_bot_skill_evidence_revisions (run_id, receipt_id, skill_id, skill_version_at_use, revision_version, definition_digest, request_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          unrelatedReceipt.runId,
+          successful.receiptId,
+          skill.id,
+          skill.version,
+          first.evidenceRevision.revisionVersion,
+          "definition-digest",
+          "request-digest",
+          new Date().toISOString(),
+        ),
+    ).toThrow(/does not match trusted receipt/iu);
+    database.close();
+
+    const retry = repository.reviseFromEvidence(successInput);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.evidenceRevision).toEqual(first.evidenceRevision);
+    expect(repository.getHistory(skill.id)).toHaveLength(2);
+    expect(() =>
+      repository.reviseFromEvidence({
+        ...successInput,
+        patch: { body: "同じreceiptに別の内容を割り当てる。" },
+      }),
+    ).toThrow(McSkillRepositoryError);
+    expect(repository.getHistory(skill.id)).toHaveLength(2);
+
+    const failed = trustedDigEvidence(repository, "revision-failed-run", {
+      observedOutcome: "failed",
+      skillIdAtUse: skill.id,
+      skillVersionAtUse: first.evidenceRevision.revisionVersion,
+    });
+    const second = repository.reviseFromEvidence({
+      runId: failed.runId,
+      skillId: skill.id,
+      expectedVersion: first.evidenceRevision.revisionVersion,
+      changeKind: "weaken",
+      changeNote: "失敗を受け条件を見直す",
+      patch: {
+        conditions: ["採掘対象と足場を再確認できた"],
+        confidence: 0.05,
+      },
+    });
+    expect(second.evidenceRevision).toMatchObject({
+      receiptId: failed.receiptId,
+      observedOutcome: "failed",
+      skillVersionAtUse: 2,
+      revisionVersion: 3,
+    });
+  });
+
+  it("rejects mismatched, stale, non-material, or operation-incompatible evidence revisions", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const skill = repository.get("mc-skill-gathering");
+    const receipt = trustedDigEvidence(repository, "revision-mismatch-run", {
+      skillIdAtUse: skill.id,
+      skillVersionAtUse: skill.version,
+    });
+    const input = {
+      runId: receipt.runId,
+      skillId: skill.id,
+      expectedVersion: skill.version,
+      changeKind: "revise" as const,
+      changeNote: "採掘手順を更新する",
+      patch: { body: "採掘前に対象を見て、採掘後に所持品の変化を確認する。" },
+    };
+
+    expect(() =>
+      repository.reviseFromEvidence({ ...input, skillId: "mc-skill-survival" }),
+    ).toThrow(McSkillRepositoryError);
+    expect(() =>
+      repository.reviseFromEvidence({
+        ...input,
+        patch: { title: "タイトルだけの変更" },
+      }),
+    ).toThrow(/materially change/iu);
+    expect(() =>
+      repository.reviseFromEvidence({
+        ...input,
+        patch: { ...input.patch, operationRefs: ["look"] },
+      }),
+    ).toThrow(/observed operation reference/iu);
+    expect(repository.get(skill.id).version).toBe(1);
+
+    repository.revise({
+      skillId: skill.id,
+      expectedVersion: skill.version,
+      changeKind: "revise",
+      changeNote: "別の更新で版を進める",
+      patch: { body: "別更新で採掘手順を見直す。" },
+    });
+    expect(() => repository.reviseFromEvidence(input)).toThrow(
+      /version conflict/iu,
+    );
+    expect(repository.getEvidenceRevision(receipt.runId)).toBeUndefined();
+  });
+
+  it("rolls back the skill and immutable revision when evidence attribution fails", () => {
+    const { options } = createFixture();
+    const repository = open(options);
+    const skill = repository.get("mc-skill-gathering");
+    const receipt = trustedDigEvidence(repository, "revision-rollback-run", {
+      skillIdAtUse: skill.id,
+      skillVersionAtUse: skill.version,
+    });
+    const blocker = new Database(options.databasePath);
+    blocker.exec(`
+      CREATE TRIGGER reject_evidence_revision
+      BEFORE INSERT ON mc_bot_skill_evidence_revisions
+      WHEN NEW.run_id = 'revision-rollback-run'
+      BEGIN SELECT RAISE(ABORT, 'injected attribution failure'); END;
+    `);
+    blocker.close();
+
+    expect(() =>
+      repository.reviseFromEvidence({
+        runId: receipt.runId,
+        skillId: skill.id,
+        expectedVersion: skill.version,
+        changeKind: "revise",
+        changeNote: "atomic rollback check",
+        patch: { body: "改訂と証跡は一緒に保存されなければならない。" },
+      }),
+    ).toThrow(/injected attribution failure/iu);
+    expect(repository.get(skill.id).version).toBe(skill.version);
+    expect(repository.getHistory(skill.id)).toHaveLength(1);
+    expect(repository.getEvidenceRevision(receipt.runId)).toBeUndefined();
+  });
+
   it("round-trips edited Markdown and provenance without inflating native experience", () => {
     const { directory, options } = createFixture();
     const source = open(options);

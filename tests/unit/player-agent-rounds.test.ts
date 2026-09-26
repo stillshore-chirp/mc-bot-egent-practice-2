@@ -91,6 +91,13 @@ describe("player agent response rounds", () => {
         version: 2,
         operationRefs: ["dig", "move_to"],
       });
+      expect(fixture.skills.getEvidenceRevision(runId)).toMatchObject({
+        runId,
+        skillId,
+        skillVersionAtUse: 1,
+        revisionVersion: 2,
+        observedOutcome: "successful",
+      });
       const proposalCalls = fixture.mind
         .snapshot()
         .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
@@ -2041,11 +2048,14 @@ function learningRevisionArguments(
     category: "gathering",
     title: "Collect a visible target",
     purpose: "Collect the target and verify the observed result.",
-    conditions: ["The target is visible and reachable."],
-    body: "Select the target, collect it, and verify the next observation.",
+    conditions: [
+      "The target is visible, reachable, and the surrounding area is safe.",
+    ],
+    body: "Inspect the target before collection; verify the inventory and world after collection.",
     operationRefs,
-    expectedOutcome: "The next observation confirms the target was collected.",
-    confidence: 0.7,
+    expectedOutcome:
+      "The target is removed and the inventory reflects the collection.",
+    confidence: 0.8,
     changeKind: "revise",
     changeNote: "Use the successful observed result to refine the method.",
   };

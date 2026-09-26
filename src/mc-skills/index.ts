@@ -10,6 +10,7 @@ export {
   type ImportedMcSkillStatistics,
   type McSkillCategory,
   type McSkillDefinition,
+  type McSkillEvidenceRevisionLink,
   type McSkillHypothesisEvidenceLink,
   type McSkillOutcome,
   type McSkillOutcomeStatus,
@@ -21,6 +22,8 @@ export {
   type RecordMcSkillOutcomeInput,
   type RecordTrustedMcSkillEvidenceInput,
   type ReviseMcSkillInput,
+  type ReviseMcSkillFromEvidenceInput,
+  type ReviseMcSkillFromEvidenceResult,
   type SearchMcSkillsOptions,
   type TrustedMcSkillEvidenceReceipt,
 } from "./types.js";

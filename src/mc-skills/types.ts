@@ -97,6 +97,28 @@ export interface ReviseMcSkillInput {
   readonly patch: Partial<Omit<McSkillDefinition, "id">>;
 }
 
+export interface ReviseMcSkillFromEvidenceInput extends ReviseMcSkillInput {
+  readonly runId: string;
+}
+
+export interface McSkillEvidenceRevisionLink {
+  readonly runId: string;
+  readonly receiptId: string;
+  readonly operationName: string;
+  readonly observedOutcome: "successful" | "failed";
+  readonly skillId: string;
+  readonly skillVersionAtUse: number;
+  readonly revisionVersion: number;
+  readonly definitionDigest: string;
+  readonly createdAt: string;
+}
+
+export interface ReviseMcSkillFromEvidenceResult {
+  readonly skill: McSkillRecord;
+  readonly evidenceRevision: McSkillEvidenceRevisionLink;
+  readonly idempotent: boolean;
+}
+
 export interface McSkillRevision extends McSkillDefinition {
   readonly version: number;
   readonly changeKind: "create" | "revise" | "merge" | "weaken" | "import";
