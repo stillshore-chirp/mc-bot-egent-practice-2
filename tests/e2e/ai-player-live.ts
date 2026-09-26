@@ -33,6 +33,7 @@ import {
   MineflayerPlayerBody,
   type PlayerBody,
   type PlayerItemCollectionOutcome,
+  type PlayerItemCollectionPathFailureReason,
   type PlayerBodyObservationOptions,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
@@ -453,11 +454,21 @@ interface ReturnPathProbeDiagnostic {
   readonly itemCollectionAttempted?: boolean;
   readonly itemCollectionStatus?: BodyOperationStatus;
   readonly itemCollectionOutcome?: PlayerItemCollectionOutcome | "none";
+  readonly itemCollectionPathFailureReason?:
+    PlayerItemCollectionPathFailureReason | "none";
   readonly itemCollectionObservedEffect?: "item_collected" | "none";
   readonly itemCollectionEffectMatchedTarget?: boolean;
   readonly itemCollectionRecoveryRequired?: boolean;
+  readonly bodyObservationAvailableAfterCollection?: boolean;
+  readonly bodyDropVisibleAfterCollection?: boolean | "unknown";
+  readonly bodyPlayerDropDistanceBucketAfterCollection?:
+    BodyPositionDriftBucket | "unknown";
+  readonly bodyInventoryItemPresentAfterCollection?: boolean | "unknown";
   readonly rconDropPresentAfterCollection?: boolean;
   readonly rconDropObservationAvailableAfterCollection?: boolean;
+  readonly rconPlayerDropDistanceObservationAvailableAfterCollection?: boolean;
+  readonly rconPlayerDropDistanceBucketAfterCollection?:
+    BodyPositionDriftBucket | "unknown";
   readonly inventoryItemPresentAfterCollection?: boolean;
   readonly inventoryObservationAvailableAfterCollection?: boolean;
   readonly itemPickupConfirmed?: boolean;
@@ -518,6 +529,15 @@ function positionDriftBucket(distance: number): BodyPositionDriftBucket {
   if (distance < 1) return "<1";
   if (distance < 2) return "1-2";
   return "2+";
+}
+
+function positionDistanceBucket(
+  left: { readonly x: number; readonly y: number; readonly z: number },
+  right: { readonly x: number; readonly y: number; readonly z: number },
+): BodyPositionDriftBucket {
+  return positionDriftBucket(
+    Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z),
+  );
 }
 
 async function executeBodyMovePathProbe(
@@ -6501,6 +6521,8 @@ async function runUnknownReturnPathProbe(
     itemCollectionAttempted: true,
     itemCollectionStatus: collectionResult.status,
     itemCollectionOutcome: collectionResult.itemCollectionOutcome ?? "none",
+    itemCollectionPathFailureReason:
+      collectionResult.itemCollectionPathFailureReason ?? "none",
     itemCollectionObservedEffect:
       collectionResult.observedEffect?.type === "item_collected"
         ? "item_collected"
@@ -6509,12 +6531,50 @@ async function runUnknownReturnPathProbe(
     itemCollectionRecoveryRequired: collectionResult.recoveryRequired,
   });
 
+  const bodyObservationAfterCollection = collectionResult.after;
+  const bodyDropAfterCollection =
+    bodyObservationAfterCollection?.perception.entities.find(
+      (entity) =>
+        entity.id === visibleDropItem.id &&
+        !entity.isPlayer &&
+        entity.name === "item",
+    );
+  const bodyInventoryItemPresentAfterCollection =
+    bodyObservationAfterCollection === null
+      ? "unknown"
+      : bodyObservationAfterCollection.self.inventory.some(
+          (item) => item.name === "blue_wool" && item.count > 0,
+        );
+  const bodyPlayerDropDistanceBucketAfterCollection =
+    bodyObservationAfterCollection === null ||
+    bodyDropAfterCollection === undefined
+      ? "unknown"
+      : positionDistanceBucket(
+          bodyObservationAfterCollection.self.position,
+          bodyDropAfterCollection.position,
+        );
+
   let rconDropPresentAfterCollection: boolean | undefined;
   let rconDropObservationAvailableAfterCollection = false;
+  let rconPlayerDropDistanceObservationAvailableAfterCollection = false;
+  let rconPlayerDropDistanceBucketAfterCollection:
+    BodyPositionDriftBucket | "unknown" = "unknown";
   try {
+    const rconDropPositionAfterCollection =
+      await rconBlueWoolDropPositionWithinRadius(rcon, target, 16);
     rconDropPresentAfterCollection =
-      (await rconBlueWoolDropPositionNear(rcon, target)) !== undefined;
+      rconDropPositionAfterCollection !== undefined;
     rconDropObservationAvailableAfterCollection = true;
+    if (rconDropPositionAfterCollection !== undefined) {
+      const rconPlayerPositionAfterCollection = parsePosition(
+        await rcon.command(`data get entity ${botName} Pos`),
+      );
+      rconPlayerDropDistanceBucketAfterCollection = positionDistanceBucket(
+        rconPlayerPositionAfterCollection,
+        rconDropPositionAfterCollection,
+      );
+      rconPlayerDropDistanceObservationAvailableAfterCollection = true;
+    }
   } catch {
     // Keep raw RCON replies private; report only whether the check completed.
   }
@@ -6536,10 +6596,20 @@ async function runUnknownReturnPathProbe(
     itemCollectionEffectMatchedTarget &&
     inventoryItemPresentAfterCollection === true;
   updateReturnPathProbeDiagnostic(state, {
+    bodyObservationAvailableAfterCollection:
+      bodyObservationAfterCollection !== null,
+    bodyDropVisibleAfterCollection:
+      bodyObservationAfterCollection === null
+        ? "unknown"
+        : bodyDropAfterCollection !== undefined,
+    bodyPlayerDropDistanceBucketAfterCollection,
+    bodyInventoryItemPresentAfterCollection,
     ...(rconDropPresentAfterCollection === undefined
       ? {}
       : { rconDropPresentAfterCollection }),
     rconDropObservationAvailableAfterCollection,
+    rconPlayerDropDistanceObservationAvailableAfterCollection,
+    rconPlayerDropDistanceBucketAfterCollection,
     ...(inventoryItemPresentAfterCollection === undefined
       ? {}
       : { inventoryItemPresentAfterCollection }),

@@ -143,6 +143,9 @@ export type PlayerItemCollectionOutcome =
   | "pickup_out_of_range"
   | "deadline_expired";
 
+export type PlayerItemCollectionPathFailureReason =
+  "no_path" | "path_timeout" | "goto_rejected" | "unknown";
+
 export interface PlayerOperationResult {
   readonly operationId: string;
   readonly operation: PlayerOperation;
@@ -159,6 +162,7 @@ export interface PlayerOperationResult {
     readonly entityId: number;
   };
   readonly itemCollectionOutcome?: PlayerItemCollectionOutcome;
+  readonly itemCollectionPathFailureReason?: PlayerItemCollectionPathFailureReason;
   readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly detail?: string;
 }
@@ -272,6 +276,7 @@ interface ActiveOperation {
   targetHitObserved?: boolean;
   targetDiedObserved?: boolean;
   itemCollectionOutcome?: PlayerItemCollectionOutcome;
+  itemCollectionPathFailureReason?: PlayerItemCollectionPathFailureReason;
   externalAbort?: () => void;
 }
 
@@ -300,10 +305,20 @@ class ItemCollectionError extends Error {
       "collected" | "deadline_expired"
     >,
     message: string,
+    public readonly pathFailureReason?: PlayerItemCollectionPathFailureReason,
   ) {
     super(message);
     this.name = "ItemCollectionError";
   }
+}
+
+function classifyItemCollectionPathFailure(
+  error: unknown,
+): PlayerItemCollectionPathFailureReason {
+  if (!(error instanceof Error)) return "unknown";
+  if (error.name === "NoPath") return "no_path";
+  if (error.name === "Timeout") return "path_timeout";
+  return "goto_rejected";
 }
 
 function positionVector(position: {
@@ -1397,8 +1412,11 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (
         operation.kind === "collect_item" &&
         error instanceof ItemCollectionError
-      )
+      ) {
         active.itemCollectionOutcome = error.outcome;
+        if (error.pathFailureReason !== undefined)
+          active.itemCollectionPathFailureReason = error.pathFailureReason;
+      }
     } finally {
       clearTimeout(timer);
       blockEvidence?.dispose();
@@ -1491,6 +1509,12 @@ export class MineflayerPlayerBody implements PlayerBody {
       recoveryRequired,
       ...(observedEffect === undefined ? {} : { observedEffect }),
       ...(itemCollectionOutcome === undefined ? {} : { itemCollectionOutcome }),
+      ...(active.itemCollectionPathFailureReason === undefined
+        ? {}
+        : {
+            itemCollectionPathFailureReason:
+              active.itemCollectionPathFailureReason,
+          }),
       ...(active.lookSweep === undefined
         ? {}
         : { lookSweep: active.lookSweep }),
@@ -2129,6 +2153,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           new ItemCollectionError(
             "path_failed",
             "The normal pathfinder could not reach the visible item target.",
+            results.status === "noPath" ? "no_path" : "path_timeout",
           ),
         );
     };
@@ -2262,10 +2287,11 @@ export class MineflayerPlayerBody implements PlayerBody {
         const pendingFailure = pathFailurePromise;
         const pathResult = pendingPath.then(
           () => "goal_reached" as const,
-          () => {
+          (error: unknown) => {
             throw new ItemCollectionError(
               "path_failed",
               "Normal pathfinding to the visible item target failed.",
+              classifyItemCollectionPathFailure(error),
             );
           },
         );

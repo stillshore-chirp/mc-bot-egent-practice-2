@@ -791,7 +791,61 @@ describe("player body", () => {
 
     expect(pathResult.status).toBe("failed");
     expect(pathResult.itemCollectionOutcome).toBe("path_failed");
+    expect(pathResult.itemCollectionPathFailureReason).toBe("goto_rejected");
     expect(pathResult.observedEffect).toBeUndefined();
+  });
+
+  it.each([
+    { pathStatus: "noPath", expectedReason: "no_path" },
+    { pathStatus: "timeout", expectedReason: "path_timeout" },
+  ])(
+    "preserves the fixed pathfinder status reason for $pathStatus",
+    async ({ pathStatus, expectedReason }) => {
+      const fake = makeFakeBot();
+      addItemEntity(fake.bot);
+      const eventEmitter = fake.bot as unknown as EventEmitter;
+      let cancelPath: (() => void) | undefined;
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            cancelPath = () => reject(new Error("Path stopped"));
+            queueMicrotask(() =>
+              eventEmitter.emit("path_update", {
+                status: pathStatus,
+                path: [],
+              }),
+            );
+          }),
+      );
+      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+        if (goal === null) cancelPath?.();
+      });
+
+      const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+        kind: "collect_item",
+        entityId: 2,
+      });
+
+      expect(result.itemCollectionOutcome).toBe("path_failed");
+      expect(result.itemCollectionPathFailureReason).toBe(expectedReason);
+    },
+  );
+
+  it("classifies untyped pathfinder rejections without exposing their message", async () => {
+    const fake = makeFakeBot();
+    addItemEntity(fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(
+      "opaque rejection",
+    );
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "collect_item",
+      entityId: 2,
+    });
+
+    expect(result.itemCollectionOutcome).toBe("path_failed");
+    expect(result.itemCollectionPathFailureReason).toBe("unknown");
+    expect(result.detail).not.toContain("opaque rejection");
   });
 
   it("stops collection pathfinding when the operation is aborted", async () => {
