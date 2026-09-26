@@ -58,7 +58,8 @@ export function firstDigLearningEvidence(
     skillVersion === undefined ||
     !baseline.skillIds.has(skillId) ||
     !baseline.successfulDerivedSkillIds.has(skillId) ||
-    !baseline.revisionVersionsBySkill.get(skillId)?.has(skillVersion)
+    !current.skillIds.has(skillId) ||
+    !current.revisionVersionsBySkill.get(skillId)?.has(skillVersion)
   ) {
     return undefined;
   }

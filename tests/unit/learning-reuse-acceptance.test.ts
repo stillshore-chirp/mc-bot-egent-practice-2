@@ -29,11 +29,16 @@ describe("first dig learning acceptance", () => {
     });
   });
 
-  it("accepts a baseline trusted-derived hypothesis used at its recorded version", () => {
+  it("accepts a baseline trusted-derived hypothesis when its used version is added later", () => {
     const baseline = snapshot({
       skillIds: ["existing-skill"],
       successfulDerivedSkillIds: ["existing-skill"],
-      revisionVersionsBySkill: [["existing-skill", [1, 2, 3]]],
+      revisionVersionsBySkill: [["existing-skill", [1]]],
+    });
+    const current = snapshot({
+      skillIds: ["existing-skill"],
+      successfulDerivedSkillIds: ["existing-skill"],
+      revisionVersionsBySkill: [["existing-skill", [1, 2]]],
     });
 
     expect(
@@ -43,10 +48,10 @@ describe("first dig learning acceptance", () => {
           kind: "dig",
           status: "successful",
           skillId: "existing-skill",
-          skillVersion: 3,
+          skillVersion: 2,
         },
         baseline,
-        baseline,
+        current,
       ),
     ).toEqual({
       source: "preexisting_hypothesis_used",
@@ -80,15 +85,19 @@ describe("first dig learning acceptance", () => {
       skillVersion: 1,
     },
     {
-      label: "a version missing from the baseline revision history",
+      label: "a version missing from the current revision history",
       baseline: snapshot({
         skillIds: ["existing-skill"],
         successfulDerivedSkillIds: ["existing-skill"],
-        revisionVersionsBySkill: [["existing-skill", [1, 2]]],
+        revisionVersionsBySkill: [["existing-skill", [1]]],
       }),
-      current: snapshot(),
+      current: snapshot({
+        skillIds: ["existing-skill"],
+        successfulDerivedSkillIds: ["existing-skill"],
+        revisionVersionsBySkill: [["existing-skill", [1]]],
+      }),
       skillId: "existing-skill",
-      skillVersion: 3,
+      skillVersion: 2,
     },
   ])("rejects $label", ({ baseline, current, skillId, skillVersion }) => {
     expect(
