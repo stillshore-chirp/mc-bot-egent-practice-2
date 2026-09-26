@@ -97,6 +97,11 @@ import {
   type PersistentMemoryProgress,
 } from "./persistent-memory-diagnostic.js";
 import {
+  angularDistance,
+  classifyLearningFixtureOrientation,
+  type LearningFixtureOrientationDiagnostic,
+} from "./learning-fixture-orientation.js";
+import {
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
   type FirstDigLearningDiagnostic,
@@ -242,6 +247,12 @@ interface LearningFixtureDiagnostic {
   readonly placementConfirmedCount: number;
   readonly freshBodyObservationSeen: boolean;
   readonly oakLogVisibleInFreshObservation: boolean;
+  readonly activeOperationAtOrient?: boolean;
+  readonly yawMatched?: boolean;
+  readonly pitchMatched?: boolean;
+}
+interface LearningFixtureOrientationReadback extends LearningFixtureOrientationDiagnostic {
+  readonly position: Position;
 }
 type SafeEvidenceValue =
   boolean | number | string | readonly PlayerAgentRoundActivity[];
@@ -1584,6 +1595,25 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
             state.learningFixtureDiagnostic.freshBodyObservationSeen,
           learningFixtureOakLogVisible:
             state.learningFixtureDiagnostic.oakLogVisibleInFreshObservation,
+          ...(state.learningFixtureDiagnostic.activeOperationAtOrient ===
+          undefined
+            ? {}
+            : {
+                learningFixtureActiveOperationAtOrient:
+                  state.learningFixtureDiagnostic.activeOperationAtOrient,
+              }),
+          ...(state.learningFixtureDiagnostic.yawMatched === undefined
+            ? {}
+            : {
+                learningFixtureYawMatched:
+                  state.learningFixtureDiagnostic.yawMatched,
+              }),
+          ...(state.learningFixtureDiagnostic.pitchMatched === undefined
+            ? {}
+            : {
+                learningFixturePitchMatched:
+                  state.learningFixtureDiagnostic.pitchMatched,
+              }),
         }
       : {}),
     ...(caseId === "skill_exchange" && state.skillExchangeStage !== undefined
@@ -1747,6 +1777,15 @@ function beginLearningFixtureDiagnostic(
     freshBodyObservationSeen: false,
     oakLogVisibleInFreshObservation: false,
   };
+}
+
+function updateLearningFixtureDiagnostic(
+  state: RunState,
+  update: Partial<LearningFixtureDiagnostic>,
+): void {
+  const diagnostic = state.learningFixtureDiagnostic;
+  if (diagnostic !== undefined)
+    state.learningFixtureDiagnostic = { ...diagnostic, ...update };
 }
 
 function recordLearningFixtureObservation(
@@ -2807,11 +2846,27 @@ async function main(): Promise<void> {
         const initialPosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
-        const origin = await orientForLearningLogFixture(
+        const playerAtInitialOrient = playerOf(
+          await collect(context.runtime.app),
+        );
+        const activeOperationAtInitialOrient = isOperationActive(
+          playerAtInitialOrient,
+        );
+        updateLearningFixtureDiagnostic(state, {
+          activeOperationAtOrient: activeOperationAtInitialOrient,
+        });
+        const initialOrientation = await orientForLearningLogFixture(
           rcon,
           state.botName,
           initialPosition,
+          activeOperationAtInitialOrient,
         );
+        updateLearningFixtureDiagnostic(state, {
+          activeOperationAtOrient: initialOrientation.activeOperationAtOrient,
+          yawMatched: initialOrientation.yawMatched,
+          pitchMatched: initialOrientation.pitchMatched,
+        });
+        const origin = initialOrientation.position;
         const firstLogs = await availableLogFixtureSites(rcon, origin);
         activeLearningLogs = firstLogs;
         await configureLogFixture(rcon, firstLogs, state.botName, (count) => {
@@ -2937,11 +2992,26 @@ async function main(): Promise<void> {
         const reusePosition = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
-        const reuseOrigin = await orientForLearningLogFixture(
+        const playerAtReuseOrient = playerOf(
+          await collect(context.runtime.app),
+        );
+        const activeOperationAtReuseOrient =
+          isOperationActive(playerAtReuseOrient);
+        updateLearningFixtureDiagnostic(state, {
+          activeOperationAtOrient: activeOperationAtReuseOrient,
+        });
+        const reuseOrientation = await orientForLearningLogFixture(
           rcon,
           state.botName,
           reusePosition,
+          activeOperationAtReuseOrient,
         );
+        updateLearningFixtureDiagnostic(state, {
+          activeOperationAtOrient: reuseOrientation.activeOperationAtOrient,
+          yawMatched: reuseOrientation.yawMatched,
+          pitchMatched: reuseOrientation.pitchMatched,
+        });
+        const reuseOrigin = reuseOrientation.position;
         const reuseLogs = await availableLogFixtureSites(rcon, reuseOrigin);
         activeLearningLogs = reuseLogs;
         await configureLogFixture(rcon, reuseLogs, state.botName, (count) => {
@@ -7685,7 +7755,8 @@ async function orientForLearningLogFixture(
   rcon: LocalRcon,
   botName: string,
   position: Position,
-): Promise<Position> {
+  activeOperationAtOrient: boolean,
+): Promise<LearningFixtureOrientationReadback> {
   const previousRotation = await readLearningFixtureRotation(rcon, botName);
   if (previousRotation === undefined)
     incomplete("LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
@@ -7707,13 +7778,15 @@ async function orientForLearningLogFixture(
   const rotation = await readLearningFixtureRotation(rcon, botName);
   if (rotation === undefined)
     incomplete("LEARNING_LOG_FIXTURE_ROTATION_READBACK_UNAVAILABLE");
-  if (
-    angularDistance(rotation.yaw, previousRotation.yaw) > 2 ||
-    Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
-  ) {
-    incomplete("LEARNING_LOG_FIXTURE_FACING_NOT_CONFIRMED");
-  }
-  return confirmedPosition;
+  return {
+    position: confirmedPosition,
+    ...classifyLearningFixtureOrientation(
+      previousRotation.yaw,
+      LEARNING_FIXTURE_PITCH,
+      rotation,
+      activeOperationAtOrient,
+    ),
+  };
 }
 
 async function readLearningFixtureRotation(
@@ -7891,10 +7964,6 @@ async function removeBuildingFixture(
     }
     if (!isAir) incomplete("BUILDING_FIXTURE_CLEANUP_UNVERIFIED");
   }
-}
-
-function angularDistance(left: number, right: number): number {
-  return Math.abs(((((left - right) % 360) + 540) % 360) - 180);
 }
 
 async function configureParallelFixture(
