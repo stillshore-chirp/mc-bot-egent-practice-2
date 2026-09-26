@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  countBoundedConsultedSkillIds,
   evidenceRevisionForOutcome,
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
@@ -8,6 +9,30 @@ import {
   type LearningSkillDefinition,
   type LearningHypothesisSnapshot,
 } from "../e2e/learning-reuse-acceptance.js";
+
+describe("bounded Skill reference evidence", () => {
+  it("counts only unique references in the persisted library", () => {
+    const persistedSkillIds = new Set(["skill-a", "skill-b", "skill-c"]);
+
+    expect(
+      countBoundedConsultedSkillIds(
+        ["skill-a", "skill-a", "stale-skill"],
+        persistedSkillIds,
+      ),
+    ).toBe(1);
+  });
+
+  it("requires a non-empty proper subset of persisted skills", () => {
+    const persistedSkillIds = new Set(["skill-a", "skill-b"]);
+
+    expect(countBoundedConsultedSkillIds([], persistedSkillIds)).toBe(
+      undefined,
+    );
+    expect(
+      countBoundedConsultedSkillIds(["skill-a", "skill-b"], persistedSkillIds),
+    ).toBeUndefined();
+  });
+});
 
 describe("first dig learning acceptance", () => {
   it("projects first-dig snapshot membership without exposing identifiers", () => {

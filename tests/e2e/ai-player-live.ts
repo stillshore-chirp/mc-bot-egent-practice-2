@@ -105,6 +105,7 @@ import {
   type LearningFixtureOrientationDiagnostic,
 } from "./learning-fixture-orientation.js";
 import {
+  countBoundedConsultedSkillIds,
   evidenceRevisionForOutcome,
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
@@ -2466,6 +2467,7 @@ async function main(): Promise<void> {
 
     const baselineSkills = readSkillSnapshot(state.databasePath);
     let verifiedLearnedSkillIds: readonly string[] = [];
+    let receiptLinkedConsultedSkillIds: readonly string[] = [];
     const autonomousResult = await recordCase(
       state,
       "autonomous_life",
@@ -3148,28 +3150,30 @@ async function main(): Promise<void> {
             outcome.kind === "dig" && outcome.status === "successful",
         );
         const repeatedDig = repeatedDigOutcome !== undefined;
-        const hasReceiptLinkedMaterialRevision = (
+        const findReceiptLinkedConsultedSkillId = (
           snapshot: SkillSnapshot,
-        ): boolean => {
-          if (repeatedDigOutcome === undefined) return false;
+        ): string | undefined => {
+          if (repeatedDigOutcome === undefined) return undefined;
           const evidenceRevision = evidenceRevisionForOutcome(
             repeatedDigOutcome,
             snapshot,
           );
-          return (
-            evidenceRevision !== undefined &&
-            verifiedLearnedSkillIds.includes(evidenceRevision.skillId) &&
-            consultedLearnedSkillIds.has(evidenceRevision.skillId) &&
-            [...snapshot.skillIds].every((skillId) =>
+          if (
+            evidenceRevision === undefined ||
+            !verifiedLearnedSkillIds.includes(evidenceRevision.skillId) ||
+            !consultedLearnedSkillIds.has(evidenceRevision.skillId) ||
+            ![...snapshot.skillIds].every((skillId) =>
               beforeReuse.skillIds.has(skillId),
-            ) &&
-            !beforeReuse.evidenceRevisionsByRunId.has(
+            ) ||
+            beforeReuse.evidenceRevisionsByRunId.has(
               repeatedDigOutcome.operationId,
-            ) &&
-            !beforeReuse.revisionVersionsBySkill
+            ) ||
+            beforeReuse.revisionVersionsBySkill
               .get(evidenceRevision.skillId)
               ?.has(evidenceRevision.revisionVersion)
-          );
+          )
+            return undefined;
+          return evidenceRevision.skillId;
         };
         if (
           !repeatedDig ||
@@ -3181,19 +3185,20 @@ async function main(): Promise<void> {
           incomplete("REUSED_SKILL_HAS_NO_OBSERVED_RESULT");
         }
         state.learningReuseStage = "reuse_result_confirmed";
-        let consultedLearnedSkillEvidenceRevisionLinked =
-          hasReceiptLinkedMaterialRevision(afterReuse);
-        if (!consultedLearnedSkillEvidenceRevisionLinked) {
+        let receiptLinkedConsultedSkillId =
+          findReceiptLinkedConsultedSkillId(afterReuse);
+        if (receiptLinkedConsultedSkillId === undefined) {
           await observeForPlayer(context, 30_000, () => {
             afterReuse = readSkillSnapshot(state.databasePath);
-            consultedLearnedSkillEvidenceRevisionLinked =
-              hasReceiptLinkedMaterialRevision(afterReuse);
-            return consultedLearnedSkillEvidenceRevisionLinked;
+            receiptLinkedConsultedSkillId =
+              findReceiptLinkedConsultedSkillId(afterReuse);
+            return receiptLinkedConsultedSkillId !== undefined;
           });
         }
-        if (!consultedLearnedSkillEvidenceRevisionLinked) {
+        if (receiptLinkedConsultedSkillId === undefined) {
           incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
         }
+        receiptLinkedConsultedSkillIds = [receiptLinkedConsultedSkillId];
         state.learningReuseStage = "revision_verified";
         await removeLearningLogFixture(rcon, reuseLogs);
         activeLearningLogs = [];
@@ -3209,7 +3214,7 @@ async function main(): Promise<void> {
             "receipt_linked_revision_from_first_dig",
           learnedSkillConsultedAgain: true,
           repeatResultObserved: true,
-          consultedLearnedSkillEvidenceRevisionLinked,
+          consultedLearnedSkillEvidenceRevisionLinked: true,
           trustedFirstDigHypothesisVerified: true,
           initialSkillCount: baselineSkills.skillCount,
           learnedSkillCount: learned.skillCount,
@@ -3228,20 +3233,15 @@ async function main(): Promise<void> {
       "skill_compactness_and_knowledge_separation",
       30_000,
       requireLiveContext(),
-      async (context) => {
+      async () => {
         const skills = readSkillSnapshot(state.databasePath);
-        const player = playerOf(await collect(context.runtime.app));
-        const consultedIds = new Set(
-          player.skillActivity
-            .filter((activity) => activity.kind === "consulted")
-            .map((activity) => activity.skillId),
+        const consultedReferences = countBoundedConsultedSkillIds(
+          receiptLinkedConsultedSkillIds,
+          skills.skillIds,
         );
-        const consultedReferences = consultedIds.size;
-        const hasBoundedConsultation =
-          consultedReferences > 0 && consultedReferences < skills.skillCount;
         if (!skills.learnedBodiesUnderLimit)
           fail("LEARNED_SKILL_BODY_EXCEEDS_8KIB");
-        if (!hasBoundedConsultation)
+        if (consultedReferences === undefined)
           incomplete("ON_DEMAND_SKILL_REFERENCE_EVIDENCE_MISSING");
         if (operationSmokeResult.evidence.gameKnowledgeAvailable !== true) {
           incomplete("GAME_KNOWLEDGE_LAYER_NOT_OBSERVED");

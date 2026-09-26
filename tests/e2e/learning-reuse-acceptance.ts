@@ -85,6 +85,20 @@ export interface FirstDigLearningDiagnostic {
   readonly currentTrustedDerivedSkillCount: number;
 }
 
+/** Count unique consulted IDs only when they still belong to persisted skills. */
+export function countBoundedConsultedSkillIds(
+  consultedSkillIds: Iterable<string>,
+  persistedSkillIds: ReadonlySet<string>,
+): number | undefined {
+  const uniquePersistedSkillIds = new Set(
+    [...consultedSkillIds].filter((skillId) => persistedSkillIds.has(skillId)),
+  );
+  return uniquePersistedSkillIds.size > 0 &&
+    uniquePersistedSkillIds.size < persistedSkillIds.size
+    ? uniquePersistedSkillIds.size
+    : undefined;
+}
+
 /** Project hypothesis evidence to fixed, identifier-free failure diagnostics. */
 export function firstDigLearningDiagnostic(
   outcome: FirstDigOutcome,
