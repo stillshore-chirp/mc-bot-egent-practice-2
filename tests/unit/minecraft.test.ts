@@ -1,6 +1,7 @@
 import { Vec3 } from "vec3";
 import { EventEmitter } from "node:events";
 import mineflayer from "mineflayer";
+import minecraftData from "minecraft-data";
 import type { goals as PathfinderGoals } from "mineflayer-pathfinder";
 import {
   MineflayerClient,
@@ -10,7 +11,335 @@ import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/minecraft/connection-manager.js";
 import { FakeMinecraft } from "../support/fake-minecraft.js";
 
+function createSpawnableBot(
+  supportsPlayerLoaded: boolean,
+  waitForChunksToLoad = vi.fn().mockResolvedValue(undefined),
+) {
+  const bot = Object.assign(new EventEmitter(), {
+    _client: Object.assign(new EventEmitter(), { write: vi.fn() }),
+    username: "server_bot",
+    version: "1.21.11",
+    registry: minecraftData("1.21.11"),
+    pathfinder: {
+      setMovements: vi.fn(),
+      thinkTimeout: 0,
+      tickTimeout: 0,
+    },
+    loadPlugin: vi.fn(),
+    supportFeature: vi.fn(
+      (feature: string) =>
+        feature === "sendsPlayerLoadedPacket" && supportsPlayerLoaded,
+    ),
+    waitForChunksToLoad,
+    end: vi.fn(function (this: EventEmitter, reason: string) {
+      this.emit("end", reason);
+    }),
+  });
+  return bot;
+}
+
+function createMineflayerClient(): MineflayerClient {
+  return new MineflayerClient(
+    {
+      bot: { username: "login@example.invalid" },
+      ownerUsername: "fixture_owner",
+      pathfinderThinkTimeoutMs: 100,
+      pathfinderTickTimeoutMs: 10,
+      collectTimeoutMs: 100,
+    },
+    { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  );
+}
+
 describe("Minecraft boundary", () => {
+  it("waits for chunks before completing a supported player connection", async () => {
+    let loadChunks!: () => void;
+    const chunksLoaded = new Promise<void>((resolve) => {
+      loadChunks = resolve;
+    });
+    const bot = createSpawnableBot(
+      true,
+      vi.fn(() => chunksLoaded),
+    );
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = createMineflayerClient();
+      const connected = vi.fn();
+      const connection = client.connect();
+      void connection.then(connected);
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(bot.waitForChunksToLoad).toHaveBeenCalledOnce(),
+      );
+      expect(connected).not.toHaveBeenCalled();
+      expect(
+        bot._client.write.mock.calls.filter(
+          ([name]) => name === "player_loaded",
+        ),
+      ).toHaveLength(0);
+
+      loadChunks();
+      await connection;
+      expect(connected).toHaveBeenCalledOnce();
+      expect(bot._client.write).toHaveBeenCalledWith("player_loaded", {});
+      expect(
+        bot._client.write.mock.calls.filter(
+          ([name]) => name === "player_loaded",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("resends player_loaded once chunks load after respawn", async () => {
+    let loadInitialChunks!: () => void;
+    let loadRespawnChunks!: () => void;
+    const initialChunks = new Promise<void>((resolve) => {
+      loadInitialChunks = resolve;
+    });
+    const respawnChunks = new Promise<void>((resolve) => {
+      loadRespawnChunks = resolve;
+    });
+    const waitForChunksToLoad = vi
+      .fn()
+      .mockReturnValueOnce(initialChunks)
+      .mockReturnValueOnce(respawnChunks);
+    const bot = createSpawnableBot(true, waitForChunksToLoad);
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const connection = createMineflayerClient().connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(waitForChunksToLoad).toHaveBeenCalledOnce(),
+      );
+      loadInitialChunks();
+      await connection;
+
+      bot._client.emit("respawn");
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(waitForChunksToLoad).toHaveBeenCalledTimes(2),
+      );
+      loadRespawnChunks();
+      await vi.waitFor(() =>
+        expect(
+          bot._client.write.mock.calls.filter(
+            ([name]) => name === "player_loaded",
+          ),
+        ).toHaveLength(2),
+      );
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("invalidates an old chunk wait when a respawn packet arrives", async () => {
+    let loadInitialChunks!: () => void;
+    let loadStaleRespawnChunks!: () => void;
+    const initialChunks = new Promise<void>((resolve) => {
+      loadInitialChunks = resolve;
+    });
+    const staleRespawnChunks = new Promise<void>((resolve) => {
+      loadStaleRespawnChunks = resolve;
+    });
+    const waitForChunksToLoad = vi
+      .fn()
+      .mockReturnValueOnce(initialChunks)
+      .mockReturnValueOnce(staleRespawnChunks)
+      .mockResolvedValue(undefined);
+    const bot = createSpawnableBot(true, waitForChunksToLoad);
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const connection = createMineflayerClient().connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(waitForChunksToLoad).toHaveBeenCalledOnce(),
+      );
+      loadInitialChunks();
+      await connection;
+
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(waitForChunksToLoad).toHaveBeenCalledTimes(2),
+      );
+      bot._client.emit("respawn");
+      loadStaleRespawnChunks();
+      await Promise.resolve();
+      expect(
+        bot._client.write.mock.calls.filter(
+          ([name]) => name === "player_loaded",
+        ),
+      ).toHaveLength(1);
+
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(
+          bot._client.write.mock.calls.filter(
+            ([name]) => name === "player_loaded",
+          ),
+        ).toHaveLength(2),
+      );
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it.each(["end", "abort", "error"] as const)(
+    "settles connect and suppresses a stale chunk completion after %s",
+    async (stopBy) => {
+      let loadChunks!: () => void;
+      const chunksLoaded = new Promise<void>((resolve) => {
+        loadChunks = resolve;
+      });
+      const bot = createSpawnableBot(
+        true,
+        vi.fn(() => chunksLoaded),
+      );
+      const createBot = vi
+        .spyOn(mineflayer, "createBot")
+        .mockReturnValue(
+          bot as unknown as ReturnType<typeof mineflayer.createBot>,
+        );
+      try {
+        const controller = new AbortController();
+        const connection = createMineflayerClient().connect(controller.signal);
+        const rejected = expect(connection).rejects.toThrow();
+        await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+        bot.emit("spawn");
+        await vi.waitFor(() =>
+          expect(bot.waitForChunksToLoad).toHaveBeenCalledOnce(),
+        );
+        if (stopBy === "end") bot.emit("end", "fixture disconnect");
+        else if (stopBy === "abort")
+          controller.abort(new Error("fixture abort"));
+        else bot.emit("error", new Error("fixture connection error"));
+        await rejected;
+        if (stopBy === "error")
+          expect(bot.end).toHaveBeenCalledWith("connection error");
+        loadChunks();
+        await Promise.resolve();
+        expect(
+          bot._client.write.mock.calls.filter(
+            ([name]) => name === "player_loaded",
+          ),
+        ).toHaveLength(0);
+      } finally {
+        createBot.mockRestore();
+      }
+    },
+  );
+
+  it("ends the bot when a spawn chunk load fails", async () => {
+    const bot = createSpawnableBot(
+      true,
+      vi.fn().mockRejectedValue(new Error("fixture chunk failure")),
+    );
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const connection = createMineflayerClient().connect();
+      const rejected = expect(connection).rejects.toMatchObject({
+        detail: {
+          code: "MINECRAFT_CONNECT_FAILED",
+          retryable: true,
+        },
+      });
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await rejected;
+      expect(bot.end).toHaveBeenCalledWith("chunk loading failed");
+      expect(
+        bot._client.write.mock.calls.filter(
+          ([name]) => name === "player_loaded",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("ignores a late end event from an old bot after reconnect", async () => {
+    let loadNewBotChunks!: () => void;
+    const newBotChunks = new Promise<void>((resolve) => {
+      loadNewBotChunks = resolve;
+    });
+    const oldBot = createSpawnableBot(false);
+    const newBot = createSpawnableBot(
+      true,
+      vi.fn(() => newBotChunks),
+    );
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValueOnce(
+        oldBot as unknown as ReturnType<typeof mineflayer.createBot>,
+      )
+      .mockReturnValueOnce(
+        newBot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = createMineflayerClient();
+      const firstConnection = client.connect();
+      oldBot.emit("spawn");
+      await firstConnection;
+      oldBot.emit("end", "fixture disconnect");
+
+      const secondConnection = client.connect();
+      newBot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(newBot.waitForChunksToLoad).toHaveBeenCalledOnce(),
+      );
+      oldBot.emit("end", "late old end");
+      loadNewBotChunks();
+      await secondConnection;
+      await client.connect();
+      expect(createBot).toHaveBeenCalledTimes(2);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("skips player_loaded and chunk waiting when the protocol lacks support", async () => {
+    const bot = createSpawnableBot(false);
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const connection = createMineflayerClient().connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await connection;
+      expect(bot.waitForChunksToLoad).not.toHaveBeenCalled();
+      expect(
+        bot._client.write.mock.calls.filter(
+          ([name]) => name === "player_loaded",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
   it("ends a login whose effective Bot name collides with the owner without reconnecting", async () => {
     const bot = Object.assign(new EventEmitter(), {
       _client: new EventEmitter(),

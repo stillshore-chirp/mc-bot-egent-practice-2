@@ -1,20 +1,24 @@
 # mc-bot-egent-practice-2
 
-Minecraft Java Edition の世界に一人のプレイヤーとして接続し、指定利用者と日本語で会話しながら、観測したゲーム状態に基づいて安全に行動する AI コンパニオンです。
+Minecraft Java Edition の世界に一人のプレイヤーとして接続し、指定利用者と日本語で会話しながら、観測したゲーム状態と関係に応じて自律的に判断し行動する AI コンパニオンです。成功・失敗は Minecraft で確認した状態を根拠にします。
 
 ## プロジェクトの目的
 
-単なる操作Botや命令実行インターフェースではなく、Minecraft世界に一人の存在として継続し、人格・関係・共有経験・記憶・自律的判断の連続性を保つことを上位の製品原則とします。AI コンパニオンが、Minecraft で観測した状況と利用者との継続的な関係を基に、安全に会話・判断・行動できる状態を実環境で成立させます。成功・失敗の正本は LLM の自己申告ではなく、Minecraft で確認した状態です。
+単なる操作Botや命令実行インターフェースではなく、Minecraft世界に一人の存在として継続し、人格・関係・共有経験・記憶・自律的判断の連続性を保つことを上位の製品原則とします。ゲーム内の危険、死亡、建築変更もプレイヤーが判断でき、強いowner要求に応じて選択を変えられます。操作は通常のBukkit・サーバー権限とownerの永続停止に従います。credential、shell、任意コード、server admin accessはモデルへ公開しません。
 
 ## 目指す理想
 
 - 安定した名前、人格、価値観、話し方を持つ。
 - 利用者との関係、共有体験、約束、世界内の場所や経験を継続的に記憶する。
 - 再起動や session をまたいでも、同じ存在として振る舞う。
-- 行動は中断可能で、安全境界と失敗時の回復手段を持つ。
-- LLM は会話と高水準の判断に使い、即時性・安全性が必要な処理は決定論的な実行機構で扱う。
+- ownerが停止した行動はすぐに止まり、失敗や再起動から復帰できる。
+- ゲーム内の危険や損失を含む判断はプレイヤーが行い、即時停止とサーバー権限は決定論的な境界で守る。
 
-## 初期目標
+## 既定のプレイヤー経路
+
+既定のAIプレイヤー／行動系GPTは `src/player` と `src/app/player-application.ts` を通じて行動を判断し、PlayerBodyがゲーム操作を実行します。判断知識を担うMC Bot Skillsは `src/mc-skills` に置きます。旧 `src/skills`、`src/decision`、`src/reflexes`、tool executionはlegacy helperとして残します。詳細は[自律プレイヤー](docs/autonomous-player.md)と[PlayerBody](docs/player-body.md)、旧Paper補助の範囲は[原木収集の建築保護](docs/building-protection.md)を参照してください。
+
+## 旧tool/runtime経路の初期目標
 
 - Minecraft への接続と指定利用者との日本語会話
 - 利用者への追従と即時停止
@@ -22,13 +26,13 @@ Minecraft Java Edition の世界に一人のプレイヤーとして接続し、
 - 利用者情報、場所、約束、共有体験の永続記憶
 - 複数工程を含む原木収集依頼の実行と観測状態による結果検証
 
-## 現在の状態
+## 旧tool/runtime経路の実装状態
 
 初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。2026-08-25には、許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使った[実環境E2Eの12項目](docs/testing.md#2026-08-25-実施結果)を、初期コンパニオン実装の先行HEADで確認しました。最終対話式runnerは12件pass、fail / skipなし、終了code 0でした。
 
 確認範囲は単一のローカル環境です。remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。依存経路の既知のmoderate advisoryはIssue #4で追跡し、high / criticalを品質gateにしています。ダッシュボードとトレース計測を含む現行HEADでの実Minecraft・実OpenAIのlatest-head E2Eは未実行です。先行HEADの12件passは、今回の完了証跡として扱いません。
 
-初期完成版では次を一続きの体験として扱います。
+旧tool/runtime経路は次の体験を実装しています。これらのhelper固有の安全候補や採取・建築制限は、既定AIプレイヤー／行動系GPTの判断方針ではありません。
 
 - 指定利用者の日本語チャットを受け取り、型付き tool を通じて行動する。
 - 追従、即時停止、空腹、危険、被ダメージ、経路詰まり、切断を決定論的な実行層で扱う。
@@ -85,7 +89,7 @@ oak_logを4個集めて、ここへ戻ってきて。
 
 `停止`、`停止して`、`止まって`、`止めて`、`ストップ`、`やめて`、`中止`、`中断`はLLM待ちを経ず、ownerの完全一致chatとして即時処理します。
 
-原木収集には [建築保護の専用補助](docs/building-protection.md#専用補助のビルドと設定) が必須です。Java 21 と Maven でビルドした JAR を Paper サーバーの `plugins` へ配置し、生成設定の `bot-names` に対象 Bot を登録して起動してください。Bot は探索時と採掘直前に補助へ照会し、応答がない場合や履歴が不明な場合は採取を拒否します。補助の稼働中に苗木から成長した木を対象にします。原木以外の汎用採掘を試験する場合は、管理者が安全を確認した領域だけを設定側の `natural-resource-regions` に登録します。既存の稼働環境への JAR 配置・設定反映・再起動は別の適用作業です。
+既定PlayerBodyはTreeGuard補助なしで動作し、通常のBukkit・サーバー権限と他pluginの保護に従います。旧Bot helperで従来のTreeGuardイベント制限を使う場合は、Paper pluginの設定で `bot-names` と `legacy-bot-action-guard.enabled: true` を明示してください。新しい設定項目を持たない既存configでは制限は無効です。旧helper向けの `natural-resource-regions` などの詳細は[建築保護文書](docs/building-protection.md)にあります。既存の稼働環境へのJAR配置・設定反映・再起動は別の適用作業です。
 
 ## 設定
 
@@ -126,6 +130,8 @@ npm run test:e2e:dashboard
 ## 文書
 
 - [アーキテクチャ](docs/architecture.md)
+- [自律プレイヤー](docs/autonomous-player.md)
+- [PlayerBody](docs/player-body.md)
 - [人格と記憶](docs/memory.md)
 - [テストと実環境 E2E](docs/testing.md)
 - [Minecraft 26.1 接続・日本語会話の検証](docs/minecraft-26-1.md)

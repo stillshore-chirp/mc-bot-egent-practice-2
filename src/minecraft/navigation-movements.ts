@@ -1,10 +1,17 @@
 import type { Bot } from "mineflayer";
 import type { Block } from "prismarine-block";
-import { Movements, type SafeBlock } from "mineflayer-pathfinder";
-import type { Vec3 } from "vec3";
+import {
+  Movements,
+  type Move,
+  type SafeBlock,
+  type XZCoordinates,
+} from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 
-export function isHandOperableDoor(name: string): boolean {
-  return name.endsWith("_door") && name !== "iron_door";
+export function isHandOperableDoor(name: unknown): boolean {
+  return (
+    typeof name === "string" && name.endsWith("_door") && name !== "iron_door"
+  );
 }
 
 /** Resolve either half of a door to the lower block used for interaction. */
@@ -58,5 +65,28 @@ export class NavigationMovements extends Movements {
     block.height = block.position.y;
     block.openable = block.getProperties().open !== true;
     return block;
+  }
+
+  public override getMoveDiagonal(
+    node: Move,
+    dir: XZCoordinates,
+    neighbors: Move[],
+  ): void {
+    const position = new Vec3(node.x, node.y, node.z);
+    const destination = this.getBlock(position, dir.x, 0, dir.z);
+    if (!destination.physical) {
+      // The upstream planner permits a diagonal when either side is clear.
+      // A player-sized body cannot cut through the corner of the blocked side.
+      for (const [dx, dz] of [
+        [dir.x, 0],
+        [0, dir.z],
+      ] as const) {
+        for (const dy of [0, 1]) {
+          const side = this.getBlock(position, dx, dy, dz);
+          if (!side.safe || side.physical) return;
+        }
+      }
+    }
+    super.getMoveDiagonal(node, dir, neighbors);
   }
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import minecraftData from "minecraft-data";
 import prismarineBlock from "prismarine-block";
 import type { Bot } from "mineflayer";
@@ -64,6 +64,36 @@ function passage(doorName: "oak_door" | "iron_door", open: boolean) {
 }
 
 describe("navigation through doors", () => {
+  it("avoids a diagonal through a blocked corner while retaining a clear detour", () => {
+    const { movements } = passage("iron_door", false);
+    const neighbors = movements.getNeighbors({
+      x: 0,
+      y: 64,
+      z: 0,
+      remainingBlocks: 0,
+      cost: 0,
+      toBreak: [],
+      toPlace: [],
+      parkour: false,
+      hash: "0,64,0",
+    });
+    expect(
+      neighbors.some(({ x, y, z }) => x === 1 && y === 64 && z === 1),
+    ).toBe(false);
+    expect(
+      neighbors.some(({ x, y, z }) => x === 0 && y === 64 && z === 1),
+    ).toBe(true);
+  });
+
+  it("keeps unloaded cells impassable without crashing path search", () => {
+    const { movements, bot } = passage("oak_door", false);
+    vi.spyOn(bot, "blockAt").mockReturnValueOnce(null);
+
+    const unknown = movements.getBlock(new Vec3(0, 64, 0), 4, 0, 0);
+    expect(unknown.safe).toBe(false);
+    expect(unknown.physical).toBe(false);
+  });
+
   it("plans an interaction through a closed wooden door without digging or placing", () => {
     const { movements } = passage("oak_door", false);
     const neighbors = movements.getNeighbors({

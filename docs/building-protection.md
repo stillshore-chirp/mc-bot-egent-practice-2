@@ -1,10 +1,12 @@
-# 原木収集の建築保護
+# Legacy helper向けの原木収集・建築保護
 
-Issue #12 の設計契約。原木の種類と形だけでは、人が設置した原木と自然木を確実に区別できない。葉の存在や地面との接触だけを採取許可の根拠にしない。
+Issue #12 の旧Bot helper向け設計記録です。既定のPlayerBody経路 (`src/player` と `src/app/player-application.ts`) のゲーム行動ポリシーではありません。現行の自律行動は[自律プレイヤー](autonomous-player.md)と[PlayerBody](player-body.md)を参照してください。原木の種類と形だけでは、人が設置した原木と自然木を確実に区別できないため、旧helperでは葉や地面との接触だけを採取許可の根拠にしません。
+
+TreeGuardのサーバーイベントでBotの破壊・設置を独自に制限する機能は、`legacy-bot-action-guard.enabled: true` を明示した場合だけ有効です。新設定を持たない既存configでは無効になります。従来の制限を旧helperで継続する場合は、`bot-names` とともに設定を明示してください。無効時は通常プレイヤーと同様にBukkit・サーバー・他pluginの判定に従います。
 
 ## 採用する境界
 
-自動探索を維持し、Paper側の成長履歴と採掘時の再検査を使う専用補助を追加する。Botの会話、判断、探索、移動、採取、記憶は引き続き単一TypeScriptアプリで扱う。補助は採取可否だけを扱い、旧Bridge、任意コマンド、収納操作を移植しない。Paperを使わない接続では、補助が応答しない原木の採取を許可しない。
+旧helperでは自動探索を維持し、Paper側の成長履歴と採掘時の再検査を使う専用補助を利用する。会話、判断、探索、移動、採取、記憶はTypeScriptアプリに残し、補助は許可判定を返す。旧Bridge、任意コマンド、収納操作は移植しない。旧helperが補助を要求する設定でPaperが応答しない場合、helperは原木採取を開始しない。
 
 - 許可: 補助の稼働中に木の成長イベントを観測した原木で、現在の種類が履歴と一致し、周辺の保護条件を満たすもの。
 - 拒否: 設置、移動、保護指定、周辺の建築、対象変化が確認されたもの。
@@ -14,15 +16,15 @@ Issue #12 の設計契約。原木の種類と形だけでは、人が設置し�
 
 ## 再確認と停止
 
-探索時の許可を採掘時まで使い回さない。移動・装備後、採掘直前に照会し、サーバー側でも実際のブロック破壊イベントで同じ保護条件を検査する。設定済みBotのブロック破壊は、その時点の対象が採取可能な原木であり、許可判定が成立する場合だけ認める。clientの直前確認後に対象が別種の建築ブロックへ変わった場合も、サーバーで破壊を拒否する。停止・timeout・危険介入後は採掘を開始しない。許可照会は既存Minecraft接続のplugin messageだけを使い、独立した公開HTTP portやAPI keyを追加しない。
+旧helperでは探索時の許可を採掘時まで使い回さず、移動・装備後に照会します。`legacy-bot-action-guard.enabled: true` の場合、`bot-names` に登録したBotの破壊・設置をTreeGuardがpermitで再確認し、対象変化やpermit欠落を拒否します。この設定が無効ならTreeGuard独自のイベント制限を加えず、Bukkit・サーバー・他pluginの通常判定を保ちます。旧helperはowner停止後に採掘を開始せず、許可照会に公開HTTP portやAPI keyを追加しません。
 
 補助は接続中のBotとそのworldを基準に検査し、clientが送ったworld識別子を信用しない。未登録の利用者による保護解除・履歴の許可登録は提供しない。第三者の採掘許可を新しく付与する機能は持たない。
 
 ## 汎用操作の採掘境界
 
-原木以外の採掘、設置、クラフト、精錬は、Bot側の候補観測だけで許可しない。Paper補助の `companion:action_guard` が操作ごとに対象・距離・現在ブロックを再確認し、Botは許可を受けた直後だけ操作する。採掘・設置後は同じchannelのread-only `inspect`でサーバー側のブロック状態を再確認し、Mineflayerのローカル更新だけでは成功扱いにしない。配置されたブロックは補助が記録し、同じ座標の汎用採掘を保護対象として扱う。
+旧helperの汎用操作ではPaper補助 `companion:action_guard` が対象・距離・現在ブロックを再確認し、Botは許可後に操作します。採掘・設置後は同じchannelのread-only `inspect`でサーバー状態を確認します。このlegacy helper契約はPlayerBodyに対するゲーム操作の禁止規則ではありません。
 
-石・土・鉱石などの素材名は自然生成の証明にならないため、汎用採掘の許可領域をサーバー設定の `natural-resource-regions` に明示する。初期値の空リストでは、原木以外の採掘は `unknown` として停止する。再起動後も配置履歴を根拠にせず、設定済みの既知の安全領域だけを許可範囲にする。実worldでこの領域を設定する場合は、建築物や保護対象が存在しない試験領域を管理者が確認し、座標をローカル設定へだけ記載する。
+旧helperでは石・土・鉱石などの素材名だけを自然生成の証明にせず、汎用採掘の候補領域を `natural-resource-regions` で確認します。初期値の空リストではhelperへの判定結果は `unknown` です。PlayerBodyの自律行動をこの設定で制限しません。実worldの座標はローカル設定だけに記載します。
 
 ## 検証と適用
 
@@ -36,7 +38,7 @@ Paperの [StructureGrowEvent](https://jd.papermc.io/paper/1.21.11/org/bukkit/eve
 
 ## 専用補助のビルドと設定
 
-Java 21とMavenで `mvn -f server/tree-guard/pom.xml verify` を実行する。生成されたJARは、許可を得たPaperサーバーのpluginsへ配置する。生成設定の `bot-names` に対象Botだけを登録し、必要な保護領域は `protected-regions` のworld・min・maxへ指定する。汎用採掘を試験する場合だけ、建築物のない許可領域を `natural-resource-regions` のworld・min・maxへ指定する。両方の初期値は空リストで、値やJAR、実worldをgitへ保存しない。
+Java 21とMavenで `mvn -f server/tree-guard/pom.xml verify` を実行する。生成されたJARは、許可を得たPaperサーバーのpluginsへ配置する。旧Bot helperを登録する場合は `bot-names` に対象だけを追加し、従来のTreeGuardイベント制限を続ける時は `legacy-bot-action-guard.enabled: true` も明示します。新しい設定項目を持たない既存configでは `false` として扱います。必要な保護領域は `protected-regions`、旧helperの汎用採掘候補領域は `natural-resource-regions` に指定します。実worldの値やJARをgitへ保存しません。
 
 原木の成長履歴はchunkのunloadでも全失効する。履歴上限を超えた場合も全失効し、上限を根拠のない許可で回避しない。汎用操作の配置履歴は、chunkのunloadで失われても再利用せず、設定された採掘許可領域の外を常に判定不能として扱う。採取許可に必要な周辺観測は、同じ成長で生まれた木全体とその1ブロック周辺を対象とする。土壌の支持層、空気、葉、草、蔓、履歴内の原木を許容し、他のブロックや保護領域との接触は除外する。自然の石や他の木との接触も拒否し得る保守的な条件である。
 

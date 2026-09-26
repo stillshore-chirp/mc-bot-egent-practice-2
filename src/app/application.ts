@@ -39,6 +39,8 @@ import { ToolExecutor } from "../tools/executor.js";
 import type { GameStatus } from "../tools/contracts.js";
 import { TraceService, type TraceSession } from "../trace/service.js";
 import { TraceStore } from "../trace/store.js";
+import type { PlayerRuntimeSnapshot } from "../player/contracts.js";
+import { createPlayerApplication } from "./player-application.js";
 import { CompanionContextFactory } from "./context-factory.js";
 import { CompanionGameController } from "./game-controller.js";
 import {
@@ -231,6 +233,7 @@ export interface LiveEvidence {
     readonly gathered?: LiveGatherEvidence;
   };
   readonly reflexState: string;
+  readonly player?: PlayerRuntimeSnapshot;
 }
 
 interface LiveGatherEvidence {
@@ -885,7 +888,9 @@ class DefaultCompanionApplication implements CompanionApplication {
   }
 }
 
-export function createApplication(config: AppConfig): CompanionApplication {
+export function createLegacyApplication(
+  config: AppConfig,
+): CompanionApplication {
   const logger = createLogger(config);
   const persona = loadPersona(config.personaPath);
   prepareDatabaseDirectory(config.databasePath);
@@ -1030,6 +1035,11 @@ export function createApplication(config: AppConfig): CompanionApplication {
     ...(traceService === undefined ? {} : { traceService }),
     dashboard: config.dashboard,
   });
+}
+
+/** The autonomous player is the default runtime; legacy application helpers remain exported. */
+export function createApplication(config: AppConfig): CompanionApplication {
+  return createPlayerApplication(config);
 }
 
 function createTraceService(
