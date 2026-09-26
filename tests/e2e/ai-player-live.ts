@@ -448,8 +448,11 @@ interface ReturnPathProbeDiagnostic {
   readonly dropItemEntityPresentBeforeMove?: boolean;
   readonly itemPresentBeforeDropMove?: boolean;
   readonly dropStageBodyConfirmed?: boolean;
+  readonly dropMoveGoal?: "parsed_drop_position";
+  readonly dropMoveRange?: 0.25;
   readonly dropMove?: BodyMovePathDiagnostic;
   readonly dropMoveRconArrivalConfirmed?: boolean;
+  readonly dropMoveRconGoalDistanceBucket?: ReturnPathDropDistanceBucket;
   readonly dropDistanceObservationAvailableAtArrival?: boolean;
   readonly dropPresentAtArrival?: boolean;
   readonly playerDropDistanceBucketAtArrival?: ReturnPathDropDistanceBucket;
@@ -461,6 +464,7 @@ interface ReturnPathProbeDiagnostic {
   readonly itemPresentAfterDropMove?: boolean;
   readonly itemPickupConfirmed?: boolean;
   readonly returnMoveSkippedRecoveryRequired?: boolean;
+  readonly returnMoveSkippedNoPickup?: boolean;
   readonly returnMove?: BodyMovePathDiagnostic;
   readonly returnRconArrivalConfirmed?: boolean;
   readonly itemPresentAfterReturn?: boolean;
@@ -6367,7 +6371,7 @@ async function runUnknownReturnPathProbe(
   if (itemPresentAfterDig)
     incomplete("RETURN_PATH_PROBE_ITEM_PICKED_UP_AFTER_DIG");
   if (dropItemEntityPresentAfterDig !== true)
-    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_CONFIRMED_AFTER_DIG");
+    incomplete("RETURN_PATH_PROBE_DROP_POSITION_UNAVAILABLE_AFTER_DIG");
 
   await rcon.command(
     `tp ${botName} ${digStage.x} ${digStage.y} ${digStage.z} 0 0`,
@@ -6413,18 +6417,18 @@ async function runUnknownReturnPathProbe(
   });
   if (itemPresentBeforeDropMove)
     incomplete("RETURN_PATH_PROBE_ITEM_ALREADY_IN_INVENTORY");
-  if (dropItemEntityPresentBeforeMove !== true)
-    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_CONFIRMED");
+  if (dropPositionBeforeMove === undefined)
+    incomplete("RETURN_PATH_PROBE_DROP_POSITION_UNAVAILABLE_BEFORE_MOVE");
+  updateReturnPathProbeDiagnostic(state, {
+    dropMoveGoal: "parsed_drop_position",
+    dropMoveRange: 0.25,
+  });
   const dropMove = await executeBodyMovePathProbe(
     body,
     {
       kind: "move_to",
-      position: {
-        x: target.x + 0.5,
-        y: target.y,
-        z: target.z + 0.5,
-      },
-      range: 1,
+      position: dropPositionBeforeMove,
+      range: 0.25,
     },
     signal,
   );
@@ -6432,12 +6436,22 @@ async function runUnknownReturnPathProbe(
   const afterDropMove = parsePosition(
     await rcon.command(`data get entity ${botName} Pos`),
   );
+  const dropMoveGoalDistance = Math.hypot(
+    afterDropMove.x - dropPositionBeforeMove.x,
+    afterDropMove.y - dropPositionBeforeMove.y,
+    afterDropMove.z - dropPositionBeforeMove.z,
+  );
+  const goalBlockDx =
+    Math.floor(afterDropMove.x) - Math.floor(dropPositionBeforeMove.x);
+  const goalBlockDy =
+    Math.floor(afterDropMove.y) - Math.floor(dropPositionBeforeMove.y);
+  const goalBlockDz =
+    Math.floor(afterDropMove.z) - Math.floor(dropPositionBeforeMove.z);
   const dropMoveRconArrivalConfirmed =
-    Math.hypot(
-      afterDropMove.x - (target.x + 0.5),
-      afterDropMove.y - target.y,
-      afterDropMove.z - (target.z + 0.5),
-    ) <= 1.75;
+    goalBlockDx * goalBlockDx +
+      goalBlockDy * goalBlockDy +
+      goalBlockDz * goalBlockDz <=
+    0.25 * 0.25;
   const dropDistanceAtArrival = await observeReturnPathDropDistance(
     rcon,
     botName,
@@ -6449,6 +6463,7 @@ async function runUnknownReturnPathProbe(
     ...(dropDistanceAtArrival.dropPresent === undefined
       ? {}
       : { dropPresentAtArrival: dropDistanceAtArrival.dropPresent }),
+    dropMoveRconGoalDistanceBucket: positionDriftBucket(dropMoveGoalDistance),
     playerDropDistanceBucketAtArrival: dropDistanceAtArrival.distanceBucket,
     dropSearchRadiusAtArrival: dropDistanceAtArrival.searchRadiusBucket,
   });
@@ -6480,6 +6495,11 @@ async function runUnknownReturnPathProbe(
     itemPresentAfterDropMove,
     itemPickupConfirmed,
   });
+
+  if (!itemPickupConfirmed) {
+    updateReturnPathProbeDiagnostic(state, { returnMoveSkippedNoPickup: true });
+    return;
+  }
 
   if (dropMove.recoveryRequired) {
     const currentPosition = parsePosition(
