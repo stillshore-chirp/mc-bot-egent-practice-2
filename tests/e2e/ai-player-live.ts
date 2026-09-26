@@ -382,6 +382,7 @@ type BodyDigErrorClass =
   | "other";
 type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
 type ReturnPathDropDistanceBucket = BodyPositionDriftBucket | "unknown";
+type ReturnPathDropSearchRadius = "r2" | "r4" | "r8" | "r16" | "unknown";
 type ReturnPathDigFeetClass = "dry" | "water" | "other" | "unknown";
 type ReturnPathDigSupportClass = "stone" | "other" | "unknown";
 
@@ -398,6 +399,7 @@ interface ReturnPathDropDistanceObservation {
   readonly available: boolean;
   readonly dropPresent?: true;
   readonly distanceBucket: ReturnPathDropDistanceBucket;
+  readonly searchRadiusBucket: ReturnPathDropSearchRadius;
 }
 
 interface BodyMovePathDiagnostic {
@@ -438,9 +440,11 @@ interface ReturnPathProbeDiagnostic {
   readonly dropDistanceObservationAvailableAtArrival?: boolean;
   readonly dropPresentAtArrival?: boolean;
   readonly playerDropDistanceBucketAtArrival?: ReturnPathDropDistanceBucket;
+  readonly dropSearchRadiusAtArrival?: ReturnPathDropSearchRadius;
   readonly dropDistanceObservationAvailableAfterPickupWait?: boolean;
   readonly dropPresentAfterPickupWait?: boolean;
   readonly playerDropDistanceBucketAfterPickupWait?: ReturnPathDropDistanceBucket;
+  readonly dropSearchRadiusAfterPickupWait?: ReturnPathDropSearchRadius;
   readonly itemPresentAfterDropMove?: boolean;
   readonly itemPickupConfirmed?: boolean;
   readonly returnMoveSkippedRecoveryRequired?: boolean;
@@ -6297,6 +6301,7 @@ async function runUnknownReturnPathProbe(
       ? {}
       : { dropPresentAtArrival: dropDistanceAtArrival.dropPresent }),
     playerDropDistanceBucketAtArrival: dropDistanceAtArrival.distanceBucket,
+    dropSearchRadiusAtArrival: dropDistanceAtArrival.searchRadiusBucket,
   });
   const itemPresentAfterDropMove = await waitForRconInventoryBlueWool(
     rcon,
@@ -6320,6 +6325,8 @@ async function runUnknownReturnPathProbe(
         }),
     playerDropDistanceBucketAfterPickupWait:
       dropDistanceAfterPickupWait.distanceBucket,
+    dropSearchRadiusAfterPickupWait:
+      dropDistanceAfterPickupWait.searchRadiusBucket,
     dropMoveRconArrivalConfirmed,
     itemPresentAfterDropMove,
     itemPickupConfirmed,
@@ -6508,12 +6515,49 @@ async function rconBlueWoolDropPositionNear(
   rcon: LocalRcon,
   target: BlockPosition,
 ): Promise<Position | undefined> {
-  const selector =
-    '@e[type=minecraft:item,limit=1,sort=nearest,distance=..2,nbt={Item:{id:"minecraft:blue_wool"}}]';
+  return rconBlueWoolDropPositionWithinRadius(rcon, target, 2);
+}
+
+async function rconBlueWoolDropPositionWithinRadius(
+  rcon: LocalRcon,
+  target: BlockPosition,
+  radius: 2 | 4 | 8 | 16,
+): Promise<Position | undefined> {
+  const selector = `@e[type=minecraft:item,limit=1,sort=nearest,distance=..${radius},nbt={Item:{id:"minecraft:blue_wool"}}]`;
   const reply = await rcon.command(
     `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
   );
   return parseOptionalPosition(reply);
+}
+
+async function searchReturnPathDropPosition(
+  rcon: LocalRcon,
+  target: BlockPosition,
+): Promise<
+  | {
+      readonly position: Position;
+      readonly searchRadiusBucket: Exclude<
+        ReturnPathDropSearchRadius,
+        "unknown"
+      >;
+    }
+  | undefined
+> {
+  const radii = [
+    { radius: 2, bucket: "r2" },
+    { radius: 4, bucket: "r4" },
+    { radius: 8, bucket: "r8" },
+    { radius: 16, bucket: "r16" },
+  ] as const;
+  for (const { radius, bucket } of radii) {
+    const position = await rconBlueWoolDropPositionWithinRadius(
+      rcon,
+      target,
+      radius,
+    );
+    if (position !== undefined) return { position, searchRadiusBucket: bucket };
+  }
+  return undefined;
 }
 
 async function observeReturnPathDropDistance(
@@ -6523,40 +6567,57 @@ async function observeReturnPathDropDistance(
   playerPosition?: Position,
 ): Promise<ReturnPathDropDistanceObservation> {
   try {
-    const currentPlayerPosition =
-      playerPosition ??
-      parseOptionalPosition(
-        await rcon.command(`data get entity ${botName} Pos`),
-      );
+    let currentPlayerPosition = playerPosition;
     if (currentPlayerPosition === undefined) {
-      return { available: false, distanceBucket: "unknown" };
+      try {
+        currentPlayerPosition = parseOptionalPosition(
+          await rcon.command(`data get entity ${botName} Pos`),
+        );
+      } catch {
+        // A missing player read does not hide a separately confirmed drop.
+      }
+    }
+    const dropSearch = await searchReturnPathDropPosition(rcon, target);
+    if (dropSearch === undefined) {
+      return {
+        available: false,
+        distanceBucket: "unknown",
+        searchRadiusBucket: "unknown",
+      };
     }
     if (
+      currentPlayerPosition === undefined ||
       ![
         currentPlayerPosition.x,
         currentPlayerPosition.y,
         currentPlayerPosition.z,
       ].every(Number.isFinite)
     ) {
-      return { available: false, distanceBucket: "unknown" };
+      return {
+        available: false,
+        dropPresent: true,
+        distanceBucket: "unknown",
+        searchRadiusBucket: dropSearch.searchRadiusBucket,
+      };
     }
-    const dropPosition = await rconBlueWoolDropPositionNear(rcon, target);
-    // No parsed position cannot distinguish absence from response drift.
-    if (dropPosition === undefined)
-      return { available: false, distanceBucket: "unknown" };
     const distance = Math.hypot(
-      currentPlayerPosition.x - dropPosition.x,
-      currentPlayerPosition.y - dropPosition.y,
-      currentPlayerPosition.z - dropPosition.z,
+      currentPlayerPosition.x - dropSearch.position.x,
+      currentPlayerPosition.y - dropSearch.position.y,
+      currentPlayerPosition.z - dropSearch.position.z,
     );
     return {
       available: true,
       dropPresent: true,
       distanceBucket: positionDriftBucket(distance),
+      searchRadiusBucket: dropSearch.searchRadiusBucket,
     };
   } catch {
     // Keep RCON response text and coordinates private; this is diagnostic only.
-    return { available: false, distanceBucket: "unknown" };
+    return {
+      available: false,
+      distanceBucket: "unknown",
+      searchRadiusBucket: "unknown",
+    };
   }
 }
 
