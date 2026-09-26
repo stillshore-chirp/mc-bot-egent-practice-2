@@ -578,6 +578,7 @@ export class MineflayerClient implements MinecraftPort {
     this.playerBodyInstance ??= new MineflayerPlayerBody(
       () => this.requireBot(),
       this.options.ownerUsername,
+      () => this.authoritativeOxygen ?? null,
     );
     if (this.botInstance !== undefined)
       this.playerBodyInstance.attach(this.botInstance);

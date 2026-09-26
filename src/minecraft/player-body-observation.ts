@@ -798,6 +798,7 @@ export function observePlayerBody(
   bot: Bot,
   ownerUsername: string | undefined,
   options: PlayerBodyObservationOptions = {},
+  authoritativeOxygen: number | null = null,
 ): PlayerBodyObservation {
   const observedAt = new Date().toISOString();
   const dimension = bot.game.dimension;
@@ -923,7 +924,11 @@ export function observePlayerBody(
       foodSaturation: Number.isFinite(bot.foodSaturation)
         ? bot.foodSaturation
         : null,
-      oxygen: Number.isFinite(bot.oxygenLevel) ? bot.oxygenLevel : null,
+      oxygen:
+        typeof authoritativeOxygen === "number" &&
+        Number.isFinite(authoritativeOxygen)
+          ? authoritativeOxygen
+          : null,
       inWater,
       inLava: physics.isInLava ?? (feet === null ? null : feet.name === "lava"),
       onFire: physics.onFire ?? null,

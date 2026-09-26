@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Window } from "prismarine-windows";
+import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
   MineflayerPlayerBody,
   playerOperationNames,
@@ -1190,6 +1191,31 @@ describe("player body", () => {
       observePlayerBody(fake.bot, "owner", { ownerPositionException: true })
         .perception.ownerPositionException?.source,
     ).toBe("owner_position_exception");
+  });
+
+  it("uses MineflayerClient's authoritative oxygen in PlayerBody observations", async () => {
+    const fake = makeFakeBot();
+    fake.bot.oxygenLevel = 0;
+    const client = new MineflayerClient(
+      {
+        bot: { username: "fixture_bot" },
+        ownerUsername: "fixture_owner",
+        pathfinderThinkTimeoutMs: 100,
+        pathfinderTickTimeoutMs: 10,
+        collectTimeoutMs: 100,
+      },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    Object.assign(client, {
+      spawned: true,
+      botInstance: fake.bot,
+      authoritativeOxygen: 12,
+    });
+
+    const observation = await client.createPlayerBody().observe();
+
+    expect(fake.bot.oxygenLevel).toBe(0);
+    expect(observation.self.oxygen).toBe(12);
   });
 
   it("searches past a dominant block name and balances the capped visible list", () => {

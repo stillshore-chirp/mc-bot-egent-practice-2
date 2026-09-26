@@ -1198,6 +1198,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   public constructor(
     private readonly getBot: () => Bot,
     private readonly ownerUsername?: string,
+    private readonly getAuthoritativeOxygen?: () => number | null,
   ) {}
 
   /** @internal MineflayerClient uses this to keep lifecycle events across reconnects. */
@@ -1210,7 +1211,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   ): Promise<PlayerBodyObservation> {
     const bot = this.getBot();
     this.bindBot(bot);
-    return observePlayerBody(bot, this.ownerUsername, options);
+    return this.observeSnapshot(bot, this.ownerUsername, options);
   }
 
   public knowledge(query: string): PlayerKnowledge {
@@ -1558,10 +1559,23 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private safeObserve(bot: Bot): PlayerBodyObservation | null {
     try {
-      return observePlayerBody(bot, this.ownerUsername);
+      return this.observeSnapshot(bot, this.ownerUsername);
     } catch {
       return null;
     }
+  }
+
+  private observeSnapshot(
+    bot: Bot,
+    ownerUsername: string | undefined,
+    options: PlayerBodyObservationOptions = {},
+  ): PlayerBodyObservation {
+    return observePlayerBody(
+      bot,
+      ownerUsername,
+      options,
+      this.getAuthoritativeOxygen?.() ?? null,
+    );
   }
 
   private noteActionSettled(active: ActiveOperation): void {
