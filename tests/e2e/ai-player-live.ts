@@ -372,9 +372,27 @@ type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 type BodyMoveErrorClass =
   "none" | "no_path" | "timeout" | "probe_deadline" | "interrupted" | "other";
 type BodyDigErrorClass =
-  "out_of_view" | "occluded" | "out_of_reach" | "unloaded" | "other";
+  | "out_of_view"
+  | "occluded"
+  | "out_of_reach"
+  | "unloaded"
+  | "timeout"
+  | "effect_unverified"
+  | "interrupted"
+  | "other";
 type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
 type ReturnPathDropDistanceBucket = BodyPositionDriftBucket | "unknown";
+type ReturnPathDigFeetClass = "dry" | "water" | "other" | "unknown";
+type ReturnPathDigSupportClass = "stone" | "other" | "unknown";
+
+interface ReturnPathDigStageObservation {
+  readonly playerDistanceBucket: BodyPositionDriftBucket | "unknown";
+  readonly bodyDistanceBucket: BodyPositionDriftBucket | "unknown";
+  readonly feetBlockClass: ReturnPathDigFeetClass;
+  readonly supportBlockClass: ReturnPathDigSupportClass;
+  readonly stable: boolean;
+  readonly ready: boolean;
+}
 
 interface ReturnPathDropDistanceObservation {
   readonly available: boolean;
@@ -396,9 +414,16 @@ interface ReturnPathProbeDiagnostic {
   readonly interpretation?: "diagnostic_only_move_outcomes_not_gated";
   readonly fixtureConfirmed?: boolean;
   readonly digStageRconConfirmed?: boolean;
+  readonly digStagePlayerDistanceBucket?: BodyPositionDriftBucket | "unknown";
+  readonly digStageBodyDistanceBucket?: BodyPositionDriftBucket | "unknown";
+  readonly digStageFeetBlockClass?: ReturnPathDigFeetClass;
+  readonly digStageSupportBlockClass?: ReturnPathDigSupportClass;
+  readonly digStageStable?: boolean;
+  readonly digStageReady?: boolean;
   readonly dropStageRconConfirmed?: boolean;
   readonly digStatus?: BodyOperationStatus;
   readonly digErrorClass?: BodyDigErrorClass;
+  readonly digRecoveryRequired?: boolean;
   readonly digLookStatus?: BodyOperationStatus;
   readonly targetVisibleAfterLook?: boolean;
   readonly digPositionDriftBucket?: BodyPositionDriftBucket;
@@ -451,9 +476,16 @@ function classifyBodyMoveError(
 }
 
 function classifyReturnPathDigError(
+  status: BodyOperationStatus,
   detail: string | undefined,
 ): BodyDigErrorClass {
   const normalized = detail?.toLowerCase() ?? "";
+  if (status === "unverified") {
+    return normalized.includes("bounded action wait expired")
+      ? "timeout"
+      : "effect_unverified";
+  }
+  if (status === "interrupted") return "interrupted";
   if (normalized.includes("outside the current field of view"))
     return "out_of_view";
   if (normalized.includes("occluded")) return "occluded";
@@ -6121,6 +6153,23 @@ async function runUnknownReturnPathProbe(
   if (!targetVisibleAfterLook)
     incomplete("RETURN_PATH_PROBE_DIG_TARGET_NOT_VISIBLE");
 
+  const digStageObservation = await observeReturnPathDigStage(
+    body,
+    rcon,
+    botName,
+    digStage,
+  );
+  updateReturnPathProbeDiagnostic(state, {
+    digStagePlayerDistanceBucket: digStageObservation.playerDistanceBucket,
+    digStageBodyDistanceBucket: digStageObservation.bodyDistanceBucket,
+    digStageFeetBlockClass: digStageObservation.feetBlockClass,
+    digStageSupportBlockClass: digStageObservation.supportBlockClass,
+    digStageStable: digStageObservation.stable,
+    digStageReady: digStageObservation.ready,
+  });
+  if (!digStageObservation.ready)
+    incomplete("RETURN_PATH_PROBE_DIG_STAGE_NOT_DRY_AND_STABLE");
+
   const digResult = await body.execute(
     { kind: "dig", position: target },
     signal,
@@ -6142,6 +6191,7 @@ async function runUnknownReturnPathProbe(
   const targetClearedAfterDig = !(await isBlock(rcon, target, "blue_wool"));
   updateReturnPathProbeDiagnostic(state, {
     digStatus: digResult.status,
+    digRecoveryRequired: digResult.recoveryRequired,
     digPositionDriftBucket,
     itemPresentAfterDig,
     ...(dropItemEntityPresentAfterDig === undefined
@@ -6150,7 +6200,12 @@ async function runUnknownReturnPathProbe(
     targetClearedAfterDig,
     ...(digResult.status === "successful"
       ? {}
-      : { digErrorClass: classifyReturnPathDigError(digResult.detail) }),
+      : {
+          digErrorClass: classifyReturnPathDigError(
+            digResult.status,
+            digResult.detail,
+          ),
+        }),
   });
   if (digResult.status !== "successful")
     incomplete("RETURN_PATH_PROBE_DIG_NOT_SUCCESSFUL");
@@ -6328,6 +6383,117 @@ async function waitForBodyAtPosition(
     await waitMs(100);
   }
   return false;
+}
+
+async function observeReturnPathDigStage(
+  body: PlayerBody,
+  rcon: LocalRcon,
+  botName: string,
+  expected: Position,
+): Promise<ReturnPathDigStageObservation> {
+  let feetPosition: BlockPosition | undefined;
+  let feetBlockClass: ReturnPathDigFeetClass = "unknown";
+  let supportBlockClass: ReturnPathDigSupportClass = "unknown";
+  let initialPlayerPosition: Position | undefined;
+  try {
+    initialPlayerPosition = parseOptionalPosition(
+      await rcon.command(`data get entity ${botName} Pos`),
+    );
+  } catch {
+    // Keep RCON replies private; an unavailable read is represented as unknown.
+  }
+  if (initialPlayerPosition !== undefined) {
+    feetPosition = {
+      x: Math.floor(initialPlayerPosition.x),
+      y: Math.floor(initialPlayerPosition.y),
+      z: Math.floor(initialPlayerPosition.z),
+    };
+    try {
+      if (await isBlock(rcon, feetPosition, "air")) {
+        feetBlockClass = "dry";
+      } else if (await isBlock(rcon, feetPosition, "water")) {
+        feetBlockClass = "water";
+      } else {
+        feetBlockClass = "other";
+      }
+    } catch {
+      feetBlockClass = "unknown";
+    }
+    try {
+      supportBlockClass = (await isBlock(
+        rcon,
+        {
+          ...feetPosition,
+          y: feetPosition.y - 1,
+        },
+        "stone",
+      ))
+        ? "stone"
+        : "other";
+    } catch {
+      supportBlockClass = "unknown";
+    }
+  }
+  let bodyPosition: Position | undefined;
+  try {
+    bodyPosition = (await body.observe()).self.position;
+  } catch {
+    // Keep Body diagnostics fixed and safe.
+  }
+  let playerPosition: Position | undefined;
+  try {
+    playerPosition = parseOptionalPosition(
+      await rcon.command(`data get entity ${botName} Pos`),
+    );
+  } catch {
+    // Keep RCON replies private; an unavailable read is represented as unknown.
+  }
+  const playerDistanceBucket = returnPathDistanceBucket(
+    playerPosition,
+    expected,
+  );
+  const bodyDistanceBucket = returnPathDistanceBucket(bodyPosition, expected);
+  const feetCellStable =
+    feetPosition !== undefined &&
+    playerPosition !== undefined &&
+    feetPosition.x === Math.floor(playerPosition.x) &&
+    feetPosition.y === Math.floor(playerPosition.y) &&
+    feetPosition.z === Math.floor(playerPosition.z);
+  const positionsAgree =
+    playerPosition !== undefined &&
+    returnPathDistanceBucket(bodyPosition, playerPosition) === "<1";
+  const stable =
+    playerDistanceBucket === "<1" &&
+    bodyDistanceBucket === "<1" &&
+    feetCellStable &&
+    positionsAgree;
+  return {
+    playerDistanceBucket,
+    bodyDistanceBucket,
+    feetBlockClass,
+    supportBlockClass,
+    stable,
+    ready: stable && feetBlockClass === "dry" && supportBlockClass === "stone",
+  };
+}
+
+function returnPathDistanceBucket(
+  current: Position | undefined,
+  expected: Position,
+): BodyPositionDriftBucket | "unknown" {
+  if (
+    current === undefined ||
+    ![current.x, current.y, current.z].every(Number.isFinite)
+  ) {
+    return "unknown";
+  }
+  return positionDriftBucket(
+    Math.hypot(
+      current.x - expected.x,
+      current.y - expected.y,
+      current.z - expected.z,
+    ),
+  );
 }
 
 async function rconInventoryHasBlueWool(
