@@ -3,9 +3,85 @@ import { describe, expect, it } from "vitest";
 import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
+  waitForRecoveryObstacleReadiness,
   withRestorableObstacle,
   type RecoveryObstaclePlan,
 } from "./unknown-recovery-obstacle.js";
+
+describe("bounded recovery-obstacle readiness", () => {
+  it("waits only while the same travel operation remains active", async () => {
+    let now = 0;
+    let operationChecks = 0;
+    let probeChecks = 0;
+    const result = await waitForRecoveryObstacleReadiness({
+      operationStillActive: async () => {
+        operationChecks += 1;
+        return operationChecks < 3;
+      },
+      probeStandingSpace: async () => {
+        probeChecks += 1;
+        return { status: "unsafe" as const };
+      },
+      wait: async (durationMs) => {
+        now += durationMs;
+      },
+      now: () => now,
+      timeoutMs: 1_000,
+      intervalMs: 100,
+    });
+
+    expect(result).toEqual({ status: "operation_changed" });
+    expect(operationChecks).toBe(3);
+    expect(probeChecks).toBe(2);
+    expect(now).toBe(200);
+  });
+
+  it("returns the safe probe result without extending the wait", async () => {
+    let now = 0;
+    let probeChecks = 0;
+    const result = await waitForRecoveryObstacleReadiness({
+      operationStillActive: async () => true,
+      probeStandingSpace: async () => {
+        probeChecks += 1;
+        return probeChecks === 2
+          ? { status: "ready" as const, value: "safe-position" }
+          : { status: "unsafe" as const };
+      },
+      wait: async (durationMs) => {
+        now += durationMs;
+      },
+      now: () => now,
+      timeoutMs: 1_000,
+      intervalMs: 100,
+    });
+
+    expect(result).toEqual({ status: "ready", value: "safe-position" });
+    expect(probeChecks).toBe(2);
+    expect(now).toBe(100);
+  });
+
+  it("stops after the fixed wait window when a safe position never appears", async () => {
+    let now = 0;
+    let probeChecks = 0;
+    const result = await waitForRecoveryObstacleReadiness({
+      operationStillActive: async () => true,
+      probeStandingSpace: async () => {
+        probeChecks += 1;
+        return { status: "unsafe" as const };
+      },
+      wait: async (durationMs) => {
+        now += durationMs;
+      },
+      now: () => now,
+      timeoutMs: 1_000,
+      intervalMs: 100,
+    });
+
+    expect(result).toEqual({ status: "standing_space_unavailable" });
+    expect(now).toBe(1_000);
+    expect(probeChecks).toBe(10);
+  });
+});
 
 describe("post-unfreeze failure attribution", () => {
   const unfrozenAt = Date.parse("2026-01-01T00:00:10.000Z");

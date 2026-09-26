@@ -77,6 +77,57 @@ export interface RecoveryObstacleCallbacks<T> {
   ) => void;
 }
 
+export type RecoveryObstacleReadinessProbe<T> =
+  | { readonly status: "ready"; readonly value: T }
+  | { readonly status: "unsafe" | "unavailable" };
+
+export type RecoveryObstacleReadinessResult<T> =
+  | { readonly status: "ready"; readonly value: T }
+  | {
+      readonly status:
+        | "operation_changed"
+        | "standing_space_unavailable"
+        | "oracle_unavailable";
+    };
+
+export async function waitForRecoveryObstacleReadiness<T>(options: {
+  readonly operationStillActive: () => Promise<boolean>;
+  readonly probeStandingSpace: (
+    remainingMs: number,
+  ) => Promise<RecoveryObstacleReadinessProbe<T>>;
+  readonly wait: (durationMs: number) => Promise<void>;
+  readonly now: () => number;
+  readonly timeoutMs: number;
+  readonly intervalMs: number;
+}): Promise<RecoveryObstacleReadinessResult<T>> {
+  const deadline = options.now() + Math.max(0, options.timeoutMs);
+  let unsafeObserved = false;
+  let unavailableObserved = false;
+
+  while (options.now() < deadline) {
+    if (!(await options.operationStillActive()))
+      return { status: "operation_changed" };
+    const remainingMs = deadline - options.now();
+    if (remainingMs <= 0) break;
+
+    const probe = await options.probeStandingSpace(remainingMs);
+    if (probe.status === "ready") return probe;
+    unsafeObserved ||= probe.status === "unsafe";
+    unavailableObserved ||= probe.status === "unavailable";
+
+    const waitMs = Math.min(options.intervalMs, deadline - options.now());
+    if (waitMs <= 0) break;
+    await options.wait(waitMs);
+  }
+
+  return {
+    status:
+      unsafeObserved || !unavailableObserved
+        ? "standing_space_unavailable"
+        : "oracle_unavailable",
+  };
+}
+
 export function isNewFailureAfterUnfreeze(
   outcome: {
     readonly operationId: string;

@@ -64,6 +64,7 @@ import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baselin
 import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
+  waitForRecoveryObstacleReadiness,
   withRestorableObstacle,
 } from "./unknown-recovery-obstacle.js";
 import {
@@ -158,6 +159,9 @@ const RUN_BUDGET_LIMITS = {
   totalTokens: 800_000,
 } as const;
 const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 2_000;
+const UNKNOWN_OBSTACLE_READINESS_WINDOW_MS = 1_000;
+const UNKNOWN_OBSTACLE_READINESS_POLL_MS = 100;
+const UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS = 200;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
@@ -296,6 +300,13 @@ type UnknownObstaclePhase =
   | "restore_verified"
   | "mutation_failed";
 
+type UnknownObstacleReadinessStatus =
+  | "ready"
+  | "operation_changed"
+  | "standing_space_unavailable"
+  | "other_entities_not_clear"
+  | "oracle_unavailable";
+
 interface UnknownCompositeDiagnostic {
   readonly unknownTargetInitiallyPresent?: boolean;
   readonly unknownOracleReadStatus?: "available" | "incomplete";
@@ -350,6 +361,10 @@ interface UnknownCompositeDiagnostic {
   readonly unknownControlledObstaclePlacementCount?: number;
   readonly unknownControlledObstacleConfirmedPlacementCount?: number;
   readonly unknownControlledObstacleEligibilityChecks?: number;
+  readonly unknownControlledObstaclePreFreezeReadiness?:
+    | Exclude<UnknownObstacleReadinessStatus, "other_entities_not_clear">
+    | "not_attempted";
+  readonly unknownControlledObstaclePostFreezeReadiness?: UnknownObstacleReadinessStatus;
   readonly unknownControlledObstacleSameOperationConfirmed?: boolean;
   readonly unknownControlledObstacleNewOperationFailed?: boolean;
   readonly unknownControlledObstaclePlayerInsideBefore?: boolean;
@@ -1933,20 +1948,28 @@ function positionStandingCenteredInCage(
   );
 }
 
-async function standingSpaceSafe(
+async function standingSpaceStatus(
   rcon: OracleRcon,
   position: Position,
   region: BlockRegion,
-): Promise<boolean> {
-  if (!positionStandingCenteredInCage(position, region)) return false;
+  botName: string,
+  timeoutMs: number,
+): Promise<"safe" | "unsafe" | "unavailable"> {
+  if (!positionStandingCenteredInCage(position, region)) return "unsafe";
   const x = Math.floor(position.x);
   const z = Math.floor(position.z);
-  if (
-    !(await blockIs(rcon, { x, y: region.minY, z }, "air", incomplete)) ||
-    !(await blockIs(rcon, { x, y: region.minY + 1, z }, "air", incomplete))
-  )
-    return false;
-  return blockIs(rcon, { x, y: region.minY - 1, z }, "stone", incomplete);
+  try {
+    const reply = await rcon.command(
+      `execute if block ${x} ${region.minY} ${z} minecraft:air if block ${x} ${region.minY + 1} ${z} minecraft:air if block ${x} ${region.minY - 1} ${z} minecraft:stone run data get entity ${botName} Pos`,
+      timeoutMs,
+    );
+    if (/^test failed\.?$/iu.test(reply.trim())) return "unsafe";
+    return /has the following entity data:/iu.test(reply)
+      ? "safe"
+      : "unavailable";
+  } catch {
+    return "unavailable";
+  }
 }
 
 function subtractCounters(after: Counters, before: Counters): Counters {
@@ -4120,6 +4143,87 @@ async function main(): Promise<void> {
                   unknownObstacleTickFreezeConfirmed: false,
                   unknownObstacleTickUnfreezeConfirmed: false,
                 });
+                const obstacleRcon = boundedOracleRcon(rcon);
+                const standingReadiness =
+                  await waitForRecoveryObstacleReadiness({
+                    operationStillActive: async () => {
+                      const freshPlayer = playerOf(
+                        await collect(context.runtime.app),
+                      );
+                      return isSameStartedTravelOperation(
+                        freshPlayer.activeOperation,
+                        operationId,
+                      );
+                    },
+                    probeStandingSpace: async (remainingMs) => {
+                      const probeStartedAt = Date.now();
+                      const timeoutMs = Math.max(
+                        1,
+                        Math.min(
+                          UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+                          remainingMs,
+                        ),
+                      );
+                      let position: Position;
+                      try {
+                        position = parsePosition(
+                          await obstacleRcon.command(
+                            `data get entity ${state.botName} Pos`,
+                            timeoutMs,
+                          ),
+                        );
+                      } catch {
+                        return { status: "unavailable" as const };
+                      }
+                      const plan = recoveryCagePlan(position, {
+                        x: 2_000,
+                        y: 64,
+                        z: 2_000,
+                      });
+                      const remainingSpaceProbeMs =
+                        remainingMs - (Date.now() - probeStartedAt);
+                      if (remainingSpaceProbeMs <= 0)
+                        return { status: "unavailable" as const };
+                      const spaceStatus = await standingSpaceStatus(
+                        obstacleRcon,
+                        position,
+                        plan.sourceRegion,
+                        state.botName,
+                        Math.max(
+                          1,
+                          Math.min(
+                            UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+                            remainingSpaceProbeMs,
+                          ),
+                        ),
+                      );
+                      if (spaceStatus === "safe")
+                        return { status: "ready" as const, value: plan };
+                      return {
+                        status:
+                          spaceStatus === "unsafe" ? "unsafe" : "unavailable",
+                      } as const;
+                    },
+                    wait: waitMs,
+                    now: Date.now,
+                    timeoutMs: UNKNOWN_OBSTACLE_READINESS_WINDOW_MS,
+                    intervalMs: UNKNOWN_OBSTACLE_READINESS_POLL_MS,
+                  });
+                const obstaclePlan =
+                  standingReadiness.status === "ready"
+                    ? standingReadiness.value
+                    : undefined;
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownControlledObstaclePreFreezeReadiness:
+                    standingReadiness.status,
+                  unknownControlledObstaclePlayerInsideBefore:
+                    obstaclePlan !== undefined,
+                });
+                if (obstaclePlan === undefined) {
+                  updateUnknownCompositeDiagnostic(state, {
+                    unknownControlledObstacleStatus: "skipped_ineligible",
+                  });
+                }
                 let obstacleTickFreezeAttempted = false;
                 let obstacleTickUnfreezeConfirmed = false;
                 let obstacleUnfrozenAt: number | undefined;
@@ -4152,204 +4256,214 @@ async function main(): Promise<void> {
                   });
                 };
                 try {
-                  obstacleTickFreezeAttempted = true;
-                  await rcon.command("tick freeze");
-                  if (
-                    classifyTickStatus(await rcon.command("tick query")) !==
-                    "frozen"
-                  )
-                    incomplete("UNKNOWN_OBSTACLE_TICK_FREEZE_NOT_CONFIRMED");
-                  updateUnknownCompositeDiagnostic(state, {
-                    unknownObstacleTickFreezeConfirmed: true,
-                  });
-                  const initialPosition = parsePosition(
-                    await rcon.command(`data get entity ${state.botName} Pos`),
-                  );
-                  const obstaclePlan = recoveryCagePlan(initialPosition, {
-                    x: 2_000,
-                    y: 64,
-                    z: 2_000,
-                  });
-                  const obstacleRcon = boundedOracleRcon(rcon);
-                  updateUnknownCompositeDiagnostic(state, {
-                    unknownControlledObstaclePlayerInsideBefore:
-                      positionStandingCenteredInCage(
-                        initialPosition,
-                        obstaclePlan.sourceRegion,
+                  if (obstaclePlan !== undefined) {
+                    obstacleTickFreezeAttempted = true;
+                    await rcon.command("tick freeze");
+                    if (
+                      classifyTickStatus(await rcon.command("tick query")) !==
+                      "frozen"
+                    )
+                      incomplete("UNKNOWN_OBSTACLE_TICK_FREEZE_NOT_CONFIRMED");
+                    updateUnknownCompositeDiagnostic(state, {
+                      unknownObstacleTickFreezeConfirmed: true,
+                    });
+                    const initialPosition = parsePosition(
+                      await rcon.command(
+                        `data get entity ${state.botName} Pos`,
                       ),
-                  });
-                  const obstacleResult = await withRestorableObstacle(
-                    obstacleRcon,
-                    obstaclePlan,
-                    {
-                      restoreInStableWorld: (restore) =>
-                        withFrozenTicks(obstacleRcon, restore, incomplete),
-                      onRestoreFailure: (stage) =>
-                        updateUnknownCompositeDiagnostic(state, {
-                          unknownControlledObstacleRestoreFailureStage: stage,
-                        }),
-                      eligible: async () => {
-                        const eligibilityChecks =
-                          (state.unknownCompositeDiagnostic
-                            ?.unknownControlledObstacleEligibilityChecks as
-                            number | undefined) ?? 0;
-                        const freshPlayer = playerOf(
-                          await collect(context.runtime.app),
-                        );
-                        const active = freshPlayer.activeOperation;
-                        const sameStartedOperation =
-                          isSameStartedTravelOperation(active, operationId);
-                        const position = parsePosition(
-                          await obstacleRcon.command(
-                            `data get entity ${state.botName} Pos`,
-                          ),
-                        );
-                        const inside = positionStandingCenteredInCage(
-                          position,
+                    );
+                    updateUnknownCompositeDiagnostic(state, {
+                      unknownControlledObstaclePlayerInsideBefore:
+                        positionStandingCenteredInCage(
+                          initialPosition,
                           obstaclePlan.sourceRegion,
-                        );
-                        const standingSpaceConfirmed = await standingSpaceSafe(
-                          obstacleRcon,
-                          position,
-                          obstaclePlan.sourceRegion,
-                        );
-                        const otherEntitiesClear = await nearbyEntitiesClear(
-                          obstacleRcon,
-                          position,
-                          state.botName,
-                        );
-                        updateUnknownCompositeDiagnostic(state, {
-                          unknownControlledObstacleEligibilityChecks:
-                            eligibilityChecks + 1,
-                          unknownControlledObstacleSameOperationConfirmed:
-                            sameStartedOperation,
-                          unknownControlledObstaclePlayerInsideBefore: inside,
-                          unknownControlledObstacleStandingSpaceConfirmed:
-                            standingSpaceConfirmed,
-                          unknownControlledObstacleOtherEntitiesClear:
-                            otherEntitiesClear,
-                        });
-                        return (
-                          sameStartedOperation &&
-                          standingSpaceConfirmed &&
-                          otherEntitiesClear
-                        );
-                      },
-                      observeWhileApplied: async () => {
-                        const playerBeforeUnfreeze = playerOf(
-                          await collect(context.runtime.app),
-                        );
-                        const activeBeforeUnfreeze =
-                          playerBeforeUnfreeze.activeOperation;
-                        const knownOutcomeIdsBeforeUnfreeze = new Set(
-                          playerBeforeUnfreeze.recentOutcomes.map(
-                            (outcome) => outcome.operationId,
-                          ),
-                        );
-                        knownOutcomeIdsBeforeUnfreeze.add(operationId);
-                        if (activeBeforeUnfreeze !== undefined)
-                          knownOutcomeIdsBeforeUnfreeze.add(
-                            activeBeforeUnfreeze.operationId,
+                        ),
+                    });
+                    const obstacleResult = await withRestorableObstacle(
+                      obstacleRcon,
+                      obstaclePlan,
+                      {
+                        restoreInStableWorld: (restore) =>
+                          withFrozenTicks(obstacleRcon, restore, incomplete),
+                        onRestoreFailure: (stage) =>
+                          updateUnknownCompositeDiagnostic(state, {
+                            unknownControlledObstacleRestoreFailureStage: stage,
+                          }),
+                        eligible: async () => {
+                          const eligibilityChecks =
+                            (state.unknownCompositeDiagnostic
+                              ?.unknownControlledObstacleEligibilityChecks as
+                              number | undefined) ?? 0;
+                          const freshPlayer = playerOf(
+                            await collect(context.runtime.app),
                           );
-                        const sameOperationBeforeUnfreeze =
-                          activeBeforeUnfreeze?.operationId === operationId &&
-                          typeof activeBeforeUnfreeze.bodyStartedAt ===
-                            "string";
-                        updateUnknownCompositeDiagnostic(state, {
-                          unknownObstacleOperationActiveBeforeUnfreeze:
-                            sameOperationBeforeUnfreeze,
-                        });
-                        await unfreezeObstacleTicks();
-                        const unfrozenAt = obstacleUnfrozenAt;
-                        if (unfrozenAt === undefined)
-                          incomplete(
-                            "UNKNOWN_OBSTACLE_TICK_UNFREEZE_NOT_CONFIRMED",
+                          const active = freshPlayer.activeOperation;
+                          const sameStartedOperation =
+                            isSameStartedTravelOperation(active, operationId);
+                          const position = parsePosition(
+                            await obstacleRcon.command(
+                              `data get entity ${state.botName} Pos`,
+                              UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+                            ),
                           );
-                        let lastSampleAt = 0;
-                        const newFailureAfterUnfreeze = (
-                          outcome: PlayerEvidence["recentOutcomes"][number],
-                        ): boolean =>
-                          isNewFailureAfterUnfreeze(
-                            outcome,
-                            knownOutcomeIdsBeforeUnfreeze,
-                            unfrozenAt,
+                          const inside = positionStandingCenteredInCage(
+                            position,
+                            obstaclePlan.sourceRegion,
                           );
-                        const failurePlayer = await observeForPlayer(
-                          context,
-                          30_000,
-                          async (candidate) => {
-                            if (Date.now() - lastSampleAt >= 2_000) {
-                              await sampleUnknownOracle();
-                              lastSampleAt = Date.now();
-                              lastOracleCheckAt = lastSampleAt;
-                            }
-                            return candidate.recentOutcomes.some(
-                              newFailureAfterUnfreeze,
+                          const spaceStatus = await standingSpaceStatus(
+                            obstacleRcon,
+                            position,
+                            obstaclePlan.sourceRegion,
+                            state.botName,
+                            UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+                          );
+                          const standingSpaceConfirmed = spaceStatus === "safe";
+                          const otherEntitiesClear = await nearbyEntitiesClear(
+                            obstacleRcon,
+                            position,
+                            state.botName,
+                          );
+                          const postFreezeReadiness: UnknownObstacleReadinessStatus =
+                            !sameStartedOperation
+                              ? "operation_changed"
+                              : spaceStatus === "unavailable"
+                                ? "oracle_unavailable"
+                                : !standingSpaceConfirmed
+                                  ? "standing_space_unavailable"
+                                  : otherEntitiesClear
+                                    ? "ready"
+                                    : "other_entities_not_clear";
+                          updateUnknownCompositeDiagnostic(state, {
+                            unknownControlledObstacleEligibilityChecks:
+                              eligibilityChecks + 1,
+                            unknownControlledObstacleSameOperationConfirmed:
+                              sameStartedOperation,
+                            unknownControlledObstaclePlayerInsideBefore: inside,
+                            unknownControlledObstacleStandingSpaceConfirmed:
+                              standingSpaceConfirmed,
+                            unknownControlledObstacleOtherEntitiesClear:
+                              otherEntitiesClear,
+                            unknownControlledObstaclePostFreezeReadiness:
+                              postFreezeReadiness,
+                          });
+                          return postFreezeReadiness === "ready";
+                        },
+                        observeWhileApplied: async () => {
+                          const playerBeforeUnfreeze = playerOf(
+                            await collect(context.runtime.app),
+                          );
+                          const activeBeforeUnfreeze =
+                            playerBeforeUnfreeze.activeOperation;
+                          const knownOutcomeIdsBeforeUnfreeze = new Set(
+                            playerBeforeUnfreeze.recentOutcomes.map(
+                              (outcome) => outcome.operationId,
+                            ),
+                          );
+                          knownOutcomeIdsBeforeUnfreeze.add(operationId);
+                          if (activeBeforeUnfreeze !== undefined)
+                            knownOutcomeIdsBeforeUnfreeze.add(
+                              activeBeforeUnfreeze.operationId,
                             );
-                          },
-                        );
-                        const newOperationFailed =
-                          failurePlayer?.recentOutcomes.some(
-                            newFailureAfterUnfreeze,
-                          ) === true;
-                        if (!newOperationFailed)
-                          return { failedInPlace: false };
-                        const failurePosition = parsePosition(
-                          await rcon.command(
-                            `data get entity ${state.botName} Pos`,
-                          ),
-                        );
-                        const playerInsideAtFailure = positionInsideCage(
-                          failurePosition,
-                          obstaclePlan.sourceRegion,
-                        );
-                        const confirmed = playerInsideAtFailure;
-                        updateUnknownCompositeDiagnostic(state, {
-                          unknownControlledObstacleNewOperationFailed:
-                            newOperationFailed,
-                          unknownControlledObstaclePlayerInsideAtFailure:
-                            playerInsideAtFailure,
-                          ...(confirmed
-                            ? {
-                                unknownFailureObserved: true,
-                                unknownFailureSource: "controlled_obstacle",
+                          const sameOperationBeforeUnfreeze =
+                            activeBeforeUnfreeze?.operationId === operationId &&
+                            typeof activeBeforeUnfreeze.bodyStartedAt ===
+                              "string";
+                          updateUnknownCompositeDiagnostic(state, {
+                            unknownObstacleOperationActiveBeforeUnfreeze:
+                              sameOperationBeforeUnfreeze,
+                          });
+                          await unfreezeObstacleTicks();
+                          const unfrozenAt = obstacleUnfrozenAt;
+                          if (unfrozenAt === undefined)
+                            incomplete(
+                              "UNKNOWN_OBSTACLE_TICK_UNFREEZE_NOT_CONFIRMED",
+                            );
+                          let lastSampleAt = 0;
+                          const newFailureAfterUnfreeze = (
+                            outcome: PlayerEvidence["recentOutcomes"][number],
+                          ): boolean =>
+                            isNewFailureAfterUnfreeze(
+                              outcome,
+                              knownOutcomeIdsBeforeUnfreeze,
+                              unfrozenAt,
+                            );
+                          const failurePlayer = await observeForPlayer(
+                            context,
+                            30_000,
+                            async (candidate) => {
+                              if (Date.now() - lastSampleAt >= 2_000) {
+                                await sampleUnknownOracle();
+                                lastSampleAt = Date.now();
+                                lastOracleCheckAt = lastSampleAt;
                               }
-                            : {}),
-                        });
-                        return { failedInPlace: confirmed };
+                              return candidate.recentOutcomes.some(
+                                newFailureAfterUnfreeze,
+                              );
+                            },
+                          );
+                          const newOperationFailed =
+                            failurePlayer?.recentOutcomes.some(
+                              newFailureAfterUnfreeze,
+                            ) === true;
+                          if (!newOperationFailed)
+                            return { failedInPlace: false };
+                          const failurePosition = parsePosition(
+                            await rcon.command(
+                              `data get entity ${state.botName} Pos`,
+                            ),
+                          );
+                          const playerInsideAtFailure = positionInsideCage(
+                            failurePosition,
+                            obstaclePlan.sourceRegion,
+                          );
+                          const confirmed = playerInsideAtFailure;
+                          updateUnknownCompositeDiagnostic(state, {
+                            unknownControlledObstacleNewOperationFailed:
+                              newOperationFailed,
+                            unknownControlledObstaclePlayerInsideAtFailure:
+                              playerInsideAtFailure,
+                            ...(confirmed
+                              ? {
+                                  unknownFailureObserved: true,
+                                  unknownFailureSource: "controlled_obstacle",
+                                }
+                              : {}),
+                          });
+                          return { failedInPlace: confirmed };
+                        },
+                        onProgress: (progress) => {
+                          if (progress.phase === "restore_verified")
+                            controlledObstacleRestoredAt = Date.now();
+                          updateUnknownCompositeDiagnostic(state, {
+                            unknownControlledObstaclePhase: progress.phase,
+                            unknownControlledObstaclePlacementCount:
+                              progress.placementCount,
+                            unknownControlledObstacleConfirmedPlacementCount:
+                              progress.confirmedPlacementCount,
+                            ...(progress.phase === "restore_verified"
+                              ? { unknownControlledObstacleRestored: true }
+                              : {}),
+                          });
+                        },
                       },
-                      onProgress: (progress) => {
-                        if (progress.phase === "restore_verified")
-                          controlledObstacleRestoredAt = Date.now();
-                        updateUnknownCompositeDiagnostic(state, {
-                          unknownControlledObstaclePhase: progress.phase,
-                          unknownControlledObstaclePlacementCount:
-                            progress.placementCount,
-                          unknownControlledObstacleConfirmedPlacementCount:
-                            progress.confirmedPlacementCount,
-                          ...(progress.phase === "restore_verified"
-                            ? { unknownControlledObstacleRestored: true }
-                            : {}),
-                        });
-                      },
-                    },
-                    incomplete,
-                  );
-                  if (obstacleResult.status === "skipped") {
-                    updateUnknownCompositeDiagnostic(state, {
-                      unknownControlledObstacleStatus: "skipped_ineligible",
-                    });
-                  } else {
-                    const failureObservedInPlace =
-                      obstacleResult.observation.failedInPlace;
-                    controlledObstacleRestoredAt ??= Date.now();
-                    updateUnknownCompositeDiagnostic(state, {
-                      unknownControlledObstacleStatus: failureObservedInPlace
-                        ? "applied_failure_observed"
-                        : "applied_without_failure",
-                      unknownControlledObstacleRestored:
-                        obstacleResult.restorationVerified,
-                    });
+                      incomplete,
+                    );
+                    if (obstacleResult.status === "skipped") {
+                      updateUnknownCompositeDiagnostic(state, {
+                        unknownControlledObstacleStatus: "skipped_ineligible",
+                      });
+                    } else {
+                      const failureObservedInPlace =
+                        obstacleResult.observation.failedInPlace;
+                      controlledObstacleRestoredAt ??= Date.now();
+                      updateUnknownCompositeDiagnostic(state, {
+                        unknownControlledObstacleStatus: failureObservedInPlace
+                          ? "applied_failure_observed"
+                          : "applied_without_failure",
+                        unknownControlledObstacleRestored:
+                          obstacleResult.restorationVerified,
+                      });
+                    }
                   }
                 } catch (error) {
                   const code = error instanceof HarnessError ? error.code : "";
