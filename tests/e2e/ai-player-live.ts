@@ -4072,7 +4072,7 @@ async function main(): Promise<void> {
           incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
         sendChat(
           context.owner,
-          "近くにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空です。方法は自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
+          "近くにある青い羊毛を採集して、この依頼を受けた地点まで持ち帰ってください。所持品は空です。方法は自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
         unknownTaskSentAt.value = Date.now();
         updateUnknownCompositeDiagnostic(state, {
