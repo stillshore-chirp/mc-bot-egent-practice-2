@@ -100,6 +100,11 @@ import {
   firstDigLearningEvidence,
   type LearningHypothesisSnapshot,
 } from "./learning-reuse-acceptance.js";
+import {
+  isCaseSelectedForTarget,
+  TARGETABLE_CASES,
+  type TargetableCase,
+} from "./target-case-selection.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -178,12 +183,6 @@ const CASE_DEADLINES = {
 
 type Status = "pass" | "fail" | "incomplete";
 type UsageStatus = "runtime_reported" | "partial_or_unknown";
-const TARGETABLE_CASES = [
-  "game_action_discretion",
-  "unknown_composite",
-  "parallel_dialogue_stop",
-] as const;
-type TargetableCase = (typeof TARGETABLE_CASES)[number];
 interface SafeCaseResult {
   readonly id: string;
   readonly status: Status;
@@ -6930,13 +6929,7 @@ async function recordCase(
     context: CaseContext,
   ) => Promise<Readonly<Record<string, boolean | number | string>>>,
 ): Promise<SafeCaseResult> {
-  const requiredAutonomousHandoff =
-    state.targetCase === "unknown_composite" && id === "autonomous_life";
-  if (
-    state.targetCase !== undefined &&
-    id !== state.targetCase &&
-    !requiredAutonomousHandoff
-  ) {
+  if (!isCaseSelectedForTarget(state.targetCase, id)) {
     const skipped: SafeCaseResult = {
       id,
       status: "incomplete",
