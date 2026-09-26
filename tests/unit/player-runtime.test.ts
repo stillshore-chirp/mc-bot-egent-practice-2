@@ -670,6 +670,159 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("reassesses a failed owner meal with its active intent and observed result", async () => {
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const ownerProposalRef: { current?: string } = {};
+    let thoughtCount = 0;
+    let failureContextPreserved = false;
+    let alternativeAccepted = false;
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        const isInitialDecision = thoughtCount === 1;
+        const decision = isInitialDecision
+          ? action("failed-owner-meal-op", {
+              kind: "consume",
+              item: "bread",
+            })
+          : action("reassess-after-failed-meal");
+        if (!isInitialDecision) {
+          failureContextPreserved =
+            snapshot.lastOutcome?.kind === "consume" &&
+            snapshot.lastOutcome.status === "failed" &&
+            events.some(({ kind }) => kind === "body_outcome") &&
+            snapshot.goals.some(
+              ({ ownerProposalId: linkedProposalId, status }) =>
+                linkedProposalId === ownerProposalRef.current &&
+                status === "active",
+            );
+        }
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+          ...(isInitialDecision && ownerProposalRef.current !== undefined
+            ? {
+                proposalResolution: {
+                  proposalId: ownerProposalRef.current,
+                  disposition: "adopted" as const,
+                  resolution: "The owner meal intent remains active.",
+                },
+              }
+            : {}),
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          fixture.mind.consumeEvents(events.map(({ id }) => id));
+        }
+        if (!isInitialDecision) alternativeAccepted = saved.accepted;
+        return { accepted: saved.accepted, decision };
+      },
+    });
+    runtimeRef.current = fixture.runtime;
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the available bread",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    ownerProposalRef.current = proposal.id;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("failed");
+      await waitFor(() => fixture.body.started.length === 2);
+
+      expect(thoughtCount).toBe(2);
+      expect(failureContextPreserved).toBe(true);
+      expect(alternativeAccepted).toBe(true);
+      expect(fixture.body.started).toEqual(["consume", "look"]);
+      expect(fixture.runtime.snapshot.lastOutcome).toMatchObject({
+        kind: "consume",
+        status: "failed",
+      });
+      expect(fixture.runtime.snapshot.goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
+      expect(fixture.body.maxConcurrent).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("keeps an owner stop latched when a consume result settles late", async () => {
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const ownerProposalRef: { current?: string } = {};
+    let purposeCalls = 0;
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        purposeCalls += 1;
+        const decision = action(`meal-attempt-${purposeCalls}`, {
+          kind: "consume",
+          item: "bread",
+        });
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+          ...(purposeCalls === 1 && ownerProposalRef.current !== undefined
+            ? {
+                proposalResolution: {
+                  proposalId: ownerProposalRef.current,
+                  disposition: "adopted" as const,
+                  resolution: "The owner meal intent is being handled.",
+                },
+              }
+            : {}),
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          fixture.mind.consumeEvents(events.map(({ id }) => id));
+        }
+        return { accepted: saved.accepted, decision };
+      },
+    });
+    runtimeRef.current = fixture.runtime;
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the available bread",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    ownerProposalRef.current = proposal.id;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+
+      fixture.runtime.receiveChat("owner", "止まれ");
+      await waitFor(() => fixture.runtime.snapshot.stopped);
+      // DeferredBody settles the aborted operation after a short delay.
+      await waitFor(
+        () => fixture.body.results.length === 1 && fixture.body.stopCalls > 0,
+      );
+      await waitFor(() => fixture.messages.length === 1);
+
+      expect(fixture.body.results[0]).toMatchObject({
+        operation: { kind: "consume" },
+        status: "interrupted",
+      });
+      expect(fixture.runtime.snapshot.lastOutcome).toMatchObject({
+        kind: "consume",
+        status: "interrupted",
+      });
+      expect(fixture.runtime.snapshot.stopped).toBe(true);
+      expect(purposeCalls).toBe(1);
+      expect(fixture.body.started).toEqual(["consume"]);
+      expect(fixture.messages).toEqual([
+        "自律行動を停止しました。再開の指示があるまで停止を続けます。",
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("suppresses a delayed owner proposal response after the stop latch is set", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -2203,7 +2356,7 @@ function createMemoryPort(): PlayerMemoryPort {
   };
 }
 
-function createRuntimeFixture() {
+function createRuntimeFixture(purpose?: PlayerPurposePort) {
   const directory = temporaryDirectory();
   const databasePath = join(directory, "player.sqlite");
   const mind = PlayerMindStore.open(databasePath);
@@ -2221,7 +2374,7 @@ function createRuntimeFixture() {
       nextTurn: () => 1,
       handleOwnerMessage: async () => undefined,
     },
-    purpose: { think: async () => ({ accepted: false }) },
+    purpose: purpose ?? { think: async () => ({ accepted: false }) },
     logger: pino({ level: "silent" }),
     say: async (message) => {
       messages.push(message);
