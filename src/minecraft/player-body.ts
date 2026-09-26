@@ -67,7 +67,11 @@ const digServerUpdateGraceMs = 5_000;
 const placeServerUpdateGraceMs = 5_000;
 const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
-const itemCollectionGoalRange = 0.75;
+// GoalNear evaluates floored block nodes; radius one includes adjacent nodes as goals.
+const itemCollectionGoalRange = 1;
+const itemCollectionPickupDistance = 1.25;
+// Allow a bobbing item a short observation window after a path goal is reached.
+const itemCollectionPickupGraceMs = 2_500;
 const maximumItemCollectionTimeoutMs = 45_000;
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
@@ -136,6 +140,7 @@ export type PlayerItemCollectionOutcome =
   | "target_unobservable"
   | "invalid_target"
   | "path_failed"
+  | "pickup_out_of_range"
   | "deadline_expired";
 
 export interface PlayerOperationResult {
@@ -2112,6 +2117,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     let pathPromise: Promise<void> | undefined;
     let pathTargetKey: string | undefined;
     let settledTargetKey: string | undefined;
+    let settledTargetSince: number | undefined;
     let pathFailurePromise: Promise<never> | undefined;
     let rejectPathFailure: ((error: ItemCollectionError) => void) | undefined;
     const onPathUpdate = (results: {
@@ -2210,7 +2216,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         ).distanceTo(
           new Vec3(targetPosition.x, targetPosition.y, targetPosition.z),
         );
-        if (distance <= 1.25) {
+        if (distance <= itemCollectionPickupDistance) {
           await stopPath();
           await waitForItemCollectionPoll(signal);
           continue;
@@ -2221,12 +2227,22 @@ export class MineflayerPlayerBody implements PlayerBody {
           await stopPath();
 
         if (pathPromise === undefined && settledTargetKey === targetKey) {
-          await waitForItemCollectionPoll(signal);
-          continue;
+          if (
+            settledTargetSince !== undefined &&
+            Date.now() - settledTargetSince < itemCollectionPickupGraceMs
+          ) {
+            await waitForItemCollectionPoll(signal);
+            continue;
+          }
+          throw new ItemCollectionError(
+            "pickup_out_of_range",
+            "The pathfinder reached a nearby block, but the visible item remained outside pickup range.",
+          );
         }
 
         if (pathPromise === undefined) {
           settledTargetKey = undefined;
+          settledTargetSince = undefined;
           pathTargetKey = targetKey;
           pathFailurePromise = new Promise<never>((_resolve, reject) => {
             rejectPathFailure = reject;
@@ -2260,6 +2276,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         ]).then((result) => {
           if (result === "goal_reached") {
             settledTargetKey = pathTargetKey;
+            settledTargetSince = Date.now();
             pathPromise = undefined;
             pathTargetKey = undefined;
             pathFailurePromise = undefined;

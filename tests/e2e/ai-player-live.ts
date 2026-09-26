@@ -6555,6 +6555,8 @@ async function runUnknownReturnPathProbe(
       incomplete("RETURN_PATH_PROBE_TARGET_ENTITY_REMOVED");
     if (collectionResult.itemCollectionOutcome === "invalid_target")
       incomplete("RETURN_PATH_PROBE_VISIBLE_ITEM_KIND_REJECTED");
+    if (collectionResult.itemCollectionOutcome === "pickup_out_of_range")
+      incomplete("RETURN_PATH_PROBE_ITEM_PICKUP_OUT_OF_RANGE");
     if (collectionResult.itemCollectionOutcome === "path_failed")
       incomplete("RETURN_PATH_PROBE_ITEM_PATH_FAILED");
     if (collectionResult.itemCollectionOutcome === "deadline_expired")

@@ -575,10 +575,11 @@ describe("player body", () => {
 
   it("follows a currently visible item entity and confirms pickup by entity ID", async () => {
     const fake = makeFakeBot();
-    const item = addItemEntity(fake.bot);
+    const item = addItemEntity(fake.bot, 2, new Vec3(0.25, 65.5, -5.5));
     const body = new MineflayerPlayerBody(() => fake.bot);
     const goto = vi.spyOn(fake.bot.pathfinder, "goto");
     goto.mockImplementation(async () => {
+      fake.bot.entity.position = new Vec3(0, 65, -6);
       (fake.bot as unknown as EventEmitter).emit(
         "playerCollect",
         fake.bot.entity,
@@ -596,6 +597,12 @@ describe("player body", () => {
       entityId: 2,
     });
     expect(goto).toHaveBeenCalledTimes(1);
+    expect(goto.mock.calls[0]?.[0]).toMatchObject({
+      x: 0,
+      y: 65,
+      z: -6,
+      rangeSq: 1,
+    });
     expect(result.after?.perception.entities).not.toContain(
       expect.objectContaining({ id: 2 }),
     );
@@ -684,6 +691,38 @@ describe("player body", () => {
     expect(result.itemCollectionOutcome).toBeUndefined();
     expect(result.observedEffect).toBeUndefined();
     expect(goto).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a bounded out-of-range result when a nearby goal is reached without pickup", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2, new Vec3(0.99, 64.99, -5.01));
+      await fake.bot.lookAt(item.position);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+      goto.mockImplementation(async () => {
+        fake.bot.entity.position = new Vec3(1, 64, -6);
+        await fake.bot.lookAt(item.position);
+      });
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(2_500);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("failed");
+      expect(result.itemCollectionOutcome).toBe("pickup_out_of_range");
+      expect(result.observedEffect).toBeUndefined();
+      expect(goto).toHaveBeenCalledTimes(1);
+      expect(goto.mock.calls[0]?.[0]).toMatchObject({
+        x: 0,
+        y: 64,
+        z: -6,
+        rangeSq: 1,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
