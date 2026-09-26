@@ -20,6 +20,7 @@ import type {
 } from "../../src/player/contracts.js";
 import {
   compactSnapshot,
+  PlayerConversationAgent,
   PlayerPurposeAgent,
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
@@ -36,6 +37,155 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("carries bounded owner chat context into a short follow-up proposal", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const memory = createMemoryPort();
+    const messages: string[] = [];
+    let proposalWakeups = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory,
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => {
+        proposalWakeups += 1;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const priorFoodMessage = "I have cooked pork chops in my inventory.";
+    const followUp = "Eat one now, please.";
+    fixture.responses.push(terminalResponse("I can check what is available."));
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: priorFoodMessage,
+        turn: conversation.nextTurn(),
+      });
+
+      fixture.responses.push(
+        functionCallResponse("meal-proposal", "propose_goal_change", {
+          title: "Eat one of the foods the owner mentioned",
+          reason:
+            "The owner is now asking me to eat one of the foods from the recent conversation.",
+          priority: 3,
+        }),
+        terminalResponse("I will consider that alongside my current state."),
+      );
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: followUp,
+        turn: conversation.nextTurn(),
+      });
+
+      const secondRequest = record(fixture.requests[1]);
+      expect(JSON.stringify(secondRequest.input)).toContain(priorFoodMessage);
+      expect(JSON.stringify(secondRequest.input)).toContain(followUp);
+      expect(JSON.stringify(secondRequest.input)).toContain(
+        "I can check what is available.",
+      );
+      expect(String(secondRequest.instructions)).toContain(
+        "直近4件までのowner会話",
+      );
+      expect(String(secondRequest.instructions)).toContain(
+        "質問、否定、引用、他者を対象にした発話",
+      );
+      expect(proposalWakeups).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Eat one of the foods the owner mentioned",
+          status: "pending",
+        }),
+      );
+      expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
+      expect(messages).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not turn guest chat or a prior request into current owner authorization", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      terminalResponse("I understand that you have bread."),
+      terminalResponse("That sounds like a question about your guest."),
+      terminalResponse("I will wait until you ask me to do something."),
+      terminalResponse("I will not act on the earlier request by itself."),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "I have bread in my inventory.",
+        turn: conversation.nextTurn(),
+      });
+      await conversation.handleOwnerMessage({
+        username: "guest",
+        message: "Please eat the bread.",
+        turn: conversation.nextTurn(),
+      });
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Should my guest eat it?",
+        turn: conversation.nextTurn(),
+      });
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Do not eat it yet.",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(3);
+      const lastRequest = record(fixture.requests[2]);
+      expect(JSON.stringify(lastRequest.input)).toContain(
+        "I have bread in my inventory.",
+      );
+      expect(JSON.stringify(lastRequest.input)).toContain("Do not eat it yet.");
+      expect(JSON.stringify(lastRequest.input)).not.toContain(
+        "Please eat the bread.",
+      );
+      expect(JSON.stringify(lastRequest.tools)).toContain(
+        "propose_goal_change",
+      );
+      expect(fixture.mind.snapshot().proposals).toHaveLength(0);
+
+      fixture.mind.stop();
+      fixture.responses.push(terminalResponse("Autonomy is still stopped."));
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Is autonomy still stopped?",
+        turn: conversation.nextTurn(),
+      });
+      const afterStopRequest = record(fixture.requests[3]);
+      expect(JSON.stringify(afterStopRequest.input)).not.toContain(
+        "I have bread in my inventory.",
+      );
+      expect(fixture.mind.snapshot().stopped).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("keeps a compromised owner intent after a self subgoal completes", async () => {
     const persistedGoalSnapshots: (readonly PlayerGoal[])[] = [];
     const memory = createMemoryPort();
@@ -588,6 +738,15 @@ function functionCallResponse(
       },
     ],
     output_text: "",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  } as unknown as Response;
+}
+
+function terminalResponse(outputText: string): Response {
+  return {
+    status: "completed",
+    output: [],
+    output_text: outputText,
     usage: { input_tokens: 1, output_tokens: 1 },
   } as unknown as Response;
 }
