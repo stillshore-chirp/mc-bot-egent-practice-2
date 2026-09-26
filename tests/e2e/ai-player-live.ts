@@ -183,6 +183,7 @@ const CASE_BUDGETS = {
   },
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
+  food_intent_continuity: { llmCalls: 12, totalTokens: 100_000 },
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -196,6 +197,7 @@ const CASE_DEADLINES = {
   skill_compactness_and_knowledge_separation: 30_000,
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
+  food_intent_continuity: 8 * 60_000,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -3627,24 +3629,26 @@ async function main(): Promise<void> {
       },
     );
 
-    const beforeDiscretionHandoff = playerOf(
-      await collect(requireLiveContext().runtime.app),
-    );
-    const pendingBeforeDiscretion = new Set(
-      beforeDiscretionHandoff.proposals
-        .filter(({ status }) => status === "pending")
-        .map(({ id }) => id),
-    );
-    state.gameActionPriorPendingProposalCount = pendingBeforeDiscretion.size;
-    state.gameActionPriorProposalsSettled =
-      pendingBeforeDiscretion.size === 0 ||
-      (await observeForPlayer(requireLiveContext(), 45_000, (player) =>
-        [...pendingBeforeDiscretion].every((id) =>
-          player.proposals.some(
-            (proposal) => proposal.id === id && proposal.status !== "pending",
+    if (isCaseSelectedForTarget(state.targetCase, "game_action_discretion")) {
+      const beforeDiscretionHandoff = playerOf(
+        await collect(requireLiveContext().runtime.app),
+      );
+      const pendingBeforeDiscretion = new Set(
+        beforeDiscretionHandoff.proposals
+          .filter(({ status }) => status === "pending")
+          .map(({ id }) => id),
+      );
+      state.gameActionPriorPendingProposalCount = pendingBeforeDiscretion.size;
+      state.gameActionPriorProposalsSettled =
+        pendingBeforeDiscretion.size === 0 ||
+        (await observeForPlayer(requireLiveContext(), 45_000, (player) =>
+          [...pendingBeforeDiscretion].every((id) =>
+            player.proposals.some(
+              (proposal) => proposal.id === id && proposal.status !== "pending",
+            ),
           ),
-        ),
-      )) !== undefined;
+        )) !== undefined;
+    }
 
     let activeBuildingFixture: BuildingFixture | undefined;
     const discretionResult = await recordCase(
@@ -3793,6 +3797,261 @@ async function main(): Promise<void> {
         activeBuildingFixture = undefined;
       }
     });
+
+    const foodResult = await recordCase(
+      state,
+      "food_intent_continuity",
+      CASE_DEADLINES.food_intent_continuity,
+      requireLiveContext(),
+      async (context) => {
+        let hungerEffectMayBeActive = false;
+        try {
+          await rcon.command(`clear ${context.botName} minecraft:bread`);
+          const initialFood = await rconFoodLevel(rcon, context.botName);
+          if (initialFood !== 20)
+            incomplete("FOOD_INTENT_INITIAL_FULL_STATE_NOT_CONFIRMED");
+
+          await rcon.command(
+            `effect give ${context.botName} minecraft:hunger 120 8 true`,
+          );
+          hungerEffectMayBeActive = true;
+          if (!(await rconHasActiveHungerEffect(rcon, context.botName)))
+            incomplete("FOOD_INTENT_HUNGER_EFFECT_NOT_CONFIRMED");
+
+          const hungerDeadline = Date.now() + 60_000;
+          let hungerPrepared = false;
+          while (Date.now() < hungerDeadline) {
+            const observedFood = await rconFoodLevel(rcon, context.botName);
+            if (observedFood < initialFood) {
+              if (observedFood < 15 || observedFood > 19)
+                incomplete("FOOD_INTENT_SAFE_HUNGER_RANGE_NOT_CONFIRMED");
+              hungerPrepared = true;
+              break;
+            }
+            await waitMs(500);
+          }
+          if (!hungerPrepared)
+            incomplete("FOOD_INTENT_HUNGER_PREPARATION_DEADLINE");
+
+          await rcon.command(
+            `effect clear ${context.botName} minecraft:hunger`,
+          );
+          if (await rconHasActiveHungerEffect(rcon, context.botName))
+            incomplete("FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+          hungerEffectMayBeActive = false;
+
+          const foodBefore = await rconFoodLevel(rcon, context.botName);
+          if (foodBefore < 15 || foodBefore > 19)
+            incomplete("FOOD_INTENT_SAFE_HUNGER_RANGE_NOT_CONFIRMED");
+          await rcon.command(`give ${context.botName} minecraft:bread 1`);
+          const breadBefore = await rconInventoryItemCount(
+            rcon,
+            context.botName,
+            "bread",
+          );
+          if (breadBefore !== 1)
+            incomplete("FOOD_INTENT_CARRIED_BREAD_NOT_CONFIRMED");
+
+          const referenceResponseStart = context.responseQueue.length;
+          sendChat(
+            context.owner,
+            "Bot自身がパンを一つ持っているのを確認しました。まず返事だけください。",
+          );
+          const referenceTurn = await observeForPlayer(
+            context,
+            45_000,
+            () => context.responseQueue.length > referenceResponseStart,
+          );
+          if (referenceTurn === undefined)
+            incomplete("FOOD_INTENT_REFERENCE_TURN_UNOBSERVED");
+          const beforeFollowup = playerOf(await collect(context.runtime.app));
+          const breadBeforeFollowup = await rconInventoryItemCount(
+            rcon,
+            context.botName,
+            "bread",
+          );
+          const foodBeforeFollowup = await rconFoodLevel(rcon, context.botName);
+          if (
+            breadBeforeFollowup !== breadBefore ||
+            foodBeforeFollowup !== foodBefore
+          )
+            incomplete("FOOD_INTENT_FIXTURE_CHANGED_BEFORE_FOLLOWUP");
+
+          const purposeDecisionObservedSince = (
+            before: PlayerEvidence,
+            player: PlayerEvidence,
+          ): boolean => {
+            const previousRounds = new Set(
+              (before.recentAgentActivity ?? []).map(
+                (activity) => `${activity.runSequence}:${activity.round}`,
+              ),
+            );
+            return (player.recentAgentActivity ?? []).some(
+              (activity) =>
+                activity.role === "purpose" &&
+                !previousRounds.has(
+                  `${activity.runSequence}:${activity.round}`,
+                ) &&
+                activity.toolCalls.some(
+                  (toolCall) =>
+                    toolCall.name === "commit_action_decision" &&
+                    toolCall.resultClass === "ok",
+                ),
+            );
+          };
+          const purposeWaitDecisionObservedSince = (
+            before: PlayerEvidence,
+            player: PlayerEvidence,
+          ): boolean => {
+            const previousJudgments = new Set(
+              before.recentJudgments.map(
+                (judgment) =>
+                  `${judgment.decidedAt ?? ""}:${judgment.kind ?? ""}:${judgment.operationKind ?? ""}`,
+              ),
+            );
+            return player.recentJudgments.some(
+              (judgment) =>
+                !previousJudgments.has(
+                  `${judgment.decidedAt ?? ""}:${judgment.kind ?? ""}:${judgment.operationKind ?? ""}`,
+                ) &&
+                (judgment.kind === "wait" || judgment.kind === "complete"),
+            );
+          };
+
+          const followupResponseStart = context.responseQueue.length;
+          sendChat(
+            context.owner,
+            "じゃあ、そのパンを食べて昼食にしてください。",
+          );
+          const decided = await waitForPlayer(context, 150_000, (player) => {
+            const consumeObserved = newOutcomes(beforeFollowup, player).some(
+              (outcome) => outcome.kind === "consume",
+            );
+            const conditionExplained = context.responseQueue
+              .slice(followupResponseStart)
+              .some(({ text }) => explainsFullHunger(text));
+            return (
+              purposeDecisionObservedSince(beforeFollowup, player) &&
+              (consumeObserved || conditionExplained)
+            );
+          });
+          if (!purposeDecisionObservedSince(beforeFollowup, decided))
+            incomplete("FOOD_INTENT_PURPOSE_DECISION_NOT_CONFIRMED");
+          const consumeOutcome = newOutcomes(beforeFollowup, decided).find(
+            (outcome) => outcome.kind === "consume",
+          );
+          if (consumeOutcome === undefined)
+            fail("FOOD_INTENT_HUNGRY_FOLLOWUP_DID_NOT_CONSUME");
+          if (consumeOutcome.status !== "successful")
+            fail("FOOD_INTENT_CONSUME_NOT_SUCCESSFUL");
+
+          const breadAfter = await rconInventoryItemCount(
+            rcon,
+            context.botName,
+            "bread",
+          );
+          const foodAfter = await rconFoodLevel(rcon, context.botName);
+          if (breadAfter !== breadBefore - 1 || foodAfter <= foodBefore)
+            fail("FOOD_INTENT_CONSUME_ORACLE_MISMATCH");
+          if (foodAfter !== 20)
+            fail("FOOD_INTENT_POST_CONSUME_FULL_STATE_NOT_CONFIRMED");
+
+          await rcon.command(`give ${context.botName} minecraft:bread 1`);
+          const fullStageBread = await rconInventoryItemCount(
+            rcon,
+            context.botName,
+            "bread",
+          );
+          const fullStageFood = await rconFoodLevel(rcon, context.botName);
+          if (fullStageBread !== 1 || fullStageFood !== 20)
+            incomplete("FOOD_INTENT_FULL_STAGE_FIXTURE_NOT_CONFIRMED");
+
+          const beforeFullStage = playerOf(await collect(context.runtime.app));
+          const fullResponseStart = context.responseQueue.length;
+          sendChat(context.owner, "もう一つのパンを食べてください。");
+          const fullDecision = await waitForPlayer(
+            context,
+            90_000,
+            (player) => {
+              const conditionExplained = context.responseQueue
+                .slice(fullResponseStart)
+                .some(({ text }) => explainsFullHunger(text));
+              const consumeObserved = newOutcomes(beforeFullStage, player).some(
+                (outcome) => outcome.kind === "consume",
+              );
+              return (
+                purposeDecisionObservedSince(beforeFullStage, player) &&
+                (consumeObserved ||
+                  (conditionExplained &&
+                    purposeWaitDecisionObservedSince(beforeFullStage, player)))
+              );
+            },
+          );
+          if (!purposeDecisionObservedSince(beforeFullStage, fullDecision))
+            incomplete("FOOD_INTENT_FULL_STAGE_PURPOSE_NOT_CONFIRMED");
+          if (
+            newOutcomes(beforeFullStage, fullDecision).some(
+              (outcome) => outcome.kind === "consume",
+            )
+          )
+            fail("FOOD_INTENT_FULL_HUNGER_SELECTED_CONSUME");
+          if (
+            !purposeWaitDecisionObservedSince(beforeFullStage, fullDecision) ||
+            !context.responseQueue
+              .slice(fullResponseStart)
+              .some(({ text }) => explainsFullHunger(text))
+          )
+            incomplete("FOOD_INTENT_FULL_HUNGER_EXPLANATION_NOT_CONFIRMED");
+
+          const fullStageBreadAfter = await rconInventoryItemCount(
+            rcon,
+            context.botName,
+            "bread",
+          );
+          const fullStageFoodAfter = await rconFoodLevel(rcon, context.botName);
+          if (
+            fullStageBreadAfter !== fullStageBread ||
+            fullStageFoodAfter !== fullStageFood
+          )
+            fail("FOOD_INTENT_FULL_HUNGER_SERVER_STATE_CHANGED");
+          return {
+            hungerPreparedWithServerEffect: true,
+            carriedBreadConfirmed: true,
+            ownerReferenceTurnObserved: true,
+            ownerFollowupObserved: true,
+            purposeDecisionCommitted: true,
+            selectedConsume: true,
+            serverInventoryDecrementConfirmed: true,
+            serverHungerIncreaseConfirmed: true,
+            fullHungerExplanationReceived: true,
+            fullHungerWaitDecisionConfirmed: true,
+            fullHungerInventoryUnchangedConfirmed: true,
+            fullHungerLevelUnchangedConfirmed: true,
+          };
+        } finally {
+          if (hungerEffectMayBeActive) {
+            let effectClearConfirmed: boolean;
+            try {
+              await rcon.command(
+                `effect clear ${context.botName} minecraft:hunger`,
+              );
+              effectClearConfirmed = !(await rconHasActiveHungerEffect(
+                rcon,
+                context.botName,
+              ));
+            } catch {
+              effectClearConfirmed = false;
+            }
+            if (!effectClearConfirmed) {
+              state.abortRequested = true;
+              state.failureCode ??=
+                "FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED";
+              incomplete("FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+            }
+          }
+        }
+      },
+    );
 
     const unknownResult = await recordCase(
       state,
@@ -5089,6 +5348,7 @@ async function main(): Promise<void> {
           skillQualityResult,
           exchangeResult,
           discretionResult,
+          foodResult,
           parallelResult,
           operationSmokeResult,
         ];
@@ -7124,6 +7384,54 @@ async function rconInventoryHasBlueWool(
   return /minecraft:blue_wool/iu.test(inventory);
 }
 
+async function rconInventoryItemCount(
+  rcon: LocalRcon,
+  botName: string,
+  item: "bread",
+): Promise<number> {
+  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  const itemId = new RegExp(`\\bid\\s*:\\s*["']minecraft:${item}["']`, "u");
+  let count = 0;
+  for (const stack of inventory.matchAll(/\{[^{}]*\}/gu)) {
+    if (!itemId.test(stack[0])) continue;
+    const stackCount = /\b(?:count|Count)\s*:\s*(\d+)(?:[bBsSlL])?\b/u.exec(
+      stack[0],
+    );
+    if (stackCount === null)
+      incomplete("FOOD_INTENT_INVENTORY_COUNT_UNAVAILABLE");
+    count += Number(stackCount[1]);
+  }
+  return count;
+}
+
+async function rconFoodLevel(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<number> {
+  const reply = await rcon.command(`data get entity ${botName} foodLevel`);
+  const match = /(?:^|:\s*)(\d+)(?:[bBsSlL])?\s*$/u.exec(reply.trim());
+  const foodLevel = match === null ? Number.NaN : Number(match[1]);
+  if (!Number.isInteger(foodLevel) || foodLevel < 0 || foodLevel > 20)
+    incomplete("FOOD_INTENT_FOOD_LEVEL_UNAVAILABLE");
+  return foodLevel;
+}
+
+async function rconHasActiveHungerEffect(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<boolean> {
+  const activeEffects = await rcon.command(
+    `data get entity ${botName} active_effects`,
+  );
+  return /\bid\s*:\s*["']minecraft:hunger["']/iu.test(activeEffects);
+}
+
+function explainsFullHunger(text: string): boolean {
+  return /満腹|お腹.{0,10}(?:いっぱい|空いていない|空いてない)|空腹.{0,10}(?:ではない|じゃない)|食べる必要.{0,8}ない|(?:food|hunger).{0,16}(?:full|not hungry)|not hungry|cannot eat|can't eat/iu.test(
+    text,
+  );
+}
+
 async function rconBlueWoolDropPositionNear(
   rcon: LocalRcon,
   target: BlockPosition,
@@ -7527,7 +7835,7 @@ async function runCase(
   let caseExecuted = false;
   try {
     if (!shouldCollectAfterRun(state))
-      incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
+      incomplete(state.failureCode ?? "RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
     const dependencyFailure = unknownHandoffCaseBlockCode(
       id,
       state.unknownHandoffDependency ?? "not_started",
