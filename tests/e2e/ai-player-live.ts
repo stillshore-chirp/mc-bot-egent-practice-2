@@ -96,6 +96,7 @@ import {
 } from "./unknown-task-progress.js";
 import {
   inspectPersistentMemoryProgress,
+  maxAgentActivityRunSequence,
   type PersistentMemoryProgress,
 } from "./persistent-memory-diagnostic.js";
 import {
@@ -2746,8 +2747,9 @@ async function main(): Promise<void> {
         const beforeResponses = context.responseQueue.length;
         const durableFact = "maple-47";
         const beforeMemory = playerOf(await collect(context.runtime.app));
-        const afterRunSequence =
-          beforeMemory.recentAgentActivity?.at(-1)?.runSequence ?? 0;
+        const afterRunSequence = maxAgentActivityRunSequence(
+          beforeMemory.recentAgentActivity ?? [],
+        );
         state.persistentMemoryDiagnostic = {
           stage: "request_sent",
           ownerReplyObserved: false,
@@ -2755,13 +2757,15 @@ async function main(): Promise<void> {
           rememberToolResult: "none",
           factPersisted: false,
         };
+        const requestSentAt = Date.now();
         sendChat(
           context.owner,
           `次のセッションでも覚えておいてください。合成テスト用の合言葉は「${durableFact}」です。私から教わった事実として記録してください。`,
         );
         await waitForPlayer(context, 120_000, (player) => {
-          const ownerReplyObserved =
-            context.responseQueue.length > beforeResponses;
+          const ownerReplyObserved = context.responseQueue
+            .slice(beforeResponses)
+            .some(({ at }) => at >= requestSentAt);
           const factPersisted = readDbContainsOwnerFact(
             state.databasePath,
             durableFact,

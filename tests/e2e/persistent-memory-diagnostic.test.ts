@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { PlayerAgentRoundActivity } from "../../src/player/responses.js";
-import { inspectPersistentMemoryProgress } from "./persistent-memory-diagnostic.js";
+import {
+  inspectPersistentMemoryProgress,
+  maxAgentActivityRunSequence,
+} from "./persistent-memory-diagnostic.js";
 
 function activity(input: {
   readonly runSequence: number;
@@ -30,6 +33,25 @@ function activity(input: {
 }
 
 describe("persistent memory diagnostics", () => {
+  it("uses the maximum run sequence when activity completion order is out of order", () => {
+    const activityInCompletionOrder = [
+      activity({ runSequence: 6 }),
+      activity({ runSequence: 5 }),
+    ];
+
+    expect(maxAgentActivityRunSequence(activityInCompletionOrder)).toBe(6);
+    expect(
+      inspectPersistentMemoryProgress({
+        activity: activityInCompletionOrder,
+        afterRunSequence: maxAgentActivityRunSequence(
+          activityInCompletionOrder,
+        ),
+        ownerReplyObserved: false,
+        factPersisted: false,
+      }).stage,
+    ).toBe("waiting_for_conversation");
+  });
+
   it("identifies a completed owner reply that never called the save tool", () => {
     const result = inspectPersistentMemoryProgress({
       activity: [activity({ runSequence: 2 })],
@@ -46,6 +68,24 @@ describe("persistent memory diagnostics", () => {
       factPersisted: false,
     });
     expect(result).not.toHaveProperty("runSequence");
+  });
+
+  it("waits for the request's owner reply before declaring a completed reply omitted the tool", () => {
+    const withoutReply = inspectPersistentMemoryProgress({
+      activity: [activity({ runSequence: 2 })],
+      afterRunSequence: 1,
+      ownerReplyObserved: false,
+      factPersisted: false,
+    });
+    const withReply = inspectPersistentMemoryProgress({
+      activity: [activity({ runSequence: 2 })],
+      afterRunSequence: 1,
+      ownerReplyObserved: true,
+      factPersisted: false,
+    });
+
+    expect(withoutReply.stage).toBe("conversation_in_progress");
+    expect(withReply.stage).toBe("conversation_finished_without_save_tool");
   });
 
   it("keeps pending replies in progress and distinguishes a rejected save", () => {

@@ -20,6 +20,15 @@ export interface PersistentMemoryProgress {
   readonly factPersisted: boolean;
 }
 
+export function maxAgentActivityRunSequence(
+  activity: readonly PlayerAgentRoundActivity[],
+): number {
+  return activity.reduce(
+    (maximum, item) => Math.max(maximum, item.runSequence),
+    0,
+  );
+}
+
 export function inspectPersistentMemoryProgress(input: {
   readonly activity: readonly PlayerAgentRoundActivity[];
   readonly afterRunSequence: number;
@@ -49,9 +58,17 @@ export function inspectPersistentMemoryProgress(input: {
     rememberToolResult === "error"
   ) {
     stage = "save_tool_rejected";
-  } else if (conversationFinished && rememberTools.length === 0) {
+  } else if (
+    input.ownerReplyObserved &&
+    conversationFinished &&
+    rememberTools.length === 0
+  ) {
     stage = "conversation_finished_without_save_tool";
-  } else if (conversationFinished && rememberTools.length > 0) {
+  } else if (
+    input.ownerReplyObserved &&
+    conversationFinished &&
+    rememberTools.length > 0
+  ) {
     stage = "save_tool_not_verified";
   } else if (conversationActivity.length > 0) {
     stage = "conversation_in_progress";
