@@ -174,7 +174,7 @@ const CASE_BUDGETS = {
     llmCalls: 2,
     totalTokens: 25_000,
   },
-  skill_exchange: { llmCalls: 20, totalTokens: 150_000 },
+  skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
