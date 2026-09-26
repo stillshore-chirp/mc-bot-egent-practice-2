@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { Vec3 } from "vec3";
 import { describe, expect, it, vi } from "vitest";
 import type { Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
 import type { Window } from "prismarine-windows";
 import {
   MineflayerPlayerBody,
@@ -37,6 +38,30 @@ function makeBlock(name: string, stateId: number, position: Vec3): FakeBlock {
 
 function pathUpdateListenerCount(bot: Bot): number {
   return (bot as unknown as EventEmitter).listenerCount("path_update");
+}
+
+function addItemEntity(
+  bot: Bot,
+  id = 2,
+  position = new Vec3(0, 64, -5),
+): Entity {
+  const item = {
+    id,
+    name: "item",
+    type: "object",
+    position,
+    velocity: new Vec3(0, 0, 0),
+    yaw: 0,
+    pitch: 0,
+    height: 0.25,
+    metadata: [],
+  } as unknown as Entity;
+  (bot.entities as Record<number, Entity>)[id] = item;
+  return item;
+}
+
+function removeItemEntity(bot: Bot, id: number): void {
+  Reflect.deleteProperty(bot.entities, id);
 }
 
 function makeWindow(id = 3): Window & EventEmitter {
@@ -453,7 +478,7 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
 
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
-    expect(playerOperationNames).toHaveLength(30);
+    expect(playerOperationNames).toHaveLength(31);
     expect(Object.keys(playerOperationDescriptions).sort()).toEqual(
       [...playerOperationNames].sort(),
     );
@@ -462,6 +487,7 @@ describe("player body", () => {
     expect(playerOperationNames).toContain("look_sweep");
     expect(playerOperationNames).toContain("window_transfer");
     expect(playerOperationNames).toContain("elytra_fly");
+    expect(playerOperationNames).toContain("collect_item");
     expect(playerOperationSchema.parse({ kind: "look_sweep" })).toEqual({
       kind: "look_sweep",
     });
@@ -539,6 +565,209 @@ describe("player body", () => {
       kind: "use",
       target: { kind: "item", holdTicks: 200 },
     });
+    expect(
+      playerOperationSchema.parse({ kind: "collect_item", entityId: 2 }),
+    ).toEqual({ kind: "collect_item", entityId: 2 });
+    expect(() =>
+      playerOperationSchema.parse({ kind: "collect_item", entityId: 0 }),
+    ).toThrow();
+  });
+
+  it("follows a currently visible item entity and confirms pickup by entity ID", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+    goto.mockImplementation(async () => {
+      (fake.bot as unknown as EventEmitter).emit(
+        "playerCollect",
+        fake.bot.entity,
+        item,
+      );
+      removeItemEntity(fake.bot, item.id);
+    });
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("successful");
+    expect(result.itemCollectionOutcome).toBe("collected");
+    expect(result.observedEffect).toEqual({
+      type: "item_collected",
+      entityId: 2,
+    });
+    expect(goto).toHaveBeenCalledTimes(1);
+    expect(result.after?.perception.entities).not.toContain(
+      expect.objectContaining({ id: 2 }),
+    );
+  });
+
+  it("updates pursuit from a newly observed item position", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    let cancelFirstPath: (() => void) | undefined;
+    const followPositions: { x: number; y: number; z: number }[] = [];
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+    goto
+      .mockImplementationOnce(() => {
+        followPositions.push({
+          x: item.position.x,
+          y: item.position.y,
+          z: item.position.z,
+        });
+        return new Promise<void>((_resolve, reject) => {
+          cancelFirstPath = () => reject(new Error("Goal changed"));
+          item.position = new Vec3(0, 64, -7);
+        });
+      })
+      .mockImplementationOnce(async () => {
+        followPositions.push({
+          x: item.position.x,
+          y: item.position.y,
+          z: item.position.z,
+        });
+        (fake.bot as unknown as EventEmitter).emit(
+          "playerCollect",
+          fake.bot.entity,
+          item,
+        );
+        removeItemEntity(fake.bot, item.id);
+      });
+    const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+    setGoal.mockImplementation((goal) => {
+      if (goal === null) cancelFirstPath?.();
+    });
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("successful");
+    expect(result.itemCollectionOutcome).toBe("collected");
+    expect(followPositions).toEqual([
+      { x: 0, y: 64, z: -5 },
+      { x: 0, y: 64, z: -7 },
+    ]);
+  });
+
+  it("does not report success from path arrival without an observed pickup", async () => {
+    const fake = makeFakeBot();
+    addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+    goto.mockResolvedValue(undefined);
+    const abortTimer = setTimeout(
+      () => controller.abort(new Error("test stop")),
+      10,
+    );
+
+    const result = await body.execute(
+      { kind: "collect_item", entityId: 2 },
+      controller.signal,
+    );
+    clearTimeout(abortTimer);
+
+    expect(result.status).toBe("interrupted");
+    expect(result.itemCollectionOutcome).toBeUndefined();
+    expect(result.observedEffect).toBeUndefined();
+    expect(goto).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    let cancelPath: (() => void) | undefined;
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+          fake.bot.entity.yaw = Math.PI / 2;
+          item.position = new Vec3(0, 64, -12);
+        }),
+    );
+    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("failed");
+    expect(result.itemCollectionOutcome).toBe("target_unobservable");
+    expect(result.after?.perception.entities).not.toContain(
+      expect.objectContaining({ id: 2 }),
+    );
+    expect(result.detail).toContain("no longer visible");
+  });
+
+  it("distinguishes a removed target from a path failure", async () => {
+    const disappeared = makeFakeBot();
+    const removedItem = addItemEntity(disappeared.bot);
+    let cancelRemovedPath: (() => void) | undefined;
+    vi.spyOn(disappeared.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelRemovedPath = () => reject(new Error("Path stopped"));
+          removeItemEntity(disappeared.bot, removedItem.id);
+        }),
+    );
+    vi.spyOn(disappeared.bot.pathfinder, "setGoal").mockImplementation(
+      (goal) => {
+        if (goal === null) cancelRemovedPath?.();
+      },
+    );
+
+    const removedResult = await new MineflayerPlayerBody(
+      () => disappeared.bot,
+    ).execute({ kind: "collect_item", entityId: 2 });
+
+    expect(removedResult.status).toBe("failed");
+    expect(removedResult.itemCollectionOutcome).toBe("entity_removed");
+
+    const noPath = makeFakeBot();
+    addItemEntity(noPath.bot);
+    vi.spyOn(noPath.bot.pathfinder, "goto").mockRejectedValueOnce(
+      new Error("No path to the goal"),
+    );
+
+    const pathResult = await new MineflayerPlayerBody(() => noPath.bot).execute(
+      {
+        kind: "collect_item",
+        entityId: 2,
+      },
+    );
+
+    expect(pathResult.status).toBe("failed");
+    expect(pathResult.itemCollectionOutcome).toBe("path_failed");
+    expect(pathResult.observedEffect).toBeUndefined();
+  });
+
+  it("stops collection pathfinding when the operation is aborted", async () => {
+    const fake = makeFakeBot();
+    addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    let cancelPath: (() => void) | undefined;
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+        }),
+    );
+    const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+    setGoal.mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+    setTimeout(() => controller.abort(new Error("test stop")), 10);
+
+    const result = await body.execute(
+      { kind: "collect_item", entityId: 2 },
+      controller.signal,
+    );
+
+    expect(result.status).toBe("interrupted");
+    expect(result.recoveryRequired).toBe(false);
+    expect(setGoal).toHaveBeenCalledWith(null);
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
   it("physically sweeps bounded views and reports blocks found only after turning", async () => {

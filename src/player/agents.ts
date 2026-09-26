@@ -70,6 +70,7 @@ const conciseArgumentHintKinds = new Set<string>([
   "look",
   "move_to",
   "move_relative",
+  "collect_item",
   "dig",
   "place",
 ]);
@@ -169,14 +170,14 @@ function conciseOperationArguments(
           : "";
       return `${name}:string${limits}`;
     }
-    if (property?.type !== "number")
+    if (property?.type !== "number" && property?.type !== "integer")
       throw new Error("PLAYER_OPERATION_ARGUMENT_HINT_UNAVAILABLE");
     const limits =
       typeof property.minimum === "number" &&
       typeof property.maximum === "number"
         ? `[${property.minimum}..${property.maximum}]`
         : "";
-    return `${name}:number${limits}`;
+    return `${name}:${property.type}${limits}`;
   };
   const argumentsToRender =
     kind === "place"

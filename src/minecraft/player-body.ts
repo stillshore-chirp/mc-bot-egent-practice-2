@@ -66,6 +66,9 @@ const minimumDigTimeoutMs = 35_000;
 const digServerUpdateGraceMs = 5_000;
 const placeServerUpdateGraceMs = 5_000;
 const maximumDigTimeoutMs = 5 * 60_000;
+const itemCollectionPollMs = 250;
+const itemCollectionGoalRange = 0.75;
+const maximumItemCollectionTimeoutMs = 45_000;
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -127,6 +130,14 @@ function throwIfAborted(signal: AbortSignal): void {
 export type PlayerOperationStatus =
   "successful" | "failed" | "interrupted" | "unverified";
 
+export type PlayerItemCollectionOutcome =
+  | "collected"
+  | "entity_removed"
+  | "target_unobservable"
+  | "invalid_target"
+  | "path_failed"
+  | "deadline_expired";
+
 export interface PlayerOperationResult {
   readonly operationId: string;
   readonly operation: PlayerOperation;
@@ -137,11 +148,12 @@ export interface PlayerOperationResult {
   readonly after: PlayerBodyObservation | null;
   /** True when cancellation returned boundedly but Mineflayer's underlying action is unresolved. */
   readonly recoveryRequired: boolean;
-  /** Server-observed attack effect. A hit and a confirmed death remain distinct outcomes. */
+  /** Server-observed effect; an attack hit and confirmed death remain distinct. */
   readonly observedEffect?: {
-    readonly type: "entity_hit" | "entity_died";
+    readonly type: "entity_hit" | "entity_died" | "item_collected";
     readonly entityId: number;
   };
+  readonly itemCollectionOutcome?: PlayerItemCollectionOutcome;
   readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly detail?: string;
 }
@@ -254,6 +266,7 @@ interface ActiveOperation {
   fishingCollectedItem?: { readonly name: string; readonly count: number };
   targetHitObserved?: boolean;
   targetDiedObserved?: boolean;
+  itemCollectionOutcome?: PlayerItemCollectionOutcome;
   externalAbort?: () => void;
 }
 
@@ -272,6 +285,19 @@ class ActionTimeoutError extends Error {
   public constructor(timeoutMs: number) {
     super(`Player operation exceeded its ${timeoutMs} ms time limit`);
     this.name = "ActionTimeoutError";
+  }
+}
+
+class ItemCollectionError extends Error {
+  public constructor(
+    public readonly outcome: Exclude<
+      PlayerItemCollectionOutcome,
+      "collected" | "deadline_expired"
+    >,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ItemCollectionError";
   }
 }
 
@@ -335,6 +361,8 @@ function timeoutFor(operation: PlayerOperation, bot: Bot): number {
       return 90_000;
     case "fish":
       return 60_000;
+    case "collect_item":
+      return maximumItemCollectionTimeoutMs;
     case "control":
     case "move_vehicle":
       return Math.min(10_000, operation.ticks * 50 + 3_000);
@@ -363,6 +391,27 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new Error("Player operation interrupted");
+}
+
+function waitForItemCollectionPoll(signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(finish, itemCollectionPollMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function waitForAction<T>(action: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -621,6 +670,21 @@ function captureAttackEvidence(
   };
 }
 
+function captureItemCollectionEvidence(
+  bot: Bot,
+  operation: PlayerOperation,
+  active: ActiveOperation,
+): (() => void) | undefined {
+  if (operation.kind !== "collect_item") return undefined;
+  const targetId = operation.entityId;
+  const onPlayerCollect = (collector: Entity, collected: Entity): void => {
+    if (collector.id === bot.entity.id && collected.id === targetId)
+      active.itemCollectionOutcome = "collected";
+  };
+  bot.on("playerCollect", onPlayerCollect);
+  return () => bot.removeListener("playerCollect", onPlayerCollect);
+}
+
 function operationEvidence(
   bot: Bot,
   operation: PlayerOperation,
@@ -630,6 +694,8 @@ function operationEvidence(
   active: ActiveOperation,
 ): boolean {
   if (operation.kind === "attack") return active.targetHitObserved === true;
+  if (operation.kind === "collect_item")
+    return active.itemCollectionOutcome === "collected";
   if (before === null || after === null) return false;
   const beforePos = before.self.position;
   const afterPos = after.self.position;
@@ -1284,6 +1350,11 @@ export class MineflayerPlayerBody implements PlayerBody {
         ? undefined
         : captureServerBlockUpdates(bot, blockTarget);
     const attackEvidence = captureAttackEvidence(bot, operation, active);
+    const itemCollectionEvidence = captureItemCollectionEvidence(
+      bot,
+      operation,
+      active,
+    );
     let commandError: unknown;
     const timeoutMs = timeoutFor(operation, bot);
     const timer = setTimeout(() => {
@@ -1318,10 +1389,16 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
     } catch (error) {
       commandError = error;
+      if (
+        operation.kind === "collect_item" &&
+        error instanceof ItemCollectionError
+      )
+        active.itemCollectionOutcome = error.outcome;
     } finally {
       clearTimeout(timer);
       blockEvidence?.dispose();
       attackEvidence?.();
+      itemCollectionEvidence?.();
       this.stopStallMonitor(active);
       this.cleanupAction(
         active,
@@ -1353,7 +1430,18 @@ export class MineflayerPlayerBody implements PlayerBody {
                 : ("entity_hit" as const),
             entityId: operation.entityId,
           }
-        : undefined;
+        : operation.kind === "collect_item" &&
+            active.itemCollectionOutcome === "collected"
+          ? {
+              type: "item_collected" as const,
+              entityId: operation.entityId,
+            }
+          : undefined;
+    const itemCollectionOutcome =
+      operation.kind !== "collect_item"
+        ? undefined
+        : (active.itemCollectionOutcome ??
+          (active.timedOut ? "deadline_expired" : undefined));
     let status: PlayerOperationStatus;
     let detail: string;
     if (confirmed) {
@@ -1363,11 +1451,15 @@ export class MineflayerPlayerBody implements PlayerBody {
           ? active.targetDiedObserved === true
             ? "Mineflayer observed this player damage the target and then observed the target die."
             : "Mineflayer observed this player damage the target; target death was not observed."
-          : "Observed post-action state confirms the requested effect.";
+          : operation.kind === "collect_item"
+            ? "Mineflayer observed this player collect the requested item entity."
+            : "Observed post-action state confirms the requested effect.";
     } else if (active.timedOut) {
       status = "unverified";
       detail =
-        "The bounded action wait expired; the requested world effect was not confirmed.";
+        operation.kind === "collect_item"
+          ? "The bounded item collection deadline expired without an observed pickup."
+          : "The bounded action wait expired; the requested world effect was not confirmed.";
     } else if (interrupted) {
       status = "interrupted";
       detail = recoveryRequired
@@ -1393,6 +1485,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       after,
       recoveryRequired,
       ...(observedEffect === undefined ? {} : { observedEffect }),
+      ...(itemCollectionOutcome === undefined ? {} : { itemCollectionOutcome }),
       ...(active.lookSweep === undefined
         ? {}
         : { lookSweep: active.lookSweep }),
@@ -1524,7 +1617,11 @@ export class MineflayerPlayerBody implements PlayerBody {
   ): void {
     const { bot, operation } = active;
     try {
-      if (operation.kind === "move_to" || operation.kind === "move_relative")
+      if (
+        operation.kind === "move_to" ||
+        operation.kind === "move_relative" ||
+        operation.kind === "collect_item"
+      )
         bot.pathfinder.setGoal(null);
       if (operation.kind === "control") bot.clearControlStates();
       if (operation.kind === "move_vehicle") bot.moveVehicle(0, 0);
@@ -1853,6 +1950,9 @@ export class MineflayerPlayerBody implements PlayerBody {
         await bot.toss(item.type, item.metadata, operation.count);
         return;
       }
+      case "collect_item":
+        await this.collectItem(bot, operation.entityId, signal, active);
+        return;
       case "transfer":
         await moveSlotWithClicks(
           bot,
@@ -2000,6 +2100,180 @@ export class MineflayerPlayerBody implements PlayerBody {
         await waitTicks(2, signal);
         return;
       }
+    }
+  }
+
+  private async collectItem(
+    bot: Bot,
+    entityId: number,
+    signal: AbortSignal,
+    active: ActiveOperation,
+  ): Promise<void> {
+    let pathPromise: Promise<void> | undefined;
+    let pathTargetKey: string | undefined;
+    let settledTargetKey: string | undefined;
+    let pathFailurePromise: Promise<never> | undefined;
+    let rejectPathFailure: ((error: ItemCollectionError) => void) | undefined;
+    const onPathUpdate = (results: {
+      readonly status: string;
+      readonly path?: readonly unknown[];
+    }): void => {
+      if (results.status === "noPath" || results.status === "timeout")
+        rejectPathFailure?.(
+          new ItemCollectionError(
+            "path_failed",
+            "The normal pathfinder could not reach the visible item target.",
+          ),
+        );
+    };
+    bot.on("path_update", onPathUpdate);
+
+    const stopPath = async (): Promise<void> => {
+      const pendingPath = pathPromise;
+      if (pendingPath === undefined) return;
+      pathPromise = undefined;
+      pathTargetKey = undefined;
+      pathFailurePromise = undefined;
+      rejectPathFailure = undefined;
+      try {
+        bot.pathfinder.setGoal(null);
+      } catch {
+        // A disconnect can make the pathfinder unavailable during cleanup.
+      }
+      await pendingPath.catch(() => undefined);
+    };
+
+    try {
+      const initial = this.safeObserve(bot);
+      if (initial === null)
+        throw new ItemCollectionError(
+          "target_unobservable",
+          "The requested item is not currently visible.",
+        );
+      const initiallyVisible = initial.perception.entities.find(
+        (entity) => entity.id === entityId,
+      );
+      if (initiallyVisible === undefined) {
+        const outcome =
+          bot.entities[entityId] === undefined
+            ? "entity_removed"
+            : "target_unobservable";
+        throw new ItemCollectionError(
+          outcome,
+          outcome === "entity_removed"
+            ? "The requested item entity has left the current client entity table."
+            : "The requested item entity is not currently visible.",
+        );
+      }
+      if (
+        initiallyVisible.name !== "item" ||
+        initiallyVisible.kind !== "object"
+      )
+        throw new ItemCollectionError(
+          "invalid_target",
+          "The requested visible entity is not an item entity.",
+        );
+
+      while (active.itemCollectionOutcome !== "collected") {
+        throwIfAborted(signal);
+
+        const observation = this.safeObserve(bot);
+        if (observation === null)
+          throw new ItemCollectionError(
+            "target_unobservable",
+            "The current view is unavailable; item pursuit was stopped.",
+          );
+        const target = observation.perception.entities.find(
+          (entity) => entity.id === entityId,
+        );
+        if (target === undefined) {
+          const outcome =
+            bot.entities[entityId] === undefined
+              ? "entity_removed"
+              : "target_unobservable";
+          throw new ItemCollectionError(
+            outcome,
+            outcome === "entity_removed"
+              ? "The requested item entity left the current client entity table before collection was observed."
+              : "The requested item is no longer visible; pursuit was stopped.",
+          );
+        }
+        if (target.name !== "item" || target.kind !== "object")
+          throw new ItemCollectionError(
+            "invalid_target",
+            "The requested entity is no longer an item entity.",
+          );
+
+        const playerPosition = observation.self.position;
+        const targetPosition = target.position;
+        const distance = new Vec3(
+          playerPosition.x,
+          playerPosition.y,
+          playerPosition.z,
+        ).distanceTo(
+          new Vec3(targetPosition.x, targetPosition.y, targetPosition.z),
+        );
+        if (distance <= 1.25) {
+          await stopPath();
+          await waitForItemCollectionPoll(signal);
+          continue;
+        }
+
+        const targetKey = blockKey(targetPosition);
+        if (pathPromise !== undefined && pathTargetKey !== targetKey)
+          await stopPath();
+
+        if (pathPromise === undefined && settledTargetKey === targetKey) {
+          await waitForItemCollectionPoll(signal);
+          continue;
+        }
+
+        if (pathPromise === undefined) {
+          settledTargetKey = undefined;
+          pathTargetKey = targetKey;
+          pathFailurePromise = new Promise<never>((_resolve, reject) => {
+            rejectPathFailure = reject;
+          });
+          void pathFailurePromise.catch(() => undefined);
+          pathPromise = bot.pathfinder.goto(
+            new goals.GoalNear(
+              targetPosition.x,
+              targetPosition.y,
+              targetPosition.z,
+              itemCollectionGoalRange,
+            ),
+          );
+        }
+
+        const pendingPath = pathPromise;
+        const pendingFailure = pathFailurePromise;
+        const pathResult = pendingPath.then(
+          () => "goal_reached" as const,
+          () => {
+            throw new ItemCollectionError(
+              "path_failed",
+              "Normal pathfinding to the visible item target failed.",
+            );
+          },
+        );
+        await Promise.race([
+          pathResult,
+          waitForItemCollectionPoll(signal).then(() => "poll" as const),
+          pendingFailure,
+        ]).then((result) => {
+          if (result === "goal_reached") {
+            settledTargetKey = pathTargetKey;
+            pathPromise = undefined;
+            pathTargetKey = undefined;
+            pathFailurePromise = undefined;
+            rejectPathFailure = undefined;
+          }
+        });
+      }
+      await stopPath();
+    } finally {
+      bot.removeListener("path_update", onPathUpdate);
+      await stopPath();
     }
   }
 

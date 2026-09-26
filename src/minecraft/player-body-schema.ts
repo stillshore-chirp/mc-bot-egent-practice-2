@@ -54,6 +54,7 @@ export const playerOperationNames = [
   "window_close",
   "consume",
   "toss",
+  "collect_item",
   "transfer",
   "fish",
   "sleep",
@@ -96,6 +97,8 @@ export const playerOperationDescriptions = {
   window_close: "Close the currently open Minecraft interface.",
   consume: "Eat a matching food item from inventory.",
   toss: "Drop an exact item count from inventory into the world.",
+  collect_item:
+    "Follow and collect an item entity that is currently visible, identified by its observed entity ID. Rechecks visibility while pursuing and stops if the target is no longer observable.",
   transfer: "Move an item stack between two player inventory slots.",
   fish: "Use a fishing rod and reel in an observed catch.",
   sleep: "Attempt to sleep in a reachable bed.",
@@ -232,6 +235,12 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
       kind: z.literal("toss"),
       item: itemNameSchema,
       count: countSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("collect_item"),
+      entityId: z.number().int().positive(),
     })
     .strict(),
   z

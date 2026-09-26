@@ -189,6 +189,19 @@ describe("on-demand player operation schemas", () => {
       expect(result.description).toEqual(expect.any(String));
     }
 
+    expect(playerOperationCatalog).toContain("collect_item:");
+    const collectItem = (await playerOperationDescriptionTool.execute({
+      kind: "collect_item",
+    })) as { schema: Record<string, unknown> };
+    const collectProperties = z
+      .record(z.string(), z.unknown())
+      .parse(collectItem.schema.properties);
+    const entityIdSchema = z
+      .record(z.string(), z.unknown())
+      .parse(collectProperties.entityId);
+    expect(entityIdSchema.type).toBe("integer");
+    expect(collectItem.schema.required).toContain("entityId");
+
     const returned = (await playerOperationDescriptionTool.execute({
       kind: "use",
     })) as { schema: Record<string, unknown> };
@@ -280,7 +293,10 @@ describe("on-demand player operation schemas", () => {
       expect(playerOperationCatalog).toContain(
         '入力: {kind:"place",item:string[1..128],position:{x:number,y:number,z:number},face?:"up"|"down"|"north"|"south"|"east"|"west"}',
       );
-      expect(playerOperationCatalog.match(/入力:/gu)).toHaveLength(5);
+      expect(playerOperationCatalog).toContain(
+        '入力: {kind:"collect_item",entityId:integer}',
+      );
+      expect(playerOperationCatalog.match(/入力:/gu)).toHaveLength(6);
       expect(instructions.length).toBeLessThan(
         instructions.replace(playerOperationCatalog, fullSchemaText).length,
       );
