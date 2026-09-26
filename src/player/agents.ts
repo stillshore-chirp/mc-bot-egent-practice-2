@@ -103,7 +103,7 @@ function bodyOutcomeEventMatches(
     event.summary ===
     `操作 ${outcome.kind} は ${outcome.status}: ${outcome.summary}`
   )
-    return event.createdAt === outcome.observedAt;
+    return true;
   return (
     event.summary ===
     `再起動後に復旧した操作結果: ${outcome.kind} ${outcome.status}`

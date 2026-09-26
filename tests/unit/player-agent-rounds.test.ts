@@ -19,6 +19,7 @@ import type {
   PlayerThoughtDecision,
   PlayerRuntimeSnapshot,
 } from "../../src/player/contracts.js";
+import { playerBodyOutcomeEventId } from "../../src/player/contracts.js";
 import {
   compactDecisionObservation,
   compactSnapshot,
@@ -284,15 +285,28 @@ describe("player agent response rounds", () => {
     try {
       const { skill } = recordSuccessfulSkillUse(fixture, firstRunId, skillId);
       recordSuccessfulSkillUse(fixture, secondRunId, skillId, skill, "move_to");
-      const events = fixture.mind.pendingEvents();
-      expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+      const currentSnapshot = fixture.mind.snapshot();
+      const events = fixture.mind.pendingEvents().map((event) => ({
+        ...event,
+        createdAt: new Date(Date.parse(event.createdAt) + 5).toISOString(),
+      }));
+      expect(currentSnapshot.lastOutcome).toMatchObject({
         operationId: secondRunId,
         kind: "move_to",
         status: "successful",
       });
+      expect(events).toHaveLength(2);
+      for (const event of events) {
+        const matchingOutcome = currentSnapshot.recentOutcomes.find(
+          ({ operationId }) =>
+            event.id === playerBodyOutcomeEventId(operationId),
+        );
+        expect(matchingOutcome).toBeDefined();
+        expect(event.createdAt).not.toBe(matchingOutcome?.observedAt);
+      }
 
       const firstThought = await fixture.agent.think({
-        snapshot: fixture.mind.snapshot(),
+        snapshot: currentSnapshot,
         events,
       });
 
