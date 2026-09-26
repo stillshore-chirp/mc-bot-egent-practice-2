@@ -96,6 +96,10 @@ import {
   inspectPersistentMemoryProgress,
   type PersistentMemoryProgress,
 } from "./persistent-memory-diagnostic.js";
+import {
+  firstDigLearningEvidence,
+  type LearningHypothesisSnapshot,
+} from "./learning-reuse-acceptance.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME =
@@ -200,7 +204,7 @@ type PlayerOutcomeStatus =
 type LearningReuseStage =
   | "initial_fixture_visible"
   | "first_dig_confirmed"
-  | "hypothesis_created"
+  | "first_dig_hypothesis_verified"
   | "reuse_fixture_visible"
   | "reuse_result_confirmed"
   | "revision_verified";
@@ -784,7 +788,7 @@ interface WorldSnapshot {
   readonly inventorySignature: string;
 }
 
-interface SkillSnapshot {
+interface SkillSnapshot extends LearningHypothesisSnapshot {
   readonly skillIds: ReadonlySet<string>;
   readonly skillCount: number;
   readonly revisionCount: number;
@@ -2776,12 +2780,12 @@ async function main(): Promise<void> {
           firstRegion,
         );
         const initialOutcomes = newOutcomes(before, after);
-        const trustedDig = initialOutcomes.some(
+        const firstDigOutcome = initialOutcomes.find(
           (outcome) =>
             outcome.kind === "dig" && outcome.status === "successful",
         );
         if (
-          !trustedDig ||
+          firstDigOutcome === undefined ||
           !worldChangedFromBlock(
             beforeWorld.blockRegionChanged,
             afterWorld.blockRegionChanged,
@@ -2793,35 +2797,32 @@ async function main(): Promise<void> {
         await removeLearningLogFixture(rcon, firstLogs);
         activeLearningLogs = [];
         let learned = readSkillSnapshot(state.databasePath);
-        const hasNewTrustedHypothesis = (snapshot: SkillSnapshot): boolean =>
-          [...snapshot.skillIds].some(
-            (skillId) =>
-              !learnedBaseline.skillIds.has(skillId) &&
-              snapshot.successfulDerivedSkillIds.has(skillId) &&
-              !learnedBaseline.successfulDerivedSkillIds.has(skillId),
-          );
-        if (!hasNewTrustedHypothesis(learned)) {
+        let firstDigEvidence = firstDigLearningEvidence(
+          firstDigOutcome,
+          learnedBaseline,
+          learned,
+        );
+        if (firstDigEvidence === undefined) {
           await observeForPlayer(context, 30_000, () => {
             learned = readSkillSnapshot(state.databasePath);
-            return hasNewTrustedHypothesis(learned);
+            return (
+              firstDigLearningEvidence(
+                firstDigOutcome,
+                learnedBaseline,
+                learned,
+              ) !== undefined
+            );
           });
+          firstDigEvidence = firstDigLearningEvidence(
+            firstDigOutcome,
+            learnedBaseline,
+            learned,
+          );
         }
-        const newSkillIds = [...learned.skillIds].filter(
-          (id) => !learnedBaseline.skillIds.has(id),
-        );
-        const trustedSuccess = newSkillIds.some(
-          (skillId) =>
-            learned.successfulDerivedSkillIds.has(skillId) &&
-            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
-        );
-        if (newSkillIds.length === 0 || !trustedSuccess)
-          incomplete("ONE_SUCCESS_DID_NOT_CREATE_VERIFIED_HYPOTHESIS");
-        verifiedLearnedSkillIds = newSkillIds.filter(
-          (skillId) =>
-            learned.successfulDerivedSkillIds.has(skillId) &&
-            !learnedBaseline.successfulDerivedSkillIds.has(skillId),
-        );
-        state.learningReuseStage = "hypothesis_created";
+        if (firstDigEvidence === undefined)
+          incomplete("FIRST_DIG_DID_NOT_CREATE_OR_USE_VERIFIED_HYPOTHESIS");
+        verifiedLearnedSkillIds = [firstDigEvidence.skillId];
+        state.learningReuseStage = "first_dig_hypothesis_verified";
 
         const beforeReuse = readSkillSnapshot(state.databasePath);
         beginLearningFixtureDiagnostic(state, "reuse");
@@ -2981,13 +2982,16 @@ async function main(): Promise<void> {
         await removeLearningLogFixture(rcon, reuseLogs);
         activeLearningLogs = [];
         return {
-          oneSuccessCreatedHypothesis: true,
+          firstDigHypothesisSource: firstDigEvidence.source,
           trustedEvidenceReceipt: true,
-          derivedHypothesisLinkedToReceipt: true,
+          derivedHypothesisLinkedToFirstDigReceipt:
+            firstDigEvidence.source === "derived_from_first_dig",
+          preexistingDerivedHypothesisUsedByFirstDig:
+            firstDigEvidence.source === "preexisting_hypothesis_used",
           learnedSkillConsultedAgain: true,
           repeatResultObserved: true,
           consultedLearnedSkillRevisionAdvanced,
-          trustedDerivedReceiptForNewSkill: trustedSuccess,
+          trustedFirstDigHypothesisVerified: true,
           initialSkillCount: baselineSkills.skillCount,
           learnedSkillCount: learned.skillCount,
           ownerReplyObserved: context.responseQueue.length > responseStart,
@@ -7648,7 +7652,9 @@ interface SkillRevisionRow {
 }
 
 interface SuccessfulDerivedSkillRow {
+  readonly run_id: string;
   readonly skill_id: string;
+  readonly skill_version: number;
 }
 
 function readSkillSnapshot(databasePath: string): SkillSnapshot {
@@ -7692,7 +7698,7 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
       .all() as { readonly skill_id: string; readonly count: number }[];
     const successfulDerivedSkills = database
       .prepare(
-        "SELECT DISTINCT derived.skill_id FROM mc_bot_skill_derived_hypotheses AS derived INNER JOIN mc_bot_skill_evidence_receipts AS receipt ON receipt.receipt_id = derived.receipt_id WHERE receipt.observed_outcome = 'successful'",
+        "SELECT derived.run_id, derived.skill_id, derived.skill_version FROM mc_bot_skill_derived_hypotheses AS derived INNER JOIN mc_bot_skill_evidence_receipts AS receipt ON receipt.receipt_id = derived.receipt_id WHERE receipt.observed_outcome = 'successful'",
       )
       .all() as SuccessfulDerivedSkillRow[];
     return {
@@ -7702,6 +7708,12 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
       evidenceReceiptCount: count("mc_bot_skill_evidence_receipts"),
       successfulDerivedSkillIds: new Set(
         successfulDerivedSkills.map((row) => row.skill_id),
+      ),
+      successfulDerivedHypothesesByRunId: new Map(
+        successfulDerivedSkills.map((row) => [
+          row.run_id,
+          { skillId: row.skill_id, skillVersion: row.skill_version },
+        ]),
       ),
       revisionVersionsBySkill,
       learnedBodiesBySkill: new Map(
