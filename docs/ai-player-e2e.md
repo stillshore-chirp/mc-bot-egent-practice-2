@@ -251,4 +251,8 @@ HEAD `46f3b8e` の対象runは`autonomous_life`が6 calls・32,720 tokensでpass
 
 後続の0 GPT帰路診断では、初回は採掘前提が未成立でした。採掘直前の乾地・支持ブロック・位置一致を確認する診断を追加した次の実行では採掘とdrop付近・spawnへの移動が成功しましたが、所持は確認できず、移動後の半径2ブロック検索でdrop位置は不明でした。検索半径を最大16ブロックへ限定して広げた実行では、移動直後に標的から半径8ブロック以内のdropを確認し、Botとの距離は2ブロック以上でした。拾得待ち後のdrop位置は不明で、所持はありません。いずれもAPI呼び出し0、終了処理3/3です。dropが移動した経路と実GPT試験での取得・帰還は未確認です。診断手順のpassをIssue受け入れには数えません。
 
+HEAD `ddc0c77` の`learning_reuse`対象試験では、初回digとserverのブロック変化を確認しましたが、そのreceiptに結び付く改訂はなく未完了でした。原因はbody outcomeイベントを受けても最後の操作結果だけを学習評価しており、後続の移動結果で採掘結果が隠れ得ることでした。結果イベントを操作ごとの履歴・trusted receiptに結び付ける変更後、HEAD `9f2f296` の対象試験では初回digの同一receipt・Skill・使用版に対応する実質改訂を確認しました。再利用digもserverで確認できましたが、その後の学習提案は操作参照の不一致で拒否され、caseは未完了でした。いずれも終了処理3/3です。
+
+HEAD `2c0e2a5` の`learning_reuse`対象試験では、Body smokeと`autonomous_life`がpassし、学習caseもpassしました。初回の成功digとserverのブロック変化から、同じtrusted receipt・Skill・使用版に結び付く実質改訂を確認しました。次の原木では同じSkillへの新規consultation、成功digとserver変化、さらにそのdigのreceipt・使用版に結び付く新しい実質改訂を確認しました。対象runは23 LLM calls・既知127,544 tokens、usageは`partial_or_unknown`、終了処理3/3です。未選択caseは`CASE_NOT_SELECTED`で、run全体の`incomplete`をIssue全体のpassへ読み替えません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集後の帰還と全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
