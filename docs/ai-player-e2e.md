@@ -2,6 +2,10 @@
 
 `tests/e2e/ai-player-live.ts` は、新しい既定アプリケーションを新規の Paper ワールドと実際の GPT に接続し、Issue #72 の受け入れ条件をゲーム内の結果で確認するための手動実行ハーネスです。API受付、発話、ユニットテストだけでは受け入れをpassにしません。各ケースは成功・失敗・未完了を記録し、未確認の動作を合格へ読み替えません。
 
+## Issue #72 の受け入れ方針（2026-09-27）
+
+各必須動作は隔離Paperと実GPTを使い、ゲーム内結果で判定します。統合条件は、共通runtime・DBを引き継ぐ複数の部分runで必要な動作の接続を確認します。無関係なcase passの寄せ集めでは満たしません。全caseを一度の長時間runで連続passさせる耐久評価は #76、開始時に遮蔽された目標の探索は #77 で扱います。
+
 新しい既定経路と責務の境界は[自律プレイヤー](autonomous-player.md)、操作・可視範囲の契約は[プレイヤー操作アダプター](player-body.md)、判断に使うゲーム内知識は[MC Bot Skills](mc-bot-skills.md)を参照してください。
 
 ## 隔離と公開境界
@@ -14,7 +18,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
-後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`game_action_discretion`、`learning_reuse`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、その実測runtime履歴を引き継ぎます。ほかのcase、特に`integrated_result`は未完了のままなので、targeted run全体をpassにせず、Issue全体の受け入れには通常の全case runを必要とします。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`game_action_discretion`、`learning_reuse`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、その実測runtime履歴を引き継ぎます。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
 
 未知状況と並行会話のowner依頼は目標の大まかな方角だけを伝えます。遮蔽された対象や迂回路、採取手順はBotが観測と判断で見つける必要があり、fixtureの座標や固定手順は会話へ渡しません。
 
@@ -28,7 +32,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 再利用時も、新しいowner proposal、同じSkillへの新規consultation、successful dig、RCON world snapshotの変化を確認します。続けて、そのdigのtrusted receiptに結び付いた同じSkill・使用version・新しい改訂versionを`mc_bot_skill_evidence_revisions`から確認し、使用版から上記4項目のいずれかが実質的に変わったこと、再利用段階で新しいSkill IDが作られていないことを要求します。学習counter、receipt総数、version総数の増加だけでは受け入れません。dig直後にそのreceipt-linked revisionがまだ見えない場合だけ最大30秒観測します。Skill交換のexport/import依頼にも新しいowner proposalの短いreadbackを設け、会話側で目的提案に渡されない場合は固定codeで未完了にします。
 
-Skill交換caseが停止した時は、export依頼・export確認・import依頼・同一Skillのimport確認・重複import依頼・重複不変性確認の最後の段階を固定enumで保存します。重複import依頼もowner proposalのreadbackを要求します。run42でimport tool成功までに10万tokensを少し超えたため、同caseの上限を15万tokensに設定し、run全体の80万tokens上限は維持します。予算増加自体を成功根拠にはしません。
+Skill交換caseが停止した時は、export依頼・export確認・import依頼・同一Skillのimport確認・重複import依頼・重複不変性確認の最後の段階を固定enumで保存します。重複import依頼もowner proposalのreadbackを要求します。run42でimport tool成功までに10万tokensを少し超えたため、同caseの上限を19万tokensに設定し、run全体の80万tokens上限は維持します。予算増加自体を成功根拠にはしません。
 
 連続caseで以前のowner提案がまだpendingなら、`game_action_discretion`のfixture準備前に最大45秒だけ自然な解決を待ちます。残れば固定code `PRIOR_OWNER_PROPOSALS_UNRESOLVED` で未完了とし、新しい修理依頼を重ねません。対象は既に存在するproposalの状態だけで、ハーネスが採用・辞退やgoal完了を代理で決めることはありません。待機中のusageもrun全体の上限に含めます。
 
@@ -55,7 +59,7 @@ Skill交換caseが停止した時は、export依頼・export確認・import依�
 | DBとMarkdownの往復    | `skill_exchange` はexportしたファイル名と同一Skill IDをimport活動・DBで照合し、合成編集marker、同IDの版・receipt更新、同じファイルの再import試行後に同IDの本文・版・receiptが変わらないことを確認します。                                                                                                                                                                                                                                                                                               |
 | 統合した実ゲーム検証  | `integrated_result` は上記のGPT・Body・server oracleの各ケースがpassした場合だけ統合passにします。                                                                                                                                                                                                                                                                                                                                                                                                      |
 
-現在の#72 fixtureは水路・水中dropを使わず、壁の先にある対象と、その直下のstone床をRCONで確認します。過去の水中drop課題・実行・probeは#74の検討対象へ切り分け、run履歴は監査用に残しますが#72の受け入れ根拠には数えません。問題文は対象物・空の所持品・帰還先と失敗後の見直しを伝え、障害物の位置や解法は示しません。`unknown_composite`の48 calls / 390,000 tokens / 7分の上限は据え置きで、旧fixtureの測定を新fixtureの受け入れ証拠へ流用しません。`AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY`はGPTなしの診断であり、#72の実GPT受け入れを代替しません。
+現在の#72 fixtureは乾地で、壁が直進経路を妨げる一方、標的は開始時から視界に入る構成です。対象とその直下のstone床はRCONで確認します。開始時に遮蔽された目標の探索は #77 の対象です。過去の水中drop課題・実行・probeは#74の検討対象へ切り分け、run履歴は監査用に残しますが#72の受け入れ根拠には数えません。問題文は対象物・空の所持品・帰還先と失敗後の見直しを伝え、障害物の位置や解法は示しません。`unknown_composite`の48 calls / 390,000 tokens / 7分の上限は据え置きで、旧fixtureの測定を新fixtureの受け入れ証拠へ流用しません。`AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY`はGPTなしの診断であり、#72の実GPT受け入れを代替しません。
 
 `observation_boundary` は返信とoracleの確認後、合成の壁・チェストをRCONで除去し、空気のreadbackを確認して後続caseへ進みます。`learning_reuse` はbot周囲の8方位から空気の配置先を個別に探し、視野角を覆う位置に合成`oak_log`を置き、初回・再利用の各配置後15秒以内に得た新しいBody観測で`oak_log`が見えることをowner依頼前に確認します。配置場所が塞がっている場合やBody観測で見えない場合は固定codeで未完了停止し、GPT依頼を送りません。各段階でRCONから位置とRotationを読み、位置と現在yawを指定してpitchを設定するtpを試します。位置readback不一致とRotation readbackの取得不能は引き続き未完了停止します。yaw/pitchの一致は固定booleanで診断記録し、向き設定直前のactive operation有無も記録しますが、一致自体は合格条件にしません。RCONで原木の設置を確認し、15秒以内の新しいBody観測に`oak_log`が含まれることを初回・再利用それぞれのowner依頼前に必須とします。原木候補の高さはBot実位置の足元levelから選び、各setblock直前にもairを再確認します。初回と再利用の依頼はいずれも原木1本の採掘と結果確認を求め、RCONがfixture位置のうち少なくとも1か所から`oak_log`が消えたことを確かめます。成功操作とworld changeを記録した後、残りの合成原木だけをRCONで除去し、readbackしてから仮説確認・次のfixtureへ進みます。未完了時もcase終了後、後続caseの前に残った合成原木を同様に除去・readbackします。初回dig後は、次のどちらかを読み取り専用DB snapshotで確認します。(1) そのdigと同じrun IDのsuccessful receiptに結び付いたderived hypothesisとそのrevision version、(2) case開始時のsnapshotにsuccessful receipt由来のderived hypothesisを持つSkill IDが存在し、初回dig outcomeのSkill IDが一致し、outcomeの使用versionが現行snapshotのimmutable revision historyにあること。どちらの場合も、選ばれた同じSkillが次の採掘で新規consultされ、successful outcomeとserver world changeが確認され、さらに後続revision versionとtrusted receipt件数が増えた時だけpassします。(1)のDB記録は既存case/run期限と使用量上限の範囲内で最大30秒だけ待ち、確認できなければ固定codeで未完了停止します。(2)は開始時snapshotのtrusted derivationと初回outcomeのID/version一致を確認し、使用versionの存在は現行immutable historyで照合します。
 
@@ -93,11 +97,11 @@ run62（HEAD `58ecd8a`）ではtick停止後の位置と安全な立ち位置を
 
 課題送信後に成功した既存oracleサンプルだけから、開始位置からの最大移動距離bucket、標的への最短距離bucket、近づいた観測の有無、blocks・position・inventoryの進捗種別を上限付き集計で保存します。生座標や時系列は保存しません。有効サンプルがない場合は`not_sampled`または`unavailable`、一部読取失敗を含む集計は`partial`として扱います。これらは観測差分の診断で、成功操作やbot起因の進捗を証明しません。特にblock差分には自然な水流変化が含まれる可能性があります。取得・帰還の成功条件は従来どおり別のoracleで判定します。
 
-unknown fixtureは壁と対象をspawnの+X側に配置するため、停止中にJava版のyaw -90°・pitch 0°を設定し、RCONのRotation readbackで向きを確認してからresumeします（Java yawは0°が南、負の90°が東）。壁は足元の一段に置いて直進移動を妨げつつ、標的までの初期視線を通します。RCON preflightは壁足元、初期視線、短い横迂回路の足場・通行空間と迂回後の視線を確認します。向き確認後、課題送信前に取得できた観測receiptだけを別の`unknownPreTask...`項目へ記録します。向き設定後のreceiptが無い場合は`unknown`とし、課題後の`unknownTask...`可視観測とは混ぜません。この診断は対象座標をagentへ渡さず、達成条件も変更しません。RCONでの幾何確認は行いますが、自律判断中のBody可視性は実GPTのrunまで未確認です。
+unknown fixtureは壁と対象をspawnの+X側に配置するため、停止中にJava版のyaw -90°・pitch 0°を設定し、RCONのRotation readbackで向きを確認してからresumeします（Java yawは0°が南、負の90°が東）。壁は足元の一段に置いて直進移動を妨げつつ、標的までの初期視線を通します。RCON preflightは壁足元、初期視線、短い横迂回路の足場・通行空間と迂回後の視線を確認します。向き確認後、課題送信前に取得できた観測receiptだけを別の`unknownPreTask...`項目へ記録します。向き設定後のreceiptが無い場合は`unknown`とし、課題後の`unknownTask...`可視観測とは混ぜません。この診断は対象座標をagentへ渡さず、達成条件も変更しません。実GPT＋Paperの対象caseでは乾地fixtureの標的が開始時から視界に入り、case passを確認しました。遮蔽された目標の自律探索は #77 で検証します。
 
 これらは代表ケースです。全操作の網羅、すべてのMinecraft環境・mod・protocol差、死亡を含むすべての結果を証明しません。未実装と判断した操作はありません。確認していない能力や環境差は未検証として残します。
 
-## 操作群の検証状態
+## 操作群の初期実測
 
 | 能力群                 | 操作                                                                                                                                 | ソース上の接続                        | fixture経由のハーネス確認                                                                                         | 実GPTの受け入れ・実測                                                                                         |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -261,4 +265,10 @@ HEAD `2c0e2a5` の`learning_reuse`対象試験では、Body smokeと`autonomous_
 
 実drop位置を使う0 GPT隔離Paper probeでは、採掘とdrop位置の解析後、`range: 0.25`の`move_to`がBody・経路ともsuccessfulで、サーバーは保存した移動目標のセルへの到着を確認しました。一方、到着時に再観測したdropはBotから`2+`の距離bucketにあり、所持は増えませんでした。拾得未確認のためspawn帰還は実行せず、診断手順はpass、GPT呼び出し0、cleanup 3/3です。この結果は静的な目標位置へ到着できる証拠であり、動いたdropへの追従・拾得、実GPTによる選択と帰還は未確認です。
 
-Issue #72全体の受け入れは未達です。`unknown_composite`の採集後の帰還と全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
+## 直近の安全なE2E証跡（2026-09-27）
+
+Targeted `unknown_composite` artifact `3422ee20…` はcase passです。caseは23 LLM calls、run全体は30 calls・既知228,808 tokens、usageは`partial_or_unknown`、cleanupは3/3でした。これは開始時から対象が視界に入る現在の乾地fixtureの結果です。
+
+全case run artifact `d357682f…` は`body_operation_smoke`、`runtime_contract`、`autonomous_life`、`observation_boundary`、`persistent_memory_restart`がpassし、`learning_reuse`は31 callsの予算で未完了停止しました。run全体は既知378,075 tokens、usageは`partial_or_unknown`、cleanupは3/3です。
+
+Issue #72全体の受け入れは未達です。必要なケースの残件と共通runtime・DBを引き継ぐ統合証拠を閉じる必要があります。単一の長時間全case連続runは #76、遮蔽された目標探索は #77 の範囲です。既知usageは部分計測として扱い、不明分を補完しません。
