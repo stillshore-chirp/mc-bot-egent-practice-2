@@ -310,6 +310,8 @@ interface UnknownCompositeDiagnostic {
   readonly unknownServerProgressObserved?: boolean;
   readonly unknownWallFixtureConfirmed?: boolean;
   readonly unknownDryGroundFixtureConfirmed?: boolean;
+  readonly unknownSideRouteConfirmed?: boolean;
+  readonly unknownSideViewCorridorConfirmed?: boolean;
   readonly unknownTaskObservationStatus?: "available" | "unknown";
   readonly unknownTaskTargetBlockVisible?: boolean;
   readonly unknownTaskWallMaterialVisible?: boolean;
@@ -3757,6 +3759,8 @@ async function main(): Promise<void> {
         updateUnknownCompositeDiagnostic(state, {
           unknownWallFixtureConfirmed: true,
           unknownDryGroundFixtureConfirmed: true,
+          unknownSideRouteConfirmed: true,
+          unknownSideViewCorridorConfirmed: true,
         });
         await prepareUnknownObservationClients(
           rcon,
@@ -6015,7 +6019,11 @@ async function runOperationSmoke(
             navigationResult = await body.execute(
               {
                 kind: "move_relative",
-                offset: { x: 8, y: 0, z: 0 },
+                offset: {
+                  x: fixtureTarget.x + 0.5 - smokeSpawn.x,
+                  y: 0,
+                  z: 0,
+                },
                 range: 1,
               },
               navigationAbort.signal,
@@ -7657,7 +7665,7 @@ function fixturePoint(
 }
 
 function unknownFixtureTarget(origin: Position): BlockPosition {
-  return fixturePoint(origin, 8, 0);
+  return fixturePoint(origin, 5, 0);
 }
 
 async function configureUnknownFixture(
@@ -7671,16 +7679,101 @@ async function configureUnknownFixture(
   const wall = { x: wallX, y: 64, z };
   const targetSupport = { x: target.x, y: target.y - 1, z: target.z };
   await rcon.command(`clear ${botName}`);
-  await rcon.command(`fill ${wallX} 64 ${z - 3} ${wallX} 67 ${z + 3} stone`);
+  await rcon.command(`fill ${wallX} 64 ${z - 1} ${wallX} 67 ${z + 1} stone`);
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
   await setAndVerifyGamerule(rcon, "advanceTime", false);
   await rcon.command("time set 1000");
   if (!(await isBlock(rcon, wall, "stone")))
     incomplete("UNKNOWN_WALL_FIXTURE_NOT_CONFIRMED");
+  if (!(await isBlock(rcon, { x: wallX, y: 65, z }, "stone")))
+    incomplete("UNKNOWN_FIXTURE_INITIAL_OCCLUSION_NOT_CONFIRMED");
   if (!(await isBlock(rcon, targetSupport, "stone")))
     incomplete("UNKNOWN_DRY_GROUND_FIXTURE_NOT_CONFIRMED");
   if (!(await isBlock(rcon, target, "blue_wool")))
     incomplete("UNKNOWN_TARGET_FIXTURE_NOT_CONFIRMED");
+  await verifyUnknownFixtureLateralApproach(rcon, origin, target, z);
+}
+
+async function verifyUnknownFixtureLateralApproach(
+  rcon: LocalRcon,
+  origin: Position,
+  target: BlockPosition,
+  centerZ: number,
+): Promise<void> {
+  const routeCells: BlockPosition[] = [];
+  for (let offset = 0; offset <= 3; offset += 1) {
+    routeCells.push(fixturePoint(origin, 0, offset));
+  }
+  const approachX = target.x - 1;
+  const approachOffsetX = approachX - Math.floor(origin.x);
+  for (let offsetX = 1; offsetX <= approachOffsetX; offsetX += 1) {
+    routeCells.push(fixturePoint(origin, offsetX, 3));
+  }
+  for (let offsetZ = 2; offsetZ >= 0; offsetZ -= 1) {
+    routeCells.push(fixturePoint(origin, approachOffsetX, offsetZ));
+  }
+  for (const routeCell of routeCells) {
+    if (
+      !(await isBlock(
+        rcon,
+        { x: routeCell.x, y: routeCell.y - 1, z: routeCell.z },
+        "stone",
+      )) ||
+      !(await isBlock(rcon, routeCell, "air")) ||
+      !(await isBlock(
+        rcon,
+        { x: routeCell.x, y: routeCell.y + 1, z: routeCell.z },
+        "air",
+      ))
+    ) {
+      incomplete("UNKNOWN_FIXTURE_LATERAL_ROUTE_UNAVAILABLE");
+    }
+  }
+
+  const eye = {
+    x: origin.x,
+    y: origin.y + 1.62,
+    z: centerZ + 3.5,
+  };
+  const targetCenter = {
+    x: target.x + 0.5,
+    y: target.y + 0.5,
+    z: target.z + 0.5,
+  };
+  const dx = targetCenter.x - eye.x;
+  const dy = targetCenter.y - eye.y;
+  const dz = targetCenter.z - eye.z;
+  const horizontalDistance = Math.hypot(dx, dz);
+  const expectedYaw = (Math.atan2(-dx, -dz) * 180) / Math.PI;
+  const horizontalAngle = angularDistance(expectedYaw, UNKNOWN_FIXTURE_YAW);
+  const verticalAngle = Math.abs(
+    (Math.atan2(dy, horizontalDistance) * 180) / Math.PI,
+  );
+  if (
+    Math.hypot(horizontalDistance, dy) > 16 ||
+    horizontalAngle > 55 ||
+    verticalAngle > 40
+  ) {
+    incomplete("UNKNOWN_FIXTURE_SIDE_VIEW_NOT_IN_FIELD_OF_VIEW");
+  }
+
+  const sampleCount = Math.ceil(Math.hypot(horizontalDistance, dy) * 8);
+  const clearViewCells = new Map<string, BlockPosition>();
+  for (let sample = 1; sample < sampleCount; sample += 1) {
+    const ratio = sample / sampleCount;
+    const cell = {
+      x: Math.floor(eye.x + dx * ratio),
+      y: Math.floor(eye.y + dy * ratio),
+      z: Math.floor(eye.z + dz * ratio),
+    };
+    if (cell.x === target.x && cell.y === target.y && cell.z === target.z)
+      continue;
+    clearViewCells.set(`${cell.x},${cell.y},${cell.z}`, cell);
+  }
+  for (const cell of clearViewCells.values()) {
+    if (!(await isBlock(rcon, cell, "air")))
+      incomplete("UNKNOWN_FIXTURE_SIDE_VIEW_CORRIDOR_BLOCKED");
+  }
 }
 
 async function prepareUnknownObservationClients(
