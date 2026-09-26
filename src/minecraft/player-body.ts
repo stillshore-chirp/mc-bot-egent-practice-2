@@ -74,6 +74,9 @@ const itemCollectionPickupDistance = 1.25;
 // Allow a bobbing item a short observation window after a path goal is reached.
 const itemCollectionPickupGraceMs = 2_500;
 const maximumItemCollectionTimeoutMs = 45_000;
+// Mineflayer's consume acknowledgement can arrive just before its inventory and food packets.
+const consumeEffectObservationGraceMs = 1_000;
+const consumeEffectObservationPollTicks = 1;
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -1393,6 +1396,13 @@ export class MineflayerPlayerBody implements PlayerBody {
           () => this.noteActionSettled(active),
         );
         await waitForAction(action, controller.signal);
+        if (operation.kind === "consume")
+          await this.waitForConsumeEffectConfirmation(
+            bot,
+            operation,
+            before,
+            active,
+          );
         if (operation.kind === "dig" && blockEvidence !== undefined)
           await blockEvidence.waitForTargetAirUpdate(
             controller.signal,
@@ -1562,6 +1572,39 @@ export class MineflayerPlayerBody implements PlayerBody {
       return this.observeSnapshot(bot, this.ownerUsername);
     } catch {
       return null;
+    }
+  }
+
+  private async waitForConsumeEffectConfirmation(
+    bot: Bot,
+    operation: Extract<PlayerOperation, { kind: "consume" }>,
+    before: PlayerBodyObservation | null,
+    active: ActiveOperation,
+  ): Promise<void> {
+    if (before === null) return;
+    const serverUpdates = new Map<string, ServerBlockUpdate>();
+    const finalAttempt = Math.ceil(
+      consumeEffectObservationGraceMs /
+        (consumeEffectObservationPollTicks * 50),
+    );
+    for (let attempt = 0; attempt <= finalAttempt; attempt += 1) {
+      const current = this.safeObserve(bot);
+      if (
+        operationEvidence(
+          bot,
+          operation,
+          before,
+          current,
+          serverUpdates,
+          active,
+        )
+      )
+        return;
+      if (attempt === finalAttempt) return;
+      await waitTicks(
+        consumeEffectObservationPollTicks,
+        active.controller.signal,
+      );
     }
   }
 

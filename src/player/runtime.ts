@@ -99,6 +99,8 @@ export class PlayerRuntime {
   #retryDelayMs = 5_000;
   #bodyNeedsRecovery = false;
   #recoveryRequestedOperationIds = new Set<string>();
+  #ownerProposalsAwaitingResolution = new Set<string>();
+  #ownerConsumeOperations = new Set<string>();
   #bodyConnected = true;
   #started = false;
   #shuttingDown = false;
@@ -148,6 +150,7 @@ export class PlayerRuntime {
       });
     }
     const snapshot = this.options.mind.snapshot();
+    this.#rememberPendingOwnerProposals(snapshot);
     this.#handledPurposeCompletionWakeSequence =
       this.options.mind.purposeCompletionWakeState().sequence;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
@@ -217,6 +220,7 @@ export class PlayerRuntime {
 
   /** Called after a durable owner proposal was recorded; this leaves the body running. */
   public onOwnerProposal(): void {
+    this.#rememberPendingOwnerProposals(this.options.mind.snapshot());
     const event = this.options.mind
       .pendingEvents(12)
       .findLast(({ kind }) => kind === "owner_proposal");
@@ -277,6 +281,7 @@ export class PlayerRuntime {
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     this.#retryTimer = undefined;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
+    this.#handleOwnerProposalResolution(snapshot, decision);
     if (decision.kind === "complete") this.#dispatchNewPurposeCompletionWake();
     if (decision.kind === "act") {
       this.#abortActiveBody("action_revision_changed");
@@ -303,6 +308,68 @@ export class PlayerRuntime {
       state.pendingEvent.summary,
       true,
     );
+  }
+
+  #rememberPendingOwnerProposals(snapshot: PlayerRuntimeSnapshot): void {
+    for (const proposal of snapshot.proposals) {
+      if (proposal.status === "pending")
+        this.#ownerProposalsAwaitingResolution.add(proposal.id);
+    }
+    while (this.#ownerProposalsAwaitingResolution.size > 16) {
+      const oldest = this.#ownerProposalsAwaitingResolution
+        .values()
+        .next().value;
+      if (oldest === undefined) break;
+      this.#ownerProposalsAwaitingResolution.delete(oldest);
+    }
+  }
+
+  #handleOwnerProposalResolution(
+    snapshot: PlayerRuntimeSnapshot,
+    decision: PlayerThoughtDecision,
+  ): void {
+    if (
+      this.#shuttingDown ||
+      snapshot.stopped ||
+      this.options.mind.snapshot().stopped
+    )
+      return;
+    const latestJudgment = snapshot.recentJudgments.at(-1);
+    const directlyResolvedId =
+      latestJudgment?.kind === decision.kind
+        ? latestJudgment.proposalId
+        : undefined;
+    const resolved = snapshot.proposals.filter(
+      ({ id, status, resolution }) =>
+        status !== "pending" &&
+        resolution !== undefined &&
+        (this.#ownerProposalsAwaitingResolution.has(id) ||
+          id === directlyResolvedId),
+    );
+    const proposal =
+      resolved.find(({ id }) => id === directlyResolvedId) ??
+      (resolved.length === 1 ? resolved[0] : undefined);
+    if (proposal === undefined) return;
+    this.#ownerProposalsAwaitingResolution.delete(proposal.id);
+
+    if (decision.kind === "act" && decision.operation.kind === "consume") {
+      this.#ownerConsumeOperations.add(decision.operationId);
+      while (this.#ownerConsumeOperations.size > 16) {
+        const oldest = this.#ownerConsumeOperations.values().next().value;
+        if (oldest === undefined) break;
+        this.#ownerConsumeOperations.delete(oldest);
+      }
+      return;
+    }
+
+    const resolution = sanitizeDetail(proposal.resolution ?? "");
+    if (resolution.length === 0) return;
+    void this.#sayWhileActive(`提案への判断：${resolution}`);
+  }
+
+  async #sayWhileActive(message: string): Promise<void> {
+    if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
+    await this.#safeSay(message);
   }
 
   private onBodyEvent(event: PlayerBodyEvent): void {
@@ -594,6 +661,9 @@ export class PlayerRuntime {
     operation: Parameters<PlayerBody["execute"]>[0],
     expectedOutcome: string,
   ): Promise<void> {
+    const reportOwnerConsume = this.#ownerConsumeOperations.delete(
+      run.operationId,
+    );
     let result: PlayerOperationResult | undefined;
     try {
       result = await this.options.body.execute(
@@ -674,6 +744,8 @@ export class PlayerRuntime {
       recoveryRequired,
     });
     if (this.#activeBody === run) this.#activeBody = undefined;
+    if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)
+      await this.#sayWhileActive(ownerConsumeOutcomeMessage(result, outcome));
     if (
       !recoveryRequired &&
       !saved.stopped &&
@@ -996,6 +1068,61 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
   const observedEffect = result.observedEffect?.type;
   const movement = observedMovementSummary(result);
   return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}${movement}次の判断では結果の実観測を再確認する。`;
+}
+
+function ownerConsumeOutcomeMessage(
+  result: PlayerOperationResult | undefined,
+  outcome: McSkillOutcomeStatus,
+): string {
+  const beforeFood = result?.before?.self.food;
+  const afterFood = result?.after?.self.food;
+  const foodChange =
+    beforeFood == null || afterFood == null
+      ? ""
+      : `実行前food=${beforeFood}、実行後food=${afterFood}。`;
+  if (
+    result?.operation.kind === "consume" &&
+    result.status === "successful" &&
+    beforeFood != null &&
+    afterFood != null &&
+    afterFood > beforeFood &&
+    consumeItemCountDecreased(result)
+  )
+    return `食事操作が成功し、food値が${beforeFood}から${afterFood}へ増えたことを観測しました。体力回復は確認していません。`;
+
+  const statusMessage: Record<McSkillOutcomeStatus, string> = {
+    successful:
+      "PlayerBodyは成功扱いでしたが、食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした。",
+    failed: "食事操作は失敗し、食べられたことを確認できませんでした。",
+    interrupted: "食事操作は中断され、成功を確認できませんでした。",
+    cancelled: "食事操作は取り消され、成功を確認できませんでした。",
+    unverified: "食事操作の結果を検証できず、成功を確認できませんでした。",
+  };
+  return `${statusMessage[outcome]}${foodChange}原因は観測から特定できていません。`;
+}
+
+function consumeItemCountDecreased(result: PlayerOperationResult): boolean {
+  if (
+    result.operation.kind !== "consume" ||
+    result.before === null ||
+    result.after === null
+  )
+    return false;
+  const itemName = result.operation.item;
+  const itemNames =
+    itemName === undefined
+      ? new Set(result.before.self.inventory.map((item) => item.name))
+      : new Set([itemName]);
+  const count = (
+    observation: PlayerOperationResult["before"],
+    name: string,
+  ): number =>
+    observation?.self.inventory
+      .filter((item) => item.name === name)
+      .reduce((total, item) => total + item.count, 0) ?? 0;
+  return [...itemNames].some(
+    (name) => count(result.before, name) > count(result.after, name),
+  );
 }
 
 function observedMovementSummary(result: PlayerOperationResult): string {

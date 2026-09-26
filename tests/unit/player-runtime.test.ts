@@ -452,6 +452,412 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("returns a resolved owner proposal reason without starting a rejected action", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Eat now",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    const decision: PlayerThoughtDecision = {
+      kind: "wait",
+      purpose: "Wait until food can be confirmed as useful.",
+      reason: "The current observation does not support eating.",
+      wakeOn: ["state_changed"],
+    };
+    const resolution =
+      "観測したfood値では食べる必要がなく、可食アイテムも確認できないため今回は実行しません。";
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "declined",
+        resolution,
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+      expect(fixture.body.started).toHaveLength(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("reports a consume result only from its before-and-after evidence", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the bread",
+      reason: "The owner asked the bot to eat bread.",
+      priority: 4,
+    });
+    const before = observation();
+    const bread = {
+      slot: 0,
+      itemId: 1,
+      name: "bread",
+      count: 1,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: null,
+      enchantments: [],
+    };
+    const after: PlayerBodyObservation = {
+      ...before,
+      self: {
+        ...before.self,
+        food: 18,
+        inventory: [],
+      },
+    };
+    fixture.body.setResultObservations(
+      {
+        ...before,
+        self: { ...before.self, food: 13, inventory: [bread] },
+      },
+      after,
+    );
+    const decision = action("owner-meal-op", {
+      kind: "consume",
+      item: "bread",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "The current observation supports eating bread.",
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("successful");
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toContain("food値が13から18へ増えた");
+      expect(fixture.messages[0]).toContain("体力回復は確認していません");
+      expect(fixture.messages[0]).not.toContain("体力が回復しました");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("does not announce a successful meal when the named item count is unchanged", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the bread",
+      reason: "The owner asked the bot to eat bread.",
+      priority: 4,
+    });
+    const bread = {
+      slot: 0,
+      itemId: 1,
+      name: "bread",
+      count: 1,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: null,
+      enchantments: [],
+    };
+    const before = observation();
+    const after: PlayerBodyObservation = {
+      ...before,
+      self: {
+        ...before.self,
+        food: 18,
+        inventory: [bread],
+      },
+    };
+    fixture.body.setResultObservations(
+      {
+        ...before,
+        self: { ...before.self, food: 13, inventory: [bread] },
+      },
+      after,
+    );
+    const decision = action("unproven-owner-meal-op", {
+      kind: "consume",
+      item: "bread",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "The current observation supports eating bread.",
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("successful");
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toContain(
+        "食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした",
+      );
+      expect(fixture.messages[0]).not.toContain("食事操作が成功し");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("reports failed eating without guessing whether the bot was full or lacked food", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the bread",
+      reason: "The owner asked the bot to eat bread.",
+      priority: 4,
+    });
+    const bread = {
+      slot: 0,
+      itemId: 1,
+      name: "bread",
+      count: 1,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: null,
+      enchantments: [],
+    };
+    const before = observation();
+    const unchanged: PlayerBodyObservation = {
+      ...before,
+      self: {
+        ...before.self,
+        food: 13,
+        inventory: [bread],
+      },
+    };
+    fixture.body.setResultObservations(unchanged, unchanged);
+    const decision = action("failed-owner-meal-op", {
+      kind: "consume",
+      item: "bread",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "The current observation supports eating bread.",
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("failed");
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toContain("食事操作は失敗し");
+      expect(fixture.messages[0]).toContain("原因は観測から特定できていません");
+      expect(fixture.messages[0]).not.toContain("満腹");
+      expect(fixture.messages[0]).not.toContain("食料がありません");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("reassesses a failed owner meal with its active intent and observed result", async () => {
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const ownerProposalRef: { current?: string } = {};
+    let thoughtCount = 0;
+    let failureContextPreserved = false;
+    let alternativeAccepted = false;
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        const isInitialDecision = thoughtCount === 1;
+        const decision = isInitialDecision
+          ? action("failed-owner-meal-op", {
+              kind: "consume",
+              item: "bread",
+            })
+          : action("reassess-after-failed-meal");
+        if (!isInitialDecision) {
+          failureContextPreserved =
+            snapshot.lastOutcome?.kind === "consume" &&
+            snapshot.lastOutcome.status === "failed" &&
+            events.some(({ kind }) => kind === "body_outcome") &&
+            snapshot.goals.some(
+              ({ ownerProposalId: linkedProposalId, status }) =>
+                linkedProposalId === ownerProposalRef.current &&
+                status === "active",
+            );
+        }
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+          ...(isInitialDecision && ownerProposalRef.current !== undefined
+            ? {
+                proposalResolution: {
+                  proposalId: ownerProposalRef.current,
+                  disposition: "adopted" as const,
+                  resolution: "The owner meal intent remains active.",
+                },
+              }
+            : {}),
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          fixture.mind.consumeEvents(events.map(({ id }) => id));
+        }
+        if (!isInitialDecision) alternativeAccepted = saved.accepted;
+        return { accepted: saved.accepted, decision };
+      },
+    });
+    runtimeRef.current = fixture.runtime;
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the available bread",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    ownerProposalRef.current = proposal.id;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("failed");
+      await waitFor(() => fixture.body.started.length === 2);
+
+      expect(thoughtCount).toBe(2);
+      expect(failureContextPreserved).toBe(true);
+      expect(alternativeAccepted).toBe(true);
+      expect(fixture.body.started).toEqual(["consume", "look"]);
+      expect(fixture.runtime.snapshot.lastOutcome).toMatchObject({
+        kind: "consume",
+        status: "failed",
+      });
+      expect(fixture.runtime.snapshot.goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
+      expect(fixture.body.maxConcurrent).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("keeps an owner stop latched when a consume result settles late", async () => {
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const ownerProposalRef: { current?: string } = {};
+    let purposeCalls = 0;
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        purposeCalls += 1;
+        const decision = action(`meal-attempt-${purposeCalls}`, {
+          kind: "consume",
+          item: "bread",
+        });
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+          ...(purposeCalls === 1 && ownerProposalRef.current !== undefined
+            ? {
+                proposalResolution: {
+                  proposalId: ownerProposalRef.current,
+                  disposition: "adopted" as const,
+                  resolution: "The owner meal intent is being handled.",
+                },
+              }
+            : {}),
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          fixture.mind.consumeEvents(events.map(({ id }) => id));
+        }
+        return { accepted: saved.accepted, decision };
+      },
+    });
+    runtimeRef.current = fixture.runtime;
+    const proposal = fixture.mind.addProposal({
+      title: "Eat the available bread",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    ownerProposalRef.current = proposal.id;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+
+      fixture.runtime.receiveChat("owner", "止まれ");
+      await waitFor(() => fixture.runtime.snapshot.stopped);
+      // DeferredBody settles the aborted operation after a short delay.
+      await waitFor(
+        () => fixture.body.results.length === 1 && fixture.body.stopCalls > 0,
+      );
+      await waitFor(() => fixture.messages.length === 1);
+
+      expect(fixture.body.results[0]).toMatchObject({
+        operation: { kind: "consume" },
+        status: "interrupted",
+      });
+      expect(fixture.runtime.snapshot.lastOutcome).toMatchObject({
+        kind: "consume",
+        status: "interrupted",
+      });
+      expect(fixture.runtime.snapshot.stopped).toBe(true);
+      expect(purposeCalls).toBe(1);
+      expect(fixture.body.started).toEqual(["consume"]);
+      expect(fixture.messages).toEqual([
+        "自律行動を停止しました。再開の指示があるまで停止を続けます。",
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("suppresses a delayed owner proposal response after the stop latch is set", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Eat now",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+    const decision: PlayerThoughtDecision = {
+      kind: "wait",
+      purpose: "Wait for a useful opportunity.",
+      reason: "The proposal cannot proceed now.",
+      wakeOn: ["state_changed"],
+    };
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "declined",
+        resolution: "A reason that must not be delivered after stop.",
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.mind.stop();
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fixture.messages).toEqual([]);
+      expect(fixture.body.started).toHaveLength(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("single-flights slow purpose thoughts and follows queued events once", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
@@ -1947,6 +2353,43 @@ function createMemoryPort(): PlayerMemoryPort {
     recall: () => [],
     persistGoals: () => undefined,
     recordEpisode: () => undefined,
+  };
+}
+
+function createRuntimeFixture(purpose?: PlayerPurposePort) {
+  const directory = temporaryDirectory();
+  const databasePath = join(directory, "player.sqlite");
+  const mind = PlayerMindStore.open(databasePath);
+  const skills = openSkills(databasePath, directory);
+  const body = new DeferredBody();
+  const messages: string[] = [];
+  const runtime = new PlayerRuntime({
+    ownerUsername: "owner",
+    playerId: "owner-player",
+    body,
+    mind,
+    memory: createMemoryPort(),
+    skills,
+    conversation: {
+      nextTurn: () => 1,
+      handleOwnerMessage: async () => undefined,
+    },
+    purpose: purpose ?? { think: async () => ({ accepted: false }) },
+    logger: pino({ level: "silent" }),
+    say: async (message) => {
+      messages.push(message);
+    },
+  });
+  return {
+    body,
+    mind,
+    runtime,
+    messages,
+    close: async () => {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    },
   };
 }
 
