@@ -237,4 +237,6 @@ HEAD `a724e6e` の対象試験ではBody smokeと自発生活がpassし、未知
 
 0 GPTの隔離Paper帰路診断では、同じ壁・水路fixtureで標的の可視確認と採掘、地上dropの存在を確認しました。採掘直後の位置ずれがあったため乾地の待機位置へ戻した後、drop付近への`move_to`とspawnへの`move_to`はともに経路探索成功・サーバー到着を確認しました。拾得は確認できず、帰還時にも所持していません。診断手順はpass、API呼び出し0、cleanup 3/3です。この一回は経路が存在することを示しますが、実GPT試験での移動失敗原因、拾得・持帰り、再現性は未確認です。
 
+HEAD `f7c5e97` の全case試験では、Body smoke、runtime、自発生活、観測境界、再起動後の記憶がpassしました。学習caseは最初の採掘まで進み、8個の原木をサーバーと新しいBody観測で確認しましたが、仮説Skillの提案1件が固定コード`OPERATION_REFERENCE_MISMATCH`で拒否され、学習更新0件のまま未完了でした。後続のSkill簡潔性とMarkdown往復は学習成果がなく未完了です。建築caseは10 calls・既知103,691 tokensでcase上限に達し、保存された判断には配置を確認できず、fixture穴はairのままでした。未知状況、並行会話、統合結果は未実施です。run全体は40 calls・既知278,744 tokens、usageは`partial_or_unknown`、cleanup 3/3でした。この結果だけから学習修正後の実GPT効果や、建築で穴が配置候補として見えていたかは判断しません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集後の帰還と全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
