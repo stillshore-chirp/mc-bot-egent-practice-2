@@ -311,6 +311,7 @@ interface UnknownCompositeDiagnostic {
   readonly unknownWallFixtureConfirmed?: boolean;
   readonly unknownDryGroundFixtureConfirmed?: boolean;
   readonly unknownSideRouteConfirmed?: boolean;
+  readonly unknownInitialViewCorridorConfirmed?: boolean;
   readonly unknownSideViewCorridorConfirmed?: boolean;
   readonly unknownTaskObservationStatus?: "available" | "unknown";
   readonly unknownTaskTargetBlockVisible?: boolean;
@@ -3765,6 +3766,7 @@ async function main(): Promise<void> {
           unknownWallFixtureConfirmed: true,
           unknownDryGroundFixtureConfirmed: true,
           unknownSideRouteConfirmed: true,
+          unknownInitialViewCorridorConfirmed: true,
           unknownSideViewCorridorConfirmed: true,
         });
         await prepareUnknownObservationClients(
@@ -5982,6 +5984,9 @@ async function runOperationSmoke(
           incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
         let obstacleRouteVerifiedByServer = false;
         if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
+          await removeHiddenContainerFixture(rcon, smokeSpawn, {
+            chest: fixturePoint(smokeSpawn, 6, 0),
+          });
           await configureUnknownFixture(rcon, smokeSpawn, state.botName);
           const fixtureTarget = unknownFixtureTarget(smokeSpawn);
           if (!(await isBlock(rcon, fixtureTarget, "blue_wool")))
@@ -7688,18 +7693,26 @@ async function configureUnknownFixture(
   const wall = { x: wallX, y: 64, z };
   const targetSupport = { x: target.x, y: target.y - 1, z: target.z };
   await rcon.command(`clear ${botName}`);
-  await rcon.command(`fill ${wallX} 64 ${z - 1} ${wallX} 67 ${z + 1} stone`);
+  await rcon.command(`fill ${wallX} 64 ${z - 1} ${wallX} 64 ${z + 1} stone`);
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
   await setAndVerifyGamerule(rcon, "advanceTime", false);
   await rcon.command("time set 1000");
   if (!(await isBlock(rcon, wall, "stone")))
     incomplete("UNKNOWN_WALL_FIXTURE_NOT_CONFIRMED");
-  if (!(await isBlock(rcon, { x: wallX, y: 65, z }, "stone")))
-    incomplete("UNKNOWN_FIXTURE_INITIAL_OCCLUSION_NOT_CONFIRMED");
+  if (!(await isBlock(rcon, { x: wallX, y: 65, z }, "air")))
+    incomplete("UNKNOWN_FIXTURE_INITIAL_VIEW_BLOCKED");
   if (!(await isBlock(rcon, targetSupport, "stone")))
     incomplete("UNKNOWN_DRY_GROUND_FIXTURE_NOT_CONFIRMED");
   if (!(await isBlock(rcon, target, "blue_wool")))
     incomplete("UNKNOWN_TARGET_FIXTURE_NOT_CONFIRMED");
+  await verifyUnknownFixtureSightline(
+    rcon,
+    { x: origin.x, y: origin.y + 1.62, z: origin.z },
+    target,
+    UNKNOWN_FIXTURE_YAW,
+    "UNKNOWN_FIXTURE_INITIAL_VIEW_NOT_IN_FIELD_OF_VIEW",
+    "UNKNOWN_FIXTURE_INITIAL_VIEW_CORRIDOR_BLOCKED",
+  );
   await verifyUnknownFixtureLateralApproach(rcon, origin, target, z);
 }
 
@@ -7739,11 +7752,24 @@ async function verifyUnknownFixtureLateralApproach(
     }
   }
 
-  const eye = {
-    x: origin.x,
-    y: origin.y + 1.62,
-    z: centerZ + 3.5,
-  };
+  await verifyUnknownFixtureSightline(
+    rcon,
+    { x: origin.x, y: origin.y + 1.62, z: centerZ + 3.5 },
+    target,
+    UNKNOWN_FIXTURE_YAW,
+    "UNKNOWN_FIXTURE_SIDE_VIEW_NOT_IN_FIELD_OF_VIEW",
+    "UNKNOWN_FIXTURE_SIDE_VIEW_CORRIDOR_BLOCKED",
+  );
+}
+
+async function verifyUnknownFixtureSightline(
+  rcon: LocalRcon,
+  eye: Position,
+  target: BlockPosition,
+  yaw: number,
+  fieldOfViewFailureCode: string,
+  corridorFailureCode: string,
+): Promise<void> {
   const targetCenter = {
     x: target.x + 0.5,
     y: target.y + 0.5,
@@ -7754,7 +7780,7 @@ async function verifyUnknownFixtureLateralApproach(
   const dz = targetCenter.z - eye.z;
   const horizontalDistance = Math.hypot(dx, dz);
   const expectedYaw = (Math.atan2(-dx, -dz) * 180) / Math.PI;
-  const horizontalAngle = angularDistance(expectedYaw, UNKNOWN_FIXTURE_YAW);
+  const horizontalAngle = angularDistance(expectedYaw, yaw);
   const verticalAngle = Math.abs(
     (Math.atan2(dy, horizontalDistance) * 180) / Math.PI,
   );
@@ -7763,7 +7789,7 @@ async function verifyUnknownFixtureLateralApproach(
     horizontalAngle > 55 ||
     verticalAngle > 40
   ) {
-    incomplete("UNKNOWN_FIXTURE_SIDE_VIEW_NOT_IN_FIELD_OF_VIEW");
+    incomplete(fieldOfViewFailureCode);
   }
 
   const sampleCount = Math.ceil(Math.hypot(horizontalDistance, dy) * 8);
@@ -7780,8 +7806,7 @@ async function verifyUnknownFixtureLateralApproach(
     clearViewCells.set(`${cell.x},${cell.y},${cell.z}`, cell);
   }
   for (const cell of clearViewCells.values()) {
-    if (!(await isBlock(rcon, cell, "air")))
-      incomplete("UNKNOWN_FIXTURE_SIDE_VIEW_CORRIDOR_BLOCKED");
+    if (!(await isBlock(rcon, cell, "air"))) incomplete(corridorFailureCode);
   }
 }
 
