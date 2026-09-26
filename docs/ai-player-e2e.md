@@ -241,4 +241,8 @@ HEAD `f7c5e97` の全case試験では、Body smoke、runtime、自発生活、�
 
 HEAD `215d3d6` の全case試験は`learning_reuse`の初回digとserver world changeを確認した後、`first_dig_confirmed`段階で未完了でした。公開artifactの固定理由は`ONE_SUCCESS_DID_NOT_CREATE_VERIFIED_HYPOTHESIS`でした。同じrunのprivate sidecarでは、そのsuccessful digに既存のtrusted-derived Skill version 3が使われたことを確認しています。従来の「新しいSkill IDが作られたこと」だけを求めるpredicateが、この有効な経路を落としていました。上記の基準では、開始時DB snapshot上のsuccessful derivationとrevision version、初回outcomeのSkill ID/version一致を追加で確認した場合に限り、既存Skill経路として受け入れます。このrunは修正後の再利用条件を通過した証拠ではありません。
 
+同じ全case試験ではBody smoke、runtime、自発生活、観測境界、再起動後の記憶がpassし、学習更新は3件でした。建築caseは事前の新しいBody観測にfixture穴が配置候補として入り、`place`の成功結果とRCONでの`oak_planks`充填を確認しました。ただしcase累計101,673 tokensで100,000-token上限を超え、前後world snapshotを使う最終predicateより先に停止したため、caseは未完了です。run全体は40 calls・既知306,565 tokens、usageは`partial_or_unknown`、cleanupは3/3です。未知状況、並行会話、統合結果は未実施です。
+
+後続の0 GPT帰路診断では、初回は採掘前提が未成立でした。採掘直前の乾地・支持ブロック・位置一致を確認する診断を追加した次の実行では採掘とdrop付近・spawnへの移動が成功しましたが、所持は確認できず、移動後の半径2ブロック検索でdrop位置は不明でした。検索半径を最大16ブロックへ限定して広げた実行では、移動直後に標的から半径8ブロック以内のdropを確認し、Botとの距離は2ブロック以上でした。拾得待ち後のdrop位置は不明で、所持はありません。いずれもAPI呼び出し0、終了処理3/3です。dropが移動した経路と実GPT試験での取得・帰還は未確認です。診断手順のpassをIssue受け入れには数えません。
+
 Issue #72全体の受け入れは未達です。`unknown_composite`の採集後の帰還と全caseを通した統合結果は未確認です。対象試験の後続caseをpassへ読み替えません。
