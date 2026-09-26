@@ -16,6 +16,26 @@ export type UnknownDistanceBucket =
 export type UnknownTaskProgressSampleStatus =
   "not_sampled" | "available" | "unavailable" | "partial" | "capped";
 
+export function unknownDistanceBucket(
+  distanceValue: number,
+): UnknownDistanceBucket | undefined {
+  if (!Number.isFinite(distanceValue) || distanceValue < 0) return undefined;
+  return distanceBucket(distanceValue);
+}
+
+export function unknownDistanceImprovedByMinimum(
+  startingDistance: number,
+  currentDistance: number,
+): boolean {
+  return (
+    Number.isFinite(startingDistance) &&
+    Number.isFinite(currentDistance) &&
+    startingDistance >= 0 &&
+    currentDistance >= 0 &&
+    currentDistance < startingDistance - MIN_CLOSER_DISTANCE
+  );
+}
+
 export interface UnknownTaskProgressAggregate {
   readonly sampleCount: number;
   readonly sampleLimitReached: boolean;

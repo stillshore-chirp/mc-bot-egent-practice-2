@@ -91,6 +91,8 @@ import {
 } from "./player-snapshot-sidecar.js";
 import {
   recordUnknownTaskProgressSample,
+  unknownDistanceBucket,
+  unknownDistanceImprovedByMinimum,
   type UnknownDistanceBucket,
   type UnknownTaskProgressAggregate,
   type UnknownTaskProgressSampleStatus,
@@ -162,6 +164,7 @@ const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 2_000;
 const UNKNOWN_OBSTACLE_READINESS_WINDOW_MS = 1_000;
 const UNKNOWN_OBSTACLE_READINESS_POLL_MS = 100;
 const UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS = 200;
+const UNKNOWN_POST_PICKUP_SAMPLE_LIMIT = 64;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
@@ -306,6 +309,7 @@ type UnknownObstacleReadinessStatus =
   | "standing_space_unavailable"
   | "other_entities_not_clear"
   | "oracle_unavailable";
+type UnknownMoveOperationKind = "move_to" | "move_relative";
 
 interface UnknownCompositeDiagnostic {
   readonly unknownTargetInitiallyPresent?: boolean;
@@ -336,6 +340,14 @@ interface UnknownCompositeDiagnostic {
   readonly unknownPostTaskBlocksProgressObserved?: boolean;
   readonly unknownPostTaskPositionProgressObserved?: boolean;
   readonly unknownPostTaskInventoryProgressObserved?: boolean;
+  readonly unknownPostPickupProgressSampleStatus?: UnknownTaskProgressSampleStatus;
+  readonly unknownPostPickupProgressSampleCount?: number;
+  readonly unknownPostPickupRuntimeSampleMissing?: boolean;
+  readonly unknownPostPickupStartingSpawnDistanceBucket?: UnknownDistanceBucket;
+  readonly unknownPostPickupCurrentSpawnDistanceBucket?: UnknownDistanceBucket;
+  readonly unknownPostPickupNearestSpawnDistanceBucket?: UnknownDistanceBucket;
+  readonly unknownPostPickupMovedCloserToSpawn?: boolean;
+  readonly unknownPostPickupLastMoveOperationKind?: UnknownMoveOperationKind;
   readonly unknownFixtureFacingCommanded?: boolean;
   readonly unknownFixtureFacingReadbackAvailable?: boolean;
   readonly unknownFixtureFacingConfirmed?: boolean;
@@ -1500,6 +1512,42 @@ function safeOperationKind(
     playerOperationNames.includes(value as PlayerOperationName)
     ? (value as PlayerOperationName)
     : undefined;
+}
+
+function lastUnknownMoveOperationKind(
+  player: PlayerEvidence,
+  afterAt: number,
+): UnknownMoveOperationKind | undefined {
+  let latest:
+    | { readonly at: number; readonly kind: UnknownMoveOperationKind }
+    | undefined;
+  const consider = (
+    value: string | undefined,
+    timestamp: string | undefined,
+  ) => {
+    const kind = safeOperationKind(value);
+    const at = timestamp === undefined ? Number.NaN : Date.parse(timestamp);
+    if (
+      (kind !== "move_to" && kind !== "move_relative") ||
+      !Number.isFinite(at) ||
+      at < afterAt ||
+      (latest !== undefined && latest.at > at)
+    ) {
+      return;
+    }
+    latest = { at, kind };
+  };
+
+  const active = player.activeOperation;
+  consider(active?.kind, active?.bodyStartedAt ?? active?.startedAt);
+  for (const judgment of player.recentJudgments) {
+    if (judgment.kind === "act")
+      consider(judgment.operationKind, judgment.decidedAt);
+  }
+  for (const outcome of player.recentOutcomes) {
+    consider(outcome.kind, outcome.observedAt);
+  }
+  return latest?.kind;
 }
 
 function safeJudgmentKind(
@@ -3895,6 +3943,14 @@ async function main(): Promise<void> {
         const unknownTaskSentAt: { value: number | undefined } = {
           value: undefined,
         };
+        let unknownPickupConfirmedAt: number | undefined;
+        let unknownPostPickupSampleCount = 0;
+        let unknownPostPickupStartingSpawnDistance: number | undefined;
+        let unknownPostPickupNearestSpawnDistance: number | undefined;
+        let unknownPostPickupMovedCloserToSpawn = false;
+        let unknownPostPickupRuntimeSampleMissing = false;
+        let unknownPostPickupLastMoveOperationKind:
+          UnknownMoveOperationKind | undefined;
         let unknownProgressAggregate: UnknownTaskProgressAggregate | undefined;
         let unknownPostTaskSampleFailureSeen = false;
         const attemptedObstacleOperationIds = new Set<string>();
@@ -3951,11 +4007,13 @@ async function main(): Promise<void> {
               unknownServerProgressObserved:
                 observedWorldProgress(beforeWorld, currentWorld) !== undefined,
             });
+            let sampledPlayer: PlayerEvidence | undefined;
+            let runtimeSampleAttempted = false;
             if (unknownTaskSentAt.value !== undefined && nearTarget) {
               try {
-                const observation = playerOf(
-                  await collect(context.runtime.app),
-                ).lastObservation;
+                runtimeSampleAttempted = true;
+                sampledPlayer = playerOf(await collect(context.runtime.app));
+                const observation = sampledPlayer.lastObservation;
                 const observationAt = Date.parse(observation?.observedAt ?? "");
                 const fresh =
                   Number.isFinite(observationAt) &&
@@ -3975,6 +4033,91 @@ async function main(): Promise<void> {
                 });
               } catch {
                 // A player snapshot failure does not erase the RCON oracle.
+              }
+            }
+            if (
+              itemReturned &&
+              unknownTaskSentAt.value !== undefined &&
+              unknownPostPickupSampleCount < UNKNOWN_POST_PICKUP_SAMPLE_LIMIT
+            ) {
+              unknownPickupConfirmedAt ??= sampledAt;
+              const spawnDistance = Math.hypot(
+                currentWorld.position.x - spawn.x,
+                currentWorld.position.y - spawn.y,
+                currentWorld.position.z - spawn.z,
+              );
+              const spawnDistanceBucket = unknownDistanceBucket(spawnDistance);
+              if (spawnDistanceBucket !== undefined) {
+                unknownPostPickupStartingSpawnDistance ??= spawnDistance;
+                unknownPostPickupNearestSpawnDistance = Math.min(
+                  unknownPostPickupNearestSpawnDistance ?? spawnDistance,
+                  spawnDistance,
+                );
+                unknownPostPickupMovedCloserToSpawn ||=
+                  unknownDistanceImprovedByMinimum(
+                    unknownPostPickupStartingSpawnDistance,
+                    spawnDistance,
+                  );
+                if (!runtimeSampleAttempted) {
+                  try {
+                    runtimeSampleAttempted = true;
+                    sampledPlayer = playerOf(
+                      await collect(context.runtime.app),
+                    );
+                  } catch {
+                    unknownPostPickupRuntimeSampleMissing = true;
+                  }
+                }
+                if (sampledPlayer === undefined) {
+                  unknownPostPickupRuntimeSampleMissing = true;
+                } else {
+                  const moveKind = lastUnknownMoveOperationKind(
+                    sampledPlayer,
+                    unknownPickupConfirmedAt,
+                  );
+                  if (moveKind !== undefined) {
+                    unknownPostPickupLastMoveOperationKind = moveKind;
+                  }
+                }
+                unknownPostPickupSampleCount += 1;
+                const startingSpawnDistanceBucket = unknownDistanceBucket(
+                  unknownPostPickupStartingSpawnDistance,
+                );
+                const nearestSpawnDistanceBucket = unknownDistanceBucket(
+                  unknownPostPickupNearestSpawnDistance,
+                );
+                updateUnknownCompositeDiagnostic(state, {
+                  unknownPostPickupProgressSampleStatus:
+                    unknownPostPickupRuntimeSampleMissing
+                      ? "partial"
+                      : unknownPostPickupSampleCount >=
+                          UNKNOWN_POST_PICKUP_SAMPLE_LIMIT
+                        ? "capped"
+                        : "available",
+                  unknownPostPickupProgressSampleCount:
+                    unknownPostPickupSampleCount,
+                  unknownPostPickupRuntimeSampleMissing,
+                  ...(startingSpawnDistanceBucket === undefined
+                    ? {}
+                    : {
+                        unknownPostPickupStartingSpawnDistanceBucket:
+                          startingSpawnDistanceBucket,
+                      }),
+                  unknownPostPickupCurrentSpawnDistanceBucket:
+                    spawnDistanceBucket,
+                  ...(nearestSpawnDistanceBucket === undefined
+                    ? {}
+                    : {
+                        unknownPostPickupNearestSpawnDistanceBucket:
+                          nearestSpawnDistanceBucket,
+                      }),
+                  unknownPostPickupMovedCloserToSpawn,
+                  ...(unknownPostPickupLastMoveOperationKind === undefined
+                    ? {}
+                    : {
+                        unknownPostPickupLastMoveOperationKind,
+                      }),
+                });
               }
             }
             if (
@@ -4035,6 +4178,12 @@ async function main(): Promise<void> {
                         ? "unavailable"
                         : "partial",
                   }),
+              ...(unknownPickupConfirmedAt === undefined
+                ? {}
+                : {
+                    unknownPostPickupProgressSampleStatus: "partial",
+                    unknownPostPickupRuntimeSampleMissing: true,
+                  }),
             });
             if (
               unknownTaskSentAt.value !== undefined &&
@@ -4079,6 +4228,7 @@ async function main(): Promise<void> {
           unknownHandoffTaskSent: true,
           unknownTaskObservationStatus: "unknown",
           unknownPostTaskProgressSampleStatus: "not_sampled",
+          unknownPostPickupProgressSampleStatus: "not_sampled",
         });
         let taskObservationCaptured = false;
         const afterPlayer = await waitForPlayer(

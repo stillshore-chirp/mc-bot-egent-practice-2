@@ -1,6 +1,29 @@
 import { describe, expect, it } from "vitest";
 
-import { recordUnknownTaskProgressSample } from "./unknown-task-progress.js";
+import {
+  unknownDistanceImprovedByMinimum,
+  recordUnknownTaskProgressSample,
+  unknownDistanceBucket,
+} from "./unknown-task-progress.js";
+
+describe("unknown-task distance buckets", () => {
+  it("keeps spawn-return evidence coarse at each bucket boundary", () => {
+    expect(unknownDistanceBucket(0)).toBe("under_2");
+    expect(unknownDistanceBucket(1.999)).toBe("under_2");
+    expect(unknownDistanceBucket(2)).toBe("2_to_under_5");
+    expect(unknownDistanceBucket(4.999)).toBe("2_to_under_5");
+    expect(unknownDistanceBucket(5)).toBe("5_to_under_10");
+    expect(unknownDistanceBucket(9.999)).toBe("5_to_under_10");
+    expect(unknownDistanceBucket(10)).toBe("10_or_more");
+    expect(unknownDistanceBucket(Number.NaN)).toBeUndefined();
+  });
+
+  it("uses the progress aggregate's minimum closer distance", () => {
+    expect(unknownDistanceImprovedByMinimum(10, 9.749)).toBe(true);
+    expect(unknownDistanceImprovedByMinimum(10, 9.75)).toBe(false);
+    expect(unknownDistanceImprovedByMinimum(10, 9.8)).toBe(false);
+  });
+});
 
 const startingPosition = { x: 0, y: 64, z: 0 };
 const targetPosition = { x: 10, y: 64, z: 0 };
