@@ -477,6 +477,38 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
   return target;
 }
 
+function prepareConsumeFixture(
+  fake: ReturnType<typeof makeFakeBot>,
+  food = 19,
+): Record<string, unknown> {
+  const bread = {
+    type: 5,
+    name: "bread",
+    count: 1,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+  };
+  const inventory = fake.bot.inventory as unknown as {
+    slots: (Record<string, unknown> | null)[];
+  };
+  inventory.slots[36] = bread;
+  fake.bot.food = food;
+  const registry = fake.bot.registry as unknown as {
+    foodsByName: Record<string, { effectiveQuality: number }>;
+  };
+  registry.foodsByName.bread = { effectiveQuality: 2 };
+  Object.assign(fake.bot, {
+    equip: vi.fn(async (item: unknown) => {
+      Object.assign(fake.bot, { heldItem: item });
+    }),
+  });
+  return bread;
+}
+
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
     expect(playerOperationNames).toHaveLength(31);
@@ -572,6 +604,95 @@ describe("player body", () => {
     expect(() =>
       playerOperationSchema.parse({ kind: "collect_item", entityId: 0 }),
     ).toThrow();
+  });
+
+  it("waits for delayed server food and inventory updates after consume", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const bread = prepareConsumeFixture(fake);
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          setTimeout(() => {
+            fake.bot.food = 20;
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, bread, null);
+          }, 200);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({ kind: "consume", item: "bread" });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.food).toBe(19);
+      expect(result.after?.self.food).toBe(20);
+      expect(result.before?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "bread", count: 1 }),
+      );
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "bread" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a consume without observed state changes unverified", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      prepareConsumeFixture(fake);
+      Object.assign(fake.bot, { consume: vi.fn(async () => undefined) });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({ kind: "consume", item: "bread" });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.before?.self.food).toBe(19);
+      expect(result.after?.self.food).toBe(19);
+      expect(result.before?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "bread", count: 1 }),
+      );
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "bread", count: 1 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets stop interrupt consume confirmation", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      prepareConsumeFixture(fake);
+      Object.assign(fake.bot, { consume: vi.fn(async () => undefined) });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const resultPromise = body.execute({ kind: "consume", item: "bread" });
+      setTimeout(() => {
+        void body.stop();
+      }, 100);
+
+      await vi.advanceTimersByTimeAsync(200);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.before?.self.food).toBe(19);
+      expect(result.after?.self.food).toBe(19);
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "bread", count: 1 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("follows a currently visible item entity and confirms pickup by entity ID", async () => {
