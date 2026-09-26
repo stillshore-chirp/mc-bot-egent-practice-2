@@ -488,6 +488,232 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it.each(["successful", "failed", "unverified"] as const)(
+    "reports an equip outcome for %s using the equipment observation",
+    async (status) => {
+      const fixture = createRuntimeFixture();
+      const proposal = fixture.mind.addProposal({
+        title: "Wear the iron helmet",
+        reason: "The owner asked the bot to wear the iron helmet.",
+        priority: 4,
+      });
+      const candidate = observedStack("iron_helmet", 36);
+      const priorHelmet = observedStack("leather_helmet", 5);
+      const before = observation();
+      const after: PlayerBodyObservation = {
+        ...before,
+        self: {
+          ...before.self,
+          inventory: status === "successful" ? [] : [candidate, priorHelmet],
+          equipment: {
+            head: status === "successful" ? candidate : priorHelmet,
+          },
+        },
+      };
+      fixture.body.setResultObservations(
+        {
+          ...before,
+          self: {
+            ...before.self,
+            inventory: [candidate, priorHelmet],
+            equipment: { head: priorHelmet },
+          },
+        },
+        after,
+      );
+      const decision = action("owner-armor-op", {
+        kind: "equip",
+        item: "iron_helmet",
+        destination: "head",
+      });
+      const saved = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision,
+        proposalResolution: {
+          proposalId: proposal.id,
+          disposition: "adopted",
+          resolution: "The observed iron helmet can replace the leather one.",
+        },
+      });
+      if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+      try {
+        fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+        await waitFor(() => fixture.body.started.length === 1);
+        fixture.body.completeActive(status);
+        await waitFor(() => fixture.messages.length === 2);
+        expect(fixture.messages[0]).toContain("提案への判断：");
+        if (status === "successful") {
+          expect(fixture.messages[1]).toContain(
+            "実行後、頭の装備欄にiron_helmetがあることを観測しました",
+          );
+          expect(fixture.messages[1]).not.toContain("装備した");
+        } else {
+          expect(fixture.messages[1]).toContain("確認できませんでした");
+          expect(fixture.messages[1]).toContain(
+            status === "failed"
+              ? "装備操作は失敗しました"
+              : "装備操作の結果を確認できていません",
+          );
+          expect(fixture.messages[1]).toContain(
+            "頭の装備欄にはleather_helmetがあり、iron_helmetは確認できませんでした",
+          );
+          expect(fixture.messages[1]).toContain(
+            "原因は観測から特定できていません",
+          );
+        }
+        expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+          kind: "equip",
+          status,
+        });
+        expect(fixture.mind.snapshot().goals).toContainEqual(
+          expect.objectContaining({
+            ownerProposalId: proposal.id,
+            source: "owner",
+            status: "active",
+          }),
+        );
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  it("reports a self equip as observed state without claiming owner intent or change", async () => {
+    const fixture = createRuntimeFixture();
+    const helmet = observedStack("iron_helmet", 5);
+    const baseObservation = observation();
+    const before = {
+      ...baseObservation,
+      self: {
+        ...baseObservation.self,
+        inventory: [],
+        equipment: { head: helmet },
+      },
+    };
+    fixture.body.setResultObservations(before, before);
+    const decision = action("self-equip-op", {
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+    });
+    if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("successful");
+      await waitFor(() => fixture.messages.length === 1);
+
+      expect(fixture.messages).toEqual([
+        "装備操作は成功と判定されました。実行後、頭の装備欄にiron_helmetがあることを観測しました。",
+      ]);
+      expect(fixture.mind.snapshot().goals).toHaveLength(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    ["unobserved", {}],
+    ["observed empty", { head: null }],
+  ] as const)(
+    "distinguishes %s equipment from a present item",
+    async (state, equipment) => {
+      const fixture = createRuntimeFixture();
+      const before = observation();
+      const after: PlayerBodyObservation = {
+        ...before,
+        self: { ...before.self, equipment },
+      };
+      fixture.body.setResultObservations(before, after);
+      const decision = action(`equip-${state}`, {
+        kind: "equip",
+        item: "iron_helmet",
+        destination: "head",
+      });
+      const saved = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision,
+      });
+      if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+
+      try {
+        fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+        await waitFor(() => fixture.body.started.length === 1);
+        fixture.body.completeActive("unverified");
+        await waitFor(() => fixture.messages.length === 1);
+
+        expect(fixture.messages[0]).toContain(
+          "装備操作の結果を確認できていません。",
+        );
+        expect(fixture.messages[0]).toContain(
+          state === "unobserved"
+            ? "実行後の頭の装備欄は観測できませんでした。"
+            : "実行後の頭の装備欄は空で、iron_helmetは確認できませんでした。",
+        );
+        expect(fixture.messages[0]).not.toContain("PlayerBody");
+        expect(fixture.messages[0]).not.toContain("slot head");
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  it("suppresses a delayed equip result after the stop latch is set", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Wear the iron helmet",
+      reason: "The owner requested a helmet change.",
+      priority: 3,
+    });
+    const decision = action("owner-armor-stop-op", {
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "The observed iron helmet is being considered for use.",
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      await waitFor(() => fixture.messages.length === 1);
+      fixture.mind.stop();
+      await fixture.runtime.stopNow();
+      await waitFor(() => fixture.body.results.length === 1);
+
+      expect(fixture.body.results[0]).toMatchObject({
+        operation: { kind: "equip" },
+        status: "interrupted",
+      });
+      expect(fixture.runtime.snapshot.stopped).toBe(true);
+      expect(fixture.runtime.snapshot.goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          status: "active",
+        }),
+      );
+      expect(fixture.messages).toEqual([
+        "提案への判断：The observed iron helmet is being considered for use.",
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("reports a consume result only from its before-and-after evidence", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -2327,6 +2553,23 @@ function makeLookSweepEvidence(): PlayerBodyLookSweep {
     complete: true,
     candidateSearchMayBeTruncated: false,
     worldAbsenceEstablished: false,
+  };
+}
+
+function observedStack(
+  name: string,
+  slot: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId: 1,
+    name,
+    count: 1,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
+    customName: null,
+    enchantments: [],
   };
 }
 

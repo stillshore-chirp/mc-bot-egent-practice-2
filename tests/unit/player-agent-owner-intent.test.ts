@@ -390,6 +390,198 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("uses a short owner armor follow-up and observed equipment to choose an upgrade", async () => {
+    const observation = equipmentObservationFixture(
+      [observedArmorItem("iron_helmet", 36)],
+      { head: observedArmorItem("leather_helmet", 5) },
+    );
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      () => observation,
+    );
+    const conversationResponses: ScriptedResponse[] = [];
+    const conversationRequests: unknown[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(conversationResponses, conversationRequests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    conversationResponses.push(
+      terminalResponse("I will use the context of your follow-up."),
+      functionCallResponse("armor-proposal", "propose_goal_change", {
+        title: "Wear the iron helmet",
+        reason: "The owner clarified which helmet they meant.",
+        priority: 3,
+      }),
+      terminalResponse("I will compare it with my current equipment."),
+    );
+    const ownerRequest = "Could you put that helmet on?";
+    const ownerFollowUp = "The iron one.";
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: ownerRequest,
+        turn: conversation.nextTurn(),
+      });
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: ownerFollowUp,
+        turn: conversation.nextTurn(),
+      });
+      const proposal = fixture.mind.snapshot().proposals[0];
+      if (proposal === undefined)
+        throw new Error("TEST_ARMOR_PROPOSAL_MISSING");
+      expect(JSON.stringify(conversationRequests[1])).toContain(ownerRequest);
+      expect(JSON.stringify(conversationRequests[1])).toContain(ownerFollowUp);
+
+      fixture.responses.push(
+        functionCallResponse(
+          "equip-iron-helmet",
+          "commit_action_decision",
+          actionArguments(
+            {
+              ...proposalResolutionArguments(proposal, "adopted"),
+              goalTitle: proposal.title,
+              goalStatus: "active",
+              goalSource: "owner",
+              changeReason:
+                "The observed candidate improves the current helmet.",
+            },
+            "act",
+            {
+              kind: "equip",
+              item: "iron_helmet",
+              destination: "head",
+            },
+          ),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "owner-proposal-armor",
+            kind: "owner_proposal",
+            summary: "The owner asked me to wear the iron helmet.",
+            createdAt: "2026-09-27T00:00:00.000Z",
+          },
+        ],
+      });
+      expect(result).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: {
+            kind: "equip",
+            item: "iron_helmet",
+            destination: "head",
+          },
+        },
+      });
+      const purposeRequest = record(fixture.requests[0]);
+      expect(String(purposeRequest.instructions)).toContain(
+        "self.inventoryとself.equipmentを比較",
+      );
+      const purposeInput = purposeInputFromRequest(purposeRequest);
+      expect(purposeInput.observation.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "iron_helmet" }),
+      );
+      expect(purposeInput.observation.self.equipment.head).toMatchObject({
+        name: "leather_helmet",
+      });
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("declines an equip proposal when the observed slot already has the better item", async () => {
+    const fixtureObservation = equipmentObservationFixture(
+      [observedArmorItem("leather_helmet", 36)],
+      { head: observedArmorItem("diamond_helmet", 5) },
+    );
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      () => fixtureObservation,
+    );
+    const proposal = fixture.mind.addProposal({
+      title: "Wear the leather helmet",
+      reason: "The owner asked me to equip the helmet.",
+      priority: 3,
+    });
+    const resolution =
+      "現在の装備欄にdiamond_helmetがあり、所持品のleather_helmetへ替える利点を観測できないため実行しません。";
+
+    try {
+      fixture.responses.push(
+        functionCallResponse(
+          "decline-weaker-helmet",
+          "commit_action_decision",
+          actionArguments(
+            {
+              ...proposalResolutionArguments(proposal, "declined"),
+              resolution,
+            },
+            "wait",
+          ),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "owner-proposal-weaker-armor",
+            kind: "owner_proposal",
+            summary: "The owner asked the bot to wear the available helmet.",
+            createdAt: "2026-09-27T00:00:00.000Z",
+          },
+        ],
+      });
+      expect(result).toMatchObject({
+        accepted: true,
+        decision: { kind: "wait" },
+      });
+      const request = record(fixture.requests[0]);
+      expect(String(request.instructions)).toContain(
+        "現在の装備を維持するかを自律判断",
+      );
+      const purposeInput = purposeInputFromRequest(request);
+      expect(purposeInput.observation.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "leather_helmet" }),
+      );
+      expect(purposeInput.observation.self.equipment.head).toMatchObject({
+        name: "diamond_helmet",
+      });
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          id: proposal.id,
+          status: "declined",
+          resolution,
+        }),
+      );
+      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
+    } finally {
+      fixture.close();
+    }
+  });
+
   it.each([
     {
       name: "an ordinary reply whose send fails",
@@ -1144,6 +1336,9 @@ interface PurposeGatherInput {
         readonly name: string;
         readonly count: number;
       }[];
+      readonly equipment: Readonly<
+        Record<string, { readonly name: string; readonly count: number } | null>
+      >;
     };
     readonly perception: {
       readonly blocks: readonly {
@@ -1205,6 +1400,34 @@ function gatheringObservationFixture(input: {
         properties: {},
       })),
     },
+  };
+}
+
+function observedArmorItem(
+  name: string,
+  slot: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId: 1,
+    name,
+    count: 1,
+    metadata: 0,
+    durability: 10,
+    maxDurability: 10,
+    customName: null,
+    enchantments: [],
+  };
+}
+
+function equipmentObservationFixture(
+  inventory: PlayerBodyObservation["self"]["inventory"],
+  equipment: PlayerBodyObservation["self"]["equipment"],
+): PlayerBodyObservation {
+  const base = bodyObservationFixture();
+  return {
+    ...base,
+    self: { ...base.self, inventory, equipment },
   };
 }
 
@@ -1332,16 +1555,19 @@ function goalArguments(input: {
 function actionArguments(
   goalState: Record<string, unknown> | undefined,
   kind: "act" | "wait" = "act",
+  operation?: Record<string, unknown>,
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {
     kind,
     purpose: "Keep considering the owner intent.",
     operationJson:
       kind === "act"
-        ? JSON.stringify({
-            kind: "look",
-            target: { x: 1, y: 64, z: 1 },
-          })
+        ? JSON.stringify(
+            operation ?? {
+              kind: "look",
+              target: { x: 1, y: 64, z: 1 },
+            },
+          )
         : "",
     expectedOutcome: "The current view informs the next choice.",
     skillId: "",

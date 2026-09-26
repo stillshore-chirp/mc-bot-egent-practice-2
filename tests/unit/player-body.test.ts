@@ -606,6 +606,85 @@ describe("player body", () => {
     ).toThrow();
   });
 
+  it("confirms armor equip only when the post-action slot contains the selected item", async () => {
+    const fake = makeFakeBot();
+    const inventory = fake.bot.inventory as unknown as {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const leatherHelmet = {
+      type: 4,
+      name: "leather_helmet",
+      count: 1,
+      metadata: 0,
+      durabilityUsed: 1,
+      maxDurability: 55,
+      enchants: [],
+      nbt: null,
+    };
+    const ironHelmet = {
+      type: 5,
+      name: "iron_helmet",
+      count: 1,
+      metadata: 0,
+      durabilityUsed: 0,
+      maxDurability: 165,
+      enchants: [],
+      nbt: null,
+    };
+    inventory.slots[5] = leatherHelmet;
+    inventory.slots[36] = ironHelmet;
+    const equip = vi.fn(async (item: unknown) => {
+      const destinationSlot = fake.bot.getEquipmentDestSlot("head");
+      inventory.slots[destinationSlot] = item as Record<string, unknown>;
+      inventory.slots[36] = null;
+    });
+    Object.assign(fake.bot, { equip });
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+
+    expect(result.status).toBe("successful");
+    expect(result.before?.self.equipment.head?.name).toBe("leather_helmet");
+    expect(result.after?.self.equipment.head?.name).toBe("iron_helmet");
+    expect(equip).toHaveBeenCalledWith(ironHelmet, "head");
+  });
+
+  it("keeps an accepted equip unverified when the equipment slot did not update", async () => {
+    const fake = makeFakeBot();
+    const inventory = fake.bot.inventory as unknown as {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const ironHelmet = {
+      type: 5,
+      name: "iron_helmet",
+      count: 1,
+      metadata: 0,
+      durabilityUsed: 0,
+      maxDurability: 165,
+      enchants: [],
+      nbt: null,
+    };
+    inventory.slots[36] = ironHelmet;
+    const equip = vi.fn(async () => undefined);
+    Object.assign(fake.bot, { equip });
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+
+    expect(result.status).toBe("unverified");
+    expect(result.after?.self.equipment.head).toBeNull();
+    expect(result.after?.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "iron_helmet", count: 1 }),
+    );
+    expect(equip).toHaveBeenCalledOnce();
+  });
+
   it("waits for delayed server food and inventory updates after consume", async () => {
     vi.useFakeTimers();
     try {
