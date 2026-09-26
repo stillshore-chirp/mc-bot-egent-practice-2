@@ -1158,12 +1158,12 @@ describe("player body", () => {
         3: occludedEntity,
       },
       players: {
-        owner: {
+        Owner: {
           entity: {
             ...unknownHealthEntity,
             id: 4,
             position: new Vec3(0, 64, -6),
-            username: "owner",
+            username: "Owner",
           },
         },
       },

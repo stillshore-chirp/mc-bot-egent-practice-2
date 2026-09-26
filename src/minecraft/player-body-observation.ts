@@ -4,6 +4,7 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import { z } from "zod";
 import { Vec3 } from "vec3";
+import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 
 export interface BodyBlockCoordinates {
   readonly x: number;
@@ -876,7 +877,9 @@ export function observePlayerBody(
   const owner =
     requestedOwner === undefined
       ? undefined
-      : bot.players[requestedOwner]?.entity;
+      : Object.entries(bot.players).find(([username]) =>
+          sameMinecraftIdentity(username, requestedOwner),
+        )?.[1].entity;
   const ownerCurrentlyVisible =
     owner !== undefined &&
     insideViewCone(bot, owner.position.offset(0, owner.height * 0.55, 0)) &&
