@@ -54,6 +54,10 @@ import {
   type FurnaceRconReplyClass,
 } from "./furnace-rcon-classifier.js";
 import {
+  readEquipmentFieldFromRcon,
+  readExecuteIfItemsRconReply,
+} from "./equipment-rcon-oracle.js";
+import {
   blockIs,
   classifyRconReply,
   classifyTickStatus,
@@ -525,8 +529,13 @@ interface ReturnPathProbeDiagnostic {
 function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES"
   );
+}
+
+function isEquipmentRconProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES";
 }
 
 function classifyBodyMoveError(
@@ -2329,6 +2338,15 @@ interface RunState {
   serverReadyObserved?: boolean;
   applicationStartDiagnostic?: SafeApplicationStartDiagnostic;
   bodySmokeDiagnostic?: BodySmokeDiagnostic;
+  equipmentRconDiagnostic?: {
+    readonly bodyInventoryItemObserved: boolean;
+    readonly bodyEquipSuccessful: boolean;
+    readonly bodyEquipmentObserved: boolean;
+    readonly equipmentFieldObserved: boolean;
+    readonly equipmentHeadItemMatched: boolean;
+    readonly executeIfItemsResultObserved: boolean;
+    readonly executeIfItemsMatched: boolean;
+  };
   observationBoundaryCapture?: {
     readonly responseStart: number;
     responseEnd?: number;
@@ -2518,6 +2536,11 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (isEquipmentRconProbeOnly()) {
+      await runEquipmentRconProbe(state, rcon);
+      state.status = "pass";
+      return;
+    }
     const owner = await connectPublicClient(state.serverPort, state.ownerName);
     ownerForCleanup = owner;
     const guest = await connectPublicClient(state.serverPort, state.guestName);
@@ -5635,6 +5658,13 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
+  if (
+    isEquipmentRconProbeOnly() &&
+    (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
+      process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES")
+  ) {
+    incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
+  }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
@@ -6972,6 +7002,115 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runEquipmentRconProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("equipment RCON probe deadline")),
+    30_000,
+  );
+  let body: PlayerBody | undefined;
+  let bodyInventoryItemObserved = false;
+  let bodyEquipSuccessful = false;
+  let bodyEquipmentObserved = false;
+  let equipmentHeadReply: string;
+  let executeIfItemsReply: string;
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    await rcon.command(`give ${state.botName} minecraft:iron_helmet 1`);
+    const itemDeadline = Date.now() + 5_000;
+    while (!abort.signal.aborted && Date.now() < itemDeadline) {
+      const observation = await body.observe();
+      bodyInventoryItemObserved = observation.self.inventory.some(
+        (item) => item.name === "iron_helmet" && item.count > 0,
+      );
+      if (bodyInventoryItemObserved) break;
+      await delay(100);
+    }
+
+    if (bodyInventoryItemObserved) {
+      try {
+        const equipResult = await body.execute(
+          { kind: "equip", item: "iron_helmet", destination: "head" },
+          abort.signal,
+        );
+        bodyEquipSuccessful = equipResult.status === "successful";
+      } catch {
+        bodyEquipSuccessful = false;
+      }
+    }
+
+    const equipmentDeadline = Date.now() + 5_000;
+    while (!abort.signal.aborted && Date.now() < equipmentDeadline) {
+      const observation = await body.observe();
+      bodyEquipmentObserved =
+        observation.self.equipment.head?.name === "iron_helmet";
+      if (bodyEquipmentObserved) break;
+      await delay(100);
+    }
+
+    equipmentHeadReply = await rcon.command(
+      `data get entity ${state.botName} equipment.head`,
+    );
+    executeIfItemsReply = await rcon.command(
+      `execute if items entity ${state.botName} armor.head minecraft:iron_helmet`,
+    );
+    const equipmentFieldReadback = readEquipmentFieldFromRcon(
+      equipmentHeadReply,
+      "minecraft:iron_helmet",
+    );
+    const executeIfItemsReadback =
+      readExecuteIfItemsRconReply(executeIfItemsReply);
+    state.equipmentRconDiagnostic = {
+      bodyInventoryItemObserved,
+      bodyEquipSuccessful,
+      bodyEquipmentObserved,
+      equipmentFieldObserved: equipmentFieldReadback.equipmentFieldObserved,
+      equipmentHeadItemMatched: equipmentFieldReadback.expectedItemMatched,
+      executeIfItemsResultObserved: executeIfItemsReadback.resultObserved,
+      executeIfItemsMatched: executeIfItemsReadback.expectedItemMatched,
+    };
+    if (!bodyInventoryItemObserved)
+      incomplete("EQUIPMENT_RCON_GIVEN_ITEM_NOT_OBSERVED_BY_BODY");
+    if (!bodyEquipSuccessful) incomplete("EQUIPMENT_BODY_EQUIP_NOT_SUCCESSFUL");
+    if (!bodyEquipmentObserved) incomplete("EQUIPMENT_BODY_HEAD_NOT_OBSERVED");
+    if (
+      !equipmentFieldReadback.equipmentFieldObserved ||
+      !equipmentFieldReadback.expectedItemMatched ||
+      !executeIfItemsReadback.resultObserved ||
+      !executeIfItemsReadback.expectedItemMatched
+    )
+      incomplete("EQUIPMENT_RCON_HEAD_ITEM_NOT_CONFIRMED");
+  } finally {
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("equipment_rcon_probe_finished");
+  }
 }
 
 async function runUnknownReturnPathProbe(
@@ -9573,7 +9712,7 @@ async function writeArtifact(state: RunState): Promise<void> {
       seed: state.seed,
       seedIsSynthetic: true,
       fixture: state.worldFixture,
-      nonOperatorClients: 3,
+      nonOperatorClients: isEquipmentRconProbeOnly() ? 1 : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
@@ -9586,6 +9725,8 @@ async function writeArtifact(state: RunState): Promise<void> {
       serverReadyObserved: state.serverReadyObserved === true,
       applicationStart: state.applicationStartDiagnostic ?? null,
       bodyOperationSmoke: state.bodySmokeDiagnostic ?? null,
+      equipmentRconProbe: state.equipmentRconDiagnostic ?? null,
+      privateServerLogRetained: state.privateDiagnosticLogRetained === true,
       observationBoundary: {
         replyReceived:
           state.observationBoundaryDiagnostic?.replyReceived === true,
