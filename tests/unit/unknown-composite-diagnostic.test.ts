@@ -53,19 +53,17 @@ describe("unknown composite operation-kind evidence", () => {
     });
   });
 
-  it("records visible target, water, and wall material as fixed booleans", () => {
+  it("records visible target and wall material as fixed booleans", () => {
     expect(
-      classifyUnknownTaskVisibility(["minecraft:blue_wool", "water", "stone"]),
+      classifyUnknownTaskVisibility(["minecraft:blue_wool", "stone"]),
     ).toEqual({
       status: "available",
       targetBlockVisible: true,
-      waterBlockVisible: true,
       wallMaterialVisible: true,
     });
     expect(classifyUnknownTaskVisibility([])).toEqual({
       status: "available",
       targetBlockVisible: false,
-      waterBlockVisible: false,
       wallMaterialVisible: false,
     });
   });

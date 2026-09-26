@@ -6,7 +6,6 @@ export type SafeUnknownOperationKind =
 export interface UnknownTaskVisibilityEvidence {
   readonly status: "available" | "unknown";
   readonly targetBlockVisible?: boolean;
-  readonly waterBlockVisible?: boolean;
   readonly wallMaterialVisible?: boolean;
 }
 
@@ -72,7 +71,6 @@ export function classifyUnknownTaskVisibility(
   return {
     status: "available",
     targetBlockVisible: normalizedNames.has("blue_wool"),
-    waterBlockVisible: normalizedNames.has("water"),
     wallMaterialVisible: normalizedNames.has("stone"),
   };
 }

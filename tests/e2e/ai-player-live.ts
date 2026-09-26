@@ -306,10 +306,10 @@ interface UnknownCompositeDiagnostic {
   readonly unknownItemReturned?: boolean;
   readonly unknownReturnedToSpawn?: boolean;
   readonly unknownServerProgressObserved?: boolean;
-  readonly unknownDayTime?: number;
+  readonly unknownWallFixtureConfirmed?: boolean;
+  readonly unknownDryGroundFixtureConfirmed?: boolean;
   readonly unknownTaskObservationStatus?: "available" | "unknown";
   readonly unknownTaskTargetBlockVisible?: boolean;
-  readonly unknownTaskWaterBlockVisible?: boolean;
   readonly unknownTaskWallMaterialVisible?: boolean;
   readonly unknownPostTaskProgressSampleStatus?: UnknownTaskProgressSampleStatus;
   readonly unknownPostTaskProgressSampleCount?: number;
@@ -325,7 +325,6 @@ interface UnknownCompositeDiagnostic {
   readonly unknownFixtureFacingConfirmed?: boolean;
   readonly unknownPreTaskObservationStatus?: "available" | "unknown";
   readonly unknownPreTaskTargetBlockVisible?: boolean;
-  readonly unknownPreTaskWaterBlockVisible?: boolean;
   readonly unknownPreTaskWallMaterialVisible?: boolean;
   readonly unknownFailureObserved?: boolean;
   readonly unknownFailureSource?: "natural" | "controlled_obstacle";
@@ -421,6 +420,8 @@ interface BodyMovePathDiagnostic {
 interface ReturnPathProbeDiagnostic {
   readonly interpretation?: "diagnostic_only_live_item_collection_not_gated";
   readonly fixtureConfirmed?: boolean;
+  readonly fixtureWallConfirmed?: boolean;
+  readonly fixtureDryGroundConfirmed?: boolean;
   readonly digStageRconConfirmed?: boolean;
   readonly digStagePlayerDistanceBucket?: BodyPositionDriftBucket | "unknown";
   readonly digStageBodyDistanceBucket?: BodyPositionDriftBucket | "unknown";
@@ -437,6 +438,7 @@ interface ReturnPathProbeDiagnostic {
   readonly digPositionDriftBucket?: BodyPositionDriftBucket;
   readonly itemPresentAfterDig?: boolean;
   readonly dropItemEntityPresentAfterDig?: boolean;
+  readonly dropGroundSupportConfirmedAfterDig?: boolean;
   readonly targetClearedAfterDig?: boolean;
   readonly dropItemEntityPresentBeforeCollection?: boolean;
   readonly itemPresentBeforeCollection?: boolean;
@@ -1940,14 +1942,6 @@ async function standingSpaceSafe(
   )
     return false;
   return blockIs(rcon, { x, y: region.minY - 1, z }, "stone", incomplete);
-}
-
-async function readSafeDayTime(rcon: LocalRcon): Promise<number | undefined> {
-  const reply = await rcon.command("time query daytime");
-  const match = /(?:^|\s)(\d+)$/u.exec(reply.trim());
-  if (match === null) return undefined;
-  const value = Number(match[1]);
-  return Number.isSafeInteger(value) ? value : undefined;
 }
 
 function subtractCounters(after: Counters, before: Counters): Counters {
@@ -3751,7 +3745,15 @@ async function main(): Promise<void> {
         ) {
           incomplete("UNKNOWN_FIXTURE_SPAWN_RESET_FAILED");
         }
+        updateUnknownCompositeDiagnostic(state, {
+          unknownWallFixtureConfirmed: false,
+          unknownDryGroundFixtureConfirmed: false,
+        });
         await configureUnknownFixture(rcon, origin, state.botName);
+        updateUnknownCompositeDiagnostic(state, {
+          unknownWallFixtureConfirmed: true,
+          unknownDryGroundFixtureConfirmed: true,
+        });
         await prepareUnknownObservationClients(
           rcon,
           context.ownerName,
@@ -3837,8 +3839,6 @@ async function main(): Promise<void> {
             : {
                 unknownPreTaskTargetBlockVisible:
                   preTaskVisibility.targetBlockVisible,
-                unknownPreTaskWaterBlockVisible:
-                  preTaskVisibility.waterBlockVisible === true,
                 unknownPreTaskWallMaterialVisible:
                   preTaskVisibility.wallMaterialVisible === true,
               }),
@@ -3871,7 +3871,6 @@ async function main(): Promise<void> {
             (state.unknownCompositeDiagnostic?.unknownOracleReadCount as
               number | undefined) ?? 0;
           try {
-            // Flowing water can occupy the target cell after the wool is mined.
             const targetCleared = !(await isBlock(rcon, target, "blue_wool"));
             const inventory = await rcon.command(
               `data get entity ${state.botName} Inventory`,
@@ -3884,7 +3883,6 @@ async function main(): Promise<void> {
               state.botName,
               fixtureRegion,
             );
-            const dayTime = await readSafeDayTime(rcon);
             const sampledAt = Date.now();
             const nearTarget =
               Math.hypot(
@@ -3914,7 +3912,6 @@ async function main(): Promise<void> {
               unknownReturnedToSpawn: returnedToSpawn,
               unknownServerProgressObserved:
                 observedWorldProgress(beforeWorld, currentWorld) !== undefined,
-              ...(dayTime === undefined ? {} : { unknownDayTime: dayTime }),
             });
             if (unknownTaskSentAt.value !== undefined && nearTarget) {
               try {
@@ -4037,7 +4034,7 @@ async function main(): Promise<void> {
           incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
         sendChat(
           context.owner,
-          "日没が近づいています。東側の水路の向こうにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空で、最短経路は壁で塞がれています。方法を自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
+          "近くにある青い羊毛を採集して、スポーン地点まで持ち帰ってください。所持品は空です。方法は自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
         unknownTaskSentAt.value = Date.now();
         updateUnknownCompositeDiagnostic(state, {
@@ -4075,8 +4072,6 @@ async function main(): Promise<void> {
                   : {
                       unknownTaskTargetBlockVisible:
                         visibility.targetBlockVisible,
-                      unknownTaskWaterBlockVisible:
-                        visibility.waterBlockVisible === true,
                       unknownTaskWallMaterialVisible:
                         visibility.wallMaterialVisible === true,
                     }),
@@ -4993,7 +4988,7 @@ async function prepareRun(): Promise<RunState> {
   }
   const suffix = randomBytes(2).toString("hex").toUpperCase();
   const runSeed = WORLD_SEED;
-  const worldFixture = "flat-platform-water-wall-container-oak-v1";
+  const worldFixture = "flat-platform-dry-wall-container-oak-v1";
   const startedClock = Date.now();
   return {
     id: runId,
@@ -6263,16 +6258,18 @@ async function runUnknownReturnPathProbe(
     y: 64,
     z: Math.floor(spawn.z),
   };
-  const waterPoint = {
-    x: target.x - 3,
-    y: 64,
-    z: Math.floor(spawn.z),
-  };
+  const targetSupport = { x: target.x, y: target.y - 1, z: target.z };
+  const fixtureWallConfirmed = await isBlock(rcon, wallPoint, "stone");
+  const fixtureDryGroundConfirmed = await isBlock(rcon, targetSupport, "stone");
   const fixtureConfirmed =
     (await isBlock(rcon, target, "blue_wool")) &&
-    (await isBlock(rcon, wallPoint, "stone")) &&
-    (await isBlock(rcon, waterPoint, "water"));
-  updateReturnPathProbeDiagnostic(state, { fixtureConfirmed });
+    fixtureWallConfirmed &&
+    fixtureDryGroundConfirmed;
+  updateReturnPathProbeDiagnostic(state, {
+    fixtureConfirmed,
+    fixtureWallConfirmed,
+    fixtureDryGroundConfirmed,
+  });
   if (!fixtureConfirmed) incomplete("RETURN_PATH_PROBE_FIXTURE_NOT_CONFIRMED");
 
   // Keep the bot outside pickup range until the separate drop-approach move.
@@ -6364,6 +6361,18 @@ async function runUnknownReturnPathProbe(
   const dropPositionAfterDig = await rconBlueWoolDropPositionNear(rcon, target);
   const dropItemEntityPresentAfterDig =
     dropPositionAfterDig === undefined ? undefined : true;
+  const dropGroundSupportConfirmedAfterDig =
+    dropPositionAfterDig === undefined
+      ? undefined
+      : await isBlock(
+          rcon,
+          {
+            x: Math.floor(dropPositionAfterDig.x),
+            y: Math.floor(dropPositionAfterDig.y) - 1,
+            z: Math.floor(dropPositionAfterDig.z),
+          },
+          "stone",
+        );
   const targetClearedAfterDig = !(await isBlock(rcon, target, "blue_wool"));
   updateReturnPathProbeDiagnostic(state, {
     digStatus: digResult.status,
@@ -6373,6 +6382,9 @@ async function runUnknownReturnPathProbe(
     ...(dropItemEntityPresentAfterDig === undefined
       ? {}
       : { dropItemEntityPresentAfterDig }),
+    ...(dropGroundSupportConfirmedAfterDig === undefined
+      ? {}
+      : { dropGroundSupportConfirmedAfterDig }),
     targetClearedAfterDig,
     ...(digResult.status === "successful"
       ? {}
@@ -7652,14 +7664,19 @@ async function configureUnknownFixture(
   const wallX = Math.floor(origin.x) + 2;
   const z = Math.floor(origin.z);
   const target = unknownFixtureTarget(origin);
+  const wall = { x: wallX, y: 64, z };
+  const targetSupport = { x: target.x, y: target.y - 1, z: target.z };
   await rcon.command(`clear ${botName}`);
   await rcon.command(`fill ${wallX} 64 ${z - 3} ${wallX} 67 ${z + 3} stone`);
-  await rcon.command(
-    `fill ${target.x - 4} 64 ${z - 2} ${target.x - 2} 64 ${z + 2} water`,
-  );
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
-  await setAndVerifyGamerule(rcon, "advanceTime", true);
-  await rcon.command("time set 11500");
+  await setAndVerifyGamerule(rcon, "advanceTime", false);
+  await rcon.command("time set 1000");
+  if (!(await isBlock(rcon, wall, "stone")))
+    incomplete("UNKNOWN_WALL_FIXTURE_NOT_CONFIRMED");
+  if (!(await isBlock(rcon, targetSupport, "stone")))
+    incomplete("UNKNOWN_DRY_GROUND_FIXTURE_NOT_CONFIRMED");
+  if (!(await isBlock(rcon, target, "blue_wool")))
+    incomplete("UNKNOWN_TARGET_FIXTURE_NOT_CONFIRMED");
 }
 
 async function prepareUnknownObservationClients(
