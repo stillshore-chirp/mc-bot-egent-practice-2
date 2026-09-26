@@ -444,13 +444,23 @@ function openPurposeFixture(
   const responses: ScriptedResponse[] = [];
   const body = {
     observe: async (options?: { ownerPositionException?: boolean }) => {
-      if (options?.ownerPositionException === true)
+      const observation = bodyObservationFixture();
+      if (options?.ownerPositionException === true) {
         ownerPositionExceptions.push(true);
-      return {
-        dimension: "overworld",
-        self: { yaw: 0 },
-        perception: { blocks: [] },
-      } as unknown as PlayerBodyObservation;
+        return {
+          ...observation,
+          perception: {
+            ...observation.perception,
+            ownerPositionException: {
+              username: "owner",
+              position: { x: 0, y: 64, z: 1, dimension: "overworld" },
+              source: "owner_position_exception",
+              currentlyVisible: false,
+            },
+          },
+        };
+      }
+      return observation;
     },
   } as unknown as PlayerBody;
   const agent = new PlayerPurposeAgent({
@@ -475,6 +485,58 @@ function openPurposeFixture(
       skills.close();
       mind.close();
     },
+  };
+}
+
+function bodyObservationFixture(): PlayerBodyObservation {
+  return {
+    observedAt: "2026-09-27T00:00:00.000Z",
+    source: "minecraft",
+    gameVersion: "test",
+    dimension: "overworld",
+    time: { day: 1, timeOfDay: 5_000, isDay: true, raining: false },
+    self: {
+      username: "bot",
+      position: { x: 0, y: 64, z: 0, dimension: "overworld" },
+      eyeHeight: 1.62,
+      yaw: 0,
+      pitch: 0,
+      velocity: { x: 0, y: 0, z: 0 },
+      health: 20,
+      food: 20,
+      foodSaturation: 5,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+      mountedEntityId: null,
+      gameMode: "survival",
+      experience: { level: 0, points: 0, progress: 0 },
+      inventory: [],
+      equipment: {},
+    },
+    perception: {
+      horizontalFieldOfViewDegrees: 90,
+      verticalFieldOfViewDegrees: 60,
+      maxDistance: 12,
+      coverage: "visible_subset",
+      blockCountLimit: 64,
+      entityCountLimit: 16,
+      blockCandidateLimit: 128,
+      entityCandidateLimit: 32,
+      omittedBlockCandidates: 0,
+      omittedEntityCandidates: 0,
+      candidateSearchMayBeTruncated: false,
+      blocks: [],
+      placementCandidateLimit: 24,
+      omittedPlacementCandidates: 0,
+      placementCandidatesMayBeTruncated: false,
+      placementCandidates: [],
+      entities: [],
+    },
+    window: null,
   };
 }
 

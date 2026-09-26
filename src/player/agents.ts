@@ -1755,10 +1755,9 @@ export function compactDecisionObservation(
 ): unknown {
   const { inventory, equipment, ...self } = observation.self;
   const { blocks, entities, ...perception } = observation.perception;
-  const compactWindow =
-    observation.window === null
-      ? null
-      : compactDecisionWindow(observation.window);
+  const compactWindow = observation.window
+    ? compactDecisionWindow(observation.window)
+    : null;
   return {
     ...observation,
     coordinateAxes: {
