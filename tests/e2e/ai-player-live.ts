@@ -6260,6 +6260,10 @@ async function runUnknownReturnPathProbe(
   spawn: Position,
   signal: AbortSignal,
 ): Promise<void> {
+  // The probe runs before cases; mirror the hidden-fixture cleanup before the live unknown case.
+  await removeHiddenContainerFixture(rcon, spawn, {
+    chest: fixturePoint(spawn, 6, 0),
+  });
   await configureUnknownFixture(rcon, spawn, botName);
   updateReturnPathProbeDiagnostic(state, {
     interpretation: "diagnostic_only_live_item_collection_not_gated",
