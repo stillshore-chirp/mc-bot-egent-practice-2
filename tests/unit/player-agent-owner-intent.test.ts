@@ -111,6 +111,103 @@ describe("player owner intent context", () => {
     }
   });
 
+  it.each([
+    {
+      name: "an ordinary reply whose send fails",
+      ownerMessage: "Could you check this?",
+      response: terminalResponse("This answer was not delivered."),
+      reply: "This answer was not delivered.",
+      rejectFirstSend: true,
+      retainReply: false,
+    },
+    {
+      name: "an ordinary reply whose send succeeds",
+      ownerMessage: "Could you check this?",
+      response: terminalResponse("This answer reached the owner."),
+      reply: "This answer reached the owner.",
+      rejectFirstSend: false,
+      retainReply: true,
+    },
+    {
+      name: "an owner-fact refusal whose send fails",
+      ownerMessage: "Remember this for next time",
+      response: functionCallResponse(
+        "verbatim-fact-summary",
+        "remember_owner_fact",
+        { summary: "Remember this for next time" },
+      ),
+      reply:
+        "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+      rejectFirstSend: true,
+      retainReply: false,
+    },
+    {
+      name: "an owner-fact refusal whose send succeeds",
+      ownerMessage: "Remember this for next time",
+      response: functionCallResponse(
+        "verbatim-fact-summary",
+        "remember_owner_fact",
+        { summary: "Remember this for next time" },
+      ),
+      reply:
+        "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+      rejectFirstSend: false,
+      retainReply: true,
+    },
+  ])(
+    "records $name in owner context only after successful delivery",
+    async ({ ownerMessage, response, reply, rejectFirstSend, retainReply }) => {
+      const fixture = openPurposeFixture(createMemoryPort());
+      const sentMessages: string[] = [];
+      let firstSend = true;
+      const conversation = new PlayerConversationAgent({
+        client: scriptedClient(fixture.responses, fixture.requests),
+        apiKey: "test-only",
+        model: "test-model",
+        ownerUsername: "owner",
+        mind: fixture.mind,
+        memory: createMemoryPort(),
+        logger: pino({ level: "silent" }),
+        say: async (message) => {
+          if (firstSend) {
+            firstSend = false;
+            if (rejectFirstSend) throw new Error("TEST_CHAT_SEND_FAILED");
+          }
+          sentMessages.push(message);
+        },
+        onProposal: () => undefined,
+        onStop: async () => undefined,
+        onResume: () => undefined,
+      });
+      fixture.responses.push(response, terminalResponse("Follow-up response."));
+
+      try {
+        const firstReply = conversation.handleOwnerMessage({
+          username: "owner",
+          message: ownerMessage,
+          turn: conversation.nextTurn(),
+        });
+        if (rejectFirstSend)
+          await expect(firstReply).rejects.toThrow("TEST_CHAT_SEND_FAILED");
+        else await expect(firstReply).resolves.toBeUndefined();
+
+        await conversation.handleOwnerMessage({
+          username: "owner",
+          message: "How should I proceed?",
+          turn: conversation.nextTurn(),
+        });
+        const followUpRequest = record(fixture.requests[1]);
+        const serializedInput = JSON.stringify(followUpRequest.input);
+        expect(serializedInput).toContain(ownerMessage);
+        if (retainReply) expect(serializedInput).toContain(reply);
+        else expect(serializedInput).not.toContain(reply);
+        expect(sentMessages).toContain("Follow-up response.");
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("grounds a meal refusal in the fresh food observation without guessing", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const proposal = fixture.mind.addProposal({

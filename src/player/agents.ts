@@ -533,14 +533,14 @@ export class PlayerConversationAgent {
     if (ownerFactSave.failed) {
       const reply =
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。";
-      currentConversationTurn.assistantReply = reply;
       await this.options.say(reply);
+      currentConversationTurn.assistantReply = reply;
       return;
     }
     if (result.text.length === 0) return;
     const reply = result.text.slice(0, assistantConversationReplyLimit);
-    currentConversationTurn.assistantReply = reply;
     await this.options.say(reply);
+    currentConversationTurn.assistantReply = reply;
   }
 }
 
