@@ -29,7 +29,11 @@ import { ZodError } from "zod";
 import { AppError, errorCategories } from "../../src/domain/errors.js";
 import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
-import type { PlayerBody } from "../../src/minecraft/player-body.js";
+import {
+  MineflayerPlayerBody,
+  type PlayerBody,
+  type PlayerBodyObservationOptions,
+} from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
@@ -209,6 +213,25 @@ type SkillExchangeStage =
   | "duplicate_requested"
   | "duplicate_confirmed";
 type GameActionFixtureHoleReadback = "oak_planks" | "air" | "unknown";
+interface GameActionPlacementCandidateDiagnostic {
+  readonly freshBodyObservationMatched: boolean;
+  readonly fixtureHoleCandidatePresent?: boolean;
+  readonly placementCandidatesMayBeTruncated?: boolean;
+  readonly placementCandidateCount?: number;
+}
+interface GameActionPlacementObservationSummary {
+  readonly fixtureHoleCandidatePresent: boolean;
+  readonly placementCandidatesMayBeTruncated: boolean;
+  readonly placementCandidateCount: number;
+}
+interface GameActionPlacementObservationProbe {
+  readonly target: BlockPosition;
+  freshAfter: number;
+  readonly observationsByTime: Map<
+    string,
+    GameActionPlacementObservationSummary
+  >;
+}
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
   readonly placementConfirmedCount: number;
@@ -1479,6 +1502,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
             state.gameActionPriorProposalsSettled,
         }
       : {}),
+    ...(caseId === "game_action_discretion"
+      ? gameActionPlacementCandidateEvidence(state)
+      : {}),
   };
 }
 
@@ -2022,6 +2048,7 @@ interface RunState {
   gameActionPriorPendingProposalCount?: number;
   gameActionPriorProposalsSettled?: boolean;
   gameActionFixtureHoleReadback?: GameActionFixtureHoleReadback;
+  gameActionPlacementCandidateDiagnostic?: GameActionPlacementCandidateDiagnostic;
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   usageUncertain?: boolean;
@@ -2074,6 +2101,93 @@ let ownerForCleanup: Bot | undefined;
 let guestForCleanup: Bot | undefined;
 let currentRunState: RunState | undefined;
 let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
+let activeGameActionPlacementObservationProbe:
+  GameActionPlacementObservationProbe | undefined;
+let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
+
+function installGameActionPlacementObservationProbe(): () => void {
+  const prototype = MineflayerPlayerBody.prototype;
+  const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
+    prototype,
+    "observe",
+  );
+  if (typeof originalObserveDescriptor?.value !== "function")
+    throw new Error("PlayerBody observation method is unavailable");
+  const originalObserve =
+    originalObserveDescriptor.value as typeof prototype.observe;
+  const instrumentedObserve = async function (
+    this: MineflayerPlayerBody,
+    options?: PlayerBodyObservationOptions,
+  ): Promise<PlayerBodyObservation> {
+    const observation = await originalObserve.call(this, options);
+    const probe = activeGameActionPlacementObservationProbe;
+    const observedAt = Date.parse(observation.observedAt);
+    if (
+      probe !== undefined &&
+      Number.isFinite(observedAt) &&
+      observedAt > probe.freshAfter
+    ) {
+      probe.observationsByTime.set(observation.observedAt, {
+        fixtureHoleCandidatePresent:
+          observation.perception.placementCandidates.some(
+            ({ position }) =>
+              position.x === probe.target.x &&
+              position.y === probe.target.y &&
+              position.z === probe.target.z,
+          ),
+        placementCandidatesMayBeTruncated:
+          observation.perception.placementCandidatesMayBeTruncated,
+        placementCandidateCount:
+          observation.perception.placementCandidates.length,
+      });
+      while (probe.observationsByTime.size > 64) {
+        const firstObservedAt = probe.observationsByTime.keys().next().value;
+        if (firstObservedAt === undefined) break;
+        probe.observationsByTime.delete(firstObservedAt);
+      }
+    }
+    return observation;
+  };
+  prototype.observe = instrumentedObserve;
+  return () => {
+    if (prototype.observe === instrumentedObserve)
+      prototype.observe = originalObserve;
+  };
+}
+
+function gameActionPlacementCandidateEvidence(state: RunState): SafeEvidence {
+  const diagnostic = state.gameActionPlacementCandidateDiagnostic;
+  if (
+    diagnostic === undefined ||
+    !diagnostic.freshBodyObservationMatched ||
+    diagnostic.fixtureHoleCandidatePresent === undefined ||
+    diagnostic.placementCandidatesMayBeTruncated === undefined ||
+    diagnostic.placementCandidateCount === undefined
+  ) {
+    return { gameActionPlacementObservationAvailable: false };
+  }
+  return {
+    gameActionPlacementObservationAvailable: true,
+    gameActionFixtureHoleInPlacementCandidates:
+      diagnostic.fixtureHoleCandidatePresent,
+    gameActionPlacementCandidatesMayBeTruncated:
+      diagnostic.placementCandidatesMayBeTruncated,
+    gameActionPlacementCandidateCount: diagnostic.placementCandidateCount,
+  };
+}
+
+function readGameActionPlacementCandidateDiagnostic(
+  probe: GameActionPlacementObservationProbe,
+  observedAt: string | undefined,
+  freshAfter: number,
+): GameActionPlacementCandidateDiagnostic {
+  if (observedAt === undefined || Date.parse(observedAt) <= freshAfter)
+    return { freshBodyObservationMatched: false };
+  const summary = probe.observationsByTime.get(observedAt);
+  return summary === undefined
+    ? { freshBodyObservationMatched: false }
+    : { freshBodyObservationMatched: true, ...summary };
+}
 
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
@@ -2136,6 +2250,8 @@ async function main(): Promise<void> {
       DASHBOARD_ENABLED: "false",
     });
     const { createApplication } = await import("../../src/app/application.js");
+    restoreGameActionPlacementObservationProbe ??=
+      installGameActionPlacementObservationProbe();
     const activeApp = createApplication(config);
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
@@ -3247,12 +3363,19 @@ async function main(): Promise<void> {
         );
         const buildingFixture = await findBuildingFixture(rcon, origin);
         activeBuildingFixture = buildingFixture;
+        const placementObservationProbe: GameActionPlacementObservationProbe = {
+          target: buildingFixture.target,
+          freshAfter: 0,
+          observationsByTime: new Map(),
+        };
+        activeGameActionPlacementObservationProbe = placementObservationProbe;
         const facingConfirmedAt = await configureBuildingFixture(
           rcon,
           context.botName,
           origin,
           buildingFixture,
         );
+        placementObservationProbe.freshAfter = facingConfirmedAt;
         await captureBlockBaseline(rcon, origin);
         const beforeWorld = await readWorldSnapshot(
           rcon,
@@ -3274,6 +3397,13 @@ async function main(): Promise<void> {
         if (wallObservation === undefined)
           incomplete("BUILDING_WALL_NOT_VISIBLE");
         const before = playerOf(await collect(context.runtime.app));
+        state.gameActionPlacementCandidateDiagnostic =
+          readGameActionPlacementCandidateDiagnostic(
+            placementObservationProbe,
+            before.lastObservation?.observedAt,
+            facingConfirmedAt,
+          );
+        activeGameActionPlacementObservationProbe = undefined;
         state.gameActionEvidenceBaseline = {
           revision: before.revision,
           outcomeOperationIds: new Set(
@@ -3349,6 +3479,7 @@ async function main(): Promise<void> {
         await removeBuildingFixture(rcon, buildingFixture);
         activeBuildingFixture = undefined;
         return {
+          ...gameActionPlacementCandidateEvidence(state),
           priorOwnerProposalsSettled: true,
           selectedBuildingOperation: selectedPlacement,
           fixtureFacingConfirmed: true,
@@ -3359,6 +3490,7 @@ async function main(): Promise<void> {
         };
       },
     ).finally(async () => {
+      activeGameActionPlacementObservationProbe = undefined;
       if (activeBuildingFixture !== undefined) {
         await removeBuildingFixture(rcon, activeBuildingFixture);
         activeBuildingFixture = undefined;
@@ -4526,6 +4658,9 @@ async function main(): Promise<void> {
     }
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
+    activeGameActionPlacementObservationProbe = undefined;
+    restoreGameActionPlacementObservationProbe?.();
+    restoreGameActionPlacementObservationProbe = undefined;
     await writeArtifact(state);
     process.stdout.write(
       `${(state.status ?? "incomplete").toUpperCase()} ${state.artifactPath}\n`,
