@@ -67,6 +67,7 @@ const digServerUpdateGraceMs = 5_000;
 const placeServerUpdateGraceMs = 5_000;
 const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
+const itemCollectionVisibilityGraceMs = 1_000;
 // GoalNear evaluates floored block nodes; radius one includes adjacent nodes as goals.
 const itemCollectionGoalRange = 1;
 const itemCollectionPickupDistance = 1.25;
@@ -2174,63 +2175,63 @@ export class MineflayerPlayerBody implements PlayerBody {
       await pendingPath.catch(() => undefined);
     };
 
-    try {
-      const initial = this.safeObserve(bot);
-      if (initial === null)
+    const pickupObserved = (): boolean =>
+      active.itemCollectionOutcome === "collected";
+    const observeVisibleTarget = async (
+      firstObservation: PlayerBodyObservation | null,
+      deadline = Date.now() + itemCollectionVisibilityGraceMs,
+    ): Promise<
+      | {
+          readonly observation: PlayerBodyObservation;
+          readonly target: PlayerBodyObservation["perception"]["entities"][number];
+        }
+      | undefined
+    > => {
+      throwIfAborted(signal);
+      if (pickupObserved()) return undefined;
+
+      if (firstObservation !== null) {
+        const target = firstObservation.perception.entities.find(
+          (entity) => entity.id === entityId,
+        );
+        if (target !== undefined) {
+          if (target.name !== "item")
+            throw new ItemCollectionError(
+              "invalid_target",
+              "The requested visible entity is not an item entity.",
+            );
+          return { observation: firstObservation, target };
+        }
+      }
+
+      if (pathPromise !== undefined) await stopPath();
+      if (pickupObserved()) return undefined;
+      if (bot.entities[entityId] === undefined)
+        throw new ItemCollectionError(
+          "entity_removed",
+          "The requested item entity has left the current client entity table.",
+        );
+      if (Date.now() >= deadline)
         throw new ItemCollectionError(
           "target_unobservable",
-          "The requested item is not currently visible.",
+          "The requested item did not return to the current visible view.",
         );
-      const initiallyVisible = initial.perception.entities.find(
-        (entity) => entity.id === entityId,
-      );
-      if (initiallyVisible === undefined) {
-        const outcome =
-          bot.entities[entityId] === undefined
-            ? "entity_removed"
-            : "target_unobservable";
-        throw new ItemCollectionError(
-          outcome,
-          outcome === "entity_removed"
-            ? "The requested item entity has left the current client entity table."
-            : "The requested item entity is not currently visible.",
-        );
-      }
-      if (initiallyVisible.name !== "item")
-        throw new ItemCollectionError(
-          "invalid_target",
-          "The requested visible entity is not an item entity.",
-        );
+
+      await waitForItemCollectionPoll(signal);
+      if (pickupObserved()) return undefined;
+      return observeVisibleTarget(this.safeObserve(bot), deadline);
+    };
+
+    try {
+      const initialTarget = await observeVisibleTarget(this.safeObserve(bot));
+      if (initialTarget === undefined || pickupObserved()) return;
 
       while (active.itemCollectionOutcome !== "collected") {
         throwIfAborted(signal);
 
-        const observation = this.safeObserve(bot);
-        if (observation === null)
-          throw new ItemCollectionError(
-            "target_unobservable",
-            "The current view is unavailable; item pursuit was stopped.",
-          );
-        const target = observation.perception.entities.find(
-          (entity) => entity.id === entityId,
-        );
-        if (target === undefined) {
-          const outcome =
-            bot.entities[entityId] === undefined
-              ? "entity_removed"
-              : "target_unobservable";
-          throw new ItemCollectionError(
-            outcome,
-            outcome === "entity_removed"
-              ? "The requested item entity left the current client entity table before collection was observed."
-              : "The requested item is no longer visible; pursuit was stopped.",
-          );
-        }
-        if (target.name !== "item")
-          throw new ItemCollectionError(
-            "invalid_target",
-            "The requested entity is no longer an item entity.",
-          );
+        const visibleTarget = await observeVisibleTarget(this.safeObserve(bot));
+        if (visibleTarget === undefined || pickupObserved()) break;
+        const { observation, target } = visibleTarget;
 
         const playerPosition = observation.self.position;
         const targetPosition = target.position;

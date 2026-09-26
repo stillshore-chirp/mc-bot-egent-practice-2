@@ -608,6 +608,90 @@ describe("player body", () => {
     );
   });
 
+  it("waits briefly for the same initially hidden item ID to become visible", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2);
+      fake.bot.entity.yaw = Math.PI / 2;
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementation(async () => {
+          fake.bot.entity.position = new Vec3(0, 64, -4);
+          (fake.bot as unknown as EventEmitter).emit(
+            "playerCollect",
+            fake.bot.entity,
+            item,
+          );
+          removeItemEntity(fake.bot, item.id);
+        });
+      setTimeout(() => {
+        fake.bot.entity.yaw = 0;
+      }, 300);
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(result.observedEffect).toEqual({
+        type: "item_collected",
+        entityId: 2,
+      });
+      expect(goto).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a stale path and resumes the same item after brief tracking visibility loss", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      let cancelFirstPath: (() => void) | undefined;
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              cancelFirstPath = () => reject(new Error("Goal cancelled"));
+              fake.bot.entity.yaw = Math.PI / 2;
+            }),
+        )
+        .mockImplementationOnce(async () => {
+          fake.bot.entity.position = new Vec3(0, 64, -4);
+          (fake.bot as unknown as EventEmitter).emit(
+            "playerCollect",
+            fake.bot.entity,
+            item,
+          );
+          removeItemEntity(fake.bot, item.id);
+        });
+      const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+      setGoal.mockImplementation((goal) => {
+        if (goal === null) cancelFirstPath?.();
+      });
+      setTimeout(() => {
+        fake.bot.entity.yaw = 0;
+      }, 500);
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(goto).toHaveBeenCalledTimes(2);
+      expect(setGoal).toHaveBeenCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects a visible non-item entity even when its Mineflayer type is other", async () => {
     const fake = makeFakeBot();
     const entity = addItemEntity(fake.bot);
@@ -726,30 +810,66 @@ describe("player body", () => {
   });
 
   it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
-    const fake = makeFakeBot();
-    const item = addItemEntity(fake.bot);
-    const body = new MineflayerPlayerBody(() => fake.bot);
-    let cancelPath: (() => void) | undefined;
-    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
-      () =>
-        new Promise<void>((_resolve, reject) => {
-          cancelPath = () => reject(new Error("Path stopped"));
-          fake.bot.entity.yaw = Math.PI / 2;
-          item.position = new Vec3(0, 64, -12);
-        }),
-    );
-    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
-      if (goal === null) cancelPath?.();
-    });
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      let cancelPath: (() => void) | undefined;
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            cancelPath = () => reject(new Error("Path stopped"));
+            fake.bot.entity.yaw = Math.PI / 2;
+            item.position = new Vec3(0, 64, -12);
+          }),
+      );
+      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+        if (goal === null) cancelPath?.();
+      });
 
-    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(1_250);
+      const result = await resultPromise;
 
-    expect(result.status).toBe("failed");
-    expect(result.itemCollectionOutcome).toBe("target_unobservable");
-    expect(result.after?.perception.entities).not.toContain(
-      expect.objectContaining({ id: 2 }),
-    );
-    expect(result.detail).toContain("no longer visible");
+      expect(result.status).toBe("failed");
+      expect(result.itemCollectionOutcome).toBe("target_unobservable");
+      expect(result.after?.perception.entities).not.toContain(
+        expect.objectContaining({ id: 2 }),
+      );
+      expect(result.detail).toContain(
+        "did not return to the current visible view",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts the visibility grace wait without starting an item path", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      addItemEntity(fake.bot);
+      fake.bot.entity.yaw = Math.PI / 2;
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const controller = new AbortController();
+      const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+      const resultPromise = body.execute(
+        { kind: "collect_item", entityId: 2 },
+        controller.signal,
+      );
+      setTimeout(() => controller.abort(new Error("test stop")), 300);
+
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.itemCollectionOutcome).toBeUndefined();
+      expect(goto).not.toHaveBeenCalled();
+      expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("distinguishes a removed target from a path failure", async () => {
