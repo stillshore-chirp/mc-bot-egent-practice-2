@@ -374,6 +374,14 @@ type BodyMoveErrorClass =
 type BodyDigErrorClass =
   "out_of_view" | "occluded" | "out_of_reach" | "unloaded" | "other";
 type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
+type ReturnPathDropDistanceBucket =
+  BodyPositionDriftBucket | "drop_missing" | "unknown";
+
+interface ReturnPathDropDistanceObservation {
+  readonly available: boolean;
+  readonly dropPresent?: boolean;
+  readonly distanceBucket: ReturnPathDropDistanceBucket;
+}
 
 interface BodyMovePathDiagnostic {
   readonly status: BodyOperationStatus;
@@ -403,6 +411,12 @@ interface ReturnPathProbeDiagnostic {
   readonly dropStageBodyConfirmed?: boolean;
   readonly dropMove?: BodyMovePathDiagnostic;
   readonly dropMoveRconArrivalConfirmed?: boolean;
+  readonly dropDistanceObservationAvailableAtArrival?: boolean;
+  readonly dropPresentAtArrival?: boolean;
+  readonly playerDropDistanceBucketAtArrival?: ReturnPathDropDistanceBucket;
+  readonly dropDistanceObservationAvailableAfterPickupWait?: boolean;
+  readonly dropPresentAfterPickupWait?: boolean;
+  readonly playerDropDistanceBucketAfterPickupWait?: ReturnPathDropDistanceBucket;
   readonly itemPresentAfterDropMove?: boolean;
   readonly itemPickupConfirmed?: boolean;
   readonly returnMoveSkippedRecoveryRequired?: boolean;
@@ -6212,14 +6226,41 @@ async function runUnknownReturnPathProbe(
       afterDropMove.y - target.y,
       afterDropMove.z - (target.z + 0.5),
     ) <= 1.75;
+  const dropDistanceAtArrival = await observeReturnPathDropDistance(
+    rcon,
+    botName,
+    target,
+    afterDropMove,
+  );
+  updateReturnPathProbeDiagnostic(state, {
+    dropDistanceObservationAvailableAtArrival: dropDistanceAtArrival.available,
+    ...(dropDistanceAtArrival.dropPresent === undefined
+      ? {}
+      : { dropPresentAtArrival: dropDistanceAtArrival.dropPresent }),
+    playerDropDistanceBucketAtArrival: dropDistanceAtArrival.distanceBucket,
+  });
   const itemPresentAfterDropMove = await waitForRconInventoryBlueWool(
     rcon,
     botName,
     2_500,
   );
+  const dropDistanceAfterPickupWait = await observeReturnPathDropDistance(
+    rcon,
+    botName,
+    target,
+  );
   // Preconditions above guarantee a fresh ground drop with no prior pickup.
   const itemPickupConfirmed = itemPresentAfterDropMove;
   updateReturnPathProbeDiagnostic(state, {
+    dropDistanceObservationAvailableAfterPickupWait:
+      dropDistanceAfterPickupWait.available,
+    ...(dropDistanceAfterPickupWait.dropPresent === undefined
+      ? {}
+      : {
+          dropPresentAfterPickupWait: dropDistanceAfterPickupWait.dropPresent,
+        }),
+    playerDropDistanceBucketAfterPickupWait:
+      dropDistanceAfterPickupWait.distanceBucket,
     dropMoveRconArrivalConfirmed,
     itemPresentAfterDropMove,
     itemPickupConfirmed,
@@ -6297,14 +6338,80 @@ async function rconHasBlueWoolDropNear(
   rcon: LocalRcon,
   target: BlockPosition,
 ): Promise<boolean> {
+  return (await rconBlueWoolDropPositionNear(rcon, target)) !== undefined;
+}
+
+async function rconBlueWoolDropPositionNear(
+  rcon: LocalRcon,
+  target: BlockPosition,
+): Promise<Position | undefined> {
   const selector =
     '@e[type=minecraft:item,limit=1,distance=..2,nbt={Item:{id:"minecraft:blue_wool"}}]';
   const reply = await rcon.command(
     `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
   );
-  return /\[\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*\]/u.test(
-    reply,
-  );
+  return parseOptionalPosition(reply);
+}
+
+async function observeReturnPathDropDistance(
+  rcon: LocalRcon,
+  botName: string,
+  target: BlockPosition,
+  playerPosition?: Position,
+): Promise<ReturnPathDropDistanceObservation> {
+  try {
+    const currentPlayerPosition =
+      playerPosition ??
+      parseOptionalPosition(
+        await rcon.command(`data get entity ${botName} Pos`),
+      );
+    if (currentPlayerPosition === undefined) {
+      return { available: false, distanceBucket: "unknown" };
+    }
+    if (
+      ![
+        currentPlayerPosition.x,
+        currentPlayerPosition.y,
+        currentPlayerPosition.z,
+      ].every(Number.isFinite)
+    ) {
+      return { available: false, distanceBucket: "unknown" };
+    }
+    const dropPosition = await rconBlueWoolDropPositionNear(rcon, target);
+    if (dropPosition === undefined) {
+      return {
+        available: true,
+        dropPresent: false,
+        distanceBucket: "drop_missing",
+      };
+    }
+    const distance = Math.hypot(
+      currentPlayerPosition.x - dropPosition.x,
+      currentPlayerPosition.y - dropPosition.y,
+      currentPlayerPosition.z - dropPosition.z,
+    );
+    return {
+      available: true,
+      dropPresent: true,
+      distanceBucket: positionDriftBucket(distance),
+    };
+  } catch {
+    // Keep RCON response text and coordinates private; this is diagnostic only.
+    return { available: false, distanceBucket: "unknown" };
+  }
+}
+
+function parseOptionalPosition(value: string): Position | undefined {
+  const match =
+    /\[\s*(-?\d+(?:\.\d+)?)d?\s*,\s*(-?\d+(?:\.\d+)?)d?\s*,\s*(-?\d+(?:\.\d+)?)d?\s*\]/u.exec(
+      value,
+    );
+  if (match === null) return undefined;
+  const x = Number(match[1]);
+  const y = Number(match[2]);
+  const z = Number(match[3]);
+  if (![x, y, z].every(Number.isFinite)) return undefined;
+  return { x, y, z };
 }
 
 async function waitForRconInventoryBlueWool(
