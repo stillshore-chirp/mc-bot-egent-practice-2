@@ -311,6 +311,66 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("matches a legacy UUID event only to its unique trusted outcome", async () => {
+    const runId = "learning-legacy-outcome-event";
+    const skillId = "learning-used-skill";
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "revise-from-legacy-outcome-event",
+        "propose_skill_learning",
+        learningRevisionArguments(runId, skillId, 1),
+      ),
+    ]);
+
+    try {
+      recordSuccessfulSkillUse(fixture, runId, skillId);
+      const legacyEvent = fixture.mind.enqueueEvent(
+        "body_outcome",
+        "操作 dig は successful: The trusted receipt records the successful operation.",
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [legacyEvent],
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().counters.learningUpdates).toBe(1);
+      expect(fixture.skills.get(skillId).version).toBe(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("skips a legacy UUID event when its outcome summary is ambiguous", async () => {
+    const firstRunId = "learning-legacy-ambiguous-first";
+    const secondRunId = "learning-legacy-ambiguous-second";
+    const skillId = "learning-used-skill";
+    const fixture = openPurposeFixture([
+      terminalResponse("No unique outcome can be selected."),
+    ]);
+
+    try {
+      const { skill } = recordSuccessfulSkillUse(fixture, firstRunId, skillId);
+      recordSuccessfulSkillUse(fixture, secondRunId, skillId, skill);
+      const legacyEvent = fixture.mind.enqueueEvent(
+        "body_outcome",
+        "操作 dig は successful: The trusted receipt records the successful operation.",
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [legacyEvent],
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().counters.learningUpdates).toBe(0);
+      expect(fixture.skills.get(skillId).version).toBe(1);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it.each(["accepted proposal", "no proposal"] as const)(
     "continues normal decision flow after a %s",
     async (scenario) => {

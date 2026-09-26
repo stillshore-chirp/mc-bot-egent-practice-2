@@ -93,20 +93,33 @@ const cachedOperationSchemaInstructionsPrefix =
 function bodyOutcomeEventMatches(
   event: PlayerRuntimeEvent,
   outcome: PlayerRuntimeSnapshot["recentOutcomes"][number],
+  recentOutcomes: PlayerRuntimeSnapshot["recentOutcomes"],
 ): boolean {
-  if (
-    event.kind !== "body_outcome" ||
-    event.id !== playerBodyOutcomeEventId(outcome.operationId)
-  )
+  if (event.kind !== "body_outcome") return false;
+  const outcomeSummary = `操作 ${outcome.kind} は ${outcome.status}: ${outcome.summary}`;
+  const recoveredSummary = `再起動後に復旧した操作結果: ${outcome.kind} ${outcome.status}`;
+  if (event.id === playerBodyOutcomeEventId(outcome.operationId))
+    return (
+      event.summary === outcomeSummary || event.summary === recoveredSummary
+    );
+  if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(event.id))
     return false;
-  if (
-    event.summary ===
-    `操作 ${outcome.kind} は ${outcome.status}: ${outcome.summary}`
-  )
-    return true;
+
+  // Before outcome events used operation-derived IDs, their rows carried a
+  // random UUID. Recover only when their structured summary selects one
+  // recent outcome; the receipt gate below still verifies that exact run.
+  const matchingOutcomes = recentOutcomes.filter(
+    (candidate) =>
+      candidate.runId === candidate.operationId &&
+      candidate.operationId.length > 0 &&
+      (event.summary ===
+        `操作 ${candidate.kind} は ${candidate.status}: ${candidate.summary}` ||
+        event.summary ===
+          `再起動後に復旧した操作結果: ${candidate.kind} ${candidate.status}`),
+  );
   return (
-    event.summary ===
-    `再起動後に復旧した操作結果: ${outcome.kind} ${outcome.status}`
+    matchingOutcomes.length === 1 &&
+    matchingOutcomes[0]?.operationId === outcome.operationId
   );
 }
 
@@ -1169,7 +1182,7 @@ export class PlayerPurposeAgent {
     for (const outcomeEvent of input.events) {
       if (outcomeEvent.kind !== "body_outcome") continue;
       const latestOutcome = latest.recentOutcomes.find((outcome) =>
-        bodyOutcomeEventMatches(outcomeEvent, outcome),
+        bodyOutcomeEventMatches(outcomeEvent, outcome, latest.recentOutcomes),
       );
       if (
         latestOutcome === undefined ||
