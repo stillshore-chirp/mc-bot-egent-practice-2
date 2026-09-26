@@ -1,11 +1,73 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  firstDigLearningDiagnostic,
   firstDigLearningEvidence,
   type LearningHypothesisSnapshot,
 } from "../e2e/learning-reuse-acceptance.js";
 
 describe("first dig learning acceptance", () => {
+  it("projects first-dig snapshot membership without exposing identifiers", () => {
+    const baseline = snapshot({ skillIds: ["private-baseline-skill"] });
+    const current = snapshot({
+      skillIds: ["private-used-skill"],
+      successfulDerivedSkillIds: ["private-used-skill"],
+      revisionVersionsBySkill: [["private-used-skill", [1, 2]]],
+      successfulDerivedHypothesesByRunId: [
+        [
+          "private-operation-id",
+          { skillId: "private-used-skill", skillVersion: 2 },
+        ],
+      ],
+    });
+
+    const diagnostic = firstDigLearningDiagnostic(
+      {
+        operationId: "private-operation-id",
+        kind: "dig",
+        status: "successful",
+        skillId: "private-used-skill",
+        skillVersion: 2,
+      },
+      baseline,
+      current,
+    );
+
+    expect(diagnostic).toMatchObject({
+      outcomeKind: "dig",
+      outcomeStatus: "successful",
+      outcomeHasSkillAtUse: true,
+      baselineHasOutcomeSkill: false,
+      baselineOutcomeSkillIsTrustedDerived: false,
+      currentHasOutcomeSkill: true,
+      currentOutcomeSkillIsTrustedDerived: true,
+      currentOutcomeSkillHasUsedRevision: true,
+      firstDigDerivedHypothesisPresent: true,
+      firstDigDerivedHypothesisIsTrustedDerived: true,
+      firstDigDerivedHypothesisHasRevision: true,
+      firstDigDerivedHypothesisMatchesOutcome: true,
+      baselineSkillCount: 1,
+      baselineTrustedDerivedSkillCount: 0,
+      currentSkillCount: 1,
+      currentTrustedDerivedSkillCount: 1,
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+  });
+
+  it("uses fixed safe labels for unknown outcome kind and status", () => {
+    expect(
+      firstDigLearningDiagnostic(
+        {
+          operationId: "private-operation-id",
+          kind: "unrecognized-operation",
+          status: "unrecognized-status",
+        },
+        snapshot(),
+        snapshot(),
+      ),
+    ).toMatchObject({ outcomeKind: "other", outcomeStatus: "unknown" });
+  });
+
   it("accepts a successful hypothesis derived from the exact first-dig receipt", () => {
     const baseline = snapshot();
     const current = snapshot({

@@ -97,7 +97,9 @@ import {
   type PersistentMemoryProgress,
 } from "./persistent-memory-diagnostic.js";
 import {
+  firstDigLearningDiagnostic,
   firstDigLearningEvidence,
+  type FirstDigLearningDiagnostic,
   type LearningHypothesisSnapshot,
 } from "./learning-reuse-acceptance.js";
 import {
@@ -1531,6 +1533,48 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
         }
       : {}),
     ...(caseId === "learning_reuse" &&
+    state.firstDigLearningDiagnostic !== undefined
+      ? {
+          learningFirstDigOutcomeKind:
+            state.firstDigLearningDiagnostic.outcomeKind,
+          learningFirstDigOutcomeStatus:
+            state.firstDigLearningDiagnostic.outcomeStatus,
+          learningFirstDigOutcomeHasSkillAtUse:
+            state.firstDigLearningDiagnostic.outcomeHasSkillAtUse,
+          learningFirstDigBaselineHasOutcomeSkill:
+            state.firstDigLearningDiagnostic.baselineHasOutcomeSkill,
+          learningFirstDigBaselineOutcomeSkillIsTrustedDerived:
+            state.firstDigLearningDiagnostic
+              .baselineOutcomeSkillIsTrustedDerived,
+          learningFirstDigCurrentHasOutcomeSkill:
+            state.firstDigLearningDiagnostic.currentHasOutcomeSkill,
+          learningFirstDigCurrentOutcomeSkillIsTrustedDerived:
+            state.firstDigLearningDiagnostic
+              .currentOutcomeSkillIsTrustedDerived,
+          learningFirstDigCurrentOutcomeSkillHasUsedRevision:
+            state.firstDigLearningDiagnostic.currentOutcomeSkillHasUsedRevision,
+          learningFirstDigDerivedHypothesisPresent:
+            state.firstDigLearningDiagnostic.firstDigDerivedHypothesisPresent,
+          learningFirstDigDerivedHypothesisIsTrustedDerived:
+            state.firstDigLearningDiagnostic
+              .firstDigDerivedHypothesisIsTrustedDerived,
+          learningFirstDigDerivedHypothesisHasRevision:
+            state.firstDigLearningDiagnostic
+              .firstDigDerivedHypothesisHasRevision,
+          learningFirstDigDerivedHypothesisMatchesOutcome:
+            state.firstDigLearningDiagnostic
+              .firstDigDerivedHypothesisMatchesOutcome,
+          learningBaselineSkillCount:
+            state.firstDigLearningDiagnostic.baselineSkillCount,
+          learningBaselineTrustedDerivedSkillCount:
+            state.firstDigLearningDiagnostic.baselineTrustedDerivedSkillCount,
+          learningCurrentSkillCount:
+            state.firstDigLearningDiagnostic.currentSkillCount,
+          learningCurrentTrustedDerivedSkillCount:
+            state.firstDigLearningDiagnostic.currentTrustedDerivedSkillCount,
+        }
+      : {}),
+    ...(caseId === "learning_reuse" &&
     state.learningFixtureDiagnostic !== undefined
       ? {
           learningFixturePhase: state.learningFixtureDiagnostic.phase,
@@ -2095,6 +2139,7 @@ interface RunState {
   autonomousLifeProgress?: SafeAutonomousProgress;
   learningReuseStage?: LearningReuseStage;
   learningReuseOwnerProposalRecorded?: boolean;
+  firstDigLearningDiagnostic?: FirstDigLearningDiagnostic;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
   skillExchangeStage?: SkillExchangeStage;
   gameActionPriorPendingProposalCount?: number;
@@ -2845,6 +2890,11 @@ async function main(): Promise<void> {
         await removeLearningLogFixture(rcon, firstLogs);
         activeLearningLogs = [];
         let learned = readSkillSnapshot(state.databasePath);
+        state.firstDigLearningDiagnostic = firstDigLearningDiagnostic(
+          firstDigOutcome,
+          learnedBaseline,
+          learned,
+        );
         let firstDigEvidence = firstDigLearningEvidence(
           firstDigOutcome,
           learnedBaseline,
@@ -2853,6 +2903,11 @@ async function main(): Promise<void> {
         if (firstDigEvidence === undefined) {
           await observeForPlayer(context, 30_000, () => {
             learned = readSkillSnapshot(state.databasePath);
+            state.firstDigLearningDiagnostic = firstDigLearningDiagnostic(
+              firstDigOutcome,
+              learnedBaseline,
+              learned,
+            );
             return (
               firstDigLearningEvidence(
                 firstDigOutcome,
@@ -2862,6 +2917,11 @@ async function main(): Promise<void> {
             );
           });
           firstDigEvidence = firstDigLearningEvidence(
+            firstDigOutcome,
+            learnedBaseline,
+            learned,
+          );
+          state.firstDigLearningDiagnostic = firstDigLearningDiagnostic(
             firstDigOutcome,
             learnedBaseline,
             learned,
