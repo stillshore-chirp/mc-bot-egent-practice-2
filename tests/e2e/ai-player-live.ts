@@ -102,6 +102,7 @@ import {
   type LearningFixtureOrientationDiagnostic,
 } from "./learning-fixture-orientation.js";
 import {
+  evidenceRevisionForOutcome,
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
   type FirstDigLearningDiagnostic,
@@ -1564,6 +1565,17 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
               .currentOutcomeSkillIsTrustedDerived,
           learningFirstDigCurrentOutcomeSkillHasUsedRevision:
             state.firstDigLearningDiagnostic.currentOutcomeSkillHasUsedRevision,
+          learningFirstDigEvidenceRevisionPresent:
+            state.firstDigLearningDiagnostic.firstDigEvidenceRevisionPresent,
+          learningFirstDigEvidenceRevisionMatchesOutcome:
+            state.firstDigLearningDiagnostic
+              .firstDigEvidenceRevisionMatchesOutcome,
+          learningFirstDigEvidenceRevisionHasMaterialChange:
+            state.firstDigLearningDiagnostic
+              .firstDigEvidenceRevisionHasMaterialChange,
+          learningFirstDigEvidenceRevisionHasNoNewSkills:
+            state.firstDigLearningDiagnostic
+              .firstDigEvidenceRevisionHasNoNewSkills,
           learningFirstDigDerivedHypothesisPresent:
             state.firstDigLearningDiagnostic.firstDigDerivedHypothesisPresent,
           learningFirstDigDerivedHypothesisIsTrustedDerived:
@@ -3109,37 +3121,35 @@ async function main(): Promise<void> {
           reuseRegion,
         );
         let afterReuse = readSkillSnapshot(state.databasePath);
-        const consultedRevisionAdvanced = (snapshot: SkillSnapshot): boolean =>
-          [...consultedLearnedSkillIds].some((skillId) => {
-            const priorVersions =
-              beforeReuse.revisionVersionsBySkill.get(skillId) ??
-              new Set<number>();
-            const currentVersions =
-              snapshot.revisionVersionsBySkill.get(skillId) ??
-              new Set<number>();
-            return [...currentVersions].some(
-              (version) => !priorVersions.has(version),
-            );
-          });
-        if (
-          !consultedRevisionAdvanced(afterReuse) ||
-          afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
-        ) {
-          await observeForPlayer(context, 30_000, () => {
-            afterReuse = readSkillSnapshot(state.databasePath);
-            return (
-              consultedRevisionAdvanced(afterReuse) &&
-              afterReuse.evidenceReceiptCount > beforeReuse.evidenceReceiptCount
-            );
-          });
-        }
-        const consultedLearnedSkillRevisionAdvanced =
-          consultedRevisionAdvanced(afterReuse);
         const repeatedOutcomes = newOutcomes(reuseStart, reused);
-        const repeatedDig = repeatedOutcomes.some(
+        const repeatedDigOutcome = repeatedOutcomes.find(
           (outcome) =>
             outcome.kind === "dig" && outcome.status === "successful",
         );
+        const repeatedDig = repeatedDigOutcome !== undefined;
+        const hasReceiptLinkedMaterialRevision = (
+          snapshot: SkillSnapshot,
+        ): boolean => {
+          if (repeatedDigOutcome === undefined) return false;
+          const evidenceRevision = evidenceRevisionForOutcome(
+            repeatedDigOutcome,
+            snapshot,
+          );
+          return (
+            evidenceRevision !== undefined &&
+            verifiedLearnedSkillIds.includes(evidenceRevision.skillId) &&
+            consultedLearnedSkillIds.has(evidenceRevision.skillId) &&
+            [...snapshot.skillIds].every((skillId) =>
+              beforeReuse.skillIds.has(skillId),
+            ) &&
+            !beforeReuse.evidenceRevisionsByRunId.has(
+              repeatedDigOutcome.operationId,
+            ) &&
+            !beforeReuse.revisionVersionsBySkill
+              .get(evidenceRevision.skillId)
+              ?.has(evidenceRevision.revisionVersion)
+          );
+        };
         if (
           !repeatedDig ||
           !worldChangedFromBlock(
@@ -3150,10 +3160,17 @@ async function main(): Promise<void> {
           incomplete("REUSED_SKILL_HAS_NO_OBSERVED_RESULT");
         }
         state.learningReuseStage = "reuse_result_confirmed";
-        if (
-          !consultedLearnedSkillRevisionAdvanced ||
-          afterReuse.evidenceReceiptCount <= beforeReuse.evidenceReceiptCount
-        ) {
+        let consultedLearnedSkillEvidenceRevisionLinked =
+          hasReceiptLinkedMaterialRevision(afterReuse);
+        if (!consultedLearnedSkillEvidenceRevisionLinked) {
+          await observeForPlayer(context, 30_000, () => {
+            afterReuse = readSkillSnapshot(state.databasePath);
+            consultedLearnedSkillEvidenceRevisionLinked =
+              hasReceiptLinkedMaterialRevision(afterReuse);
+            return consultedLearnedSkillEvidenceRevisionLinked;
+          });
+        }
+        if (!consultedLearnedSkillEvidenceRevisionLinked) {
           incomplete("SUCCESS_OR_FAILURE_DID_NOT_UPDATE_SKILL_EVIDENCE");
         }
         state.learningReuseStage = "revision_verified";
@@ -3166,9 +3183,12 @@ async function main(): Promise<void> {
             firstDigEvidence.source === "derived_from_first_dig",
           preexistingDerivedHypothesisUsedByFirstDig:
             firstDigEvidence.source === "preexisting_hypothesis_used",
+          receiptLinkedRevisionFromFirstDig:
+            firstDigEvidence.source ===
+            "receipt_linked_revision_from_first_dig",
           learnedSkillConsultedAgain: true,
           repeatResultObserved: true,
-          consultedLearnedSkillRevisionAdvanced,
+          consultedLearnedSkillEvidenceRevisionLinked,
           trustedFirstDigHypothesisVerified: true,
           initialSkillCount: baselineSkills.skillCount,
           learnedSkillCount: learned.skillCount,
@@ -8098,12 +8118,28 @@ interface SkillRow {
 interface SkillRevisionRow {
   readonly skill_id: string;
   readonly version: number;
+  readonly conditions_json: string;
+  readonly body: string;
+  readonly expected_outcome: string;
+  readonly confidence: number;
 }
 
 interface SuccessfulDerivedSkillRow {
   readonly run_id: string;
   readonly skill_id: string;
   readonly skill_version: number;
+}
+
+interface EvidenceRevisionRow {
+  readonly run_id: string;
+  readonly receipt_run_id: string;
+  readonly receipt_skill_id_at_use: string | null;
+  readonly receipt_skill_version_at_use: number | null;
+  readonly skill_id: string;
+  readonly operation_name: string;
+  readonly observed_outcome: string;
+  readonly skill_version_at_use: number;
+  readonly revision_version: number;
 }
 
 function readSkillSnapshot(databasePath: string): SkillSnapshot {
@@ -8117,14 +8153,46 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
       .prepare("SELECT id, version, body FROM mc_bot_skills")
       .all() as SkillRow[];
     const revisions = database
-      .prepare("SELECT skill_id, version FROM mc_bot_skill_revisions")
+      .prepare(
+        "SELECT skill_id, version, conditions_json, body, expected_outcome, confidence FROM mc_bot_skill_revisions",
+      )
       .all() as SkillRevisionRow[];
     const revisionVersionsBySkill = new Map<string, Set<number>>();
+    const revisionDefinitionsBySkill = new Map<
+      string,
+      Map<
+        number,
+        {
+          conditions: string[];
+          body: string;
+          expectedOutcome: string;
+          confidence: number;
+        }
+      >
+    >();
     for (const revision of revisions) {
       const versions =
         revisionVersionsBySkill.get(revision.skill_id) ?? new Set<number>();
       versions.add(revision.version);
       revisionVersionsBySkill.set(revision.skill_id, versions);
+      const definitions =
+        revisionDefinitionsBySkill.get(revision.skill_id) ??
+        new Map<
+          number,
+          {
+            conditions: string[];
+            body: string;
+            expectedOutcome: string;
+            confidence: number;
+          }
+        >();
+      definitions.set(revision.version, {
+        conditions: JSON.parse(revision.conditions_json) as string[],
+        body: revision.body,
+        expectedOutcome: revision.expected_outcome,
+        confidence: revision.confidence,
+      });
+      revisionDefinitionsBySkill.set(revision.skill_id, definitions);
     }
     const count = (table: string): number => {
       if (
@@ -8150,6 +8218,19 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
         "SELECT derived.run_id, derived.skill_id, derived.skill_version FROM mc_bot_skill_derived_hypotheses AS derived INNER JOIN mc_bot_skill_evidence_receipts AS receipt ON receipt.receipt_id = derived.receipt_id WHERE receipt.observed_outcome = 'successful'",
       )
       .all() as SuccessfulDerivedSkillRow[];
+    const evidenceRevisions = database
+      .prepare(
+        `SELECT evidence_revision.run_id, receipt.run_id AS receipt_run_id,
+                receipt.skill_id_at_use AS receipt_skill_id_at_use,
+                receipt.skill_version_at_use AS receipt_skill_version_at_use,
+                evidence_revision.skill_id,
+                evidence_revision.skill_version_at_use, evidence_revision.revision_version,
+                receipt.operation_name, receipt.observed_outcome
+         FROM mc_bot_skill_evidence_revisions AS evidence_revision
+         INNER JOIN mc_bot_skill_evidence_receipts AS receipt
+           ON receipt.receipt_id = evidence_revision.receipt_id`,
+      )
+      .all() as EvidenceRevisionRow[];
     return {
       skillIds: new Set(skills.map((skill) => skill.id)),
       skillCount: skills.length,
@@ -8165,6 +8246,22 @@ function readSkillSnapshot(databasePath: string): SkillSnapshot {
         ]),
       ),
       revisionVersionsBySkill,
+      revisionDefinitionsBySkill,
+      evidenceRevisionsByRunId: new Map(
+        evidenceRevisions.map((row) => [
+          row.run_id,
+          {
+            receiptRunId: row.receipt_run_id,
+            receiptSkillIdAtUse: row.receipt_skill_id_at_use,
+            receiptSkillVersionAtUse: row.receipt_skill_version_at_use,
+            skillId: row.skill_id,
+            operationName: row.operation_name,
+            observedOutcome: row.observed_outcome,
+            skillVersionAtUse: row.skill_version_at_use,
+            revisionVersion: row.revision_version,
+          },
+        ]),
+      ),
       learnedBodiesBySkill: new Map(
         skills.map((skill) => [skill.id, skill.body]),
       ),
