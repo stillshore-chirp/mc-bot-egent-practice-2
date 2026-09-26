@@ -16,6 +16,8 @@ MC Bot Skill は、Minecraftで繰り返し使える行動の要点を、目的�
 
 `reviseFromEvidence({ runId, ...revision })` は、成功または失敗を観測したtrusted receiptが実際に使ったSkillとversionを同一transaction内で照合し、そのreceiptを直後のimmutable revisionへ結びます。条件、本文、期待結果、confidenceのいずれかに実質的な変更が必要です。receipt/run、Skill/version、改訂版の不一致、古いversion、同一receiptへの異なる改訂は拒否されます。同じrunと同じ改訂内容の再送は既存の証跡リンクを返し、revisionやlearning counterを重ねて増やしません。改訂保存と証跡リンク挿入は一体でcommitまたはrollbackされ、リンクは更新・削除できません。`getEvidenceRevision(runId)` と `listEvidenceRevisions(skillId)` で対応を検証できます。通常の `revise` は引き続き利用できますが、trusted receiptに基づく学習ではこのAPIを使います。
 
+Player learning facadeの`revise`入力は`operationRefs`を受け取りません。receiptに記録されたSkill/versionのimmutable定義から参照一覧を読み、そのまま改訂へ渡します。使用版がreceiptのoperationを参照していなければ改訂を拒否し、モデル提案の参照追加で補正しません。これによりreceiptに結び付く操作参照と、使用版から保持する既存参照が一致します。
+
 `createHypothesisFromEvidence({ runId, input })` は、GPTの提案を受け取った学習facadeから呼べます。repositoryは既存のtrusted successful receiptを読み直し、receiptのoperation参照とrun単位の重複をtransaction内で検証してから新しいSkill仮説を作ります。GPTが申告した結果だけでreceiptを作る経路はありません。receiptのoperationを新Skillの`operationRefs`に含める必要があります。既存Skillの使用receiptなら証跡とのimmutableな関連だけを追加し、使用Skillのnative outcomeや件数を変更しません。事前にSkillが割り当てられていないreceiptなら、新Skill、初回revision、最初のnative successful outcome、証跡関連を一つのtransactionで保存します。同じrun・同じ内容の再要求は初回のSkill IDを返し、タイトルなど内容を変えて同じrunを再利用するとconflictになります。`listDerivedHypotheses(skillId)`で関連IDを取得し、`getEvidence(runId)`でreceiptを参照できます。`recordTrustedEvidence`は引き続きモデル入力から隔離されたゲーム観測・検証経路専用writerです。
 
 証跡には会話全文、LLM入出力、raw log、Minecraft username、UUID、IP、server address、座標などを渡さず、必要な事実だけを一般化してください。Skill本文は目的や周囲に合わせた行動判断の参考です。利用者の停止指示、Minecraftサーバーが実際に設定した権限、接続先サービスのアクセス制御に従い、Bot独自の固定禁止や強制退避を追加するためには使いません。

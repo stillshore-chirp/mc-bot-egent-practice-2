@@ -71,6 +71,7 @@ export const playerSkillLearningRejectionCodes = [
   "CREATE_REQUIRES_SUCCESSFUL_RECEIPT",
   "SIMILAR_SKILL_EXISTS",
   "SKILL_VERSION_RECEIPT_MISMATCH",
+  "SKILL_VERSION_OPERATION_MISMATCH",
 ] as const;
 
 export type PlayerSkillLearningRejectionCode =

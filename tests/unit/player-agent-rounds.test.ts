@@ -38,44 +38,15 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
-  it("retries a skill revision once after an operation-reference rejection", async () => {
-    const runId = "learning-revise-correct-once";
+  it("inherits operation references in the dedicated review from the used Skill version", async () => {
+    const runId = "learning-revise-dedicated";
     const skillId = "learning-used-skill";
     const fixture = openPurposeFixture([
       functionCallResponse(
-        "learning-revision-mismatch",
+        "learning-revision-without-operation-refs",
         "propose_skill_learning",
-        learningRevisionArguments(runId, skillId, 1, ["move_to"]),
+        learningRevisionArguments(runId, skillId, 1),
       ),
-      (request) => {
-        const requestRecord = z.record(z.string(), z.unknown()).parse(request);
-        expect(requestRecord.instructions).toContain(
-          "OPERATION_REFERENCE_MISMATCH",
-        );
-        const correctionPayload = requestUserPayload(request);
-        expect(correctionPayload.trustedSuccessfulReceipt).toMatchObject({
-          runId,
-          operationName: "dig",
-        });
-        expect(correctionPayload.usedHypothesis).toMatchObject({
-          id: skillId,
-          version: 1,
-          operationRefs: ["dig", "move_to"],
-        });
-        const correction = correctionPayload.correction;
-        expect(correction).toEqual({
-          previousRejectionCode: "OPERATION_REFERENCE_MISMATCH",
-        });
-        const usedHypothesis = z
-          .record(z.string(), z.unknown())
-          .parse(requestUserPayload(request).usedHypothesis);
-        expect(usedHypothesis.operationRefs).toEqual(["dig", "move_to"]);
-        return functionCallResponse(
-          "learning-revision-corrected",
-          "propose_skill_learning",
-          learningRevisionArguments(runId, skillId, 1, ["dig", "move_to"]),
-        );
-      },
     ]);
 
     try {
@@ -86,7 +57,7 @@ describe("player agent response rounds", () => {
       });
 
       expect(result.accepted).toBe(false);
-      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.requests).toHaveLength(1);
       expect(fixture.mind.snapshot().counters.learningUpdates).toBe(1);
       expect(fixture.mind.snapshot().learningReferences).toHaveLength(1);
       expect(fixture.skills.get(skill.id)).toMatchObject({
@@ -104,145 +75,116 @@ describe("player agent response rounds", () => {
         .snapshot()
         .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
         .filter(({ name }) => name === "propose_skill_learning");
-      expect(proposalCalls).toHaveLength(2);
-      expect(proposalCalls[0]).toMatchObject({
-        resultClass: "rejected",
-        resultCode: "OPERATION_REFERENCE_MISMATCH",
-      });
-      expect(proposalCalls[1]).toMatchObject({ resultClass: "ok" });
+      expect(proposalCalls).toHaveLength(1);
+      expect(proposalCalls[0]).toMatchObject({ resultClass: "ok" });
       const initialRequest = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(initialRequest.instructions).toContain(
-        "operationNameをoperationRefsへ必ず含め",
+        "operationRefsを提案する必要はありません",
       );
-      expect(initialRequest.instructions).toContain(
-        "既存operationRefsもすべて保持",
-      );
+      const tool = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(initialRequest.tools)
+        .find(({ name }) => name === "propose_skill_learning");
+      const parameters = z
+        .record(z.string(), z.unknown())
+        .parse(tool?.parameters);
+      expect(parameters.properties).not.toHaveProperty("operationRefs");
     } finally {
       fixture.close();
     }
   });
 
-  it("stops after one rejected correction proposal", async () => {
-    const runId = "learning-revise-reject-twice";
+  it("inherits operation references in the normal tool path without model input", async () => {
+    const runId = "learning-revise-normal";
     const skillId = "learning-used-skill";
     const fixture = openPurposeFixture([
       functionCallResponse(
-        "learning-first-mismatch",
+        "learning-normal-path-revision",
         "propose_skill_learning",
-        learningRevisionArguments(runId, skillId, 1, ["move_to"]),
+        learningRevisionArguments(runId, skillId, 1),
       ),
-      functionCallResponse(
-        "learning-second-mismatch",
-        "propose_skill_learning",
-        learningRevisionArguments(runId, skillId, 1, ["move_to"]),
-      ),
-      functionCallResponse(
-        "action-after-learning-review",
-        "commit_action_decision",
-        actionArguments(),
-      ),
+      terminalResponse("The receipt-grounded revision was recorded."),
     ]);
 
     try {
-      recordSuccessfulSkillUse(fixture, runId, skillId);
+      const { skill } = recordSuccessfulSkillUse(fixture, runId, skillId);
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().counters.learningUpdates).toBe(1);
+      expect(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[0])
+          .instructions,
+      ).not.toContain("独立した技能学習評価役");
+      expect(fixture.skills.get(skill.id)).toMatchObject({
+        version: 2,
+        operationRefs: ["dig", "move_to"],
+      });
+      const proposalCalls = fixture.mind
+        .snapshot()
+        .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
+        .filter(({ name }) => name === "propose_skill_learning");
+      expect(proposalCalls).toHaveLength(1);
+      expect(proposalCalls[0]).toMatchObject({ resultClass: "ok" });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rejects a receipt whose exact used version lacks its operation reference", async () => {
+    const runId = "learning-used-version-operation-mismatch";
+    const skillId = "learning-used-skill";
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "learning-mismatched-used-version",
+        "propose_skill_learning",
+        learningRevisionArguments(runId, skillId, 1),
+      ),
+      terminalResponse("No revision can be proposed for this used version."),
+    ]);
+
+    try {
+      const skill = fixture.skills.createSkill({
+        id: skillId,
+        category: "gathering",
+        title: "Collect a visible target",
+        purpose: "Collect the target and verify the observed result.",
+        conditions: ["The target is visible and reachable."],
+        body: "Select the target, collect it, and verify the next observation.",
+        operationRefs: ["move_to"],
+        expectedOutcome:
+          "The next observation confirms the target was collected.",
+        confidence: 0.7,
+      });
+      recordSuccessfulSkillUse(fixture, runId, skillId, skill);
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: fixture.mind.pendingEvents(),
       });
 
-      expect(result.accepted).toBe(true);
-      expect(fixture.requests).toHaveLength(3);
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(2);
       expect(fixture.mind.snapshot().counters.learningUpdates).toBe(0);
       expect(fixture.mind.snapshot().learningReferences).toHaveLength(0);
+      expect(fixture.skills.get(skillId)).toMatchObject({
+        version: 1,
+        operationRefs: ["move_to"],
+      });
       const proposalCalls = fixture.mind
         .snapshot()
         .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
         .filter(({ name }) => name === "propose_skill_learning");
-      expect(proposalCalls).toHaveLength(2);
-      expect(
-        proposalCalls.map(({ resultClass, resultCode }) => ({
-          resultClass,
-          resultCode,
-        })),
-      ).toEqual([
-        {
-          resultClass: "rejected",
-          resultCode: "OPERATION_REFERENCE_MISMATCH",
-        },
-        {
-          resultClass: "rejected",
-          resultCode: "OPERATION_REFERENCE_MISMATCH",
-        },
-      ]);
-    } finally {
-      fixture.close();
-    }
-  });
-
-  it("keeps an operation-reference rejection local to its receipt", async () => {
-    const firstRunId = "learning-first-receipt-mismatch";
-    const secondRunId = "learning-second-receipt-valid";
-    const skillId = "learning-used-skill";
-    const fixture = openPurposeFixture([
-      functionCallResponse(
-        "learning-first-receipt-mismatch",
-        "propose_skill_learning",
-        learningRevisionArguments(firstRunId, skillId, 1, ["move_to"]),
-      ),
-      functionCallResponse(
-        "learning-first-receipt-still-mismatch",
-        "propose_skill_learning",
-        learningRevisionArguments(firstRunId, skillId, 1, ["move_to"]),
-      ),
-      functionCallResponse(
-        "action-after-first-receipt-review",
-        "commit_action_decision",
-        actionArguments(),
-      ),
-      (request) => {
-        const requestRecord = z.record(z.string(), z.unknown()).parse(request);
-        expect(requestRecord.instructions).not.toContain(
-          "直前の提案はOPERATION_REFERENCE_MISMATCH",
-        );
-        expect(
-          requestUserPayload(request).trustedSuccessfulReceipt,
-        ).toMatchObject({ runId: secondRunId, operationName: "dig" });
-        return functionCallResponse(
-          "learning-second-receipt-accepted",
-          "propose_skill_learning",
-          learningRevisionArguments(secondRunId, skillId, 1, [
-            "dig",
-            "move_to",
-          ]),
-        );
-      },
-    ]);
-
-    try {
-      const { skill } = recordSuccessfulSkillUse(fixture, firstRunId, skillId);
-      const firstResult = await fixture.agent.think({
-        snapshot: fixture.mind.snapshot(),
-        events: fixture.mind.pendingEvents(),
+      expect(proposalCalls).toHaveLength(1);
+      expect(proposalCalls[0]).toMatchObject({
+        resultClass: "rejected",
+        resultCode: "SKILL_VERSION_OPERATION_MISMATCH",
       });
-
-      expect(firstResult.accepted).toBe(true);
-      expect(fixture.requests).toHaveLength(3);
-
-      recordSuccessfulSkillUse(fixture, secondRunId, skillId, skill);
-      const secondResult = await fixture.agent.think({
-        snapshot: fixture.mind.snapshot(),
-        events: fixture.mind.pendingEvents(),
-      });
-
-      expect(secondResult.accepted).toBe(false);
-      expect(fixture.requests).toHaveLength(4);
-      expect(fixture.mind.snapshot().counters.learningUpdates).toBe(1);
-      expect(fixture.mind.snapshot().learningReferences).toHaveLength(1);
-      expect(fixture.mind.snapshot().learningReferences[0]?.runId).toBe(
-        secondRunId,
-      );
     } finally {
       fixture.close();
     }
@@ -256,7 +198,7 @@ describe("player agent response rounds", () => {
       functionCallResponse(
         "revise-from-first-sequential-receipt",
         "propose_skill_learning",
-        learningRevisionArguments(firstRunId, skillId, 1, ["dig", "move_to"]),
+        learningRevisionArguments(firstRunId, skillId, 1),
       ),
       (request) => {
         const payload = requestUserPayload(request);
@@ -370,7 +312,7 @@ describe("player agent response rounds", () => {
   });
 
   it.each(["accepted proposal", "no proposal"] as const)(
-    "does not run a correction after a %s",
+    "continues normal decision flow after a %s",
     async (scenario) => {
       const runId = `learning-no-correction-${scenario.replaceAll(" ", "-")}`;
       const skillId = "learning-used-skill";
@@ -380,10 +322,7 @@ describe("player agent response rounds", () => {
               functionCallResponse(
                 "learning-accepted",
                 "propose_skill_learning",
-                learningRevisionArguments(runId, skillId, 1, [
-                  "dig",
-                  "move_to",
-                ]),
+                learningRevisionArguments(runId, skillId, 1),
               ),
               functionCallResponse(
                 "action-after-learning-review",
@@ -411,13 +350,6 @@ describe("player agent response rounds", () => {
         expect(fixture.requests).toHaveLength(
           scenario === "accepted proposal" ? 1 : 2,
         );
-        expect(
-          fixture.requests.some((request) =>
-            String(
-              z.record(z.string(), z.unknown()).parse(request).instructions,
-            ).includes("直前の提案はOPERATION_REFERENCE_MISMATCH"),
-          ),
-        ).toBe(false);
         expect(fixture.mind.snapshot().counters.learningUpdates).toBe(
           scenario === "accepted proposal" ? 1 : 0,
         );
@@ -2161,7 +2093,6 @@ function learningRevisionArguments(
   runId: string,
   skillId: string,
   expectedVersion: number,
-  operationRefs: string[],
 ): Record<string, unknown> {
   return {
     runId,
@@ -2175,7 +2106,6 @@ function learningRevisionArguments(
       "The target is visible, reachable, and the surrounding area is safe.",
     ],
     body: "Inspect the target before collection; verify the inventory and world after collection.",
-    operationRefs,
     expectedOutcome:
       "The target is removed and the inventory reflects the collection.",
     confidence: 0.8,
