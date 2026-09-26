@@ -3755,6 +3755,11 @@ async function main(): Promise<void> {
           unknownWallFixtureConfirmed: false,
           unknownDryGroundFixtureConfirmed: false,
         });
+        if (state.targetCase === "unknown_composite") {
+          await removeHiddenContainerFixture(rcon, origin, {
+            chest: fixturePoint(origin, 6, 0),
+          });
+        }
         await configureUnknownFixture(rcon, origin, state.botName);
         updateUnknownCompositeDiagnostic(state, {
           unknownWallFixtureConfirmed: true,
