@@ -26,6 +26,7 @@ import type {
   PlayerMemoryPort,
   PlayerRuntimeEvent,
 } from "../../src/player/contracts.js";
+import { playerBodyOutcomeEventId } from "../../src/player/contracts.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import { PlayerRuntime } from "../../src/player/runtime.js";
 import type { PlayerResponsesClient } from "../../src/player/responses.js";
@@ -58,11 +59,7 @@ describe("player skill learning", () => {
         return functionCallResponse(
           "review-success",
           "propose_skill_learning",
-          learningArguments(
-            runId,
-            "Reach a landmark using an observed route",
-            "dig",
-          ),
+          learningArguments(runId, "Reach a landmark using an observed route"),
         );
       },
       (request) => {
@@ -238,6 +235,7 @@ describe("player skill learning", () => {
     const runId = "learning-related-hypothesis-current-run";
     const observedAt = new Date().toISOString();
     const expectedOutcome = "The selected block is removed from view.";
+    startLearningTestOperation(mind, runId, expectedOutcome, usedSkill);
     skills.recordTrustedEvidence({
       runId,
       operationName: "dig",
@@ -262,10 +260,7 @@ describe("player skill learning", () => {
         observedAt,
       },
     });
-    const outcomeEvent = mind.enqueueEvent(
-      "body_outcome",
-      "A successful body outcome needs purpose review.",
-    );
+    const outcomeEvent = findLearningOutcomeEvent(mind, runId);
     const requests: unknown[] = [];
     const agent = new PlayerPurposeAgent({
       client: scriptedClient([
@@ -767,7 +762,6 @@ describe("player skill learning", () => {
     const operationName = seed.operationRefs[0];
     if (operationName === undefined)
       throw new Error("seed operation reference is missing");
-    const modelOperationRef = operationName === "dig" ? "look" : "dig";
     const runId = "learning-run-observed-success";
     const seedStatisticsBefore = skills.get(seed.id).nativeStatistics;
     skills.recordTrustedEvidence({
@@ -784,12 +778,7 @@ describe("player skill learning", () => {
     });
 
     const title = "Reach a landmark using an observed route";
-    const modelCreateArguments = learningArguments(
-      runId,
-      title,
-      operationName,
-      modelOperationRef,
-    );
+    const modelCreateArguments = learningArguments(runId, title);
     modelCreateArguments.skillId = "model-provided-untrusted-target";
     modelCreateArguments.expectedVersion = seed.version + 7;
     const client = scriptedClient([
@@ -814,7 +803,7 @@ describe("player skill learning", () => {
       functionCallResponse(
         "retry-1",
         "propose_skill_learning",
-        learningArguments(runId, title, operationName),
+        learningArguments(runId, title),
       ),
       (request) => {
         expect(toolOutput(request, "retry-1")).toMatchObject({
@@ -915,7 +904,7 @@ describe("player skill learning", () => {
       observedAt: new Date().toISOString(),
     });
     const title = "Failed receipt must not create a new hypothesis";
-    const modelCreateArguments = learningArguments(runId, title, operationName);
+    const modelCreateArguments = learningArguments(runId, title);
     modelCreateArguments.skillId = seed.id;
     modelCreateArguments.expectedVersion = seed.version;
     const client = scriptedClient([
@@ -972,8 +961,6 @@ describe("player skill learning", () => {
 function learningArguments(
   runId: string,
   title: string,
-  operationName: string,
-  modelOperationRef = operationName,
 ): Record<string, unknown> {
   return {
     runId,
@@ -985,7 +972,6 @@ function learningArguments(
     purpose: "reach a chosen landmark using the current visible route",
     conditions: ["A landmark is selected and a route is visible."],
     body: "Compare the visible route to the landmark, select a suitable path, and verify arrival from the next body observation.",
-    operationRefs: [modelOperationRef],
     expectedOutcome: "The next observation confirms arrival at the landmark.",
     confidence: 0.65,
     changeKind: "revise",
@@ -1001,6 +987,7 @@ function recordTrustedSuccessfulOutcome(
 ): PlayerRuntimeEvent {
   const observedAt = new Date().toISOString();
   const expectedOutcome = "The selected block is removed from view.";
+  startLearningTestOperation(mind, runId, expectedOutcome);
   skills.recordTrustedEvidence({
     runId,
     operationName: "dig",
@@ -1021,10 +1008,43 @@ function recordTrustedSuccessfulOutcome(
       observedAt,
     },
   });
-  return mind.enqueueEvent(
-    "body_outcome",
-    "A successful body outcome needs purpose review.",
-  );
+  return findLearningOutcomeEvent(mind, runId);
+}
+
+function startLearningTestOperation(
+  mind: PlayerMindStore,
+  runId: string,
+  expectedOutcome: string,
+  skill?: ReturnType<McSkillRepository["createSkill"]>,
+): void {
+  const started = mind.commitThought({
+    expectedRevision: mind.snapshot().revision,
+    decision: {
+      kind: "act",
+      purpose: "Record the test operation before its observed outcome.",
+      operation: { kind: "dig", position: { x: 1, y: 64, z: 0 } },
+      operationId: runId,
+      expectedOutcome,
+      ...(skill === undefined
+        ? {}
+        : { skillId: skill.id, skillVersion: skill.version }),
+      wakeOn: ["body_outcome"],
+    },
+  });
+  if (!started.accepted)
+    throw new Error("learning test operation could not be started");
+}
+
+function findLearningOutcomeEvent(
+  mind: PlayerMindStore,
+  runId: string,
+): PlayerRuntimeEvent {
+  const event = mind
+    .pendingEvents()
+    .find(({ id }) => id === playerBodyOutcomeEventId(runId));
+  if (event === undefined)
+    throw new Error("trusted body outcome event was not recorded");
+  return event;
 }
 
 function requestToolNames(request: unknown): string[] {
