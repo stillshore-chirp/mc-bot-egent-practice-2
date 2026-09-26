@@ -3805,25 +3805,27 @@ async function main(): Promise<void> {
       requireLiveContext(),
       async (context) => {
         let hungerEffectMayBeActive = false;
+        let saturationEffectMayBeActive = false;
+        let saturationEffectUsedForFullState = false;
         try {
           await rcon.command(`clear ${context.botName} minecraft:bread`);
           const initialFood = await rconFoodLevel(rcon, context.botName);
           if (initialFood !== 20)
             incomplete("FOOD_INTENT_INITIAL_FULL_STATE_NOT_CONFIRMED");
 
+          hungerEffectMayBeActive = true;
           await rcon.command(
             `effect give ${context.botName} minecraft:hunger 120 8 true`,
           );
-          hungerEffectMayBeActive = true;
-          if (!(await rconHasActiveHungerEffect(rcon, context.botName)))
+          if (!(await rconHasActiveEffect(rcon, context.botName, "hunger")))
             incomplete("FOOD_INTENT_HUNGER_EFFECT_NOT_CONFIRMED");
 
           const hungerDeadline = Date.now() + 60_000;
           let hungerPrepared = false;
           while (Date.now() < hungerDeadline) {
             const observedFood = await rconFoodLevel(rcon, context.botName);
-            if (observedFood < initialFood) {
-              if (observedFood < 15 || observedFood > 19)
+            if (observedFood <= 15) {
+              if (observedFood < 12)
                 incomplete("FOOD_INTENT_SAFE_HUNGER_RANGE_NOT_CONFIRMED");
               hungerPrepared = true;
               break;
@@ -3836,12 +3838,12 @@ async function main(): Promise<void> {
           await rcon.command(
             `effect clear ${context.botName} minecraft:hunger`,
           );
-          if (await rconHasActiveHungerEffect(rcon, context.botName))
+          if (await rconHasActiveEffect(rcon, context.botName, "hunger"))
             incomplete("FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
           hungerEffectMayBeActive = false;
 
           const foodBefore = await rconFoodLevel(rcon, context.botName);
-          if (foodBefore < 15 || foodBefore > 19)
+          if (foodBefore < 12 || foodBefore > 15)
             incomplete("FOOD_INTENT_SAFE_HUNGER_RANGE_NOT_CONFIRMED");
           await rcon.command(`give ${context.botName} minecraft:bread 1`);
           const breadBefore = await rconInventoryItemCount(
@@ -3953,8 +3955,29 @@ async function main(): Promise<void> {
           const foodAfter = await rconFoodLevel(rcon, context.botName);
           if (breadAfter !== breadBefore - 1 || foodAfter <= foodBefore)
             fail("FOOD_INTENT_CONSUME_ORACLE_MISMATCH");
-          if (foodAfter !== 20)
-            fail("FOOD_INTENT_POST_CONSUME_FULL_STATE_NOT_CONFIRMED");
+          let foodBeforeFullStage = foodAfter;
+          if (foodBeforeFullStage < 20) {
+            saturationEffectUsedForFullState = true;
+            saturationEffectMayBeActive = true;
+            await rcon.command(
+              `effect give ${context.botName} minecraft:saturation 1 20 true`,
+            );
+            const fullStateDeadline = Date.now() + 3_000;
+            while (Date.now() < fullStateDeadline) {
+              foodBeforeFullStage = await rconFoodLevel(rcon, context.botName);
+              if (foodBeforeFullStage === 20) break;
+              await waitMs(250);
+            }
+            await rcon.command(
+              `effect clear ${context.botName} minecraft:saturation`,
+            );
+            if (await rconHasActiveEffect(rcon, context.botName, "saturation"))
+              incomplete("FOOD_INTENT_SATURATION_EFFECT_CLEANUP_NOT_CONFIRMED");
+            saturationEffectMayBeActive = false;
+            foodBeforeFullStage = await rconFoodLevel(rcon, context.botName);
+          }
+          if (foodBeforeFullStage !== 20)
+            incomplete("FOOD_INTENT_FULL_STAGE_FIXTURE_NOT_CONFIRMED");
 
           await rcon.command(`give ${context.botName} minecraft:bread 1`);
           const fullStageBread = await rconInventoryItemCount(
@@ -4023,31 +4046,38 @@ async function main(): Promise<void> {
             selectedConsume: true,
             serverInventoryDecrementConfirmed: true,
             serverHungerIncreaseConfirmed: true,
+            saturationEffectUsedForFullState,
             fullHungerExplanationReceived: true,
             fullHungerWaitDecisionConfirmed: true,
             fullHungerInventoryUnchangedConfirmed: true,
             fullHungerLevelUnchangedConfirmed: true,
           };
         } finally {
-          if (hungerEffectMayBeActive) {
+          let allFoodEffectsCleared = true;
+          for (const [effect, mayBeActive] of [
+            ["hunger", hungerEffectMayBeActive],
+            ["saturation", saturationEffectMayBeActive],
+          ] as const) {
+            if (!mayBeActive) continue;
             let effectClearConfirmed: boolean;
             try {
               await rcon.command(
-                `effect clear ${context.botName} minecraft:hunger`,
+                `effect clear ${context.botName} minecraft:${effect}`,
               );
-              effectClearConfirmed = !(await rconHasActiveHungerEffect(
+              effectClearConfirmed = !(await rconHasActiveEffect(
                 rcon,
                 context.botName,
+                effect,
               ));
             } catch {
               effectClearConfirmed = false;
             }
-            if (!effectClearConfirmed) {
-              state.abortRequested = true;
-              state.failureCode ??=
-                "FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED";
-              incomplete("FOOD_INTENT_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
-            }
+            if (!effectClearConfirmed) allFoodEffectsCleared = false;
+          }
+          if (!allFoodEffectsCleared) {
+            state.abortRequested = true;
+            state.failureCode ??= "FOOD_INTENT_EFFECT_CLEANUP_NOT_CONFIRMED";
+            incomplete("FOOD_INTENT_EFFECT_CLEANUP_NOT_CONFIRMED");
           }
         }
       },
@@ -7416,14 +7446,17 @@ async function rconFoodLevel(
   return foodLevel;
 }
 
-async function rconHasActiveHungerEffect(
+async function rconHasActiveEffect(
   rcon: LocalRcon,
   botName: string,
+  effect: "hunger" | "saturation",
 ): Promise<boolean> {
   const activeEffects = await rcon.command(
     `data get entity ${botName} active_effects`,
   );
-  return /\bid\s*:\s*["']minecraft:hunger["']/iu.test(activeEffects);
+  return new RegExp(`\\bid\\s*:\\s*["']minecraft:${effect}["']`, "iu").test(
+    activeEffects,
+  );
 }
 
 function explainsFullHunger(text: string): boolean {
