@@ -17,7 +17,7 @@
 
 ## 会話、判断、身体の境界
 
-所有者のMinecraft chatは独立した会話エージェントへ送られます。会話エージェントは返答、目的提案、明示的な停止・再開を扱います。目的提案はMindStoreへ先に保存され、行動中のbodyを直接変更しません。目的エージェントは現在の目的・proposal・観測・記憶を照らし、採用、妥協、辞退、別の自律目的を理由付きで選びます。owner以外のchatは受け付けません。
+所有者のMinecraft chatは独立した会話エージェントへ送られます。会話エージェントは返答、目的提案、明示的な停止・再開を扱います。目的提案はMindStoreへ先に保存され、行動中のbodyを直接変更しません。目的エージェントは現在の目的・proposal・観測・記憶を照らし、採用、妥協、辞退、別の自律目的を理由付きで選びます。owner以外のchatは受け付けません。提案への判断理由は、consumeを他のowner goalの準備行動として選んだ場合もownerへ通知し、consumeの結果はPlayerBodyの事後観測に基づいて別途伝えます。会話エージェントは、送信に成功したassistant返答だけを後続turnの会話文脈へ記録します。
 
 採用・妥協したproposalは元のtitleと意図を持つowner goalに結び付き、解決理由と一緒に以後の判断文脈へ残ります。activeとpausedのリンクgoalは直近goalの件数制限を越えて文脈に保持しますが、paused goalは自動再開しません。self由来の中間goalを完了しても、リンクされたowner intentは完了しません。owner intentの完了や放棄は明示的なgoal更新で判断し、提案を辞退した場合はgoalを自動生成しません。`locate_owner`はpending proposal、またはadopted/compromisedかつリンクgoalがactiveな時だけ所有者位置を観測します。proposal解決とgoal linkageは同じCAS transactionに入り、goal mirrorへも保存します。
 
