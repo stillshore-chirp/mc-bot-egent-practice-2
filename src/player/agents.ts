@@ -68,6 +68,7 @@ const conciseArgumentHintKinds = new Set<string>([
   "move_to",
   "move_relative",
   "dig",
+  "place",
 ]);
 /** Compact operation index shown every round; complex schemas remain on demand. */
 export const playerOperationCatalog = playerOperationNames
@@ -121,6 +122,17 @@ function conciseOperationArguments(
         .map((child) => render(String(child), children[String(child)]))
         .join(",")}}`;
     }
+    if (Array.isArray(property?.enum)) {
+      return `${name}:${property.enum.map((item) => JSON.stringify(item)).join("|")}`;
+    }
+    if (property?.type === "string") {
+      const limits =
+        typeof property.minLength === "number" &&
+        typeof property.maxLength === "number"
+          ? `[${property.minLength}..${property.maxLength}]`
+          : "";
+      return `${name}:string${limits}`;
+    }
     if (property?.type !== "number")
       throw new Error("PLAYER_OPERATION_ARGUMENT_HINT_UNAVAILABLE");
     const limits =
@@ -130,9 +142,17 @@ function conciseOperationArguments(
         : "";
     return `${name}:number${limits}`;
   };
-  return `{kind:"${kind}",${required
-    .filter((name) => name !== "kind")
-    .map((name) => render(String(name), properties[String(name)]))
+  const argumentsToRender =
+    kind === "place"
+      ? Object.keys(properties).filter((name) => name !== "kind")
+      : required.filter((name) => name !== "kind");
+  return `{kind:"${kind}",${argumentsToRender
+    .map((name) =>
+      render(
+        `${name}${required.includes(name) ? "" : "?"}`,
+        properties[String(name)],
+      ),
+    )
     .join(",")}}`;
 }
 

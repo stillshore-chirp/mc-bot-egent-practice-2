@@ -277,7 +277,10 @@ describe("on-demand player operation schemas", () => {
       expect(playerOperationCatalog).toContain(
         '入力: {kind:"move_relative",offset:{x:number[-32..32],y:number[-32..32],z:number[-32..32]},range:number[0.25..8]}',
       );
-      expect(playerOperationCatalog.match(/入力:/gu)).toHaveLength(4);
+      expect(playerOperationCatalog).toContain(
+        '入力: {kind:"place",item:string[1..128],position:{x:number,y:number,z:number},face?:"up"|"down"|"north"|"south"|"east"|"west"}',
+      );
+      expect(playerOperationCatalog.match(/入力:/gu)).toHaveLength(5);
       expect(instructions.length).toBeLessThan(
         instructions.replace(playerOperationCatalog, fullSchemaText).length,
       );
