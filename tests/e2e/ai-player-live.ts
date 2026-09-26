@@ -32,6 +32,7 @@ import { loadConfig } from "../../src/config/load-config.js";
 import {
   MineflayerPlayerBody,
   type PlayerBody,
+  type PlayerItemCollectionOutcome,
   type PlayerBodyObservationOptions,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
@@ -394,8 +395,6 @@ type BodyDigErrorClass =
   | "interrupted"
   | "other";
 type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
-type ReturnPathDropDistanceBucket = BodyPositionDriftBucket | "unknown";
-type ReturnPathDropSearchRadius = "r2" | "r4" | "r8" | "r16" | "unknown";
 type ReturnPathDigFeetClass = "dry" | "water" | "other" | "unknown";
 type ReturnPathDigSupportClass = "stone" | "other" | "unknown";
 
@@ -406,13 +405,6 @@ interface ReturnPathDigStageObservation {
   readonly supportBlockClass: ReturnPathDigSupportClass;
   readonly stable: boolean;
   readonly ready: boolean;
-}
-
-interface ReturnPathDropDistanceObservation {
-  readonly available: boolean;
-  readonly dropPresent?: true;
-  readonly distanceBucket: ReturnPathDropDistanceBucket;
-  readonly searchRadiusBucket: ReturnPathDropSearchRadius;
 }
 
 interface BodyMovePathDiagnostic {
@@ -426,7 +418,7 @@ interface BodyMovePathDiagnostic {
 }
 
 interface ReturnPathProbeDiagnostic {
-  readonly interpretation?: "diagnostic_only_move_outcomes_not_gated";
+  readonly interpretation?: "diagnostic_only_live_item_collection_not_gated";
   readonly fixtureConfirmed?: boolean;
   readonly digStageRconConfirmed?: boolean;
   readonly digStagePlayerDistanceBucket?: BodyPositionDriftBucket | "unknown";
@@ -445,24 +437,31 @@ interface ReturnPathProbeDiagnostic {
   readonly itemPresentAfterDig?: boolean;
   readonly dropItemEntityPresentAfterDig?: boolean;
   readonly targetClearedAfterDig?: boolean;
-  readonly dropItemEntityPresentBeforeMove?: boolean;
-  readonly itemPresentBeforeDropMove?: boolean;
+  readonly dropItemEntityPresentBeforeCollection?: boolean;
+  readonly itemPresentBeforeCollection?: boolean;
   readonly dropStageBodyConfirmed?: boolean;
-  readonly dropMoveGoal?: "parsed_drop_position";
-  readonly dropMoveRange?: 0.25;
-  readonly dropMove?: BodyMovePathDiagnostic;
-  readonly dropMoveRconArrivalConfirmed?: boolean;
-  readonly dropMoveRconGoalDistanceBucket?: ReturnPathDropDistanceBucket;
-  readonly dropDistanceObservationAvailableAtArrival?: boolean;
-  readonly dropPresentAtArrival?: boolean;
-  readonly playerDropDistanceBucketAtArrival?: ReturnPathDropDistanceBucket;
-  readonly dropSearchRadiusAtArrival?: ReturnPathDropSearchRadius;
-  readonly dropDistanceObservationAvailableAfterPickupWait?: boolean;
-  readonly dropPresentAfterPickupWait?: boolean;
-  readonly playerDropDistanceBucketAfterPickupWait?: ReturnPathDropDistanceBucket;
-  readonly dropSearchRadiusAfterPickupWait?: ReturnPathDropSearchRadius;
-  readonly itemPresentAfterDropMove?: boolean;
+  readonly dropLookStatus?: BodyOperationStatus;
+  readonly dropVisibilityStatus?:
+    | "unique"
+    | "not_visible"
+    | "ambiguous"
+    | "observation_unavailable"
+    | "cancelled"
+    | "look_failed";
+  readonly visibleDropItemCount?: number;
+  readonly dropEntityKindClass?: "object" | "other";
+  readonly itemCollectionAttempted?: boolean;
+  readonly itemCollectionStatus?: BodyOperationStatus;
+  readonly itemCollectionOutcome?: PlayerItemCollectionOutcome | "none";
+  readonly itemCollectionObservedEffect?: "item_collected" | "none";
+  readonly itemCollectionEffectMatchedTarget?: boolean;
+  readonly itemCollectionRecoveryRequired?: boolean;
+  readonly rconDropPresentAfterCollection?: boolean;
+  readonly rconDropObservationAvailableAfterCollection?: boolean;
+  readonly inventoryItemPresentAfterCollection?: boolean;
+  readonly inventoryObservationAvailableAfterCollection?: boolean;
   readonly itemPickupConfirmed?: boolean;
+  readonly returnMoveAttempted?: boolean;
   readonly returnMoveSkippedRecoveryRequired?: boolean;
   readonly returnMoveSkippedNoPickup?: boolean;
   readonly returnMove?: BodyMovePathDiagnostic;
@@ -5316,7 +5315,7 @@ async function runOperationSmoke(
         body = client.createPlayerBody();
         const names = new Set(playerOperationNames);
         if (
-          names.size !== 30 ||
+          names.size !== 31 ||
           !names.has("move_relative") ||
           !names.has("look_sweep") ||
           !names.has("dig") ||
@@ -6236,7 +6235,7 @@ async function runUnknownReturnPathProbe(
 ): Promise<void> {
   await configureUnknownFixture(rcon, spawn, botName);
   updateReturnPathProbeDiagnostic(state, {
-    interpretation: "diagnostic_only_move_outcomes_not_gated",
+    interpretation: "diagnostic_only_live_item_collection_not_gated",
   });
   const target = unknownFixtureTarget(spawn);
   const wallPoint = {
@@ -6399,125 +6398,182 @@ async function runUnknownReturnPathProbe(
     incomplete("RETURN_PATH_PROBE_DROP_STAGE_NOT_CONFIRMED");
   }
 
-  const itemPresentBeforeDropMove = await rconInventoryHasBlueWool(
+  const itemPresentBeforeCollection = await rconInventoryHasBlueWool(
     rcon,
     botName,
   );
-  const dropPositionBeforeMove = await rconBlueWoolDropPositionNear(
+  const dropPositionBeforeCollection = await rconBlueWoolDropPositionNear(
     rcon,
     target,
   );
-  const dropItemEntityPresentBeforeMove =
-    dropPositionBeforeMove === undefined ? undefined : true;
+  const dropItemEntityPresentBeforeCollection =
+    dropPositionBeforeCollection === undefined ? undefined : true;
   updateReturnPathProbeDiagnostic(state, {
-    ...(dropItemEntityPresentBeforeMove === undefined
+    ...(dropItemEntityPresentBeforeCollection === undefined
       ? {}
-      : { dropItemEntityPresentBeforeMove }),
-    itemPresentBeforeDropMove,
+      : { dropItemEntityPresentBeforeCollection }),
+    itemPresentBeforeCollection,
   });
-  if (itemPresentBeforeDropMove)
+  if (itemPresentBeforeCollection)
     incomplete("RETURN_PATH_PROBE_ITEM_ALREADY_IN_INVENTORY");
-  if (dropPositionBeforeMove === undefined)
-    incomplete("RETURN_PATH_PROBE_DROP_POSITION_UNAVAILABLE_BEFORE_MOVE");
-  updateReturnPathProbeDiagnostic(state, {
-    dropMoveGoal: "parsed_drop_position",
-    dropMoveRange: 0.25,
-  });
-  const dropMove = await executeBodyMovePathProbe(
-    body,
-    {
-      kind: "move_to",
-      position: dropPositionBeforeMove,
-      range: 0.25,
-    },
+  if (dropPositionBeforeCollection === undefined)
+    incomplete("RETURN_PATH_PROBE_DROP_POSITION_UNAVAILABLE_BEFORE_LOOK");
+
+  const dropLookResult = await body.execute(
+    { kind: "look", target: dropPositionBeforeCollection },
     signal,
   );
-  updateReturnPathProbeDiagnostic(state, { dropMove });
-  const afterDropMove = parsePosition(
-    await rcon.command(`data get entity ${botName} Pos`),
-  );
-  const dropMoveGoalDistance = Math.hypot(
-    afterDropMove.x - dropPositionBeforeMove.x,
-    afterDropMove.y - dropPositionBeforeMove.y,
-    afterDropMove.z - dropPositionBeforeMove.z,
-  );
-  const goalBlockDx =
-    Math.floor(afterDropMove.x) - Math.floor(dropPositionBeforeMove.x);
-  const goalBlockDy =
-    Math.floor(afterDropMove.y) - Math.floor(dropPositionBeforeMove.y);
-  const goalBlockDz =
-    Math.floor(afterDropMove.z) - Math.floor(dropPositionBeforeMove.z);
-  const dropMoveRconArrivalConfirmed =
-    goalBlockDx * goalBlockDx +
-      goalBlockDy * goalBlockDy +
-      goalBlockDz * goalBlockDz <=
-    0.25 * 0.25;
-  const dropDistanceAtArrival = await observeReturnPathDropDistance(
-    rcon,
-    botName,
-    target,
-    afterDropMove,
-  );
   updateReturnPathProbeDiagnostic(state, {
-    dropDistanceObservationAvailableAtArrival: dropDistanceAtArrival.available,
-    ...(dropDistanceAtArrival.dropPresent === undefined
+    dropLookStatus: dropLookResult.status,
+    ...(dropLookResult.status === "successful"
       ? {}
-      : { dropPresentAtArrival: dropDistanceAtArrival.dropPresent }),
-    dropMoveRconGoalDistanceBucket: positionDriftBucket(dropMoveGoalDistance),
-    playerDropDistanceBucketAtArrival: dropDistanceAtArrival.distanceBucket,
-    dropSearchRadiusAtArrival: dropDistanceAtArrival.searchRadiusBucket,
+      : { dropVisibilityStatus: "look_failed" as const }),
   });
-  const itemPresentAfterDropMove = await waitForRconInventoryBlueWool(
-    rcon,
-    botName,
-    2_500,
-  );
-  const dropDistanceAfterPickupWait = await observeReturnPathDropDistance(
-    rcon,
-    botName,
-    target,
-  );
-  // Preconditions above guarantee a fresh ground drop with no prior pickup.
-  const itemPickupConfirmed = itemPresentAfterDropMove;
+  if (dropLookResult.status !== "successful")
+    incomplete("RETURN_PATH_PROBE_DROP_LOOK_FAILED");
+
+  let visibleDropCandidates: PlayerBodyObservation["perception"]["entities"] =
+    [];
+  let observationUnavailable = false;
+  const visibilityDeadline = Date.now() + 5_000;
+  while (!signal.aborted && Date.now() < visibilityDeadline) {
+    try {
+      const observation = await body.observe();
+      visibleDropCandidates = observation.perception.entities.filter(
+        (entity) =>
+          !entity.isPlayer &&
+          entity.name === "item" &&
+          Math.hypot(
+            entity.position.x - dropPositionBeforeCollection.x,
+            entity.position.y - dropPositionBeforeCollection.y,
+            entity.position.z - dropPositionBeforeCollection.z,
+          ) <= 1,
+      );
+    } catch {
+      observationUnavailable = true;
+      break;
+    }
+    if (visibleDropCandidates.length === 1) break;
+    await waitMs(100);
+  }
+  const dropVisibilityStatus =
+    visibleDropCandidates.length === 1
+      ? "unique"
+      : signal.aborted
+        ? "cancelled"
+        : observationUnavailable
+          ? "observation_unavailable"
+          : visibleDropCandidates.length === 0
+            ? "not_visible"
+            : "ambiguous";
+  const visibleDropItem =
+    visibleDropCandidates.length === 1 ? visibleDropCandidates[0] : undefined;
   updateReturnPathProbeDiagnostic(state, {
-    dropDistanceObservationAvailableAfterPickupWait:
-      dropDistanceAfterPickupWait.available,
-    ...(dropDistanceAfterPickupWait.dropPresent === undefined
+    dropVisibilityStatus,
+    visibleDropItemCount: visibleDropCandidates.length,
+    ...(visibleDropItem === undefined
       ? {}
       : {
-          dropPresentAfterPickupWait: dropDistanceAfterPickupWait.dropPresent,
+          dropEntityKindClass:
+            visibleDropItem.kind === "object" ? "object" : "other",
         }),
-    playerDropDistanceBucketAfterPickupWait:
-      dropDistanceAfterPickupWait.distanceBucket,
-    dropSearchRadiusAfterPickupWait:
-      dropDistanceAfterPickupWait.searchRadiusBucket,
-    dropMoveRconArrivalConfirmed,
-    itemPresentAfterDropMove,
+  });
+  if (visibleDropItem === undefined) {
+    incomplete(
+      dropVisibilityStatus === "not_visible"
+        ? "RETURN_PATH_PROBE_DROP_NOT_VISIBLE_AFTER_LOOK"
+        : dropVisibilityStatus === "ambiguous"
+          ? "RETURN_PATH_PROBE_DROP_ID_NOT_UNIQUE"
+          : dropVisibilityStatus === "cancelled"
+            ? "RETURN_PATH_PROBE_DROP_VISIBILITY_CHECK_CANCELLED"
+            : "RETURN_PATH_PROBE_DROP_OBSERVATION_UNAVAILABLE",
+    );
+  }
+
+  const collectionResult = await body.execute(
+    { kind: "collect_item", entityId: visibleDropItem.id },
+    signal,
+  );
+  const itemCollectionEffectMatchedTarget =
+    collectionResult.observedEffect?.type === "item_collected" &&
+    collectionResult.observedEffect.entityId === visibleDropItem.id;
+  updateReturnPathProbeDiagnostic(state, {
+    itemCollectionAttempted: true,
+    itemCollectionStatus: collectionResult.status,
+    itemCollectionOutcome: collectionResult.itemCollectionOutcome ?? "none",
+    itemCollectionObservedEffect:
+      collectionResult.observedEffect?.type === "item_collected"
+        ? "item_collected"
+        : "none",
+    itemCollectionEffectMatchedTarget,
+    itemCollectionRecoveryRequired: collectionResult.recoveryRequired,
+  });
+
+  let rconDropPresentAfterCollection: boolean | undefined;
+  let rconDropObservationAvailableAfterCollection = false;
+  try {
+    rconDropPresentAfterCollection =
+      (await rconBlueWoolDropPositionNear(rcon, target)) !== undefined;
+    rconDropObservationAvailableAfterCollection = true;
+  } catch {
+    // Keep raw RCON replies private; report only whether the check completed.
+  }
+  let inventoryItemPresentAfterCollection: boolean | undefined;
+  let inventoryObservationAvailableAfterCollection = false;
+  try {
+    inventoryItemPresentAfterCollection = await waitForRconInventoryBlueWool(
+      rcon,
+      botName,
+      2_500,
+    );
+    inventoryObservationAvailableAfterCollection = true;
+  } catch {
+    // Keep raw RCON replies private; report only whether the check completed.
+  }
+  const itemPickupConfirmed =
+    collectionResult.status === "successful" &&
+    collectionResult.itemCollectionOutcome === "collected" &&
+    itemCollectionEffectMatchedTarget &&
+    inventoryItemPresentAfterCollection === true;
+  updateReturnPathProbeDiagnostic(state, {
+    ...(rconDropPresentAfterCollection === undefined
+      ? {}
+      : { rconDropPresentAfterCollection }),
+    rconDropObservationAvailableAfterCollection,
+    ...(inventoryItemPresentAfterCollection === undefined
+      ? {}
+      : { inventoryItemPresentAfterCollection }),
+    inventoryObservationAvailableAfterCollection,
     itemPickupConfirmed,
   });
 
   if (!itemPickupConfirmed) {
     updateReturnPathProbeDiagnostic(state, { returnMoveSkippedNoPickup: true });
-    return;
+    if (collectionResult.itemCollectionOutcome === "target_unobservable")
+      incomplete("RETURN_PATH_PROBE_TARGET_BECAME_UNOBSERVABLE");
+    if (collectionResult.itemCollectionOutcome === "entity_removed")
+      incomplete("RETURN_PATH_PROBE_TARGET_ENTITY_REMOVED");
+    if (collectionResult.itemCollectionOutcome === "invalid_target")
+      incomplete("RETURN_PATH_PROBE_VISIBLE_ITEM_KIND_REJECTED");
+    if (collectionResult.itemCollectionOutcome === "path_failed")
+      incomplete("RETURN_PATH_PROBE_ITEM_PATH_FAILED");
+    if (collectionResult.itemCollectionOutcome === "deadline_expired")
+      incomplete("RETURN_PATH_PROBE_ITEM_COLLECTION_DEADLINE");
+    if (collectionResult.status !== "successful")
+      incomplete("RETURN_PATH_PROBE_ITEM_COLLECTION_NOT_SUCCESSFUL");
+    if (!inventoryObservationAvailableAfterCollection)
+      incomplete("RETURN_PATH_PROBE_POST_COLLECTION_INVENTORY_UNAVAILABLE");
+    incomplete("RETURN_PATH_PROBE_ITEM_PICKUP_NOT_CONFIRMED_BY_INVENTORY");
   }
 
-  if (dropMove.recoveryRequired) {
-    const currentPosition = parsePosition(
-      await rcon.command(`data get entity ${botName} Pos`),
-    );
+  if (collectionResult.recoveryRequired) {
     updateReturnPathProbeDiagnostic(state, {
       returnMoveSkippedRecoveryRequired: true,
-      returnRconArrivalConfirmed:
-        Math.hypot(
-          currentPosition.x - spawn.x,
-          currentPosition.y - spawn.y,
-          currentPosition.z - spawn.z,
-        ) <= 4.5,
-      itemPresentAfterReturn: await rconInventoryHasBlueWool(rcon, botName),
     });
-    return;
+    incomplete("RETURN_PATH_PROBE_COLLECTION_RECOVERY_REQUIRED");
   }
 
+  updateReturnPathProbeDiagnostic(state, { returnMoveAttempted: true });
   const returnMove = await executeBodyMovePathProbe(
     body,
     { kind: "move_to", position: spawn, range: 4.5 },
@@ -6527,15 +6583,29 @@ async function runUnknownReturnPathProbe(
   const returnedPosition = parsePosition(
     await rcon.command(`data get entity ${botName} Pos`),
   );
+  const returnRconArrivalConfirmed =
+    Math.hypot(
+      returnedPosition.x - spawn.x,
+      returnedPosition.y - spawn.y,
+      returnedPosition.z - spawn.z,
+    ) <= 4.5;
+  const itemPresentAfterReturn = await waitForRconInventoryBlueWool(
+    rcon,
+    botName,
+    2_500,
+  );
   updateReturnPathProbeDiagnostic(state, {
-    returnRconArrivalConfirmed:
-      Math.hypot(
-        returnedPosition.x - spawn.x,
-        returnedPosition.y - spawn.y,
-        returnedPosition.z - spawn.z,
-      ) <= 4.5,
-    itemPresentAfterReturn: await rconInventoryHasBlueWool(rcon, botName),
+    returnRconArrivalConfirmed,
+    itemPresentAfterReturn,
   });
+  if (returnMove.status !== "successful" || !returnRconArrivalConfirmed)
+    incomplete("RETURN_PATH_PROBE_SPAWN_RETURN_NOT_CONFIRMED");
+  if (!itemPresentAfterReturn)
+    incomplete("RETURN_PATH_PROBE_ITEM_NOT_RETAINED_AFTER_RETURN");
+  if (!rconDropObservationAvailableAfterCollection)
+    incomplete("RETURN_PATH_PROBE_POST_COLLECTION_DROP_UNAVAILABLE");
+  if (rconDropPresentAfterCollection === true)
+    incomplete("RETURN_PATH_PROBE_DROP_REMAINS_AFTER_COLLECTION");
 }
 
 async function waitForBodyAtPosition(
@@ -6697,97 +6767,6 @@ async function rconBlueWoolDropPositionWithinRadius(
     `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
   );
   return parseOptionalPosition(reply);
-}
-
-async function searchReturnPathDropPosition(
-  rcon: LocalRcon,
-  target: BlockPosition,
-): Promise<
-  | {
-      readonly position: Position;
-      readonly searchRadiusBucket: Exclude<
-        ReturnPathDropSearchRadius,
-        "unknown"
-      >;
-    }
-  | undefined
-> {
-  const radii = [
-    { radius: 2, bucket: "r2" },
-    { radius: 4, bucket: "r4" },
-    { radius: 8, bucket: "r8" },
-    { radius: 16, bucket: "r16" },
-  ] as const;
-  for (const { radius, bucket } of radii) {
-    const position = await rconBlueWoolDropPositionWithinRadius(
-      rcon,
-      target,
-      radius,
-    );
-    if (position !== undefined) return { position, searchRadiusBucket: bucket };
-  }
-  return undefined;
-}
-
-async function observeReturnPathDropDistance(
-  rcon: LocalRcon,
-  botName: string,
-  target: BlockPosition,
-  playerPosition?: Position,
-): Promise<ReturnPathDropDistanceObservation> {
-  try {
-    let currentPlayerPosition = playerPosition;
-    if (currentPlayerPosition === undefined) {
-      try {
-        currentPlayerPosition = parseOptionalPosition(
-          await rcon.command(`data get entity ${botName} Pos`),
-        );
-      } catch {
-        // A missing player read does not hide a separately confirmed drop.
-      }
-    }
-    const dropSearch = await searchReturnPathDropPosition(rcon, target);
-    if (dropSearch === undefined) {
-      return {
-        available: false,
-        distanceBucket: "unknown",
-        searchRadiusBucket: "unknown",
-      };
-    }
-    if (
-      currentPlayerPosition === undefined ||
-      ![
-        currentPlayerPosition.x,
-        currentPlayerPosition.y,
-        currentPlayerPosition.z,
-      ].every(Number.isFinite)
-    ) {
-      return {
-        available: false,
-        dropPresent: true,
-        distanceBucket: "unknown",
-        searchRadiusBucket: dropSearch.searchRadiusBucket,
-      };
-    }
-    const distance = Math.hypot(
-      currentPlayerPosition.x - dropSearch.position.x,
-      currentPlayerPosition.y - dropSearch.position.y,
-      currentPlayerPosition.z - dropSearch.position.z,
-    );
-    return {
-      available: true,
-      dropPresent: true,
-      distanceBucket: positionDriftBucket(distance),
-      searchRadiusBucket: dropSearch.searchRadiusBucket,
-    };
-  } catch {
-    // Keep RCON response text and coordinates private; this is diagnostic only.
-    return {
-      available: false,
-      distanceBucket: "unknown",
-      searchRadiusBucket: "unknown",
-    };
-  }
 }
 
 function parseOptionalPosition(value: string): Position | undefined {

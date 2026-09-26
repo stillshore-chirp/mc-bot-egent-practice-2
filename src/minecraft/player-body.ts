@@ -2165,10 +2165,7 @@ export class MineflayerPlayerBody implements PlayerBody {
             : "The requested item entity is not currently visible.",
         );
       }
-      if (
-        initiallyVisible.name !== "item" ||
-        initiallyVisible.kind !== "object"
-      )
+      if (initiallyVisible.name !== "item")
         throw new ItemCollectionError(
           "invalid_target",
           "The requested visible entity is not an item entity.",
@@ -2198,7 +2195,7 @@ export class MineflayerPlayerBody implements PlayerBody {
               : "The requested item is no longer visible; pursuit was stopped.",
           );
         }
-        if (target.name !== "item" || target.kind !== "object")
+        if (target.name !== "item")
           throw new ItemCollectionError(
             "invalid_target",
             "The requested entity is no longer an item entity.",

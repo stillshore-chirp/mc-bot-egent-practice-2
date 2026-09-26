@@ -48,7 +48,7 @@ function addItemEntity(
   const item = {
     id,
     name: "item",
-    type: "object",
+    type: "other",
     position,
     velocity: new Vec3(0, 0, 0),
     yaw: 0,
@@ -599,6 +599,20 @@ describe("player body", () => {
     expect(result.after?.perception.entities).not.toContain(
       expect.objectContaining({ id: 2 }),
     );
+  });
+
+  it("rejects a visible non-item entity even when its Mineflayer type is other", async () => {
+    const fake = makeFakeBot();
+    const entity = addItemEntity(fake.bot);
+    entity.name = "zombie";
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("failed");
+    expect(result.itemCollectionOutcome).toBe("invalid_target");
+    expect(goto).not.toHaveBeenCalled();
   });
 
   it("updates pursuit from a newly observed item position", async () => {
