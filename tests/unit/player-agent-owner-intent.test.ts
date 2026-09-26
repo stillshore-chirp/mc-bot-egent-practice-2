@@ -111,6 +111,76 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("grounds a meal refusal in the fresh food observation without guessing", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Eat something now",
+      reason: "The owner asked the bot to eat.",
+      priority: 4,
+    });
+
+    try {
+      fixture.responses.push(
+        functionCallResponse(
+          "decline-meal",
+          "commit_action_decision",
+          actionArguments(
+            proposalResolutionArguments(proposal, "declined"),
+            "wait",
+          ),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "owner-meal-proposal",
+            kind: "owner_proposal",
+            summary: "The owner asked the bot to eat.",
+            createdAt: "2026-09-27T00:00:00.000Z",
+          },
+        ],
+      });
+
+      expect(result).toMatchObject({
+        accepted: true,
+        decision: { kind: "wait" },
+      });
+      const request = record(fixture.requests[0]);
+      if (!Array.isArray(request.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const firstItem = record(request.input[0]);
+      const purposeInput = JSON.parse(String(firstItem.content)) as {
+        observation: {
+          self: {
+            food: number | null;
+            foodSaturation: number | null;
+            inventory: readonly unknown[];
+          };
+        };
+      };
+      expect(purposeInput.observation.self).toMatchObject({
+        food: 20,
+        foodSaturation: 5,
+        inventory: [],
+      });
+      expect(String(request.instructions)).toContain(
+        "self.foodSaturation、self.inventory",
+      );
+      expect(String(request.instructions)).toContain(
+        "満腹や食料なしと断定せず",
+      );
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          id: proposal.id,
+          status: "declined",
+        }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("does not turn guest chat or a prior request into current owner authorization", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const conversation = new PlayerConversationAgent({
