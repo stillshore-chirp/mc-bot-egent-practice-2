@@ -20,6 +20,7 @@ import type {
 } from "../../src/player/contracts.js";
 import {
   compactSnapshot,
+  playerOperationCatalog,
   PlayerConversationAgent,
   PlayerPurposeAgent,
 } from "../../src/player/agents.js";
@@ -37,6 +38,103 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("grounds capability consultation in the catalog without proposing action", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    let proposalWakeups = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => {
+        proposalWakeups += 1;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      terminalResponse(
+        "I will check the available operations and current state.",
+      ),
+      functionCallResponse("explicit-gather-request", "propose_goal_change", {
+        title: "Mine the visible coal block",
+        reason: "The owner explicitly asked me to mine it.",
+        priority: 3,
+      }),
+      terminalResponse(
+        "I will consider the request against the current state.",
+      ),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "採掘・精錬・装備など、今の操作でできますか？",
+        turn: conversation.nextTurn(),
+      });
+
+      const consultationRequest = record(fixture.requests[0]);
+      const instructions = String(consultationRequest.instructions);
+      const input = JSON.stringify(consultationRequest.input);
+      expect(instructions).toContain("現在の公開操作catalog");
+      expect(instructions).toContain(playerOperationCatalog);
+      expect(instructions).toContain(
+        "操作kind・説明の掲載はそのkindの存在を示します",
+      );
+      expect(instructions).toContain(
+        "今回の可視性・距離・所持状態による実行可否",
+      );
+      expect(instructions).toContain("能力相談や質問だけではproposalを作らず");
+      expect(input).not.toContain("lastObservation");
+      expect(input).not.toContain("lastOutcome");
+      expect(playerOperationCatalog).toContain("dig:");
+      expect(playerOperationCatalog).toContain(
+        "Mine a currently visible block within normal player reach.",
+      );
+      expect(playerOperationCatalog).toContain("equip:");
+      expect(playerOperationCatalog).toContain(
+        "Equip an inventory item into a player equipment slot.",
+      );
+      expect(playerOperationCatalog).toContain("open_window:");
+      expect(playerOperationCatalog).toContain(
+        "Open a currently visible block or entity interface.",
+      );
+      expect(playerOperationCatalog).toContain("window_click:");
+      expect(playerOperationCatalog).toContain(
+        "Click a slot in the currently open Minecraft interface.",
+      );
+      expect(playerOperationCatalog).toContain("window_transfer:");
+      expect(new Set<string>(playerOperationNames).has("smelt")).toBe(false);
+      expect(playerOperationCatalog).not.toMatch(/^smelt:/mu);
+      expect(fixture.mind.snapshot().proposals).toHaveLength(0);
+      expect(proposalWakeups).toBe(0);
+
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Please mine the visible coal block now.",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Mine the visible coal block",
+          status: "pending",
+        }),
+      );
+      expect(proposalWakeups).toBe(1);
+      expect(messages).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("carries bounded owner chat context into a short follow-up proposal", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const memory = createMemoryPort();
