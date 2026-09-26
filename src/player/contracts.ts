@@ -144,6 +144,7 @@ export interface PlayerTrustedOutcomeEvidence {
   readonly observedAt: string;
   readonly movementDelta?: PlayerObservedDisplacement | undefined;
   readonly lookSweep?: PlayerBodyLookSweep | undefined;
+  readonly expectedOutcome?: string | undefined;
   readonly skillId?: string | undefined;
   readonly skillVersion?: number | undefined;
 }
@@ -238,6 +239,11 @@ export interface PlayerRuntimeEvent {
   readonly kind: PlayerWakeKind;
   readonly summary: string;
   readonly createdAt: string;
+}
+
+/** Stable event key that binds a body outcome wake to its operation run. */
+export function playerBodyOutcomeEventId(operationId: string): string {
+  return `body_outcome:${operationId}`;
 }
 
 export interface PlayerRuntimeSnapshot {

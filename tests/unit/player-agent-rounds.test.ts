@@ -12,6 +12,7 @@ import { playerOperationNames } from "../../src/minecraft/player-body-schema.js"
 import type {
   PlayerBody,
   PlayerBodyObservation,
+  PlayerOperation,
 } from "../../src/minecraft/player-body.js";
 import type {
   PlayerMemoryPort,
@@ -241,6 +242,114 @@ describe("player agent response rounds", () => {
       expect(fixture.mind.snapshot().learningReferences[0]?.runId).toBe(
         secondRunId,
       );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("reviews each successful body event against its own receipt, not lastOutcome", async () => {
+    const firstRunId = "learning-sequential-first-dig";
+    const secondRunId = "learning-sequential-next-move";
+    const skillId = "learning-used-skill";
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "revise-from-first-sequential-receipt",
+        "propose_skill_learning",
+        learningRevisionArguments(firstRunId, skillId, 1, ["dig", "move_to"]),
+      ),
+      (request) => {
+        const payload = requestUserPayload(request);
+        expect(payload.trustedSuccessfulReceipt).toMatchObject({
+          runId: secondRunId,
+          operationName: "move_to",
+        });
+        expect(payload.usedHypothesis).toMatchObject({
+          id: skillId,
+          version: 1,
+        });
+        return terminalResponse("No reusable method was found for this move.");
+      },
+      functionCallResponse(
+        "action-after-sequential-learning-reviews",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+      functionCallResponse(
+        "action-after-replayed-learning-events",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+    ]);
+
+    try {
+      const { skill } = recordSuccessfulSkillUse(fixture, firstRunId, skillId);
+      recordSuccessfulSkillUse(fixture, secondRunId, skillId, skill, "move_to");
+      const events = fixture.mind.pendingEvents();
+      expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+        operationId: secondRunId,
+        kind: "move_to",
+        status: "successful",
+      });
+
+      const firstThought = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(firstThought.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.skills.get(skillId).version).toBe(2);
+
+      const secondThought = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(secondThought.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(3);
+
+      const replayedThought = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(replayedThought.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(4);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not review the latest outcome for an unrelated body outcome event", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "action-after-unrelated-body-event",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+    ]);
+
+    try {
+      recordSuccessfulSkillUse(
+        fixture,
+        "learning-unmatched-success",
+        "learning-used-skill",
+      );
+      const unrelatedEvent = fixture.mind.enqueueEvent(
+        "body_outcome",
+        "An unrelated outcome wake must not select a different receipt.",
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [unrelatedEvent],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(1);
+      expect(requestUserPayload(fixture.requests[0])).not.toHaveProperty(
+        "trustedSuccessfulReceipt",
+      );
+      expect(fixture.mind.snapshot().counters.learningUpdates).toBe(0);
     } finally {
       fixture.close();
     }
@@ -2066,6 +2175,7 @@ function recordSuccessfulSkillUse(
   runId: string,
   skillId: string,
   existingSkill?: ReturnType<McSkillRepository["createSkill"]>,
+  kind: "dig" | "move_to" = "dig",
 ): { skill: ReturnType<McSkillRepository["createSkill"]> } {
   const skill =
     existingSkill ??
@@ -2085,10 +2195,28 @@ function recordSuccessfulSkillUse(
   const expectedOutcome =
     "The next observation confirms the target was collected.";
   const summary = "The trusted receipt records the successful operation.";
+  const operation: PlayerOperation =
+    kind === "dig"
+      ? { kind, position: { x: 1, y: 64, z: 0 } }
+      : { kind, position: { x: 2, y: 64, z: 0 }, range: 1 };
+  const started = fixture.mind.commitThought({
+    expectedRevision: fixture.mind.snapshot().revision,
+    decision: {
+      kind: "act",
+      purpose: "Record a trusted successful operation.",
+      operation,
+      operationId: runId,
+      expectedOutcome,
+      skillId: skill.id,
+      skillVersion: skill.version,
+      wakeOn: ["body_outcome"],
+    },
+  });
+  if (!started.accepted) throw new Error("TEST_OPERATION_START_REJECTED");
   fixture.skills.recordTrustedEvidence({
     runId,
-    operationName: "dig",
-    inputSummary: "operation=dig",
+    operationName: kind,
+    inputSummary: `operation=${kind}`,
     conditions: ["The target is visible and reachable."],
     expectedOutcome,
     observedOutcome: "successful",
@@ -2100,7 +2228,7 @@ function recordSuccessfulSkillUse(
   fixture.mind.recordOutcome({
     evidence: {
       operationId: runId,
-      kind: "dig",
+      kind,
       status: "successful",
       summary,
       expectedOutcome,
@@ -2109,10 +2237,6 @@ function recordSuccessfulSkillUse(
       observedAt,
     },
   });
-  fixture.mind.enqueueEvent(
-    "body_outcome",
-    "A trusted successful outcome needs a learning review.",
-  );
   return { skill };
 }
 

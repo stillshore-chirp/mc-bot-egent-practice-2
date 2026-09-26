@@ -30,6 +30,7 @@ import type {
   PlayerWakeKind,
 } from "./contracts.js";
 import {
+  playerBodyOutcomeEventId,
   playerThoughtCommitRejectionCodes,
   playerThoughtStaleChangeComponents,
   type PlayerThoughtCommitRejectionCode,
@@ -1138,7 +1139,7 @@ export class PlayerMindStore {
             "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'body_outcome', ?, ?, NULL)",
           )
           .run(
-            randomUUID(),
+            playerBodyOutcomeEventId(evidence.operationId),
             `操作 ${evidence.kind} は ${evidence.status}: ${evidence.summary}`,
             now,
           );
@@ -1277,7 +1278,7 @@ export class PlayerMindStore {
           "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'body_outcome', ?, ?, NULL)",
         )
         .run(
-          randomUUID(),
+          playerBodyOutcomeEventId(active.operationId),
           `再起動後に復旧した操作結果: ${active.kind} ${status}`,
           now,
         );

@@ -22,7 +22,10 @@ import type {
   PlayerBodyObservation,
 } from "../minecraft/player-body.js";
 import type { TraceService } from "../trace/service.js";
-import { playerThoughtStaleChangeComponents } from "./contracts.js";
+import {
+  playerBodyOutcomeEventId,
+  playerThoughtStaleChangeComponents,
+} from "./contracts.js";
 import type {
   PlayerGoal,
   PlayerGoalChange,
@@ -86,6 +89,26 @@ const cachedOperationSchemaCharsLimit = 4_096;
 const maxRelatedLearningHypotheses = 6;
 const cachedOperationSchemaInstructionsPrefix =
   "以前に確認した操作schema（現在の定義）:\n";
+
+function bodyOutcomeEventMatches(
+  event: PlayerRuntimeEvent,
+  outcome: PlayerRuntimeSnapshot["recentOutcomes"][number],
+): boolean {
+  if (
+    event.kind !== "body_outcome" ||
+    event.id !== playerBodyOutcomeEventId(outcome.operationId)
+  )
+    return false;
+  if (
+    event.summary ===
+    `操作 ${outcome.kind} は ${outcome.status}: ${outcome.summary}`
+  )
+    return event.createdAt === outcome.observedAt;
+  return (
+    event.summary ===
+    `再起動後に復旧した操作結果: ${outcome.kind} ${outcome.status}`
+  );
+}
 
 function canonicalOperationDescription(
   kind: (typeof playerOperationNames)[number],
@@ -1151,22 +1174,25 @@ export class PlayerPurposeAgent {
       bodyObservation === undefined
         ? tools
         : tools.filter((tool) => tool.definition.name !== "observe_body");
-    const latestOutcome = latest.lastOutcome;
-    const shouldReviewLatestSuccess =
-      input.events.some(({ kind }) => kind === "body_outcome") &&
-      latestOutcome?.status === "successful" &&
-      latestOutcome.operationId.length > 0 &&
-      !this.#learningReviewAttemptedRuns.has(latestOutcome.operationId) &&
-      !latest.learningReferences.some(
-        ({ runId }) => runId === latestOutcome.operationId,
-      ) &&
-      latest.recentOutcomes.some(
-        ({ runId, operationId, status }) =>
-          runId === latestOutcome.operationId &&
-          operationId === latestOutcome.operationId &&
-          status === "successful",
+    const reviewedRunsThisThought = new Set<string>();
+    for (const outcomeEvent of input.events) {
+      if (outcomeEvent.kind !== "body_outcome") continue;
+      const latestOutcome = latest.recentOutcomes.find((outcome) =>
+        bodyOutcomeEventMatches(outcomeEvent, outcome),
       );
-    if (shouldReviewLatestSuccess) {
+      if (
+        latestOutcome === undefined ||
+        latestOutcome.runId !== latestOutcome.operationId ||
+        latestOutcome.status !== "successful" ||
+        latestOutcome.operationId.length === 0 ||
+        reviewedRunsThisThought.has(latestOutcome.operationId) ||
+        this.#learningReviewAttemptedRuns.has(latestOutcome.operationId) ||
+        latest.learningReferences.some(
+          ({ runId }) => runId === latestOutcome.operationId,
+        )
+      )
+        continue;
+      reviewedRunsThisThought.add(latestOutcome.operationId);
       const learningReviewState: {
         operationReferenceMismatchRejected: boolean;
       } = { operationReferenceMismatchRejected: false };
@@ -1183,9 +1209,14 @@ export class PlayerPurposeAgent {
         receipt.skillVersionAtUse === latestOutcome.skillVersion
       ) {
         const usedSkill =
-          receipt.skillIdAtUse === undefined
+          receipt.skillIdAtUse === undefined ||
+          receipt.skillVersionAtUse === undefined
             ? undefined
-            : this.options.skills.get(receipt.skillIdAtUse);
+            : this.options.skills
+                .getHistory(receipt.skillIdAtUse)
+                .find(({ version }) => version === receipt.skillVersionAtUse);
+        if (receipt.skillIdAtUse !== undefined && usedSkill === undefined)
+          continue;
         const relatedSkillIds = new Set<string>();
         const relatedSkillTitles = new Set<string>();
         const relatedSkills = this.options.skills
