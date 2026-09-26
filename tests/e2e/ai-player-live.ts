@@ -374,12 +374,11 @@ type BodyMoveErrorClass =
 type BodyDigErrorClass =
   "out_of_view" | "occluded" | "out_of_reach" | "unloaded" | "other";
 type BodyPositionDriftBucket = "<1" | "1-2" | "2+";
-type ReturnPathDropDistanceBucket =
-  BodyPositionDriftBucket | "drop_missing" | "unknown";
+type ReturnPathDropDistanceBucket = BodyPositionDriftBucket | "unknown";
 
 interface ReturnPathDropDistanceObservation {
   readonly available: boolean;
-  readonly dropPresent?: boolean;
+  readonly dropPresent?: true;
   readonly distanceBucket: ReturnPathDropDistanceBucket;
 }
 
@@ -6137,16 +6136,17 @@ async function runUnknownReturnPathProbe(
     ),
   );
   const itemPresentAfterDig = await rconInventoryHasBlueWool(rcon, botName);
-  const dropItemEntityPresentAfterDig = await rconHasBlueWoolDropNear(
-    rcon,
-    target,
-  );
+  const dropPositionAfterDig = await rconBlueWoolDropPositionNear(rcon, target);
+  const dropItemEntityPresentAfterDig =
+    dropPositionAfterDig === undefined ? undefined : true;
   const targetClearedAfterDig = !(await isBlock(rcon, target, "blue_wool"));
   updateReturnPathProbeDiagnostic(state, {
     digStatus: digResult.status,
     digPositionDriftBucket,
     itemPresentAfterDig,
-    dropItemEntityPresentAfterDig,
+    ...(dropItemEntityPresentAfterDig === undefined
+      ? {}
+      : { dropItemEntityPresentAfterDig }),
     targetClearedAfterDig,
     ...(digResult.status === "successful"
       ? {}
@@ -6158,8 +6158,8 @@ async function runUnknownReturnPathProbe(
     incomplete("RETURN_PATH_PROBE_TARGET_NOT_CLEARED");
   if (itemPresentAfterDig)
     incomplete("RETURN_PATH_PROBE_ITEM_PICKED_UP_AFTER_DIG");
-  if (!dropItemEntityPresentAfterDig)
-    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_FOUND_AFTER_DIG");
+  if (dropItemEntityPresentAfterDig !== true)
+    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_CONFIRMED_AFTER_DIG");
 
   await rcon.command(
     `tp ${botName} ${digStage.x} ${digStage.y} ${digStage.z} 0 0`,
@@ -6191,18 +6191,22 @@ async function runUnknownReturnPathProbe(
     rcon,
     botName,
   );
-  const dropItemEntityPresentBeforeMove = await rconHasBlueWoolDropNear(
+  const dropPositionBeforeMove = await rconBlueWoolDropPositionNear(
     rcon,
     target,
   );
+  const dropItemEntityPresentBeforeMove =
+    dropPositionBeforeMove === undefined ? undefined : true;
   updateReturnPathProbeDiagnostic(state, {
-    dropItemEntityPresentBeforeMove,
+    ...(dropItemEntityPresentBeforeMove === undefined
+      ? {}
+      : { dropItemEntityPresentBeforeMove }),
     itemPresentBeforeDropMove,
   });
   if (itemPresentBeforeDropMove)
     incomplete("RETURN_PATH_PROBE_ITEM_ALREADY_IN_INVENTORY");
-  if (!dropItemEntityPresentBeforeMove)
-    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_FOUND");
+  if (dropItemEntityPresentBeforeMove !== true)
+    incomplete("RETURN_PATH_PROBE_DROP_ENTITY_NOT_CONFIRMED");
   const dropMove = await executeBodyMovePathProbe(
     body,
     {
@@ -6334,19 +6338,12 @@ async function rconInventoryHasBlueWool(
   return /minecraft:blue_wool/iu.test(inventory);
 }
 
-async function rconHasBlueWoolDropNear(
-  rcon: LocalRcon,
-  target: BlockPosition,
-): Promise<boolean> {
-  return (await rconBlueWoolDropPositionNear(rcon, target)) !== undefined;
-}
-
 async function rconBlueWoolDropPositionNear(
   rcon: LocalRcon,
   target: BlockPosition,
 ): Promise<Position | undefined> {
   const selector =
-    '@e[type=minecraft:item,limit=1,distance=..2,nbt={Item:{id:"minecraft:blue_wool"}}]';
+    '@e[type=minecraft:item,limit=1,sort=nearest,distance=..2,nbt={Item:{id:"minecraft:blue_wool"}}]';
   const reply = await rcon.command(
     `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
   );
@@ -6378,13 +6375,9 @@ async function observeReturnPathDropDistance(
       return { available: false, distanceBucket: "unknown" };
     }
     const dropPosition = await rconBlueWoolDropPositionNear(rcon, target);
-    if (dropPosition === undefined) {
-      return {
-        available: true,
-        dropPresent: false,
-        distanceBucket: "drop_missing",
-      };
-    }
+    // No parsed position cannot distinguish absence from response drift.
+    if (dropPosition === undefined)
+      return { available: false, distanceBucket: "unknown" };
     const distance = Math.hypot(
       currentPlayerPosition.x - dropPosition.x,
       currentPlayerPosition.y - dropPosition.y,
