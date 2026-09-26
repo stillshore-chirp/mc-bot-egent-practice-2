@@ -35,6 +35,35 @@ describe("targeted E2E case selection", () => {
     );
   });
 
+  it("runs skill acceptance targets with only their bounded learning chain", () => {
+    const skillTargets = [
+      "skill_compactness_and_knowledge_separation",
+      "skill_exchange",
+    ] as const;
+    for (const targetCase of skillTargets) {
+      expect(TARGETABLE_CASES).toContain(targetCase);
+      for (const selectedCase of [
+        "autonomous_life",
+        "learning_reuse",
+        targetCase,
+      ]) {
+        expect(isCaseSelectedForTarget(targetCase, selectedCase)).toBe(true);
+      }
+      for (const skippedCase of [
+        "runtime_contract",
+        "observation_boundary",
+        "persistent_memory_restart",
+        ...skillTargets.filter((skillCase) => skillCase !== targetCase),
+        "game_action_discretion",
+        "unknown_composite",
+        "parallel_dialogue_stop",
+        "integrated_result",
+      ]) {
+        expect(isCaseSelectedForTarget(targetCase, skippedCase)).toBe(false);
+      }
+    }
+  });
+
   it("does not add autonomous_life to unrelated target cases", () => {
     expect(
       isCaseSelectedForTarget("game_action_discretion", "autonomous_life"),
