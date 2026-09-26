@@ -209,6 +209,187 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("carries a natural owner gather follow-up through observed purpose progress", async () => {
+    let observation = gatheringObservationFixture({
+      coalCount: 0,
+      remainingCoalOre: [
+        { x: 0, y: 64, z: -2 },
+        { x: 1, y: 64, z: -2 },
+      ],
+    });
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      () => observation,
+    );
+    const conversationResponses: ScriptedResponse[] = [];
+    const conversationRequests: unknown[] = [];
+    const conversationReplies: string[] = [];
+    let proposalWakeups = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(conversationResponses, conversationRequests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        conversationReplies.push(message);
+      },
+      onProposal: () => (proposalWakeups += 1),
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const ownerRequest = "Could you gather useful fuel from around here?";
+    const ownerFollowUp = "Coal would be good.";
+    conversationResponses.push(
+      terminalResponse("I will consider what you mentioned."),
+      functionCallResponse("gather-coal", "propose_goal_change", {
+        title: "Gather the visible coal",
+        reason: "The owner clarified that coal is the desired target.",
+        priority: 3,
+      }),
+      terminalResponse(
+        "I will inspect the current area and decide how to proceed.",
+      ),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: ownerRequest,
+        turn: conversation.nextTurn(),
+      });
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: ownerFollowUp,
+        turn: conversation.nextTurn(),
+      });
+      const proposal = fixture.mind.snapshot().proposals[0];
+      if (proposal === undefined)
+        throw new Error("TEST_GATHER_PROPOSAL_MISSING");
+      expect(proposalWakeups).toBe(1);
+      expect(conversationReplies).toHaveLength(2);
+      expect(JSON.stringify(conversationRequests[1])).toContain(ownerRequest);
+      expect(JSON.stringify(conversationRequests[1])).toContain(ownerFollowUp);
+
+      const firstTarget = { x: 0, y: 64, z: -2 };
+      fixture.responses.push(
+        functionCallResponse(
+          "dig-first-coal-ore",
+          "commit_action_decision",
+          gatherActionArguments(
+            { kind: "dig", position: firstTarget },
+            {
+              ...proposalResolutionArguments(proposal, "adopted"),
+              goalTitle: proposal.title,
+              goalStatus: "active",
+              goalSource: "owner",
+              changeReason: "The owner clarified the resource to gather.",
+            },
+          ),
+        ),
+      );
+      const started = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "owner-proposal-gather-coal",
+            kind: "owner_proposal",
+            summary: "The owner clarified a request to gather coal nearby.",
+            createdAt: "2026-09-27T00:00:00.000Z",
+          },
+        ],
+      });
+      expect(started).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "dig", position: firstTarget },
+        },
+      });
+      const ownerGoal = fixture.mind
+        .snapshot()
+        .goals.find(({ ownerProposalId }) => ownerProposalId === proposal.id);
+      if (ownerGoal === undefined) throw new Error("TEST_OWNER_GOAL_MISSING");
+      expect(ownerGoal).toMatchObject({
+        title: proposal.title,
+        source: "owner",
+        status: "active",
+      });
+      const initialPurposeInput = purposeInputFromRequest(fixture.requests[0]);
+      expect(initialPurposeInput.observation.perception.blocks).toHaveLength(2);
+      expect(initialPurposeInput.runtime.proposals).toContainEqual(
+        expect.objectContaining({ title: proposal.title, status: "pending" }),
+      );
+
+      const firstOperation = started.decision;
+      if (firstOperation?.kind !== "act")
+        throw new Error("TEST_FIRST_GATHER_ACTION_MISSING");
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: firstOperation.operationId,
+          kind: "dig",
+          status: "successful",
+          summary:
+            "The server block update removed the target; inventory shows one coal.",
+          expectedOutcome:
+            "The selected coal ore changes and its drop is observed.",
+          observedAt: "2026-09-27T00:00:01.000Z",
+        },
+      });
+      observation = gatheringObservationFixture({
+        coalCount: 1,
+        remainingCoalOre: [{ x: 1, y: 64, z: -2 }],
+      });
+      const secondTarget = { x: 1, y: 64, z: -2 };
+      fixture.responses.push(
+        functionCallResponse(
+          "dig-remaining-coal-ore",
+          "commit_action_decision",
+          gatherActionArguments({
+            kind: "dig",
+            position: secondTarget,
+          }),
+        ),
+      );
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(),
+      });
+      expect(continued).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "dig", position: secondTarget },
+        },
+      });
+      const remainingPurposeInput = purposeInputFromRequest(
+        fixture.requests[1],
+      );
+      expect(remainingPurposeInput.observation.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "coal", count: 1 }),
+      );
+      expect(
+        remainingPurposeInput.observation.perception.blocks,
+      ).toContainEqual(
+        expect.objectContaining({ name: "coal_ore", position: secondTarget }),
+      );
+      expect(remainingPurposeInput.runtime.recentOutcomes).toContainEqual(
+        expect.objectContaining({ kind: "dig", status: "successful" }),
+      );
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          ownerProposalId: proposal.id,
+          status: "active",
+        }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it.each([
     {
       name: "an ordinary reply whose send fails",
@@ -845,6 +1026,7 @@ interface PurposeFixture {
 function openPurposeFixture(
   memory: PlayerMemoryPort,
   ownerPositionExceptions: boolean[] = [],
+  observe: () => PlayerBodyObservation = bodyObservationFixture,
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -859,7 +1041,7 @@ function openPurposeFixture(
   const responses: ScriptedResponse[] = [];
   const body = {
     observe: async (options?: { ownerPositionException?: boolean }) => {
-      const observation = bodyObservationFixture();
+      const observation = observe();
       if (options?.ownerPositionException === true) {
         ownerPositionExceptions.push(true);
         return {
@@ -952,6 +1134,100 @@ function bodyObservationFixture(): PlayerBodyObservation {
       entities: [],
     },
     window: null,
+  };
+}
+
+interface PurposeGatherInput {
+  readonly observation: {
+    readonly self: {
+      readonly inventory: readonly {
+        readonly name: string;
+        readonly count: number;
+      }[];
+    };
+    readonly perception: {
+      readonly blocks: readonly {
+        readonly name: string;
+        readonly position: {
+          readonly x: number;
+          readonly y: number;
+          readonly z: number;
+        };
+      }[];
+    };
+  };
+  readonly runtime: {
+    readonly proposals: readonly Record<string, unknown>[];
+    readonly recentOutcomes: readonly Record<string, unknown>[];
+  };
+}
+
+function purposeInputFromRequest(request: unknown): PurposeGatherInput {
+  const input = record(request).input;
+  if (!Array.isArray(input))
+    throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+  return JSON.parse(String(record(input[0]).content)) as PurposeGatherInput;
+}
+
+function gatheringObservationFixture(input: {
+  readonly coalCount: number;
+  readonly remainingCoalOre: readonly { x: number; y: number; z: number }[];
+}): PlayerBodyObservation {
+  const base = bodyObservationFixture();
+  return {
+    ...base,
+    self: {
+      ...base.self,
+      inventory:
+        input.coalCount === 0
+          ? []
+          : [
+              {
+                slot: 0,
+                itemId: 1,
+                name: "coal",
+                count: input.coalCount,
+                metadata: 0,
+                durability: null,
+                maxDurability: null,
+                customName: null,
+                enchantments: [],
+              },
+            ],
+    },
+    perception: {
+      ...base.perception,
+      blocks: input.remainingCoalOre.map((position) => ({
+        name: "coal_ore",
+        stateId: 1,
+        position: { ...position, dimension: "overworld" },
+        distance: 2,
+        properties: {},
+      })),
+    },
+  };
+}
+
+function gatherActionArguments(
+  operation: {
+    readonly kind: "dig";
+    readonly position: { x: number; y: number; z: number };
+  },
+  goalState?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    kind: "act",
+    purpose: "Gather coal using the current visible targets.",
+    operationJson: JSON.stringify(operation),
+    expectedOutcome:
+      "A server-observed target change and resulting inventory are checked.",
+    skillId: "",
+    skillVersion: 0,
+    reason: "The current observation shows a reachable coal ore target.",
+    wakeOn: [],
+    wakeAt: "",
+    stateUpdates:
+      goalState === undefined ? null : { goalState, understanding: null },
   };
 }
 
