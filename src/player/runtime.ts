@@ -359,7 +359,6 @@ export class PlayerRuntime {
         if (oldest === undefined) break;
         this.#ownerConsumeOperations.delete(oldest);
       }
-      return;
     }
 
     const resolution = sanitizeDetail(proposal.resolution ?? "");

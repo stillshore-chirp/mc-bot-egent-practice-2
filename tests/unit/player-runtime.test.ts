@@ -541,10 +541,48 @@ describe("integrated player runtime", () => {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[1]).toContain("food値が13から18へ増えた");
+      expect(fixture.messages[1]).toContain("体力回復は確認していません");
+      expect(fixture.messages[1]).not.toContain("体力が回復しました");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("preserves a non-meal owner resolution when consuming food as preparation", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Build a shelter",
+      reason: "The owner asked the bot to build a shelter.",
+      priority: 4,
+    });
+    const decision = action("shelter-preparation-meal", {
+      kind: "consume",
+      item: "bread",
+    });
+    const resolution = "I will eat first, then continue the shelter goal.";
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution,
+      },
+    });
+    if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
       await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toContain("food値が13から18へ増えた");
-      expect(fixture.messages[0]).toContain("体力回復は確認していません");
-      expect(fixture.messages[0]).not.toContain("体力が回復しました");
+      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+
+      fixture.body.completeActive("failed");
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[1]).toContain("食事操作は失敗し");
     } finally {
       await fixture.close();
     }
@@ -603,11 +641,12 @@ describe("integrated player runtime", () => {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
-      await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toContain(
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[1]).toContain(
         "食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした",
       );
-      expect(fixture.messages[0]).not.toContain("食事操作が成功し");
+      expect(fixture.messages[1]).not.toContain("食事操作が成功し");
     } finally {
       await fixture.close();
     }
@@ -660,11 +699,12 @@ describe("integrated player runtime", () => {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("failed");
-      await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toContain("食事操作は失敗し");
-      expect(fixture.messages[0]).toContain("原因は観測から特定できていません");
-      expect(fixture.messages[0]).not.toContain("満腹");
-      expect(fixture.messages[0]).not.toContain("食料がありません");
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[1]).toContain("食事操作は失敗し");
+      expect(fixture.messages[1]).toContain("原因は観測から特定できていません");
+      expect(fixture.messages[1]).not.toContain("満腹");
+      expect(fixture.messages[1]).not.toContain("食料がありません");
     } finally {
       await fixture.close();
     }
@@ -802,7 +842,7 @@ describe("integrated player runtime", () => {
       await waitFor(
         () => fixture.body.results.length === 1 && fixture.body.stopCalls > 0,
       );
-      await waitFor(() => fixture.messages.length === 1);
+      await waitFor(() => fixture.messages.length === 2);
 
       expect(fixture.body.results[0]).toMatchObject({
         operation: { kind: "consume" },
@@ -816,6 +856,7 @@ describe("integrated player runtime", () => {
       expect(purposeCalls).toBe(1);
       expect(fixture.body.started).toEqual(["consume"]);
       expect(fixture.messages).toEqual([
+        "提案への判断：The owner meal intent is being handled.",
         "自律行動を停止しました。再開の指示があるまで停止を続けます。",
       ]);
     } finally {
