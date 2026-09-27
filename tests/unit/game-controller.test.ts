@@ -110,7 +110,7 @@ describe("CompanionGameController", () => {
   });
 
   it.each([5, 6])(
-    "does not report a completed return when the owner disappears at observation %i",
+    "keeps the task and report consistent when the owner disappears at observation %i",
     async (vanishAt) => {
       class VanishingOwnerMinecraft extends FakeMinecraft {
         private observationCount = 0;
@@ -135,16 +135,33 @@ describe("CompanionGameController", () => {
           ],
         }),
       );
-      const { game, close } = createController(minecraft);
+      const { game, tasks, close } = createController(minecraft);
       try {
         const report = await game.returnToOwner(
           3,
           new AbortController().signal,
         );
 
-        expect(report.outcome).toBe("failed");
-        expect(report.failureCode).toBe("RETURN_NOT_VERIFIED");
-        expect(report.summary).not.toContain("戻りました");
+        const disappearedBeforeTaskCompletion = vanishAt === 5;
+        expect(report.outcome).toBe(
+          disappearedBeforeTaskCompletion ? "failed" : "completed",
+        );
+        expect(report.failureCode).toBe(
+          disappearedBeforeTaskCompletion ? "RETURN_NOT_VERIFIED" : undefined,
+        );
+        if (disappearedBeforeTaskCompletion) {
+          expect(tasks.current?.status).toBe("failed");
+          expect(report.summary).not.toContain("戻りました");
+        } else {
+          expect(tasks.current?.status).toBe("completed");
+          expect(report.confirmedState).toMatchObject({
+            distanceAtCompletion: 0,
+            ownerCurrentlyObserved: false,
+            ownerCurrentlyWithinSafeDistance: false,
+          });
+          expect(report.summary).toContain("現在の距離は未確認です。");
+          expect(report.summary).not.toContain("現在位置へ戻りました");
+        }
       } finally {
         close();
       }
