@@ -135,6 +135,77 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("rebuilds an oversized capability reply and records only the sent text", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const question = "採掘・精錬・装備は今の操作でできますか？";
+    const longDraft =
+      "採掘はdigでできます。" +
+      "詳細説明".repeat(60) +
+      "精錬専用kindはありませんが、炉操作を組み合わせます。条件は未確認です。";
+    const compactReply =
+      "採掘はdig、装備はequipがcatalogにあり、精錬専用kindはなく炉操作の組合せですが、今回は実行条件を未確認です。";
+    fixture.responses.push(
+      terminalResponse(longDraft),
+      terminalResponse(compactReply),
+      terminalResponse("現在の条件はまだ確認できていません。"),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: question,
+        turn: conversation.nextTurn(),
+      });
+
+      expect(longDraft.length).toBeGreaterThan(240);
+      expect(/[。！？.!?]$/u.test(longDraft.slice(0, 240))).toBe(false);
+      expect(longDraft.slice(0, 240)).not.toContain("精錬専用kind");
+      expect(messages).toEqual([compactReply]);
+      expect(messages[0]?.length).toBeLessThanOrEqual(240);
+      expect(messages[0]).toMatch(/[。！？.!?]$/u);
+
+      const repairRequest = record(fixture.requests[1]);
+      expect(repairRequest.tools).toEqual([]);
+      expect(repairRequest.tool_choice).toBe("none");
+      expect(String(repairRequest.instructions)).toContain("180文字以内");
+      expect(String(repairRequest.instructions)).toContain(
+        playerOperationCatalog,
+      );
+      expect(JSON.stringify(repairRequest.input)).toContain(question);
+      expect(JSON.stringify(repairRequest.input)).toContain(longDraft);
+      expect(JSON.stringify(repairRequest.input)).toContain("currentState");
+
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "この条件ではどうですか？",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(JSON.stringify(record(fixture.requests[2]).input)).toContain(
+        compactReply,
+      );
+      expect(fixture.mind.snapshot().proposals).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("carries bounded owner chat context into a short follow-up proposal", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const memory = createMemoryPort();

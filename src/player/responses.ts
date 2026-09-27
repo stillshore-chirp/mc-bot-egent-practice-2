@@ -155,6 +155,8 @@ export interface RunPlayerAgentInput {
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
   readonly maxRounds?: number;
+  /** Restrict follow-up formatting requests from invoking tools. */
+  readonly toolChoice?: "auto" | "none";
   readonly role?: PlayerAgentRole;
   /** Character count only; the observation itself is never copied here. */
   readonly initialObservationChars?: number;
@@ -269,7 +271,7 @@ export async function runPlayerAgent(
             instructions: input.instructions,
             input: messages,
             tools,
-            tool_choice: "auto",
+            tool_choice: input.toolChoice ?? "auto",
             parallel_tool_calls: false,
             store: false,
             include: ["reasoning.encrypted_content"],
