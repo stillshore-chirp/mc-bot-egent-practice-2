@@ -4309,7 +4309,6 @@ async function main(): Promise<void> {
         const naturalRegeneration = await rconNaturalRegeneration(rcon);
 
         let naturalRegenerationMayNeedRestore = false;
-        let hungerEffectMayBeActive = false;
         let effectsMayNeedCleanup = false;
         let damageMayNeedCleanup = false;
         let foodMayNeedCleanup = false;
@@ -4411,41 +4410,20 @@ async function main(): Promise<void> {
               incomplete("DAMAGE_RESPONSE_FOOD_EFFECT_CLEANUP_NOT_CONFIRMED");
           }
 
-          hungerEffectMayBeActive = true;
-          effectsMayNeedCleanup = true;
           foodMayNeedCleanup = true;
-          await rcon.command(
-            `effect give ${context.botName} minecraft:hunger 120 8 true`,
-          );
-          const hungerDeadline = Date.now() + 60_000;
-          let safeFoodPrepared = false;
-          while (Date.now() < hungerDeadline) {
-            const food = await rconFoodLevel(rcon, context.botName);
-            if (food < 12)
-              incomplete("DAMAGE_RESPONSE_FOOD_PREPARATION_OVERSHOT");
-            if (food <= 15) {
-              safeFoodPrepared = true;
-              break;
-            }
-            await waitMs(500);
-          }
-          if (!safeFoodPrepared)
-            incomplete("DAMAGE_RESPONSE_FOOD_PREPARATION_DEADLINE");
-          await rcon.command(
-            `effect clear ${context.botName} minecraft:hunger`,
-          );
-          hungerEffectMayBeActive = false;
-          if ((await rconActiveEffectsState(rcon, context.botName)) !== "empty")
-            incomplete("DAMAGE_RESPONSE_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
           const preparedEvidence = await collect(context.runtime.app);
           const preparedFood = await rconFoodLevel(rcon, context.botName);
+          const preparedRconHealth = await rconEntityHealth(
+            rcon,
+            context.botName,
+          );
           const preparedBodyHealth = preparedEvidence.game?.health;
           const preparedBodyFood = preparedEvidence.game?.food;
           if (
             preparedBodyHealth !== expectedHealth ||
+            preparedRconHealth !== expectedHealth ||
             preparedBodyFood !== preparedFood ||
-            preparedFood < 12 ||
-            preparedFood > 15
+            preparedFood !== expectedFood
           )
             incomplete(
               "DAMAGE_RESPONSE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES",
@@ -4590,20 +4568,6 @@ async function main(): Promise<void> {
           throw error;
         } finally {
           let cleanupConfirmed = true;
-          if (hungerEffectMayBeActive) {
-            try {
-              await rcon.command(
-                `effect clear ${context.botName} minecraft:hunger`,
-              );
-              if (
-                (await rconActiveEffectsState(rcon, context.botName)) !==
-                "empty"
-              )
-                cleanupConfirmed = false;
-            } catch {
-              cleanupConfirmed = false;
-            }
-          }
           if (damageMayNeedCleanup) {
             try {
               effectsMayNeedCleanup = true;
