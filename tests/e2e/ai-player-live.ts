@@ -155,6 +155,10 @@ const E2E_GAMERULES = {
     id: "minecraft:respawn_radius",
     readbackFailure: "WORLD_RESPAWN_RADIUS_READBACK_MISMATCH",
   },
+  naturalRegeneration: {
+    id: "minecraft:natural_health_regeneration",
+    readbackFailure: "DAMAGE_RESPONSE_REGENERATION_STATE_UNAVAILABLE",
+  },
 } as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
@@ -4287,9 +4291,7 @@ async function main(): Promise<void> {
             await rcon.command(`data get entity ${context.botName} Pos`),
           );
           naturalRegenerationMayNeedRestore = true;
-          await rcon.command("gamerule naturalRegeneration false");
-          if (await rconNaturalRegeneration(rcon))
-            incomplete("DAMAGE_RESPONSE_REGENERATION_NOT_DISABLED");
+          await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
 
           hungerEffectMayBeActive = true;
           foodMayNeedCleanup = true;
@@ -4503,11 +4505,11 @@ async function main(): Promise<void> {
           }
           if (naturalRegenerationMayNeedRestore) {
             try {
-              await rcon.command(
-                `gamerule naturalRegeneration ${naturalRegeneration}`,
+              await setAndVerifyGamerule(
+                rcon,
+                "naturalRegeneration",
+                naturalRegeneration,
               );
-              if ((await rconNaturalRegeneration(rcon)) !== naturalRegeneration)
-                cleanupConfirmed = false;
             } catch {
               cleanupConfirmed = false;
             }
@@ -7967,7 +7969,9 @@ async function rconActiveEffectsState(
 }
 
 async function rconNaturalRegeneration(rcon: LocalRcon): Promise<boolean> {
-  const reply = await rcon.command("gamerule naturalRegeneration");
+  const reply = await rcon.command(
+    `gamerule ${E2E_GAMERULES.naturalRegeneration.id}`,
+  );
   const value = /(?:^|\s)(true|false)\s*$/iu.exec(reply.trim())?.[1];
   if (value === undefined)
     incomplete("DAMAGE_RESPONSE_REGENERATION_STATE_UNAVAILABLE");
