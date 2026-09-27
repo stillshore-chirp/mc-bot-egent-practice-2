@@ -195,6 +195,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
+  damage_response: { llmCalls: 6, totalTokens: 35_000 },
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -209,6 +210,7 @@ const CASE_DEADLINES = {
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
+  damage_response: 4 * 60_000,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -4250,6 +4252,313 @@ async function main(): Promise<void> {
       },
     );
 
+    const damageResult = await recordCase(
+      state,
+      "damage_response",
+      CASE_DEADLINES.damage_response,
+      requireLiveContext(),
+      async (context) => {
+        const initialEvidence = await collect(context.runtime.app);
+        const initialHealth = initialEvidence.game?.health;
+        const initialRconHealth = await rconEntityHealth(rcon, context.botName);
+        const initialFood = initialEvidence.game?.food;
+        const initialRconFood = await rconFoodLevel(rcon, context.botName);
+        const effectsBaseline = await rconActiveEffectsState(
+          rcon,
+          context.botName,
+        );
+        const naturalRegeneration = await rconNaturalRegeneration(rcon);
+        if (
+          initialHealth !== 20 ||
+          initialRconHealth !== 20 ||
+          initialFood !== 20 ||
+          initialRconFood !== 20 ||
+          effectsBaseline !== "empty"
+        )
+          incomplete("DAMAGE_RESPONSE_BASELINE_NOT_SAFE");
+
+        let naturalRegenerationMayNeedRestore = false;
+        let hungerEffectMayBeActive = false;
+        let damageMayNeedCleanup = false;
+        let foodMayNeedCleanup = false;
+        let fixturePosition: Position | undefined;
+        try {
+          fixturePosition = parsePosition(
+            await rcon.command(`data get entity ${context.botName} Pos`),
+          );
+          naturalRegenerationMayNeedRestore = true;
+          await rcon.command("gamerule naturalRegeneration false");
+          if (await rconNaturalRegeneration(rcon))
+            incomplete("DAMAGE_RESPONSE_REGENERATION_NOT_DISABLED");
+
+          hungerEffectMayBeActive = true;
+          foodMayNeedCleanup = true;
+          await rcon.command(
+            `effect give ${context.botName} minecraft:hunger 120 8 true`,
+          );
+          const hungerDeadline = Date.now() + 60_000;
+          let safeFoodPrepared = false;
+          while (Date.now() < hungerDeadline) {
+            const food = await rconFoodLevel(rcon, context.botName);
+            if (food < 12)
+              incomplete("DAMAGE_RESPONSE_FOOD_PREPARATION_OVERSHOT");
+            if (food <= 15) {
+              safeFoodPrepared = true;
+              break;
+            }
+            await waitMs(500);
+          }
+          if (!safeFoodPrepared)
+            incomplete("DAMAGE_RESPONSE_FOOD_PREPARATION_DEADLINE");
+          await rcon.command(
+            `effect clear ${context.botName} minecraft:hunger`,
+          );
+          hungerEffectMayBeActive = false;
+          if ((await rconActiveEffectsState(rcon, context.botName)) !== "empty")
+            incomplete("DAMAGE_RESPONSE_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+          const preparedEvidence = await collect(context.runtime.app);
+          const preparedFood = await rconFoodLevel(rcon, context.botName);
+          const preparedBodyHealth = preparedEvidence.game?.health;
+          const preparedBodyFood = preparedEvidence.game?.food;
+          if (
+            preparedBodyHealth !== initialHealth ||
+            preparedBodyFood !== preparedFood ||
+            preparedFood < 12 ||
+            preparedFood > 15
+          )
+            incomplete(
+              "DAMAGE_RESPONSE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES",
+            );
+
+          const before = playerOf(preparedEvidence);
+          const priorActivity = new Set(
+            (before.recentAgentActivity ?? []).map(
+              (activity) => `${activity.runSequence}:${activity.round}`,
+            ),
+          );
+          damageMayNeedCleanup = true;
+          await rcon.command(`damage ${context.botName} 14 minecraft:generic`);
+          const damageAppliedAt = Date.now();
+          const damagedRconHealth = await rconEntityHealth(
+            rcon,
+            context.botName,
+          );
+          const damagedEvidence = await collect(context.runtime.app);
+          const damagedHealth = damagedEvidence.game?.health;
+          if (
+            damagedRconHealth >= initialRconHealth ||
+            damagedRconHealth <= 0 ||
+            damagedRconHealth > 6 ||
+            damagedHealth === undefined ||
+            damagedHealth >= initialHealth ||
+            damagedHealth > 6
+          )
+            incomplete("DAMAGE_RESPONSE_DAMAGE_NOT_CONFIRMED_BY_BOTH_ORACLES");
+          const afterDamage = playerOf(damagedEvidence);
+          const priorJudgments = new Set(
+            before.recentJudgments.map(
+              (judgment) =>
+                `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+            ),
+          );
+
+          const hasJudgmentLinkedOutcome = (
+            player: PlayerEvidence,
+          ): boolean => {
+            const outcomes = newOutcomes(afterDamage, player).filter(
+              (outcome) => outcome.status === "successful",
+            );
+            return player.recentJudgments.some((judgment) => {
+              const judgmentKey = `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+              const judgmentAt = Date.parse(judgment.decidedAt ?? "");
+              const operationKind = judgment.operationKind;
+              if (
+                priorJudgments.has(judgmentKey) ||
+                !Number.isFinite(judgmentAt) ||
+                judgmentAt < damageAppliedAt ||
+                operationKind === undefined ||
+                ![
+                  "look_sweep",
+                  "consume",
+                  "equip",
+                  "move_to",
+                  "move_relative",
+                ].includes(operationKind)
+              )
+                return false;
+              return outcomes.some(
+                (outcome) =>
+                  outcome.kind === operationKind &&
+                  outcome.observedAt !== undefined &&
+                  Number.isFinite(Date.parse(outcome.observedAt)) &&
+                  Date.parse(outcome.observedAt) >= judgmentAt,
+              );
+            });
+          };
+
+          const decided = await waitForPlayer(context, 150_000, (player) => {
+            const freshActivity = (player.recentAgentActivity ?? []).some(
+              (activity) =>
+                activity.role === "purpose" &&
+                !priorActivity.has(
+                  `${activity.runSequence}:${activity.round}`,
+                ) &&
+                activity.toolCalls.some(
+                  (toolCall) =>
+                    toolCall.name === "commit_action_decision" &&
+                    toolCall.resultClass === "ok",
+                ),
+            );
+            return freshActivity && hasJudgmentLinkedOutcome(player);
+          });
+          if (!hasJudgmentLinkedOutcome(decided))
+            incomplete("DAMAGE_RESPONSE_BODY_OUTCOME_NOT_CONFIRMED");
+          const finalDamageHealth = await rconEntityHealth(
+            rcon,
+            context.botName,
+          );
+          const finalDamageBodyHealth = (await collect(context.runtime.app))
+            .game?.health;
+          if (
+            finalDamageHealth <= 0 ||
+            finalDamageBodyHealth === undefined ||
+            finalDamageBodyHealth <= 0
+          )
+            fail("DAMAGE_RESPONSE_LETHAL_OUTCOME");
+          return {
+            baselineHealthBodyAndRconConfirmed: true,
+            boundedNonlethalDamageConfirmedByBodyAndRcon: true,
+            purposeCommitActionDecisionObserved: true,
+            successfulBodyOutcomeObserved: true,
+            healthRemainedNonlethal: true,
+          };
+        } finally {
+          let cleanupConfirmed = true;
+          if (hungerEffectMayBeActive) {
+            try {
+              await rcon.command(
+                `effect clear ${context.botName} minecraft:hunger`,
+              );
+              if (
+                (await rconActiveEffectsState(rcon, context.botName)) !==
+                "empty"
+              )
+                cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (damageMayNeedCleanup) {
+            try {
+              await rcon.command(
+                `effect give ${context.botName} minecraft:instant_health 1 4 true`,
+              );
+              const restoreDeadline = Date.now() + 5_000;
+              let healthRestored = false;
+              while (Date.now() < restoreDeadline) {
+                if (
+                  (await rconEntityHealth(rcon, context.botName)) ===
+                  initialRconHealth
+                ) {
+                  healthRestored = true;
+                  break;
+                }
+                await waitMs(100);
+              }
+              if (!healthRestored) cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (foodMayNeedCleanup) {
+            try {
+              await rcon.command(
+                `effect give ${context.botName} minecraft:saturation 1 20 true`,
+              );
+              const restoreDeadline = Date.now() + 5_000;
+              let foodRestored = false;
+              while (Date.now() < restoreDeadline) {
+                if (
+                  (await rconFoodLevel(rcon, context.botName)) ===
+                  initialRconFood
+                ) {
+                  foodRestored = true;
+                  break;
+                }
+                await waitMs(100);
+              }
+              if (!foodRestored) cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          try {
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              cleanupConfirmed = false;
+          } catch {
+            cleanupConfirmed = false;
+          }
+          if (naturalRegenerationMayNeedRestore) {
+            try {
+              await rcon.command(
+                `gamerule naturalRegeneration ${naturalRegeneration}`,
+              );
+              if ((await rconNaturalRegeneration(rcon)) !== naturalRegeneration)
+                cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (fixturePosition !== undefined) {
+            try {
+              await rcon.command(
+                `tp ${context.botName} ${fixturePosition.x} ${fixturePosition.y} ${fixturePosition.z}`,
+              );
+              const restoredPosition = parsePosition(
+                await rcon.command(`data get entity ${context.botName} Pos`),
+              );
+              if (
+                Math.hypot(
+                  restoredPosition.x - fixturePosition.x,
+                  restoredPosition.y - fixturePosition.y,
+                  restoredPosition.z - fixturePosition.z,
+                ) > 0.2
+              )
+                cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          try {
+            const restoredBody = (await collect(context.runtime.app)).game;
+            const restoredBodyHealth = restoredBody?.health;
+            const restoredBodyFood = restoredBody?.food;
+            if (
+              (await rconEntityHealth(rcon, context.botName)) !==
+                initialRconHealth ||
+              restoredBodyHealth !== initialHealth ||
+              (await rconFoodLevel(rcon, context.botName)) !==
+                initialRconFood ||
+              restoredBodyFood !== initialFood ||
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              cleanupConfirmed = false;
+          } catch {
+            cleanupConfirmed = false;
+          }
+          if (!cleanupConfirmed) {
+            state.abortRequested = true;
+            state.failureCode ??=
+              "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED";
+            incomplete("DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED");
+          }
+        }
+      },
+    );
+
     const unknownResult = await recordCase(
       state,
       "unknown_composite",
@@ -5546,6 +5855,7 @@ async function main(): Promise<void> {
           exchangeResult,
           discretionResult,
           foodResult,
+          damageResult,
           parallelResult,
           operationSmokeResult,
         ];
@@ -7627,6 +7937,41 @@ async function rconFoodLevel(
   if (!Number.isInteger(foodLevel) || foodLevel < 0 || foodLevel > 20)
     incomplete("FOOD_INTENT_FOOD_LEVEL_UNAVAILABLE");
   return foodLevel;
+}
+
+async function rconEntityHealth(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<number> {
+  const reply = await rcon.command(`data get entity ${botName} Health`);
+  const match = /(?:^|:\s*)(\d+(?:\.\d+)?)(?:[bBsSlLfFdD])?\s*$/u.exec(
+    reply.trim(),
+  );
+  const health = match === null ? Number.NaN : Number(match[1]);
+  if (!Number.isFinite(health) || health < 0 || health > 20)
+    incomplete("DAMAGE_RESPONSE_RCON_HEALTH_UNAVAILABLE");
+  return health;
+}
+
+async function rconActiveEffectsState(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<"empty" | "active" | "unknown"> {
+  const reply = await rcon
+    .command(`data get entity ${botName} active_effects`)
+    .catch(() => "");
+  const value = reply.trim();
+  if (/\[\s*\]\s*$/u.test(value)) return "empty";
+  if (/\[\s*\{[\s\S]*\}\s*\]\s*$/u.test(value)) return "active";
+  return "unknown";
+}
+
+async function rconNaturalRegeneration(rcon: LocalRcon): Promise<boolean> {
+  const reply = await rcon.command("gamerule naturalRegeneration");
+  const value = /(?:^|\s)(true|false)\s*$/iu.exec(reply.trim())?.[1];
+  if (value === undefined)
+    incomplete("DAMAGE_RESPONSE_REGENERATION_STATE_UNAVAILABLE");
+  return value.toLowerCase() === "true";
 }
 
 async function rconHasActiveEffect(
