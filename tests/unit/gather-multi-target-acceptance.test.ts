@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   countCompletedGatherActions,
   confirmsSecondGatheredTarget,
+  gatherMultiTargetRconSampleEvidence,
   gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
   hasNewPostFollowupDigJudgment,
@@ -471,5 +472,54 @@ describe("multi-target gather E2E acceptance", () => {
         sample: { ...sample, inventoryCount: { oak_log: 1, birch_log: 0 } },
       }),
     ).toBe(false);
+  });
+
+  it("records separate baseline-relative RCON buckets without exact counts", () => {
+    const sample = {
+      blockPresent: { oak_log: false, birch_log: true },
+      inventoryCount: { oak_log: 1, birch_log: 0 },
+      completedGatherCount: 2,
+    } as const;
+    const predicateEvidence = gatherMultiTargetRconSampleEvidence(
+      "postFollowupPredicate",
+      sample,
+      { oak_log: 0, birch_log: 0 },
+      "fresh",
+    );
+    const finalEvidence = gatherMultiTargetRconSampleEvidence(
+      "final",
+      undefined,
+      { oak_log: 0, birch_log: 0 },
+      "unavailable",
+    );
+
+    expect(predicateEvidence).toEqual({
+      gatherMultiTargetPostFollowupPredicateRconStatus: "fresh",
+      gatherMultiTargetPostFollowupPredicateRconOakLogBlockPresent: false,
+      gatherMultiTargetPostFollowupPredicateRconOakLogBaselineInventoryBucket:
+        "zero",
+      gatherMultiTargetPostFollowupPredicateRconOakLogCurrentInventoryBucket:
+        "one_or_more",
+      gatherMultiTargetPostFollowupPredicateRconOakLogInventoryDeltaBucket:
+        "increased_by_one",
+      gatherMultiTargetPostFollowupPredicateRconBirchLogBlockPresent: true,
+      gatherMultiTargetPostFollowupPredicateRconBirchLogBaselineInventoryBucket:
+        "zero",
+      gatherMultiTargetPostFollowupPredicateRconBirchLogCurrentInventoryBucket:
+        "zero",
+      gatherMultiTargetPostFollowupPredicateRconBirchLogInventoryDeltaBucket:
+        "unchanged",
+    });
+    expect(finalEvidence).toMatchObject({
+      gatherMultiTargetFinalRconStatus: "unavailable",
+      gatherMultiTargetFinalRconOakLogBlockPresent: "unknown",
+      gatherMultiTargetFinalRconOakLogBaselineInventoryBucket: "zero",
+      gatherMultiTargetFinalRconOakLogCurrentInventoryBucket: "unknown",
+      gatherMultiTargetFinalRconOakLogInventoryDeltaBucket: "unknown",
+    });
+    const serialized = JSON.stringify({ predicateEvidence, finalEvidence });
+    expect(Object.values(predicateEvidence)).not.toContain(1);
+    expect(Object.values(predicateEvidence)).not.toContain(0);
+    expect(serialized).not.toContain("completedGatherCount");
   });
 });

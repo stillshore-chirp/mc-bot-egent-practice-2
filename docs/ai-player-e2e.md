@@ -85,7 +85,8 @@ Skill交換caseが停止した時は、export依頼・export確認・import依�
 
 - attempted / recorded / overflow件数、dig対象とfixture対象の一致、操作status、拾得結果・path失敗enumを残します。
 - 各操作の前後で、位置・向きbucket、対象block / drop可視性、候補探索切り詰め、所持数bucketと増減を記録します。
-- artifactに座標・entity ID・操作ID・自由記述を含めません。この診断を含む実GPT runは未実施で、診断結果だけでは採取受け入れを判定しません。
+- 追記後の最初のdig→pickup pairで強制freshした判定用RCON sampleと、cleanup直前のfresh final sampleを分け、block有無・baseline/current所持数bucket・差分enumを残します。取得不能時は`unavailable`です。
+- artifactに座標・entity ID・操作ID・自由記述を含めません。Body操作前後の診断は実GPT runで確認済みで、新しいRCON sample診断を含むrunは未実施です。診断結果だけでは採取受け入れを判定しません。
 
 現在の#72 fixtureは乾地で、壁が直進経路を妨げる一方、標的は開始時から視界に入る構成です。対象とその直下のstone床はRCONで確認します。開始時に遮蔽された目標の探索は #77 の対象です。過去の水中drop課題・実行・probeは#74の検討対象へ切り分け、run履歴は監査用に残しますが#72の受け入れ根拠には数えません。問題文は対象物・空の所持品・帰還先と失敗後の見直しを伝え、障害物の位置や解法は示しません。`unknown_composite`の48 calls / 390,000 tokens / 7分の上限は据え置きで、旧fixtureの測定を新fixtureの受け入れ証拠へ流用しません。`AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY`はGPTなしの診断であり、#72の実GPT受け入れを代替しません。
 

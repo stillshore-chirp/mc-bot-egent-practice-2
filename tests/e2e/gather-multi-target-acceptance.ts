@@ -9,6 +9,79 @@ export interface GatherMultiTargetOracleSample {
   readonly completedGatherCount: number;
 }
 
+export type GatherMultiTargetRconSampleStage =
+  "postFollowupPredicate" | "final";
+export type GatherMultiTargetRconSampleStatus =
+  "not_attempted" | "fresh" | "unavailable";
+type InventoryCountBucket = "zero" | "one_or_more" | "unknown";
+type InventoryDeltaBucket =
+  | "unchanged"
+  | "increased_by_one"
+  | "increased_by_multiple"
+  | "decreased"
+  | "unknown";
+
+/** Keep RCON samples useful for diagnosis without publishing exact counts. */
+export function gatherMultiTargetRconSampleEvidence(
+  stage: GatherMultiTargetRconSampleStage,
+  sample: GatherMultiTargetOracleSample | undefined,
+  baseline: Readonly<Record<GatherMultiTargetItem, number>> | undefined,
+  readStatus: GatherMultiTargetRconSampleStatus,
+): Readonly<Record<string, boolean | string>> {
+  const safeSample = readStatus === "fresh" ? sample : undefined;
+  const status =
+    readStatus === "fresh" && safeSample === undefined
+      ? "unavailable"
+      : readStatus;
+  const prefix = `gatherMultiTarget${capitalize(stage)}Rcon`;
+  const evidence: Record<string, boolean | string> = {
+    [`${prefix}Status`]: status,
+  };
+  for (const item of GATHER_MULTI_TARGET_ITEMS) {
+    const itemLabel = item === "oak_log" ? "OakLog" : "BirchLog";
+    evidence[`${prefix}${itemLabel}BlockPresent`] =
+      safeSample?.blockPresent[item] ?? "unknown";
+    evidence[`${prefix}${itemLabel}BaselineInventoryBucket`] =
+      bucketInventoryCount(baseline?.[item]);
+    evidence[`${prefix}${itemLabel}CurrentInventoryBucket`] =
+      bucketInventoryCount(safeSample?.inventoryCount[item]);
+    evidence[`${prefix}${itemLabel}InventoryDeltaBucket`] =
+      bucketInventoryDelta(baseline?.[item], safeSample?.inventoryCount[item]);
+  }
+  return evidence;
+}
+
+function bucketInventoryCount(count: number | undefined): InventoryCountBucket {
+  if (count === undefined || !Number.isSafeInteger(count) || count < 0)
+    return "unknown";
+  return count === 0 ? "zero" : "one_or_more";
+}
+
+function bucketInventoryDelta(
+  baseline: number | undefined,
+  current: number | undefined,
+): InventoryDeltaBucket {
+  if (
+    baseline === undefined ||
+    current === undefined ||
+    !Number.isSafeInteger(baseline) ||
+    !Number.isSafeInteger(current) ||
+    baseline < 0 ||
+    current < 0
+  ) {
+    return "unknown";
+  }
+  const delta = current - baseline;
+  if (delta === 0) return "unchanged";
+  if (delta === 1) return "increased_by_one";
+  if (delta > 1) return "increased_by_multiple";
+  return "decreased";
+}
+
+function capitalize(value: string): string {
+  return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
 export interface GatherOperationOutcome {
   readonly operationId?: string | undefined;
   readonly kind?: string | undefined;

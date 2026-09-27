@@ -156,6 +156,7 @@ import {
 import {
   countCompletedGatherActions,
   confirmsSecondGatheredTarget,
+  gatherMultiTargetRconSampleEvidence,
   gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
   GATHER_MULTI_TARGET_ITEMS,
@@ -1833,6 +1834,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "gather_multi_target_continuity"
       ? (state.gatherDropProbeEvidence ?? {})
       : {}),
+    ...(caseId === "gather_multi_target_continuity"
+      ? (state.gatherMultiTargetRconEvidence ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2129,6 +2133,7 @@ function updateLearningFixtureDiagnostic(
 
 function beginGatherMultiTargetContinuityDiagnostic(state: RunState): void {
   delete state.gatherDropProbeEvidence;
+  delete state.gatherMultiTargetRconEvidence;
   state.gatherMultiTargetContinuityDiagnostic = {
     caseStarted: true,
     fixtureConfigured: false,
@@ -2574,6 +2579,7 @@ interface RunState {
   learningReuseOwnerProposalRecorded?: boolean;
   gatherMultiTargetContinuityDiagnostic?: GatherMultiTargetContinuityDiagnostic;
   gatherDropProbeEvidence?: Readonly<Record<string, boolean | number | string>>;
+  gatherMultiTargetRconEvidence?: Readonly<Record<string, boolean | string>>;
   gatherBodyVisibilityProbeDiagnostic?: GatherBodyVisibilityProbeDiagnostic;
   gatherDropVisibilityProbeDiagnostic?: GatherDropVisibilityProbeDiagnostic;
   firstDigLearningDiagnostic?: FirstDigLearningDiagnostic;
@@ -3918,7 +3924,39 @@ async function main(): Promise<void> {
         let fixture: GatherMultiTargetFixture | undefined;
         let gatherDropProbe: GatherDropProbeCapture | undefined;
         let restoreGatherDropProbe: (() => void) | undefined;
+        let gatherInventoryBaseline:
+          Readonly<Record<GatherMultiTargetItem, number>> | undefined;
         let completedBodyGatherCount: number;
+        const captureFinalGatherRconSample = async (): Promise<void> => {
+          if (fixture === undefined) return;
+          try {
+            const sample = await sampleGatherMultiTargetOracle(
+              context.rcon,
+              context.botName,
+              fixture,
+              0,
+            );
+            state.gatherMultiTargetRconEvidence = {
+              ...(state.gatherMultiTargetRconEvidence ?? {}),
+              ...gatherMultiTargetRconSampleEvidence(
+                "final",
+                sample,
+                gatherInventoryBaseline,
+                "fresh",
+              ),
+            };
+          } catch {
+            state.gatherMultiTargetRconEvidence = {
+              ...(state.gatherMultiTargetRconEvidence ?? {}),
+              ...gatherMultiTargetRconSampleEvidence(
+                "final",
+                undefined,
+                gatherInventoryBaseline,
+                "unavailable",
+              ),
+            };
+          }
+        };
         try {
           const quietPlayer = await observeForPlayer(
             context,
@@ -3944,6 +3982,7 @@ async function main(): Promise<void> {
             context.botName,
             configuredFixture,
           );
+          gatherInventoryBaseline = baseline;
           await context.rcon.command(
             `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
           );
@@ -4025,9 +4064,7 @@ async function main(): Promise<void> {
           >();
           let lastOracleSampleAt = 0;
           let latestOracleSample: GatherMultiTargetOracleSample | undefined;
-          const sampleGatherProgress = async (
-            player: PlayerEvidence,
-          ): Promise<GatherMultiTargetOracleSample> => {
+          const recordGatherOutcomes = (player: PlayerEvidence): void => {
             for (const outcome of player.recentOutcomes) {
               if (
                 outcomeIdsBeforeTask.has(outcome.operationId) ||
@@ -4042,11 +4079,18 @@ async function main(): Promise<void> {
                 observedAt: outcome.observedAt,
               });
             }
+          };
+          const sampleGatherProgress = async (
+            player: PlayerEvidence,
+            forceFreshRconSample = false,
+          ): Promise<GatherMultiTargetOracleSample> => {
+            recordGatherOutcomes(player);
             const gatherOutcomes = [...observedGatherOutcomes.values()];
             const gatherPairs = successfulGatherActionPairs(gatherOutcomes);
             const completedGatherCount = gatherPairs.length;
 
             if (
+              forceFreshRconSample ||
               latestOracleSample === undefined ||
               Date.now() - lastOracleSampleAt >= 1_500
             ) {
@@ -4058,7 +4102,29 @@ async function main(): Promise<void> {
                   completedGatherCount,
                 );
                 lastOracleSampleAt = Date.now();
+                if (forceFreshRconSample) {
+                  state.gatherMultiTargetRconEvidence = {
+                    ...(state.gatherMultiTargetRconEvidence ?? {}),
+                    ...gatherMultiTargetRconSampleEvidence(
+                      "postFollowupPredicate",
+                      latestOracleSample,
+                      baseline,
+                      "fresh",
+                    ),
+                  };
+                }
               } catch {
+                if (forceFreshRconSample) {
+                  state.gatherMultiTargetRconEvidence = {
+                    ...(state.gatherMultiTargetRconEvidence ?? {}),
+                    ...gatherMultiTargetRconSampleEvidence(
+                      "postFollowupPredicate",
+                      undefined,
+                      baseline,
+                      "unavailable",
+                    ),
+                  };
+                }
                 incomplete("GATHER_MULTI_TARGET_SERVER_ORACLE_UNAVAILABLE");
               }
             }
@@ -4138,12 +4204,28 @@ async function main(): Promise<void> {
           let postFollowupDigJudgmentObserved = false;
           let postFollowupDigJudgmentBeforeSecondTargetObserved = false;
           let secondTargetGatherPairObserved = false;
+          let postFollowupPairRconSampleCaptured = false;
 
           const secondGathered = await observeForPlayer(
             context,
             150_000,
             async (player) => {
-              const sample = await sampleGatherProgress(player);
+              recordGatherOutcomes(player);
+              const postFollowupPairs = postFollowupGatherActionPairs({
+                outcomes: [...observedGatherOutcomes.values()],
+                previousOutcomeIds: outcomeIdsBeforeFollowup,
+                followupSentAt,
+              });
+              const secondPostFollowupPair = postFollowupPairs[0];
+              const forceFreshRconSample =
+                secondPostFollowupPair !== undefined &&
+                !postFollowupPairRconSampleCaptured;
+              if (forceFreshRconSample)
+                postFollowupPairRconSampleCaptured = true;
+              const sample = await sampleGatherProgress(
+                player,
+                forceFreshRconSample,
+              );
               postFollowupDigJudgmentObserved ||= hasNewPostFollowupDigJudgment(
                 player.recentJudgments,
                 judgmentKeysBeforeFollowup,
@@ -4154,12 +4236,6 @@ async function main(): Promise<void> {
                   postFollowupDigJudgmentObserved: true,
                 });
               }
-              const postFollowupPairs = postFollowupGatherActionPairs({
-                outcomes: [...observedGatherOutcomes.values()],
-                previousOutcomeIds: outcomeIdsBeforeFollowup,
-                followupSentAt,
-              });
-              const secondPostFollowupPair = postFollowupPairs[0];
               if (secondPostFollowupPair !== undefined) {
                 secondTargetGatherPairObserved = true;
                 updateGatherMultiTargetContinuityDiagnostic(state, {
@@ -4226,42 +4302,47 @@ async function main(): Promise<void> {
                     );
                 }
               } finally {
-                if (fixture !== undefined) {
-                  let fixtureCleanupConfirmed: boolean;
-                  try {
-                    fixtureCleanupConfirmed =
-                      await cleanupGatherMultiTargetFixture(
-                        context.rcon,
-                        context.botName,
-                        fixture,
-                        (progress) => {
-                          const cleanupReadbackUpdate: Partial<GatherMultiTargetContinuityDiagnostic> =
-                            {
-                              ...(progress.oakDropReadbackClass === undefined
-                                ? {}
-                                : {
-                                    oakDropReadbackClass:
-                                      progress.oakDropReadbackClass,
-                                  }),
-                              ...(progress.birchDropReadbackClass === undefined
-                                ? {}
-                                : {
-                                    birchDropReadbackClass:
-                                      progress.birchDropReadbackClass,
-                                  }),
-                            };
-                          updateGatherMultiTargetContinuityDiagnostic(
-                            state,
-                            cleanupReadbackUpdate,
-                          );
-                        },
-                      );
-                  } catch {
-                    fixtureCleanupConfirmed = false;
+                try {
+                  await captureFinalGatherRconSample();
+                } finally {
+                  if (fixture !== undefined) {
+                    let fixtureCleanupConfirmed: boolean;
+                    try {
+                      fixtureCleanupConfirmed =
+                        await cleanupGatherMultiTargetFixture(
+                          context.rcon,
+                          context.botName,
+                          fixture,
+                          (progress) => {
+                            const cleanupReadbackUpdate: Partial<GatherMultiTargetContinuityDiagnostic> =
+                              {
+                                ...(progress.oakDropReadbackClass === undefined
+                                  ? {}
+                                  : {
+                                      oakDropReadbackClass:
+                                        progress.oakDropReadbackClass,
+                                    }),
+                                ...(progress.birchDropReadbackClass ===
+                                undefined
+                                  ? {}
+                                  : {
+                                      birchDropReadbackClass:
+                                        progress.birchDropReadbackClass,
+                                    }),
+                              };
+                            updateGatherMultiTargetContinuityDiagnostic(
+                              state,
+                              cleanupReadbackUpdate,
+                            );
+                          },
+                        );
+                    } catch {
+                      fixtureCleanupConfirmed = false;
+                    }
+                    updateGatherMultiTargetContinuityDiagnostic(state, {
+                      fixtureCleanupConfirmed,
+                    });
                   }
-                  updateGatherMultiTargetContinuityDiagnostic(state, {
-                    fixtureCleanupConfirmed,
-                  });
                 }
               }
             },
@@ -4279,6 +4360,7 @@ async function main(): Promise<void> {
             completedBodyGatherCount,
           ),
           ...(state.gatherDropProbeEvidence ?? {}),
+          ...(state.gatherMultiTargetRconEvidence ?? {}),
         };
       },
     );
@@ -12611,11 +12693,13 @@ async function writeArtifact(state: RunState): Promise<void> {
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
       gatherMultiTargetContinuity:
         state.gatherMultiTargetContinuityDiagnostic === undefined &&
-        state.gatherDropProbeEvidence === undefined
+        state.gatherDropProbeEvidence === undefined &&
+        state.gatherMultiTargetRconEvidence === undefined
           ? null
           : {
               ...(state.gatherMultiTargetContinuityDiagnostic ?? {}),
               ...(state.gatherDropProbeEvidence ?? {}),
+              ...(state.gatherMultiTargetRconEvidence ?? {}),
             },
       gatherMultiTargetBodyVisibilityProbe:
         state.gatherBodyVisibilityProbeDiagnostic ?? null,
