@@ -290,7 +290,7 @@ interface LearningFixtureOrientationReadback extends LearningFixtureOrientationD
   readonly position: Position;
 }
 type SafeEvidenceValue =
-  boolean | number | string | readonly PlayerAgentRoundActivity[];
+  boolean | number | string | null | readonly PlayerAgentRoundActivity[];
 type SafeEvidence = Readonly<Record<string, SafeEvidenceValue>>;
 
 interface SafeAutonomousProgress {
@@ -1639,6 +1639,15 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "damage_response"
       ? (state.damageResponseFailureDiagnostic ?? {})
       : {}),
+    ...(caseId === "damage_response" &&
+    state.damageResponseDamageHealthReadback !== undefined
+      ? {
+          damageResponseBodyHealthAfterDamage:
+            state.damageResponseDamageHealthReadback.bodyHealth,
+          damageResponseRconHealthAfterDamage:
+            state.damageResponseDamageHealthReadback.rconHealth,
+        }
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2372,6 +2381,10 @@ interface RunState {
     readonly damageResponsePostDamageJudgment:
       "candidate" | "other" | "not_observed" | "unknown";
     readonly damageResponseLinkedSuccessfulOutcomeObserved: boolean;
+  };
+  damageResponseDamageHealthReadback?: {
+    readonly bodyHealth: number | null;
+    readonly rconHealth: number | null;
   };
   usageUncertain?: boolean;
   failureCode?: string;
@@ -4471,21 +4484,68 @@ async function main(): Promise<void> {
           positionMayNeedRestore = true;
           await rcon.command(`damage ${context.botName} 14 minecraft:generic`);
           const damageAppliedAt = Date.now();
-          const damagedRconHealth = await rconEntityHealth(
-            rcon,
-            context.botName,
-          );
-          const damagedEvidence = await collect(context.runtime.app);
-          const damagedHealth = damagedEvidence.game?.health;
+          const damageReadbackDeadlineAt = damageAppliedAt + 3_000;
+          let damagedRconHealth: number | null = null;
+          let damagedHealth: number | null = null;
+          let damagedEvidence: Evidence | undefined;
+          while (Date.now() < damageReadbackDeadlineAt) {
+            const timeoutMs = Math.max(
+              1,
+              Math.min(500, damageReadbackDeadlineAt - Date.now()),
+            );
+            try {
+              damagedRconHealth = await rconEntityHealth(
+                rcon,
+                context.botName,
+                timeoutMs,
+              );
+            } catch {
+              damagedRconHealth = null;
+            }
+            try {
+              damagedEvidence = await collect(context.runtime.app);
+              const observedHealth = damagedEvidence.game?.health;
+              damagedHealth =
+                typeof observedHealth === "number" &&
+                Number.isFinite(observedHealth)
+                  ? observedHealth
+                  : null;
+            } catch {
+              damagedEvidence = undefined;
+              damagedHealth = null;
+            }
+            if (
+              damagedRconHealth !== null &&
+              damagedRconHealth > 0 &&
+              damagedRconHealth < expectedHealth &&
+              damagedRconHealth <= 6 &&
+              damagedHealth !== null &&
+              damagedHealth > 0 &&
+              damagedHealth < expectedHealth &&
+              damagedHealth <= 6
+            )
+              break;
+            const remainingMs = damageReadbackDeadlineAt - Date.now();
+            if (remainingMs <= 0) break;
+            await waitMs(Math.min(100, remainingMs));
+          }
           if (
+            damagedRconHealth === null ||
             damagedRconHealth >= expectedHealth ||
             damagedRconHealth <= 0 ||
             damagedRconHealth > 6 ||
-            damagedHealth === undefined ||
+            damagedHealth === null ||
             damagedHealth >= expectedHealth ||
-            damagedHealth > 6
-          )
+            damagedHealth <= 0 ||
+            damagedHealth > 6 ||
+            damagedEvidence === undefined
+          ) {
+            state.damageResponseDamageHealthReadback = {
+              bodyHealth: damagedHealth,
+              rconHealth: damagedRconHealth,
+            };
             incomplete("DAMAGE_RESPONSE_DAMAGE_NOT_CONFIRMED_BY_BOTH_ORACLES");
+          }
           const afterDamage = playerOf(damagedEvidence);
           const priorJudgments = new Set(
             before.recentJudgments.map(
@@ -8123,8 +8183,12 @@ async function rconFoodLevel(
 async function rconEntityHealth(
   rcon: LocalRcon,
   botName: string,
+  timeoutMs = 5_000,
 ): Promise<number> {
-  const reply = await rcon.command(`data get entity ${botName} Health`);
+  const reply = await rcon.command(
+    `data get entity ${botName} Health`,
+    timeoutMs,
+  );
   const match = /(?:^|:\s*)(\d+(?:\.\d+)?)(?:[bBsSlLfFdD])?\s*$/u.exec(
     reply.trim(),
   );
