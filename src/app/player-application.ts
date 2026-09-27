@@ -392,6 +392,9 @@ export function createPlayerApplication(
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
         ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+        ...(metrics.usageUnknownReason === undefined
+          ? {}
+          : { usageUnknownReason: metrics.usageUnknownReason }),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     say,
@@ -419,6 +422,9 @@ export function createPlayerApplication(
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
         ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+        ...(metrics.usageUnknownReason === undefined
+          ? {}
+          : { usageUnknownReason: metrics.usageUnknownReason }),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     onObservation: (observation) => {

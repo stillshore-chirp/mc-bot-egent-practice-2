@@ -134,6 +134,9 @@ export interface PlayerAgentTool {
   execute(argumentsValue: unknown): Promise<unknown>;
 }
 
+export type PlayerAgentUsageUnknownReason =
+  "request_error" | "response_usage_missing";
+
 export interface PlayerAgentCallResult {
   readonly text: string;
   readonly calls: number;
@@ -143,6 +146,7 @@ export interface PlayerAgentCallResult {
   readonly toolCalls: number;
   /** True when no provider usage was returned; token totals are only a lower bound. */
   readonly usageUnknown?: boolean;
+  readonly usageUnknownReason?: PlayerAgentUsageUnknownReason;
 }
 
 export interface RunPlayerAgentInput {
@@ -334,6 +338,7 @@ export async function runPlayerAgent(
         latencyMs: Math.round(performance.now() - started),
         toolCalls,
         usageUnknown: true,
+        usageUnknownReason: "request_error",
       });
       throw error;
     }
@@ -348,7 +353,12 @@ export async function runPlayerAgent(
       outputTokens: safeCount(response.usage?.output_tokens),
       latencyMs: elapsed,
       toolCalls: 0,
-      ...(response.usage === undefined ? { usageUnknown: true } : {}),
+      ...(response.usage === undefined
+        ? {
+            usageUnknown: true,
+            usageUnknownReason: "response_usage_missing" as const,
+          }
+        : {}),
     });
     const responseStatus = response.status ?? "unknown";
     const activityToolCalls: PlayerAgentToolRoundActivity[] = [];

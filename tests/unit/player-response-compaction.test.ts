@@ -157,6 +157,9 @@ describe("Responses server-side compaction", () => {
             outputTokens: metrics.outputTokens,
             latencyMs: metrics.latencyMs,
             ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+            ...(metrics.usageUnknownReason === undefined
+              ? {}
+              : { usageUnknownReason: metrics.usageUnknownReason }),
           }),
       }),
     ).rejects.toBe(requestError);
@@ -164,12 +167,56 @@ describe("Responses server-side compaction", () => {
     expect(mind.snapshot().counters).toMatchObject({
       llmCalls: 1,
       usageUnknownCalls: 1,
+      usageUnknownRequestErrorCalls: 1,
+      usageUnknownResponseUsageMissingCalls: 0,
       inputTokens: 0,
       outputTokens: 0,
     });
     expect(mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
       responseStatus: "request_error",
       requestErrorCause: "request_failed",
+    });
+    mind.close();
+  });
+
+  it("counts responses that omit provider usage separately", async () => {
+    const mind = PlayerMindStore.open(":memory:");
+    const response = {
+      ...terminalResponse("Done."),
+      usage: undefined,
+    } as unknown as Response;
+    const client = {
+      responses: { create: async () => response },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        onCall: (metrics) =>
+          mind.recordCall({
+            inputTokens: metrics.inputTokens,
+            outputTokens: metrics.outputTokens,
+            latencyMs: metrics.latencyMs,
+            ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+            ...(metrics.usageUnknownReason === undefined
+              ? {}
+              : { usageUnknownReason: metrics.usageUnknownReason }),
+          }),
+      }),
+    ).resolves.toMatchObject({ text: "Done.", calls: 1 });
+
+    expect(mind.snapshot().counters).toMatchObject({
+      llmCalls: 1,
+      usageUnknownCalls: 1,
+      usageUnknownRequestErrorCalls: 0,
+      usageUnknownResponseUsageMissingCalls: 1,
+      inputTokens: 0,
+      outputTokens: 0,
     });
     mind.close();
   });
