@@ -12,6 +12,10 @@
 
 このprobeでは実GPT、既定runtime、Purpose判断を実行しません。したがって証明するのはfixture準備と独立readbackだけで、接続後のno-food時の判断、失敗したconsumeの反復抑制、代案・理由付きwait、再評価契機の受け入れには数えません。
 
+`AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY=YES` はfixtureを作った同じ隔離worldへ既定applicationを接続し、startupの最初のBody observationでHealth 1〜6、Food 12〜15、空inventoryをBody/RCON双方から読み戻します。HealthとFoodは各oracle間の一致も要求します。Body observation wrapperはreadbackを完了してからruntimeへ戻り、startup Purposeがscheduleされた後の最初の`beforeCall` gateはResponses API送信前に必ず停止します。実API keyなしで実行し、artifactではprovider要求の遮断、Body/RCONの数値とempty確認、LLM calls 0を照合できます。`AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts` で一度実行します。
+
+continuity probeのpassが示すのは、既定application接続後の最初のBody observationまでno-food fixtureがBody/RCON間で維持され、最初のprovider要求を送信前に止めたことです。Purpose判断の完了、consume失敗の反復抑制、代案・理由付きwait、再評価契機の受け入れは確認しません。readback・停止・cleanupのいずれかが確認できない場合は固定codeで未完了にします。
+
 新しい既定経路と責務の境界は[自律プレイヤー](autonomous-player.md)、操作・可視範囲の契約は[プレイヤー操作アダプター](player-body.md)、判断に使うゲーム内知識は[MC Bot Skills](mc-bot-skills.md)を参照してください。
 
 ## 隔離と公開境界

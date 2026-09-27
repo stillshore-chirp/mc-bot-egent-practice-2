@@ -277,6 +277,26 @@ interface GameActionPlacementObservationProbe {
     GameActionPlacementObservationSummary
   >;
 }
+interface NoFoodContinuityDiagnostic {
+  readonly startupBodyObservationAvailable: boolean;
+  readonly startupStateConfirmed: boolean;
+  readonly bodyHealth: number | null;
+  readonly rconHealth: number | null;
+  readonly bodyFood: number | null;
+  readonly rconFood: number | null;
+  readonly bodyInventoryEmpty: boolean;
+  readonly rconInventoryEmpty: boolean;
+}
+const EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC: NoFoodContinuityDiagnostic = {
+  startupBodyObservationAvailable: false,
+  startupStateConfirmed: false,
+  bodyHealth: null,
+  rconHealth: null,
+  bodyFood: null,
+  rconFood: null,
+  bodyInventoryEmpty: false,
+  rconInventoryEmpty: false,
+};
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
   readonly placementConfirmedCount: number;
@@ -541,8 +561,13 @@ function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES"
   );
+}
+
+function isNoFoodContinuityProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES";
 }
 
 function classifyBodyMoveError(
@@ -1615,11 +1640,25 @@ function finalRunCounters(state: RunState): Counters {
   return state.countersFinal ?? state.countersInitial ?? zeroCounters();
 }
 
+function noFoodContinuitySafeEvidence(state: RunState): SafeEvidence {
+  return {
+    ...EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC,
+    ...state.noFoodContinuityDiagnostic,
+    providerRequestBlocked:
+      state.noFoodContinuityProviderRequestBlocked === true,
+    providerRequestBlockedAfterReadback:
+      state.noFoodContinuityProviderRequestBlockedAfterReadback === true,
+  };
+}
+
 function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
   const progress =
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
   return {
     ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(caseId === "no_food_continuity_probe"
+      ? noFoodContinuitySafeEvidence(state)
+      : {}),
     ...(caseId === "observation_boundary"
       ? (state.observationBoundaryDiagnostic ?? {
           replyReceived: false,
@@ -2429,6 +2468,9 @@ interface RunState {
   };
   observationBoundarySidecarRetained?: boolean;
   persistentMemoryDiagnostic?: PersistentMemoryProgress;
+  noFoodContinuityDiagnostic?: NoFoodContinuityDiagnostic;
+  noFoodContinuityProviderRequestBlocked?: boolean;
+  noFoodContinuityProviderRequestBlockedAfterReadback?: boolean;
 }
 
 interface FoodIntentContinuityDiagnostic {
@@ -2502,6 +2544,7 @@ let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
+let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
 function installGameActionPlacementObservationProbe(): () => void {
   const prototype = MineflayerPlayerBody.prototype;
@@ -2553,6 +2596,82 @@ function installGameActionPlacementObservationProbe(): () => void {
   };
 }
 
+function installNoFoodContinuityObservationProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): () => void {
+  const prototype = MineflayerPlayerBody.prototype;
+  const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
+    prototype,
+    "observe",
+  );
+  if (typeof originalObserveDescriptor?.value !== "function")
+    throw new Error("PlayerBody observation method is unavailable");
+  const originalObserve =
+    originalObserveDescriptor.value as typeof prototype.observe;
+  let captured = false;
+  const instrumentedObserve = async function (
+    this: MineflayerPlayerBody,
+    options?: PlayerBodyObservationOptions,
+  ): Promise<PlayerBodyObservation> {
+    const observation = await originalObserve.call(this, options);
+    if (!captured) {
+      captured = true;
+      const [rconHealth, rconFood, rconInventoryEmpty] = await Promise.all([
+        rconEntityHealth(rcon, state.botName).catch(() => null),
+        rconFoodLevel(rcon, state.botName).catch(() => null),
+        rconInventoryIsEmpty(rcon, state.botName).catch(() => false),
+      ]);
+      const bodyHealth = observation.self.health;
+      const bodyFood = observation.self.food;
+      const bodyInventoryEmpty =
+        observation.self.inventory.reduce(
+          (count, item) => count + item.count,
+          0,
+        ) === 0 &&
+        Object.values(observation.self.equipment).every(
+          (item) => item === null,
+        );
+      const healthConfirmed =
+        bodyHealth !== null &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6 &&
+        bodyHealth === rconHealth;
+      const foodConfirmed =
+        bodyFood !== null &&
+        bodyFood >= 12 &&
+        bodyFood <= 15 &&
+        rconFood !== null &&
+        rconFood >= 12 &&
+        rconFood <= 15 &&
+        bodyFood === rconFood;
+      state.noFoodContinuityDiagnostic = {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed:
+          healthConfirmed &&
+          foodConfirmed &&
+          bodyInventoryEmpty &&
+          rconInventoryEmpty,
+        bodyHealth,
+        rconHealth,
+        bodyFood,
+        rconFood,
+        bodyInventoryEmpty,
+        rconInventoryEmpty,
+      };
+    }
+    return observation;
+  };
+  prototype.observe = instrumentedObserve;
+  return () => {
+    if (prototype.observe === instrumentedObserve)
+      prototype.observe = originalObserve;
+  };
+}
+
 function gameActionPlacementCandidateEvidence(state: RunState): SafeEvidence {
   const diagnostic = state.gameActionPlacementCandidateDiagnostic;
   if (
@@ -2587,6 +2706,99 @@ function readGameActionPlacementCandidateDiagnostic(
     : { freshBodyObservationMatched: true, ...summary };
 }
 
+async function runNoFoodContinuityProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const fixture = await runCase(
+    state,
+    "no_food_fixture_probe",
+    120_000,
+    0,
+    0,
+    () => prepareNoFoodFixtureProbe(state, rcon),
+  );
+  if (fixture.status !== "pass") {
+    state.status = fixture.status;
+    state.failureCode ??=
+      fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+    return;
+  }
+
+  const config = loadConfig({
+    ...process.env,
+    OPENAI_API_KEY: "no-provider-request-e2e-probe",
+    MINECRAFT_HOST: "127.0.0.1",
+    MINECRAFT_PORT: String(state.serverPort),
+    MINECRAFT_USERNAME: state.botName,
+    MINECRAFT_AUTH: "offline",
+    MINECRAFT_VERSION: SERVER_VERSION,
+    OWNER_USERNAME: state.ownerName,
+    OPENAI_MODEL: MODEL,
+    DATABASE_PATH: state.databasePath,
+    PERSONA_PATH: resolve(PROJECT_ROOT, "config/persona.example.json"),
+    LOG_LEVEL: "silent",
+    RECONNECT_ENABLED: "false",
+    DASHBOARD_ENABLED: "false",
+  });
+  const { createApplication } = await import("../../src/app/application.js");
+  const app = createApplication(config, state.llmAdmission?.beforeCall);
+  appForCleanup = app;
+  state.countersInitial = countersOf(await collect(app));
+  restoreNoFoodContinuityObservationProbe ??=
+    installNoFoodContinuityObservationProbe(state, rcon);
+  await connectApplication(app, state);
+
+  const continuity = await runCase(
+    state,
+    "no_food_continuity_probe",
+    15_000,
+    0,
+    0,
+    async () => {
+      const deadline = Date.now() + 10_000;
+      while (
+        state.noFoodContinuityProviderRequestBlocked !== true &&
+        Date.now() < deadline
+      ) {
+        await waitMs(50);
+      }
+      const diagnostic = state.noFoodContinuityDiagnostic;
+      if (diagnostic?.startupBodyObservationAvailable !== true)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_OBSERVATION_NOT_CONFIRMED");
+      if (!diagnostic.startupStateConfirmed)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_STATE_NOT_CONFIRMED");
+      if (state.noFoodContinuityProviderRequestBlocked !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_NOT_REACHED");
+      if (state.noFoodContinuityProviderRequestBlockedAfterReadback !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_BEFORE_READBACK");
+      return {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed: true,
+        bodyInventoryEmpty: true,
+        rconInventoryEmpty: true,
+        providerRequestBlocked: true,
+        providerRequestBlockedAfterReadback: true,
+      };
+    },
+  );
+  state.status = continuity.status;
+  if (continuity.status !== "pass")
+    state.failureCode ??=
+      continuity.reason ?? "NO_FOOD_CONTINUITY_NOT_CONFIRMED";
+  try {
+    state.countersFinal = countersOf(await collect(app));
+  } catch {
+    state.countersFinal = state.countersInitial;
+  }
+  try {
+    await boundedShutdown(app, "no_food_continuity_probe_complete");
+  } catch {
+    state.status = "incomplete";
+    state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+  }
+}
+
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
   loadEnvironmentFile({ path: resolve(repoRoot, ".env.local"), quiet: true });
@@ -2604,6 +2816,10 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (isNoFoodContinuityProbeOnly()) {
+      await runNoFoodContinuityProbe(state, rcon);
+      return;
+    }
     if (process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES") {
       const fixture = await runCase(
         state,
@@ -6073,7 +6289,7 @@ async function main(): Promise<void> {
     state.status = status;
     state.failureCode ??= code;
     if (state.countersInitial !== undefined && status === "incomplete") {
-      state.usageUncertain = true;
+      if (!isNoFoodContinuityProbeOnly()) state.usageUncertain = true;
     }
   } finally {
     if (liveContext !== undefined && shouldCollectAfterRun(state)) {
@@ -6087,6 +6303,8 @@ async function main(): Promise<void> {
     }
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
+    restoreNoFoodContinuityObservationProbe?.();
+    restoreNoFoodContinuityObservationProbe = undefined;
     activeGameActionPlacementObservationProbe = undefined;
     restoreGameActionPlacementObservationProbe?.();
     restoreGameActionPlacementObservationProbe = undefined;
@@ -6115,6 +6333,7 @@ async function prepareRun(): Promise<RunState> {
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY,
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY,
     process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY,
   ].filter((value) => value === "YES").length;
   if (selectedNoGptProbeCount > 1) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
@@ -6245,6 +6464,16 @@ async function prepareRun(): Promise<RunState> {
   state.llmAdmission = {
     ...admission,
     beforeCall: () => {
+      if (isNoFoodContinuityProbeOnly()) {
+        state.noFoodContinuityProviderRequestBlocked = true;
+        state.noFoodContinuityProviderRequestBlockedAfterReadback =
+          state.noFoodContinuityDiagnostic?.startupBodyObservationAvailable ===
+          true;
+        throw new HarnessError(
+          "incomplete",
+          "NO_FOOD_CONTINUITY_PROVIDER_REQUEST_BLOCKED",
+        );
+      }
       try {
         admission.beforeCall();
       } catch (error) {
@@ -8981,6 +9210,7 @@ async function runCase(
     const usageUncertain =
       id !== "body_operation_smoke" &&
       id !== "no_food_fixture_probe" &&
+      id !== "no_food_continuity_probe" &&
       (/BUDGET|DEADLINE/u.test(reason) ||
         delta.usageUnknownCalls > 0 ||
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
@@ -10441,7 +10671,10 @@ async function writeArtifact(state: RunState): Promise<void> {
       seedIsSynthetic: true,
       fixture: state.worldFixture,
       nonOperatorClients:
-        process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ? 1 : 3,
+        process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+        isNoFoodContinuityProbeOnly()
+          ? 1
+          : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
@@ -10467,6 +10700,9 @@ async function writeArtifact(state: RunState): Promise<void> {
         retained: state.playerSnapshotSidecarRetained === true,
         failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
+      noFoodContinuity: isNoFoodContinuityProbeOnly()
+        ? noFoodContinuitySafeEvidence(state)
+        : null,
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
     },
     budgets: {
