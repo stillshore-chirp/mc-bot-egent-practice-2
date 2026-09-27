@@ -4356,11 +4356,20 @@ async function main(): Promise<void> {
         let naturalRegenerationMayNeedRestore = false;
         let effectsMayNeedCleanup = false;
         let damageMayNeedCleanup = false;
-        let foodMayNeedCleanup = false;
         let positionMayNeedRestore = false;
         let primaryFailureCode: string | undefined;
         let fixturePosition: Position | undefined;
         try {
+          if (
+            !damageResponseFoodBaselineConfirmed(
+              initialFood,
+              initialRconFood,
+              expectedFood,
+            )
+          )
+            incomplete(
+              "DAMAGE_RESPONSE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES",
+            );
           fixturePosition = parsePosition(
             await rcon.command(`data get entity ${context.botName} Pos`),
           );
@@ -4417,45 +4426,6 @@ async function main(): Promise<void> {
             )
               incomplete("DAMAGE_RESPONSE_HEALTH_EFFECT_CLEANUP_NOT_CONFIRMED");
           }
-          if (
-            initialFood !== expectedFood ||
-            initialRconFood !== expectedFood
-          ) {
-            foodMayNeedCleanup = true;
-            effectsMayNeedCleanup = true;
-            await rcon.command(
-              `effect give ${context.botName} minecraft:saturation 1 20 true`,
-            );
-            const foodDeadline = Date.now() + 5_000;
-            let foodReady = false;
-            while (Date.now() < foodDeadline) {
-              const bodyFood = (await collect(context.runtime.app)).game?.food;
-              const rconFood = await rconFoodLevel(rcon, context.botName);
-              if (bodyFood === expectedFood && rconFood === expectedFood) {
-                foodReady = true;
-                break;
-              }
-              await waitMs(100);
-            }
-            if (!foodReady) {
-              const bodyFood = (await collect(context.runtime.app)).game?.food;
-              const rconFood = await rconFoodLevel(rcon, context.botName);
-              incomplete(
-                rconFood !== expectedFood
-                  ? "DAMAGE_RESPONSE_RCON_FOOD_BASELINE_NOT_RESTORED"
-                  : bodyFood !== expectedFood
-                    ? "DAMAGE_RESPONSE_BODY_FOOD_BASELINE_NOT_CONFIRMED"
-                    : "DAMAGE_RESPONSE_FOOD_BASELINE_NOT_CONFIRMED",
-              );
-            }
-            await rcon.command(`effect clear ${context.botName}`);
-            if (
-              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
-            )
-              incomplete("DAMAGE_RESPONSE_FOOD_EFFECT_CLEANUP_NOT_CONFIRMED");
-          }
-
-          foodMayNeedCleanup = true;
           const preparedEvidence = await collect(context.runtime.app);
           const preparedFood = await rconFoodLevel(rcon, context.botName);
           const preparedRconHealth = await rconEntityHealth(
@@ -4546,7 +4516,6 @@ async function main(): Promise<void> {
             };
             incomplete("DAMAGE_RESPONSE_DAMAGE_NOT_CONFIRMED_BY_BOTH_ORACLES");
           }
-          const afterDamage = playerOf(damagedEvidence);
           const priorJudgments = new Set(
             before.recentJudgments.map(
               (judgment) =>
@@ -4554,39 +4523,14 @@ async function main(): Promise<void> {
             ),
           );
 
-          const hasJudgmentLinkedOutcome = (
-            player: PlayerEvidence,
-          ): boolean => {
-            const outcomes = newOutcomes(afterDamage, player).filter(
-              (outcome) => outcome.status === "successful",
+          const hasJudgmentLinkedOutcome = (player: PlayerEvidence): boolean =>
+            damageResponseHasJudgmentLinkedOutcome(
+              before.recentOutcomes,
+              player.recentJudgments,
+              player.recentOutcomes,
+              priorJudgments,
+              damageAppliedAt,
             );
-            return player.recentJudgments.some((judgment) => {
-              const judgmentKey = `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
-              const judgmentAt = Date.parse(judgment.decidedAt ?? "");
-              const operationKind = judgment.operationKind;
-              if (
-                priorJudgments.has(judgmentKey) ||
-                !Number.isFinite(judgmentAt) ||
-                judgmentAt < damageAppliedAt ||
-                operationKind === undefined ||
-                ![
-                  "look_sweep",
-                  "consume",
-                  "equip",
-                  "move_to",
-                  "move_relative",
-                ].includes(operationKind)
-              )
-                return false;
-              return outcomes.some(
-                (outcome) =>
-                  outcome.kind === operationKind &&
-                  outcome.observedAt !== undefined &&
-                  Number.isFinite(Date.parse(outcome.observedAt)) &&
-                  Date.parse(outcome.observedAt) >= judgmentAt,
-              );
-            });
-          };
           const hasFreshPurposeCommit = (player: PlayerEvidence): boolean =>
             (player.recentAgentActivity ?? []).some(
               (activity) =>
@@ -4683,28 +4627,6 @@ async function main(): Promise<void> {
               cleanupConfirmed = false;
             }
           }
-          if (foodMayNeedCleanup) {
-            try {
-              effectsMayNeedCleanup = true;
-              await rcon.command(
-                `effect give ${context.botName} minecraft:saturation 1 20 true`,
-              );
-              const restoreDeadline = Date.now() + 5_000;
-              let foodRestored = false;
-              while (Date.now() < restoreDeadline) {
-                if (
-                  (await rconFoodLevel(rcon, context.botName)) === expectedFood
-                ) {
-                  foodRestored = true;
-                  break;
-                }
-                await waitMs(100);
-              }
-              if (!foodRestored) cleanupConfirmed = false;
-            } catch {
-              cleanupConfirmed = false;
-            }
-          }
           if (effectsMayNeedCleanup) {
             try {
               await rcon.command(`effect clear ${context.botName}`);
@@ -4749,20 +4671,12 @@ async function main(): Promise<void> {
             }
           }
           try {
-            if (damageMayNeedCleanup || foodMayNeedCleanup) {
+            if (damageMayNeedCleanup) {
               const restoredBody = (await collect(context.runtime.app)).game;
               if (
-                damageMayNeedCleanup &&
-                ((await rconEntityHealth(rcon, context.botName)) !==
+                (await rconEntityHealth(rcon, context.botName)) !==
                   expectedHealth ||
-                  restoredBody?.health !== expectedHealth)
-              )
-                cleanupConfirmed = false;
-              if (
-                foodMayNeedCleanup &&
-                ((await rconFoodLevel(rcon, context.botName)) !==
-                  expectedFood ||
-                  restoredBody?.food !== expectedFood)
+                restoredBody?.health !== expectedHealth
               )
                 cleanupConfirmed = false;
             }
@@ -8253,6 +8167,43 @@ export function classifyDamageResponsePostDamageJudgment(
   return postDamage.length > 0 ? "other" : "not_observed";
 }
 
+export function damageResponseHasJudgmentLinkedOutcome(
+  beforeOutcomes: PlayerEvidence["recentOutcomes"],
+  currentJudgments: PlayerEvidence["recentJudgments"],
+  currentOutcomes: PlayerEvidence["recentOutcomes"],
+  priorJudgments: ReadonlySet<string>,
+  damageAppliedAt: number,
+): boolean {
+  const priorOutcomeIds = new Set(
+    beforeOutcomes.map((outcome) => outcome.operationId),
+  );
+  const outcomes = currentOutcomes.filter(
+    (outcome) =>
+      !priorOutcomeIds.has(outcome.operationId) &&
+      outcome.status === "successful",
+  );
+  return currentJudgments.some((judgment) => {
+    const judgmentKey = `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+    const judgmentAt = Date.parse(judgment.decidedAt ?? "");
+    const operationKind = judgment.operationKind;
+    if (
+      priorJudgments.has(judgmentKey) ||
+      !Number.isFinite(judgmentAt) ||
+      judgmentAt < damageAppliedAt ||
+      operationKind === undefined ||
+      !DAMAGE_RESPONSE_CANDIDATE_OPERATIONS.has(operationKind)
+    )
+      return false;
+    return outcomes.some(
+      (outcome) =>
+        outcome.kind === operationKind &&
+        outcome.observedAt !== undefined &&
+        Number.isFinite(Date.parse(outcome.observedAt)) &&
+        Date.parse(outcome.observedAt) >= judgmentAt,
+    );
+  });
+}
+
 export function classifyRconActiveEffectsReply(
   reply: string,
 ): "empty" | "active" | "unknown" {
@@ -8280,6 +8231,14 @@ export function damageResponseCleanupDisposition(
     cleanupFailureCode: "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED",
     throwCleanupFailure: primaryFailureCode === undefined,
   };
+}
+
+export function damageResponseFoodBaselineConfirmed(
+  bodyFood: number | undefined,
+  rconFood: number | undefined,
+  expectedFood: number,
+): boolean {
+  return bodyFood === expectedFood && rconFood === expectedFood;
 }
 
 async function rconNaturalRegeneration(rcon: LocalRcon): Promise<boolean> {

@@ -5,6 +5,8 @@ import {
   classifyDamageResponsePostDamageJudgment,
   classifyRconActiveEffectsReply,
   damageResponseCleanupDisposition,
+  damageResponseFoodBaselineConfirmed,
+  damageResponseHasJudgmentLinkedOutcome,
   runBudgetCoversCase,
 } from "./ai-player-live.js";
 import {
@@ -50,6 +52,67 @@ describe("damage response targeted E2E case", () => {
 });
 
 describe("damage response fixture diagnostics", () => {
+  it("requires matching full-food oracles before changing the fixture", () => {
+    expect(damageResponseFoodBaselineConfirmed(20, 20, 20)).toBe(true);
+    expect(damageResponseFoodBaselineConfirmed(19, 20, 20)).toBe(false);
+    expect(damageResponseFoodBaselineConfirmed(20, undefined, 20)).toBe(false);
+  });
+
+  it("links outcomes recorded during damage readback to a later judgment", () => {
+    const damageAppliedAt = Date.parse("2026-09-28T12:00:00.000Z");
+    const beforeOutcomes = [
+      {
+        operationId: "prior",
+        kind: "look_sweep",
+        status: "successful",
+        observedAt: "2026-09-28T11:59:59.000Z",
+      },
+    ];
+    const currentJudgments = [
+      {
+        revision: 2,
+        decidedAt: "2026-09-28T12:00:01.000Z",
+        operationKind: "look_sweep",
+      },
+    ];
+    const currentOutcomes = [
+      ...beforeOutcomes,
+      {
+        operationId: "readback-window",
+        kind: "look_sweep",
+        status: "successful",
+        observedAt: "2026-09-28T12:00:02.000Z",
+      },
+    ];
+
+    expect(
+      damageResponseHasJudgmentLinkedOutcome(
+        beforeOutcomes,
+        currentJudgments,
+        currentOutcomes,
+        new Set(),
+        damageAppliedAt,
+      ),
+    ).toBe(true);
+    expect(
+      damageResponseHasJudgmentLinkedOutcome(
+        beforeOutcomes,
+        currentJudgments,
+        [
+          ...beforeOutcomes,
+          {
+            operationId: "too-early",
+            kind: "look_sweep",
+            status: "successful",
+            observedAt: "2026-09-28T12:00:00.500Z",
+          },
+        ],
+        new Set(),
+        damageAppliedAt,
+      ),
+    ).toBe(false);
+  });
+
   it("classifies only fresh post-damage judgments as candidate or other", () => {
     const damageAppliedAt = Date.parse("2026-09-28T12:00:00.000Z");
     const classify = (
