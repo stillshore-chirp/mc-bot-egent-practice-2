@@ -1618,6 +1618,10 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "parallel_dialogue_stop"
       ? (state.parallelDiagnostic ?? {})
       : {}),
+    ...(caseId === "damage_response" &&
+    state.damageResponseCleanupFailureCode !== undefined
+      ? { cleanupFailureCode: state.damageResponseCleanupFailureCode }
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2313,6 +2317,7 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
+  damageResponseCleanupFailureCode?: string;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -4273,19 +4278,22 @@ async function main(): Promise<void> {
           rcon,
           context.botName,
         );
+        if (effectsBaseline === "unknown") {
+          const code = "DAMAGE_RESPONSE_BASELINE_EFFECTS_STATE_UNAVAILABLE";
+          state.failureCode ??= code;
+          incomplete(code);
+        }
         const naturalRegeneration = await rconNaturalRegeneration(rcon);
 
         let naturalRegenerationMayNeedRestore = false;
         let hungerEffectMayBeActive = false;
-        let damageMayNeedCleanup =
-          initialHealth !== expectedHealth ||
-          initialRconHealth !== expectedHealth;
-        let foodMayNeedCleanup =
-          initialFood !== expectedFood || initialRconFood !== expectedFood;
+        let effectsMayNeedCleanup = false;
+        let damageMayNeedCleanup = false;
+        let foodMayNeedCleanup = false;
+        let positionMayNeedRestore = false;
+        let primaryFailureCode: string | undefined;
         let fixturePosition: Position | undefined;
         try {
-          if (effectsBaseline === "unknown")
-            incomplete("DAMAGE_RESPONSE_BASELINE_EFFECTS_STATE_UNAVAILABLE");
           fixturePosition = parsePosition(
             await rcon.command(`data get entity ${context.botName} Pos`),
           );
@@ -4293,6 +4301,7 @@ async function main(): Promise<void> {
           await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
 
           if (effectsBaseline === "active") {
+            effectsMayNeedCleanup = true;
             await rcon.command(`effect clear ${context.botName}`);
             if (
               (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
@@ -4304,6 +4313,7 @@ async function main(): Promise<void> {
             initialRconHealth !== expectedHealth
           ) {
             damageMayNeedCleanup = true;
+            effectsMayNeedCleanup = true;
             await rcon.command(
               `effect give ${context.botName} minecraft:instant_health 1 4 true`,
             );
@@ -4345,6 +4355,7 @@ async function main(): Promise<void> {
             initialRconFood !== expectedFood
           ) {
             foodMayNeedCleanup = true;
+            effectsMayNeedCleanup = true;
             await rcon.command(
               `effect give ${context.botName} minecraft:saturation 1 20 true`,
             );
@@ -4378,6 +4389,7 @@ async function main(): Promise<void> {
           }
 
           hungerEffectMayBeActive = true;
+          effectsMayNeedCleanup = true;
           foodMayNeedCleanup = true;
           await rcon.command(
             `effect give ${context.botName} minecraft:hunger 120 8 true`,
@@ -4423,6 +4435,7 @@ async function main(): Promise<void> {
             ),
           );
           damageMayNeedCleanup = true;
+          positionMayNeedRestore = true;
           await rcon.command(`damage ${context.botName} 14 minecraft:generic`);
           const damageAppliedAt = Date.now();
           const damagedRconHealth = await rconEntityHealth(
@@ -4518,6 +4531,11 @@ async function main(): Promise<void> {
             successfulBodyOutcomeObserved: true,
             healthRemainedNonlethal: true,
           };
+        } catch (error) {
+          primaryFailureCode =
+            error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
+          state.failureCode ??= primaryFailureCode;
+          throw error;
         } finally {
           let cleanupConfirmed = true;
           if (hungerEffectMayBeActive) {
@@ -4536,6 +4554,7 @@ async function main(): Promise<void> {
           }
           if (damageMayNeedCleanup) {
             try {
+              effectsMayNeedCleanup = true;
               await rcon.command(
                 `effect give ${context.botName} minecraft:instant_health 1 4 true`,
               );
@@ -4544,7 +4563,7 @@ async function main(): Promise<void> {
               while (Date.now() < restoreDeadline) {
                 if (
                   (await rconEntityHealth(rcon, context.botName)) ===
-                  initialRconHealth
+                  expectedHealth
                 ) {
                   healthRestored = true;
                   break;
@@ -4558,6 +4577,7 @@ async function main(): Promise<void> {
           }
           if (foodMayNeedCleanup) {
             try {
+              effectsMayNeedCleanup = true;
               await rcon.command(
                 `effect give ${context.botName} minecraft:saturation 1 20 true`,
               );
@@ -4565,8 +4585,7 @@ async function main(): Promise<void> {
               let foodRestored = false;
               while (Date.now() < restoreDeadline) {
                 if (
-                  (await rconFoodLevel(rcon, context.botName)) ===
-                  initialRconFood
+                  (await rconFoodLevel(rcon, context.botName)) === expectedFood
                 ) {
                   foodRestored = true;
                   break;
@@ -4578,14 +4597,17 @@ async function main(): Promise<void> {
               cleanupConfirmed = false;
             }
           }
-          try {
-            await rcon.command(`effect clear ${context.botName}`);
-            if (
-              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
-            )
+          if (effectsMayNeedCleanup) {
+            try {
+              await rcon.command(`effect clear ${context.botName}`);
+              if (
+                (await rconActiveEffectsState(rcon, context.botName)) !==
+                "empty"
+              )
+                cleanupConfirmed = false;
+            } catch {
               cleanupConfirmed = false;
-          } catch {
-            cleanupConfirmed = false;
+            }
           }
           if (naturalRegenerationMayNeedRestore) {
             try {
@@ -4598,7 +4620,7 @@ async function main(): Promise<void> {
               cleanupConfirmed = false;
             }
           }
-          if (fixturePosition !== undefined) {
+          if (positionMayNeedRestore && fixturePosition !== undefined) {
             try {
               await rcon.command(
                 `tp ${context.botName} ${fixturePosition.x} ${fixturePosition.y} ${fixturePosition.z}`,
@@ -4619,26 +4641,44 @@ async function main(): Promise<void> {
             }
           }
           try {
-            const restoredBody = (await collect(context.runtime.app)).game;
-            const restoredBodyHealth = restoredBody?.health;
-            const restoredBodyFood = restoredBody?.food;
+            if (damageMayNeedCleanup || foodMayNeedCleanup) {
+              const restoredBody = (await collect(context.runtime.app)).game;
+              if (
+                damageMayNeedCleanup &&
+                ((await rconEntityHealth(rcon, context.botName)) !==
+                  expectedHealth ||
+                  restoredBody?.health !== expectedHealth)
+              )
+                cleanupConfirmed = false;
+              if (
+                foodMayNeedCleanup &&
+                ((await rconFoodLevel(rcon, context.botName)) !==
+                  expectedFood ||
+                  restoredBody?.food !== expectedFood)
+              )
+                cleanupConfirmed = false;
+            }
             if (
-              (await rconEntityHealth(rcon, context.botName)) !==
-                expectedHealth ||
-              restoredBodyHealth !== expectedHealth ||
-              (await rconFoodLevel(rcon, context.botName)) !== expectedFood ||
-              restoredBodyFood !== expectedFood ||
+              effectsMayNeedCleanup &&
               (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
             )
               cleanupConfirmed = false;
           } catch {
             cleanupConfirmed = false;
           }
-          if (!cleanupConfirmed) {
+          const cleanupDisposition = damageResponseCleanupDisposition(
+            primaryFailureCode,
+            cleanupConfirmed,
+          );
+          if (cleanupDisposition !== undefined) {
             state.abortRequested = true;
+            state.damageResponseCleanupFailureCode ??=
+              cleanupDisposition.cleanupFailureCode;
             state.failureCode ??=
-              "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED";
-            incomplete("DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED");
+              cleanupDisposition.primaryFailureCode ??
+              cleanupDisposition.cleanupFailureCode;
+            if (cleanupDisposition.throwCleanupFailure)
+              incomplete(cleanupDisposition.cleanupFailureCode);
           }
         }
       },
@@ -8045,10 +8085,36 @@ async function rconActiveEffectsState(
   const reply = await rcon
     .command(`data get entity ${botName} active_effects`)
     .catch(() => "");
+  return classifyRconActiveEffectsReply(reply);
+}
+
+export function classifyRconActiveEffectsReply(
+  reply: string,
+): "empty" | "active" | "unknown" {
   const value = reply.trim();
+  if (/^Found no elements matching active_effects$/iu.test(value))
+    return "empty";
   if (/\[\s*\]\s*$/u.test(value)) return "empty";
   if (/\[\s*\{[\s\S]*\}\s*\]\s*$/u.test(value)) return "active";
   return "unknown";
+}
+
+export function damageResponseCleanupDisposition(
+  primaryFailureCode: string | undefined,
+  cleanupConfirmed: boolean,
+):
+  | {
+      readonly primaryFailureCode?: string;
+      readonly cleanupFailureCode: "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED";
+      readonly throwCleanupFailure: boolean;
+    }
+  | undefined {
+  if (cleanupConfirmed) return undefined;
+  return {
+    ...(primaryFailureCode === undefined ? {} : { primaryFailureCode }),
+    cleanupFailureCode: "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED",
+    throwCleanupFailure: primaryFailureCode === undefined,
+  };
 }
 
 async function rconNaturalRegeneration(rcon: LocalRcon): Promise<boolean> {
@@ -10117,11 +10183,16 @@ async function writeArtifact(state: RunState): Promise<void> {
   );
 }
 
-void main().catch((error: unknown) => {
-  const code =
-    error instanceof HarnessError && /^[A-Z0-9_]+$/u.test(error.code)
-      ? error.code
-      : "UNEXPECTED_FAILURE";
-  process.stderr.write(`INCOMPLETE AI_PLAYER_E2E_${code}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] !== undefined &&
+  fileURLToPath(import.meta.url) === resolve(process.argv[1])
+) {
+  void main().catch((error: unknown) => {
+    const code =
+      error instanceof HarnessError && /^[A-Z0-9_]+$/u.test(error.code)
+        ? error.code
+        : "UNEXPECTED_FAILURE";
+    process.stderr.write(`INCOMPLETE AI_PLAYER_E2E_${code}\n`);
+    process.exitCode = 1;
+  });
+}
