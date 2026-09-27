@@ -79,6 +79,12 @@ import {
   withRestorableObstacle,
 } from "./unknown-recovery-obstacle.js";
 import {
+  isInsidePartialPathCorridor,
+  partialPathPlans,
+  partialPathProbeComplete,
+  type PartialPathProbeEvidence,
+} from "./partial-path-probe.js";
+import {
   hasJudgmentAfterSuccessfulOutcome,
   hasTerminalOutcomeForOperation,
   isStoppedHandoffBoundaryConfirmed,
@@ -540,7 +546,8 @@ interface ReturnPathProbeDiagnostic {
 function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_PARTIAL_PATH_PROBE_ONLY === "YES"
   );
 }
 
@@ -712,6 +719,18 @@ interface BodySmokeDiagnostic {
   readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
   readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
+  readonly partialPathOperationStatus?: BodyOperationStatus;
+  readonly partialPathFailureClass?: BodyMoveErrorClass;
+  readonly partialPathProgressedBeforeBarrier?: boolean;
+  readonly partialPathBarrierInstalledWhileMoveActive?: boolean;
+  readonly partialPathBarrierAheadBeforeUnfreeze?: boolean;
+  readonly partialPathBarrierVisibleBeforeUnfreeze?: boolean;
+  readonly partialPathStoppedBeforeTarget?: boolean;
+  readonly partialPathFreshBodyObservation?: boolean;
+  readonly partialPathBodyObservedBarrier?: boolean;
+  readonly partialPathRconConfirmedBarrier?: boolean;
+  readonly partialPathRestorationVerified?: boolean;
+  readonly partialPathProbeVerified?: boolean;
   readonly returnPathProbe?: ReturnPathProbeDiagnostic;
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
@@ -1344,6 +1363,69 @@ function bodySmokeEvidence(
           obstacleRouteTargetVisibleAfterLook:
             diagnostic.obstacleRouteTargetVisibleAfterLook,
         }),
+    ...(diagnostic.partialPathOperationStatus === undefined
+      ? {}
+      : { partialPathOperationStatus: diagnostic.partialPathOperationStatus }),
+    ...(diagnostic.partialPathFailureClass === undefined
+      ? {}
+      : { partialPathFailureClass: diagnostic.partialPathFailureClass }),
+    ...(diagnostic.partialPathProgressedBeforeBarrier === undefined
+      ? {}
+      : {
+          partialPathProgressedBeforeBarrier:
+            diagnostic.partialPathProgressedBeforeBarrier,
+        }),
+    ...(diagnostic.partialPathBarrierInstalledWhileMoveActive === undefined
+      ? {}
+      : {
+          partialPathBarrierInstalledWhileMoveActive:
+            diagnostic.partialPathBarrierInstalledWhileMoveActive,
+        }),
+    ...(diagnostic.partialPathBarrierAheadBeforeUnfreeze === undefined
+      ? {}
+      : {
+          partialPathBarrierAheadBeforeUnfreeze:
+            diagnostic.partialPathBarrierAheadBeforeUnfreeze,
+        }),
+    ...(diagnostic.partialPathBarrierVisibleBeforeUnfreeze === undefined
+      ? {}
+      : {
+          partialPathBarrierVisibleBeforeUnfreeze:
+            diagnostic.partialPathBarrierVisibleBeforeUnfreeze,
+        }),
+    ...(diagnostic.partialPathStoppedBeforeTarget === undefined
+      ? {}
+      : {
+          partialPathStoppedBeforeTarget:
+            diagnostic.partialPathStoppedBeforeTarget,
+        }),
+    ...(diagnostic.partialPathFreshBodyObservation === undefined
+      ? {}
+      : {
+          partialPathFreshBodyObservation:
+            diagnostic.partialPathFreshBodyObservation,
+        }),
+    ...(diagnostic.partialPathBodyObservedBarrier === undefined
+      ? {}
+      : {
+          partialPathBodyObservedBarrier:
+            diagnostic.partialPathBodyObservedBarrier,
+        }),
+    ...(diagnostic.partialPathRconConfirmedBarrier === undefined
+      ? {}
+      : {
+          partialPathRconConfirmedBarrier:
+            diagnostic.partialPathRconConfirmedBarrier,
+        }),
+    ...(diagnostic.partialPathRestorationVerified === undefined
+      ? {}
+      : {
+          partialPathRestorationVerified:
+            diagnostic.partialPathRestorationVerified,
+        }),
+    ...(diagnostic.partialPathProbeVerified === undefined
+      ? {}
+      : { partialPathProbeVerified: diagnostic.partialPathProbeVerified }),
     ...(diagnostic.resourceTargetRconConfirmed === undefined
       ? {}
       : {
@@ -6095,10 +6177,12 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  if (
-    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
-  ) {
+  const selectedDiagnosticProbes = [
+    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_PARTIAL_PATH_PROBE_ONLY,
+  ].filter((value) => value === "YES").length;
+  if (selectedDiagnosticProbes > 1) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
@@ -7184,6 +7268,15 @@ async function runOperationSmoke(
         );
         if (!positionMatchesSmokeSpawn(smokeEndPosition))
           incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
+        if (process.env.AI_PLAYER_E2E_PARTIAL_PATH_PROBE_ONLY === "YES") {
+          await runPartialPathFailureProbe(
+            state,
+            rcon,
+            body,
+            smokeSpawn,
+            abort.signal,
+          );
+        }
         let obstacleRouteVerifiedByServer = false;
         if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
           await removeHiddenContainerFixture(rcon, smokeSpawn, {
@@ -7442,6 +7535,9 @@ async function runOperationSmoke(
           ...(state.bodySmokeDiagnostic.obstacleRestoreProbeVerified === true
             ? { obstacleRestoreProbeVerified: true }
             : {}),
+          ...(state.bodySmokeDiagnostic.partialPathProbeVerified === true
+            ? { partialPathProbeVerified: true }
+            : {}),
           gptCalls: 0,
           ...(returnPathProbeOnly ? { diagnosticOnly: true } : {}),
           apiOperationsReportedSuccess,
@@ -7462,6 +7558,347 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runPartialPathFailureProbe(
+  state: RunState,
+  rcon: LocalRcon,
+  body: PlayerBody,
+  spawn: Position,
+  parentSignal: AbortSignal,
+): Promise<void> {
+  const oracle = boundedOracleRcon(rcon);
+  const plans = partialPathPlans(spawn);
+  const startPosition = parsePosition(
+    await oracle.command(`data get entity ${state.botName} Pos`),
+  );
+  if (
+    Math.hypot(
+      startPosition.x - spawn.x,
+      startPosition.y - spawn.y,
+      startPosition.z - spawn.z,
+    ) > 0.5
+  )
+    incomplete("PARTIAL_PATH_START_POSITION_NOT_CONFIRMED");
+
+  await oracle.command(
+    `tp ${state.ownerName} ${spawn.x - 8} ${spawn.y} ${spawn.z + 8}`,
+  );
+  await oracle.command(
+    `tp ${state.guestName} ${spawn.x - 8} ${spawn.y} ${spawn.z - 8}`,
+  );
+  if (!(await nearbyEntitiesClear(oracle, startPosition, state.botName)))
+    incomplete("PARTIAL_PATH_FIXTURE_OCCUPIED");
+
+  const noEvidence: PartialPathProbeEvidence = {
+    gptCalls: 0,
+    operationStatus: "unverified",
+    failureClass: "other",
+    progressedBeforeBarrier: false,
+    barrierInstalledWhileMoveActive: false,
+    barrierAheadBeforeUnfreeze: false,
+    barrierVisibleBeforeUnfreeze: false,
+    stoppedBeforeTarget: false,
+    freshBodyObservation: false,
+    bodyObservedBarrier: false,
+    rconConfirmedBarrier: false,
+    restorationVerified: false,
+  };
+  const sidewallResult = await withRestorableObstacle(
+    oracle,
+    plans.sidewalls,
+    {
+      eligible: async () =>
+        nearbyEntitiesClear(oracle, startPosition, state.botName),
+      restoreInStableWorld: (restore) =>
+        withFrozenTicks(oracle, restore, incomplete),
+      observeWhileApplied: async () => {
+        const operationAbort = new AbortController();
+        let operationDeadlineReached = false;
+        const operationState = { settled: false };
+        const operationTimer = setTimeout(() => {
+          operationDeadlineReached = true;
+          operationAbort.abort(new Error("partial path probe deadline"));
+        }, 15_000);
+        const operationSignal = AbortSignal.any([
+          parentSignal,
+          operationAbort.signal,
+        ]);
+        const operationPromise = body
+          .execute(
+            {
+              kind: "move_to",
+              position: plans.target,
+              range: 1,
+            },
+            operationSignal,
+          )
+          .then(
+            (result) => {
+              operationState.settled = true;
+              return { status: result.status, detail: result.detail };
+            },
+            () => {
+              operationState.settled = true;
+              return {
+                status: parentSignal.aborted ? "interrupted" : "failed",
+                detail: undefined,
+              } as const;
+            },
+          );
+        const stopProbeOperation = async (reason: string): Promise<void> => {
+          if (operationState.settled) return;
+          operationAbort.abort(new Error(reason));
+          await body.stop();
+          await operationPromise;
+        };
+        try {
+          const progressDeadline = Date.now() + 5_000;
+          let progressPosition: Position | undefined;
+          while (
+            !parentSignal.aborted &&
+            !operationState.settled &&
+            Date.now() < progressDeadline
+          ) {
+            progressPosition = parsePosition(
+              await oracle.command(
+                `data get entity ${state.botName} Pos`,
+                UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+              ),
+            );
+            if (
+              isInsidePartialPathCorridor(progressPosition, plans) &&
+              progressPosition.x >= startPosition.x + 1.25 &&
+              progressPosition.x < plans.barrierPosition.x - 0.5
+            )
+              break;
+            await waitMs(100);
+          }
+          const progressedBeforeBarrier =
+            progressPosition !== undefined &&
+            isInsidePartialPathCorridor(progressPosition, plans) &&
+            progressPosition.x >= startPosition.x + 1.25 &&
+            progressPosition.x < plans.barrierPosition.x - 0.5;
+          if (!progressedBeforeBarrier) {
+            await stopProbeOperation("partial path progress unavailable");
+            const result = await operationPromise;
+            return {
+              evidence: {
+                ...noEvidence,
+                operationStatus: result.status,
+                failureClass: classifyBodyMoveError(
+                  result.status,
+                  result.detail,
+                  operationDeadlineReached,
+                ),
+              },
+              barrierRestorationVerified: false,
+            };
+          }
+
+          const tickState = { frozen: true };
+          try {
+            await oracle.command("tick freeze");
+            if (
+              classifyTickStatus(await oracle.command("tick query")) !==
+              "frozen"
+            )
+              incomplete("PARTIAL_PATH_TICK_FREEZE_NOT_CONFIRMED");
+            let barrierAppliedAt = 0;
+            let barrierInstalledWhileMoveActive = false;
+            const barrierResult = await withRestorableObstacle(
+              oracle,
+              plans.barrier,
+              {
+                eligible: async () => {
+                  if (operationState.settled) return false;
+                  const currentPosition = parsePosition(
+                    await oracle.command(
+                      `data get entity ${state.botName} Pos`,
+                      UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS,
+                    ),
+                  );
+                  return (
+                    isInsidePartialPathCorridor(currentPosition, plans) &&
+                    currentPosition.x < plans.barrierPosition.x - 0.5 &&
+                    (await nearbyEntitiesClear(
+                      oracle,
+                      currentPosition,
+                      state.botName,
+                    ))
+                  );
+                },
+                onProgress: (progress) => {
+                  if (progress.phase === "mutation_verified") {
+                    barrierAppliedAt = Date.now();
+                    barrierInstalledWhileMoveActive = !operationState.settled;
+                  }
+                },
+                restoreInStableWorld: async (restore) => {
+                  await stopProbeOperation("partial path fixture cleanup");
+                  await withFrozenTicks(oracle, restore, incomplete);
+                },
+                observeWhileApplied: async () => {
+                  const preUnfreezePosition = parsePosition(
+                    await oracle.command(
+                      `data get entity ${state.botName} Pos`,
+                    ),
+                  );
+                  const preUnfreezeObservation = await body.observe();
+                  const barrierAheadBeforeUnfreeze =
+                    !operationState.settled &&
+                    isInsidePartialPathCorridor(preUnfreezePosition, plans) &&
+                    preUnfreezePosition.x < plans.barrierPosition.x - 0.5;
+                  const barrierVisibleBeforeUnfreeze =
+                    observedBlockName(
+                      preUnfreezeObservation,
+                      plans.barrierPosition,
+                    ) === "bedrock";
+                  if (!barrierAheadBeforeUnfreeze) {
+                    await stopProbeOperation(
+                      "partial path barrier was not ahead before unfreeze",
+                    );
+                    const result = await operationPromise;
+                    return {
+                      ...noEvidence,
+                      operationStatus: result.status,
+                      failureClass: classifyBodyMoveError(
+                        result.status,
+                        result.detail,
+                        operationDeadlineReached,
+                      ),
+                      progressedBeforeBarrier: true,
+                      barrierInstalledWhileMoveActive,
+                      barrierAheadBeforeUnfreeze,
+                      barrierVisibleBeforeUnfreeze,
+                      rconConfirmedBarrier: await blockIs(
+                        oracle,
+                        plans.barrierPosition,
+                        "bedrock",
+                        incomplete,
+                      ),
+                    };
+                  }
+                  try {
+                    await oracle.command("tick unfreeze");
+                  } catch {
+                    // Confirm the tick state below if the command reply is lost.
+                  }
+                  tickState.frozen = false;
+                  if (
+                    classifyTickStatus(await oracle.command("tick query")) !==
+                    "running"
+                  )
+                    incomplete("PARTIAL_PATH_TICK_UNFREEZE_NOT_CONFIRMED");
+
+                  const result = await operationPromise;
+                  const observation = await body.observe();
+                  const finalPosition = parsePosition(
+                    await oracle.command(
+                      `data get entity ${state.botName} Pos`,
+                    ),
+                  );
+                  const rconConfirmedBarrier = await blockIs(
+                    oracle,
+                    plans.barrierPosition,
+                    "bedrock",
+                    incomplete,
+                  );
+                  const freshBodyObservation =
+                    barrierAppliedAt > 0 &&
+                    Number.isFinite(Date.parse(observation.observedAt)) &&
+                    Date.parse(observation.observedAt) > barrierAppliedAt;
+                  return {
+                    ...noEvidence,
+                    operationStatus: result.status,
+                    failureClass: classifyBodyMoveError(
+                      result.status,
+                      result.detail,
+                      operationDeadlineReached,
+                    ),
+                    progressedBeforeBarrier: true,
+                    barrierInstalledWhileMoveActive,
+                    barrierAheadBeforeUnfreeze,
+                    barrierVisibleBeforeUnfreeze,
+                    stoppedBeforeTarget:
+                      finalPosition.x > startPosition.x + 1 &&
+                      finalPosition.x < plans.target.x - 1,
+                    freshBodyObservation,
+                    bodyObservedBarrier:
+                      observedBlockName(observation, plans.barrierPosition) ===
+                      "bedrock",
+                    rconConfirmedBarrier,
+                  };
+                },
+              },
+              incomplete,
+            );
+            const evidence =
+              barrierResult.status === "applied"
+                ? {
+                    ...barrierResult.observation,
+                    restorationVerified: barrierResult.restorationVerified,
+                  }
+                : noEvidence;
+            return {
+              evidence,
+              barrierRestorationVerified:
+                barrierResult.status === "applied" &&
+                barrierResult.restorationVerified,
+            };
+          } finally {
+            if (tickState.frozen) {
+              try {
+                await oracle.command("tick unfreeze");
+              } catch {
+                // Read the state below even if the command reply is lost.
+              }
+              if (
+                classifyTickStatus(await oracle.command("tick query")) !==
+                "running"
+              )
+                incomplete("PARTIAL_PATH_TICK_UNFREEZE_NOT_CONFIRMED");
+            }
+          }
+        } finally {
+          await stopProbeOperation("partial path probe cleanup");
+          clearTimeout(operationTimer);
+        }
+      },
+    },
+    incomplete,
+  );
+  const evidence: PartialPathProbeEvidence =
+    sidewallResult.status === "applied"
+      ? {
+          ...sidewallResult.observation.evidence,
+          restorationVerified:
+            sidewallResult.observation.barrierRestorationVerified &&
+            sidewallResult.restorationVerified,
+        }
+      : noEvidence;
+  const verified = partialPathProbeComplete(evidence);
+  const priorDiagnostic = state.bodySmokeDiagnostic;
+  if (priorDiagnostic === undefined)
+    incomplete("PARTIAL_PATH_DIAGNOSTIC_BASELINE_MISSING");
+  state.bodySmokeDiagnostic = {
+    ...priorDiagnostic,
+    partialPathOperationStatus: evidence.operationStatus,
+    partialPathFailureClass: evidence.failureClass,
+    partialPathProgressedBeforeBarrier: evidence.progressedBeforeBarrier,
+    partialPathBarrierInstalledWhileMoveActive:
+      evidence.barrierInstalledWhileMoveActive,
+    partialPathBarrierAheadBeforeUnfreeze: evidence.barrierAheadBeforeUnfreeze,
+    partialPathBarrierVisibleBeforeUnfreeze:
+      evidence.barrierVisibleBeforeUnfreeze,
+    partialPathStoppedBeforeTarget: evidence.stoppedBeforeTarget,
+    partialPathFreshBodyObservation: evidence.freshBodyObservation,
+    partialPathBodyObservedBarrier: evidence.bodyObservedBarrier,
+    partialPathRconConfirmedBarrier: evidence.rconConfirmedBarrier,
+    partialPathRestorationVerified: evidence.restorationVerified,
+    partialPathProbeVerified: verified,
+  };
+  if (!verified) incomplete("PARTIAL_PATH_FAILURE_PROBE_NOT_CONFIRMED");
 }
 
 async function runUnknownReturnPathProbe(
