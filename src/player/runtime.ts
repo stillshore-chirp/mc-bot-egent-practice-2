@@ -18,6 +18,7 @@ import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
 import type { TraceService, TraceSession } from "../trace/service.js";
 import type {
   PlayerMemoryPort,
+  PlayerObservationEvidence,
   PlayerObservedDisplacement,
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
@@ -269,7 +270,38 @@ export class PlayerRuntime {
   }
 
   public evidence(): PlayerRuntimeSnapshot {
-    return this.options.mind.snapshot();
+    const snapshot = this.options.mind.snapshot();
+    return {
+      ...snapshot,
+      ...(snapshot.lastObservation === undefined
+        ? {}
+        : {
+            lastObservation: withoutPrivateObservationDetails(
+              snapshot.lastObservation,
+            ),
+          }),
+      ...(snapshot.latestDeath === undefined
+        ? {}
+        : {
+            latestDeath: {
+              observedAt: snapshot.latestDeath.observedAt,
+              ...(snapshot.latestDeath.beforeObservation === undefined
+                ? {}
+                : {
+                    beforeObservation: withoutPrivateObservationDetails(
+                      snapshot.latestDeath.beforeObservation,
+                    ),
+                  }),
+              ...(snapshot.latestDeath.firstPostDeathObservation === undefined
+                ? {}
+                : {
+                    firstPostDeathObservation: withoutPrivateObservationDetails(
+                      snapshot.latestDeath.firstPostDeathObservation,
+                    ),
+                  }),
+            },
+          }),
+    };
   }
 
   public handleCommittedDecision(
@@ -487,11 +519,14 @@ export class PlayerRuntime {
       kind === "state_changed" &&
       !summary.includes("vitals") &&
       this.#activeThought !== undefined;
-    const event = this.options.mind.enqueueEvent(
-      kind,
-      summary,
-      deferObservation ? { invalidateDecision: false } : undefined,
-    );
+    const event =
+      kind === "bot_death"
+        ? this.options.mind.recordDeathEvent(at, summary)
+        : this.options.mind.enqueueEvent(
+            kind,
+            summary,
+            deferObservation ? { invalidateDecision: false } : undefined,
+          );
     this.#requestThought(kind, event.summary);
   }
 
@@ -1056,6 +1091,17 @@ export class PlayerRuntime {
       "player runtime operation failed",
     );
   }
+}
+
+function withoutPrivateObservationDetails(
+  observation: PlayerObservationEvidence,
+): PlayerObservationEvidence {
+  const {
+    position: _position,
+    inventoryItems: _inventoryItems,
+    ...visibleEvidence
+  } = observation;
+  return visibleEvidence;
 }
 
 function groundedOperationSummary(result: PlayerOperationResult): string {

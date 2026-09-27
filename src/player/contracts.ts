@@ -171,6 +171,20 @@ export interface PlayerStateNote {
 export interface PlayerObservationEvidence {
   readonly observedAt: string;
   readonly dimension: string;
+  readonly position?:
+    | {
+        readonly x: number;
+        readonly y: number;
+        readonly z: number;
+        readonly dimension: string;
+      }
+    | undefined;
+  readonly inventoryItems?:
+    | readonly {
+        readonly name: string;
+        readonly count: number;
+      }[]
+    | undefined;
   readonly day: number | null;
   readonly timeOfDay: number | null;
   readonly isDay: boolean | null;
@@ -196,6 +210,12 @@ export interface PlayerObservationEvidence {
   readonly visibleEntityKinds: readonly string[];
   readonly candidateSearchMayBeTruncated: boolean;
   readonly ownerPositionExceptionUsed: boolean;
+}
+
+export interface PlayerDeathMemory {
+  readonly observedAt: string;
+  readonly beforeObservation?: PlayerObservationEvidence | undefined;
+  readonly firstPostDeathObservation?: PlayerObservationEvidence | undefined;
 }
 
 export interface PlayerGoalChange {
@@ -265,6 +285,7 @@ export interface PlayerRuntimeSnapshot {
   readonly learningReferences: readonly PlayerLearningEvidence[];
   readonly skillActivity: readonly PlayerSkillActivityEvidence[];
   readonly lastObservation?: PlayerObservationEvidence | undefined;
+  readonly latestDeath?: PlayerDeathMemory | undefined;
   readonly recentAgentActivity: readonly PlayerAgentRoundActivity[];
   readonly counters: {
     readonly llmCalls: number;
