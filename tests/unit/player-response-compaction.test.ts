@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 import type { Logger } from "pino";
@@ -13,6 +13,128 @@ import {
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 
 describe("Responses server-side compaction", () => {
+  it("rejects a call before creating a provider request when admission is exhausted", async () => {
+    const exhausted = new Error("TEST_BUDGET_EXHAUSTED");
+    const create = vi.fn(async () => terminalResponse("unused"));
+    const client = {
+      responses: { create },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        beforeCall: () => {
+          throw exhausted;
+        },
+      }),
+    ).rejects.toBe(exhausted);
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("uses one synchronous admission hook to cap concurrent agent calls", async () => {
+    const limit = 2;
+    let admitted = 0;
+    const exhausted = new Error("TEST_BUDGET_EXHAUSTED");
+    const beforeCall = (): void => {
+      if (admitted >= limit) throw exhausted;
+      admitted += 1;
+    };
+    let release!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const create = vi.fn(() => pending);
+    const client = {
+      responses: { create },
+    } as unknown as PlayerResponsesClient;
+    const invoke = () =>
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        beforeCall,
+      });
+
+    const first = invoke();
+    const second = invoke();
+    const rejected = invoke();
+    await expect(rejected).rejects.toBe(exhausted);
+    expect(create).toHaveBeenCalledTimes(limit);
+
+    release(terminalResponse("Done."));
+    await expect(Promise.all([first, second])).resolves.toHaveLength(limit);
+  });
+
+  it("keeps the existing request path when admission hook is omitted", async () => {
+    const create = vi.fn(async () => terminalResponse("Done."));
+    const client = {
+      responses: { create },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+      }),
+    ).resolves.toMatchObject({ text: "Done.", calls: 1 });
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables SDK retries only for admission-budgeted requests", async () => {
+    const budgetedOptions: unknown[] = [];
+    const budgetedClient = {
+      responses: {
+        create: async (...args: unknown[]) => {
+          budgetedOptions.push(args[1]);
+          return terminalResponse("Done.");
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+    await runPlayerAgent({
+      client: budgetedClient,
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Input.",
+      tools: [],
+      logger: silentLogger(),
+      beforeCall: () => undefined,
+    });
+    expect(budgetedOptions[0]).toMatchObject({ maxRetries: 0 });
+
+    const ordinaryOptions: unknown[] = [];
+    const ordinaryClient = {
+      responses: {
+        create: async (...args: unknown[]) => {
+          ordinaryOptions.push(args[1]);
+          return terminalResponse("Done.");
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+    await runPlayerAgent({
+      client: ordinaryClient,
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Input.",
+      tools: [],
+      logger: silentLogger(),
+    });
+    expect(ordinaryOptions[0]).not.toHaveProperty("maxRetries");
+  });
+
   it("persists requests whose token usage was not returned", async () => {
     const mind = PlayerMindStore.open(":memory:");
     const requestError = new Error("TEST_REQUEST_INTERRUPTED");
@@ -35,6 +157,9 @@ describe("Responses server-side compaction", () => {
             outputTokens: metrics.outputTokens,
             latencyMs: metrics.latencyMs,
             ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+            ...(metrics.usageUnknownReason === undefined
+              ? {}
+              : { usageUnknownReason: metrics.usageUnknownReason }),
           }),
       }),
     ).rejects.toBe(requestError);
@@ -42,12 +167,56 @@ describe("Responses server-side compaction", () => {
     expect(mind.snapshot().counters).toMatchObject({
       llmCalls: 1,
       usageUnknownCalls: 1,
+      usageUnknownRequestErrorCalls: 1,
+      usageUnknownResponseUsageMissingCalls: 0,
       inputTokens: 0,
       outputTokens: 0,
     });
     expect(mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
       responseStatus: "request_error",
       requestErrorCause: "request_failed",
+    });
+    mind.close();
+  });
+
+  it("counts responses that omit provider usage separately", async () => {
+    const mind = PlayerMindStore.open(":memory:");
+    const response = {
+      ...terminalResponse("Done."),
+      usage: undefined,
+    } as unknown as Response;
+    const client = {
+      responses: { create: async () => response },
+    } as unknown as PlayerResponsesClient;
+
+    await expect(
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: silentLogger(),
+        onCall: (metrics) =>
+          mind.recordCall({
+            inputTokens: metrics.inputTokens,
+            outputTokens: metrics.outputTokens,
+            latencyMs: metrics.latencyMs,
+            ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+            ...(metrics.usageUnknownReason === undefined
+              ? {}
+              : { usageUnknownReason: metrics.usageUnknownReason }),
+          }),
+      }),
+    ).resolves.toMatchObject({ text: "Done.", calls: 1 });
+
+    expect(mind.snapshot().counters).toMatchObject({
+      llmCalls: 1,
+      usageUnknownCalls: 1,
+      usageUnknownRequestErrorCalls: 0,
+      usageUnknownResponseUsageMissingCalls: 1,
+      inputTokens: 0,
+      outputTokens: 0,
     });
     mind.close();
   });

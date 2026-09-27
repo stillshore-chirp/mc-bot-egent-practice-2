@@ -15,6 +15,7 @@ import {
   playerAgentToolNames,
   playerSkillLearningRejectionCodes,
   type PlayerAgentRoundActivity,
+  type PlayerAgentUsageUnknownReason,
 } from "./responses.js";
 import type {
   OwnerProposal,
@@ -224,6 +225,18 @@ const observationSchema = z
   .object({
     observedAt: z.iso.datetime(),
     dimension: z.string().min(1).max(80),
+    position: positionSchema.optional(),
+    inventoryItems: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(80),
+            count: z.number().int().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(48)
+      .optional(),
     day: z.number().int().nonnegative().nullable(),
     timeOfDay: z.number().int().min(0).max(24_000).nullable(),
     isDay: z.boolean().nullable(),
@@ -253,6 +266,14 @@ const observationSchema = z
   })
   .strict();
 
+const deathMemorySchema = z
+  .object({
+    observedAt: z.iso.datetime(),
+    beforeObservation: observationSchema.optional(),
+    firstPostDeathObservation: observationSchema.optional(),
+  })
+  .strict();
+
 const stateSchema = z
   .object({
     revision: z.number().int().nonnegative(),
@@ -267,6 +288,7 @@ const stateSchema = z
     stateFacts: z.array(stateNoteSchema).max(40),
     uncertainties: z.array(stateNoteSchema).max(40),
     lastObservation: observationSchema.optional(),
+    latestDeath: deathMemorySchema.optional(),
     proposals: z.array(proposalSchema).max(60),
     recentJudgments: z.array(judgmentSchema).max(24),
     recentOutcomes: z.array(outcomeHistorySchema).max(24),
@@ -319,6 +341,16 @@ const stateSchema = z
       .object({
         llmCalls: z.number().int().nonnegative(),
         usageUnknownCalls: z.number().int().nonnegative().default(0),
+        usageUnknownRequestErrorCalls: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(0),
+        usageUnknownResponseUsageMissingCalls: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(0),
         inputTokens: z.number().int().nonnegative(),
         outputTokens: z.number().int().nonnegative(),
         latencyMs: z.number().int().nonnegative(),
@@ -399,6 +431,8 @@ const initialState: StoredState = {
   counters: {
     llmCalls: 0,
     usageUnknownCalls: 0,
+    usageUnknownRequestErrorCalls: 0,
+    usageUnknownResponseUsageMissingCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,
@@ -587,6 +621,49 @@ export class PlayerMindStore {
     });
     transaction.immediate();
     return { id, kind, summary: safeSummary, createdAt: now };
+  }
+
+  public recordDeathEvent(
+    observedAt: string,
+    summary: string,
+  ): PlayerRuntimeEvent {
+    const deathObservedAt = isoDate(observedAt);
+    const safeSummary = bounded(summary, 400, "event summary");
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const transaction = this.database.transaction(() => {
+      const current = this.readStored();
+      const beforeObservation =
+        current.lastObservation !== undefined &&
+        Date.parse(current.lastObservation.observedAt) <=
+          Date.parse(deathObservedAt)
+          ? current.lastObservation
+          : undefined;
+      const latestDeath = deathMemorySchema.parse({
+        observedAt: deathObservedAt,
+        ...(beforeObservation === undefined ? {} : { beforeObservation }),
+      });
+      this.writeStored(
+        {
+          ...current,
+          revision: current.revision + 1,
+          latestDeath,
+        },
+        now,
+      );
+      this.database
+        .prepare(
+          "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'bot_death', ?, ?, NULL)",
+        )
+        .run(id, safeSummary, now);
+      return {
+        id,
+        kind: "bot_death" as const,
+        summary: safeSummary,
+        createdAt: now,
+      };
+    });
+    return transaction.immediate();
   }
 
   public addProposal(input: {
@@ -1387,8 +1464,19 @@ export class PlayerMindStore {
     const validated = observationSchema.parse(observation);
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
+      const death = current.latestDeath;
+      const latestDeath =
+        death !== undefined &&
+        death.firstPostDeathObservation === undefined &&
+        Date.parse(validated.observedAt) > Date.parse(death.observedAt)
+          ? { ...death, firstPostDeathObservation: validated }
+          : death;
       this.writeStored(
-        { ...current, lastObservation: validated },
+        {
+          ...current,
+          lastObservation: validated,
+          ...(latestDeath === undefined ? {} : { latestDeath }),
+        },
         validated.observedAt,
       );
       return this.snapshot();
@@ -1449,6 +1537,7 @@ export class PlayerMindStore {
     readonly latencyMs: number;
     readonly learningUpdate?: boolean;
     readonly usageUnknown?: boolean;
+    readonly usageUnknownReason?: PlayerAgentUsageUnknownReason;
   }): void {
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
@@ -1461,6 +1550,18 @@ export class PlayerMindStore {
             usageUnknownCalls:
               current.counters.usageUnknownCalls +
               (metrics.usageUnknown === true ? 1 : 0),
+            usageUnknownRequestErrorCalls:
+              current.counters.usageUnknownRequestErrorCalls +
+              (metrics.usageUnknown === true &&
+              metrics.usageUnknownReason === "request_error"
+                ? 1
+                : 0),
+            usageUnknownResponseUsageMissingCalls:
+              current.counters.usageUnknownResponseUsageMissingCalls +
+              (metrics.usageUnknown === true &&
+              metrics.usageUnknownReason === "response_usage_missing"
+                ? 1
+                : 0),
             inputTokens:
               current.counters.inputTokens + nonnegative(metrics.inputTokens),
             outputTokens:

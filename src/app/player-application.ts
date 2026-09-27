@@ -241,6 +241,7 @@ export class PlayerCompanionApplication implements CompanionApplication {
 
 export function createPlayerApplication(
   config: AppConfig,
+  beforeCall?: () => void,
 ): CompanionApplication {
   const logger = createLogger(config);
   const persona = loadPersona(config.personaPath);
@@ -384,12 +385,16 @@ export function createPlayerApplication(
     memory: playerMemory,
     logger,
     ...(trace === undefined ? {} : { trace }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
     onCall: (metrics) =>
       mind.recordCall({
         inputTokens: metrics.inputTokens,
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
         ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+        ...(metrics.usageUnknownReason === undefined
+          ? {}
+          : { usageUnknownReason: metrics.usageUnknownReason }),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     say,
@@ -410,12 +415,16 @@ export function createPlayerApplication(
     ownerPlayerId: owner.id,
     logger,
     ...(trace === undefined ? {} : { trace }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
     onCall: (metrics) =>
       mind.recordCall({
         inputTokens: metrics.inputTokens,
         outputTokens: metrics.outputTokens,
         latencyMs: metrics.latencyMs,
         ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+        ...(metrics.usageUnknownReason === undefined
+          ? {}
+          : { usageUnknownReason: metrics.usageUnknownReason }),
       }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     onObservation: (observation) => {

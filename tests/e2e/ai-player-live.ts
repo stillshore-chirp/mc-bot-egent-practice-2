@@ -69,6 +69,11 @@ import {
 } from "./world-oracle.js";
 import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baseline.js";
 import {
+  createLlmCallAdmission,
+  LlmCallAdmissionError,
+  type LlmCallAdmission,
+} from "./llm-call-admission.js";
+import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   waitForRecoveryObstacleReadiness,
@@ -151,6 +156,10 @@ const E2E_GAMERULES = {
     id: "minecraft:respawn_radius",
     readbackFailure: "WORLD_RESPAWN_RADIUS_READBACK_MISMATCH",
   },
+  naturalRegeneration: {
+    id: "minecraft:natural_health_regeneration",
+    readbackFailure: "DAMAGE_RESPONSE_REGENERATION_STATE_UNAVAILABLE",
+  },
 } as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
@@ -177,6 +186,10 @@ const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 const LEARNING_FIXTURE_PITCH = 15;
 const ROTATION_READ_MAX_ATTEMPTS = 3;
 const ROTATION_READ_RETRY_DELAY_MS = 100;
+export const DAMAGE_RESPONSE_CASE_BUDGET = {
+  llmCalls: 8,
+  totalTokens: 75_000,
+} as const;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: { llmCalls: 8, totalTokens: 80_000 },
@@ -192,6 +205,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
+  damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -207,6 +221,7 @@ const CASE_DEADLINES = {
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
+  damage_response: 4 * 60_000,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -278,7 +293,7 @@ interface LearningFixtureOrientationReadback extends LearningFixtureOrientationD
   readonly position: Position;
 }
 type SafeEvidenceValue =
-  boolean | number | string | readonly PlayerAgentRoundActivity[];
+  boolean | number | string | null | readonly PlayerAgentRoundActivity[];
 type SafeEvidence = Readonly<Record<string, SafeEvidenceValue>>;
 
 interface SafeAutonomousProgress {
@@ -1095,6 +1110,8 @@ interface SafeApplicationStartDiagnostic {
 interface Counters {
   readonly llmCalls: number;
   readonly usageUnknownCalls: number;
+  readonly usageUnknownRequestErrorCalls: number;
+  readonly usageUnknownResponseUsageMissingCalls: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
@@ -1729,6 +1746,8 @@ function playerOf(evidence: Evidence): PlayerEvidence {
   const counterFields = [
     "llmCalls",
     "usageUnknownCalls",
+    "usageUnknownRequestErrorCalls",
+    "usageUnknownResponseUsageMissingCalls",
     "inputTokens",
     "outputTokens",
     "latencyMs",
@@ -1763,6 +1782,12 @@ function countersOf(evidence: Evidence): Counters {
   return {
     llmCalls: positiveNumber(counters.llmCalls),
     usageUnknownCalls: positiveNumber(counters.usageUnknownCalls),
+    usageUnknownRequestErrorCalls: positiveNumber(
+      counters.usageUnknownRequestErrorCalls,
+    ),
+    usageUnknownResponseUsageMissingCalls: positiveNumber(
+      counters.usageUnknownResponseUsageMissingCalls,
+    ),
     inputTokens: positiveNumber(counters.inputTokens),
     outputTokens: positiveNumber(counters.outputTokens),
     latencyMs: positiveNumber(counters.latencyMs),
@@ -1911,6 +1936,22 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
       : {}),
     ...(caseId === "parallel_dialogue_stop"
       ? (state.parallelDiagnostic ?? {})
+      : {}),
+    ...(caseId === "damage_response" &&
+    state.damageResponseCleanupFailureCode !== undefined
+      ? { cleanupFailureCode: state.damageResponseCleanupFailureCode }
+      : {}),
+    ...(caseId === "damage_response"
+      ? (state.damageResponseFailureDiagnostic ?? {})
+      : {}),
+    ...(caseId === "damage_response" &&
+    state.damageResponseDamageHealthReadback !== undefined
+      ? {
+          damageResponseBodyHealthAfterDamage:
+            state.damageResponseDamageHealthReadback.bodyHealth,
+          damageResponseRconHealthAfterDamage:
+            state.damageResponseDamageHealthReadback.rconHealth,
+        }
       : {}),
     ...(progress === undefined
       ? {}
@@ -2340,6 +2381,16 @@ function subtractCounters(after: Counters, before: Counters): Counters {
       0,
       after.usageUnknownCalls - before.usageUnknownCalls,
     ),
+    usageUnknownRequestErrorCalls: Math.max(
+      0,
+      after.usageUnknownRequestErrorCalls -
+        before.usageUnknownRequestErrorCalls,
+    ),
+    usageUnknownResponseUsageMissingCalls: Math.max(
+      0,
+      after.usageUnknownResponseUsageMissingCalls -
+        before.usageUnknownResponseUsageMissingCalls,
+    ),
     inputTokens: Math.max(0, after.inputTokens - before.inputTokens),
     outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
     latencyMs: Math.max(0, after.latencyMs - before.latencyMs),
@@ -2348,6 +2399,18 @@ function subtractCounters(after: Counters, before: Counters): Counters {
       0,
       after.learningUpdates - before.learningUpdates,
     ),
+  };
+}
+
+function safeUsageUnknownReasonEvidence(
+  caseId: string,
+  counters: Counters,
+): SafeEvidence {
+  if (caseId !== "damage_response") return {};
+  return {
+    usageUnknownRequestErrorCalls: counters.usageUnknownRequestErrorCalls,
+    usageUnknownResponseUsageMissingCalls:
+      counters.usageUnknownResponseUsageMissingCalls,
   };
 }
 
@@ -2393,6 +2456,16 @@ function runBudgetFromEnvironment(): RunBudget {
       RUN_BUDGET_LIMITS.totalTokens,
     ),
   };
+}
+
+export function runBudgetCoversCase(
+  runBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  caseBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+): boolean {
+  return (
+    runBudget.llmCalls >= caseBudget.llmCalls &&
+    runBudget.totalTokens >= caseBudget.totalTokens
+  );
 }
 
 async function unusedLoopbackPort(): Promise<number> {
@@ -2565,6 +2638,7 @@ interface RunState {
   readonly startedAt: string;
   readonly seed: string;
   readonly runBudget: RunBudget;
+  llmAdmission?: LlmCallAdmission;
   readonly cases: SafeCaseResult[];
   readonly startedClock: number;
   readonly runDeadlineAt: number;
@@ -2608,6 +2682,17 @@ interface RunState {
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
   ownerReturnDiagnostic?: OwnerReturnDiagnostic;
   ownerReturnProposalIdForRun?: string;
+  damageResponseCleanupFailureCode?: string;
+  damageResponseFailureDiagnostic?: {
+    readonly damageResponseFreshPurposeCommitObserved: boolean;
+    readonly damageResponsePostDamageJudgment:
+      "candidate" | "other" | "not_observed" | "unknown";
+    readonly damageResponseLinkedSuccessfulOutcomeObserved: boolean;
+  };
+  damageResponseDamageHealthReadback?: {
+    readonly bodyHealth: number | null;
+    readonly rconHealth: number | null;
+  };
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -2896,7 +2981,7 @@ async function main(): Promise<void> {
     const { createApplication } = await import("../../src/app/application.js");
     restoreGameActionPlacementObservationProbe ??=
       installGameActionPlacementObservationProbe();
-    const activeApp = createApplication(config);
+    const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
     state.preStartPlayer = playerOf(preStartEvidence);
@@ -3285,7 +3370,10 @@ async function main(): Promise<void> {
         await context.runtime.app.shutdown("ai_player_e2e_memory_restart");
         const { createApplication } =
           await import("../../src/app/application.js");
-        const nextApp = createApplication(context.runtime.config);
+        const nextApp = createApplication(
+          context.runtime.config,
+          state.llmAdmission?.beforeCall,
+        );
         appForCleanup = nextApp;
         await connectApplication(nextApp, state);
         const restartedContext: CaseContext = {
@@ -4568,6 +4656,383 @@ async function main(): Promise<void> {
             state.abortRequested = true;
             state.failureCode ??= "FOOD_INTENT_EFFECT_CLEANUP_NOT_CONFIRMED";
             incomplete("FOOD_INTENT_EFFECT_CLEANUP_NOT_CONFIRMED");
+          }
+        }
+      },
+    );
+
+    const damageResult = await recordCase(
+      state,
+      "damage_response",
+      CASE_DEADLINES.damage_response,
+      requireLiveContext(),
+      async (context) => {
+        const expectedHealth = 20;
+        const expectedFood = 20;
+        const initialEvidence = await collect(context.runtime.app);
+        const initialHealth = initialEvidence.game?.health;
+        const initialRconHealth = await rconEntityHealth(rcon, context.botName);
+        const initialFood = initialEvidence.game?.food;
+        const initialRconFood = await rconFoodLevel(rcon, context.botName);
+        const effectsBaseline = await rconActiveEffectsState(
+          rcon,
+          context.botName,
+        );
+        if (effectsBaseline === "unknown") {
+          const code = "DAMAGE_RESPONSE_BASELINE_EFFECTS_STATE_UNAVAILABLE";
+          state.failureCode ??= code;
+          incomplete(code);
+        }
+        const naturalRegeneration = await rconNaturalRegeneration(rcon);
+
+        let naturalRegenerationMayNeedRestore = false;
+        let effectsMayNeedCleanup = false;
+        let damageMayNeedCleanup = false;
+        let positionMayNeedRestore = false;
+        let primaryFailureCode: string | undefined;
+        let fixturePosition: Position | undefined;
+        try {
+          if (
+            !damageResponseFoodBaselineConfirmed(
+              initialFood,
+              initialRconFood,
+              expectedFood,
+            )
+          )
+            incomplete(
+              "DAMAGE_RESPONSE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES",
+            );
+          fixturePosition = parsePosition(
+            await rcon.command(`data get entity ${context.botName} Pos`),
+          );
+          naturalRegenerationMayNeedRestore = true;
+          await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
+
+          if (effectsBaseline === "active") {
+            effectsMayNeedCleanup = true;
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              incomplete("DAMAGE_RESPONSE_BASELINE_EFFECTS_NOT_CLEARED");
+          }
+          if (
+            initialHealth !== expectedHealth ||
+            initialRconHealth !== expectedHealth
+          ) {
+            damageMayNeedCleanup = true;
+            effectsMayNeedCleanup = true;
+            await rcon.command(
+              `effect give ${context.botName} minecraft:instant_health 1 4 true`,
+            );
+            const healthDeadline = Date.now() + 5_000;
+            let healthReady = false;
+            while (Date.now() < healthDeadline) {
+              const bodyHealth = (await collect(context.runtime.app)).game
+                ?.health;
+              const rconHealth = await rconEntityHealth(rcon, context.botName);
+              if (
+                bodyHealth === expectedHealth &&
+                rconHealth === expectedHealth
+              ) {
+                healthReady = true;
+                break;
+              }
+              await waitMs(100);
+            }
+            if (!healthReady) {
+              const bodyHealth = (await collect(context.runtime.app)).game
+                ?.health;
+              const rconHealth = await rconEntityHealth(rcon, context.botName);
+              incomplete(
+                rconHealth !== expectedHealth
+                  ? "DAMAGE_RESPONSE_RCON_HEALTH_BASELINE_NOT_RESTORED"
+                  : bodyHealth !== expectedHealth
+                    ? "DAMAGE_RESPONSE_BODY_HEALTH_BASELINE_NOT_CONFIRMED"
+                    : "DAMAGE_RESPONSE_HEALTH_BASELINE_NOT_CONFIRMED",
+              );
+            }
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              incomplete("DAMAGE_RESPONSE_HEALTH_EFFECT_CLEANUP_NOT_CONFIRMED");
+          }
+          const preparedEvidence = await collect(context.runtime.app);
+          const preparedFood = await rconFoodLevel(rcon, context.botName);
+          const preparedRconHealth = await rconEntityHealth(
+            rcon,
+            context.botName,
+          );
+          const preparedBodyHealth = preparedEvidence.game?.health;
+          const preparedBodyFood = preparedEvidence.game?.food;
+          if (
+            preparedBodyHealth !== expectedHealth ||
+            preparedRconHealth !== expectedHealth ||
+            preparedBodyFood !== preparedFood ||
+            preparedFood !== expectedFood
+          )
+            incomplete(
+              "DAMAGE_RESPONSE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES",
+            );
+
+          const before = playerOf(preparedEvidence);
+          const priorActivity = new Set(
+            (before.recentAgentActivity ?? []).map(
+              (activity) => `${activity.runSequence}:${activity.round}`,
+            ),
+          );
+          damageMayNeedCleanup = true;
+          positionMayNeedRestore = true;
+          await rcon.command(`damage ${context.botName} 14 minecraft:generic`);
+          const damageAppliedAt = Date.now();
+          const damageReadbackDeadlineAt = damageAppliedAt + 3_000;
+          let damagedRconHealth: number | null = null;
+          let damagedHealth: number | null = null;
+          let damagedEvidence: Evidence | undefined;
+          while (Date.now() < damageReadbackDeadlineAt) {
+            const timeoutMs = Math.max(
+              1,
+              Math.min(500, damageReadbackDeadlineAt - Date.now()),
+            );
+            try {
+              damagedRconHealth = await rconEntityHealth(
+                rcon,
+                context.botName,
+                timeoutMs,
+              );
+            } catch {
+              damagedRconHealth = null;
+            }
+            try {
+              damagedEvidence = await collect(context.runtime.app);
+              const observedHealth = damagedEvidence.game?.health;
+              damagedHealth =
+                typeof observedHealth === "number" &&
+                Number.isFinite(observedHealth)
+                  ? observedHealth
+                  : null;
+            } catch {
+              damagedEvidence = undefined;
+              damagedHealth = null;
+            }
+            if (
+              damagedRconHealth !== null &&
+              damagedRconHealth > 0 &&
+              damagedRconHealth < expectedHealth &&
+              damagedRconHealth <= 6 &&
+              damagedHealth !== null &&
+              damagedHealth > 0 &&
+              damagedHealth < expectedHealth &&
+              damagedHealth <= 6
+            )
+              break;
+            const remainingMs = damageReadbackDeadlineAt - Date.now();
+            if (remainingMs <= 0) break;
+            await waitMs(Math.min(100, remainingMs));
+          }
+          if (
+            damagedRconHealth === null ||
+            damagedRconHealth >= expectedHealth ||
+            damagedRconHealth <= 0 ||
+            damagedRconHealth > 6 ||
+            damagedHealth === null ||
+            damagedHealth >= expectedHealth ||
+            damagedHealth <= 0 ||
+            damagedHealth > 6 ||
+            damagedEvidence === undefined
+          ) {
+            state.damageResponseDamageHealthReadback = {
+              bodyHealth: damagedHealth,
+              rconHealth: damagedRconHealth,
+            };
+            incomplete("DAMAGE_RESPONSE_DAMAGE_NOT_CONFIRMED_BY_BOTH_ORACLES");
+          }
+          const priorJudgments = new Set(
+            before.recentJudgments.map(
+              (judgment) =>
+                `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+            ),
+          );
+
+          const hasJudgmentLinkedOutcome = (player: PlayerEvidence): boolean =>
+            damageResponseHasJudgmentLinkedOutcome(
+              before.recentOutcomes,
+              player.recentJudgments,
+              player.recentOutcomes,
+              priorJudgments,
+              damageAppliedAt,
+            );
+          const hasFreshPurposeCommit = (player: PlayerEvidence): boolean =>
+            (player.recentAgentActivity ?? []).some(
+              (activity) =>
+                activity.role === "purpose" &&
+                !priorActivity.has(
+                  `${activity.runSequence}:${activity.round}`,
+                ) &&
+                activity.toolCalls.some(
+                  (toolCall) =>
+                    toolCall.name === "commit_action_decision" &&
+                    toolCall.resultClass === "ok",
+                ),
+            );
+
+          const decided = await waitForPlayer(
+            context,
+            150_000,
+            (player) =>
+              hasFreshPurposeCommit(player) && hasJudgmentLinkedOutcome(player),
+          ).catch(async (error: unknown) => {
+            if (
+              error instanceof HarnessError &&
+              (error.code === "RUN_LLM_BUDGET_EXCEEDED" ||
+                error.code === "CASE_LLM_BUDGET_EXCEEDED")
+            ) {
+              try {
+                const player = playerOf(await collect(context.runtime.app));
+                state.damageResponseFailureDiagnostic = {
+                  damageResponseFreshPurposeCommitObserved:
+                    hasFreshPurposeCommit(player),
+                  damageResponsePostDamageJudgment:
+                    classifyDamageResponsePostDamageJudgment(
+                      player.recentJudgments,
+                      priorJudgments,
+                      damageAppliedAt,
+                    ),
+                  damageResponseLinkedSuccessfulOutcomeObserved:
+                    hasJudgmentLinkedOutcome(player),
+                };
+              } catch {
+                // Preserve the budget failure if diagnostic collection fails.
+              }
+            }
+            throw error;
+          });
+          if (!hasJudgmentLinkedOutcome(decided))
+            incomplete("DAMAGE_RESPONSE_BODY_OUTCOME_NOT_CONFIRMED");
+          const finalDamageHealth = await rconEntityHealth(
+            rcon,
+            context.botName,
+          );
+          const finalDamageBodyHealth = (await collect(context.runtime.app))
+            .game?.health;
+          if (
+            finalDamageHealth <= 0 ||
+            finalDamageBodyHealth === undefined ||
+            finalDamageBodyHealth <= 0
+          )
+            fail("DAMAGE_RESPONSE_LETHAL_OUTCOME");
+          return {
+            baselineHealthBodyAndRconConfirmed: true,
+            boundedNonlethalDamageConfirmedByBodyAndRcon: true,
+            purposeCommitActionDecisionObserved: true,
+            successfulBodyOutcomeObserved: true,
+            healthRemainedNonlethal: true,
+          };
+        } catch (error) {
+          primaryFailureCode =
+            error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
+          state.failureCode ??= primaryFailureCode;
+          throw error;
+        } finally {
+          let cleanupConfirmed = true;
+          if (damageMayNeedCleanup) {
+            try {
+              effectsMayNeedCleanup = true;
+              await rcon.command(
+                `effect give ${context.botName} minecraft:instant_health 1 4 true`,
+              );
+              const restoreDeadline = Date.now() + 5_000;
+              let healthRestored = false;
+              while (Date.now() < restoreDeadline) {
+                if (
+                  (await rconEntityHealth(rcon, context.botName)) ===
+                  expectedHealth
+                ) {
+                  healthRestored = true;
+                  break;
+                }
+                await waitMs(100);
+              }
+              if (!healthRestored) cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (effectsMayNeedCleanup) {
+            try {
+              await rcon.command(`effect clear ${context.botName}`);
+              if (
+                (await rconActiveEffectsState(rcon, context.botName)) !==
+                "empty"
+              )
+                cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (naturalRegenerationMayNeedRestore) {
+            try {
+              await setAndVerifyGamerule(
+                rcon,
+                "naturalRegeneration",
+                naturalRegeneration,
+              );
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          if (positionMayNeedRestore && fixturePosition !== undefined) {
+            try {
+              await rcon.command(
+                `tp ${context.botName} ${fixturePosition.x} ${fixturePosition.y} ${fixturePosition.z}`,
+              );
+              const restoredPosition = parsePosition(
+                await rcon.command(`data get entity ${context.botName} Pos`),
+              );
+              if (
+                Math.hypot(
+                  restoredPosition.x - fixturePosition.x,
+                  restoredPosition.y - fixturePosition.y,
+                  restoredPosition.z - fixturePosition.z,
+                ) > 0.2
+              )
+                cleanupConfirmed = false;
+            } catch {
+              cleanupConfirmed = false;
+            }
+          }
+          try {
+            if (damageMayNeedCleanup) {
+              const restoredBody = (await collect(context.runtime.app)).game;
+              if (
+                (await rconEntityHealth(rcon, context.botName)) !==
+                  expectedHealth ||
+                restoredBody?.health !== expectedHealth
+              )
+                cleanupConfirmed = false;
+            }
+            if (
+              effectsMayNeedCleanup &&
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              cleanupConfirmed = false;
+          } catch {
+            cleanupConfirmed = false;
+          }
+          const cleanupDisposition = damageResponseCleanupDisposition(
+            primaryFailureCode,
+            cleanupConfirmed,
+          );
+          if (cleanupDisposition !== undefined) {
+            state.abortRequested = true;
+            state.damageResponseCleanupFailureCode ??=
+              cleanupDisposition.cleanupFailureCode;
+            state.failureCode ??=
+              cleanupDisposition.primaryFailureCode ??
+              cleanupDisposition.cleanupFailureCode;
+            if (cleanupDisposition.throwCleanupFailure)
+              incomplete(cleanupDisposition.cleanupFailureCode);
           }
         }
       },
@@ -5905,6 +6370,7 @@ async function main(): Promise<void> {
           discretionResult,
           foodResult,
           ownerReturnResult,
+          damageResult,
           parallelResult,
           operationSmokeResult,
         ];
@@ -6049,6 +6515,14 @@ async function prepareRun(): Promise<RunState> {
     incomplete("JAVA_21_NOT_FOUND");
   }
   const runBudget = runBudgetFromEnvironment();
+  const targetCaseBudget =
+    targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
+  if (
+    targetCaseBudget !== undefined &&
+    !runBudgetCoversCase(runBudget, targetCaseBudget)
+  ) {
+    incomplete("RUN_BUDGET_BELOW_TARGET_CASE_BUDGET");
+  }
   const cacheDirectoryValue =
     process.env.AI_PLAYER_E2E_SERVER_CACHE_DIR?.trim();
   const serverCacheDirectory =
@@ -6087,7 +6561,7 @@ async function prepareRun(): Promise<RunState> {
   const runSeed = WORLD_SEED;
   const worldFixture = "flat-platform-dry-wall-container-oak-v1";
   const startedClock = Date.now();
-  return {
+  const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
     startedAt: new Date().toISOString(),
@@ -6117,6 +6591,22 @@ async function prepareRun(): Promise<RunState> {
     privateServerLogStream: undefined,
     responses: [],
   };
+  const admission = createLlmCallAdmission(runBudget.llmCalls, (code) => {
+    state.failureCode ??= code;
+  });
+  state.llmAdmission = {
+    ...admission,
+    beforeCall: () => {
+      try {
+        admission.beforeCall();
+      } catch (error) {
+        if (error instanceof LlmCallAdmissionError)
+          throw new HarnessError("incomplete", error.code);
+        throw error;
+      }
+    },
+  };
+  return state;
 }
 
 async function startServer(state: RunState): Promise<void> {
@@ -9393,6 +9883,163 @@ async function rconFoodLevel(
   return foodLevel;
 }
 
+async function rconEntityHealth(
+  rcon: LocalRcon,
+  botName: string,
+  timeoutMs = 5_000,
+): Promise<number> {
+  const reply = await rcon.command(
+    `data get entity ${botName} Health`,
+    timeoutMs,
+  );
+  const match = /(?:^|:\s*)(\d+(?:\.\d+)?)(?:[bBsSlLfFdD])?\s*$/u.exec(
+    reply.trim(),
+  );
+  const health = match === null ? Number.NaN : Number(match[1]);
+  if (!Number.isFinite(health) || health < 0 || health > 20)
+    incomplete("DAMAGE_RESPONSE_RCON_HEALTH_UNAVAILABLE");
+  return health;
+}
+
+async function rconActiveEffectsState(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<"empty" | "active" | "unknown"> {
+  const reply = await rcon
+    .command(`data get entity ${botName} active_effects`)
+    .catch(() => "");
+  return classifyRconActiveEffectsReply(reply);
+}
+
+const DAMAGE_RESPONSE_CANDIDATE_OPERATIONS = new Set([
+  "look_sweep",
+  "consume",
+  "equip",
+  "move_to",
+  "move_relative",
+]);
+
+export function classifyDamageResponsePostDamageJudgment(
+  judgments: PlayerEvidence["recentJudgments"],
+  priorJudgments: ReadonlySet<string>,
+  damageAppliedAt: number,
+): "candidate" | "other" | "not_observed" | "unknown" {
+  const fresh = judgments.filter(
+    (judgment) =>
+      !priorJudgments.has(
+        `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+      ),
+  );
+  const postDamage = fresh.filter((judgment) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    return Number.isFinite(decidedAt) && decidedAt >= damageAppliedAt;
+  });
+  if (
+    postDamage.some((judgment) =>
+      DAMAGE_RESPONSE_CANDIDATE_OPERATIONS.has(
+        safeOperationKind(judgment.operationKind) ?? "",
+      ),
+    )
+  )
+    return "candidate";
+  if (
+    fresh.some((judgment) => {
+      const decidedAt = Date.parse(judgment.decidedAt ?? "");
+      return (
+        !Number.isFinite(decidedAt) ||
+        (decidedAt >= damageAppliedAt &&
+          safeOperationKind(judgment.operationKind) === undefined)
+      );
+    })
+  )
+    return "unknown";
+  return postDamage.length > 0 ? "other" : "not_observed";
+}
+
+export function damageResponseHasJudgmentLinkedOutcome(
+  beforeOutcomes: PlayerEvidence["recentOutcomes"],
+  currentJudgments: PlayerEvidence["recentJudgments"],
+  currentOutcomes: PlayerEvidence["recentOutcomes"],
+  priorJudgments: ReadonlySet<string>,
+  damageAppliedAt: number,
+): boolean {
+  const priorOutcomeIds = new Set(
+    beforeOutcomes.map((outcome) => outcome.operationId),
+  );
+  const outcomes = currentOutcomes.filter(
+    (outcome) =>
+      !priorOutcomeIds.has(outcome.operationId) &&
+      outcome.status === "successful",
+  );
+  return currentJudgments.some((judgment) => {
+    const judgmentKey = `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+    const judgmentAt = Date.parse(judgment.decidedAt ?? "");
+    const operationKind = judgment.operationKind;
+    if (
+      priorJudgments.has(judgmentKey) ||
+      !Number.isFinite(judgmentAt) ||
+      judgmentAt < damageAppliedAt ||
+      operationKind === undefined ||
+      !DAMAGE_RESPONSE_CANDIDATE_OPERATIONS.has(operationKind)
+    )
+      return false;
+    return outcomes.some(
+      (outcome) =>
+        outcome.kind === operationKind &&
+        outcome.observedAt !== undefined &&
+        Number.isFinite(Date.parse(outcome.observedAt)) &&
+        Date.parse(outcome.observedAt) >= judgmentAt,
+    );
+  });
+}
+
+export function classifyRconActiveEffectsReply(
+  reply: string,
+): "empty" | "active" | "unknown" {
+  const value = reply.trim();
+  if (/^Found no elements matching active_effects$/iu.test(value))
+    return "empty";
+  if (/\[\s*\]\s*$/u.test(value)) return "empty";
+  if (/\[\s*\{[\s\S]*\}\s*\]\s*$/u.test(value)) return "active";
+  return "unknown";
+}
+
+export function damageResponseCleanupDisposition(
+  primaryFailureCode: string | undefined,
+  cleanupConfirmed: boolean,
+):
+  | {
+      readonly primaryFailureCode?: string;
+      readonly cleanupFailureCode: "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED";
+      readonly throwCleanupFailure: boolean;
+    }
+  | undefined {
+  if (cleanupConfirmed) return undefined;
+  return {
+    ...(primaryFailureCode === undefined ? {} : { primaryFailureCode }),
+    cleanupFailureCode: "DAMAGE_RESPONSE_FIXTURE_CLEANUP_NOT_CONFIRMED",
+    throwCleanupFailure: primaryFailureCode === undefined,
+  };
+}
+
+export function damageResponseFoodBaselineConfirmed(
+  bodyFood: number | undefined,
+  rconFood: number | undefined,
+  expectedFood: number,
+): boolean {
+  return bodyFood === expectedFood && rconFood === expectedFood;
+}
+
+async function rconNaturalRegeneration(rcon: LocalRcon): Promise<boolean> {
+  const reply = await rcon.command(
+    `gamerule ${E2E_GAMERULES.naturalRegeneration.id}`,
+  );
+  const value = /(?:^|\s)(true|false)\s*$/iu.exec(reply.trim())?.[1];
+  if (value === undefined)
+    incomplete("DAMAGE_RESPONSE_REGENERATION_STATE_UNAVAILABLE");
+  return value.toLowerCase() === "true";
+}
+
 async function rconHasActiveEffect(
   rcon: LocalRcon,
   botName: string,
@@ -9554,7 +10201,10 @@ async function stopAndRestartForUnknownCase(
   });
 
   const { createApplication } = await import("../../src/app/application.js");
-  const nextApp = createApplication(context.runtime.config);
+  const nextApp = createApplication(
+    context.runtime.config,
+    state.llmAdmission?.beforeCall,
+  );
   appForCleanup = nextApp;
   await connectApplication(nextApp, state);
   const restartedEvidence = await collect(nextApp);
@@ -9754,42 +10404,50 @@ async function recordCase(
     ([caseId]) => caseId === id,
   )?.[1];
   if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
-  return runCase(
-    state,
-    id,
-    deadlineMs,
-    caseBudget.llmCalls,
-    caseBudget.totalTokens,
-    async () => {
-      const baseline = countersOf(await collect(context.runtime.app));
-      const caseStarted = Date.now();
-      const caseContext: CaseContext = {
-        ...context,
-        usageAtStart: baseline,
-        runUsageAtStart: context.runUsageAtStart,
-        startedAt: caseStarted,
-        caseDeadlineAt: Math.min(caseStarted + deadlineMs, state.runDeadlineAt),
-        runBudget: state.runBudget,
-        caseBudget,
-      };
-      const measured = await runCaseBody(caseContext);
-      const finalUsage = countersOf(
-        await collect(requireLiveContext().runtime.app),
-      );
-      const delta = subtractCounters(finalUsage, baseline);
-      if (
-        delta.llmCalls > caseBudget.llmCalls ||
-        totalTokens(delta) > caseBudget.totalTokens
-      ) {
-        incomplete("CASE_LLM_BUDGET_EXCEEDED");
-      }
-      return {
-        ...measured,
-        llmCalls: delta.llmCalls,
-        tokens: totalTokens(delta),
-      };
-    },
-  );
+  state.llmAdmission?.beginCase(caseBudget.llmCalls);
+  try {
+    return await runCase(
+      state,
+      id,
+      deadlineMs,
+      caseBudget.llmCalls,
+      caseBudget.totalTokens,
+      async () => {
+        const baseline = countersOf(await collect(context.runtime.app));
+        const caseStarted = Date.now();
+        const caseContext: CaseContext = {
+          ...context,
+          usageAtStart: baseline,
+          runUsageAtStart: context.runUsageAtStart,
+          startedAt: caseStarted,
+          caseDeadlineAt: Math.min(
+            caseStarted + deadlineMs,
+            state.runDeadlineAt,
+          ),
+          runBudget: state.runBudget,
+          caseBudget,
+        };
+        const measured = await runCaseBody(caseContext);
+        const finalUsage = countersOf(
+          await collect(requireLiveContext().runtime.app),
+        );
+        const delta = subtractCounters(finalUsage, baseline);
+        if (
+          delta.llmCalls > caseBudget.llmCalls ||
+          totalTokens(delta) > caseBudget.totalTokens
+        ) {
+          incomplete("CASE_LLM_BUDGET_EXCEEDED");
+        }
+        return {
+          ...measured,
+          llmCalls: delta.llmCalls,
+          tokens: totalTokens(delta),
+        };
+      },
+    );
+  } finally {
+    state.llmAdmission?.endCase();
+  }
 }
 
 async function runCase(
@@ -9875,7 +10533,10 @@ async function runCase(
       latencyMs: delta.latencyMs,
       usageStatus:
         delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
-      evidence,
+      evidence: {
+        ...evidence,
+        ...safeUsageUnknownReasonEvidence(id, delta),
+      },
     };
     await retainCasePlayerSnapshot(
       state,
@@ -9967,6 +10628,7 @@ async function runCase(
         ...(id === "game_action_discretion" && /BUDGET|DEADLINE/u.test(reason)
           ? safeGameActionFailureEvidence(state, lastEvidence)
           : {}),
+        ...safeUsageUnknownReasonEvidence(id, delta),
       },
       reason,
     };
@@ -10077,6 +10739,13 @@ async function observeForPlayer(
     context.runDeadlineAt,
   );
   while (Date.now() < deadline) {
+    const admissionFailure = currentRunState?.failureCode;
+    if (
+      admissionFailure === "RUN_LLM_BUDGET_EXCEEDED" ||
+      admissionFailure === "CASE_LLM_BUDGET_EXCEEDED"
+    ) {
+      incomplete(admissionFailure);
+    }
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
     const runDelta = subtractCounters(player.counters, context.runUsageAtStart);
@@ -10866,6 +11535,8 @@ function zeroCounters(): Counters {
   return {
     llmCalls: 0,
     usageUnknownCalls: 0,
+    usageUnknownRequestErrorCalls: 0,
+    usageUnknownResponseUsageMissingCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,
@@ -11432,11 +12103,16 @@ async function writeArtifact(state: RunState): Promise<void> {
   );
 }
 
-void main().catch((error: unknown) => {
-  const code =
-    error instanceof HarnessError && /^[A-Z0-9_]+$/u.test(error.code)
-      ? error.code
-      : "UNEXPECTED_FAILURE";
-  process.stderr.write(`INCOMPLETE AI_PLAYER_E2E_${code}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] !== undefined &&
+  fileURLToPath(import.meta.url) === resolve(process.argv[1])
+) {
+  void main().catch((error: unknown) => {
+    const code =
+      error instanceof HarnessError && /^[A-Z0-9_]+$/u.test(error.code)
+        ? error.code
+        : "UNEXPECTED_FAILURE";
+    process.stderr.write(`INCOMPLETE AI_PLAYER_E2E_${code}\n`);
+    process.exitCode = 1;
+  });
+}

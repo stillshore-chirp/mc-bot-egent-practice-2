@@ -1038,8 +1038,11 @@ export function createLegacyApplication(
 }
 
 /** The autonomous player is the default runtime; legacy application helpers remain exported. */
-export function createApplication(config: AppConfig): CompanionApplication {
-  return createPlayerApplication(config);
+export function createApplication(
+  config: AppConfig,
+  beforeCall?: () => void,
+): CompanionApplication {
+  return createPlayerApplication(config, beforeCall);
 }
 
 function createTraceService(
