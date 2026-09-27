@@ -109,6 +109,48 @@ describe("CompanionGameController", () => {
     }
   });
 
+  it.each([5, 6])(
+    "does not report a completed return when the owner disappears at observation %i",
+    async (vanishAt) => {
+      class VanishingOwnerMinecraft extends FakeMinecraft {
+        private observationCount = 0;
+
+        public override async observe() {
+          this.observationCount += 1;
+          if (this.observationCount === vanishAt) {
+            this.snapshot = { ...this.snapshot, players: [] };
+          }
+          return super.observe();
+        }
+      }
+
+      const minecraft = new VanishingOwnerMinecraft(
+        createSnapshot({
+          players: [
+            {
+              username: "owner",
+              position: { x: 0, y: 64, z: 0 },
+              distance: 0,
+            },
+          ],
+        }),
+      );
+      const { game, close } = createController(minecraft);
+      try {
+        const report = await game.returnToOwner(
+          3,
+          new AbortController().signal,
+        );
+
+        expect(report.outcome).toBe("failed");
+        expect(report.failureCode).toBe("RETURN_NOT_VERIFIED");
+        expect(report.summary).not.toContain("戻りました");
+      } finally {
+        close();
+      }
+    },
+  );
+
   it("explains a refused high-place return without exposing an internal error name", async () => {
     class UnsafeLandingMinecraft extends FakeMinecraft {
       public override async moveToWithSafeDescent(

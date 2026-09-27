@@ -1542,20 +1542,41 @@ export class CompanionGameController implements GameController {
           range: safeDistance,
           maxAttempts: this.#retryLimit + 1,
         }),
-      (output) => ({
-        outcome: "completed",
-        confirmedState: {
-          distance: output.distance,
-          usedDescent: output.usedDescent,
-          predictedMaxDamage: output.predictedMaxDamage,
-          healthBefore: output.healthBefore,
-          minimumObservedHealth: output.minimumObservedHealth,
-          healthAfter: output.healthAfter,
-        },
-        summary: output.usedDescent
-          ? `安全を確認した降下で利用者の場所へ戻りました。距離${output.distance.toFixed(1)}ブロック、Botの体力は降下中に最低${output.minimumObservedHealth}、帰還時${output.healthAfter}を観測しました。`
-          : `歩ける経路で指定利用者の現在位置へ戻り、距離${output.distance.toFixed(1)}ブロックを観測しました。`,
-      }),
+      (output, after) => {
+        const owner = after?.players.find(
+          (candidate) => candidate.username === this.#ownerUsername,
+        );
+        if (owner === undefined || owner.distance > safeDistance) {
+          return {
+            outcome: "failed",
+            failureCategory: "observation",
+            failureCode: "RETURN_NOT_VERIFIED",
+            failureRetryable: true,
+            failedAt: "return_to_player",
+            confirmedState: {
+              usedDescent: output.usedDescent,
+              ...(owner === undefined ? {} : { distance: owner.distance }),
+            },
+            nextActions: ["利用者の位置と距離を再確認してから帰還を試します。"],
+            summary:
+              "帰還後に利用者との距離を確認できなかったため、完了とは判定できませんでした。",
+          };
+        }
+        return {
+          outcome: "completed",
+          confirmedState: {
+            distance: owner.distance,
+            usedDescent: output.usedDescent,
+            predictedMaxDamage: output.predictedMaxDamage,
+            healthBefore: output.healthBefore,
+            minimumObservedHealth: output.minimumObservedHealth,
+            healthAfter: output.healthAfter,
+          },
+          summary: output.usedDescent
+            ? `安全を確認した降下で利用者の場所へ戻りました。距離${owner.distance.toFixed(1)}ブロック、Botの体力は降下中に最低${output.minimumObservedHealth}、帰還時${output.healthAfter}を観測しました。`
+            : `歩ける経路で指定利用者の現在位置へ戻り、距離${owner.distance.toFixed(1)}ブロックを観測しました。`,
+        };
+      },
     );
     if (report.failureCode !== "SAFE_DESCENT_BLOCKED") return report;
     const reason = report.confirmedState?.reason;
@@ -1646,9 +1667,12 @@ export class CompanionGameController implements GameController {
       | "outcome"
       | "failureCategory"
       | "failureCode"
+      | "failureRetryable"
+      | "failedAt"
       | "confirmedState"
       | "evidenceKind"
       | "summary"
+      | "nextActions"
     >,
     capturedBefore?: WorldSnapshot,
     allowHostileResponse = false,
