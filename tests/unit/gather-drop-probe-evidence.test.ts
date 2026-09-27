@@ -9,10 +9,12 @@ import {
   bucketGatherDropProbeCount,
   bucketGatherDropProbeFacing,
   bucketGatherDropProbePosition,
+  createGatherDropProbeObservationTrace,
   createGatherDropProbeCapture,
   flattenGatherDropProbeEvidence,
   gatherDropProbeTwoStackInventoryEvidence,
   installScopedExecuteProbe,
+  installScopedSafeObserveProbe,
   projectGatherOperationBodyTransition,
   withScopedExecuteProbeRestoration,
 } from "../e2e/gather-drop-probe-evidence.js";
@@ -21,6 +23,71 @@ const origin = { x: 0, y: 64, z: 0 };
 const target = { x: 1.5, y: 64.5, z: -4.5 };
 
 describe("gather drop probe public evidence buckets", () => {
+  it("captures a bounded safe trace from one scoped Body observation path", () => {
+    const observations = [
+      bodyObservation({
+        position: origin,
+        birchCount: 0,
+        visibleDrop: true,
+        yaw: 0,
+      }),
+      bodyObservation({
+        position: { x: 1.5, y: 64.5, z: -4.5 },
+        birchCount: 0,
+        visibleDrop: false,
+        yaw: Math.PI / 2,
+        candidateSearchMayBeTruncated: true,
+      }),
+    ];
+    class FakeBody {
+      private observationIndex = 0;
+
+      public safeObserve(): PlayerBodyObservation | null {
+        const observation = observations[this.observationIndex % 2];
+        this.observationIndex += 1;
+        return observation ?? null;
+      }
+    }
+
+    const body = new FakeBody();
+    const trace = createGatherDropProbeObservationTrace({ origin, target });
+    const restore = installScopedSafeObserveProbe(body, trace);
+    try {
+      trace.enable(987654, 0);
+      for (let index = 0; index < 20; index += 1) body.safeObserve();
+      trace.disable();
+      body.safeObserve();
+    } finally {
+      restore();
+    }
+
+    const samples = trace.snapshot();
+    expect(samples).toHaveLength(16);
+    expect(samples.slice(0, 2)).toEqual([
+      {
+        requestedDropVisibility: "visible",
+        facingChange: "unchanged",
+        position: "origin",
+        candidateSearchMayBeTruncated: false,
+      },
+      {
+        requestedDropVisibility: "invisible",
+        facingChange: "changed",
+        position: "target_area",
+        candidateSearchMayBeTruncated: true,
+      },
+    ]);
+    expect(trace.overflowed()).toBe(true);
+    expect(Object.hasOwn(body, "safeObserve")).toBe(false);
+    const serialized = JSON.stringify({
+      samples,
+      overflowed: trace.overflowed(),
+    });
+    expect(serialized).not.toContain("987654");
+    expect(serialized).not.toContain('"x"');
+    expect(serialized).not.toContain("PRIVATE_PLAYER");
+  });
+
   it("retains only coarse position classes", () => {
     expect(bucketGatherDropProbePosition(origin, origin, target)).toBe(
       "origin",

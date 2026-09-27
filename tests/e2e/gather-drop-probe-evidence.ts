@@ -31,6 +31,146 @@ export type GatherDropProbeDeltaBucket =
 export type GatherDropProbeVisibleEntityBucket =
   "none" | "single" | "multiple" | "unknown";
 
+export type GatherDropProbeEntityVisibility =
+  "visible" | "invisible" | "unknown";
+
+export interface GatherDropProbeObservationSample {
+  readonly requestedDropVisibility: GatherDropProbeEntityVisibility;
+  readonly facingChange: GatherDropProbeFacingBucket;
+  readonly position: GatherDropProbePositionBucket;
+  readonly candidateSearchMayBeTruncated: boolean | "unknown";
+}
+
+export interface GatherDropProbeObservationTrace {
+  enable(requestedEntityId: number, referenceYaw: number | undefined): void;
+  disable(): void;
+  record(observation: PlayerBodyObservation | null): void;
+  snapshot(): readonly GatherDropProbeObservationSample[];
+  overflowed(): boolean;
+}
+
+export const GATHER_DROP_PROBE_OBSERVATION_LIMIT = 16;
+
+/** Keep only a bounded sequence of observation buckets from one collect call. */
+export function createGatherDropProbeObservationTrace(input: {
+  readonly origin: GatherDropProbePoint;
+  readonly target: GatherDropProbePoint;
+}): GatherDropProbeObservationTrace {
+  let enabled = false;
+  let requestedEntityId: number | undefined;
+  let referenceYaw: number | undefined;
+  let didOverflow = false;
+  const samples: GatherDropProbeObservationSample[] = [];
+  return {
+    enable(entityId, yaw) {
+      enabled = true;
+      requestedEntityId = entityId;
+      referenceYaw = yaw;
+    },
+    disable() {
+      enabled = false;
+      requestedEntityId = undefined;
+      referenceYaw = undefined;
+    },
+    record(observation) {
+      if (!enabled) return;
+      if (samples.length >= GATHER_DROP_PROBE_OBSERVATION_LIMIT) {
+        didOverflow = true;
+        return;
+      }
+      const requestedDropVisibility =
+        observation === null || requestedEntityId === undefined
+          ? "unknown"
+          : observation.perception.entities.some(
+                ({ id, name }) => id === requestedEntityId && name === "item",
+              )
+            ? "visible"
+            : "invisible";
+      samples.push({
+        requestedDropVisibility,
+        facingChange:
+          observation === null
+            ? "unknown"
+            : bucketGatherDropProbeFacing(
+                referenceYaw,
+                observation.self.yaw,
+                "radians",
+              ),
+        position:
+          observation === null
+            ? "unknown"
+            : bucketGatherDropProbePosition(
+                observation.self.position,
+                input.origin,
+                input.target,
+              ),
+        candidateSearchMayBeTruncated:
+          observation?.perception.candidateSearchMayBeTruncated ?? "unknown",
+      });
+    },
+    snapshot() {
+      return samples.slice();
+    },
+    overflowed() {
+      return didOverflow;
+    },
+  };
+}
+
+const scopedSafeObserveProbeMarker = Symbol("scopedSafeObserveProbe");
+type SafeObserveMethod = (
+  this: unknown,
+  ...args: unknown[]
+) => PlayerBodyObservation | null;
+
+/** Instrument the existing internal observation path on one Body instance. */
+export function installScopedSafeObserveProbe(
+  body: object,
+  trace: GatherDropProbeObservationTrace,
+): () => void {
+  const carrier = body as { safeObserve?: SafeObserveMethod };
+  const descriptor = Object.getOwnPropertyDescriptor(body, "safeObserve");
+  const original = carrier.safeObserve;
+  if (typeof original !== "function")
+    throw new Error("safeObserve method is unavailable");
+  if (Object.hasOwn(original, scopedSafeObserveProbeMarker))
+    throw new Error("safeObserve method is already wrapped");
+
+  const wrapped: SafeObserveMethod = function (
+    this: unknown,
+    ...args: unknown[]
+  ): PlayerBodyObservation | null {
+    const observation = original.apply(this, args);
+    try {
+      trace.record(observation);
+    } catch {
+      // Diagnostics must not change the operation result.
+    }
+    return observation;
+  };
+  Object.defineProperty(wrapped, scopedSafeObserveProbeMarker, { value: true });
+  Object.defineProperty(body, "safeObserve", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: wrapped,
+  });
+
+  let restored = false;
+  return () => {
+    if (restored) return;
+    if (
+      Object.getOwnPropertyDescriptor(body, "safeObserve")?.value !== wrapped
+    ) {
+      throw new Error("safeObserve method changed while probe was installed");
+    }
+    if (descriptor === undefined)
+      delete (body as { safeObserve?: unknown }).safeObserve;
+    else Object.defineProperty(body, "safeObserve", descriptor);
+    restored = true;
+  };
+}
+
 export type GatherDropProbeExactCountBucket =
   "zero" | "one" | "multiple" | "unknown";
 export type GatherDropProbeExactDeltaBucket =

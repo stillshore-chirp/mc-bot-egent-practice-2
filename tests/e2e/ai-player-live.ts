@@ -36,6 +36,7 @@ import {
   type PlayerItemCollectionOutcome,
   type PlayerItemCollectionPathFailureReason,
   type PlayerBodyObservationOptions,
+  type PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
@@ -181,14 +182,18 @@ import {
   gatherDropProbeTwoStackInventoryEvidence,
   bucketGatherDropProbeFacing,
   bucketGatherDropProbePosition,
+  createGatherDropProbeObservationTrace,
   createGatherDropProbeCapture,
   flattenGatherDropProbeEvidence,
   installScopedExecuteProbe,
+  installScopedSafeObserveProbe,
   withScopedExecuteProbeRestoration,
   type GatherDropProbeCapture,
   type GatherDropProbeCountBucket,
   type GatherDropProbeFacingBucket,
   type GatherDropProbeInventoryCounts,
+  type GatherDropProbeObservationTrace,
+  type GatherDropProbeObservationSample,
   type GatherDropProbePositionBucket,
   type GatherDropProbeTwoStackInventoryEvidence,
 } from "./gather-drop-probe-evidence.js";
@@ -404,6 +409,12 @@ interface GatherDropVisibilityProbeDiagnostic {
   readonly collectPathFailureReason:
     PlayerItemCollectionPathFailureReason | "none" | "not_attempted";
   readonly collectRecoveryRequired: boolean;
+  readonly collectObservationTrace: {
+    readonly samples: readonly GatherDropProbeObservationSample[];
+    readonly overflowed: boolean;
+  };
+  readonly observationProbeInstalled: boolean;
+  readonly observationProbeRestored: boolean;
   readonly afterCollectStage: GatherDropProbeStageDiagnostic;
   readonly fixtureCleanupAttempted: boolean;
   readonly fixtureCleanupConfirmed: boolean;
@@ -8941,6 +8952,9 @@ async function runGatherDropVisibilityProbe(
   );
   let body: PlayerBody | undefined;
   let fixture: GatherMultiTargetFixture | undefined;
+  let collectObservationTrace: GatherDropProbeObservationTrace | undefined;
+  let restoreSafeObserveProbe: (() => void) | undefined;
+  let safeObserveProbeRestored = false;
   let cleanupConfirmed: boolean | undefined;
   let origin: Position | undefined;
   let initialBodyYaw: number | undefined;
@@ -8990,6 +9004,9 @@ async function runGatherDropVisibilityProbe(
     collectOutcome: "not_attempted",
     collectPathFailureReason: "not_attempted",
     collectRecoveryRequired: false,
+    collectObservationTrace: { samples: [], overflowed: false },
+    observationProbeInstalled: false,
+    observationProbeRestored: false,
     afterCollectStage: emptyGatherDropProbeStage(),
     fixtureCleanupAttempted: false,
     fixtureCleanupConfirmed: false,
@@ -9110,8 +9127,17 @@ async function runGatherDropVisibilityProbe(
       await rcon.command(`data get entity ${state.botName} Pos`),
     );
     fixture = await availableGatherMultiTargetFixture(rcon, origin);
+    collectObservationTrace = createGatherDropProbeObservationTrace({
+      origin,
+      target: fixture.birchLog,
+    });
+    restoreSafeObserveProbe = installScopedSafeObserveProbe(
+      body,
+      collectObservationTrace,
+    );
     updateGatherDropVisibilityProbeDiagnostic(state, {
       fixtureSitePreflightConfirmed: true,
+      observationProbeInstalled: true,
     });
     const supportConfirmed = await isBlock(
       rcon,
@@ -9280,13 +9306,26 @@ async function runGatherDropVisibilityProbe(
     }
 
     if (collectEntityId !== undefined && preCollectObservation !== undefined) {
+      const observationTrace = collectObservationTrace;
       updateGatherDropVisibilityProbeDiagnostic(state, {
         collectAttempted: true,
       });
-      const collectResult = await body.execute(
-        { kind: "collect_item", entityId: collectEntityId },
-        abort.signal,
-      );
+      observationTrace.enable(collectEntityId, preCollectObservation.self.yaw);
+      let collectResult: PlayerOperationResult;
+      try {
+        collectResult = await body.execute(
+          { kind: "collect_item", entityId: collectEntityId },
+          abort.signal,
+        );
+      } finally {
+        observationTrace.disable();
+        updateGatherDropVisibilityProbeDiagnostic(state, {
+          collectObservationTrace: {
+            samples: observationTrace.snapshot(),
+            overflowed: observationTrace.overflowed(),
+          },
+        });
+      }
       updateGatherDropVisibilityProbeDiagnostic(state, {
         collectStatus: collectResult.status,
         collectOutcome: collectResult.itemCollectionOutcome ?? "none",
@@ -9322,6 +9361,17 @@ async function runGatherDropVisibilityProbe(
       });
     }
   } finally {
+    if (restoreSafeObserveProbe !== undefined) {
+      try {
+        restoreSafeObserveProbe();
+        safeObserveProbeRestored = true;
+      } catch {
+        safeObserveProbeRestored = false;
+      }
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        observationProbeRestored: safeObserveProbeRestored,
+      });
+    }
     if (fixture !== undefined) {
       updateGatherDropVisibilityProbeDiagnostic(state, {
         fixtureCleanupAttempted: true,
@@ -9355,6 +9405,9 @@ async function runGatherDropVisibilityProbe(
   }
   if (cleanupConfirmed !== true) {
     incomplete("GATHER_DROP_PROBE_CLEANUP_NOT_CONFIRMED");
+  }
+  if (!safeObserveProbeRestored) {
+    incomplete("GATHER_DROP_PROBE_OBSERVATION_WRAPPER_RESTORE_FAILED");
   }
 }
 

@@ -168,6 +168,11 @@ AI_PLAYER_E2E_SERVER_CACHE_DIR=/path/to/paper-cache
 
 初期、dig後、collect前、collect後の各snapshotで、Bodyの位置・向きbucket、白樺とdropの可視状態、候補探索切り詰めbool、およびRCONの位置・向きbucket、白樺block、所持数bucket、drop readback enumを記録します。dig後は最大5秒間、Bodyからdropが一意に見えるかとRCON drop位置を確認し、一意な可視entityがある場合だけBodyの`collect_item`を一度実行します。fixture後片付けではblock air、inventory空、oak/birch dropの既知不在を確認し、unknown返信や照会失敗ではcleanupをpassさせません。artifactに会話、座標、entity ID、RCON返信本文は保存せず、固定bool・enum・bucketだけを記録します。probe runの`pass`はfixtureと診断処理がcleanupまで完了した意味です。dig/collectの成功は`digStatus`、`collectStatus`、`collectOutcome`で個別に判定してください。Paper 1.21.11の測定（2026-09-27、36,984ms）はdig/collect成功、RCON dropの出現・消失、所持増加を確認し、0 API calls / 0 tokens、server・listener・world cleanup 3/3でpassしました。
 
+#### collect中の限定Body観測
+
+- `collect_item`が使う既存の250ms `safeObserve`経路を、そのprobeのBodyインスタンスだけで一時的に包みます。回収試行中の最大16観測を記録し、上限到達は`overflowed` boolで示します。
+- 各sampleは要求dropの可視/不可視、開始時からの向き変化、位置bucket、候補探索切り詰めboolだけです。座標、entity ID、会話、RCON返信は保存せず、collectの合否条件も変えません。
+
 ### 採取probeの二stack所持診断
 
 - `AI_PLAYER_E2E_GATHER_DROP_TWO_STACK=YES`は、`AI_PLAYER_E2E_GATHER_DROP_VISIBILITY_PROBE_ONLY=YES`と併用した時だけ有効です。GPTなしの既存probeに限った追加条件で、未指定時は単独白樺probeの動作を保ちます。
