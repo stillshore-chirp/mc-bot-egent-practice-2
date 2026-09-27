@@ -160,6 +160,7 @@ import {
   gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
   GATHER_MULTI_TARGET_ITEMS,
+  parseGatherMultiTargetInventoryReply,
   hasNewBirchGatherIntent,
   hasNewPostFollowupDigJudgment,
   hasNewPostFollowupDigJudgmentBeforeSecondDig,
@@ -11690,29 +11691,14 @@ async function rconGatherMultiTargetInventoryCounts(
 ): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
   const inventory = await rcon.command(`data get entity ${botName} Inventory`);
   if (
-    !/entity data:\s*\[/iu.test(inventory) ||
     /(?:unknown(?: or incomplete)? command|error|failed|not found)/iu.test(
       inventory,
     )
-  ) {
+  )
     incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
-  }
-  const counts: Record<GatherMultiTargetItem, number> = {
-    oak_log: 0,
-    birch_log: 0,
-  };
-  for (const stack of inventory.matchAll(/\{[^{}]*\}/gu)) {
-    for (const item of GATHER_MULTI_TARGET_ITEMS) {
-      const itemId = new RegExp(`\\bid\\s*:\\s*["']minecraft:${item}["']`, "u");
-      if (!itemId.test(stack[0])) continue;
-      const stackCount = /\b(?:count|Count)\s*:\s*(\d+)(?:[bBsSlL])?\b/u.exec(
-        stack[0],
-      );
-      if (stackCount === null)
-        incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
-      counts[item] += Number(stackCount[1]);
-    }
-  }
+  const counts = parseGatherMultiTargetInventoryReply(inventory);
+  if (counts === undefined)
+    incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
   return counts;
 }
 

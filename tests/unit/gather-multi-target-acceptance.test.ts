@@ -12,6 +12,7 @@ import {
   hasResolvedBirchGatherOwnerGoal,
   identifyFirstGatheredTarget,
   newBirchGatherProposalIds,
+  parseGatherMultiTargetInventoryReply,
   postFollowupGatherActionPairs,
   successfulGatherActionPairs,
 } from "../e2e/gather-multi-target-acceptance.js";
@@ -19,6 +20,51 @@ import {
 const baseline = { oak_log: 0, birch_log: 0 } as const;
 
 describe("multi-target gather E2E acceptance", () => {
+  it("parses top-level target stacks regardless of field order and NBT suffix", () => {
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        'entity data: [{id:"minecraft:oak_log",count:2b,Slot:0b},{Count:3,id:"minecraft:birch_log",Slot:1b}]',
+      ),
+    ).toEqual({ oak_log: 2, birch_log: 3 });
+  });
+
+  it("ignores target names in nested components and quoted text", () => {
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        `entity data: [{components:{"minecraft:custom_name":'{"text":"minecraft:birch_log, count:99"}'},id:"minecraft:oak_log",count:2},{id:"minecraft:stone",count:1,display:{Name:'oak_log minecraft:birch_log'}}]`,
+      ),
+    ).toEqual({ oak_log: 2, birch_log: 0 });
+  });
+
+  it("fails closed when a target stack count is absent, malformed, or ambiguous", () => {
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        'entity data: [{id:"minecraft:oak_log"}]',
+      ),
+    ).toBeUndefined();
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        'entity data: [{id:"minecraft:birch_log",count:many}]',
+      ),
+    ).toBeUndefined();
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        'entity data: [{id:"minecraft:oak_log",count:1,count:2}]',
+      ),
+    ).toBeUndefined();
+  });
+
+  it("fails closed for malformed inventory structure instead of returning zero", () => {
+    expect(
+      parseGatherMultiTargetInventoryReply(
+        'entity data: [{id:"minecraft:oak_log",count:1',
+      ),
+    ).toBeUndefined();
+    expect(
+      parseGatherMultiTargetInventoryReply("command failed"),
+    ).toBeUndefined();
+  });
+
   it("includes the post-cleanup confirmation in pass evidence", () => {
     expect(
       gatherMultiTargetPassEvidence(
