@@ -318,6 +318,7 @@ interface NoFoodReplanDiagnostic {
   waitReasonAndWakeConditionPresent: boolean;
   waitWakeReassessmentObserved: boolean;
   postOutcomeNoFoodStateConfirmed: boolean;
+  postOutcomePurposeJudgmentObserved: boolean;
 }
 const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
   startupStateConfirmed: false,
@@ -328,6 +329,7 @@ const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
   waitReasonAndWakeConditionPresent: false,
   waitWakeReassessmentObserved: false,
   postOutcomeNoFoodStateConfirmed: false,
+  postOutcomePurposeJudgmentObserved: false,
 };
 const EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC: NoFoodContinuityDiagnostic = {
   startupBodyObservationAvailable: false,
@@ -2791,6 +2793,19 @@ export function classifyNoFoodReplanDecision(
   return operation === "consume" ? "consume" : "alternative";
 }
 
+export function isNoFoodReplanPurposeAfterOutcome(
+  judgmentAt: string | undefined,
+  outcomeObservedAt: string | undefined,
+): boolean {
+  const judgmentTime = Date.parse(judgmentAt ?? "");
+  const outcomeTime = Date.parse(outcomeObservedAt ?? "");
+  return (
+    Number.isFinite(judgmentTime) &&
+    Number.isFinite(outcomeTime) &&
+    judgmentTime > outcomeTime
+  );
+}
+
 export function noFoodReplanBeforeCallBlockReason(
   callsStarted: number,
   usageUnknownCalls: number,
@@ -3095,6 +3110,33 @@ async function runNoFoodReplanCase(
     if (outcomeStatus === "successful") {
       if (currentClass === "consume")
         fail("NO_FOOD_CONSUME_SUCCESS_CONTRADICTS_EMPTY_INVENTORY");
+      const outcomeObservedAt = Date.parse(outcome.observedAt ?? "");
+      if (!Number.isFinite(outcomeObservedAt))
+        incomplete("NO_FOOD_BODY_OUTCOME_TIME_NOT_AVAILABLE");
+      const remainingMs = context.caseDeadlineAt - Date.now();
+      const postOutcomePlayer = await observeForPlayer(
+        context,
+        Math.min(60_000, Math.max(1, remainingMs)),
+        (snapshot) => {
+          assertNoFoodReplanUsage(context, snapshot);
+          return snapshot.recentJudgments.some((item) =>
+            isNoFoodReplanPurposeAfterOutcome(
+              item.decidedAt,
+              outcome.observedAt,
+            ),
+          );
+        },
+      );
+      const postOutcomePurposeJudgmentObserved =
+        postOutcomePlayer?.recentJudgments.some((item) =>
+          isNoFoodReplanPurposeAfterOutcome(item.decidedAt, outcome.observedAt),
+        ) ?? false;
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        postOutcomePurposeJudgmentObserved,
+      };
+      if (!postOutcomePurposeJudgmentObserved)
+        incomplete("NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED");
       return {
         ...state.noFoodReplanDiagnostic,
         startupOraclesConfirmed: true,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifyNoFoodReplanDecision,
+  isNoFoodReplanPurposeAfterOutcome,
   noFoodReplanBeforeCallBlockReason,
   noFoodReplanOraclesConfirmed,
   NO_FOOD_REPLAN_CASE_BUDGET,
@@ -56,6 +57,27 @@ describe("no-food replan targeted E2E case", () => {
     expect(noFoodReplanOraclesConfirmed(4, 4, 13, 13, true, true)).toBe(true);
     expect(noFoodReplanOraclesConfirmed(4, 3, 13, 13, true, true)).toBe(false);
     expect(noFoodReplanOraclesConfirmed(4, 4, 13, 12, true, true)).toBe(false);
+  });
+
+  it("accepts only a Purpose judgment timestamped after the successful outcome", () => {
+    expect(
+      isNoFoodReplanPurposeAfterOutcome(
+        "2026-01-01T00:00:02.000Z",
+        "2026-01-01T00:00:01.000Z",
+      ),
+    ).toBe(true);
+    expect(
+      isNoFoodReplanPurposeAfterOutcome(
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:01.000Z",
+      ),
+    ).toBe(false);
+    expect(
+      isNoFoodReplanPurposeAfterOutcome(
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:01.000Z",
+      ),
+    ).toBe(false);
   });
 
   it("selects no_food_replan without unrelated prerequisites", () => {
