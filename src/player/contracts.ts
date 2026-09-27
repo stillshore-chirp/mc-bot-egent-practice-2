@@ -216,7 +216,10 @@ export interface PlayerDeathMemory {
   readonly observedAt: string;
   readonly beforeObservation?: PlayerObservationEvidence | undefined;
   readonly firstPostDeathObservation?: PlayerObservationEvidence | undefined;
+  readonly recoveryStagesUsed?: readonly PlayerDeathRecoveryStage[] | undefined;
 }
+
+export type PlayerDeathRecoveryStage = "approach" | "sweep" | "collect";
 
 export interface PlayerGoalChange {
   readonly id?: string;

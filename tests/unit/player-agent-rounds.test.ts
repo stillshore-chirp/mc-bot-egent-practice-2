@@ -16,6 +16,7 @@ import type {
 } from "../../src/minecraft/player-body.js";
 import type {
   PlayerMemoryPort,
+  PlayerObservationEvidence,
   PlayerThoughtDecision,
   PlayerRuntimeSnapshot,
 } from "../../src/player/contracts.js";
@@ -27,6 +28,7 @@ import {
   PlayerPurposeAgent,
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
+import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 import type { PlayerResponsesClient } from "../../src/player/responses.js";
 import { toSpatialView } from "../../src/player/spatial-view.js";
 
@@ -2255,6 +2257,465 @@ describe("player agent response rounds", () => {
       }
     },
   );
+
+  it("rejects a snapshot invalidated by the initial Body observation callback", async () => {
+    const observation = bodyObservationFixture();
+    const fixtureRef: { current: PurposeFixture | undefined } = {
+      current: undefined,
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "action-after-observation-revision",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => observation,
+      () => {
+        fixtureRef.current?.mind.enqueueEvent(
+          "state_changed",
+          "Synthetic observation callback revision.",
+        );
+      },
+    );
+    fixtureRef.current = fixture;
+
+    try {
+      const inputSnapshot = fixture.mind.snapshot();
+      const result = await fixture.agent.think({
+        snapshot: inputSnapshot,
+        events: [],
+      });
+      expect(result.accepted).toBe(false);
+      expect(fixture.mind.snapshot().revision).toBe(inputSnapshot.revision + 1);
+      expect(fixture.requests).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps death recovery bounded across wakes, reconnects, and outcome history rollover", async () => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const before = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:00.000Z",
+      self: {
+        ...bodyObservationFixture().self,
+        position: { x: 30, y: 64, z: 0, dimension: "overworld" },
+      },
+    };
+    const firstPostDeath = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:08.000Z",
+    };
+    const current = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:20.000Z",
+    };
+    const fixture = openPurposeFixture(
+      [
+        (request) => {
+          expect(requestUserPayload(request).deathRecovery).toMatchObject({
+            deathObservedAt: deathAt,
+            elapsedSinceDeathMs: 15_000,
+            anchorStatus: "ready",
+            approachUsed: false,
+            sweepUsed: false,
+            collectUsed: false,
+          });
+          return functionCallResponse(
+            "approach-last-observed-area",
+            "commit_action_decision",
+            deathRecoveryActionArguments(deathAt, "approach", {
+              kind: "move_to",
+              position: { x: 30, y: 64, z: 0 },
+              range: 1,
+            }),
+          );
+        },
+        functionCallResponse(
+          "resume-recovery-after-reconnect",
+          "commit_action_decision",
+          {
+            ...actionArguments(),
+            kind: "continue",
+            operationJson: "",
+            reason: "Continue the prior recovery movement.",
+            wakeOn: ["body_outcome"],
+          },
+        ),
+        functionCallResponse(
+          "repeat-recovery-approach",
+          "commit_action_decision",
+          deathRecoveryActionArguments(deathAt, "approach", {
+            kind: "move_to",
+            position: { x: 30, y: 64, z: 0 },
+            range: 1,
+          }),
+        ),
+        functionCallResponse(
+          "wait-after-recovery-budget",
+          "commit_action_decision",
+          deathRecoveryWaitArguments(),
+        ),
+        functionCallResponse(
+          "repeat-after-outcome-history-rollover",
+          "commit_action_decision",
+          deathRecoveryActionArguments(deathAt, "approach", {
+            kind: "move_to",
+            position: { x: 30, y: 64, z: 0 },
+            range: 1,
+          }),
+        ),
+        functionCallResponse(
+          "wait-after-outcome-history-rollover",
+          "commit_action_decision",
+          deathRecoveryWaitArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => current,
+    );
+
+    try {
+      const deathEvent = recordDeathScenario(
+        fixture.mind,
+        toObservationEvidence(before),
+        deathAt,
+        toObservationEvidence(firstPostDeath),
+      );
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [deathEvent],
+      });
+      expect(first.accepted).toBe(true);
+      expect(fixture.mind.snapshot().activeOperation?.expectedOutcome).toBe(
+        `[death-recovery:${deathAt}:approach] Move once toward the last observed area.`,
+      );
+      expect(fixture.mind.snapshot().latestDeath?.recoveryStagesUsed).toEqual([
+        "approach",
+      ]);
+
+      const afterReconnect = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "synthetic-reconnect-event",
+            kind: "reconnected",
+            summary: "Synthetic reconnect for a bounded recovery fixture.",
+            createdAt: "2026-09-25T00:00:21.000Z",
+          },
+        ],
+      });
+      expect(afterReconnect.accepted).toBe(true);
+      expect(afterReconnect.decision?.kind).toBe("wait");
+      expect(
+        requestUserPayload(fixture.requests[1]).deathRecovery,
+      ).toMatchObject({ approachUsed: true });
+      expect(JSON.stringify(fixture.requests[2])).toContain(
+        "DEATH_RECOVERY_RECONNECT_REQUIRES_REPLAN",
+      );
+      expect(JSON.stringify(fixture.requests[3])).toContain(
+        "DEATH_RECOVERY_STEP_ALREADY_USED",
+      );
+      for (let index = 0; index < 30; index += 1) {
+        fixture.mind.recordOutcome({
+          evidence: {
+            operationId: `synthetic-follow-up-${index}`,
+            kind: "look",
+            status: "successful",
+            summary: "Synthetic unrelated outcome for history retention.",
+            observedAt: new Date(
+              Date.parse(deathAt) + 30_000 + index * 1_000,
+            ).toISOString(),
+          },
+        });
+      }
+      expect(fixture.mind.snapshot().recentOutcomes).toHaveLength(24);
+      expect(
+        fixture.mind
+          .snapshot()
+          .recentOutcomes.some((outcome) =>
+            outcome.expectedOutcome?.startsWith(
+              `[death-recovery:${deathAt}:approach]`,
+            ),
+          ),
+      ).toBe(false);
+
+      const afterHistoryRollover = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(afterHistoryRollover.accepted).toBe(true);
+      expect(afterHistoryRollover.decision?.kind).toBe("wait");
+      expect(
+        requestUserPayload(fixture.requests[5]).deathRecovery,
+      ).toMatchObject({ approachUsed: true });
+      expect(JSON.stringify(fixture.requests[5])).toContain(
+        "DEATH_RECOVERY_STEP_ALREADY_USED",
+      );
+      expect(fixture.requests).toHaveLength(6);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("allows one nearby death-site sweep and persists its one-attempt budget", async () => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const before = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:00.000Z",
+    };
+    const firstPostDeath = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:08.000Z",
+    };
+    const current = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:20.000Z",
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "first-bounded-death-sweep",
+          "commit_action_decision",
+          deathRecoveryActionArguments(deathAt, "sweep", {
+            kind: "look_sweep",
+            pitchDegrees: -25,
+          }),
+        ),
+        functionCallResponse(
+          "repeat-bounded-death-sweep",
+          "commit_action_decision",
+          deathRecoveryActionArguments(deathAt, "sweep", {
+            kind: "look_sweep",
+            pitchDegrees: -25,
+          }),
+        ),
+        functionCallResponse(
+          "wait-after-used-death-sweep",
+          "commit_action_decision",
+          deathRecoveryWaitArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => current,
+    );
+
+    try {
+      const deathEvent = recordDeathScenario(
+        fixture.mind,
+        toObservationEvidence(before),
+        deathAt,
+        toObservationEvidence(firstPostDeath),
+      );
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [deathEvent],
+      });
+      expect(first.accepted).toBe(true);
+      expect(fixture.mind.snapshot().latestDeath?.recoveryStagesUsed).toEqual([
+        "sweep",
+      ]);
+
+      const second = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(second.accepted).toBe(true);
+      expect(second.decision?.kind).toBe("wait");
+      expect(JSON.stringify(fixture.requests[2])).toContain(
+        "DEATH_RECOVERY_STEP_ALREADY_USED",
+      );
+      expect(fixture.requests).toHaveLength(3);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each([
+    "missing pre-death position",
+    "dimension mismatch",
+    "current hazard",
+    "hazard appears before commit",
+    "unavailable current observation",
+    "stale current observation",
+    "invisible drop",
+    "unmarked anchor approach",
+    "sweep beyond visible range",
+  ] as const)("does not commit death recovery with %s", async (failure) => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const baseBefore = bodyObservationFixture();
+    const beforeBody = {
+      ...baseBefore,
+      observedAt: "2026-09-25T00:00:00.000Z",
+      self: {
+        ...baseBefore.self,
+        position: {
+          ...baseBefore.self.position,
+          x: failure === "sweep beyond visible range" ? 30 : 0,
+        },
+      },
+    };
+    const beforeEvidence = toObservationEvidence(beforeBody);
+    if (failure === "missing pre-death position")
+      delete (beforeEvidence as { position?: unknown }).position;
+    const firstPostDeath = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:08.000Z",
+    };
+    let current = {
+      ...bodyObservationFixture(),
+      observedAt: "2026-09-25T00:00:20.000Z",
+    };
+    if (failure === "dimension mismatch")
+      current = {
+        ...current,
+        dimension: "nether",
+        self: {
+          ...current.self,
+          position: { ...current.self.position, dimension: "nether" },
+        },
+      };
+    if (failure === "current hazard")
+      current = {
+        ...current,
+        self: { ...current.self, inLava: true },
+      };
+    if (failure === "stale current observation")
+      current = { ...current, observedAt: deathAt };
+    const expectedAnchorStatus = {
+      "missing pre-death position": "death_position_unavailable",
+      "dimension mismatch": "dimension_mismatch",
+      "current hazard": "current_hazard_observed",
+      "hazard appears before commit": "ready",
+      "unavailable current observation": "current_body_unavailable",
+      "stale current observation": "current_observation_not_after_death",
+      "invisible drop": "ready",
+      "unmarked anchor approach": "ready",
+      "sweep beyond visible range": "ready",
+    }[failure];
+    const expectedCode =
+      failure === "invisible drop"
+        ? "DEATH_RECOVERY_TARGET_NOT_CURRENTLY_VISIBLE"
+        : failure === "unmarked anchor approach"
+          ? "DEATH_RECOVERY_MARKER_REQUIRED"
+          : failure === "sweep beyond visible range"
+            ? "DEATH_RECOVERY_APPROACH_REQUIRED"
+            : "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
+    const action =
+      failure === "invisible drop"
+        ? ({ kind: "collect_item", entityId: 77 } as const)
+        : failure === "sweep beyond visible range"
+          ? ({ kind: "look_sweep", pitchDegrees: -25 } as const)
+          : ({
+              kind: "move_to",
+              position: { x: 0, y: 64, z: 0 },
+              range: 1,
+            } as const);
+    const hazardousCurrent = {
+      ...current,
+      self: { ...current.self, inLava: true },
+    };
+    let observations = 0;
+    const fixture = openPurposeFixture(
+      [
+        (request) => {
+          expect(requestUserPayload(request).deathRecovery).toMatchObject({
+            anchorStatus: expectedAnchorStatus,
+          });
+          const actionInput =
+            failure === "unmarked anchor approach"
+              ? {
+                  ...actionArguments(),
+                  operationJson: JSON.stringify(action),
+                  expectedOutcome: "Approach the remembered area once.",
+                }
+              : deathRecoveryActionArguments(
+                  deathAt,
+                  failure === "invisible drop"
+                    ? "collect"
+                    : failure === "sweep beyond visible range"
+                      ? "sweep"
+                      : "approach",
+                  action,
+                );
+          return functionCallResponse(
+            `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
+            "commit_action_decision",
+            actionInput,
+          );
+        },
+        functionCallResponse(
+          `wait-after-${failure.replaceAll(" ", "-")}`,
+          "commit_action_decision",
+          deathRecoveryWaitArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      failure === "unavailable current observation"
+        ? async () => {
+            throw new Error("SYNTHETIC_OBSERVATION_UNAVAILABLE");
+          }
+        : failure === "hazard appears before commit"
+          ? async () => {
+              observations += 1;
+              return observations === 1 ? current : hazardousCurrent;
+            }
+          : async () => current,
+    );
+
+    try {
+      recordDeathScenario(
+        fixture.mind,
+        beforeEvidence,
+        deathAt,
+        toObservationEvidence(firstPostDeath),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(true);
+      expect(result.decision?.kind).toBe("wait");
+      expect(JSON.stringify(fixture.requests[1])).toContain(expectedCode);
+      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not request or commit recovery while the owner stop latch is set", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "recovery-while-stopped",
+        "commit_action_decision",
+        deathRecoveryActionArguments("2026-09-25T00:00:05.000Z", "approach", {
+          kind: "move_to",
+          position: { x: 0, y: 64, z: 0 },
+          range: 1,
+        }),
+      ),
+    ]);
+    try {
+      fixture.mind.stop();
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(0);
+      expect(fixture.mind.snapshot().stopped).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
 });
 
 type ScriptedResponse =
@@ -2278,6 +2739,7 @@ function openPurposeFixture(
   ) => void = () => undefined,
   memory: PlayerMemoryPort = createMemoryPort(),
   observeBody?: () => Promise<PlayerBodyObservation>,
+  onObservation?: (observation: PlayerBodyObservation) => void,
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-agent-rounds-"));
   temporaryDirectories.push(directory);
@@ -2310,6 +2772,7 @@ function openPurposeFixture(
     ownerPlayerId: "owner-player",
     logger: pino({ level: "silent" }),
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
+    ...(onObservation === undefined ? {} : { onObservation }),
     onCommitted,
   });
   return {
@@ -2326,6 +2789,19 @@ function openPurposeFixture(
       mind.close();
     },
   };
+}
+
+function recordDeathScenario(
+  mind: PlayerMindStore,
+  beforeObservation: PlayerObservationEvidence,
+  deathAt: string,
+  firstPostDeathObservation?: PlayerObservationEvidence,
+) {
+  mind.recordObservation(beforeObservation);
+  const event = mind.recordDeathEvent(deathAt, "Synthetic death event.");
+  if (firstPostDeathObservation !== undefined)
+    mind.recordObservation(firstPostDeathObservation);
+  return event;
 }
 
 function bodyObservationFixture(): PlayerBodyObservation {
@@ -2614,6 +3090,39 @@ function actionArguments(
     wakeOn: [],
     wakeAt: "",
     ...(stateUpdates === undefined ? {} : { stateUpdates }),
+  };
+}
+
+function deathRecoveryActionArguments(
+  observedAt: string,
+  stage: "approach" | "sweep" | "collect",
+  operation: PlayerOperation,
+): Record<string, unknown> {
+  const stageDescription = {
+    approach: "Move once toward the last observed area.",
+    sweep: "Inspect the currently visible area once.",
+    collect: "Try the currently visible item once.",
+  }[stage];
+  return {
+    ...actionArguments(),
+    purpose: "Make one bounded recovery observation.",
+    operationJson: JSON.stringify(operation),
+    expectedOutcome: `[death-recovery:${observedAt}:${stage}] ${stageDescription}`,
+    reason:
+      "The marker records one finite recovery stage for this death event.",
+    wakeOn: ["body_outcome"],
+  };
+}
+
+function deathRecoveryWaitArguments(): Record<string, unknown> {
+  return {
+    ...actionArguments(),
+    kind: "wait",
+    operationJson: "",
+    purpose: "Wait for an observable change before further recovery judgment.",
+    expectedOutcome: "An owner or body event may justify a new judgment.",
+    reason: "The bounded recovery stages are unavailable or already used.",
+    wakeOn: ["state_changed"],
   };
 }
 
