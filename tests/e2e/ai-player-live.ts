@@ -176,6 +176,11 @@ import {
   bucketGatherDropProbeCount,
   bucketGatherDropProbeFacing,
   bucketGatherDropProbePosition,
+  createGatherDropProbeCapture,
+  flattenGatherDropProbeEvidence,
+  installScopedExecuteProbe,
+  withScopedExecuteProbeRestoration,
+  type GatherDropProbeCapture,
   type GatherDropProbeCountBucket,
   type GatherDropProbeFacingBucket,
   type GatherDropProbePositionBucket,
@@ -1825,6 +1830,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "gather_multi_target_continuity"
       ? (state.gatherMultiTargetContinuityDiagnostic ?? {})
       : {}),
+    ...(caseId === "gather_multi_target_continuity"
+      ? (state.gatherDropProbeEvidence ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2120,6 +2128,7 @@ function updateLearningFixtureDiagnostic(
 }
 
 function beginGatherMultiTargetContinuityDiagnostic(state: RunState): void {
+  delete state.gatherDropProbeEvidence;
   state.gatherMultiTargetContinuityDiagnostic = {
     caseStarted: true,
     fixtureConfigured: false,
@@ -2564,6 +2573,7 @@ interface RunState {
   learningReuseStage?: LearningReuseStage;
   learningReuseOwnerProposalRecorded?: boolean;
   gatherMultiTargetContinuityDiagnostic?: GatherMultiTargetContinuityDiagnostic;
+  gatherDropProbeEvidence?: Readonly<Record<string, boolean | number | string>>;
   gatherBodyVisibilityProbeDiagnostic?: GatherBodyVisibilityProbeDiagnostic;
   gatherDropVisibilityProbeDiagnostic?: GatherDropVisibilityProbeDiagnostic;
   firstDigLearningDiagnostic?: FirstDigLearningDiagnostic;
@@ -3906,6 +3916,8 @@ async function main(): Promise<void> {
       async (context) => {
         beginGatherMultiTargetContinuityDiagnostic(state);
         let fixture: GatherMultiTargetFixture | undefined;
+        let gatherDropProbe: GatherDropProbeCapture | undefined;
+        let restoreGatherDropProbe: (() => void) | undefined;
         let completedBodyGatherCount: number;
         try {
           const quietPlayer = await observeForPlayer(
@@ -4082,6 +4094,15 @@ async function main(): Promise<void> {
             ),
             ...observedGatherOutcomes.keys(),
           ]);
+          gatherDropProbe = createGatherDropProbeCapture({
+            origin,
+            target: configuredFixture.birchLog,
+          });
+          restoreGatherDropProbe = installScopedExecuteProbe(
+            MineflayerPlayerBody.prototype,
+            () => gatherDropProbe,
+          );
+          gatherDropProbe.enable();
           const followupSentAt = new Date().toISOString();
           sendChat(context.owner, "白樺の原木もお願い。");
           updateGatherMultiTargetContinuityDiagnostic(state, {
@@ -4192,41 +4213,59 @@ async function main(): Promise<void> {
             ...observedGatherOutcomes.values(),
           ]);
         } finally {
-          if (fixture !== undefined) {
-            let fixtureCleanupConfirmed: boolean;
-            try {
-              fixtureCleanupConfirmed = await cleanupGatherMultiTargetFixture(
-                context.rcon,
-                context.botName,
-                fixture,
-                (progress) => {
-                  const cleanupReadbackUpdate: Partial<GatherMultiTargetContinuityDiagnostic> =
-                    {
-                      ...(progress.oakDropReadbackClass === undefined
-                        ? {}
-                        : {
-                            oakDropReadbackClass: progress.oakDropReadbackClass,
-                          }),
-                      ...(progress.birchDropReadbackClass === undefined
-                        ? {}
-                        : {
-                            birchDropReadbackClass:
-                              progress.birchDropReadbackClass,
-                          }),
-                    };
-                  updateGatherMultiTargetContinuityDiagnostic(
-                    state,
-                    cleanupReadbackUpdate,
-                  );
-                },
-              );
-            } catch {
-              fixtureCleanupConfirmed = false;
-            }
-            updateGatherMultiTargetContinuityDiagnostic(state, {
-              fixtureCleanupConfirmed,
-            });
-          }
+          await withScopedExecuteProbeRestoration(
+            restoreGatherDropProbe,
+            async () => {
+              try {
+                gatherDropProbe?.disable();
+                if (gatherDropProbe !== undefined) {
+                  state.gatherDropProbeEvidence =
+                    flattenGatherDropProbeEvidence(
+                      gatherDropProbe.snapshot(),
+                      gatherDropProbe.counts(),
+                    );
+                }
+              } finally {
+                if (fixture !== undefined) {
+                  let fixtureCleanupConfirmed: boolean;
+                  try {
+                    fixtureCleanupConfirmed =
+                      await cleanupGatherMultiTargetFixture(
+                        context.rcon,
+                        context.botName,
+                        fixture,
+                        (progress) => {
+                          const cleanupReadbackUpdate: Partial<GatherMultiTargetContinuityDiagnostic> =
+                            {
+                              ...(progress.oakDropReadbackClass === undefined
+                                ? {}
+                                : {
+                                    oakDropReadbackClass:
+                                      progress.oakDropReadbackClass,
+                                  }),
+                              ...(progress.birchDropReadbackClass === undefined
+                                ? {}
+                                : {
+                                    birchDropReadbackClass:
+                                      progress.birchDropReadbackClass,
+                                  }),
+                            };
+                          updateGatherMultiTargetContinuityDiagnostic(
+                            state,
+                            cleanupReadbackUpdate,
+                          );
+                        },
+                      );
+                  } catch {
+                    fixtureCleanupConfirmed = false;
+                  }
+                  updateGatherMultiTargetContinuityDiagnostic(state, {
+                    fixtureCleanupConfirmed,
+                  });
+                }
+              }
+            },
+          );
         }
         if (
           state.gatherMultiTargetContinuityDiagnostic
@@ -4234,10 +4273,13 @@ async function main(): Promise<void> {
         ) {
           incomplete("GATHER_MULTI_TARGET_FIXTURE_CLEANUP_NOT_CONFIRMED");
         }
-        return gatherMultiTargetPassEvidence(
-          state.gatherMultiTargetContinuityDiagnostic,
-          completedBodyGatherCount,
-        );
+        return {
+          ...gatherMultiTargetPassEvidence(
+            state.gatherMultiTargetContinuityDiagnostic,
+            completedBodyGatherCount,
+          ),
+          ...(state.gatherDropProbeEvidence ?? {}),
+        };
       },
     );
 
@@ -12568,7 +12610,13 @@ async function writeArtifact(state: RunState): Promise<void> {
       },
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
       gatherMultiTargetContinuity:
-        state.gatherMultiTargetContinuityDiagnostic ?? null,
+        state.gatherMultiTargetContinuityDiagnostic === undefined &&
+        state.gatherDropProbeEvidence === undefined
+          ? null
+          : {
+              ...(state.gatherMultiTargetContinuityDiagnostic ?? {}),
+              ...(state.gatherDropProbeEvidence ?? {}),
+            },
       gatherMultiTargetBodyVisibilityProbe:
         state.gatherBodyVisibilityProbeDiagnostic ?? null,
       gatherDropVisibilityProbe:
