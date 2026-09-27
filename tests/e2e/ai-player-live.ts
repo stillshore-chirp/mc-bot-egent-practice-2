@@ -283,6 +283,29 @@ interface GatherMultiTargetFixture {
   readonly oakLog: BlockPosition;
   readonly birchLog: BlockPosition;
 }
+type GatherFixtureCleanupStage =
+  | "not_started"
+  | "commands_started"
+  | "commands_returned"
+  | "oak_block_readback"
+  | "birch_block_readback"
+  | "inventory_readback"
+  | "oak_drop_readback"
+  | "birch_drop_readback"
+  | "readbacks_complete";
+interface GatherMultiTargetFixtureCleanupDiagnostic {
+  stage: GatherFixtureCleanupStage;
+  oakBlockReadbackConfirmed: boolean;
+  oakBlockAirConfirmed: boolean;
+  birchBlockReadbackConfirmed: boolean;
+  birchBlockAirConfirmed: boolean;
+  inventoryReadbackConfirmed: boolean;
+  inventoryEmptyConfirmed: boolean;
+  oakDropReadbackConfirmed: boolean;
+  oakDropAbsentConfirmed: boolean;
+  birchDropReadbackConfirmed: boolean;
+  birchDropAbsentConfirmed: boolean;
+}
 interface GatherBodyVisibilityProbeDiagnostic {
   clientConnected: boolean;
   fixtureSitePreflightConfirmed: boolean;
@@ -293,9 +316,18 @@ interface GatherBodyVisibilityProbeDiagnostic {
   oakTargetVisibleInBody: boolean;
   birchTargetVisibleInBody: boolean;
   bothTargetsVisibleInBody: boolean;
+  oakTargetVisibleInFirstFreshObservation: boolean;
+  birchTargetVisibleInFirstFreshObservation: boolean;
+  bothTargetsVisibleInFirstFreshObservation: boolean;
+  followupBodyObservationObserved: boolean;
+  oakTargetVisibleInAnyFollowupObservation: boolean;
+  birchTargetVisibleInAnyFollowupObservation: boolean;
+  bothTargetsVisibleInAnyFollowupObservation: boolean;
   candidateSearchMayBeTruncated?: boolean;
+  followupCandidateSearchMayBeTruncated?: boolean;
   fixtureCleanupAttempted: boolean;
   fixtureCleanupConfirmed: boolean;
+  fixtureCleanupReadback: GatherMultiTargetFixtureCleanupDiagnostic;
 }
 type LearningFixturePhase = "initial" | "reuse";
 type SkillExchangeStage =
@@ -8148,8 +8180,28 @@ async function runGatherBodyVisibilityProbe(
     oakTargetVisibleInBody: false,
     birchTargetVisibleInBody: false,
     bothTargetsVisibleInBody: false,
+    oakTargetVisibleInFirstFreshObservation: false,
+    birchTargetVisibleInFirstFreshObservation: false,
+    bothTargetsVisibleInFirstFreshObservation: false,
+    followupBodyObservationObserved: false,
+    oakTargetVisibleInAnyFollowupObservation: false,
+    birchTargetVisibleInAnyFollowupObservation: false,
+    bothTargetsVisibleInAnyFollowupObservation: false,
     fixtureCleanupAttempted: false,
     fixtureCleanupConfirmed: false,
+    fixtureCleanupReadback: {
+      stage: "not_started",
+      oakBlockReadbackConfirmed: false,
+      oakBlockAirConfirmed: false,
+      birchBlockReadbackConfirmed: false,
+      birchBlockAirConfirmed: false,
+      inventoryReadbackConfirmed: false,
+      inventoryEmptyConfirmed: false,
+      oakDropReadbackConfirmed: false,
+      oakDropAbsentConfirmed: false,
+      birchDropReadbackConfirmed: false,
+      birchDropAbsentConfirmed: false,
+    },
   };
   state.gatherBodyVisibilityProbeDiagnostic = diagnostic;
   try {
@@ -8209,23 +8261,68 @@ async function runGatherBodyVisibilityProbe(
       await waitMs(50);
     }
     if (observation !== undefined) {
-      const oakTargetVisibleInBody =
+      const oakTargetVisibleInFirstFreshObservation =
         observedBlockName(observation, fixture.oakLog) === "oak_log";
-      const birchTargetVisibleInBody =
+      const birchTargetVisibleInFirstFreshObservation =
         observedBlockName(observation, fixture.birchLog) === "birch_log";
-      diagnostic.oakTargetVisibleInBody = oakTargetVisibleInBody;
-      diagnostic.birchTargetVisibleInBody = birchTargetVisibleInBody;
+      const bothTargetsVisibleInFirstFreshObservation =
+        oakTargetVisibleInFirstFreshObservation &&
+        birchTargetVisibleInFirstFreshObservation;
+      diagnostic.oakTargetVisibleInFirstFreshObservation =
+        oakTargetVisibleInFirstFreshObservation;
+      diagnostic.birchTargetVisibleInFirstFreshObservation =
+        birchTargetVisibleInFirstFreshObservation;
+      diagnostic.bothTargetsVisibleInFirstFreshObservation =
+        bothTargetsVisibleInFirstFreshObservation;
+      diagnostic.oakTargetVisibleInBody =
+        oakTargetVisibleInFirstFreshObservation;
+      diagnostic.birchTargetVisibleInBody =
+        birchTargetVisibleInFirstFreshObservation;
       diagnostic.bothTargetsVisibleInBody =
-        oakTargetVisibleInBody && birchTargetVisibleInBody;
+        bothTargetsVisibleInFirstFreshObservation;
       diagnostic.candidateSearchMayBeTruncated =
         observation.perception.candidateSearchMayBeTruncated;
+
+      const followupDeadline = Date.now() + 5_000;
+      while (!abort.signal.aborted && Date.now() < followupDeadline) {
+        await waitMs(250);
+        const candidate = await body.observe();
+        const observedAt = Date.parse(candidate.observedAt);
+        if (!Number.isFinite(observedAt) || observedAt < fixtureConfiguredAt)
+          continue;
+        const oakVisible =
+          observedBlockName(candidate, fixture.oakLog) === "oak_log";
+        const birchVisible =
+          observedBlockName(candidate, fixture.birchLog) === "birch_log";
+        const bothVisible = oakVisible && birchVisible;
+        diagnostic.followupBodyObservationObserved = true;
+        diagnostic.oakTargetVisibleInAnyFollowupObservation ||= oakVisible;
+        diagnostic.birchTargetVisibleInAnyFollowupObservation ||= birchVisible;
+        diagnostic.bothTargetsVisibleInAnyFollowupObservation ||= bothVisible;
+        diagnostic.oakTargetVisibleInBody ||= oakVisible;
+        diagnostic.birchTargetVisibleInBody ||= birchVisible;
+        diagnostic.bothTargetsVisibleInBody ||= bothVisible;
+        diagnostic.followupCandidateSearchMayBeTruncated =
+          diagnostic.followupCandidateSearchMayBeTruncated === true ||
+          candidate.perception.candidateSearchMayBeTruncated;
+      }
     }
   } finally {
     if (fixture !== undefined) {
       diagnostic.fixtureCleanupAttempted = true;
       try {
         diagnostic.fixtureCleanupConfirmed =
-          await cleanupGatherMultiTargetFixture(rcon, state.botName, fixture);
+          await cleanupGatherMultiTargetFixture(
+            rcon,
+            state.botName,
+            fixture,
+            (update) => {
+              diagnostic.fixtureCleanupReadback = {
+                ...diagnostic.fixtureCleanupReadback,
+                ...update,
+              };
+            },
+          );
       } catch {
         diagnostic.fixtureCleanupConfirmed = false;
       }
@@ -8236,6 +8333,8 @@ async function runGatherBodyVisibilityProbe(
   }
   if (!diagnostic.freshBodyObservationObserved)
     incomplete("GATHER_BODY_VISIBILITY_PROBE_FRESH_OBSERVATION_UNAVAILABLE");
+  if (!diagnostic.followupBodyObservationObserved)
+    incomplete("GATHER_BODY_VISIBILITY_PROBE_FOLLOWUP_OBSERVATION_UNAVAILABLE");
   if (
     !diagnostic.fixtureCleanupAttempted ||
     !diagnostic.fixtureCleanupConfirmed
@@ -10750,11 +10849,15 @@ async function cleanupGatherMultiTargetFixture(
   rcon: LocalRcon,
   botName: string,
   fixture: GatherMultiTargetFixture,
+  onProgress?: (
+    update: Partial<GatherMultiTargetFixtureCleanupDiagnostic>,
+  ) => void,
 ): Promise<boolean> {
   const positions = [
     { position: fixture.oakLog, item: "oak_log" },
     { position: fixture.birchLog, item: "birch_log" },
   ] as const;
+  onProgress?.({ stage: "commands_started" });
   for (const { position, item } of positions) {
     await rcon.command(
       `fill ${position.x} ${position.y} ${position.z} ${position.x} ${position.y} ${position.z} air replace ${item}`,
@@ -10766,23 +10869,56 @@ async function cleanupGatherMultiTargetFixture(
   for (const item of GATHER_MULTI_TARGET_ITEMS) {
     await rcon.command(`clear ${botName} minecraft:${item}`);
   }
+  onProgress?.({ stage: "commands_returned" });
+  onProgress?.({ stage: "oak_block_readback" });
+  const oakBlockAirConfirmed = await isBlock(rcon, fixture.oakLog, "air");
+  onProgress?.({
+    stage: "birch_block_readback",
+    oakBlockReadbackConfirmed: true,
+    oakBlockAirConfirmed,
+  });
+  const birchBlockAirConfirmed = await isBlock(rcon, fixture.birchLog, "air");
+  onProgress?.({
+    stage: "inventory_readback",
+    birchBlockReadbackConfirmed: true,
+    birchBlockAirConfirmed,
+  });
   const finalCounts = await rconGatherMultiTargetInventoryCounts(rcon, botName);
+  const inventoryEmptyConfirmed = GATHER_MULTI_TARGET_ITEMS.every(
+    (item) => finalCounts[item] === 0,
+  );
+  onProgress?.({
+    stage: "oak_drop_readback",
+    inventoryReadbackConfirmed: true,
+    inventoryEmptyConfirmed,
+  });
   const remainingOakDrop = await rconGatherItemDropPositionNear(
     rcon,
     fixture.oakLog,
     "oak_log",
   );
+  onProgress?.({
+    stage: "birch_drop_readback",
+    oakDropReadbackConfirmed: true,
+    oakDropAbsentConfirmed: remainingOakDrop === undefined,
+  });
   const remainingBirchDrop = await rconGatherItemDropPositionNear(
     rcon,
     fixture.birchLog,
     "birch_log",
   );
+  const birchDropAbsentConfirmed = remainingBirchDrop === undefined;
+  onProgress?.({
+    stage: "readbacks_complete",
+    birchDropReadbackConfirmed: true,
+    birchDropAbsentConfirmed,
+  });
   return (
-    (await isBlock(rcon, fixture.oakLog, "air")) &&
-    (await isBlock(rcon, fixture.birchLog, "air")) &&
-    GATHER_MULTI_TARGET_ITEMS.every((item) => finalCounts[item] === 0) &&
+    oakBlockAirConfirmed &&
+    birchBlockAirConfirmed &&
+    inventoryEmptyConfirmed &&
     remainingOakDrop === undefined &&
-    remainingBirchDrop === undefined
+    birchDropAbsentConfirmed
   );
 }
 
