@@ -76,6 +76,7 @@ import {
 import {
   classifyGatherDropReadbackFailure,
   classifyGatherDropReadbackReply,
+  gatherDropPositionReadbackCommand,
   gatherDropReadbackConfirmsAbsence,
   type GatherDropReadbackClass,
 } from "./gather-drop-readback.js";
@@ -11174,10 +11175,9 @@ async function rconGatherItemDropReadbackNear(
   target: BlockPosition,
   item: GatherMultiTargetItem,
 ): Promise<Exclude<GatherDropReadbackClass, "not_attempted">> {
-  const selector = `@e[type=minecraft:item,limit=1,sort=nearest,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`;
   try {
     const reply = await rcon.command(
-      `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
+      gatherDropPositionReadbackCommand(target, item),
     );
     return classifyGatherDropReadbackReply(reply);
   } catch (error) {

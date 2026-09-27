@@ -6,6 +6,12 @@ export type GatherDropReadbackClass =
   | "timeout"
   | "unavailable";
 
+export interface GatherDropReadbackOrigin {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}
+
 export function gatherDropReadbackConfirmsAbsence(
   classification: GatherDropReadbackClass,
 ): boolean {
@@ -27,9 +33,16 @@ export function classifyGatherDropReadbackReply(
   }
 
   const normalized = reply.trim();
-  if (/^(?:test failed|no entity was found)\.?$/iu.test(normalized))
-    return "known_negative";
+  if (/^no entity was found\.?$/iu.test(normalized)) return "known_negative";
   return "unknown_reply";
+}
+
+export function gatherDropPositionReadbackCommand(
+  origin: GatherDropReadbackOrigin,
+  item: "oak_log" | "birch_log",
+): string {
+  const selector = `@e[type=minecraft:item,limit=1,sort=nearest,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`;
+  return `execute positioned ${origin.x + 0.5} ${origin.y + 0.5} ${origin.z + 0.5} run data get entity ${selector} Pos`;
 }
 
 export function classifyGatherDropReadbackFailure(
