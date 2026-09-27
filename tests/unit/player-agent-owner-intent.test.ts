@@ -22,6 +22,7 @@ import {
   compactSnapshot,
   PlayerConversationAgent,
   PlayerPurposeAgent,
+  playerOperationCatalog,
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
@@ -37,6 +38,172 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("grounds capability answers in the current public operation catalog", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("digは使えます。"));
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "digは使えますか？",
+        turn: conversation.nextTurn(),
+      });
+
+      const request = record(fixture.requests[0]);
+      expect(String(request.instructions)).toContain(
+        "能力や実行条件の相談には",
+      );
+      expect(String(request.instructions)).toContain(playerOperationCatalog);
+      expect(request.tool_choice).toBe("auto");
+      expect(messages).toEqual(["digは使えます。"]);
+      expect(fixture.mind.snapshot().proposals).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("regenerates an overlong reply once without tools and keeps call admission", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    let admittedCalls = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      beforeCall: () => {
+        admittedCalls += 1;
+      },
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const draft = "長い回答".repeat(61);
+    fixture.responses.push(
+      terminalResponse(draft),
+      terminalResponse("digとequipを利用できます。"),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "どんな操作ができますか？",
+        turn: conversation.nextTurn(),
+      });
+
+      const initialRequest = record(fixture.requests[0]);
+      const compactRequest = record(fixture.requests[1]);
+      expect(initialRequest.tool_choice).toBe("auto");
+      expect(compactRequest.tool_choice).toBe("none");
+      expect(compactRequest.tools).toEqual([]);
+      expect(JSON.stringify(compactRequest.input)).toContain(draft);
+      expect(admittedCalls).toBe(2);
+      expect(messages).toEqual(["digとequipを利用できます。"]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses a generic fallback when reply regeneration fails", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("長い回答".repeat(61)), () => {
+      throw new Error("TEST_REGENERATION_FAILED");
+    });
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "この操作の使い方を教えてください。",
+        turn: conversation.nextTurn(),
+      });
+      expect(messages).toEqual([
+        "返信を短くまとめられませんでした。もう一度お願いします。",
+      ]);
+      expect(messages[0]).not.toMatch(/操作は|完了|覚えました/u);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not swallow call-admission rejection during reply regeneration", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    let admittedCalls = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      beforeCall: () => {
+        admittedCalls += 1;
+        if (admittedCalls > 1) throw new Error("TEST_BUDGET_EXHAUSTED");
+      },
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("長い回答".repeat(61)));
+
+    try {
+      await expect(
+        conversation.handleOwnerMessage({
+          username: "owner",
+          message: "どんな操作ができますか？",
+          turn: conversation.nextTurn(),
+        }),
+      ).rejects.toThrow("TEST_BUDGET_EXHAUSTED");
+      expect(admittedCalls).toBe(2);
+      expect(fixture.requests).toHaveLength(1);
+      expect(messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("carries bounded owner chat context into a short follow-up proposal", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const memory = createMemoryPort();

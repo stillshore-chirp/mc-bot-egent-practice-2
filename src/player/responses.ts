@@ -159,6 +159,8 @@ export interface RunPlayerAgentInput {
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
   readonly maxRounds?: number;
+  /** Restrict a formatting-only request from invoking tools. */
+  readonly toolChoice?: "auto" | "none";
   /** Synchronously admit or reject each provider request before it starts. */
   readonly beforeCall?: () => void;
   readonly role?: PlayerAgentRole;
@@ -276,7 +278,7 @@ export async function runPlayerAgent(
             instructions: input.instructions,
             input: messages,
             tools,
-            tool_choice: "auto",
+            tool_choice: input.toolChoice ?? "auto",
             parallel_tool_calls: false,
             store: false,
             include: ["reasoning.encrypted_content"],
