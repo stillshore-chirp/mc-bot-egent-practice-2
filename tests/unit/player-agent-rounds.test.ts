@@ -971,6 +971,39 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("guides low-health choices from observation without fixing a survival priority", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "low-health-guidance",
+        "commit_action_decision",
+        actionArguments(),
+      ),
+    ]);
+
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const instructions = String(request.instructions);
+      expect(instructions).toContain(
+        "ownerの行動指示がない時も、低healthやdamage",
+      );
+      expect(instructions).toContain("見えている脅威と原因未特定の危険を区別");
+      expect(instructions).toContain("同じ条件・引数のまま繰り返さず");
+      expect(instructions).toContain("結果は観測で確認できた範囲だけ");
+      expect(instructions).toContain(
+        "生存行動や退避を固定的な反射として強制せず、目的や周囲の状況から選択してください",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("commits action, goal, proposal resolution, and understanding in one CAS", async () => {
     const persistedGoals: unknown[] = [];
     const memory = createMemoryPort();
