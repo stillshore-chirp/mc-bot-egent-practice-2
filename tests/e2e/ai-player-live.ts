@@ -111,6 +111,7 @@ import {
   isStoppedHandoffBoundaryConfirmed,
 } from "./autonomous-milestone.js";
 import { classifyObservationReply } from "./observation-reply-classifier.js";
+import { readRconCommandResponse } from "./rcon-command-response.js";
 import {
   classifyUnknownTaskVisibility,
   isSameStartedTravelOperation,
@@ -2430,20 +2431,19 @@ class LocalRcon {
     const socket = createConnection({ host: "127.0.0.1", port: this.port });
     socket.setNoDelay(true);
     let buffered = Buffer.alloc(0);
-    const packets = new Map<
-      number,
-      { readonly type: number; readonly body: string }[]
-    >();
-    const waiters = new Map<
-      number,
-      {
-        resolve: (packet: {
-          readonly type: number;
-          readonly body: string;
-        }) => void;
-        reject: (error: Error) => void;
-      }
-    >();
+    const packets: {
+      readonly id: number;
+      readonly type: number;
+      readonly body: string;
+    }[] = [];
+    const waiters: {
+      resolve: (packet: {
+        readonly id: number;
+        readonly type: number;
+        readonly body: string;
+      }) => void;
+      reject: (error: Error) => void;
+    }[] = [];
     let nextId = 1;
     const timer = setTimeout(
       () => socket.destroy(new Error("RCON_TIMEOUT")),
@@ -2451,30 +2451,29 @@ class LocalRcon {
     );
 
     const packet = (id: number, type: number, body: string) => {
-      const queue = packets.get(id) ?? [];
-      queue.push({ type, body });
-      packets.set(id, queue);
-      const waiter = waiters.get(id);
-      const value = queue.shift();
-      if (waiter && value !== undefined) {
-        waiters.delete(id);
+      const value = { id, type, body };
+      const waiter = waiters.shift();
+      if (waiter !== undefined) {
         waiter.resolve(value);
+      } else {
+        packets.push(value);
       }
     };
-    const readPacket = (id: number) =>
-      new Promise<{ readonly type: number; readonly body: string }>(
-        (resolvePacket, reject) => {
-          const existing = packets.get(id)?.shift();
-          if (existing !== undefined) {
-            resolvePacket(existing);
-            return;
-          }
-          waiters.set(id, { resolve: resolvePacket, reject });
-        },
-      );
+    const readNextPacket = () =>
+      new Promise<{
+        readonly id: number;
+        readonly type: number;
+        readonly body: string;
+      }>((resolvePacket, reject) => {
+        const existing = packets.shift();
+        if (existing !== undefined) {
+          resolvePacket(existing);
+          return;
+        }
+        waiters.push({ resolve: resolvePacket, reject });
+      });
     const rejectAll = (error: Error) => {
-      for (const waiter of waiters.values()) waiter.reject(error);
-      waiters.clear();
+      for (const waiter of waiters.splice(0)) waiter.reject(error);
     };
     socket.on("data", (chunk) => {
       buffered = Buffer.concat([buffered, chunk]);
@@ -2500,15 +2499,18 @@ class LocalRcon {
       });
       const authId = nextId++;
       socket.write(encodeRconPacket(authId, 3, this.password));
-      const authResponse = await readPacket(authId);
-      if (authResponse.type !== 2) incomplete("RCON_AUTH_FAILED");
+      const authResponse = await readNextPacket();
+      if (authResponse.id !== authId || authResponse.type !== 2)
+        incomplete("RCON_AUTH_FAILED");
       const commandId = nextId++;
+      const terminatorId = nextId++;
       socket.write(encodeRconPacket(commandId, 2, command));
-      const response = await readPacket(commandId);
-      if (response.type !== 0 && response.type !== 2) {
-        incomplete("RCON_COMMAND_FAILED");
-      }
-      return response.body;
+      socket.write(encodeRconPacket(terminatorId, 2, ""));
+      return await readRconCommandResponse(
+        readNextPacket,
+        commandId,
+        terminatorId,
+      );
     } catch (error) {
       if (error instanceof HarnessError) throw error;
       incomplete(
