@@ -5,6 +5,7 @@ import type { Window } from "prismarine-windows";
 import { z } from "zod";
 import { Vec3 } from "vec3";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import { isHandOperableDoor } from "./navigation-movements.js";
 
 export interface BodyBlockCoordinates {
   readonly x: number;
@@ -294,6 +295,8 @@ const verticalFovDegrees = 80;
 const maxVisibleDistance = 16;
 const blockCandidateLimit = 192;
 const blockCandidateSearchPassLimit = 3;
+const nearbyDoorCandidateLimit = 8;
+const nearbyDoorInteractionRange = 4.5;
 const entityCandidateLimit = 128;
 const blockOutputLimit = 96;
 const entityOutputLimit = 64;
@@ -539,19 +542,38 @@ function visibleBlockCandidates(
 ): {
   blocks: BodyVisibleBlock[];
   mayBeTruncated: boolean;
-  priorityPositionKey: string | undefined;
+  priorityPositionKeys: readonly string[];
 } {
   const excludedNames = new Set<string>();
   const seenPositions = new Set<string>();
   const candidates: Vec3[] = [];
+  const priorityPositionKeys: string[] = [];
   const priorityPosition = crosshairBlockPosition(bot, origin);
   const priorityPositionKey =
     priorityPosition === null ? undefined : blockPositionKey(priorityPosition);
   if (priorityPosition !== null) {
     seenPositions.add(blockPositionKey(priorityPosition));
     candidates.push(priorityPosition);
+    priorityPositionKeys.push(blockPositionKey(priorityPosition));
   }
   let mayBeTruncated = false;
+
+  const nearbyDoorPositions = bot.findBlocks({
+    matching: (block) => isHandOperableDoor(block.name),
+    maxDistance: nearbyDoorInteractionRange,
+    count: nearbyDoorCandidateLimit,
+  });
+  if (nearbyDoorPositions.length >= nearbyDoorCandidateLimit)
+    mayBeTruncated = true;
+  for (const position of nearbyDoorPositions) {
+    const block = bot.blockAt(position);
+    if (block === null || !isHandOperableDoor(block.name)) continue;
+    const key = blockPositionKey(block.position);
+    if (seenPositions.has(key)) continue;
+    seenPositions.add(key);
+    candidates.push(position);
+    priorityPositionKeys.push(key);
+  }
 
   for (let pass = 0; pass < blockCandidateSearchPassLimit; pass += 1) {
     const searchResults = bot.findBlocks({
@@ -619,27 +641,30 @@ function visibleBlockCandidates(
   }
 
   blocks.sort((left, right) => left.distance - right.distance);
-  return { blocks, mayBeTruncated, priorityPositionKey };
+  return { blocks, mayBeTruncated, priorityPositionKeys };
 }
 
 function balancedVisibleBlocks(
   blocks: readonly BodyVisibleBlock[],
   limit: number,
-  priorityPositionKey?: string,
+  priorityPositionKeys: readonly string[] = [],
 ): BodyVisibleBlock[] {
   if (limit <= 0) return [];
-  const priorityBlock =
-    priorityPositionKey === undefined
-      ? undefined
-      : blocks.find(
-          (block) => blockPositionKey(block.position) === priorityPositionKey,
-        );
-  const remainingBlocks =
-    priorityBlock === undefined
-      ? blocks
-      : blocks.filter(
-          (block) => blockPositionKey(block.position) !== priorityPositionKey,
-        );
+  const blocksByPosition = new Map(
+    blocks.map((block) => [blockPositionKey(block.position), block]),
+  );
+  const priorityBlocks: BodyVisibleBlock[] = [];
+  const priorityKeys = new Set<string>();
+  for (const key of priorityPositionKeys) {
+    const block = blocksByPosition.get(key);
+    if (block === undefined || priorityKeys.has(key)) continue;
+    priorityBlocks.push(block);
+    priorityKeys.add(key);
+    if (priorityBlocks.length === limit) break;
+  }
+  const remainingBlocks = blocks.filter(
+    (block) => !priorityKeys.has(blockPositionKey(block.position)),
+  );
   const blocksByName = new Map<string, BodyVisibleBlock[]>();
   for (const block of remainingBlocks) {
     const sameName = blocksByName.get(block.name) ?? [];
@@ -656,8 +681,7 @@ function balancedVisibleBlocks(
       leftFirst.name.localeCompare(rightFirst.name)
     );
   });
-  const selected: BodyVisibleBlock[] =
-    priorityBlock === undefined ? [] : [priorityBlock];
+  const selected = [...priorityBlocks];
   for (let index = 0; selected.length < limit; index += 1) {
     let found = false;
     for (const group of groups) {
@@ -974,7 +998,7 @@ export function observePlayerBody(
       blocks: balancedVisibleBlocks(
         visibleBlocks,
         blockOutputLimit,
-        blockObservation.priorityPositionKey,
+        blockObservation.priorityPositionKeys,
       ),
       placementCandidateLimit,
       omittedPlacementCandidates: placementObservation.omitted,
