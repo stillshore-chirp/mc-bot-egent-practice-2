@@ -69,6 +69,10 @@ import {
   hasAccurateIronHelmetCompletionNotice,
 } from "./armor-capability-reply.js";
 import {
+  classifyArmorProposalResolution,
+  type ArmorProposalResolutionClass,
+} from "./armor-proposal-resolution.js";
+import {
   retainArmorCapabilityCompletionNotices,
   retainArmorCapabilityReply,
   retainArmorCapabilityReplyFragments,
@@ -879,6 +883,7 @@ interface PlayerEvidence {
   }[];
   readonly proposals: readonly {
     readonly id: string;
+    readonly createdAt?: string;
     readonly title?: string;
     readonly status?: string;
     readonly resolution?: string;
@@ -2518,6 +2523,9 @@ interface ArmorCapabilityDiagnostic {
   bodyHeadEmptyObservedBeforeSelection: boolean;
   shortEquipRequestSent: boolean;
   ownerProposalAdopted: boolean;
+  proposalResolutionClassification:
+    ArmorProposalResolutionClass | "not_evaluated";
+  proposalResolutionStage: ArmorCapabilityProposalResolutionStage;
   purposeSelectedEquip: boolean;
   bodyEquipSuccessful: boolean;
   bodyHeadHelmetObservedAfterEquip: boolean;
@@ -2537,6 +2545,20 @@ interface ArmorCapabilityDiagnostic {
   fixtureCleanupConfirmed: boolean;
 }
 
+type ArmorCapabilityProposalResolutionStage =
+  | "not_started"
+  | "awaiting_new_proposal"
+  | "awaiting_proposal_resolution"
+  | "awaiting_owner_goal"
+  | "awaiting_equip_judgment"
+  | "awaiting_successful_equip_outcome"
+  | "resolved"
+  | "declined"
+  | "ambiguous"
+  | "unlinked_or_autonomous_goal"
+  | "wrong_goal_intent"
+  | "invalid_timeline";
+
 const EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC: ArmorCapabilityDiagnostic = {
   caseStarted: false,
   capabilityReplyObserved: false,
@@ -2552,6 +2574,8 @@ const EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC: ArmorCapabilityDiagnostic = {
   bodyHeadEmptyObservedBeforeSelection: false,
   shortEquipRequestSent: false,
   ownerProposalAdopted: false,
+  proposalResolutionClassification: "not_evaluated",
+  proposalResolutionStage: "not_started",
   purposeSelectedEquip: false,
   bodyEquipSuccessful: false,
   bodyHeadHelmetObservedAfterEquip: false,
@@ -2570,6 +2594,57 @@ const EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC: ArmorCapabilityDiagnostic = {
   fixtureCleanupFailureCode: "not_run",
   fixtureCleanupConfirmed: false,
 };
+
+function armorProposalResolutionStage(
+  classification: ArmorProposalResolutionClass,
+  successfulEquipOutcomeAfterJudgment: boolean,
+): ArmorCapabilityProposalResolutionStage {
+  switch (classification) {
+    case "direct_proposal_equip_judgment":
+    case "owner_goal_equip_judgment":
+      return successfulEquipOutcomeAfterJudgment
+        ? "resolved"
+        : "awaiting_successful_equip_outcome";
+    default:
+      return classification;
+  }
+}
+
+function resolvedArmorEquipJudgment(
+  player: PlayerEvidence,
+  proposalId: string,
+  classification: ArmorProposalResolutionClass,
+): PlayerEvidence["recentJudgments"][number] | undefined {
+  const isEquipJudgment = (
+    judgment: PlayerEvidence["recentJudgments"][number],
+  ) => judgment.kind === "act" && judgment.operationKind === "equip";
+  if (classification === "direct_proposal_equip_judgment") {
+    return player.recentJudgments.find(
+      (judgment) =>
+        judgment.proposalId === proposalId &&
+        judgment.kind === "act" &&
+        judgment.operationKind === "equip" &&
+        (judgment.proposalDisposition === "adopted" ||
+          judgment.proposalDisposition === "compromised"),
+    );
+  }
+  if (classification !== "owner_goal_equip_judgment") return undefined;
+
+  const proposalCreatedAt = Date.parse(
+    player.proposals.find(({ id }) => id === proposalId)?.createdAt ?? "",
+  );
+  if (!Number.isFinite(proposalCreatedAt)) return undefined;
+  return player.recentJudgments.find((judgment) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    return (
+      isEquipJudgment(judgment) &&
+      (judgment.proposalId === undefined ||
+        judgment.proposalId === proposalId) &&
+      Number.isFinite(decidedAt) &&
+      decidedAt > proposalCreatedAt
+    );
+  });
+}
 
 type ArmorFixtureCleanupFailureCode =
   | "not_run"
@@ -4929,6 +5004,9 @@ async function main(): Promise<void> {
         const proposalIdsBeforeEquip = new Set(
           beforeEquip.proposals.map(({ id }) => id),
         );
+        const baselineOutcomeIds = new Set(
+          beforeEquip.recentOutcomes.map(({ operationId }) => operationId),
+        );
         const initialPurposeRounds = new Set(
           (beforeEquip.recentAgentActivity ?? []).map(
             ({ runSequence, round }) => `${runSequence}:${round}`,
@@ -4956,50 +5034,90 @@ async function main(): Promise<void> {
             incomplete("ARMOR_CAPABILITY_FIXTURE_NOT_CONFIRMED");
 
           const equipResponseStart = context.responseQueue.length;
-          observationProbe.equipRequestAt = Date.now();
+          const ownerRequestSentAt = new Date().toISOString();
+          observationProbe.equipRequestAt = Date.parse(ownerRequestSentAt);
+          const recordResolution = (player: PlayerEvidence) => {
+            const evidence = classifyArmorProposalResolution({
+              baselineProposalIds: proposalIdsBeforeEquip,
+              baselineOutcomeIds,
+              ownerRequestSentAt,
+              snapshot: {
+                proposals: player.proposals,
+                goals: player.goals,
+                judgments: player.recentJudgments,
+                outcomes: player.recentOutcomes,
+              },
+            });
+            updateArmorCapabilityDiagnostic(state, {
+              proposalResolutionClassification: evidence.classification,
+              proposalResolutionStage: armorProposalResolutionStage(
+                evidence.classification,
+                evidence.successfulEquipOutcomeAfterJudgment,
+              ),
+              ownerProposalAdopted: evidence.ownerProposalResolved,
+            });
+            return evidence;
+          };
           sendChat(context.owner, "鉄のヘルメットを着てみて。");
           updateArmorCapabilityDiagnostic(state, {
             shortEquipRequestSent: true,
+            proposalResolutionClassification: "awaiting_new_proposal",
+            proposalResolutionStage: "awaiting_new_proposal",
           });
           const proposalSnapshot = await observeForPlayer(
             context,
             45_000,
-            (player) =>
-              player.proposals.some(
+            (player) => {
+              const hasNewProposal = player.proposals.some(
                 ({ id }) => !proposalIdsBeforeEquip.has(id),
-              ),
+              );
+              if (!hasNewProposal) return false;
+              recordResolution(player);
+              return true;
+            },
           );
           if (proposalSnapshot === undefined)
             incomplete("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_OBSERVED");
-          const proposal = proposalSnapshot.proposals.find(
+          const newProposals = proposalSnapshot.proposals.filter(
             ({ id }) => !proposalIdsBeforeEquip.has(id),
           );
+          if (newProposals.length !== 1)
+            incomplete("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_OBSERVED");
+          const proposal = newProposals[0];
           if (proposal === undefined)
             incomplete("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_OBSERVED");
 
           const decisionSnapshot = await observeForPlayer(
             context,
             150_000,
-            (player) =>
-              player.recentJudgments.some(
-                (judgment) =>
-                  judgment.proposalId === proposal.id &&
-                  ["act", "wait", "complete"].includes(judgment.kind ?? ""),
-              ),
+            (player) => {
+              const evidence = recordResolution(player);
+              if (evidence.equipJudgmentAfterProposal) return true;
+              return (
+                evidence.classification === "declined" ||
+                evidence.classification === "ambiguous" ||
+                evidence.classification === "unlinked_or_autonomous_goal" ||
+                evidence.classification === "wrong_goal_intent" ||
+                evidence.classification === "invalid_timeline"
+              );
+            },
           );
           if (decisionSnapshot === undefined)
             incomplete("ARMOR_CAPABILITY_PURPOSE_DECISION_NOT_OBSERVED");
-          const resolution = decisionSnapshot.recentJudgments.find(
-            (judgment) => judgment.proposalId === proposal.id,
+          const resolutionEvidence = recordResolution(decisionSnapshot);
+          if (resolutionEvidence.classification === "declined")
+            fail("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_ADOPTED");
+          if (!resolutionEvidence.ownerProposalResolved)
+            incomplete("ARMOR_CAPABILITY_PROPOSAL_RESOLUTION_NOT_CONFIRMED");
+          if (!resolutionEvidence.equipJudgmentAfterProposal)
+            incomplete("ARMOR_CAPABILITY_PURPOSE_DECISION_NOT_OBSERVED");
+          const resolution = resolvedArmorEquipJudgment(
+            decisionSnapshot,
+            proposal.id,
+            resolutionEvidence.classification,
           );
           if (resolution === undefined)
             incomplete("ARMOR_CAPABILITY_PURPOSE_DECISION_NOT_OBSERVED");
-          const ownerProposalAdopted =
-            resolution.proposalDisposition === "adopted" ||
-            resolution.proposalDisposition === "compromised";
-          updateArmorCapabilityDiagnostic(state, { ownerProposalAdopted });
-          if (!ownerProposalAdopted)
-            fail("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_ADOPTED");
           const purposeCommitObserved = (
             decisionSnapshot.recentAgentActivity ?? []
           ).some(
@@ -5059,10 +5177,15 @@ async function main(): Promise<void> {
           );
           if (equipOutcome === undefined)
             incomplete("ARMOR_CAPABILITY_EQUIP_OUTCOME_NOT_OBSERVED");
+          const outcomeResolutionEvidence = recordResolution(outcomeSnapshot);
           const bodyEquipSuccessful = equipOutcome.status === "successful";
           updateArmorCapabilityDiagnostic(state, { bodyEquipSuccessful });
           if (!bodyEquipSuccessful)
             fail("ARMOR_CAPABILITY_BODY_EQUIP_NOT_SUCCESSFUL");
+          if (!outcomeResolutionEvidence.successfulEquipOutcomeAfterJudgment)
+            incomplete(
+              "ARMOR_CAPABILITY_SUCCESSFUL_OUTCOME_NOT_AFTER_JUDGMENT",
+            );
 
           const outcomeAt =
             equipOutcome.observedAt === undefined
