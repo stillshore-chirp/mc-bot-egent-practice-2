@@ -178,7 +178,6 @@ AI_PLAYER_E2E_SERVER_CACHE_DIR=/path/to/paper-cache
   - `parseStage`は`not_parsed`、`marker_missing`、`root_invalid`、`nested_token_invalid`、`trailing_content`、`stack_id_invalid`、`target_count_invalid`、`response_truncated_possible`、`parsed`の固定分類です。`response_truncated_possible`は入力終端で構文が閉じていないことを示すだけで、通信切断の確証ではありません。
   - `parsed`: countを解析できた状態。未到達stageは`not_attempted`です。
   - countsとreasonは同じRCON応答から得て、artifactへ応答本文は保存しません。
-- LocalRconはcommand responseを最大32 packetまで終端packetまで結合します。終端未到達・packet上限・不正packetはread failureになり、artifactには本文、本文長、packet IDを残しません。
 - artifactへcountの数値やRCON本文は保存しません。seedと遷移の不一致も診断結果として残し、probeの`pass`は診断・fixture cleanup完了を示します。
 
 cleanup分類を調べるno-GPT probe（2026-09-27、29,451ms、GPT 0回）は、既存の`air` aliasと`minecraft:air`の両方でreplace返信class=`changed`、1tick待機を確認しました。case artifact `1172c2f7-e787-4ef0-aa29-15447229545f.json`は、当時のparserが実際のnegative応答形式を未認識だったためcleanup未確認・run incompleteです。mode 0600のprivate sidecarを固定分類でレビューすると、両command後にequipment fieldがno-element、slot predicateがknown-negativeで、inventory内helmetも0でした。raw返信はartifact・文書へ転記していません。`execute if items` parserは専用のnegative形式だけを認識し、head空判定はequipment fieldのno-elementとslot predicateのknown-negativeが両方ある場合に限定しました。実GPT case cleanupも`minecraft:air`、1tick待機、head slot wildcard readbackで検証します。Paper process・listener・temp world cleanupは3/3で、既存server PIDは操作していません。この再分類は元artifactを書き換えず、実GPT受け入れrunも再実行していません。
