@@ -73,6 +73,21 @@ describe("targeted E2E case selection", () => {
     ).toBe(false);
   });
 
+  it("runs gather_multi_target_continuity without unrelated prerequisites", () => {
+    const targetCase = "gather_multi_target_continuity";
+    expect(TARGETABLE_CASES).toContain(targetCase);
+    expect(isCaseSelectedForTarget(targetCase, targetCase)).toBe(true);
+    for (const caseId of [
+      "autonomous_life",
+      "learning_reuse",
+      "food_intent_continuity",
+      "armor_capability",
+      "integrated_result",
+    ]) {
+      expect(isCaseSelectedForTarget(targetCase, caseId)).toBe(false);
+    }
+  });
+
   it("selects every case when no target is configured", () => {
     expect(isCaseSelectedForTarget(undefined, "autonomous_life")).toBe(true);
     expect(isCaseSelectedForTarget(undefined, "integrated_result")).toBe(true);

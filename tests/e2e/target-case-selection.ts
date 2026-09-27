@@ -3,6 +3,7 @@ export const TARGETABLE_CASES = [
   "food_intent_continuity",
   "armor_capability",
   "learning_reuse",
+  "gather_multi_target_continuity",
   "skill_compactness_and_knowledge_separation",
   "skill_exchange",
   "unknown_composite",
