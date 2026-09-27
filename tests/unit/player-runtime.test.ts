@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
+import type { Response } from "openai/resources/responses/responses.js";
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -18,12 +19,18 @@ import type {
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
-import { compactSnapshot } from "../../src/player/agents.js";
+import {
+  compactSnapshot,
+  PlayerConversationAgent,
+} from "../../src/player/agents.js";
 import type {
   PlayerMemoryPort,
+  PlayerRuntimeSnapshot,
   PlayerThoughtDecision,
 } from "../../src/player/contracts.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
+import type { PlayerResponsesClient } from "../../src/player/responses.js";
+import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 import {
   PlayerRuntime,
   semanticSignatures,
@@ -1899,6 +1906,284 @@ describe("integrated player runtime", () => {
       await runtime.shutdown();
       skills.close();
       mind.close();
+    }
+  });
+
+  it("persists death observations across restart and shares them with both agents", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const deathObservedAt = new Date(Date.now() + 1_000).toISOString();
+    const beforeObservedAt = new Date(
+      Date.parse(deathObservedAt) - 2_000,
+    ).toISOString();
+    const afterObservedAt = new Date(
+      Date.parse(deathObservedAt) + 2_000,
+    ).toISOString();
+    const base = observation();
+    const emerald = {
+      slot: 0,
+      itemId: 388,
+      name: "emerald",
+      count: 3,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: null,
+      enchantments: [],
+    };
+    const beforeDeath: PlayerBodyObservation = {
+      ...base,
+      observedAt: beforeObservedAt,
+      dimension: "minecraft:the_nether",
+      self: {
+        ...base.self,
+        position: {
+          x: 41.5,
+          y: 82,
+          z: -17.25,
+          dimension: "minecraft:the_nether",
+        },
+        inventory: [emerald],
+      },
+    };
+    const afterDeath: PlayerBodyObservation = {
+      ...base,
+      observedAt: afterObservedAt,
+      dimension: "overworld",
+      self: {
+        ...base.self,
+        health: 20,
+        position: { x: -6.25, y: 70, z: 14.5, dimension: "overworld" },
+        inventory: [],
+      },
+    };
+    const body = new DeferredBody();
+    body.setObservation(beforeDeath);
+    const firstMind = PlayerMindStore.open(databasePath);
+    const firstSkills = openSkills(databasePath, directory);
+    let firstPurposeCalls = 0;
+    const firstRuntime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind: firstMind,
+      memory: createMemoryPort(),
+      skills: firstSkills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async () => {
+          firstPurposeCalls += 1;
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await firstRuntime.start();
+      await waitFor(() => firstPurposeCalls > 0);
+      body.emit({ type: "bot_death", at: deathObservedAt });
+      await waitFor(
+        () => firstMind.snapshot().latestDeath?.observedAt === deathObservedAt,
+      );
+      expect(firstMind.snapshot().latestDeath?.beforeObservation).toMatchObject(
+        {
+          observedAt: beforeObservedAt,
+          dimension: "minecraft:the_nether",
+          position: {
+            x: 41.5,
+            y: 82,
+            z: -17.25,
+            dimension: "minecraft:the_nether",
+          },
+          inventoryItems: [{ name: "emerald", count: 3 }],
+        },
+      );
+      expect(
+        firstRuntime.evidence().latestDeath?.beforeObservation?.position,
+      ).toBeUndefined();
+      expect(
+        firstRuntime.evidence().latestDeath?.beforeObservation?.inventoryItems,
+      ).toBeUndefined();
+
+      body.setObservation(afterDeath);
+      body.emit({
+        type: "state_changed",
+        reason: "position",
+        at: afterObservedAt,
+      });
+      await waitFor(
+        () =>
+          firstMind.snapshot().latestDeath?.firstPostDeathObservation
+            ?.observedAt === afterObservedAt,
+      );
+      expect(
+        firstMind.snapshot().latestDeath?.firstPostDeathObservation,
+      ).toMatchObject({
+        observedAt: afterObservedAt,
+        dimension: "overworld",
+        position: {
+          x: -6.25,
+          y: 70,
+          z: 14.5,
+          dimension: "overworld",
+        },
+        inventoryItems: [],
+      });
+    } finally {
+      await firstRuntime.shutdown();
+      firstSkills.close();
+      firstMind.close();
+    }
+
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const reopenedBody = new DeferredBody();
+    reopenedBody.setObservation(afterDeath);
+    const purposeSnapshots: PlayerRuntimeSnapshot[] = [];
+    const purposeEventKinds: string[][] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body: reopenedBody,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events }) => {
+          purposeSnapshots.push(snapshot);
+          purposeEventKinds.push(events.map(({ kind }) => kind));
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      await runtime.start();
+      await waitFor(() =>
+        purposeEventKinds.some((kinds) => kinds.includes("bot_death")),
+      );
+      const restoredDeath = mind.snapshot().latestDeath;
+      expect(restoredDeath).toBeDefined();
+      expect(purposeSnapshots.at(-1)?.latestDeath).toEqual(restoredDeath);
+      const compact = z
+        .record(z.string(), z.unknown())
+        .parse(compactSnapshot(mind.snapshot()));
+      expect(compact.latestDeath).toEqual(restoredDeath);
+
+      const requests: unknown[] = [];
+      const conversation = new PlayerConversationAgent({
+        client: {
+          responses: {
+            create: async (request: unknown) => {
+              requests.push(request);
+              return {
+                status: "completed",
+                output: [],
+                output_text: "死亡後の観測を確認しました。",
+                usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+              } as unknown as Response;
+            },
+          },
+        } as unknown as PlayerResponsesClient,
+        apiKey: "test-only",
+        model: "test-model",
+        ownerUsername: "owner",
+        mind,
+        memory: createMemoryPort(),
+        logger: pino({ level: "silent" }),
+        say: async () => undefined,
+        onProposal: () => undefined,
+        onStop: async () => undefined,
+        onResume: () => undefined,
+      });
+      const turn = conversation.nextTurn();
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "死亡前と後の状態を確認してください。",
+        turn,
+      });
+      const request = z.record(z.string(), z.unknown()).parse(requests[0]);
+      const input = z.string().parse(JSON.stringify(request.input));
+      expect(input).toContain(deathObservedAt);
+      expect(input).toContain(beforeObservedAt);
+      expect(input).toContain(afterObservedAt);
+      expect(input).toContain("minecraft:the_nether");
+      expect(input).toContain("emerald");
+      expect(input).toContain("firstPostDeathObservation");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("keeps missing death-before evidence unknown across restart", () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const deathObservedAt = "2026-09-28T00:00:02.000Z";
+    const first = PlayerMindStore.open(databasePath);
+    first.recordDeathEvent(
+      deathObservedAt,
+      "Bot自身の死亡を観測し、復帰後の目的を再評価",
+    );
+    expect(first.snapshot().latestDeath?.beforeObservation).toBeUndefined();
+    first.close();
+
+    const reopened = PlayerMindStore.open(databasePath);
+    try {
+      expect(reopened.snapshot().latestDeath).toEqual({
+        observedAt: deathObservedAt,
+      });
+    } finally {
+      reopened.close();
+    }
+
+    const legacyDatabasePath = join(directory, "legacy-player.sqlite");
+    const legacyDeathAt = new Date(Date.now() + 2_000).toISOString();
+    const legacyObservation = toObservationEvidence({
+      ...observation(),
+      observedAt: new Date(Date.parse(legacyDeathAt) - 1_000).toISOString(),
+    });
+    const {
+      position: _position,
+      inventoryItems: _inventoryItems,
+      ...legacyEvidence
+    } = legacyObservation;
+    const legacyMind = PlayerMindStore.open(legacyDatabasePath);
+    legacyMind.recordObservation(legacyEvidence);
+    legacyMind.recordDeathEvent(
+      legacyDeathAt,
+      "Bot自身の死亡を観測し、復帰後の目的を再評価",
+    );
+    expect(legacyMind.snapshot().latestDeath?.beforeObservation).toMatchObject({
+      observedAt: legacyEvidence.observedAt,
+    });
+    expect(
+      legacyMind.snapshot().latestDeath?.beforeObservation?.position,
+    ).toBeUndefined();
+    expect(
+      legacyMind.snapshot().latestDeath?.beforeObservation?.inventoryItems,
+    ).toBeUndefined();
+    legacyMind.close();
+
+    const reopenedLegacy = PlayerMindStore.open(legacyDatabasePath);
+    try {
+      expect(reopenedLegacy.snapshot().latestDeath?.beforeObservation).toEqual(
+        legacyEvidence,
+      );
+    } finally {
+      reopenedLegacy.close();
     }
   });
 

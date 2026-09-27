@@ -30,9 +30,24 @@ export function toObservationEvidence(
   observation: PlayerBodyObservation,
 ): PlayerObservationEvidence {
   const blocks = observation.perception.blocks;
+  const inventoryItems = new Map<string, number>();
+  for (const item of observation.self.inventory) {
+    const name = item.name.slice(0, 80);
+    inventoryItems.set(name, (inventoryItems.get(name) ?? 0) + item.count);
+  }
   return {
     observedAt: observation.observedAt,
     dimension: observation.dimension.slice(0, 80),
+    position: {
+      x: observation.self.position.x,
+      y: observation.self.position.y,
+      z: observation.self.position.z,
+      dimension: observation.self.position.dimension.slice(0, 80),
+    },
+    inventoryItems: [...inventoryItems.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(0, 48)
+      .map(([name, count]) => ({ name, count })),
     day: observation.time.day,
     timeOfDay: observation.time.timeOfDay,
     isDay: observation.time.isDay,
