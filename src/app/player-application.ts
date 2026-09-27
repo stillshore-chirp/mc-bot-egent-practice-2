@@ -241,6 +241,7 @@ export class PlayerCompanionApplication implements CompanionApplication {
 
 export function createPlayerApplication(
   config: AppConfig,
+  beforeCall?: () => void,
 ): CompanionApplication {
   const logger = createLogger(config);
   const persona = loadPersona(config.personaPath);
@@ -384,6 +385,7 @@ export function createPlayerApplication(
     memory: playerMemory,
     logger,
     ...(trace === undefined ? {} : { trace }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
     onCall: (metrics) =>
       mind.recordCall({
         inputTokens: metrics.inputTokens,
@@ -410,6 +412,7 @@ export function createPlayerApplication(
     ownerPlayerId: owner.id,
     logger,
     ...(trace === undefined ? {} : { trace }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
     onCall: (metrics) =>
       mind.recordCall({
         inputTokens: metrics.inputTokens,

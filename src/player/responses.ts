@@ -155,6 +155,8 @@ export interface RunPlayerAgentInput {
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
   readonly maxRounds?: number;
+  /** Synchronously admit or reject each provider request before it starts. */
+  readonly beforeCall?: () => void;
   readonly role?: PlayerAgentRole;
   /** Character count only; the observation itself is never copied here. */
   readonly initialObservationChars?: number;
@@ -258,6 +260,7 @@ export async function runPlayerAgent(
 
   for (let round = 0; round < maxRounds; round += 1) {
     input.signal?.throwIfAborted();
+    input.beforeCall?.();
     const started = performance.now();
     let response: Response;
     const requestInputChars = safeSerializedLength(messages);
@@ -282,6 +285,7 @@ export async function runPlayerAgent(
           } satisfies ResponseCreateParamsNonStreaming,
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(input.beforeCall === undefined ? {} : { maxRetries: 0 }),
           },
         );
       response =
