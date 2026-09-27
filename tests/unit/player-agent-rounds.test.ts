@@ -972,13 +972,29 @@ describe("player agent response rounds", () => {
   });
 
   it("guides low-health choices from observation without fixing a survival priority", async () => {
-    const fixture = openPurposeFixture([
-      functionCallResponse(
-        "low-health-guidance",
-        "commit_action_decision",
-        actionArguments(),
-      ),
-    ]);
+    const baseObservation = bodyObservationFixture();
+    const observation: PlayerBodyObservation = {
+      ...baseObservation,
+      self: {
+        ...baseObservation.self,
+        health: 4,
+        food: 4,
+        foodSaturation: 0,
+        inventory: [],
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "low-health-guidance",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => observation,
+    );
 
     try {
       await fixture.agent.think({
@@ -991,6 +1007,26 @@ describe("player agent response rounds", () => {
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
       expect(instructions).toContain(
+        "食事を検討する時はowner依頼か自分の目的かを問わず",
+      );
+      expect(instructions).toContain(
+        "観測と照会で食べる必要がない、または可食アイテムがないと確認できた場合はconsumeしない",
+      );
+      expect(instructions).toContain(
+        "満腹や食料なしと断定せず、確認できない点を説明してください",
+      );
+      expect(instructions).toContain(
+        "その根拠をproposal resolutionに伝えてください",
+      );
+      const mealInstructionLines = instructions
+        .split("\n")
+        .filter((line) => line.startsWith("食事"));
+      expect(mealInstructionLines).toHaveLength(2);
+      expect(mealInstructionLines[0]).toContain(
+        "満腹や食料なしと断定せず、確認できない点を説明してください",
+      );
+      expect(mealInstructionLines[1]).not.toContain("満腹や食料なしと断定せず");
+      expect(instructions).toContain(
         "ownerの行動指示がない時も、低healthやdamage",
       );
       expect(instructions).toContain("見えている脅威と原因未特定の危険を区別");
@@ -998,6 +1034,99 @@ describe("player agent response rounds", () => {
       expect(instructions).toContain("結果は観測で確認できた範囲だけ");
       expect(instructions).toContain(
         "生存行動や退避を固定的な反射として強制せず、目的や周囲の状況から選択してください",
+      );
+      expect(requestUserPayload(request).observation).toMatchObject({
+        self: { health: 4, food: 4, foodSaturation: 0, inventory: [] },
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("waits for a route-relevant change after a failed retreat without ongoing damage", async () => {
+    const baseObservation = bodyObservationFixture();
+    const observation: PlayerBodyObservation = {
+      ...baseObservation,
+      self: {
+        ...baseObservation.self,
+        health: 4,
+        inLava: false,
+        onFire: false,
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "wait-after-failed-retreat",
+          "commit_action_decision",
+          {
+            ...actionArguments(),
+            kind: "wait",
+            purpose:
+              "Wait for an observable change before choosing another route.",
+            operationJson: "",
+            expectedOutcome:
+              "A changed observation may reveal a feasible route.",
+            reason:
+              "The retreat path failed, but no ongoing environmental damage is observed; reconsider when the route or danger state changes.",
+            wakeOn: ["state_changed"],
+            wakeAt: "",
+          },
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => observation,
+    );
+    const failedAt = new Date().toISOString();
+    const failureSummary =
+      "move_to は failed: The attempted retreat route was unavailable";
+    fixture.mind.recordOutcome({
+      evidence: {
+        operationId: "failed-retreat-move-to",
+        kind: "move_to",
+        status: "failed",
+        summary: failureSummary,
+        observedAt: failedAt,
+      },
+    });
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "failed-retreat-event",
+            kind: "body_outcome",
+            summary: failureSummary,
+            createdAt: failedAt,
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      const decision = result.decision;
+      if (decision?.kind !== "wait")
+        throw new Error("EXPECTED_WAIT_AFTER_FAILED_RETREAT");
+      expect(decision.reason).toContain(
+        "no ongoing environmental damage is observed",
+      );
+      expect(decision.wakeOn).toEqual(["state_changed"]);
+      const input = requestUserPayload(fixture.requests[0]);
+      expect(input.runtime).toMatchObject({
+        lastOutcome: { kind: "move_to", status: "failed" },
+      });
+      expect(input.events).toContainEqual(
+        expect.objectContaining({ kind: "body_outcome" }),
+      );
+      expect(input.observation).toMatchObject({
+        self: { health: 4, inLava: false, onFire: false },
+      });
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "body操作がfailed、unverified、interrupted、cancelledになったら",
       );
     } finally {
       fixture.close();
