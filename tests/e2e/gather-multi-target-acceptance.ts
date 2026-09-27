@@ -1,3 +1,5 @@
+import type { GatherDropReadbackClass } from "./gather-drop-readback.js";
+
 export const GATHER_MULTI_TARGET_ITEMS = ["oak_log", "birch_log"] as const;
 export type GatherMultiTargetItem = (typeof GATHER_MULTI_TARGET_ITEMS)[number];
 
@@ -25,6 +27,8 @@ export interface GatherMultiTargetContinuityDiagnostic {
   readonly continuationDigDecisionObserved: boolean;
   readonly secondTargetServerAndBodyProgressObserved: boolean;
   readonly fixtureCleanupConfirmed: boolean;
+  readonly oakDropReadbackClass: GatherDropReadbackClass;
+  readonly birchDropReadbackClass: GatherDropReadbackClass;
 }
 
 export interface GatherActionPairTimes {

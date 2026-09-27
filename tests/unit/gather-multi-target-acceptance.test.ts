@@ -30,6 +30,8 @@ describe("multi-target gather E2E acceptance", () => {
           continuationDigDecisionObserved: true,
           secondTargetServerAndBodyProgressObserved: true,
           fixtureCleanupConfirmed: true,
+          oakDropReadbackClass: "known_negative",
+          birchDropReadbackClass: "known_negative",
         },
         2,
       ),
@@ -45,6 +47,8 @@ describe("multi-target gather E2E acceptance", () => {
       continuationDigDecisionObserved: true,
       secondTargetServerAndBodyProgressObserved: true,
       fixtureCleanupConfirmed: true,
+      oakDropReadbackClass: "known_negative",
+      birchDropReadbackClass: "known_negative",
       completedBodyGatherCount: 2,
     });
   });

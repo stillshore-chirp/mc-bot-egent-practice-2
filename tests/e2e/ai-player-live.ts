@@ -74,6 +74,12 @@ import {
   type ArmorProposalResolutionClass,
 } from "./armor-proposal-resolution.js";
 import {
+  classifyGatherDropReadbackFailure,
+  classifyGatherDropReadbackReply,
+  gatherDropReadbackConfirmsAbsence,
+  type GatherDropReadbackClass,
+} from "./gather-drop-readback.js";
+import {
   retainArmorCapabilityCompletionNotices,
   retainArmorCapabilityReply,
   retainArmorCapabilityReplyFragments,
@@ -305,8 +311,10 @@ interface GatherMultiTargetFixtureCleanupDiagnostic {
   birchBlockAirConfirmed: boolean;
   inventoryReadbackConfirmed: boolean;
   inventoryEmptyConfirmed: boolean;
+  oakDropReadbackClass: GatherDropReadbackClass;
   oakDropReadbackConfirmed: boolean;
   oakDropAbsentConfirmed: boolean;
+  birchDropReadbackClass: GatherDropReadbackClass;
   birchDropReadbackConfirmed: boolean;
   birchDropAbsentConfirmed: boolean;
 }
@@ -2061,6 +2069,8 @@ function beginGatherMultiTargetContinuityDiagnostic(state: RunState): void {
     continuationDigDecisionObserved: false,
     secondTargetServerAndBodyProgressObserved: false,
     fixtureCleanupConfirmed: false,
+    oakDropReadbackClass: "not_attempted",
+    birchDropReadbackClass: "not_attempted",
   };
 }
 
@@ -4093,6 +4103,26 @@ async function main(): Promise<void> {
                 context.rcon,
                 context.botName,
                 fixture,
+                (progress) => {
+                  const cleanupReadbackUpdate: Partial<GatherMultiTargetContinuityDiagnostic> =
+                    {
+                      ...(progress.oakDropReadbackClass === undefined
+                        ? {}
+                        : {
+                            oakDropReadbackClass: progress.oakDropReadbackClass,
+                          }),
+                      ...(progress.birchDropReadbackClass === undefined
+                        ? {}
+                        : {
+                            birchDropReadbackClass:
+                              progress.birchDropReadbackClass,
+                          }),
+                    };
+                  updateGatherMultiTargetContinuityDiagnostic(
+                    state,
+                    cleanupReadbackUpdate,
+                  );
+                },
               );
             } catch {
               fixtureCleanupConfirmed = false;
@@ -8398,8 +8428,10 @@ async function runGatherBodyVisibilityProbe(
       birchBlockAirConfirmed: false,
       inventoryReadbackConfirmed: false,
       inventoryEmptyConfirmed: false,
+      oakDropReadbackClass: "not_attempted",
       oakDropReadbackConfirmed: false,
       oakDropAbsentConfirmed: false,
+      birchDropReadbackClass: "not_attempted",
       birchDropReadbackConfirmed: false,
       birchDropAbsentConfirmed: false,
     },
@@ -11100,49 +11132,58 @@ async function cleanupGatherMultiTargetFixture(
     inventoryReadbackConfirmed: true,
     inventoryEmptyConfirmed,
   });
-  const remainingOakDrop = await rconGatherItemDropPositionNear(
+  const oakDropReadback = await rconGatherItemDropReadbackNear(
     rcon,
     fixture.oakLog,
     "oak_log",
   );
+  const oakDropReadbackConfirmed =
+    oakDropReadback === "position" || oakDropReadback === "known_negative";
   onProgress?.({
     stage: "birch_drop_readback",
-    oakDropReadbackConfirmed: true,
-    oakDropAbsentConfirmed: remainingOakDrop === undefined,
+    oakDropReadbackClass: oakDropReadback,
+    oakDropReadbackConfirmed,
+    oakDropAbsentConfirmed: gatherDropReadbackConfirmsAbsence(oakDropReadback),
   });
-  const remainingBirchDrop = await rconGatherItemDropPositionNear(
+  const birchDropReadback = await rconGatherItemDropReadbackNear(
     rcon,
     fixture.birchLog,
     "birch_log",
   );
-  const birchDropAbsentConfirmed = remainingBirchDrop === undefined;
+  const birchDropReadbackConfirmed =
+    birchDropReadback === "position" || birchDropReadback === "known_negative";
+  const birchDropAbsentConfirmed =
+    gatherDropReadbackConfirmsAbsence(birchDropReadback);
   onProgress?.({
     stage: "readbacks_complete",
-    birchDropReadbackConfirmed: true,
+    birchDropReadbackClass: birchDropReadback,
+    birchDropReadbackConfirmed,
     birchDropAbsentConfirmed,
   });
   return (
     oakBlockAirConfirmed &&
     birchBlockAirConfirmed &&
     inventoryEmptyConfirmed &&
-    remainingOakDrop === undefined &&
+    gatherDropReadbackConfirmsAbsence(oakDropReadback) &&
     birchDropAbsentConfirmed
   );
 }
 
-async function rconGatherItemDropPositionNear(
+async function rconGatherItemDropReadbackNear(
   rcon: LocalRcon,
   target: BlockPosition,
   item: GatherMultiTargetItem,
-): Promise<Position | undefined> {
+): Promise<Exclude<GatherDropReadbackClass, "not_attempted">> {
   const selector = `@e[type=minecraft:item,limit=1,sort=nearest,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`;
-  const reply = await rcon.command(
-    `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
-  );
-  const position = parseOptionalPosition(reply);
-  if (position !== undefined) return position;
-  if (/(?:test failed|no entity was found)/iu.test(reply)) return undefined;
-  incomplete("GATHER_MULTI_TARGET_DROP_ORACLE_UNAVAILABLE");
+  try {
+    const reply = await rcon.command(
+      `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${selector} run data get entity ${selector} Pos`,
+    );
+    return classifyGatherDropReadbackReply(reply);
+  } catch (error) {
+    const code = error instanceof HarnessError ? error.code : undefined;
+    return classifyGatherDropReadbackFailure(code);
+  }
 }
 
 async function orientForLearningLogFixture(
