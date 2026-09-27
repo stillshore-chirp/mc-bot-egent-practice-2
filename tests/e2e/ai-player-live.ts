@@ -54,9 +54,25 @@ import {
   type FurnaceRconReplyClass,
 } from "./furnace-rcon-classifier.js";
 import {
+  confirmsEquipmentHeadFieldAbsent,
   readEquipmentFieldFromRcon,
   readExecuteIfItemsRconReply,
 } from "./equipment-rcon-oracle.js";
+import {
+  classifyItemReplaceReply,
+  confirmsEquipmentHeadEmpty,
+  parseGameTimeReply,
+  type ItemReplaceReplyClass,
+} from "./equipment-cleanup-rcon.js";
+import {
+  classifyArmorCapabilityReply,
+  hasAccurateIronHelmetCompletionNotice,
+} from "./armor-capability-reply.js";
+import {
+  retainArmorCapabilityCompletionNotices,
+  retainArmorCapabilityReply,
+  retainArmorCapabilityReplyFragments,
+} from "./armor-capability-reply-sidecar.js";
 import {
   blockIs,
   classifyRconReply,
@@ -194,6 +210,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
+  armor_capability: { llmCalls: 28, totalTokens: 240_000 },
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -208,6 +225,7 @@ const CASE_DEADLINES = {
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
+  armor_capability: 8 * 60_000,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -265,6 +283,14 @@ interface GameActionPlacementObservationProbe {
     string,
     GameActionPlacementObservationSummary
   >;
+}
+interface ArmorCapabilityObservationProbe {
+  freshAfter: number;
+  equipRequestAt?: number;
+  carriedHelmetObservedAt?: number;
+  emptyHeadObservedAt?: number;
+  carriedHelmetAndEmptyHeadObservedAt?: number;
+  equippedHelmetObservedAt?: number;
 }
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
@@ -1616,6 +1642,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "parallel_dialogue_stop"
       ? (state.parallelDiagnostic ?? {})
       : {}),
+    ...(caseId === "armor_capability"
+      ? (state.armorCapabilityDiagnostic ?? EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC)
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2063,6 +2092,28 @@ function waitMs(timeoutMs: number): Promise<void> {
   return delay(timeoutMs);
 }
 
+async function waitForResponseBurst(
+  responseQueue: readonly OwnerResponse[],
+  startIndex: number,
+  quietMs = 300,
+  maxWaitMs = 1_500,
+): Promise<readonly OwnerResponse[]> {
+  const startedAt = Date.now();
+  let lastResponseAt = startedAt;
+  let observedLength = responseQueue.length;
+  while (
+    Date.now() - startedAt < maxWaitMs &&
+    Date.now() - lastResponseAt < quietMs
+  ) {
+    await waitMs(50);
+    if (responseQueue.length !== observedLength) {
+      observedLength = responseQueue.length;
+      lastResponseAt = Date.now();
+    }
+  }
+  return responseQueue.slice(startIndex);
+}
+
 function boundedBudgetValue(
   name: string,
   fallback: number,
@@ -2310,6 +2361,7 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
+  armorCapabilityDiagnostic?: ArmorCapabilityDiagnostic;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -2346,6 +2398,14 @@ interface RunState {
     readonly equipmentHeadItemMatched: boolean;
     readonly executeIfItemsResultObserved: boolean;
     readonly executeIfItemsMatched: boolean;
+    readonly headReplaceResponseReceived: boolean;
+    readonly headEmptyAfterReplaceConfirmed: boolean;
+    readonly inventoryClearResponseReceived: boolean;
+    readonly headEmptyAfterCleanupConfirmed: boolean;
+    readonly inventoryHelmetAbsentAfterClearConfirmed: boolean;
+    readonly fixtureCleanupFailureCode: ArmorFixtureCleanupFailureCode;
+    readonly fixtureCleanupConfirmed: boolean;
+    readonly cleanupComparison?: EquipmentCleanupComparisonDiagnostic;
   };
   observationBoundaryCapture?: {
     readonly responseStart: number;
@@ -2386,6 +2446,126 @@ interface FoodIntentContinuityDiagnostic {
   fullStageConsumeNotSelected: boolean;
   fullStageBreadUnchangedConfirmed: boolean;
   fullStageFoodLevelUnchangedConfirmed: boolean;
+}
+
+interface ArmorCapabilityDiagnostic {
+  caseStarted: boolean;
+  capabilityReplyObserved: boolean;
+  capabilityDigAndEquipAvailable: boolean;
+  capabilityFurnaceUiAvailable: boolean;
+  capabilityDedicatedSmeltStatementObserved: boolean;
+  capabilityDedicatedSmeltReportedUnavailable: boolean;
+  capabilityReplySidecarCaptured: boolean;
+  consultationNoNewProposal: boolean;
+  consultationNoBodyAction: boolean;
+  rconHelmetFixtureConfirmed: boolean;
+  bodyCarriedHelmetObservedBeforeSelection: boolean;
+  bodyHeadEmptyObservedBeforeSelection: boolean;
+  shortEquipRequestSent: boolean;
+  ownerProposalAdopted: boolean;
+  purposeSelectedEquip: boolean;
+  bodyEquipSuccessful: boolean;
+  bodyHeadHelmetObservedAfterEquip: boolean;
+  rconEquipmentFieldMatched: boolean;
+  rconExecuteIfItemsMatched: boolean;
+  ownerCompletionNoticeObserved: boolean;
+  ownerCompletionNoticeMultipleCandidates: boolean;
+  completionNoticeSidecarCaptured: boolean;
+  ownerCompletionNoticeAccurate: boolean;
+  textClassifiersRequireHumanReview: boolean;
+  headReplaceResponseReceived: boolean;
+  headEmptyAfterReplaceConfirmed: boolean;
+  inventoryClearResponseReceived: boolean;
+  headEmptyAfterCleanupConfirmed: boolean;
+  inventoryHelmetAbsentAfterClearConfirmed: boolean;
+  fixtureCleanupFailureCode: ArmorFixtureCleanupFailureCode;
+  fixtureCleanupConfirmed: boolean;
+}
+
+const EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC: ArmorCapabilityDiagnostic = {
+  caseStarted: false,
+  capabilityReplyObserved: false,
+  capabilityDigAndEquipAvailable: false,
+  capabilityFurnaceUiAvailable: false,
+  capabilityDedicatedSmeltStatementObserved: false,
+  capabilityDedicatedSmeltReportedUnavailable: false,
+  capabilityReplySidecarCaptured: false,
+  consultationNoNewProposal: false,
+  consultationNoBodyAction: false,
+  rconHelmetFixtureConfirmed: false,
+  bodyCarriedHelmetObservedBeforeSelection: false,
+  bodyHeadEmptyObservedBeforeSelection: false,
+  shortEquipRequestSent: false,
+  ownerProposalAdopted: false,
+  purposeSelectedEquip: false,
+  bodyEquipSuccessful: false,
+  bodyHeadHelmetObservedAfterEquip: false,
+  rconEquipmentFieldMatched: false,
+  rconExecuteIfItemsMatched: false,
+  ownerCompletionNoticeObserved: false,
+  ownerCompletionNoticeMultipleCandidates: false,
+  completionNoticeSidecarCaptured: false,
+  ownerCompletionNoticeAccurate: false,
+  textClassifiersRequireHumanReview: true,
+  headReplaceResponseReceived: false,
+  headEmptyAfterReplaceConfirmed: false,
+  inventoryClearResponseReceived: false,
+  headEmptyAfterCleanupConfirmed: false,
+  inventoryHelmetAbsentAfterClearConfirmed: false,
+  fixtureCleanupFailureCode: "not_run",
+  fixtureCleanupConfirmed: false,
+};
+
+type ArmorFixtureCleanupFailureCode =
+  | "not_run"
+  | "none"
+  | "head_empty_after_replace_unconfirmed"
+  | "head_empty_after_cleanup_unconfirmed"
+  | "inventory_helmet_absence_unconfirmed";
+
+interface ArmorFixtureCleanupDiagnostic {
+  headReplaceResponseReceived: boolean;
+  headEmptyAfterReplaceConfirmed: boolean;
+  inventoryClearResponseReceived: boolean;
+  headEmptyAfterCleanupConfirmed: boolean;
+  inventoryHelmetAbsentAfterClearConfirmed: boolean;
+  fixtureCleanupFailureCode: ArmorFixtureCleanupFailureCode;
+  fixtureCleanupConfirmed: boolean;
+}
+
+interface EquipmentCleanupStageDiagnostic {
+  readonly replaceReplyClass: ItemReplaceReplyClass;
+  readonly replaceResponseReceived: boolean;
+  readonly helmetPresentBeforeCommandConfirmed: boolean;
+  readonly oneTickWaitConfirmed: boolean;
+  readonly equipmentFieldObserved: boolean;
+  readonly equipmentHeadHelmetMatched: boolean;
+  readonly equipmentHeadFieldEmptyConfirmed: boolean;
+  readonly helmetPredicateResultObserved: boolean;
+  readonly helmetPredicateMatched: boolean;
+  readonly anyHeadItemPredicateResultObserved: boolean;
+  readonly anyHeadItemMatched: boolean;
+  readonly headEmptyConfirmed: boolean;
+}
+
+interface EquipmentCleanupComparisonDiagnostic {
+  readonly airAlias: EquipmentCleanupStageDiagnostic;
+  readonly minecraftAir: EquipmentCleanupStageDiagnostic;
+  readonly finalCommandClass: "air_alias" | "minecraft_air" | "not_confirmed";
+  readonly finalHeadEmptyConfirmed: boolean;
+  readonly finalInventoryHelmetAbsentConfirmed: boolean;
+  readonly privateRconRepliesRetained: boolean;
+}
+
+function updateArmorCapabilityDiagnostic(
+  state: RunState,
+  update: Partial<ArmorCapabilityDiagnostic>,
+): void {
+  state.armorCapabilityDiagnostic = {
+    ...EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC,
+    ...state.armorCapabilityDiagnostic,
+    ...update,
+  };
 }
 
 const EMPTY_FOOD_INTENT_CONTINUITY_DIAGNOSTIC: FoodIntentContinuityDiagnostic =
@@ -2433,6 +2613,8 @@ let currentRunState: RunState | undefined;
 let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
+let activeArmorCapabilityObservationProbe:
+  ArmorCapabilityObservationProbe | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
 
 function installGameActionPlacementObservationProbe(): () => void {
@@ -2474,6 +2656,31 @@ function installGameActionPlacementObservationProbe(): () => void {
         const firstObservedAt = probe.observationsByTime.keys().next().value;
         if (firstObservedAt === undefined) break;
         probe.observationsByTime.delete(firstObservedAt);
+      }
+    }
+    const armorProbe = activeArmorCapabilityObservationProbe;
+    if (
+      armorProbe !== undefined &&
+      Number.isFinite(observedAt) &&
+      observedAt > armorProbe.freshAfter
+    ) {
+      const carriedIronHelmet = observation.self.inventory.some(
+        (item) => item.name === "iron_helmet" && item.count > 0,
+      );
+      const headItem = observation.self.equipment.head;
+      if (carriedIronHelmet && armorProbe.carriedHelmetObservedAt === undefined)
+        armorProbe.carriedHelmetObservedAt = observedAt;
+      if (headItem == null && armorProbe.emptyHeadObservedAt === undefined)
+        armorProbe.emptyHeadObservedAt = observedAt;
+      if (carriedIronHelmet && headItem == null) {
+        armorProbe.carriedHelmetAndEmptyHeadObservedAt = observedAt;
+      }
+      if (
+        armorProbe.equipRequestAt !== undefined &&
+        observedAt > armorProbe.equipRequestAt &&
+        headItem?.name === "iron_helmet"
+      ) {
+        armorProbe.equippedHelmetObservedAt = observedAt;
       }
     }
     return observation;
@@ -4264,6 +4471,377 @@ async function main(): Promise<void> {
       },
     );
 
+    const armorCapabilityResult = await recordCase(
+      state,
+      "armor_capability",
+      CASE_DEADLINES.armor_capability,
+      requireLiveContext(),
+      async (context) => {
+        updateArmorCapabilityDiagnostic(state, { caseStarted: true });
+        const initialQuiet = await observeForPlayer(
+          context,
+          15_000,
+          (player) =>
+            player.activeOperation === undefined &&
+            !player.proposals.some(({ status }) => status === "pending"),
+        );
+        if (initialQuiet === undefined)
+          incomplete("ARMOR_CAPABILITY_PRECONDITION_NOT_QUIET");
+
+        const beforeConsult = playerOf(await collect(context.runtime.app));
+        const proposalIdsBeforeConsult = new Set(
+          beforeConsult.proposals.map(({ id }) => id),
+        );
+        const responseStart = context.responseQueue.length;
+        const consultationSentAt = Date.now();
+        sendChat(
+          context.owner,
+          "今の公開操作catalogで、digとequipは何ができ、かまどUIのopen_window・window_transferと専用smelt操作はどう違いますか？ 実行条件も短く説明してください。能力相談だけなので、目標提案やMinecraft操作は始めないでください。",
+        );
+        const consultationReplyPlayer = await observeForPlayer(
+          context,
+          45_000,
+          () =>
+            context.responseQueue
+              .slice(responseStart)
+              .some(({ at }) => at >= consultationSentAt),
+        );
+        if (consultationReplyPlayer === undefined)
+          incomplete("ARMOR_CAPABILITY_REPLY_NOT_OBSERVED");
+        const capabilityReplies = (
+          await waitForResponseBurst(context.responseQueue, responseStart)
+        ).filter(({ at }) => at >= consultationSentAt);
+        const firstCapabilityReply = capabilityReplies[0];
+        if (firstCapabilityReply === undefined)
+          incomplete("ARMOR_CAPABILITY_REPLY_NOT_OBSERVED");
+        try {
+          await retainArmorCapabilityReply(state.id, firstCapabilityReply.text);
+          await retainArmorCapabilityReplyFragments(
+            state.id,
+            capabilityReplies.slice(1).map(({ at, text }) => ({
+              offsetMs: Math.max(0, at - consultationSentAt),
+              text,
+            })),
+          );
+        } catch {
+          incomplete("ARMOR_CAPABILITY_REPLY_SIDECAR_NOT_RETAINED");
+        }
+        const capabilityReplyText = capabilityReplies
+          .map(({ text }) => text)
+          .join("\n");
+        const capabilityClassification =
+          classifyArmorCapabilityReply(capabilityReplyText);
+        updateArmorCapabilityDiagnostic(state, {
+          capabilityReplyObserved: true,
+          capabilityDigAndEquipAvailable:
+            capabilityClassification.digAndEquipAvailable,
+          capabilityFurnaceUiAvailable:
+            capabilityClassification.furnaceUiAvailable,
+          capabilityDedicatedSmeltStatementObserved:
+            capabilityClassification.dedicatedSmeltStatementObserved,
+          capabilityDedicatedSmeltReportedUnavailable:
+            capabilityClassification.dedicatedSmeltReportedUnavailable,
+          capabilityReplySidecarCaptured: true,
+        });
+        if (
+          !capabilityClassification.digAndEquipAvailable ||
+          !capabilityClassification.furnaceUiAvailable
+        )
+          incomplete("ARMOR_CAPABILITY_REPLY_NOT_CLASSIFIED");
+
+        await waitMs(1_500);
+        const afterConsult = playerOf(await collect(context.runtime.app));
+        const consultationNoNewProposal = !afterConsult.proposals.some(
+          ({ id }) => !proposalIdsBeforeConsult.has(id),
+        );
+        const consultationNoBodyAction =
+          afterConsult.actionRevision === beforeConsult.actionRevision &&
+          newOutcomes(beforeConsult, afterConsult).length === 0 &&
+          afterConsult.activeOperation === undefined;
+        updateArmorCapabilityDiagnostic(state, {
+          consultationNoNewProposal,
+          consultationNoBodyAction,
+        });
+        if (!consultationNoNewProposal)
+          fail("ARMOR_CAPABILITY_CONSULT_CREATED_PROPOSAL");
+
+        const carriedHelmetBefore = await rconInventoryItemCount(
+          context.rcon,
+          context.botName,
+          "iron_helmet",
+        );
+        if (carriedHelmetBefore !== 0)
+          incomplete("ARMOR_CAPABILITY_FIXTURE_NOT_EMPTY");
+        const beforeEquip = playerOf(await collect(context.runtime.app));
+        const proposalIdsBeforeEquip = new Set(
+          beforeEquip.proposals.map(({ id }) => id),
+        );
+        const initialPurposeRounds = new Set(
+          (beforeEquip.recentAgentActivity ?? []).map(
+            ({ runSequence, round }) => `${runSequence}:${round}`,
+          ),
+        );
+        const observationProbe: ArmorCapabilityObservationProbe = {
+          freshAfter: Date.now(),
+        };
+        activeArmorCapabilityObservationProbe = observationProbe;
+        let bodyError: unknown;
+        try {
+          await context.rcon.command(
+            `give ${context.botName} minecraft:iron_helmet 1`,
+          );
+          const helmetFixtureConfirmed =
+            (await rconInventoryItemCount(
+              context.rcon,
+              context.botName,
+              "iron_helmet",
+            )) === 1;
+          updateArmorCapabilityDiagnostic(state, {
+            rconHelmetFixtureConfirmed: helmetFixtureConfirmed,
+          });
+          if (!helmetFixtureConfirmed)
+            incomplete("ARMOR_CAPABILITY_FIXTURE_NOT_CONFIRMED");
+
+          const equipResponseStart = context.responseQueue.length;
+          observationProbe.equipRequestAt = Date.now();
+          sendChat(context.owner, "鉄のヘルメットを着てみて。");
+          updateArmorCapabilityDiagnostic(state, {
+            shortEquipRequestSent: true,
+          });
+          const proposalSnapshot = await observeForPlayer(
+            context,
+            45_000,
+            (player) =>
+              player.proposals.some(
+                ({ id }) => !proposalIdsBeforeEquip.has(id),
+              ),
+          );
+          if (proposalSnapshot === undefined)
+            incomplete("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_OBSERVED");
+          const proposal = proposalSnapshot.proposals.find(
+            ({ id }) => !proposalIdsBeforeEquip.has(id),
+          );
+          if (proposal === undefined)
+            incomplete("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_OBSERVED");
+
+          const decisionSnapshot = await observeForPlayer(
+            context,
+            150_000,
+            (player) =>
+              player.recentJudgments.some(
+                (judgment) =>
+                  judgment.proposalId === proposal.id &&
+                  ["act", "wait", "complete"].includes(judgment.kind ?? ""),
+              ),
+          );
+          if (decisionSnapshot === undefined)
+            incomplete("ARMOR_CAPABILITY_PURPOSE_DECISION_NOT_OBSERVED");
+          const resolution = decisionSnapshot.recentJudgments.find(
+            (judgment) => judgment.proposalId === proposal.id,
+          );
+          if (resolution === undefined)
+            incomplete("ARMOR_CAPABILITY_PURPOSE_DECISION_NOT_OBSERVED");
+          const ownerProposalAdopted =
+            resolution.proposalDisposition === "adopted" ||
+            resolution.proposalDisposition === "compromised";
+          updateArmorCapabilityDiagnostic(state, { ownerProposalAdopted });
+          if (!ownerProposalAdopted)
+            fail("ARMOR_CAPABILITY_OWNER_PROPOSAL_NOT_ADOPTED");
+          const purposeCommitObserved = (
+            decisionSnapshot.recentAgentActivity ?? []
+          ).some(
+            (activity) =>
+              activity.role === "purpose" &&
+              !initialPurposeRounds.has(
+                `${activity.runSequence}:${activity.round}`,
+              ) &&
+              activity.toolCalls.some(
+                (toolCall) =>
+                  toolCall.name === "commit_action_decision" &&
+                  toolCall.resultClass === "ok",
+              ),
+          );
+          const purposeSelectedEquip =
+            purposeCommitObserved &&
+            resolution.kind === "act" &&
+            resolution.operationKind === "equip";
+          updateArmorCapabilityDiagnostic(state, { purposeSelectedEquip });
+          if (!purposeSelectedEquip)
+            fail("ARMOR_CAPABILITY_PURPOSE_DID_NOT_SELECT_EQUIP");
+
+          const selectionAt =
+            resolution.decidedAt === undefined
+              ? Number.NaN
+              : Date.parse(resolution.decidedAt);
+          const carriedAndEmptyObservedAt =
+            observationProbe.carriedHelmetAndEmptyHeadObservedAt;
+          const bodyCarriedHelmetObservedBeforeSelection =
+            carriedAndEmptyObservedAt !== undefined &&
+            Number.isFinite(selectionAt) &&
+            carriedAndEmptyObservedAt < selectionAt;
+          const bodyHeadEmptyObservedBeforeSelection =
+            bodyCarriedHelmetObservedBeforeSelection;
+          updateArmorCapabilityDiagnostic(state, {
+            bodyCarriedHelmetObservedBeforeSelection,
+            bodyHeadEmptyObservedBeforeSelection,
+          });
+          if (
+            !bodyCarriedHelmetObservedBeforeSelection ||
+            !bodyHeadEmptyObservedBeforeSelection
+          )
+            incomplete("ARMOR_CAPABILITY_FRESH_BODY_OBSERVATION_NOT_CONFIRMED");
+
+          const outcomeSnapshot = await observeForPlayer(
+            context,
+            100_000,
+            (player) =>
+              newOutcomes(beforeEquip, player).some(
+                (outcome) => outcome.kind === "equip",
+              ),
+          );
+          if (outcomeSnapshot === undefined)
+            incomplete("ARMOR_CAPABILITY_EQUIP_OUTCOME_NOT_OBSERVED");
+          const equipOutcome = newOutcomes(beforeEquip, outcomeSnapshot).find(
+            (outcome) => outcome.kind === "equip",
+          );
+          if (equipOutcome === undefined)
+            incomplete("ARMOR_CAPABILITY_EQUIP_OUTCOME_NOT_OBSERVED");
+          const bodyEquipSuccessful = equipOutcome.status === "successful";
+          updateArmorCapabilityDiagnostic(state, { bodyEquipSuccessful });
+          if (!bodyEquipSuccessful)
+            fail("ARMOR_CAPABILITY_BODY_EQUIP_NOT_SUCCESSFUL");
+
+          const outcomeAt =
+            equipOutcome.observedAt === undefined
+              ? Number.NaN
+              : Date.parse(equipOutcome.observedAt);
+          const observationDeadline = Date.now() + 10_000;
+          while (
+            observationProbe.equippedHelmetObservedAt === undefined &&
+            Date.now() < observationDeadline
+          ) {
+            await waitMs(250);
+          }
+          const bodyHeadHelmetObservedAfterEquip =
+            observationProbe.equippedHelmetObservedAt !== undefined &&
+            observationProbe.equippedHelmetObservedAt > selectionAt &&
+            observationProbe.equippedHelmetObservedAt >= outcomeAt;
+          updateArmorCapabilityDiagnostic(state, {
+            bodyHeadHelmetObservedAfterEquip,
+          });
+          if (!bodyHeadHelmetObservedAfterEquip)
+            incomplete("ARMOR_CAPABILITY_BODY_EQUIPMENT_NOT_OBSERVED");
+
+          let equipmentHeadReadback = {
+            equipmentFieldObserved: false,
+            expectedItemMatched: false,
+          };
+          let executeIfItemsReadback = {
+            resultObserved: false,
+            expectedItemMatched: false,
+          };
+          const readbackDeadline = Date.now() + 5_000;
+          do {
+            const equipmentHeadReply = await context.rcon.command(
+              `data get entity ${context.botName} equipment.head`,
+            );
+            const executeIfItemsReply = await context.rcon.command(
+              `execute if items entity ${context.botName} armor.head minecraft:iron_helmet`,
+            );
+            equipmentHeadReadback = readEquipmentFieldFromRcon(
+              equipmentHeadReply,
+              "minecraft:iron_helmet",
+            );
+            executeIfItemsReadback =
+              readExecuteIfItemsRconReply(executeIfItemsReply);
+            if (
+              equipmentHeadReadback.expectedItemMatched &&
+              executeIfItemsReadback.expectedItemMatched
+            )
+              break;
+            await waitMs(250);
+          } while (Date.now() < readbackDeadline);
+          updateArmorCapabilityDiagnostic(state, {
+            rconEquipmentFieldMatched:
+              equipmentHeadReadback.equipmentFieldObserved &&
+              equipmentHeadReadback.expectedItemMatched,
+            rconExecuteIfItemsMatched:
+              executeIfItemsReadback.resultObserved &&
+              executeIfItemsReadback.expectedItemMatched,
+          });
+          if (
+            !equipmentHeadReadback.equipmentFieldObserved ||
+            !equipmentHeadReadback.expectedItemMatched ||
+            !executeIfItemsReadback.resultObserved ||
+            !executeIfItemsReadback.expectedItemMatched
+          )
+            fail("ARMOR_CAPABILITY_RCON_EQUIPMENT_ORACLE_MISMATCH");
+
+          const completionMessageObserved = await observeForPlayer(
+            context,
+            40_000,
+            () =>
+              context.responseQueue
+                .slice(equipResponseStart)
+                .some(
+                  ({ at }) => Number.isFinite(outcomeAt) && at >= outcomeAt,
+                ),
+          );
+          if (completionMessageObserved === undefined)
+            incomplete("ARMOR_CAPABILITY_COMPLETION_NOTICE_NOT_OBSERVED");
+          const completionNoticeCandidates = (
+            await waitForResponseBurst(
+              context.responseQueue,
+              equipResponseStart,
+              900,
+              5_000,
+            )
+          ).filter(({ at }) => Number.isFinite(outcomeAt) && at >= outcomeAt);
+          if (completionNoticeCandidates.length === 0)
+            incomplete("ARMOR_CAPABILITY_COMPLETION_NOTICE_NOT_OBSERVED");
+          try {
+            await retainArmorCapabilityCompletionNotices(
+              state.id,
+              completionNoticeCandidates.map(({ at, text }) => ({
+                offsetMs: Math.max(0, at - outcomeAt),
+                text,
+              })),
+            );
+          } catch {
+            incomplete("ARMOR_CAPABILITY_COMPLETION_SIDECAR_NOT_RETAINED");
+          }
+          const ownerCompletionNoticeAccurate =
+            hasAccurateIronHelmetCompletionNotice(
+              completionNoticeCandidates.map(({ text }) => text),
+            );
+          updateArmorCapabilityDiagnostic(state, {
+            ownerCompletionNoticeObserved: true,
+            ownerCompletionNoticeMultipleCandidates:
+              completionNoticeCandidates.length > 1,
+            completionNoticeSidecarCaptured: true,
+            ownerCompletionNoticeAccurate,
+          });
+          if (!ownerCompletionNoticeAccurate)
+            incomplete("ARMOR_CAPABILITY_COMPLETION_NOTICE_NOT_CLASSIFIED");
+        } catch (error) {
+          bodyError = error;
+        } finally {
+          activeArmorCapabilityObservationProbe = undefined;
+          const cleanup = await cleanupArmorHelmetFixture(
+            context.rcon,
+            context.botName,
+          );
+          updateArmorCapabilityDiagnostic(state, cleanup);
+        }
+        if (bodyError instanceof Error) throw bodyError;
+        if (bodyError !== undefined)
+          incomplete("ARMOR_CAPABILITY_CASE_EXECUTION_FAILED");
+        if (state.armorCapabilityDiagnostic?.fixtureCleanupConfirmed !== true)
+          incomplete("ARMOR_CAPABILITY_FIXTURE_CLEANUP_NOT_CONFIRMED");
+        return { ...state.armorCapabilityDiagnostic };
+      },
+    );
+
     const unknownResult = await recordCase(
       state,
       "unknown_composite",
@@ -5560,6 +6138,7 @@ async function main(): Promise<void> {
           exchangeResult,
           discretionResult,
           foodResult,
+          armorCapabilityResult,
           parallelResult,
           operationSmokeResult,
         ];
@@ -5629,6 +6208,7 @@ async function main(): Promise<void> {
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
     activeGameActionPlacementObservationProbe = undefined;
+    activeArmorCapabilityObservationProbe = undefined;
     restoreGameActionPlacementObservationProbe?.();
     restoreGameActionPlacementObservationProbe = undefined;
     await writeArtifact(state);
@@ -7037,6 +7617,8 @@ async function runEquipmentRconProbe(
   let bodyInventoryItemObserved = false;
   let bodyEquipSuccessful = false;
   let bodyEquipmentObserved = false;
+  let fixtureCleanupConfirmed: boolean;
+  let cleanupComparison: EquipmentCleanupComparisonDiagnostic | undefined;
   let equipmentHeadReply: string;
   let executeIfItemsReply: string;
   try {
@@ -7094,6 +7676,13 @@ async function runEquipmentRconProbe(
       equipmentHeadItemMatched: equipmentFieldReadback.expectedItemMatched,
       executeIfItemsResultObserved: executeIfItemsReadback.resultObserved,
       executeIfItemsMatched: executeIfItemsReadback.expectedItemMatched,
+      headReplaceResponseReceived: false,
+      headEmptyAfterReplaceConfirmed: false,
+      inventoryClearResponseReceived: false,
+      headEmptyAfterCleanupConfirmed: false,
+      inventoryHelmetAbsentAfterClearConfirmed: false,
+      fixtureCleanupFailureCode: "not_run",
+      fixtureCleanupConfirmed: false,
     };
     if (!bodyInventoryItemObserved)
       incomplete("EQUIPMENT_RCON_GIVEN_ITEM_NOT_OBSERVED_BY_BODY");
@@ -7108,9 +7697,36 @@ async function runEquipmentRconProbe(
       incomplete("EQUIPMENT_RCON_HEAD_ITEM_NOT_CONFIRMED");
   } finally {
     clearTimeout(abortTimer);
+    cleanupComparison = await runEquipmentCleanupComparison(state, rcon, body);
+    fixtureCleanupConfirmed =
+      cleanupComparison.finalHeadEmptyConfirmed &&
+      cleanupComparison.finalInventoryHelmetAbsentConfirmed;
+    if (state.equipmentRconDiagnostic !== undefined) {
+      state.equipmentRconDiagnostic = {
+        ...state.equipmentRconDiagnostic,
+        headReplaceResponseReceived:
+          cleanupComparison.airAlias.replaceResponseReceived,
+        headEmptyAfterReplaceConfirmed:
+          cleanupComparison.airAlias.headEmptyConfirmed,
+        inventoryClearResponseReceived: true,
+        headEmptyAfterCleanupConfirmed:
+          cleanupComparison.finalHeadEmptyConfirmed,
+        inventoryHelmetAbsentAfterClearConfirmed:
+          cleanupComparison.finalInventoryHelmetAbsentConfirmed,
+        fixtureCleanupFailureCode: fixtureCleanupConfirmed
+          ? "none"
+          : "head_empty_after_replace_unconfirmed",
+        fixtureCleanupConfirmed,
+        cleanupComparison,
+      };
+    }
     await body?.stop().catch(() => undefined);
     await client.disconnect("equipment_rcon_probe_finished");
   }
+  if (!cleanupComparison.privateRconRepliesRetained)
+    incomplete("EQUIPMENT_CLEANUP_RCON_SIDECAR_WRITE_FAILED");
+  if (!fixtureCleanupConfirmed)
+    incomplete("EQUIPMENT_RCON_PROBE_CLEANUP_NOT_CONFIRMED");
 }
 
 async function runUnknownReturnPathProbe(
@@ -7714,9 +8330,22 @@ async function rconInventoryHasBlueWool(
 async function rconInventoryItemCount(
   rcon: LocalRcon,
   botName: string,
-  item: "bread",
+  item: "bread" | "iron_helmet",
+  replyRecorder?: (reply: string) => void,
 ): Promise<number> {
   const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  replyRecorder?.(inventory);
+  if (
+    !/entity data:\s*\[/iu.test(inventory) ||
+    /(?:unknown(?: or incomplete)? command|error|failed|not found)/iu.test(
+      inventory,
+    )
+  )
+    incomplete(
+      item === "bread"
+        ? "FOOD_INTENT_INVENTORY_COUNT_UNAVAILABLE"
+        : "ARMOR_CAPABILITY_INVENTORY_COUNT_UNAVAILABLE",
+    );
   const itemId = new RegExp(`\\bid\\s*:\\s*["']minecraft:${item}["']`, "u");
   let count = 0;
   for (const stack of inventory.matchAll(/\{[^{}]*\}/gu)) {
@@ -7725,10 +8354,455 @@ async function rconInventoryItemCount(
       stack[0],
     );
     if (stackCount === null)
-      incomplete("FOOD_INTENT_INVENTORY_COUNT_UNAVAILABLE");
+      incomplete(
+        item === "bread"
+          ? "FOOD_INTENT_INVENTORY_COUNT_UNAVAILABLE"
+          : "ARMOR_CAPABILITY_INVENTORY_COUNT_UNAVAILABLE",
+      );
     count += Number(stackCount[1]);
   }
   return count;
+}
+
+interface PrivateEquipmentCleanupRconReply {
+  readonly step: string;
+  readonly reply: string | null;
+}
+
+interface EquipmentHeadRconObservation {
+  readonly equipmentFieldObserved: boolean;
+  readonly equipmentHeadHelmetMatched: boolean;
+  readonly equipmentHeadFieldEmptyConfirmed: boolean;
+  readonly helmetPredicateResultObserved: boolean;
+  readonly helmetPredicateMatched: boolean;
+  readonly anyHeadItemPredicateResultObserved: boolean;
+  readonly anyHeadItemMatched: boolean;
+  readonly headEmptyConfirmed: boolean;
+}
+
+async function recordedEquipmentCleanupRconCommand(
+  rcon: LocalRcon,
+  step: string,
+  command: string,
+  replies: PrivateEquipmentCleanupRconReply[],
+): Promise<string | null> {
+  try {
+    const reply = await rcon.command(command, 1_000);
+    replies.push({ step, reply });
+    return reply;
+  } catch {
+    replies.push({ step, reply: null });
+    return null;
+  }
+}
+
+async function waitForOneGameTick(
+  rcon: LocalRcon,
+  step: string,
+  replies: PrivateEquipmentCleanupRconReply[],
+): Promise<boolean> {
+  const baseline = parseGameTimeReply(
+    await recordedEquipmentCleanupRconCommand(
+      rcon,
+      `${step}.tick_baseline`,
+      "time query gametime",
+      replies,
+    ),
+  );
+  if (baseline === undefined) return false;
+  const deadline = Date.now() + 1_500;
+  while (Date.now() < deadline) {
+    await delay(50);
+    const current = parseGameTimeReply(
+      await recordedEquipmentCleanupRconCommand(
+        rcon,
+        `${step}.tick_observation`,
+        "time query gametime",
+        replies,
+      ),
+    );
+    if (current !== undefined && current > baseline) return true;
+  }
+  return false;
+}
+
+async function observeEquipmentHeadOverRcon(
+  rcon: LocalRcon,
+  botName: string,
+  step: string,
+  replies: PrivateEquipmentCleanupRconReply[],
+): Promise<EquipmentHeadRconObservation> {
+  const fieldReply = await recordedEquipmentCleanupRconCommand(
+    rcon,
+    `${step}.equipment_head`,
+    `data get entity ${botName} equipment.head`,
+    replies,
+  );
+  const helmetPredicateReply = await recordedEquipmentCleanupRconCommand(
+    rcon,
+    `${step}.helmet_predicate`,
+    `execute if items entity ${botName} armor.head minecraft:iron_helmet`,
+    replies,
+  );
+  const anyItemPredicateReply = await recordedEquipmentCleanupRconCommand(
+    rcon,
+    `${step}.any_item_predicate`,
+    `execute if items entity ${botName} armor.head *`,
+    replies,
+  );
+  const field = readEquipmentFieldFromRcon(fieldReply, "minecraft:iron_helmet");
+  const helmetPredicate = readExecuteIfItemsRconReply(helmetPredicateReply);
+  const anyItemPredicate = readExecuteIfItemsRconReply(anyItemPredicateReply);
+  return {
+    equipmentFieldObserved: field.equipmentFieldObserved,
+    equipmentHeadHelmetMatched: field.expectedItemMatched,
+    equipmentHeadFieldEmptyConfirmed:
+      confirmsEquipmentHeadFieldAbsent(fieldReply),
+    helmetPredicateResultObserved: helmetPredicate.resultObserved,
+    helmetPredicateMatched: helmetPredicate.expectedItemMatched,
+    anyHeadItemPredicateResultObserved: anyItemPredicate.resultObserved,
+    anyHeadItemMatched: anyItemPredicate.expectedItemMatched,
+    headEmptyConfirmed: confirmsEquipmentHeadEmpty(
+      fieldReply,
+      anyItemPredicate,
+    ),
+  };
+}
+
+function helmetPresenceConfirmed(
+  observation: EquipmentHeadRconObservation,
+): boolean {
+  return (
+    (observation.equipmentFieldObserved &&
+      observation.equipmentHeadHelmetMatched) ||
+    (observation.helmetPredicateResultObserved &&
+      observation.helmetPredicateMatched)
+  );
+}
+
+function toEquipmentCleanupStageDiagnostic(
+  replaceReply: string | null,
+  helmetPresentBeforeCommandConfirmed: boolean,
+  oneTickWaitConfirmed: boolean,
+  observation: EquipmentHeadRconObservation,
+): EquipmentCleanupStageDiagnostic {
+  return {
+    replaceReplyClass: classifyItemReplaceReply(replaceReply),
+    replaceResponseReceived: replaceReply !== null,
+    helmetPresentBeforeCommandConfirmed,
+    oneTickWaitConfirmed,
+    ...observation,
+  };
+}
+
+async function runEquipmentReplaceTrial(
+  rcon: LocalRcon,
+  botName: string,
+  step: "air_alias" | "minecraft_air",
+  itemStack: "air" | "minecraft:air",
+  replies: PrivateEquipmentCleanupRconReply[],
+): Promise<EquipmentCleanupStageDiagnostic> {
+  const before = await observeEquipmentHeadOverRcon(
+    rcon,
+    botName,
+    `${step}.before`,
+    replies,
+  );
+  const replaceReply = await recordedEquipmentCleanupRconCommand(
+    rcon,
+    `${step}.replace`,
+    `item replace entity ${botName} armor.head with ${itemStack}`,
+    replies,
+  );
+  const oneTickWaitConfirmed = await waitForOneGameTick(rcon, step, replies);
+  const after = await observeEquipmentHeadOverRcon(
+    rcon,
+    botName,
+    `${step}.after`,
+    replies,
+  );
+  return toEquipmentCleanupStageDiagnostic(
+    replaceReply,
+    helmetPresenceConfirmed(before),
+    oneTickWaitConfirmed,
+    after,
+  );
+}
+
+async function prepareHelmetForCleanupTrial(
+  rcon: LocalRcon,
+  body: PlayerBody | undefined,
+  botName: string,
+  signal: AbortSignal,
+  replies: PrivateEquipmentCleanupRconReply[],
+): Promise<boolean> {
+  await recordedEquipmentCleanupRconCommand(
+    rcon,
+    "canonical_trial.reseed_clear",
+    `clear ${botName} minecraft:iron_helmet`,
+    replies,
+  );
+  await recordedEquipmentCleanupRconCommand(
+    rcon,
+    "canonical_trial.reseed_give",
+    `give ${botName} minecraft:iron_helmet 1`,
+    replies,
+  );
+  if (body === undefined) return false;
+
+  const inventoryDeadline = Date.now() + 5_000;
+  let bodyInventoryItemObserved = false;
+  while (!signal.aborted && Date.now() < inventoryDeadline) {
+    try {
+      const observation = await body.observe();
+      bodyInventoryItemObserved = observation.self.inventory.some(
+        (item) => item.name === "iron_helmet" && item.count > 0,
+      );
+    } catch {
+      bodyInventoryItemObserved = false;
+    }
+    if (bodyInventoryItemObserved) break;
+    await delay(100);
+  }
+  if (!bodyInventoryItemObserved) return false;
+
+  try {
+    const result = await body.execute(
+      { kind: "equip", item: "iron_helmet", destination: "head" },
+      signal,
+    );
+    if (result.status !== "successful") return false;
+  } catch {
+    return false;
+  }
+
+  const equipmentDeadline = Date.now() + 5_000;
+  while (!signal.aborted && Date.now() < equipmentDeadline) {
+    const observation = await observeEquipmentHeadOverRcon(
+      rcon,
+      botName,
+      "canonical_trial.precondition",
+      replies,
+    );
+    if (helmetPresenceConfirmed(observation)) return true;
+    await delay(100);
+  }
+  return false;
+}
+
+async function retainPrivateEquipmentCleanupRconReplies(
+  runId: string,
+  replies: readonly PrivateEquipmentCleanupRconReply[],
+): Promise<boolean> {
+  const diagnosticsDirectory = join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+  );
+  const destination = join(
+    diagnosticsDirectory,
+    `${runId}-equipment-cleanup-rcon.json`,
+  );
+  try {
+    await mkdir(diagnosticsDirectory, { recursive: true, mode: 0o700 });
+    await chmod(diagnosticsDirectory, 0o700);
+    await writeFile(
+      destination,
+      `${JSON.stringify(
+        {
+          schema: "ai-player-e2e-private-equipment-cleanup-rcon/v1",
+          replies,
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+    await chmod(destination, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runEquipmentCleanupComparison(
+  state: RunState,
+  rcon: LocalRcon,
+  body: PlayerBody | undefined,
+): Promise<EquipmentCleanupComparisonDiagnostic> {
+  const replies: PrivateEquipmentCleanupRconReply[] = [];
+  const signal = new AbortController();
+  const airAlias = await runEquipmentReplaceTrial(
+    rcon,
+    state.botName,
+    "air_alias",
+    "air",
+    replies,
+  );
+  let canonicalPreconditionConfirmed =
+    airAlias.helmetPresentBeforeCommandConfirmed &&
+    (airAlias.helmetPredicateMatched || airAlias.equipmentHeadHelmetMatched);
+  if (!canonicalPreconditionConfirmed) {
+    canonicalPreconditionConfirmed = await prepareHelmetForCleanupTrial(
+      rcon,
+      body,
+      state.botName,
+      signal.signal,
+      replies,
+    );
+  }
+  const minecraftAirTrial = await runEquipmentReplaceTrial(
+    rcon,
+    state.botName,
+    "minecraft_air",
+    "minecraft:air",
+    replies,
+  );
+  const minecraftAir: EquipmentCleanupStageDiagnostic = {
+    ...minecraftAirTrial,
+    helmetPresentBeforeCommandConfirmed:
+      canonicalPreconditionConfirmed &&
+      minecraftAirTrial.helmetPresentBeforeCommandConfirmed,
+  };
+
+  const finalCommandClass = minecraftAir.headEmptyConfirmed
+    ? "minecraft_air"
+    : airAlias.headEmptyConfirmed
+      ? "air_alias"
+      : "not_confirmed";
+  await recordedEquipmentCleanupRconCommand(
+    rcon,
+    "final_inventory_clear",
+    `clear ${state.botName} minecraft:iron_helmet`,
+    replies,
+  );
+  const finalItemStack =
+    finalCommandClass === "air_alias" ? "air" : "minecraft:air";
+  const finalReplace = await recordedEquipmentCleanupRconCommand(
+    rcon,
+    "final_head_replace",
+    `item replace entity ${state.botName} armor.head with ${finalItemStack}`,
+    replies,
+  );
+  const finalTickWaitConfirmed = await waitForOneGameTick(
+    rcon,
+    "final_cleanup",
+    replies,
+  );
+  const finalHeadObservation = await observeEquipmentHeadOverRcon(
+    rcon,
+    state.botName,
+    "final_cleanup",
+    replies,
+  );
+  const finalInventoryHelmetAbsentConfirmed = await rconInventoryItemCount(
+    rcon,
+    state.botName,
+    "iron_helmet",
+    (reply) => replies.push({ step: "final_inventory_readback", reply }),
+  )
+    .then((count) => count === 0)
+    .catch(() => false);
+  const privateRconRepliesRetained =
+    await retainPrivateEquipmentCleanupRconReplies(state.id, replies);
+  return {
+    airAlias,
+    minecraftAir,
+    finalCommandClass:
+      finalReplace === null ? "not_confirmed" : finalCommandClass,
+    finalHeadEmptyConfirmed:
+      finalTickWaitConfirmed && finalHeadObservation.headEmptyConfirmed,
+    finalInventoryHelmetAbsentConfirmed,
+    privateRconRepliesRetained,
+  };
+}
+
+async function cleanupArmorHelmetFixture(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<ArmorFixtureCleanupDiagnostic> {
+  let headReplaceResponseReceived = false;
+  let headEmptyAfterReplaceConfirmed: boolean;
+  let inventoryClearResponseReceived = false;
+  let headEmptyAfterCleanupConfirmed: boolean;
+  let inventoryHelmetAbsentAfterClearConfirmed: boolean;
+
+  try {
+    await rcon.command(
+      `item replace entity ${botName} armor.head with minecraft:air`,
+    );
+    headReplaceResponseReceived = true;
+  } catch {
+    // Readback below still runs so command and state evidence remain distinct.
+  }
+  try {
+    const tickWaitConfirmed = await waitForOneGameTick(
+      rcon,
+      "case_cleanup_after_replace",
+      [],
+    );
+    const headObservation = await observeEquipmentHeadOverRcon(
+      rcon,
+      botName,
+      "case_cleanup_after_replace",
+      [],
+    );
+    headEmptyAfterReplaceConfirmed =
+      tickWaitConfirmed && headObservation.headEmptyConfirmed;
+  } catch {
+    headEmptyAfterReplaceConfirmed = false;
+  }
+
+  try {
+    await rcon.command(`clear ${botName} minecraft:iron_helmet`);
+    inventoryClearResponseReceived = true;
+  } catch {
+    // Continue with independent readbacks after a failed clear command.
+  }
+  try {
+    const tickWaitConfirmed = await waitForOneGameTick(
+      rcon,
+      "case_cleanup_after_clear",
+      [],
+    );
+    const headObservation = await observeEquipmentHeadOverRcon(
+      rcon,
+      botName,
+      "case_cleanup_after_clear",
+      [],
+    );
+    headEmptyAfterCleanupConfirmed =
+      tickWaitConfirmed && headObservation.headEmptyConfirmed;
+  } catch {
+    headEmptyAfterCleanupConfirmed = false;
+  }
+  try {
+    inventoryHelmetAbsentAfterClearConfirmed =
+      (await rconInventoryItemCount(rcon, botName, "iron_helmet")) === 0;
+  } catch {
+    inventoryHelmetAbsentAfterClearConfirmed = false;
+  }
+
+  const fixtureCleanupFailureCode: ArmorFixtureCleanupFailureCode =
+    !headEmptyAfterReplaceConfirmed
+      ? "head_empty_after_replace_unconfirmed"
+      : !headEmptyAfterCleanupConfirmed
+        ? "head_empty_after_cleanup_unconfirmed"
+        : !inventoryHelmetAbsentAfterClearConfirmed
+          ? "inventory_helmet_absence_unconfirmed"
+          : "none";
+
+  return {
+    headReplaceResponseReceived,
+    headEmptyAfterReplaceConfirmed,
+    inventoryClearResponseReceived,
+    headEmptyAfterCleanupConfirmed,
+    inventoryHelmetAbsentAfterClearConfirmed,
+    fixtureCleanupFailureCode,
+    fixtureCleanupConfirmed:
+      headEmptyAfterReplaceConfirmed &&
+      headEmptyAfterCleanupConfirmed &&
+      inventoryHelmetAbsentAfterClearConfirmed,
+  };
 }
 
 async function rconFoodLevel(
@@ -9741,6 +10815,11 @@ async function writeArtifact(state: RunState): Promise<void> {
         failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
+      armorCapability:
+        state.armorCapabilityDiagnostic ??
+        (state.targetCase === "armor_capability"
+          ? EMPTY_ARMOR_CAPABILITY_DIAGNOSTIC
+          : null),
     },
     budgets: {
       run: state.runBudget,

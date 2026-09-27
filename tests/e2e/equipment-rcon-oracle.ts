@@ -8,6 +8,15 @@ export interface ExecuteIfItemsReadback {
   readonly expectedItemMatched: boolean;
 }
 
+export function confirmsEquipmentHeadFieldAbsent(
+  reply: string | null,
+): boolean {
+  return (
+    reply !== null &&
+    /^found no elements matching equipment(?:\.head)?\.?$/iu.test(reply.trim())
+  );
+}
+
 export function readEquipmentFieldFromRcon(
   reply: string | null,
   expectedItem: string,
@@ -45,6 +54,9 @@ export function readExecuteIfItemsRconReply(
   }
 
   if (/test failed[^\n]*no items matched/iu.test(reply)) {
+    return { resultObserved: true, expectedItemMatched: false };
+  }
+  if (/^test failed\.?$/iu.test(reply.trim())) {
     return { resultObserved: true, expectedItemMatched: false };
   }
 

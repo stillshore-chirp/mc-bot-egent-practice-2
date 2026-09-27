@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  confirmsEquipmentHeadFieldAbsent,
   readEquipmentFieldFromRcon,
   readExecuteIfItemsRconReply,
 } from "./equipment-rcon-oracle.js";
@@ -36,6 +37,24 @@ describe("equipment RCON oracle", () => {
     ).toEqual({ equipmentFieldObserved: true, expectedItemMatched: false });
   });
 
+  it("recognizes only an explicit absent equipment.head path", () => {
+    expect(
+      confirmsEquipmentHeadFieldAbsent("Found no elements matching equipment"),
+    ).toBe(true);
+    expect(
+      confirmsEquipmentHeadFieldAbsent(
+        "Found no elements matching equipment.head",
+      ),
+    ).toBe(true);
+    expect(
+      confirmsEquipmentHeadFieldAbsent("Found no elements matching Inventory"),
+    ).toBe(false);
+    expect(
+      confirmsEquipmentHeadFieldAbsent("Unknown or incomplete command"),
+    ).toBe(false);
+    expect(confirmsEquipmentHeadFieldAbsent(null)).toBe(false);
+  });
+
   it("classifies the observed execute-if-items count", () => {
     expect(readExecuteIfItemsRconReply("1 matching item")).toEqual({
       resultObserved: true,
@@ -48,6 +67,14 @@ describe("equipment RCON oracle", () => {
     expect(
       readExecuteIfItemsRconReply("Test failed, no items matched"),
     ).toEqual({ resultObserved: true, expectedItemMatched: false });
+    expect(readExecuteIfItemsRconReply("Test failed")).toEqual({
+      resultObserved: true,
+      expectedItemMatched: false,
+    });
+    expect(readExecuteIfItemsRconReply("Test failed to run command")).toEqual({
+      resultObserved: false,
+      expectedItemMatched: false,
+    });
     expect(
       readExecuteIfItemsRconReply("Unknown or incomplete command"),
     ).toEqual({ resultObserved: false, expectedItemMatched: false });
