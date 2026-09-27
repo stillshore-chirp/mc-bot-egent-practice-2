@@ -42,6 +42,7 @@ import { playerOperationNames } from "../../src/minecraft/player-body-schema.js"
 import {
   projectSafePlayerAgentActivityTail,
   type PlayerAgentRoundActivity,
+  type PlayerAgentToolName,
 } from "../../src/player/responses.js";
 import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
@@ -190,9 +191,13 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   llmCalls: 8,
   totalTokens: 75_000,
 } as const;
+export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
+  llmCalls: 12,
+  totalTokens: 80_000,
+} as const;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
-  owner_return_through_door: { llmCalls: 8, totalTokens: 80_000 },
+  owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
   unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
@@ -478,6 +483,8 @@ type OwnerReturnStopReason =
   | "fixture_preflight_failed";
 
 type OwnerReturnDistanceBucket = "within_1_75" | "over_1_75" | "unknown";
+type OwnerReturnProposalDisposition =
+  "pending" | "adopted" | "compromised" | "declined" | "unknown";
 
 interface OwnerReturnDiagnostic {
   readonly stage:
@@ -502,11 +509,15 @@ interface OwnerReturnDiagnostic {
   readonly bodyRconSampleAlignedAfter?: boolean;
   readonly ownerRequestSent?: boolean;
   readonly newOwnerProposalObserved?: boolean;
-  readonly ownerProposalDisposition?:
-    "pending" | "adopted" | "compromised" | "declined" | "unknown";
+  readonly ownerProposalDisposition?: OwnerReturnProposalDisposition;
   readonly ownerProposalAdoptedForRequest?: boolean;
+  readonly ownerProposalProgressableForRequest?: boolean;
   readonly ownerGoalLinked?: boolean;
   readonly ownerMoveJudgmentObserved?: boolean;
+  readonly toolNamesByRole?: Readonly<{
+    conversation: readonly PlayerAgentToolName[];
+    purpose: readonly PlayerAgentToolName[];
+  }>;
   readonly moveOutcomeStatus?: BodyOperationStatus;
   readonly bodyReachedOwnerSide?: boolean;
   readonly rconReachedOwnerSide?: boolean;
@@ -7871,13 +7882,44 @@ function ownerReturnDistanceBucket(
 
 function ownerReturnProposalDisposition(
   proposal: PlayerEvidence["proposals"][number] | undefined,
-): NonNullable<OwnerReturnDiagnostic["ownerProposalDisposition"]> {
+): OwnerReturnProposalDisposition {
   const status = (proposal?.resolution ?? proposal?.status ?? "").toLowerCase();
   if (status.includes("declin")) return "declined";
   if (status.includes("compromis")) return "compromised";
   if (status.includes("adopt") || status.includes("accept")) return "adopted";
   if (status.includes("pending")) return "pending";
   return "unknown";
+}
+
+export function isOwnerProposalProgressable(
+  disposition: OwnerReturnProposalDisposition,
+  ownerGoalLinked: boolean,
+): boolean {
+  return (
+    ownerGoalLinked &&
+    (disposition === "adopted" || disposition === "compromised")
+  );
+}
+
+export function ownerReturnArrivalConfirmed(
+  sample: Pick<
+    OwnerReturnWorldSample,
+    | "bodySide"
+    | "rconSide"
+    | "bodyDistance"
+    | "rconDistance"
+    | "bodyRconAligned"
+    | "doorState"
+  >,
+): boolean {
+  return (
+    sample.bodySide === "owner_side" &&
+    sample.rconSide === "owner_side" &&
+    sample.bodyDistance === "within_1_75" &&
+    sample.rconDistance === "within_1_75" &&
+    sample.bodyRconAligned &&
+    sample.doorState === "open"
+  );
 }
 
 function ownerReturnGoalStatus(
@@ -7889,6 +7931,38 @@ function ownerReturnGoalStatus(
     value === "abandoned"
     ? value
     : "unknown";
+}
+
+export function ownerReturnToolNamesSince(
+  activities: readonly Pick<
+    PlayerAgentRoundActivity,
+    "runSequence" | "round" | "role" | "toolCalls"
+  >[],
+  previousActivities: readonly Pick<
+    PlayerAgentRoundActivity,
+    "runSequence" | "round" | "role" | "toolCalls"
+  >[],
+): Readonly<{
+  conversation: readonly PlayerAgentToolName[];
+  purpose: readonly PlayerAgentToolName[];
+}> {
+  const activityKey = (
+    activity: Pick<PlayerAgentRoundActivity, "runSequence" | "round" | "role">,
+  ): string => `${activity.runSequence}:${activity.role}:${activity.round}`;
+  const previousRounds = new Set(previousActivities.map(activityKey));
+  const namesByRole = {
+    conversation: new Set<PlayerAgentToolName>(),
+    purpose: new Set<PlayerAgentToolName>(),
+  };
+  for (const activity of activities) {
+    if (previousRounds.has(activityKey(activity))) continue;
+    const names = namesByRole[activity.role];
+    for (const toolCall of activity.toolCalls) names.add(toolCall.name);
+  }
+  return {
+    conversation: [...namesByRole.conversation].sort(),
+    purpose: [...namesByRole.purpose].sort(),
+  };
 }
 
 async function runOwnerReturnThroughDoorCase(
@@ -8165,6 +8239,14 @@ async function runOwnerReturnThroughDoorCase(
     const baseline = playerOf(await collect(context.runtime.app));
     if (isOperationActive(baseline))
       incomplete("OWNER_RETURN_BODY_BECAME_ACTIVE_BEFORE_REQUEST");
+    const baselineActivities = baseline.recentAgentActivity ?? [];
+    const updateObservedToolNames = (player: PlayerEvidence): void =>
+      updateOwnerReturnDiagnostic(state, {
+        toolNamesByRole: ownerReturnToolNamesSince(
+          player.recentAgentActivity ?? [],
+          baselineActivities,
+        ),
+      });
     const baselineProposalIds = new Set(
       baseline.proposals.map((proposal) => proposal.id),
     );
@@ -8186,6 +8268,7 @@ async function runOwnerReturnThroughDoorCase(
       context,
       observationWindowMs,
       async (player) => {
+        updateObservedToolNames(player);
         const newProposals = player.proposals.filter(
           (proposal) => !baselineProposalIds.has(proposal.id),
         );
@@ -8205,11 +8288,10 @@ async function runOwnerReturnThroughDoorCase(
           proposal !== undefined &&
           disposition === "adopted" &&
           ownerGoalLinked;
-        if (
+        const ownerProposalProgressableForRequest =
           proposal !== undefined &&
-          disposition === "adopted" &&
-          ownerGoalLinked
-        )
+          isOwnerProposalProgressable(disposition, ownerGoalLinked);
+        if (ownerProposalProgressableForRequest)
           state.ownerReturnProposalIdForRun = proposal.id;
         const ownerMoveJudgmentObserved = player.recentJudgments.some(
           (judgment) =>
@@ -8234,6 +8316,7 @@ async function runOwnerReturnThroughDoorCase(
           newOwnerProposalObserved: newProposals.length > 0,
           ownerProposalDisposition: disposition,
           ownerProposalAdoptedForRequest,
+          ownerProposalProgressableForRequest,
           ownerGoalLinked,
           ownerMoveJudgmentObserved,
           ...(safeMoveOutcomeStatus === undefined
@@ -8250,14 +8333,9 @@ async function runOwnerReturnThroughDoorCase(
           lastWorldSampleAt = Date.now();
           updateWorldDiagnostic(latestWorldSample, false);
           arrived =
-            ownerProposalAdoptedForRequest &&
+            ownerProposalProgressableForRequest &&
             ownerMoveJudgmentObserved &&
-            latestWorldSample.bodySide === "owner_side" &&
-            latestWorldSample.rconSide === "owner_side" &&
-            latestWorldSample.bodyDistance === "within_1_75" &&
-            latestWorldSample.rconDistance === "within_1_75" &&
-            latestWorldSample.bodyRconAligned &&
-            latestWorldSample.doorState === "open";
+            ownerReturnArrivalConfirmed(latestWorldSample);
           update({
             bodyReachedOwnerSide: latestWorldSample.bodySide === "owner_side",
             rconReachedOwnerSide: latestWorldSample.rconSide === "owner_side",
@@ -8270,6 +8348,8 @@ async function runOwnerReturnThroughDoorCase(
     if (reachedPlayer === undefined) {
       latestWorldSample = await sampleWorld();
       updateWorldDiagnostic(latestWorldSample, false);
+      const stopPlayer = playerOf(await collect(context.runtime.app));
+      updateObservedToolNames(stopPlayer);
       const stopReason: OwnerReturnStopReason =
         state.ownerReturnDiagnostic?.ownerProposalDisposition === "declined"
           ? "proposal_declined"
@@ -8279,12 +8359,11 @@ async function runOwnerReturnThroughDoorCase(
             : "observation_window_elapsed";
       update({
         stopReason,
-        activeOperationPresentAtStop: isOperationActive(
-          playerOf(await collect(context.runtime.app)),
-        ),
+        activeOperationPresentAtStop: isOperationActive(stopPlayer),
       });
     } else {
       arrived = true;
+      updateObservedToolNames(reachedPlayer);
       update({
         stopReason: "owner_arrival",
         bodyReachedOwnerSide: true,
@@ -8294,6 +8373,7 @@ async function runOwnerReturnThroughDoorCase(
       });
     }
     const terminalPlayer = playerOf(await collect(context.runtime.app));
+    updateObservedToolNames(terminalPlayer);
     const linkedProposal = terminalPlayer.proposals.find(
       (proposal) => proposal.id === requestProposalId,
     );
@@ -8309,10 +8389,15 @@ async function runOwnerReturnThroughDoorCase(
       linkedProposal !== undefined &&
       terminalDisposition === "adopted" &&
       terminalOwnerGoalLinked;
+    const terminalProposalProgressableForRequest =
+      linkedProposal !== undefined &&
+      isOwnerProposalProgressable(terminalDisposition, terminalOwnerGoalLinked);
     update({
       newOwnerProposalObserved: requestProposalObserved,
       ownerProposalDisposition: terminalDisposition,
       ownerProposalAdoptedForRequest: terminalProposalAdoptedForRequest,
+      ownerProposalProgressableForRequest:
+        terminalProposalProgressableForRequest,
       ownerGoalLinked: terminalOwnerGoalLinked,
       ownerGoalStatusAtStop: ownerReturnGoalStatus(linkedGoal?.status),
       activeOperationPresentAtStop: isOperationActive(terminalPlayer),
@@ -8382,6 +8467,8 @@ async function runOwnerReturnThroughDoorCase(
     fixtureConfigured: state.ownerReturnDiagnostic?.fixtureConfigured === true,
     ownerProposalAdoptedForRequest:
       state.ownerReturnDiagnostic?.ownerProposalAdoptedForRequest === true,
+    ownerProposalProgressableForRequest:
+      state.ownerReturnDiagnostic?.ownerProposalProgressableForRequest === true,
     ownerGoalLinked: state.ownerReturnDiagnostic?.ownerGoalLinked === true,
     ownerMoveJudgmentObserved:
       state.ownerReturnDiagnostic?.ownerMoveJudgmentObserved === true,
