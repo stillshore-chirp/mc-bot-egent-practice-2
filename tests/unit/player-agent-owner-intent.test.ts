@@ -415,14 +415,15 @@ describe("player owner intent context", () => {
         remainingCoalOre: [{ x: 1, y: 64, z: -2 }],
       });
       const secondTarget = { x: 1, y: 64, z: -2 };
+      const continuationAction = gatherActionArguments({
+        kind: "dig",
+        position: secondTarget,
+      });
       fixture.responses.push(
         functionCallResponse(
           "dig-remaining-coal-ore",
           "commit_action_decision",
-          gatherActionArguments({
-            kind: "dig",
-            position: secondTarget,
-          }),
+          continuationAction,
         ),
       );
       const continued = await fixture.agent.think({
@@ -436,6 +437,7 @@ describe("player owner intent context", () => {
           operation: { kind: "dig", position: secondTarget },
         },
       });
+      expect(continuationAction.stateUpdates).toBeNull();
       const remainingPurposeInput = purposeInputFromRequest(
         fixture.requests[1],
       );
@@ -449,6 +451,28 @@ describe("player owner intent context", () => {
       );
       expect(remainingPurposeInput.runtime.recentOutcomes).toContainEqual(
         expect.objectContaining({ kind: "dig", status: "successful" }),
+      );
+      expect(remainingPurposeInput.runtime.proposals).toContainEqual(
+        expect.objectContaining({
+          id: proposal.id,
+          title: proposal.title,
+          status: "adopted",
+        }),
+      );
+      expect(remainingPurposeInput.runtime.goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal.id,
+          ownerProposalId: proposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
+      const continuationRequest = fixture.requests[1];
+      expect(String(record(continuationRequest).instructions)).toContain(
+        "proposalを解決するのはruntime.proposalsでstatus=pendingのものだけ",
+      );
+      expect(String(record(continuationRequest).instructions)).toContain(
+        "後続actionで再解決しない",
       );
       expect(fixture.mind.snapshot().goals).toContainEqual(
         expect.objectContaining({
@@ -1423,6 +1447,7 @@ interface PurposeGatherInput {
     };
   };
   readonly runtime: {
+    readonly goals: readonly Record<string, unknown>[];
     readonly proposals: readonly Record<string, unknown>[];
     readonly recentOutcomes: readonly Record<string, unknown>[];
   };
