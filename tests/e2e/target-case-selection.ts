@@ -1,4 +1,5 @@
 export const TARGETABLE_CASES = [
+  "owner_return_through_door",
   "game_action_discretion",
   "food_intent_continuity",
   "learning_reuse",

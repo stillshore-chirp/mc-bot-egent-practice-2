@@ -29,6 +29,7 @@ import { ZodError } from "zod";
 import { AppError, errorCategories } from "../../src/domain/errors.js";
 import type { CompanionApplication } from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
+import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
   MineflayerPlayerBody,
   type PlayerBody,
@@ -178,6 +179,7 @@ const ROTATION_READ_MAX_ATTEMPTS = 3;
 const ROTATION_READ_RETRY_DELAY_MS = 100;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
+  owner_return_through_door: { llmCalls: 8, totalTokens: 80_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
   unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
@@ -195,6 +197,7 @@ const CASE_BUDGETS = {
 } as const;
 const CASE_DEADLINES = {
   runtime_contract: 60_000,
+  owner_return_through_door: 4 * 60_000,
   autonomous_life: 5 * 60_000,
   unknown_composite: 7 * 60_000,
   observation_boundary: 4 * 60_000,
@@ -451,6 +454,66 @@ type ProgressiveNavigationDoorLookSkipReason =
   | "operation_unresolved"
   | "attempted";
 type ProgressiveNavigationObservedDoorHalf = "lower" | "upper" | "neither";
+
+type OwnerReturnStopReason =
+  | "owner_arrival"
+  | "navigation_terminal"
+  | "proposal_declined"
+  | "observation_window_elapsed"
+  | "fixture_preflight_failed";
+
+type OwnerReturnDistanceBucket = "within_1_75" | "over_1_75" | "unknown";
+
+interface OwnerReturnDiagnostic {
+  readonly stage:
+    | "fixture_setup"
+    | "preflight"
+    | "owner_request"
+    | "navigation"
+    | "cleanup"
+    | "complete";
+  readonly fixtureConfigured?: boolean;
+  readonly doorStateBefore?: ProgressiveNavigationDoorState;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+  readonly bodySideBefore?: ProgressiveNavigationSide;
+  readonly bodySideAfter?: ProgressiveNavigationSide;
+  readonly rconSideBefore?: ProgressiveNavigationSide;
+  readonly rconSideAfter?: ProgressiveNavigationSide;
+  readonly bodyDistanceBefore?: OwnerReturnDistanceBucket;
+  readonly bodyDistanceAfter?: OwnerReturnDistanceBucket;
+  readonly rconDistanceBefore?: OwnerReturnDistanceBucket;
+  readonly rconDistanceAfter?: OwnerReturnDistanceBucket;
+  readonly bodyRconSampleAlignedBefore?: boolean;
+  readonly bodyRconSampleAlignedAfter?: boolean;
+  readonly ownerRequestSent?: boolean;
+  readonly newOwnerProposalObserved?: boolean;
+  readonly ownerProposalDisposition?:
+    "pending" | "adopted" | "compromised" | "declined" | "unknown";
+  readonly ownerProposalAdoptedForRequest?: boolean;
+  readonly ownerGoalLinked?: boolean;
+  readonly ownerMoveJudgmentObserved?: boolean;
+  readonly moveOutcomeStatus?: BodyOperationStatus;
+  readonly bodyReachedOwnerSide?: boolean;
+  readonly rconReachedOwnerSide?: boolean;
+  readonly bodyAndRconArrivalObserved?: boolean;
+  readonly ownerGoalStatusAtStop?:
+    "active" | "paused" | "completed" | "abandoned" | "unknown";
+  readonly ownerGoalStatusBeforeParallel?:
+    "active" | "paused" | "completed" | "abandoned" | "unknown";
+  readonly activeOperationPresentAtStop?: boolean;
+  readonly stopReason?: OwnerReturnStopReason;
+  readonly fixtureCleanupConfirmed?: boolean;
+  readonly originalFixtureRestored?: boolean;
+}
+
+interface OwnerReturnWorldSample {
+  readonly bodySide: ProgressiveNavigationSide;
+  readonly rconSide: ProgressiveNavigationSide;
+  readonly bodyDistance: OwnerReturnDistanceBucket;
+  readonly rconDistance: OwnerReturnDistanceBucket;
+  readonly bodyRconAligned: boolean;
+  readonly doorState: ProgressiveNavigationDoorState;
+}
 
 interface ProgressiveNavigationMovementSample {
   readonly point: ProgressiveNavigationSamplePoint;
@@ -1053,6 +1116,7 @@ interface PlayerEvidence {
   readonly purpose?: string;
   readonly goals: readonly {
     readonly id: string;
+    readonly ownerProposalId?: string;
     readonly title?: string;
     readonly status?: string;
     readonly priority?: number;
@@ -2542,6 +2606,8 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
+  ownerReturnDiagnostic?: OwnerReturnDiagnostic;
+  ownerReturnProposalIdForRun?: string;
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -2656,6 +2722,7 @@ let currentRunState: RunState | undefined;
 let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
+let activeApplicationPlayerBody: MineflayerPlayerBody | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
 
 function installGameActionPlacementObservationProbe(): () => void {
@@ -2668,6 +2735,22 @@ function installGameActionPlacementObservationProbe(): () => void {
     throw new Error("PlayerBody observation method is unavailable");
   const originalObserve =
     originalObserveDescriptor.value as typeof prototype.observe;
+  const createPlayerBodyDescriptor = Object.getOwnPropertyDescriptor(
+    MineflayerClient.prototype,
+    "createPlayerBody",
+  );
+  if (typeof createPlayerBodyDescriptor?.value !== "function")
+    throw new Error("MineflayerClient body factory is unavailable");
+  const originalCreatePlayerBody = createPlayerBodyDescriptor.value as (
+    this: MineflayerClient,
+  ) => PlayerBody;
+  const instrumentedCreatePlayerBody = function (
+    this: MineflayerClient,
+  ): PlayerBody {
+    const body = originalCreatePlayerBody.call(this);
+    activeApplicationPlayerBody = body as MineflayerPlayerBody;
+    return body;
+  };
   const instrumentedObserve = async function (
     this: MineflayerPlayerBody,
     options?: PlayerBodyObservationOptions,
@@ -2702,9 +2785,17 @@ function installGameActionPlacementObservationProbe(): () => void {
     return observation;
   };
   prototype.observe = instrumentedObserve;
+  MineflayerClient.prototype.createPlayerBody = instrumentedCreatePlayerBody;
   return () => {
     if (prototype.observe === instrumentedObserve)
       prototype.observe = originalObserve;
+    if (
+      MineflayerClient.prototype.createPlayerBody ===
+      instrumentedCreatePlayerBody
+    ) {
+      MineflayerClient.prototype.createPlayerBody = originalCreatePlayerBody;
+    }
+    activeApplicationPlayerBody = undefined;
   };
 }
 
@@ -5543,12 +5634,47 @@ async function main(): Promise<void> {
       },
     );
 
+    const ownerReturnResult = await recordCase(
+      state,
+      "owner_return_through_door",
+      CASE_DEADLINES.owner_return_through_door,
+      requireLiveContext(),
+      async (context) => runOwnerReturnThroughDoorCase(state, context),
+    );
+
     const parallelResult = await recordCase(
       state,
       "parallel_dialogue_stop",
       CASE_DEADLINES.parallel_dialogue_stop,
       requireLiveContext(),
       async (context) => {
+        if (
+          state.targetCase === undefined &&
+          state.ownerReturnProposalIdForRun !== undefined
+        ) {
+          const inheritedPlayer = playerOf(await collect(context.runtime.app));
+          const inheritedGoal = inheritedPlayer.goals.find(
+            (goal) =>
+              goal.source === "owner" &&
+              goal.ownerProposalId === state.ownerReturnProposalIdForRun,
+          );
+          const inheritedGoalStatus = ownerReturnGoalStatus(
+            inheritedGoal?.status,
+          );
+          updateOwnerReturnDiagnostic(state, {
+            ownerGoalLinked: inheritedGoal !== undefined,
+            ownerGoalStatusBeforeParallel: inheritedGoalStatus,
+          });
+          if (
+            inheritedGoalStatus !== "completed" &&
+            inheritedGoalStatus !== "abandoned"
+          ) {
+            state.abortRequested = true;
+            state.failureCode ??=
+              "OWNER_RETURN_GOAL_NOT_TERMINAL_BEFORE_PARALLEL";
+            incomplete(state.failureCode);
+          }
+        }
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -5778,6 +5904,7 @@ async function main(): Promise<void> {
           exchangeResult,
           discretionResult,
           foodResult,
+          ownerReturnResult,
           parallelResult,
           operationSmokeResult,
         ];
@@ -7233,6 +7360,549 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+function updateOwnerReturnDiagnostic(
+  state: RunState,
+  update: Partial<OwnerReturnDiagnostic>,
+): void {
+  state.ownerReturnDiagnostic = {
+    stage: "fixture_setup",
+    ...state.ownerReturnDiagnostic,
+    ...update,
+  };
+}
+
+function ownerReturnDistanceBucket(
+  distance: number,
+): OwnerReturnDistanceBucket {
+  return distance <= 1.75 ? "within_1_75" : "over_1_75";
+}
+
+function ownerReturnProposalDisposition(
+  proposal: PlayerEvidence["proposals"][number] | undefined,
+): NonNullable<OwnerReturnDiagnostic["ownerProposalDisposition"]> {
+  const status = (proposal?.resolution ?? proposal?.status ?? "").toLowerCase();
+  if (status.includes("declin")) return "declined";
+  if (status.includes("compromis")) return "compromised";
+  if (status.includes("adopt") || status.includes("accept")) return "adopted";
+  if (status.includes("pending")) return "pending";
+  return "unknown";
+}
+
+function ownerReturnGoalStatus(
+  value: string | undefined,
+): NonNullable<OwnerReturnDiagnostic["ownerGoalStatusAtStop"]> {
+  return value === "active" ||
+    value === "paused" ||
+    value === "completed" ||
+    value === "abandoned"
+    ? value
+    : "unknown";
+}
+
+async function runOwnerReturnThroughDoorCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const body = activeApplicationPlayerBody;
+  if (body === undefined)
+    incomplete("OWNER_RETURN_APPLICATION_BODY_UNAVAILABLE");
+  const rcon = context.rcon;
+  const origin = { x: 0.5, y: 64, z: 0.5 };
+  const door = fixturePoint(origin, 2, 0);
+  const start = { x: door.x + 6.5, y: 68, z: door.z + 0.5 };
+  const ownerTarget = { x: origin.x, y: origin.y, z: origin.z };
+  const stairBlocks = [
+    { x: door.x + 1, y: 64, z: door.z },
+    { x: door.x + 2, y: 65, z: door.z },
+    { x: door.x + 3, y: 66, z: door.z },
+    { x: door.x + 4, y: 67, z: door.z },
+  ] as const;
+  const supports = [
+    { x: door.x + 2, y: 64, z: door.z },
+    { x: door.x + 3, y: 64, z: door.z },
+    { x: door.x + 3, y: 65, z: door.z },
+    { x: door.x + 4, y: 64, z: door.z },
+    { x: door.x + 4, y: 65, z: door.z },
+    { x: door.x + 4, y: 66, z: door.z },
+  ] as const;
+  const platform = [
+    { x: door.x + 5, y: 67, z: door.z },
+    { x: door.x + 6, y: 67, z: door.z },
+  ] as const;
+  const hiddenFixture = { chest: fixturePoint(origin, 6, 0) };
+  let fixtureMutationStarted = false;
+  let arrived = false;
+  const commandText = (...parts: (string | number)[]): string => parts.join("");
+  const update = (patch: Partial<OwnerReturnDiagnostic>): void =>
+    updateOwnerReturnDiagnostic(state, patch);
+  const sampleWorld = async (): Promise<OwnerReturnWorldSample> => {
+    const [bodyObservation, botPositionText, ownerPositionText] =
+      await Promise.all([
+        body.observe(),
+        rcon.command("data get entity " + context.botName + " Pos"),
+        rcon.command("data get entity " + context.ownerName + " Pos"),
+      ]);
+    const [botPosition, ownerPosition] = [
+      parsePosition(botPositionText),
+      parsePosition(ownerPositionText),
+    ];
+    const bodyPosition = bodyObservation.self.position;
+    const bodyDistance = Math.hypot(
+      bodyPosition.x - ownerPosition.x,
+      bodyPosition.y - ownerPosition.y,
+      bodyPosition.z - ownerPosition.z,
+    );
+    const rconDistance = Math.hypot(
+      botPosition.x - ownerPosition.x,
+      botPosition.y - ownerPosition.y,
+      botPosition.z - ownerPosition.z,
+    );
+    return {
+      bodySide: progressiveNavigationSide(bodyPosition, door.x),
+      rconSide: progressiveNavigationSide(botPosition, door.x),
+      bodyDistance: ownerReturnDistanceBucket(bodyDistance),
+      rconDistance: ownerReturnDistanceBucket(rconDistance),
+      bodyRconAligned:
+        Math.hypot(
+          bodyPosition.x - botPosition.x,
+          bodyPosition.y - botPosition.y,
+          bodyPosition.z - botPosition.z,
+        ) <= 1.5,
+      doorState: await readProgressiveNavigationDoorState(
+        rcon,
+        door,
+        context.botName,
+      ),
+    };
+  };
+  const updateWorldDiagnostic = (
+    sample: OwnerReturnWorldSample,
+    before: boolean,
+  ): void => {
+    update(
+      before
+        ? {
+            bodySideBefore: sample.bodySide,
+            rconSideBefore: sample.rconSide,
+            bodyDistanceBefore: sample.bodyDistance,
+            rconDistanceBefore: sample.rconDistance,
+            bodyRconSampleAlignedBefore: sample.bodyRconAligned,
+            doorStateBefore: sample.doorState,
+          }
+        : {
+            bodySideAfter: sample.bodySide,
+            rconSideAfter: sample.rconSide,
+            bodyDistanceAfter: sample.bodyDistance,
+            rconDistanceAfter: sample.rconDistance,
+            bodyRconSampleAlignedAfter: sample.bodyRconAligned,
+            doorStateAfter: sample.doorState,
+          },
+    );
+  };
+
+  update({ stage: "fixture_setup" });
+  try {
+    const idle = await observeForPlayer(
+      context,
+      15_000,
+      (player) => !isOperationActive(player),
+    );
+    if (idle === undefined) incomplete("OWNER_RETURN_BODY_NOT_IDLE");
+    fixtureMutationStarted = true;
+    await removeHiddenContainerFixture(rcon, origin, hiddenFixture);
+    await rcon.command(
+      commandText(
+        "kill @e[type=minecraft:item,x=",
+        hiddenFixture.chest.x,
+        ",y=",
+        hiddenFixture.chest.y,
+        ",z=",
+        hiddenFixture.chest.z,
+        ",distance=..3]",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "fill ",
+        door.x,
+        " 64 ",
+        door.z - 1,
+        " ",
+        Math.floor(start.x),
+        " 69 ",
+        door.z - 1,
+        " stone",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "fill ",
+        door.x,
+        " 64 ",
+        door.z + 1,
+        " ",
+        Math.floor(start.x),
+        " 69 ",
+        door.z + 1,
+        " stone",
+      ),
+    );
+    for (const support of supports) {
+      await rcon.command(
+        commandText(
+          "setblock ",
+          support.x,
+          " ",
+          support.y,
+          " ",
+          support.z,
+          " stone",
+        ),
+      );
+    }
+    for (const block of platform) {
+      await rcon.command(
+        commandText("setblock ", block.x, " ", block.y, " ", block.z, " stone"),
+      );
+    }
+    await rcon.command(
+      commandText(
+        "setblock ",
+        door.x,
+        " ",
+        door.y,
+        " ",
+        door.z,
+        " oak_door[facing=west,half=lower,hinge=left,open=false,powered=false]",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "setblock ",
+        door.x,
+        " ",
+        door.y + 1,
+        " ",
+        door.z,
+        " oak_door[facing=west,half=upper,hinge=left,open=false,powered=false]",
+      ),
+    );
+    for (const stair of stairBlocks) {
+      await rcon.command(
+        commandText(
+          "setblock ",
+          stair.x,
+          " ",
+          stair.y,
+          " ",
+          stair.z,
+          " oak_stairs[facing=west,half=bottom,shape=straight,waterlogged=false]",
+        ),
+      );
+    }
+    const stairsConfirmed = (
+      await Promise.all(
+        stairBlocks.map((stair) => isBlock(rcon, stair, "oak_stairs")),
+      )
+    ).every(Boolean);
+    const supportBlocks = [...supports, ...platform];
+    const supportsConfirmed = (
+      await Promise.all(
+        supportBlocks.map((support) => isBlock(rcon, support, "stone")),
+      )
+    ).every(Boolean);
+    const doorHalvesConfirmed =
+      (await isBlock(rcon, door, "oak_door")) &&
+      (await isBlock(rcon, { ...door, y: door.y + 1 }, "oak_door"));
+    const fixtureConfigured =
+      stairsConfirmed &&
+      supportsConfirmed &&
+      doorHalvesConfirmed &&
+      (await readProgressiveNavigationDoorState(
+        rcon,
+        door,
+        context.botName,
+      )) === "closed";
+    update({ fixtureConfigured, stage: "preflight" });
+    if (!fixtureConfigured) incomplete("OWNER_RETURN_FIXTURE_UNCONFIRMED");
+
+    await rcon.command(
+      commandText(
+        "tp ",
+        context.ownerName,
+        " ",
+        ownerTarget.x,
+        " ",
+        ownerTarget.y,
+        " ",
+        ownerTarget.z,
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "tp ",
+        context.botName,
+        " ",
+        start.x,
+        " ",
+        start.y,
+        " ",
+        start.z,
+        " 90 0",
+      ),
+    );
+    let before = await sampleWorld();
+    const bodyReadyBy = Date.now() + 5_000;
+    while (
+      Date.now() < bodyReadyBy &&
+      (before.bodySide !== "return_side" ||
+        before.rconSide !== "return_side" ||
+        !before.bodyRconAligned)
+    ) {
+      await waitMs(250);
+      before = await sampleWorld();
+    }
+    updateWorldDiagnostic(before, true);
+    if (
+      before.bodySide !== "return_side" ||
+      before.rconSide !== "return_side" ||
+      before.doorState !== "closed" ||
+      !before.bodyRconAligned
+    )
+      incomplete("OWNER_RETURN_START_NOT_CONFIRMED");
+    const baseline = playerOf(await collect(context.runtime.app));
+    if (isOperationActive(baseline))
+      incomplete("OWNER_RETURN_BODY_BECAME_ACTIVE_BEFORE_REQUEST");
+    const baselineProposalIds = new Set(
+      baseline.proposals.map((proposal) => proposal.id),
+    );
+    const baselineOutcomeIds = new Set(
+      baseline.recentOutcomes.map((outcome) => outcome.operationId),
+    );
+    let requestProposalId: string | undefined;
+    let requestProposalObserved = false;
+    const requestAt = Date.now();
+    update({ stage: "owner_request", ownerRequestSent: true });
+    sendChat(context.owner, "ドアを通って、こっちまで戻ってきてください。");
+    let lastWorldSampleAt = 0;
+    let latestWorldSample = before;
+    const observationWindowMs = Math.max(
+      1,
+      Math.min(150_000, context.caseDeadlineAt - Date.now() - 20_000),
+    );
+    const reachedPlayer = await observeForPlayer(
+      context,
+      observationWindowMs,
+      async (player) => {
+        const newProposals = player.proposals.filter(
+          (proposal) => !baselineProposalIds.has(proposal.id),
+        );
+        requestProposalObserved ||= newProposals.length > 0;
+        const proposal =
+          newProposals.length === 1 ? newProposals[0] : undefined;
+        if (proposal !== undefined) requestProposalId = proposal.id;
+        else if (newProposals.length > 1) requestProposalId = undefined;
+        const disposition = ownerReturnProposalDisposition(proposal);
+        const ownerGoalLinked =
+          proposal !== undefined &&
+          player.goals.some(
+            (goal) =>
+              goal.ownerProposalId === proposal.id && goal.source === "owner",
+          );
+        const ownerProposalAdoptedForRequest =
+          proposal !== undefined &&
+          disposition === "adopted" &&
+          ownerGoalLinked;
+        if (
+          proposal !== undefined &&
+          disposition === "adopted" &&
+          ownerGoalLinked
+        )
+          state.ownerReturnProposalIdForRun = proposal.id;
+        const ownerMoveJudgmentObserved = player.recentJudgments.some(
+          (judgment) =>
+            judgment.kind === "act" &&
+            judgment.operationKind === "move_to" &&
+            judgment.decidedAt !== undefined &&
+            Date.parse(judgment.decidedAt) >= requestAt,
+        );
+        const moveOutcome = player.recentOutcomes.findLast(
+          (outcome) =>
+            !baselineOutcomeIds.has(outcome.operationId) &&
+            outcome.kind === "move_to" &&
+            outcome.observedAt !== undefined &&
+            Date.parse(outcome.observedAt) >= requestAt,
+        );
+        const safeMoveOutcomeStatus =
+          moveOutcome === undefined
+            ? undefined
+            : safeOutcomeStatus(moveOutcome.status);
+        update({
+          stage: "navigation",
+          newOwnerProposalObserved: newProposals.length > 0,
+          ownerProposalDisposition: disposition,
+          ownerProposalAdoptedForRequest,
+          ownerGoalLinked,
+          ownerMoveJudgmentObserved,
+          ...(safeMoveOutcomeStatus === undefined
+            ? {}
+            : {
+                moveOutcomeStatus:
+                  safeMoveOutcomeStatus === "cancelled"
+                    ? "interrupted"
+                    : safeMoveOutcomeStatus,
+              }),
+        });
+        if (Date.now() - lastWorldSampleAt >= 10_000) {
+          latestWorldSample = await sampleWorld();
+          lastWorldSampleAt = Date.now();
+          updateWorldDiagnostic(latestWorldSample, false);
+          arrived =
+            ownerProposalAdoptedForRequest &&
+            ownerMoveJudgmentObserved &&
+            latestWorldSample.bodySide === "owner_side" &&
+            latestWorldSample.rconSide === "owner_side" &&
+            latestWorldSample.bodyDistance === "within_1_75" &&
+            latestWorldSample.rconDistance === "within_1_75" &&
+            latestWorldSample.bodyRconAligned &&
+            latestWorldSample.doorState === "open";
+          update({
+            bodyReachedOwnerSide: latestWorldSample.bodySide === "owner_side",
+            rconReachedOwnerSide: latestWorldSample.rconSide === "owner_side",
+            bodyAndRconArrivalObserved: arrived,
+          });
+        }
+        return arrived;
+      },
+    );
+    if (reachedPlayer === undefined) {
+      latestWorldSample = await sampleWorld();
+      updateWorldDiagnostic(latestWorldSample, false);
+      const stopReason: OwnerReturnStopReason =
+        state.ownerReturnDiagnostic?.ownerProposalDisposition === "declined"
+          ? "proposal_declined"
+          : state.ownerReturnDiagnostic?.moveOutcomeStatus !== undefined &&
+              state.ownerReturnDiagnostic.moveOutcomeStatus !== "successful"
+            ? "navigation_terminal"
+            : "observation_window_elapsed";
+      update({
+        stopReason,
+        activeOperationPresentAtStop: isOperationActive(
+          playerOf(await collect(context.runtime.app)),
+        ),
+      });
+    } else {
+      arrived = true;
+      update({
+        stopReason: "owner_arrival",
+        bodyReachedOwnerSide: true,
+        rconReachedOwnerSide: true,
+        bodyAndRconArrivalObserved: true,
+        activeOperationPresentAtStop: isOperationActive(reachedPlayer),
+      });
+    }
+    const terminalPlayer = playerOf(await collect(context.runtime.app));
+    const linkedProposal = terminalPlayer.proposals.find(
+      (proposal) => proposal.id === requestProposalId,
+    );
+    const linkedGoal = terminalPlayer.goals.find(
+      (goal) =>
+        requestProposalId !== undefined &&
+        goal.ownerProposalId === requestProposalId &&
+        goal.source === "owner",
+    );
+    const terminalDisposition = ownerReturnProposalDisposition(linkedProposal);
+    const terminalOwnerGoalLinked = linkedGoal !== undefined;
+    const terminalProposalAdoptedForRequest =
+      linkedProposal !== undefined &&
+      terminalDisposition === "adopted" &&
+      terminalOwnerGoalLinked;
+    update({
+      newOwnerProposalObserved: requestProposalObserved,
+      ownerProposalDisposition: terminalDisposition,
+      ownerProposalAdoptedForRequest: terminalProposalAdoptedForRequest,
+      ownerGoalLinked: terminalOwnerGoalLinked,
+      ownerGoalStatusAtStop: ownerReturnGoalStatus(linkedGoal?.status),
+      activeOperationPresentAtStop: isOperationActive(terminalPlayer),
+    });
+    if (!arrived) incomplete("OWNER_RETURN_DOOR_CROSSING_NOT_CONFIRMED");
+  } finally {
+    if (fixtureMutationStarted) {
+      update({ stage: "cleanup" });
+      const fixtureCleanupConfirmed = await (async () => {
+        try {
+          await rcon.command(
+            commandText(
+              "fill ",
+              door.x,
+              " 64 ",
+              door.z - 1,
+              " ",
+              Math.floor(start.x),
+              " 69 ",
+              door.z + 1,
+              " air",
+            ),
+          );
+          const cleanupCells = [
+            door,
+            { ...door, y: door.y + 1 },
+            ...stairBlocks,
+            ...supports,
+            ...platform,
+            { x: door.x + 2, y: 64, z: door.z - 1 },
+            { x: door.x + 2, y: 69, z: door.z + 1 },
+          ];
+          return (
+            await Promise.all(
+              cleanupCells.map((position) => isBlock(rcon, position, "air")),
+            )
+          ).every(Boolean);
+        } catch {
+          return false;
+        }
+      })();
+      const originalFixtureRestored = await (async () => {
+        try {
+          await configureHiddenContainer(rcon, origin);
+          return (
+            (await isBlock(rcon, { ...door, y: 64 }, "stone")) &&
+            (await isBlock(rcon, hiddenFixture.chest, "chest"))
+          );
+        } catch {
+          return false;
+        }
+      })();
+      update({
+        fixtureCleanupConfirmed,
+        originalFixtureRestored,
+        stage:
+          fixtureCleanupConfirmed && originalFixtureRestored
+            ? "complete"
+            : "cleanup",
+      });
+      if (!fixtureCleanupConfirmed || !originalFixtureRestored)
+        incomplete("OWNER_RETURN_FIXTURE_CLEANUP_UNCONFIRMED");
+    }
+  }
+  return {
+    ownerRequestSent: true,
+    fixtureConfigured: state.ownerReturnDiagnostic?.fixtureConfigured === true,
+    ownerProposalAdoptedForRequest:
+      state.ownerReturnDiagnostic?.ownerProposalAdoptedForRequest === true,
+    ownerGoalLinked: state.ownerReturnDiagnostic?.ownerGoalLinked === true,
+    ownerMoveJudgmentObserved:
+      state.ownerReturnDiagnostic?.ownerMoveJudgmentObserved === true,
+    bodyAndRconArrivalObserved:
+      state.ownerReturnDiagnostic?.bodyAndRconArrivalObserved === true,
+    doorOpened: state.ownerReturnDiagnostic?.doorStateAfter === "open",
+    fixtureCleanupConfirmed:
+      state.ownerReturnDiagnostic?.fixtureCleanupConfirmed === true,
+    originalFixtureRestored:
+      state.ownerReturnDiagnostic?.originalFixtureRestored === true,
+  };
 }
 
 async function runProgressiveNavigationProbe(
@@ -10719,6 +11389,7 @@ async function writeArtifact(state: RunState): Promise<void> {
         failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
+      ownerReturnThroughDoor: state.ownerReturnDiagnostic ?? null,
     },
     budgets: {
       run: state.runBudget,

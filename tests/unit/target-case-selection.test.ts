@@ -6,6 +6,26 @@ import {
 } from "../e2e/target-case-selection.js";
 
 describe("targeted E2E case selection", () => {
+  it("runs the owner door return case without unrelated prerequisites", () => {
+    expect(TARGETABLE_CASES).toContain("owner_return_through_door");
+    expect(
+      isCaseSelectedForTarget(
+        "owner_return_through_door",
+        "owner_return_through_door",
+      ),
+    ).toBe(true);
+    for (const caseId of [
+      "runtime_contract",
+      "autonomous_life",
+      "game_action_discretion",
+      "integrated_result",
+    ]) {
+      expect(isCaseSelectedForTarget("owner_return_through_door", caseId)).toBe(
+        false,
+      );
+    }
+  });
+
   it("runs only learning_reuse and its autonomous_life prerequisite", () => {
     expect(TARGETABLE_CASES).toContain("learning_reuse");
     expect(isCaseSelectedForTarget("learning_reuse", "learning_reuse")).toBe(
