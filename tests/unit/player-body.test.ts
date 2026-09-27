@@ -45,6 +45,10 @@ function addItemEntity(
   bot: Bot,
   id = 2,
   position = new Vec3(0, 64, -5),
+  droppedItem: { readonly name: string; readonly count: number } | null = {
+    name: "emerald",
+    count: 1,
+  },
 ): Entity {
   const item = {
     id,
@@ -56,6 +60,7 @@ function addItemEntity(
     pitch: 0,
     height: 0.25,
     metadata: [],
+    getDroppedItem: () => droppedItem,
   } as unknown as Entity;
   (bot.entities as Record<number, Entity>)[id] = item;
   return item;
@@ -63,6 +68,55 @@ function addItemEntity(
 
 function removeItemEntity(bot: Bot, id: number): void {
   Reflect.deleteProperty(bot.entities, id);
+}
+
+function addItemToInventory(
+  fake: ReturnType<typeof makeFakeBot>,
+  name: string,
+  count: number,
+): void {
+  const inventory = fake.inventory as EventEmitter & {
+    slots: (Record<string, unknown> | null)[];
+  };
+  const existingIndex = inventory.slots.findIndex(
+    (item) => item?.name === name,
+  );
+  const slot =
+    existingIndex >= 0
+      ? existingIndex
+      : inventory.slots.findIndex(
+          (item, index) => index >= 9 && index <= 44 && item === null,
+        );
+  if (slot < 0) return;
+  const previous = inventory.slots[slot] ?? null;
+  const next = {
+    type: 1,
+    name,
+    count: Number(previous?.count ?? 0) + count,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+  };
+  inventory.slots[slot] = next;
+  inventory.emit("updateSlot", slot, previous, next);
+}
+
+function emitItemPickup(
+  fake: ReturnType<typeof makeFakeBot>,
+  collected: Entity,
+  updateInventory = true,
+): void {
+  (fake.bot as unknown as EventEmitter).emit(
+    "playerCollect",
+    fake.bot.entity,
+    collected,
+  );
+  if (!updateInventory) return;
+  const item = collected.getDroppedItem();
+  if (item !== null) addItemToInventory(fake, item.name, item.count);
 }
 
 function makeWindow(id = 3): Window & EventEmitter {
@@ -702,11 +756,7 @@ describe("player body", () => {
     const goto = vi.spyOn(fake.bot.pathfinder, "goto");
     goto.mockImplementation(async () => {
       fake.bot.entity.position = new Vec3(0, 65, -6);
-      (fake.bot as unknown as EventEmitter).emit(
-        "playerCollect",
-        fake.bot.entity,
-        item,
-      );
+      emitItemPickup(fake, item);
       removeItemEntity(fake.bot, item.id);
     });
 
@@ -730,6 +780,118 @@ describe("player body", () => {
     );
   });
 
+  it("waits briefly for the matching inventory count after a pickup event", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2, undefined, {
+        name: "emerald",
+        count: 2,
+      });
+      addItemToInventory(fake, "emerald", 3);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(async () => {
+        emitItemPickup(fake, item, false);
+        removeItemEntity(fake.bot, item.id);
+        setTimeout(() => addItemToInventory(fake, "emerald", 2), 300);
+      });
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "emerald", count: 3 }),
+      );
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "emerald", count: 5 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a matching pickup event unverified when inventory does not increase", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(async () => {
+        emitItemPickup(fake, item, false);
+        removeItemEntity(fake.bot, item.id);
+      });
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(result.detail).toContain("inventory increase was not confirmed");
+      expect(result.observedEffect).toBeUndefined();
+      expect(result.after?.self.inventory).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count another item increase as proof of the requested pickup", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2, undefined, {
+        name: "emerald",
+        count: 1,
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(async () => {
+        emitItemPickup(fake, item, false);
+        addItemToInventory(fake, "coal", 1);
+        removeItemEntity(fake.bot, item.id);
+      });
+
+      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(result.detail).toContain("inventory increase was not confirmed");
+      expect(result.observedEffect).toBeUndefined();
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "coal", count: 1 }),
+      );
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "emerald" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not confirm a pickup effect when the collected item's name is unknown", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot, 2, undefined, null);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(async () => {
+      emitItemPickup(fake, item, false);
+      addItemToInventory(fake, "coal", 1);
+      removeItemEntity(fake.bot, item.id);
+    });
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("unverified");
+    expect(result.itemCollectionOutcome).toBe("collected");
+    expect(result.detail).toContain("inventory increase was not confirmed");
+    expect(result.observedEffect).toBeUndefined();
+    expect(result.after?.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "coal", count: 1 }),
+    );
+  });
+
   it("waits briefly for the same initially hidden item ID to become visible", async () => {
     vi.useFakeTimers();
     try {
@@ -741,11 +903,7 @@ describe("player body", () => {
         .spyOn(fake.bot.pathfinder, "goto")
         .mockImplementation(async () => {
           fake.bot.entity.position = new Vec3(0, 64, -4);
-          (fake.bot as unknown as EventEmitter).emit(
-            "playerCollect",
-            fake.bot.entity,
-            item,
-          );
+          emitItemPickup(fake, item);
           removeItemEntity(fake.bot, item.id);
         });
       setTimeout(() => {
@@ -786,11 +944,7 @@ describe("player body", () => {
         )
         .mockImplementationOnce(async () => {
           fake.bot.entity.position = new Vec3(0, 64, -4);
-          (fake.bot as unknown as EventEmitter).emit(
-            "playerCollect",
-            fake.bot.entity,
-            item,
-          );
+          emitItemPickup(fake, item);
           removeItemEntity(fake.bot, item.id);
         });
       const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
@@ -853,11 +1007,7 @@ describe("player body", () => {
           y: item.position.y,
           z: item.position.z,
         });
-        (fake.bot as unknown as EventEmitter).emit(
-          "playerCollect",
-          fake.bot.entity,
-          item,
-        );
+        emitItemPickup(fake, item);
         removeItemEntity(fake.bot, item.id);
       });
     const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
