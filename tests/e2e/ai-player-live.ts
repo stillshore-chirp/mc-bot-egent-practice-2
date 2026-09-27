@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { config as loadEnvironmentFile } from "dotenv";
 import mineflayer, { type Bot } from "mineflayer";
+import { Vec3 } from "vec3";
 import { ZodError } from "zod";
 
 import { AppError, errorCategories } from "../../src/domain/errors.js";
@@ -325,9 +326,27 @@ interface GatherBodyVisibilityProbeDiagnostic {
   bothTargetsVisibleInAnyFollowupObservation: boolean;
   candidateSearchMayBeTruncated?: boolean;
   followupCandidateSearchMayBeTruncated?: boolean;
+  firstFreshObservationStages: GatherBodyVisibilityObservationStages;
+  anyFollowupObservationStages: GatherBodyVisibilityObservationStages;
   fixtureCleanupAttempted: boolean;
   fixtureCleanupConfirmed: boolean;
   fixtureCleanupReadback: GatherMultiTargetFixtureCleanupDiagnostic;
+}
+interface GatherBodyVisibilityTargetStages {
+  findBlocksReturnedTarget: boolean;
+  knownBlockBeforeObservation: boolean;
+  withinCandidateDistance: boolean;
+  withinEyeDistance: boolean;
+  insideHorizontalFieldOfView: boolean;
+  insideVerticalFieldOfView: boolean;
+  canSeeBlockChecked: boolean;
+  canSeeBlockPassed: boolean;
+  targetPresentInBodyOutput: boolean;
+}
+interface GatherBodyVisibilityObservationStages {
+  instrumentationAvailable: boolean;
+  oak: GatherBodyVisibilityTargetStages;
+  birch: GatherBodyVisibilityTargetStages;
 }
 type LearningFixturePhase = "initial" | "reuse";
 type SkillExchangeStage =
@@ -8139,6 +8158,183 @@ async function runOperationSmoke(
   return result;
 }
 
+function emptyGatherBodyVisibilityTargetStages(): GatherBodyVisibilityTargetStages {
+  return {
+    findBlocksReturnedTarget: false,
+    knownBlockBeforeObservation: false,
+    withinCandidateDistance: false,
+    withinEyeDistance: false,
+    insideHorizontalFieldOfView: false,
+    insideVerticalFieldOfView: false,
+    canSeeBlockChecked: false,
+    canSeeBlockPassed: false,
+    targetPresentInBodyOutput: false,
+  };
+}
+
+function emptyGatherBodyVisibilityObservationStages(): GatherBodyVisibilityObservationStages {
+  return {
+    instrumentationAvailable: false,
+    oak: emptyGatherBodyVisibilityTargetStages(),
+    birch: emptyGatherBodyVisibilityTargetStages(),
+  };
+}
+
+function mergeGatherBodyVisibilityTargetStages(
+  target: GatherBodyVisibilityTargetStages,
+  update: GatherBodyVisibilityTargetStages,
+): void {
+  target.findBlocksReturnedTarget ||= update.findBlocksReturnedTarget;
+  target.knownBlockBeforeObservation ||= update.knownBlockBeforeObservation;
+  target.withinCandidateDistance ||= update.withinCandidateDistance;
+  target.withinEyeDistance ||= update.withinEyeDistance;
+  target.insideHorizontalFieldOfView ||= update.insideHorizontalFieldOfView;
+  target.insideVerticalFieldOfView ||= update.insideVerticalFieldOfView;
+  target.canSeeBlockChecked ||= update.canSeeBlockChecked;
+  target.canSeeBlockPassed ||= update.canSeeBlockPassed;
+  target.targetPresentInBodyOutput ||= update.targetPresentInBodyOutput;
+}
+
+function mergeGatherBodyVisibilityObservationStages(
+  target: GatherBodyVisibilityObservationStages,
+  update: GatherBodyVisibilityObservationStages,
+): void {
+  target.instrumentationAvailable ||= update.instrumentationAvailable;
+  mergeGatherBodyVisibilityTargetStages(target.oak, update.oak);
+  mergeGatherBodyVisibilityTargetStages(target.birch, update.birch);
+}
+
+function sameGatherFixtureBlock(
+  position: { readonly x: number; readonly y: number; readonly z: number },
+  target: BlockPosition,
+): boolean {
+  return (
+    Math.floor(position.x) === target.x &&
+    Math.floor(position.y) === target.y &&
+    Math.floor(position.z) === target.z
+  );
+}
+
+function gatherBodyTargetGeometry(
+  observation: PlayerBodyObservation,
+  target: BlockPosition,
+): Pick<
+  GatherBodyVisibilityTargetStages,
+  | "withinCandidateDistance"
+  | "withinEyeDistance"
+  | "insideHorizontalFieldOfView"
+  | "insideVerticalFieldOfView"
+> {
+  const targetX = target.x + 0.5;
+  const targetY = target.y + 0.5;
+  const targetZ = target.z + 0.5;
+  const { position, eyeHeight, yaw, pitch } = observation.self;
+  const candidateDistance = Math.hypot(
+    targetX - position.x,
+    targetY - position.y,
+    targetZ - position.z,
+  );
+  const eyeOffset = {
+    x: targetX - position.x,
+    y: targetY - (position.y + eyeHeight),
+    z: targetZ - position.z,
+  };
+  const eyeDistance = Math.hypot(eyeOffset.x, eyeOffset.y, eyeOffset.z);
+  const horizontalDistance = Math.hypot(eyeOffset.x, eyeOffset.z);
+  const horizontalFov = observation.perception.horizontalFieldOfViewDegrees;
+  const verticalFov = observation.perception.verticalFieldOfViewDegrees;
+  let insideHorizontalFieldOfView = true;
+  let insideVerticalFieldOfView: boolean;
+  if (horizontalDistance < 1e-6) {
+    const targetPitch = Math.sign(eyeOffset.y) * (Math.PI / 2);
+    insideVerticalFieldOfView =
+      Math.abs(((targetPitch - pitch) * 180) / Math.PI) <= verticalFov / 2;
+  } else {
+    const targetYaw = Math.atan2(-eyeOffset.x, -eyeOffset.z);
+    const yawDelta = Math.atan2(
+      Math.sin(targetYaw - yaw),
+      Math.cos(targetYaw - yaw),
+    );
+    const targetPitch = Math.atan2(eyeOffset.y, horizontalDistance);
+    insideHorizontalFieldOfView =
+      Math.abs((yawDelta * 180) / Math.PI) <= horizontalFov / 2;
+    insideVerticalFieldOfView =
+      Math.abs(((targetPitch - pitch) * 180) / Math.PI) <= verticalFov / 2;
+  }
+  const maxDistance = observation.perception.maxDistance;
+  return {
+    withinCandidateDistance: candidateDistance <= maxDistance,
+    withinEyeDistance: eyeDistance <= maxDistance,
+    insideHorizontalFieldOfView,
+    insideVerticalFieldOfView,
+  };
+}
+
+async function observeGatherBodyWithStages(
+  client: object,
+  body: PlayerBody,
+  fixture: GatherMultiTargetFixture,
+): Promise<{
+  readonly observation: PlayerBodyObservation;
+  readonly stages: GatherBodyVisibilityObservationStages;
+}> {
+  const stages = emptyGatherBodyVisibilityObservationStages();
+  const bot = (client as { readonly botInstance?: Bot }).botInstance;
+  if (bot === undefined) return { observation: await body.observe(), stages };
+
+  const targets = [
+    { name: "oak_log", position: fixture.oakLog, stages: stages.oak },
+    { name: "birch_log", position: fixture.birchLog, stages: stages.birch },
+  ] as const;
+  for (const target of targets) {
+    try {
+      target.stages.knownBlockBeforeObservation =
+        bot.blockAt(
+          new Vec3(target.position.x, target.position.y, target.position.z),
+        )?.name === target.name;
+    } catch {
+      target.stages.knownBlockBeforeObservation = false;
+    }
+  }
+
+  const findBlocks = bot.findBlocks;
+  const canSeeBlock = bot.canSeeBlock;
+  try {
+    bot.findBlocks = (options) => {
+      const positions = findBlocks.call(bot, options);
+      for (const target of targets) {
+        target.stages.findBlocksReturnedTarget ||= positions.some((position) =>
+          sameGatherFixtureBlock(position, target.position),
+        );
+      }
+      return positions;
+    };
+    bot.canSeeBlock = (block) => {
+      const result = canSeeBlock.call(bot, block);
+      for (const target of targets) {
+        if (!sameGatherFixtureBlock(block.position, target.position)) continue;
+        target.stages.canSeeBlockChecked = true;
+        target.stages.canSeeBlockPassed ||= result;
+      }
+      return result;
+    };
+    stages.instrumentationAvailable = true;
+    const observation = await body.observe();
+    for (const target of targets) {
+      Object.assign(
+        target.stages,
+        gatherBodyTargetGeometry(observation, target.position),
+      );
+      target.stages.targetPresentInBodyOutput =
+        observedBlockName(observation, target.position) === target.name;
+    }
+    return { observation, stages };
+  } finally {
+    bot.findBlocks = findBlocks;
+    bot.canSeeBlock = canSeeBlock;
+  }
+}
+
 async function runGatherBodyVisibilityProbe(
   state: RunState,
   rcon: LocalRcon,
@@ -8187,6 +8383,8 @@ async function runGatherBodyVisibilityProbe(
     oakTargetVisibleInAnyFollowupObservation: false,
     birchTargetVisibleInAnyFollowupObservation: false,
     bothTargetsVisibleInAnyFollowupObservation: false,
+    firstFreshObservationStages: emptyGatherBodyVisibilityObservationStages(),
+    anyFollowupObservationStages: emptyGatherBodyVisibilityObservationStages(),
     fixtureCleanupAttempted: false,
     fixtureCleanupConfirmed: false,
     fixtureCleanupReadback: {
@@ -8251,10 +8449,12 @@ async function runGatherBodyVisibilityProbe(
     const observationDeadline = Date.now() + 5_000;
     let observation: PlayerBodyObservation | undefined;
     while (!abort.signal.aborted && Date.now() < observationDeadline) {
-      const candidate = await body.observe();
+      const { observation: candidate, stages } =
+        await observeGatherBodyWithStages(client, body, fixture);
       const observedAt = Date.parse(candidate.observedAt);
       if (Number.isFinite(observedAt) && observedAt >= fixtureConfiguredAt) {
         observation = candidate;
+        diagnostic.firstFreshObservationStages = stages;
         diagnostic.freshBodyObservationObserved = true;
         break;
       }
@@ -8286,10 +8486,15 @@ async function runGatherBodyVisibilityProbe(
       const followupDeadline = Date.now() + 5_000;
       while (!abort.signal.aborted && Date.now() < followupDeadline) {
         await waitMs(250);
-        const candidate = await body.observe();
+        const { observation: candidate, stages } =
+          await observeGatherBodyWithStages(client, body, fixture);
         const observedAt = Date.parse(candidate.observedAt);
         if (!Number.isFinite(observedAt) || observedAt < fixtureConfiguredAt)
           continue;
+        mergeGatherBodyVisibilityObservationStages(
+          diagnostic.anyFollowupObservationStages,
+          stages,
+        );
         const oakVisible =
           observedBlockName(candidate, fixture.oakLog) === "oak_log";
         const birchVisible =
