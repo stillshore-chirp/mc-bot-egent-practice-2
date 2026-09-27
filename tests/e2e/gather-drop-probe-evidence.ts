@@ -5,6 +5,7 @@ import type {
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
+import type { GatherMultiTargetItem } from "./gather-multi-target-acceptance.js";
 
 export interface GatherDropProbePoint {
   readonly x: number;
@@ -25,6 +26,101 @@ export type GatherDropProbeDeltaBucket =
   "unchanged" | "increased" | "decreased" | "unknown";
 export type GatherDropProbeVisibleEntityBucket =
   "none" | "single" | "multiple" | "unknown";
+
+export type GatherDropProbeExactCountBucket =
+  "zero" | "one" | "multiple" | "unknown";
+export type GatherDropProbeExactDeltaBucket =
+  | "unchanged"
+  | "increased_by_one"
+  | "increased_by_multiple"
+  | "decreased"
+  | "unknown";
+export type GatherDropProbeInventoryCounts = Readonly<
+  Record<GatherMultiTargetItem, number>
+>;
+
+interface GatherDropProbeInventorySeedEvidence {
+  readonly oak: GatherDropProbeExactCountBucket;
+  readonly birch: GatherDropProbeExactCountBucket;
+  readonly confirmed: boolean;
+}
+interface GatherDropProbeInventoryTransitionEvidence {
+  readonly oakDelta: GatherDropProbeExactDeltaBucket;
+  readonly birchDelta: GatherDropProbeExactDeltaBucket;
+  readonly confirmed: boolean;
+}
+export interface GatherDropProbeTwoStackInventoryEvidence {
+  readonly seedBody: GatherDropProbeInventorySeedEvidence;
+  readonly seedRcon: GatherDropProbeInventorySeedEvidence;
+  readonly afterBody: GatherDropProbeInventoryTransitionEvidence;
+  readonly afterRcon: GatherDropProbeInventoryTransitionEvidence;
+}
+
+/** Keep the opt-in oak/birch comparison to safe count buckets and deltas. */
+export function gatherDropProbeTwoStackInventoryEvidence(input: {
+  readonly seedBody?: GatherDropProbeInventoryCounts | undefined;
+  readonly seedRcon?: GatherDropProbeInventoryCounts | undefined;
+  readonly afterBody?: GatherDropProbeInventoryCounts | undefined;
+  readonly afterRcon?: GatherDropProbeInventoryCounts | undefined;
+}): GatherDropProbeTwoStackInventoryEvidence {
+  const countBucket = (
+    count: number | undefined,
+  ): GatherDropProbeExactCountBucket => {
+    if (count === undefined || !Number.isSafeInteger(count) || count < 0)
+      return "unknown";
+    if (count === 0) return "zero";
+    return count === 1 ? "one" : "multiple";
+  };
+  const deltaBucket = (
+    before: number | undefined,
+    after: number | undefined,
+  ): GatherDropProbeExactDeltaBucket => {
+    if (
+      before === undefined ||
+      after === undefined ||
+      !Number.isSafeInteger(before) ||
+      !Number.isSafeInteger(after) ||
+      before < 0 ||
+      after < 0
+    ) {
+      return "unknown";
+    }
+    const delta = after - before;
+    if (delta === 0) return "unchanged";
+    if (delta === 1) return "increased_by_one";
+    if (delta > 1) return "increased_by_multiple";
+    return "decreased";
+  };
+  const seedEvidence = (
+    counts: GatherDropProbeInventoryCounts | undefined,
+  ) => ({
+    oak: countBucket(counts?.oak_log),
+    birch: countBucket(counts?.birch_log),
+    confirmed: counts?.oak_log === 1 && counts.birch_log === 0,
+  });
+  const transitionEvidence = (
+    before: GatherDropProbeInventoryCounts | undefined,
+    after: GatherDropProbeInventoryCounts | undefined,
+  ) => {
+    const oakDelta = deltaBucket(before?.oak_log, after?.oak_log);
+    const birchDelta = deltaBucket(before?.birch_log, after?.birch_log);
+    return {
+      oakDelta,
+      birchDelta,
+      confirmed:
+        before?.oak_log === 1 &&
+        before.birch_log === 0 &&
+        oakDelta === "unchanged" &&
+        birchDelta === "increased_by_one",
+    };
+  };
+  return {
+    seedBody: seedEvidence(input.seedBody),
+    seedRcon: seedEvidence(input.seedRcon),
+    afterBody: transitionEvidence(input.seedBody, input.afterBody),
+    afterRcon: transitionEvidence(input.seedRcon, input.afterRcon),
+  };
+}
 
 export interface GatherOperationBodyObservationBuckets {
   readonly observed: boolean;

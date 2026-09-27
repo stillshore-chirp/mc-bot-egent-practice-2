@@ -11,6 +11,7 @@ import {
   bucketGatherDropProbePosition,
   createGatherDropProbeCapture,
   flattenGatherDropProbeEvidence,
+  gatherDropProbeTwoStackInventoryEvidence,
   installScopedExecuteProbe,
   projectGatherOperationBodyTransition,
   withScopedExecuteProbeRestoration,
@@ -53,6 +54,53 @@ describe("gather drop probe public evidence buckets", () => {
     expect(bucketGatherDropProbeCount(1)).toBe("one_or_more");
     expect(bucketGatherDropProbeCount(undefined)).toBe("unknown");
     expect(bucketGatherDropProbeCount(-1)).toBe("unknown");
+  });
+
+  it("classifies the opt-in two-stack seed and post-collection deltas", () => {
+    const evidence = gatherDropProbeTwoStackInventoryEvidence({
+      seedBody: { oak_log: 1, birch_log: 0 },
+      seedRcon: { oak_log: 1, birch_log: 0 },
+      afterBody: { oak_log: 1, birch_log: 1 },
+      afterRcon: { oak_log: 1, birch_log: 1 },
+    });
+    expect(evidence).toEqual({
+      seedBody: { oak: "one", birch: "zero", confirmed: true },
+      seedRcon: { oak: "one", birch: "zero", confirmed: true },
+      afterBody: {
+        oakDelta: "unchanged",
+        birchDelta: "increased_by_one",
+        confirmed: true,
+      },
+      afterRcon: {
+        oakDelta: "unchanged",
+        birchDelta: "increased_by_one",
+        confirmed: true,
+      },
+    });
+    expect(JSON.stringify(evidence)).not.toContain('"oak_log"');
+    expect(JSON.stringify(evidence)).not.toContain('"birch_log"');
+  });
+
+  it("keeps an unexpected or unavailable two-stack transition distinct", () => {
+    const evidence = gatherDropProbeTwoStackInventoryEvidence({
+      seedBody: { oak_log: 2, birch_log: 0 },
+      seedRcon: { oak_log: 1, birch_log: 0 },
+      afterBody: { oak_log: 2, birch_log: 1 },
+    });
+    expect(evidence).toMatchObject({
+      seedBody: { oak: "multiple", birch: "zero", confirmed: false },
+      seedRcon: { oak: "one", birch: "zero", confirmed: true },
+      afterBody: {
+        oakDelta: "unchanged",
+        birchDelta: "increased_by_one",
+        confirmed: false,
+      },
+      afterRcon: {
+        oakDelta: "unknown",
+        birchDelta: "unknown",
+        confirmed: false,
+      },
+    });
   });
 
   it("projects before and after Body observations to safe buckets", () => {

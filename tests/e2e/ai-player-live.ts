@@ -176,6 +176,7 @@ import {
 } from "./gather-multi-target-acceptance.js";
 import {
   bucketGatherDropProbeCount,
+  gatherDropProbeTwoStackInventoryEvidence,
   bucketGatherDropProbeFacing,
   bucketGatherDropProbePosition,
   createGatherDropProbeCapture,
@@ -185,7 +186,9 @@ import {
   type GatherDropProbeCapture,
   type GatherDropProbeCountBucket,
   type GatherDropProbeFacingBucket,
+  type GatherDropProbeInventoryCounts,
   type GatherDropProbePositionBucket,
+  type GatherDropProbeTwoStackInventoryEvidence,
 } from "./gather-drop-probe-evidence.js";
 import {
   isCaseSelectedForTarget,
@@ -403,6 +406,7 @@ interface GatherDropVisibilityProbeDiagnostic {
   readonly fixtureCleanupAttempted: boolean;
   readonly fixtureCleanupConfirmed: boolean;
   readonly fixtureCleanupReadback: GatherMultiTargetFixtureCleanupDiagnostic;
+  readonly twoStackInventoryEvidence?: GatherDropProbeTwoStackInventoryEvidence;
 }
 interface GatherBodyVisibilityTargetStages {
   findBlocksReturnedTarget: boolean;
@@ -736,6 +740,10 @@ function isGatherBodyVisibilityProbeOnly(): boolean {
 
 function isGatherDropVisibilityProbeOnly(): boolean {
   return process.env.AI_PLAYER_E2E_GATHER_DROP_VISIBILITY_PROBE_ONLY === "YES";
+}
+
+function isGatherDropTwoStackProbeRequested(): boolean {
+  return process.env.AI_PLAYER_E2E_GATHER_DROP_TWO_STACK === "YES";
 }
 
 function isSingleClientProbeOnly(): boolean {
@@ -7074,6 +7082,12 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
+  if (
+    isGatherDropTwoStackProbeRequested() &&
+    !isGatherDropVisibilityProbeOnly()
+  ) {
+    incomplete("GATHER_DROP_TWO_STACK_REQUIRES_DROP_VISIBILITY_PROBE");
+  }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
@@ -8465,6 +8479,30 @@ function emptyGatherDropProbeStage(): GatherDropProbeStageDiagnostic {
   };
 }
 
+function gatherDropProbeBodyInventoryCounts(
+  observation: PlayerBodyObservation | undefined,
+): GatherDropProbeInventoryCounts | undefined {
+  if (observation === undefined) return undefined;
+  const counts: Record<GatherMultiTargetItem, number> = {
+    oak_log: 0,
+    birch_log: 0,
+  };
+  for (const stack of observation.self.inventory) {
+    const item = GATHER_MULTI_TARGET_ITEMS.find(
+      (candidate) =>
+        candidate ===
+        (stack.name.startsWith("minecraft:")
+          ? stack.name.slice("minecraft:".length)
+          : stack.name),
+    );
+    if (item === undefined) continue;
+    if (!Number.isSafeInteger(stack.count) || stack.count < 0) return undefined;
+    counts[item] += stack.count;
+    if (!Number.isSafeInteger(counts[item])) return undefined;
+  }
+  return counts;
+}
+
 function visibleGatherDropEntitiesNear(
   observation: PlayerBodyObservation | undefined,
   target: BlockPosition,
@@ -8873,6 +8911,7 @@ async function runGatherDropVisibilityProbe(
   state: RunState,
   rcon: LocalRcon,
 ): Promise<void> {
+  const twoStackProbeEnabled = isGatherDropTwoStackProbeRequested();
   const [{ MineflayerClient }, { createLogger }] = await Promise.all([
     import("../../src/minecraft/mineflayer-client.js"),
     import("../../src/observability/logger.js"),
@@ -8904,6 +8943,9 @@ async function runGatherDropVisibilityProbe(
   let origin: Position | undefined;
   let initialBodyYaw: number | undefined;
   let initialRconYaw: number | undefined;
+  let seedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
+  let capturedBodyInventoryCounts: GatherDropProbeInventoryCounts | undefined;
+  let capturedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
   const emptyCleanup: GatherMultiTargetFixtureCleanupDiagnostic = {
     stage: "not_started",
     oakBlockReadbackConfirmed: false,
@@ -8942,11 +8984,20 @@ async function runGatherDropVisibilityProbe(
     fixtureCleanupAttempted: false,
     fixtureCleanupConfirmed: false,
     fixtureCleanupReadback: emptyCleanup,
+    ...(twoStackProbeEnabled
+      ? {
+          twoStackInventoryEvidence: gatherDropProbeTwoStackInventoryEvidence(
+            {},
+          ),
+        }
+      : {}),
   };
 
   const captureStage = async (
     observation: PlayerBodyObservation | undefined,
   ): Promise<GatherDropProbeStageDiagnostic> => {
+    capturedBodyInventoryCounts = undefined;
+    capturedRconInventoryCounts = undefined;
     if (origin === undefined || fixture === undefined)
       return emptyGatherDropProbeStage();
     let rconPositionBucket: GatherDropProbePositionBucket = "unknown";
@@ -8985,14 +9036,20 @@ async function runGatherDropVisibilityProbe(
     } catch {
       // Keep the raw RCON reply private and preserve an unknown class.
     }
-    let birchInventoryCount: number | undefined;
+    let rconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
     try {
-      birchInventoryCount = (
-        await rconGatherMultiTargetInventoryCounts(rcon, state.botName)
-      ).birch_log;
+      rconInventoryCounts = await rconGatherMultiTargetInventoryCounts(
+        rcon,
+        state.botName,
+      );
     } catch {
       // Keep the raw RCON reply private and preserve an unknown count bucket.
     }
+    const bodyInventoryCounts = twoStackProbeEnabled
+      ? gatherDropProbeBodyInventoryCounts(observation)
+      : undefined;
+    capturedBodyInventoryCounts = bodyInventoryCounts;
+    capturedRconInventoryCounts = rconInventoryCounts;
     const rconDropReadbackClass = await rconGatherItemDropReadbackNear(
       rcon,
       fixture.birchLog,
@@ -9025,7 +9082,9 @@ async function runGatherDropVisibilityProbe(
       rconPositionBucket,
       rconFacingDriftBucket,
       rconBirchBlockClass,
-      rconBirchInventoryCount: bucketGatherDropProbeCount(birchInventoryCount),
+      rconBirchInventoryCount: bucketGatherDropProbeCount(
+        rconInventoryCounts?.birch_log,
+      ),
       rconDropReadbackClass,
     };
   };
@@ -9062,6 +9121,25 @@ async function runGatherDropVisibilityProbe(
     );
     if (!staleFixtureCleanupConfirmed)
       incomplete("GATHER_DROP_PROBE_BASELINE_CLEANUP_NOT_CONFIRMED");
+    if (twoStackProbeEnabled) {
+      await rcon.command(`give ${state.botName} minecraft:oak_log 1`);
+      try {
+        seedRconInventoryCounts = await rconGatherMultiTargetInventoryCounts(
+          rcon,
+          state.botName,
+        );
+      } catch {
+        // Preserve unknown buckets; the raw RCON reply stays private.
+      }
+      const seedEvidence = gatherDropProbeTwoStackInventoryEvidence({
+        seedRcon: seedRconInventoryCounts,
+      });
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        twoStackInventoryEvidence: seedEvidence,
+      });
+      if (!seedEvidence.seedRcon.confirmed)
+        incomplete("GATHER_DROP_PROBE_TWO_STACK_RCON_SEED_NOT_CONFIRMED");
+    }
     await rcon.command(
       `setblock ${fixture.birchLog.x} ${fixture.birchLog.y} ${fixture.birchLog.z} birch_log`,
     );
@@ -9117,6 +9195,19 @@ async function runGatherDropVisibilityProbe(
     initialBodyYaw = initialObservation.self.yaw;
     initialRconYaw = confirmedRotation.yaw;
     const initialStage = await captureStage(initialObservation);
+    const seedBodyInventoryCounts = capturedBodyInventoryCounts;
+    if (twoStackProbeEnabled) {
+      const seedEvidence = gatherDropProbeTwoStackInventoryEvidence({
+        seedBody: seedBodyInventoryCounts,
+        seedRcon: seedRconInventoryCounts,
+      });
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        initialStage,
+        twoStackInventoryEvidence: seedEvidence,
+      });
+      if (!seedEvidence.seedBody.confirmed || !seedEvidence.seedRcon.confirmed)
+        incomplete("GATHER_DROP_PROBE_TWO_STACK_BODY_SEED_NOT_CONFIRMED");
+    }
     updateGatherDropVisibilityProbeDiagnostic(state, {
       initialStage,
     });
@@ -9191,7 +9282,19 @@ async function runGatherDropVisibilityProbe(
       const afterCollectObservation =
         collectResult.after ?? (await body.observe());
       const afterCollectStage = await captureStage(afterCollectObservation);
+      const afterBodyInventoryCounts = capturedBodyInventoryCounts;
+      const afterRconInventoryCounts = capturedRconInventoryCounts;
       updateGatherDropVisibilityProbeDiagnostic(state, { afterCollectStage });
+      if (twoStackProbeEnabled) {
+        updateGatherDropVisibilityProbeDiagnostic(state, {
+          twoStackInventoryEvidence: gatherDropProbeTwoStackInventoryEvidence({
+            seedBody: seedBodyInventoryCounts,
+            seedRcon: seedRconInventoryCounts,
+            afterBody: afterBodyInventoryCounts,
+            afterRcon: afterRconInventoryCounts,
+          }),
+        });
+      }
     } else {
       updateGatherDropVisibilityProbeDiagnostic(state, {
         beforeCollectStage,
