@@ -9,8 +9,18 @@ const smeltUnavailable =
   /(?:\bsmelt\b|専用の?精錬操作|精錬操作).{0,40}(?:ない|ありません|未提供|未登録|存在しない)|(?:ない|ありません|未提供|未登録|存在しない).{0,40}(?:\bsmelt\b|専用の?精錬操作|精錬操作)/iu;
 const directDenial =
   /^(?:(?:[\s、,:：]{0,3})(?:(?:は|を|が)\s*)?(?:できません|できない|使えません|使えない|ありません|ないです|ない|未提供|未登録|存在しない|不可)|(?:\s{0,3})(?:(?:is|are)\s+)?(?:not\s+available|unavailable|cannot|can't|doesn't exist))/iu;
-const furnaceUiOperation =
-  /\bopen_window\b|\bwindow_(?:click|transfer)\b|画面.{0,8}(?:開|移)|UI.{0,8}(?:開|移)/u;
+const uiOpenOperation = /\bopen_window\b/iu;
+const uiTransferOperation = /\bwindow_transfer\b/iu;
+const uiOpenAffirmative =
+  /(?:開け|開き|開く|使えます|利用できます|利用可能|可能|can\s+open|opens?\b|available)/iu;
+const uiTransferAffirmative =
+  /(?:移せ(?:ます|る)|移し(?:ます)?|移します|移す|移動|移送|転送|使えます|利用できます|利用可能|可能|can\s+(?:transfer|move)|transfers?\b|moves?\b|available)/iu;
+const uiOperationDenial =
+  /(?:できません|できない|使えません|使えない|利用できません|利用できない|開けません|開けない|移せません|移せない|移動できません|移送できません|転送できません|利用不可|操作不可|not available|unavailable|cannot|can't)/iu;
+const furnaceUiDenied =
+  /(?:炉|かまど|furnace).{0,24}(?:画面|ui|screen|interface|open_window|window_transfer).{0,24}(?:できません|できない|使えません|使えない|利用できません|利用できない|開けません|開けない|移せません|移せない|利用不可|操作不可|not available|unavailable|cannot|can't)|(?:画面|ui|screen|interface|open_window|window_transfer).{0,24}(?:炉|かまど|furnace).{0,24}(?:できません|できない|使えません|使えない|利用できません|利用できない|開けません|開けない|移せません|移せない|利用不可|操作不可|not available|unavailable|cannot|can't)/iu;
+const visibleBlockInterface =
+  /(?:視界内|見える|見えている|到達可能|visible|reachable).{0,28}(?:ブロック|block).{0,28}(?:画面|ui|screen|interface)/iu;
 
 function mentionsAvailableOperation(text: string, pattern: RegExp): boolean {
   const match = pattern.exec(text);
@@ -22,6 +32,23 @@ function mentionsAvailableOperation(text: string, pattern: RegExp): boolean {
   return !directDenial.test(afterOperation);
 }
 
+function mentionsAffirmativeUiOperation(
+  text: string,
+  operation: RegExp,
+  affirmative: RegExp,
+): boolean {
+  const match = operation.exec(text);
+  const matchedOperation = match?.[0];
+  if (match === null || matchedOperation === undefined) return false;
+  const afterOperation =
+    text
+      .slice(match.index + matchedOperation.length)
+      .split(/[。.!?！？;；,，、]/u, 1)[0] ?? "";
+  return (
+    !uiOperationDenial.test(afterOperation) && affirmative.test(afterOperation)
+  );
+}
+
 export function classifyArmorCapabilityReply(
   reply: string,
 ): ArmorCapabilityReplyClassification {
@@ -29,9 +56,24 @@ export function classifyArmorCapabilityReply(
   const digAndEquipAvailable =
     mentionsAvailableOperation(text, /\bdig\b|採掘|掘/u) &&
     mentionsAvailableOperation(text, /\bequip\b|装備/u);
+  const sentences = text.split(/[。.!?！？\n]+/u);
   const furnaceUiAvailable =
-    /かまど|炉|furnace/u.test(text) &&
-    mentionsAvailableOperation(text, furnaceUiOperation);
+    !furnaceUiDenied.test(text) &&
+    sentences.some(
+      (sentence) =>
+        (/(?:かまど|炉|furnace)/u.test(sentence) ||
+          visibleBlockInterface.test(sentence)) &&
+        mentionsAffirmativeUiOperation(
+          sentence,
+          uiOpenOperation,
+          uiOpenAffirmative,
+        ) &&
+        mentionsAffirmativeUiOperation(
+          sentence,
+          uiTransferOperation,
+          uiTransferAffirmative,
+        ),
+    );
   const dedicatedSmeltStatementObserved =
     /\bsmelt\b|専用の?精錬操作|精錬操作/u.test(text);
   const dedicatedSmeltReportedUnavailable =

@@ -7,7 +7,7 @@ import {
 } from "./armor-capability-reply.js";
 
 describe("armor capability reply classifier", () => {
-  it("requires the direct operations, furnace interface, and absent smelt kind", () => {
+  it("classifies explicit furnace UI operations and diagnoses absent smelt", () => {
     expect(
       classifyArmorCapabilityReply(
         "digで採掘でき、equipで装備できます。かまどのopen_windowとwindow_transferは使えますが、専用のsmelt操作はありません。",
@@ -20,14 +20,35 @@ describe("armor capability reply classifier", () => {
     });
   });
 
-  it("does not accept missing or directly denied capabilities", () => {
+  it("recognizes the catalog's general visible-block interface capability", () => {
+    expect(
+      classifyArmorCapabilityReply(
+        "digで採掘でき、equipで装備できます。視界内のブロックやエンティティの画面はopen_windowで開け、window_transferで指定数を移せます。専用smelt操作はcatalogにありません。",
+      ),
+    ).toEqual({
+      digAndEquipAvailable: true,
+      furnaceUiAvailable: true,
+      dedicatedSmeltStatementObserved: true,
+      dedicatedSmeltReportedUnavailable: true,
+    });
+  });
+
+  it("rejects operation-name lists without an affirmative capability claim", () => {
+    expect(
+      classifyArmorCapabilityReply(
+        "炉UIの操作名はopen_window、window_transfer、window_clickです。",
+      ).furnaceUiAvailable,
+    ).toBe(false);
+  });
+
+  it("does not accept missing, denied, or incomplete UI capabilities", () => {
     expect(
       classifyArmorCapabilityReply(
         "digはできますがequipは使えません。炉の画面を開けます。専用smeltはありません。",
       ),
     ).toEqual({
       digAndEquipAvailable: false,
-      furnaceUiAvailable: true,
+      furnaceUiAvailable: false,
       dedicatedSmeltStatementObserved: true,
       dedicatedSmeltReportedUnavailable: true,
     });
@@ -47,9 +68,19 @@ describe("armor capability reply classifier", () => {
       dedicatedSmeltStatementObserved: true,
       dedicatedSmeltReportedUnavailable: true,
     });
+    expect(
+      classifyArmorCapabilityReply(
+        "視界内のブロック画面はopen_windowで開けますが、window_transferでは移せません。",
+      ).furnaceUiAvailable,
+    ).toBe(false);
+    expect(
+      classifyArmorCapabilityReply(
+        "視界内のブロック画面はopen_windowで開け、window_transferで移せます。ただし炉UIは利用できません。",
+      ).furnaceUiAvailable,
+    ).toBe(false);
   });
 
-  it("records an explicit smelt claim without making it a gate", () => {
+  it("does not classify a direct smelt claim as smelt-unavailable", () => {
     expect(
       classifyArmorCapabilityReply(
         "digとequipで採掘・装備ができ、かまどのopen_windowとwindow_transferも使えます。smelt操作も利用できます。",
