@@ -12,8 +12,10 @@ import {
   hasResolvedBirchGatherOwnerGoal,
   identifyFirstGatheredTarget,
   newBirchGatherProposalIds,
+  parseGatherMultiTargetInventoryReplyDetailed,
   parseGatherMultiTargetInventoryReply,
   postFollowupGatherActionPairs,
+  readGatherMultiTargetInventory,
   successfulGatherActionPairs,
 } from "../e2e/gather-multi-target-acceptance.js";
 
@@ -26,6 +28,70 @@ describe("multi-target gather E2E acceptance", () => {
         'entity data: [{id:"minecraft:oak_log",count:2b,Slot:0b},{Count:3,id:"minecraft:birch_log",Slot:1b}]',
       ),
     ).toEqual({ oak_log: 2, birch_log: 3 });
+  });
+
+  it("classifies single and two-stack replies without retaining their text", async () => {
+    let readCount = 0;
+    const single = parseGatherMultiTargetInventoryReplyDetailed(
+      'Entity data: [{id:"minecraft:oak_log",count:1}]',
+    );
+    const twoStack = await readGatherMultiTargetInventory(async () => {
+      readCount += 1;
+      return 'Entity data: [{id:"minecraft:oak_log",count:1,display:{Name:"PRIVATE_failed_RCON_SENTINEL"}},{Slot:1b,Count:1,id:"minecraft:birch_log"}]';
+    });
+    expect(single).toEqual({
+      reason: "parsed",
+      counts: { oak_log: 1, birch_log: 0 },
+    });
+    expect(twoStack).toEqual({
+      reason: "parsed",
+      counts: { oak_log: 1, birch_log: 1 },
+    });
+    expect(readCount).toBe(1);
+    expect(JSON.stringify({ single, twoStack })).not.toContain(
+      "PRIVATE_failed_RCON_SENTINEL",
+    );
+  });
+
+  it("returns a fixed reason for every inventory read boundary", async () => {
+    const readFailed = await readGatherMultiTargetInventory(async () => {
+      throw new Error("PRIVATE_RCON_SENTINEL");
+    });
+    const commandRejected = await readGatherMultiTargetInventory(
+      async () => "Unknown or incomplete command: PRIVATE_RCON_SENTINEL",
+    );
+    const markerMissing = parseGatherMultiTargetInventoryReplyDetailed(
+      "PRIVATE_RCON_SENTINEL",
+    );
+    const structureInvalid = parseGatherMultiTargetInventoryReplyDetailed(
+      "Entity data: [broken]",
+    );
+    const targetCountInvalid = parseGatherMultiTargetInventoryReplyDetailed(
+      'Entity data: [{id:"minecraft:birch_log",count:"1"}]',
+    );
+
+    expect([
+      readFailed.reason,
+      commandRejected.reason,
+      markerMissing.reason,
+      structureInvalid.reason,
+      targetCountInvalid.reason,
+    ]).toEqual([
+      "read_failed",
+      "command_rejected",
+      "marker_missing",
+      "structure_invalid",
+      "target_count_invalid",
+    ]);
+    expect(
+      JSON.stringify({
+        readFailed,
+        commandRejected,
+        markerMissing,
+        structureInvalid,
+        targetCountInvalid,
+      }),
+    ).not.toContain("PRIVATE_RCON_SENTINEL");
   });
 
   it("ignores target names in nested components and quoted text", () => {

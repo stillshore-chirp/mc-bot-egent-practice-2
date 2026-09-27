@@ -5,7 +5,10 @@ import type {
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
-import type { GatherMultiTargetItem } from "./gather-multi-target-acceptance.js";
+import type {
+  GatherMultiTargetInventoryReadReason,
+  GatherMultiTargetItem,
+} from "./gather-multi-target-acceptance.js";
 
 export interface GatherDropProbePoint {
   readonly x: number;
@@ -52,16 +55,24 @@ interface GatherDropProbeInventoryTransitionEvidence {
 export interface GatherDropProbeTwoStackInventoryEvidence {
   readonly seedBody: GatherDropProbeInventorySeedEvidence;
   readonly seedRcon: GatherDropProbeInventorySeedEvidence;
+  readonly seedRconReadReason:
+    GatherMultiTargetInventoryReadReason | "not_attempted";
   readonly afterBody: GatherDropProbeInventoryTransitionEvidence;
   readonly afterRcon: GatherDropProbeInventoryTransitionEvidence;
+  readonly afterRconReadReason:
+    GatherMultiTargetInventoryReadReason | "not_attempted";
 }
 
 /** Keep the opt-in oak/birch comparison to safe count buckets and deltas. */
 export function gatherDropProbeTwoStackInventoryEvidence(input: {
   readonly seedBody?: GatherDropProbeInventoryCounts | undefined;
   readonly seedRcon?: GatherDropProbeInventoryCounts | undefined;
+  readonly seedRconReadReason?:
+    GatherMultiTargetInventoryReadReason | "not_attempted" | undefined;
   readonly afterBody?: GatherDropProbeInventoryCounts | undefined;
   readonly afterRcon?: GatherDropProbeInventoryCounts | undefined;
+  readonly afterRconReadReason?:
+    GatherMultiTargetInventoryReadReason | "not_attempted" | undefined;
 }): GatherDropProbeTwoStackInventoryEvidence {
   const countBucket = (
     count: number | undefined,
@@ -117,8 +128,10 @@ export function gatherDropProbeTwoStackInventoryEvidence(input: {
   return {
     seedBody: seedEvidence(input.seedBody),
     seedRcon: seedEvidence(input.seedRcon),
+    seedRconReadReason: input.seedRconReadReason ?? "not_attempted",
     afterBody: transitionEvidence(input.seedBody, input.afterBody),
     afterRcon: transitionEvidence(input.seedRcon, input.afterRcon),
+    afterRconReadReason: input.afterRconReadReason ?? "not_attempted",
   };
 }
 

@@ -18,12 +18,37 @@ type ParsedInventoryTag =
     }
   | { readonly kind: "list"; readonly values: readonly ParsedInventoryTag[] };
 
+export type GatherMultiTargetInventoryReadReason =
+  | "read_failed"
+  | "command_rejected"
+  | "marker_missing"
+  | "structure_invalid"
+  | "target_count_invalid"
+  | "parsed";
+
+export type GatherMultiTargetInventoryReadResult =
+  | {
+      readonly reason: "parsed";
+      readonly counts: Readonly<Record<GatherMultiTargetItem, number>>;
+    }
+  | {
+      readonly reason: Exclude<GatherMultiTargetInventoryReadReason, "parsed">;
+    };
+
 /** Parse only top-level inventory stacks; malformed or ambiguous replies fail closed. */
 export function parseGatherMultiTargetInventoryReply(
   reply: string,
 ): Readonly<Record<GatherMultiTargetItem, number>> | undefined {
+  const result = parseGatherMultiTargetInventoryReplyDetailed(reply);
+  return result.reason === "parsed" ? result.counts : undefined;
+}
+
+/** Return a fixed safe reason without retaining or exposing the RCON reply. */
+export function parseGatherMultiTargetInventoryReplyDetailed(
+  reply: string,
+): GatherMultiTargetInventoryReadResult {
   const marker = /entity data:\s*/iu.exec(reply);
-  if (marker === null) return undefined;
+  if (marker === null) return { reason: "marker_missing" };
 
   try {
     const parser = new InventoryTagParser(
@@ -34,16 +59,17 @@ export function parseGatherMultiTargetInventoryReply(
       !parser.isAtEnd() ||
       root.values.some((value) => value.kind !== "compound")
     )
-      return undefined;
+      return { reason: "structure_invalid" };
 
     const counts: Record<GatherMultiTargetItem, number> = {
       oak_log: 0,
       birch_log: 0,
     };
     for (const value of root.values) {
-      if (value.kind !== "compound") return undefined;
+      if (value.kind !== "compound") return { reason: "structure_invalid" };
       const ids = value.fields.filter(({ key }) => key === "id");
-      if (ids.length !== 1 || ids[0]?.value.kind !== "scalar") return undefined;
+      if (ids.length !== 1 || ids[0]?.value.kind !== "scalar")
+        return { reason: "structure_invalid" };
       const id = ids[0].value.value;
       const target = GATHER_MULTI_TARGET_ITEMS.find(
         (item) => id === `minecraft:${item}`,
@@ -60,20 +86,46 @@ export function parseGatherMultiTargetInventoryReply(
         stackCount.quoted ||
         !/^\d+[bBsSlL]?$/u.test(stackCount.value)
       ) {
-        return undefined;
+        return { reason: "target_count_invalid" };
       }
       const amount = Number.parseInt(
         stackCount.value.replace(/[bBsSlL]$/u, ""),
         10,
       );
-      if (!Number.isSafeInteger(amount) || amount < 0) return undefined;
+      if (!Number.isSafeInteger(amount) || amount < 0)
+        return { reason: "target_count_invalid" };
       counts[target] += amount;
-      if (!Number.isSafeInteger(counts[target])) return undefined;
+      if (!Number.isSafeInteger(counts[target]))
+        return { reason: "target_count_invalid" };
     }
-    return counts;
+    return { reason: "parsed", counts };
   } catch {
-    return undefined;
+    return { reason: "structure_invalid" };
   }
+}
+
+/** Read once, returning only safe classification and parsed counts. */
+export async function readGatherMultiTargetInventory(
+  readReply: () => Promise<string>,
+): Promise<GatherMultiTargetInventoryReadResult> {
+  let reply: string;
+  try {
+    reply = await readReply();
+  } catch {
+    return { reason: "read_failed" };
+  }
+
+  const parsed = parseGatherMultiTargetInventoryReplyDetailed(reply);
+  if (parsed.reason === "parsed") return parsed;
+  if (isGatherMultiTargetInventoryCommandRejection(reply))
+    return { reason: "command_rejected" };
+  return parsed;
+}
+
+function isGatherMultiTargetInventoryCommandRejection(reply: string): boolean {
+  return /^(?:unknown(?: or incomplete)? command\b|incorrect argument\b|expected\b|usage:|error\b|failed\b|not found\b|no entity was found\b|found no elements matching\b)/iu.test(
+    reply.trimStart(),
+  );
 }
 
 class InventoryTagParser {

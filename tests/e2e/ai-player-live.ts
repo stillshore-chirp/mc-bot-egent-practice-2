@@ -160,7 +160,7 @@ import {
   gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
   GATHER_MULTI_TARGET_ITEMS,
-  parseGatherMultiTargetInventoryReply,
+  readGatherMultiTargetInventory,
   hasNewBirchGatherIntent,
   hasNewPostFollowupDigJudgment,
   hasNewPostFollowupDigJudgmentBeforeSecondDig,
@@ -170,6 +170,7 @@ import {
   postFollowupGatherActionPairs,
   successfulGatherActionPairs,
   type GatherMultiTargetContinuityDiagnostic,
+  type GatherMultiTargetInventoryReadReason,
   type GatherMultiTargetItem,
   type GatherMultiTargetOracleSample,
   type GatherOperationOutcome,
@@ -8944,8 +8945,12 @@ async function runGatherDropVisibilityProbe(
   let initialBodyYaw: number | undefined;
   let initialRconYaw: number | undefined;
   let seedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
+  let seedRconInventoryReadReason:
+    GatherMultiTargetInventoryReadReason | undefined;
   let capturedBodyInventoryCounts: GatherDropProbeInventoryCounts | undefined;
   let capturedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
+  let capturedRconInventoryReadReason:
+    GatherMultiTargetInventoryReadReason | undefined;
   const emptyCleanup: GatherMultiTargetFixtureCleanupDiagnostic = {
     stage: "not_started",
     oakBlockReadbackConfirmed: false,
@@ -8998,6 +9003,7 @@ async function runGatherDropVisibilityProbe(
   ): Promise<GatherDropProbeStageDiagnostic> => {
     capturedBodyInventoryCounts = undefined;
     capturedRconInventoryCounts = undefined;
+    capturedRconInventoryReadReason = undefined;
     if (origin === undefined || fixture === undefined)
       return emptyGatherDropProbeStage();
     let rconPositionBucket: GatherDropProbePositionBucket = "unknown";
@@ -9036,15 +9042,12 @@ async function runGatherDropVisibilityProbe(
     } catch {
       // Keep the raw RCON reply private and preserve an unknown class.
     }
-    let rconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
-    try {
-      rconInventoryCounts = await rconGatherMultiTargetInventoryCounts(
-        rcon,
-        state.botName,
-      );
-    } catch {
-      // Keep the raw RCON reply private and preserve an unknown count bucket.
-    }
+    const inventoryRead = await readGatherMultiTargetInventory(() =>
+      rcon.command(`data get entity ${state.botName} Inventory`),
+    );
+    const rconInventoryCounts =
+      inventoryRead.reason === "parsed" ? inventoryRead.counts : undefined;
+    capturedRconInventoryReadReason = inventoryRead.reason;
     const bodyInventoryCounts = twoStackProbeEnabled
       ? gatherDropProbeBodyInventoryCounts(observation)
       : undefined;
@@ -9123,16 +9126,17 @@ async function runGatherDropVisibilityProbe(
       incomplete("GATHER_DROP_PROBE_BASELINE_CLEANUP_NOT_CONFIRMED");
     if (twoStackProbeEnabled) {
       await rcon.command(`give ${state.botName} minecraft:oak_log 1`);
-      try {
-        seedRconInventoryCounts = await rconGatherMultiTargetInventoryCounts(
-          rcon,
-          state.botName,
-        );
-      } catch {
-        // Preserve unknown buckets; the raw RCON reply stays private.
-      }
+      const seedInventoryRead = await readGatherMultiTargetInventory(() =>
+        rcon.command(`data get entity ${state.botName} Inventory`),
+      );
+      seedRconInventoryReadReason = seedInventoryRead.reason;
+      seedRconInventoryCounts =
+        seedInventoryRead.reason === "parsed"
+          ? seedInventoryRead.counts
+          : undefined;
       const seedEvidence = gatherDropProbeTwoStackInventoryEvidence({
         seedRcon: seedRconInventoryCounts,
+        seedRconReadReason: seedRconInventoryReadReason,
       });
       updateGatherDropVisibilityProbeDiagnostic(state, {
         twoStackInventoryEvidence: seedEvidence,
@@ -9200,6 +9204,7 @@ async function runGatherDropVisibilityProbe(
       const seedEvidence = gatherDropProbeTwoStackInventoryEvidence({
         seedBody: seedBodyInventoryCounts,
         seedRcon: seedRconInventoryCounts,
+        seedRconReadReason: seedRconInventoryReadReason,
       });
       updateGatherDropVisibilityProbeDiagnostic(state, {
         initialStage,
@@ -9290,8 +9295,11 @@ async function runGatherDropVisibilityProbe(
           twoStackInventoryEvidence: gatherDropProbeTwoStackInventoryEvidence({
             seedBody: seedBodyInventoryCounts,
             seedRcon: seedRconInventoryCounts,
+            seedRconReadReason: seedRconInventoryReadReason,
             afterBody: afterBodyInventoryCounts,
             afterRcon: afterRconInventoryCounts,
+            afterRconReadReason:
+              capturedRconInventoryReadReason ?? "not_attempted",
           }),
         });
       }
@@ -11792,17 +11800,12 @@ async function rconGatherMultiTargetInventoryCounts(
   rcon: LocalRcon,
   botName: string,
 ): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
-  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
-  if (
-    /(?:unknown(?: or incomplete)? command|error|failed|not found)/iu.test(
-      inventory,
-    )
-  )
+  const result = await readGatherMultiTargetInventory(() =>
+    rcon.command(`data get entity ${botName} Inventory`),
+  );
+  if (result.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
-  const counts = parseGatherMultiTargetInventoryReply(inventory);
-  if (counts === undefined)
-    incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
-  return counts;
+  return result.counts;
 }
 
 async function sampleGatherMultiTargetOracle(

@@ -60,12 +60,15 @@ describe("gather drop probe public evidence buckets", () => {
     const evidence = gatherDropProbeTwoStackInventoryEvidence({
       seedBody: { oak_log: 1, birch_log: 0 },
       seedRcon: { oak_log: 1, birch_log: 0 },
+      seedRconReadReason: "parsed",
       afterBody: { oak_log: 1, birch_log: 1 },
       afterRcon: { oak_log: 1, birch_log: 1 },
+      afterRconReadReason: "parsed",
     });
     expect(evidence).toEqual({
       seedBody: { oak: "one", birch: "zero", confirmed: true },
       seedRcon: { oak: "one", birch: "zero", confirmed: true },
+      seedRconReadReason: "parsed",
       afterBody: {
         oakDelta: "unchanged",
         birchDelta: "increased_by_one",
@@ -76,6 +79,7 @@ describe("gather drop probe public evidence buckets", () => {
         birchDelta: "increased_by_one",
         confirmed: true,
       },
+      afterRconReadReason: "parsed",
     });
     expect(JSON.stringify(evidence)).not.toContain('"oak_log"');
     expect(JSON.stringify(evidence)).not.toContain('"birch_log"');
@@ -86,6 +90,8 @@ describe("gather drop probe public evidence buckets", () => {
       seedBody: { oak_log: 2, birch_log: 0 },
       seedRcon: { oak_log: 1, birch_log: 0 },
       afterBody: { oak_log: 2, birch_log: 1 },
+      seedRconReadReason: "parsed",
+      afterRconReadReason: "structure_invalid",
     });
     expect(evidence).toMatchObject({
       seedBody: { oak: "multiple", birch: "zero", confirmed: false },
@@ -100,6 +106,7 @@ describe("gather drop probe public evidence buckets", () => {
         birchDelta: "unknown",
         confirmed: false,
       },
+      afterRconReadReason: "structure_invalid",
     });
   });
 
