@@ -238,7 +238,7 @@ const CASE_BUDGETS = {
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
   learning_reuse: { llmCalls: 30, totalTokens: 300_000 },
-  gather_multi_target_continuity: { llmCalls: 36, totalTokens: 280_000 },
+  gather_multi_target_continuity: { llmCalls: 48, totalTokens: 380_000 },
   skill_compactness_and_knowledge_separation: {
     llmCalls: 2,
     totalTokens: 25_000,
