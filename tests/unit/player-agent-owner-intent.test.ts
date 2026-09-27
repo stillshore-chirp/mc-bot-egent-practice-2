@@ -485,6 +485,129 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("provides failed pickup and fresh drop context to an active gathering retry decision", async () => {
+    const observation = gatheringObservationFixture({
+      coalCount: 0,
+      remainingCoalOre: [],
+      visibleCoalDrop: true,
+    });
+    const fixture = openPurposeFixture(createMemoryPort(), [], () => ({
+      ...observation,
+      observedAt: "2026-09-27T00:00:03.000Z",
+    }));
+    const proposal = fixture.mind.addProposal({
+      title: "Gather the visible coal",
+      reason: "The owner requested coal gathering.",
+      priority: 3,
+    });
+
+    try {
+      const adopted = resolveProposal(
+        fixture.mind,
+        fixture.mind.snapshot(),
+        proposal,
+        "adopted",
+      );
+      const ownerGoal = adopted.goals.find(
+        ({ ownerProposalId }) => ownerProposalId === proposal.id,
+      );
+      if (ownerGoal === undefined)
+        throw new Error("TEST_OWNER_GATHER_GOAL_MISSING");
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: "dig-coal-target",
+          kind: "dig",
+          status: "successful",
+          summary: "The coal ore block changed and a drop may remain.",
+          expectedOutcome: "Observe the block change and resulting drop.",
+          observedAt: "2026-09-27T00:00:01.000Z",
+        },
+      });
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: "collect-coal-drop",
+          kind: "collect_item",
+          status: "failed",
+          summary: "Pickup failed: target_unobservable.",
+          expectedOutcome: "Collect the visible coal drop.",
+          observedAt: "2026-09-27T00:00:02.000Z",
+        },
+      });
+
+      const retryAction = actionArguments(
+        goalArguments({
+          id: ownerGoal.id,
+          title: ownerGoal.title,
+          status: "active",
+          source: "owner",
+          reason: "The pickup failed; recheck the visible drop.",
+        }),
+        "act",
+        { kind: "collect_item", entityId: 42 },
+      );
+      fixture.responses.push(
+        functionCallResponse(
+          "retry-visible-coal-pickup",
+          "commit_action_decision",
+          retryAction,
+        ),
+      );
+      const decision = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(),
+      });
+
+      expect(decision).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "collect_item", entityId: 42 },
+        },
+      });
+      expect(retryAction.stateUpdates).toMatchObject({
+        goalState: { goalStatus: "active", goalSource: "owner" },
+      });
+      const request = fixture.requests[0];
+      const instructions = String(record(request).instructions);
+      expect(instructions).toContain(
+        "digのsuccessfulはブロック変化の確認であり、dropの拾得確認ではありません",
+      );
+      expect(instructions).toContain(
+        "次のfresh Body observationでself.inventoryの個数",
+      );
+      const purposeInput = purposeInputFromRequest(request);
+      expect(purposeInput.observation.observedAt).toBe(
+        "2026-09-27T00:00:03.000Z",
+      );
+      expect(purposeInput.observation.self.inventory).toEqual([]);
+      expect(purposeInput.observation.perception.entities).toContainEqual(
+        expect.objectContaining({ kind: "item", category: "item" }),
+      );
+      expect(purposeInput.runtime.recentOutcomes).toContainEqual(
+        expect.objectContaining({
+          kind: "dig",
+          status: "successful",
+        }),
+      );
+      const failedPickup = purposeInput.runtime.recentOutcomes.find(
+        ({ kind }) => kind === "collect_item",
+      );
+      expect(failedPickup).toMatchObject({
+        status: "failed",
+      });
+      expect(String(failedPickup?.summary)).toContain("target_unobservable");
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal.id,
+          ownerProposalId: proposal.id,
+          status: "active",
+        }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("uses a short owner armor follow-up and observed equipment to choose an upgrade", async () => {
     const observation = equipmentObservationFixture(
       [observedArmorItem("iron_helmet", 36)],
@@ -1426,6 +1549,7 @@ function bodyObservationFixture(): PlayerBodyObservation {
 
 interface PurposeGatherInput {
   readonly observation: {
+    readonly observedAt: string;
     readonly self: {
       readonly inventory: readonly {
         readonly name: string;
@@ -1443,6 +1567,11 @@ interface PurposeGatherInput {
           readonly y: number;
           readonly z: number;
         };
+      }[];
+      readonly entities: readonly {
+        readonly id: number;
+        readonly kind: string;
+        readonly category: string | null;
       }[];
     };
   };
@@ -1463,6 +1592,7 @@ function purposeInputFromRequest(request: unknown): PurposeGatherInput {
 function gatheringObservationFixture(input: {
   readonly coalCount: number;
   readonly remainingCoalOre: readonly { x: number; y: number; z: number }[];
+  readonly visibleCoalDrop?: boolean;
 }): PlayerBodyObservation {
   const base = bodyObservationFixture();
   return {
@@ -1495,6 +1625,21 @@ function gatheringObservationFixture(input: {
         distance: 2,
         properties: {},
       })),
+      entities:
+        input.visibleCoalDrop === true
+          ? [
+              {
+                id: 42,
+                name: "item",
+                kind: "item",
+                category: "item",
+                position: { x: 0, y: 64, z: -1, dimension: "overworld" },
+                distance: 1,
+                health: null,
+                isPlayer: false,
+              },
+            ]
+          : [],
     },
   };
 }
