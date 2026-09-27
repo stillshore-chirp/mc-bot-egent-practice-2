@@ -441,6 +441,14 @@ type ProgressiveNavigationUseSkipReason =
   | "operation_unresolved"
   | "door_not_observed"
   | "door_out_of_reach"
+  | "look_not_successful"
+  | "look_observation_unavailable"
+  | "attempted";
+type ProgressiveNavigationDoorLookSkipReason =
+  | "initial_route_confirmed"
+  | "run_deadline"
+  | "door_not_closed"
+  | "operation_unresolved"
   | "attempted";
 type ProgressiveNavigationObservedDoorHalf = "lower" | "upper" | "neither";
 
@@ -484,6 +492,22 @@ interface ProgressiveNavigationDoorUseReadiness {
     | "doorWithinReach"
   >;
   readonly targetPosition: BlockPosition | null;
+}
+
+interface ProgressiveNavigationDoorLookDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason: ProgressiveNavigationDoorLookSkipReason;
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired?: boolean;
+  readonly doorObservedHalfBefore: ProgressiveNavigationObservedDoorHalf;
+  readonly doorObservedHalfAfter:
+    ProgressiveNavigationObservedDoorHalf | "unknown" | "not_sampled";
+  readonly bodyBlockSearchMayBeTruncatedBefore: boolean | "unknown";
+  readonly bodyBlockSearchMayBeTruncatedAfter:
+    boolean | "unknown" | "not_sampled";
+  readonly doorStateBefore: ProgressiveNavigationDoorState;
+  readonly doorStateAfter: ProgressiveNavigationDoorState | "not_sampled";
 }
 
 interface ProgressiveNavigationRetryDiagnostic {
@@ -910,6 +934,7 @@ interface BodySmokeDiagnostic {
     readonly samples: readonly ProgressiveNavigationMovementSample[];
   };
   readonly progressiveNavigationDoorUse?: ProgressiveNavigationDoorUseDiagnostic;
+  readonly progressiveNavigationDoorLook?: ProgressiveNavigationDoorLookDiagnostic;
   readonly progressiveNavigationRetryMove?: ProgressiveNavigationRetryDiagnostic;
   readonly progressiveNavigationFixtureCleanupConfirmed?: boolean;
   readonly progressiveNavigationOriginalFixtureRestored?: boolean;
@@ -7493,10 +7518,81 @@ async function runProgressiveNavigationProbe(
       rconPassedDoor &&
       bodyDistanceAfter <= 1.75 &&
       rconDistanceAfter <= 1.75;
-    const doorUseReadinessResult = progressiveNavigationDoorUseReadiness(
+    const doorUseReadinessBeforeLook = progressiveNavigationDoorUseReadiness(
       bodyAfter,
       door,
     );
+    const skippedDoorLook = (
+      skipReason: ProgressiveNavigationDoorLookSkipReason,
+    ): ProgressiveNavigationDoorLookDiagnostic => ({
+      attempted: false,
+      skipReason,
+      doorObservedHalfBefore:
+        doorUseReadinessBeforeLook.diagnostic.doorObservedHalf,
+      doorObservedHalfAfter: "not_sampled",
+      bodyBlockSearchMayBeTruncatedBefore:
+        doorUseReadinessBeforeLook.diagnostic.bodyBlockSearchMayBeTruncated,
+      bodyBlockSearchMayBeTruncatedAfter: "not_sampled",
+      doorStateBefore: doorStateAfter,
+      doorStateAfter: "not_sampled",
+    });
+    let doorUseReadinessResult = doorUseReadinessBeforeLook;
+    let doorStateBeforeUse = doorStateAfter;
+    let doorLookDiagnostic: ProgressiveNavigationDoorLookDiagnostic;
+    let doorLookObservationAvailable = false;
+    if (isProgressiveNavigationSignalAborted(signal)) {
+      doorLookDiagnostic = skippedDoorLook("run_deadline");
+    } else if (routeConfirmed) {
+      doorLookDiagnostic = skippedDoorLook("initial_route_confirmed");
+    } else if (doorStateAfter !== "closed") {
+      doorLookDiagnostic = skippedDoorLook("door_not_closed");
+    } else if (move.recoveryRequired) {
+      doorLookDiagnostic = skippedDoorLook("operation_unresolved");
+    } else {
+      const doorLook = await executeProgressiveNavigationDoorLook(
+        body,
+        {
+          x: door.x + 0.5,
+          y: door.y + 1.5,
+          z: door.z + 0.5,
+        },
+        signal,
+        5_000,
+      );
+      const [bodyAfterLook, doorStateAfterLook] = await Promise.all([
+        body.observe().catch(() => undefined),
+        readProgressiveNavigationDoorState(rcon, door, state.botName).catch(
+          () => "unknown" as const,
+        ),
+      ]);
+      const readinessAfterLook =
+        bodyAfterLook === undefined
+          ? undefined
+          : progressiveNavigationDoorUseReadiness(bodyAfterLook, door);
+      if (readinessAfterLook !== undefined) {
+        doorUseReadinessResult = readinessAfterLook;
+        doorLookObservationAvailable = true;
+      }
+      doorStateBeforeUse = doorStateAfterLook;
+      doorLookDiagnostic = {
+        attempted: true,
+        skipReason: "attempted",
+        status: doorLook.status,
+        errorClass: doorLook.errorClass,
+        recoveryRequired: doorLook.recoveryRequired,
+        doorObservedHalfBefore:
+          doorUseReadinessBeforeLook.diagnostic.doorObservedHalf,
+        doorObservedHalfAfter:
+          readinessAfterLook?.diagnostic.doorObservedHalf ?? "unknown",
+        bodyBlockSearchMayBeTruncatedBefore:
+          doorUseReadinessBeforeLook.diagnostic.bodyBlockSearchMayBeTruncated,
+        bodyBlockSearchMayBeTruncatedAfter:
+          readinessAfterLook?.diagnostic.bodyBlockSearchMayBeTruncated ??
+          "unknown",
+        doorStateBefore: doorStateAfter,
+        doorStateAfter: doorStateAfterLook,
+      };
+    }
     const doorUseReadiness = doorUseReadinessResult.diagnostic;
     let doorUseDiagnostic: ProgressiveNavigationDoorUseDiagnostic;
     let retryDiagnostic: ProgressiveNavigationRetryDiagnostic;
@@ -7517,14 +7613,17 @@ async function runProgressiveNavigationProbe(
         attempted: false,
         skipReason: "initial_route_confirmed",
       };
-    } else if (doorStateAfter !== "closed") {
+    } else if (doorStateBeforeUse !== "closed") {
       doorUseDiagnostic = {
         attempted: false,
         skipReason: "door_not_closed",
         ...doorUseReadiness,
       };
       retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
-    } else if (move.recoveryRequired) {
+    } else if (
+      move.recoveryRequired ||
+      doorLookDiagnostic.recoveryRequired === true
+    ) {
       doorUseDiagnostic = {
         attempted: false,
         skipReason: "operation_unresolved",
@@ -7534,6 +7633,27 @@ async function runProgressiveNavigationProbe(
         attempted: false,
         skipReason: "operation_unresolved",
       };
+    } else if (doorLookDiagnostic.skipReason !== "attempted") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_not_successful",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (doorLookDiagnostic.status !== "successful") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_not_successful",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (!doorLookObservationAvailable) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_observation_unavailable",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
     } else if (
       doorUseReadiness.doorObservedHalf === "neither" ||
       doorUseReadinessResult.targetPosition === null
@@ -7681,6 +7801,7 @@ async function runProgressiveNavigationProbe(
         stallElapsedBucket: move.stallElapsedBucket ?? "none",
         samples: movementSamples.slice(0, 5),
       },
+      progressiveNavigationDoorLook: doorLookDiagnostic,
       progressiveNavigationDoorUse: doorUseDiagnostic,
       progressiveNavigationRetryMove: retryDiagnostic,
     });
@@ -7809,12 +7930,12 @@ function progressiveNavigationDoorUseReadiness(
       block.position.z === door.z &&
       block.properties.half === "upper",
   );
-  const visibleDoor = visibleLowerDoor ?? visibleUpperDoor;
+  const visibleDoor = visibleUpperDoor ?? visibleLowerDoor;
   const doorObservedHalf: ProgressiveNavigationObservedDoorHalf =
-    visibleLowerDoor !== undefined
-      ? "lower"
-      : visibleUpperDoor !== undefined
-        ? "upper"
+    visibleUpperDoor !== undefined
+      ? "upper"
+      : visibleLowerDoor !== undefined
+        ? "lower"
         : "neither";
   const targetPosition =
     visibleDoor === undefined
@@ -7872,6 +7993,46 @@ async function executeProgressiveNavigationDoorUse(
   try {
     const result = await body.execute(
       { kind: "use", target: { kind: "block", position: door } },
+      AbortSignal.any([parentSignal, probeAbort.signal]),
+    );
+    status = result.status;
+    detail = result.detail;
+    recoveryRequired = result.recoveryRequired;
+  } catch (error) {
+    detail = error instanceof Error ? error.message : undefined;
+    status = parentSignal.aborted ? "interrupted" : "failed";
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    status,
+    errorClass: classifyProgressiveDoorUseErrorClass(
+      detail,
+      probeDeadlineReached,
+    ),
+    recoveryRequired,
+    probeDeadlineReached,
+  };
+}
+
+async function executeProgressiveNavigationDoorLook(
+  body: PlayerBody,
+  target: Position,
+  parentSignal: AbortSignal,
+  deadlineMs: number,
+): Promise<ProgressiveNavigationDoorUseOperationResult> {
+  const probeAbort = new AbortController();
+  let probeDeadlineReached = false;
+  let status: BodyOperationStatus;
+  let detail: string | undefined;
+  let recoveryRequired = false;
+  const timer = setTimeout(() => {
+    probeDeadlineReached = true;
+    probeAbort.abort(new Error("progressive navigation door look deadline"));
+  }, deadlineMs);
+  try {
+    const result = await body.execute(
+      { kind: "look", target },
       AbortSignal.any([parentSignal, probeAbort.signal]),
     );
     status = result.status;
