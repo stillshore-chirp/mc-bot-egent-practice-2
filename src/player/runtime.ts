@@ -18,6 +18,7 @@ import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
 import type { TraceService, TraceSession } from "../trace/service.js";
 import type {
   PlayerMemoryPort,
+  PlayerObservationEvidence,
   PlayerObservedDisplacement,
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
@@ -269,7 +270,38 @@ export class PlayerRuntime {
   }
 
   public evidence(): PlayerRuntimeSnapshot {
-    return this.options.mind.snapshot();
+    const snapshot = this.options.mind.snapshot();
+    return {
+      ...snapshot,
+      ...(snapshot.lastObservation === undefined
+        ? {}
+        : {
+            lastObservation: withoutPrivateObservationDetails(
+              snapshot.lastObservation,
+            ),
+          }),
+      ...(snapshot.latestDeath === undefined
+        ? {}
+        : {
+            latestDeath: {
+              observedAt: snapshot.latestDeath.observedAt,
+              ...(snapshot.latestDeath.beforeObservation === undefined
+                ? {}
+                : {
+                    beforeObservation: withoutPrivateObservationDetails(
+                      snapshot.latestDeath.beforeObservation,
+                    ),
+                  }),
+              ...(snapshot.latestDeath.firstPostDeathObservation === undefined
+                ? {}
+                : {
+                    firstPostDeathObservation: withoutPrivateObservationDetails(
+                      snapshot.latestDeath.firstPostDeathObservation,
+                    ),
+                  }),
+            },
+          }),
+    };
   }
 
   public handleCommittedDecision(
@@ -487,11 +519,14 @@ export class PlayerRuntime {
       kind === "state_changed" &&
       !summary.includes("vitals") &&
       this.#activeThought !== undefined;
-    const event = this.options.mind.enqueueEvent(
-      kind,
-      summary,
-      deferObservation ? { invalidateDecision: false } : undefined,
-    );
+    const event =
+      kind === "bot_death"
+        ? this.options.mind.recordDeathEvent(at, summary)
+        : this.options.mind.enqueueEvent(
+            kind,
+            summary,
+            deferObservation ? { invalidateDecision: false } : undefined,
+          );
     this.#requestThought(kind, event.summary);
   }
 
@@ -525,10 +560,11 @@ export class PlayerRuntime {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
       } else if (
         !this.#activeThoughtCommitted &&
+        kind !== "body_outcome" &&
         (kind !== "state_changed" || reason.includes("vitals"))
       ) {
-        // Decision-invalidating events advance CAS. Ordinary observation
-        // changes remain queued for the next thought after this one settles.
+        // Body outcomes advance CAS but let the in-flight request settle; its
+        // stale commit will be rejected before the queued outcome is retried.
         activeThought.abort(new Error(`new_event_preempted_thought:${kind}`));
       }
       return;
@@ -587,6 +623,8 @@ export class PlayerRuntime {
       this.#pendingThoughtWake = { kind, reason };
       return;
     }
+    // Keep a durable body result as the next wake; owner proposals preempt above.
+    if (pending.kind === "body_outcome" && kind !== "body_outcome") return;
     if (kind !== "state_changed" || pending.kind === "state_changed")
       this.#pendingThoughtWake = { kind, reason };
   }
@@ -597,6 +635,10 @@ export class PlayerRuntime {
     this.#activeThoughtCommitted = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
+      return;
+    }
+    if (this.#pendingThoughtWake?.kind === "body_outcome") {
+      this.#dispatchPendingThought();
       return;
     }
     if (retry) {
@@ -1056,6 +1098,17 @@ export class PlayerRuntime {
       "player runtime operation failed",
     );
   }
+}
+
+function withoutPrivateObservationDetails(
+  observation: PlayerObservationEvidence,
+): PlayerObservationEvidence {
+  const {
+    position: _position,
+    inventoryItems: _inventoryItems,
+    ...visibleEvidence
+  } = observation;
+  return visibleEvidence;
 }
 
 function groundedOperationSummary(result: PlayerOperationResult): string {
