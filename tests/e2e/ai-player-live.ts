@@ -193,6 +193,7 @@ const E2E_GAMERULES = {
 } as const;
 const REGION = { minX: -12, minY: 63, minZ: -12, maxX: 12, maxY: 72, maxZ: 12 };
 const REGION_BASELINE = { x: 1_000, y: 63, z: 1_000 };
+const PREPARED_FLOOR_BLOCK = "stone";
 // The spread covers the 110-degree horizontal view cone; east stays in front of the hidden wall.
 const AUTONOMOUS_RESOURCE_FIXTURE = [
   { x: 1, y: 64, z: 0 },
@@ -7056,7 +7057,7 @@ async function prepareWorld(state: RunState, rcon: LocalRcon): Promise<void> {
   await rcon.command("weather clear");
   await rcon.command("setworldspawn 0 64 0");
   await rcon.command(
-    `fill ${REGION.minX} ${REGION.minY} ${REGION.minZ} ${REGION.maxX} ${REGION.minY} ${REGION.maxZ} stone`,
+    `fill ${REGION.minX} ${REGION.minY} ${REGION.minZ} ${REGION.maxX} ${REGION.minY} ${REGION.maxZ} ${PREPARED_FLOOR_BLOCK}`,
   );
   await rcon.command(
     `fill ${REGION.minX} ${REGION.minY + 1} ${REGION.minZ} ${REGION.maxX} ${REGION.maxY} ${REGION.maxZ} air`,
@@ -10452,7 +10453,7 @@ async function availableGatherMultiTargetFixture(
       if (
         !(await isBlock(rcon, target, "air")) ||
         !(await isBlock(rcon, { ...target, y: target.y + 1 }, "air")) ||
-        !(await isBlock(rcon, support, "grass_block"))
+        !(await isBlock(rcon, support, PREPARED_FLOOR_BLOCK))
       ) {
         sitesAvailable = false;
         break;
