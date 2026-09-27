@@ -442,6 +442,7 @@ type ProgressiveNavigationUseSkipReason =
   | "door_not_observed"
   | "door_out_of_reach"
   | "attempted";
+type ProgressiveNavigationObservedDoorHalf = "lower" | "upper" | "neither";
 
 interface ProgressiveNavigationMovementSample {
   readonly point: ProgressiveNavigationSamplePoint;
@@ -458,6 +459,7 @@ interface ProgressiveNavigationDoorUseDiagnostic {
   readonly attempted: boolean;
   readonly skipReason: ProgressiveNavigationUseSkipReason;
   readonly doorObserved: boolean | "unknown";
+  readonly doorObservedHalf: ProgressiveNavigationObservedDoorHalf;
   readonly bodyBlockSearchMayBeTruncated: boolean | "unknown";
   readonly doorWithinReach: boolean | "unknown";
   readonly status?: BodyOperationStatus;
@@ -471,6 +473,17 @@ interface ProgressiveNavigationDoorUseOperationResult {
   readonly errorClass: BodyDetailClass | "probe_deadline";
   readonly recoveryRequired: boolean;
   readonly probeDeadlineReached: boolean;
+}
+
+interface ProgressiveNavigationDoorUseReadiness {
+  readonly diagnostic: Pick<
+    ProgressiveNavigationDoorUseDiagnostic,
+    | "doorObserved"
+    | "doorObservedHalf"
+    | "bodyBlockSearchMayBeTruncated"
+    | "doorWithinReach"
+  >;
+  readonly targetPosition: BlockPosition | null;
 }
 
 interface ProgressiveNavigationRetryDiagnostic {
@@ -7480,10 +7493,11 @@ async function runProgressiveNavigationProbe(
       rconPassedDoor &&
       bodyDistanceAfter <= 1.75 &&
       rconDistanceAfter <= 1.75;
-    const doorUseReadiness = progressiveNavigationDoorUseReadiness(
+    const doorUseReadinessResult = progressiveNavigationDoorUseReadiness(
       bodyAfter,
       door,
     );
+    const doorUseReadiness = doorUseReadinessResult.diagnostic;
     let doorUseDiagnostic: ProgressiveNavigationDoorUseDiagnostic;
     let retryDiagnostic: ProgressiveNavigationRetryDiagnostic;
     if (isProgressiveNavigationSignalAborted(signal)) {
@@ -7520,7 +7534,10 @@ async function runProgressiveNavigationProbe(
         attempted: false,
         skipReason: "operation_unresolved",
       };
-    } else if (!doorUseReadiness.doorObserved) {
+    } else if (
+      doorUseReadiness.doorObservedHalf === "neither" ||
+      doorUseReadinessResult.targetPosition === null
+    ) {
       doorUseDiagnostic = {
         attempted: false,
         skipReason: "door_not_observed",
@@ -7537,7 +7554,7 @@ async function runProgressiveNavigationProbe(
     } else {
       const use = await executeProgressiveNavigationDoorUse(
         body,
-        door,
+        doorUseReadinessResult.targetPosition,
         signal,
         15_000,
       );
@@ -7775,33 +7792,65 @@ function isProgressiveNavigationSignalAborted(signal: AbortSignal): boolean {
 function progressiveNavigationDoorUseReadiness(
   observation: Awaited<ReturnType<PlayerBody["observe"]>>,
   door: BlockPosition,
-): Pick<
-  ProgressiveNavigationDoorUseDiagnostic,
-  "doorObserved" | "bodyBlockSearchMayBeTruncated" | "doorWithinReach"
-> {
-  const visibleDoor = observation.perception.blocks.find(
+): ProgressiveNavigationDoorUseReadiness {
+  const visibleLowerDoor = observation.perception.blocks.find(
     (block) =>
       block.name === "oak_door" &&
       block.position.x === door.x &&
       block.position.y === door.y &&
-      block.position.z === door.z,
+      block.position.z === door.z &&
+      block.properties.half === "lower",
   );
-  const target = { x: door.x + 0.5, y: door.y + 0.5, z: door.z + 0.5 };
+  const visibleUpperDoor = observation.perception.blocks.find(
+    (block) =>
+      block.name === "oak_door" &&
+      block.position.x === door.x &&
+      block.position.y === door.y + 1 &&
+      block.position.z === door.z &&
+      block.properties.half === "upper",
+  );
+  const visibleDoor = visibleLowerDoor ?? visibleUpperDoor;
+  const doorObservedHalf: ProgressiveNavigationObservedDoorHalf =
+    visibleLowerDoor !== undefined
+      ? "lower"
+      : visibleUpperDoor !== undefined
+        ? "upper"
+        : "neither";
+  const targetPosition =
+    visibleDoor === undefined
+      ? null
+      : {
+          x: visibleDoor.position.x,
+          y: visibleDoor.position.y,
+          z: visibleDoor.position.z,
+        };
+  const target =
+    visibleDoor === undefined
+      ? undefined
+      : {
+          x: visibleDoor.position.x + 0.5,
+          y: visibleDoor.position.y + 0.5,
+          z: visibleDoor.position.z + 0.5,
+        };
   const eye = {
     x: observation.self.position.x,
     y: observation.self.position.y + observation.self.eyeHeight,
     z: observation.self.position.z,
   };
-  const eyeDistance = Math.hypot(
-    eye.x - target.x,
-    eye.y - target.y,
-    eye.z - target.z,
-  );
+  const eyeDistance =
+    target === undefined
+      ? undefined
+      : Math.hypot(eye.x - target.x, eye.y - target.y, eye.z - target.z);
   return {
-    doorObserved: visibleDoor !== undefined,
-    bodyBlockSearchMayBeTruncated:
-      observation.perception.candidateSearchMayBeTruncated,
-    doorWithinReach: eyeDistance <= 4.65,
+    diagnostic: {
+      doorObserved: visibleDoor !== undefined,
+      doorObservedHalf,
+      bodyBlockSearchMayBeTruncated:
+        observation.perception.candidateSearchMayBeTruncated,
+      doorWithinReach:
+        eyeDistance === undefined ? "unknown" : eyeDistance <= 4.65,
+    },
+    targetPosition,
   };
 }
 
