@@ -173,6 +173,14 @@ import {
   type GatherOperationOutcome,
 } from "./gather-multi-target-acceptance.js";
 import {
+  bucketGatherDropProbeCount,
+  bucketGatherDropProbeFacing,
+  bucketGatherDropProbePosition,
+  type GatherDropProbeCountBucket,
+  type GatherDropProbeFacingBucket,
+  type GatherDropProbePositionBucket,
+} from "./gather-drop-probe-evidence.js";
+import {
   isCaseSelectedForTarget,
   TARGETABLE_CASES,
   type TargetableCase,
@@ -346,6 +354,48 @@ interface GatherBodyVisibilityProbeDiagnostic {
   fixtureCleanupAttempted: boolean;
   fixtureCleanupConfirmed: boolean;
   fixtureCleanupReadback: GatherMultiTargetFixtureCleanupDiagnostic;
+}
+type GatherDropProbeVisibleEntityBucket =
+  "none" | "single" | "multiple" | "unknown";
+type GatherDropProbeBlockClass = "birch_log" | "air" | "other" | "unknown";
+interface GatherDropProbeStageDiagnostic {
+  readonly bodyObservationObserved: boolean;
+  readonly bodyPositionBucket: GatherDropProbePositionBucket;
+  readonly bodyFacingDriftBucket: GatherDropProbeFacingBucket;
+  readonly bodyBirchLogVisible: boolean;
+  readonly bodyDropEntityBucket: GatherDropProbeVisibleEntityBucket;
+  readonly candidateSearchMayBeTruncated: boolean | "unknown";
+  readonly rconPositionBucket: GatherDropProbePositionBucket;
+  readonly rconFacingDriftBucket: GatherDropProbeFacingBucket;
+  readonly rconBirchBlockClass: GatherDropProbeBlockClass;
+  readonly rconBirchInventoryCount: GatherDropProbeCountBucket;
+  readonly rconDropReadbackClass: GatherDropReadbackClass;
+}
+interface GatherDropVisibilityProbeDiagnostic {
+  readonly clientConnected: boolean;
+  readonly fixtureSitePreflightConfirmed: boolean;
+  readonly fixtureSupportConfirmed: boolean;
+  readonly fixtureConfigured: boolean;
+  readonly orientationConfirmed: boolean;
+  readonly initialStage: GatherDropProbeStageDiagnostic;
+  readonly digAttempted: boolean;
+  readonly digStatus: BodyOperationStatus | "not_attempted";
+  readonly digRecoveryRequired: boolean;
+  readonly afterDigStage: GatherDropProbeStageDiagnostic;
+  readonly bodyDropEntityObservedBeforeCollection: boolean;
+  readonly rconDropPositionObservedBeforeCollection: boolean;
+  readonly beforeCollectStage: GatherDropProbeStageDiagnostic;
+  readonly collectAttempted: boolean;
+  readonly collectStatus: BodyOperationStatus | "not_attempted";
+  readonly collectOutcome:
+    PlayerItemCollectionOutcome | "none" | "not_attempted";
+  readonly collectPathFailureReason:
+    PlayerItemCollectionPathFailureReason | "none" | "not_attempted";
+  readonly collectRecoveryRequired: boolean;
+  readonly afterCollectStage: GatherDropProbeStageDiagnostic;
+  readonly fixtureCleanupAttempted: boolean;
+  readonly fixtureCleanupConfirmed: boolean;
+  readonly fixtureCleanupReadback: GatherMultiTargetFixtureCleanupDiagnostic;
 }
 interface GatherBodyVisibilityTargetStages {
   findBlocksReturnedTarget: boolean;
@@ -664,7 +714,8 @@ function isNoGptDiagnosticProbeOnly(): boolean {
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_GATHER_BODY_VISIBILITY_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_GATHER_BODY_VISIBILITY_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_GATHER_DROP_VISIBILITY_PROBE_ONLY === "YES"
   );
 }
 
@@ -676,8 +727,16 @@ function isGatherBodyVisibilityProbeOnly(): boolean {
   return process.env.AI_PLAYER_E2E_GATHER_BODY_VISIBILITY_PROBE_ONLY === "YES";
 }
 
+function isGatherDropVisibilityProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_GATHER_DROP_VISIBILITY_PROBE_ONLY === "YES";
+}
+
 function isSingleClientProbeOnly(): boolean {
-  return isEquipmentRconProbeOnly() || isGatherBodyVisibilityProbeOnly();
+  return (
+    isEquipmentRconProbeOnly() ||
+    isGatherBodyVisibilityProbeOnly() ||
+    isGatherDropVisibilityProbeOnly()
+  );
 }
 
 function classifyBodyMoveError(
@@ -2506,6 +2565,7 @@ interface RunState {
   learningReuseOwnerProposalRecorded?: boolean;
   gatherMultiTargetContinuityDiagnostic?: GatherMultiTargetContinuityDiagnostic;
   gatherBodyVisibilityProbeDiagnostic?: GatherBodyVisibilityProbeDiagnostic;
+  gatherDropVisibilityProbeDiagnostic?: GatherDropVisibilityProbeDiagnostic;
   firstDigLearningDiagnostic?: FirstDigLearningDiagnostic;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
   skillExchangeStage?: SkillExchangeStage;
@@ -2970,6 +3030,11 @@ async function main(): Promise<void> {
     await assertNoOperators(state);
     if (isGatherBodyVisibilityProbeOnly()) {
       await runGatherBodyVisibilityProbe(state, rcon);
+      state.status = "pass";
+      return;
+    }
+    if (isGatherDropVisibilityProbeOnly()) {
+      await runGatherDropVisibilityProbe(state, rcon);
       state.status = "pass";
       return;
     }
@@ -6875,6 +6940,15 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
+  if (
+    isGatherDropVisibilityProbeOnly() &&
+    (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
+      process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+      isEquipmentRconProbeOnly() ||
+      isGatherBodyVisibilityProbeOnly())
+  ) {
+    incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
+  }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
@@ -6886,7 +6960,7 @@ async function prepareRun(): Promise<RunState> {
     incomplete("E2E_TARGET_CASE_INVALID");
   const targetCase =
     requestedTargetCase === undefined || requestedTargetCase.length === 0
-      ? isGatherBodyVisibilityProbeOnly()
+      ? isGatherBodyVisibilityProbeOnly() || isGatherDropVisibilityProbeOnly()
         ? "gather_multi_target_continuity"
         : undefined
       : (requestedTargetCase as TargetableCase);
@@ -6895,6 +6969,12 @@ async function prepareRun(): Promise<RunState> {
     targetCase !== "gather_multi_target_continuity"
   ) {
     incomplete("GATHER_BODY_VISIBILITY_PROBE_TARGET_CASE_MISMATCH");
+  }
+  if (
+    isGatherDropVisibilityProbeOnly() &&
+    targetCase !== "gather_multi_target_continuity"
+  ) {
+    incomplete("GATHER_DROP_VISIBILITY_PROBE_TARGET_CASE_MISMATCH");
   }
   const serverJarValue = process.env.AI_PLAYER_E2E_SERVER_JAR;
   if (serverJarValue === undefined || serverJarValue.trim() === "")
@@ -8244,6 +8324,48 @@ function emptyGatherBodyVisibilityObservationStages(): GatherBodyVisibilityObser
   };
 }
 
+function emptyGatherDropProbeStage(): GatherDropProbeStageDiagnostic {
+  return {
+    bodyObservationObserved: false,
+    bodyPositionBucket: "unknown",
+    bodyFacingDriftBucket: "unknown",
+    bodyBirchLogVisible: false,
+    bodyDropEntityBucket: "unknown",
+    candidateSearchMayBeTruncated: "unknown",
+    rconPositionBucket: "unknown",
+    rconFacingDriftBucket: "unknown",
+    rconBirchBlockClass: "unknown",
+    rconBirchInventoryCount: "unknown",
+    rconDropReadbackClass: "not_attempted",
+  };
+}
+
+function visibleGatherDropEntitiesNear(
+  observation: PlayerBodyObservation | undefined,
+  target: BlockPosition,
+): readonly PlayerBodyObservation["perception"]["entities"][number][] {
+  if (observation === undefined) return [];
+  return observation.perception.entities.filter(
+    ({ isPlayer, name, position }) =>
+      !isPlayer &&
+      name === "item" &&
+      Math.hypot(
+        position.x - (target.x + 0.5),
+        position.y - (target.y + 0.5),
+        position.z - (target.z + 0.5),
+      ) <= 3,
+  );
+}
+
+function bucketGatherDropVisibleEntities(
+  observation: PlayerBodyObservation | undefined,
+  target: BlockPosition,
+): GatherDropProbeVisibleEntityBucket {
+  if (observation === undefined) return "unknown";
+  const count = visibleGatherDropEntitiesNear(observation, target).length;
+  return count === 0 ? "none" : count === 1 ? "single" : "multiple";
+}
+
 function mergeGatherBodyVisibilityTargetStages(
   target: GatherBodyVisibilityTargetStages,
   update: GatherBodyVisibilityTargetStages,
@@ -8611,6 +8733,380 @@ async function runGatherBodyVisibilityProbe(
     !diagnostic.fixtureCleanupConfirmed
   )
     incomplete("GATHER_BODY_VISIBILITY_PROBE_CLEANUP_NOT_CONFIRMED");
+}
+
+function updateGatherDropVisibilityProbeDiagnostic(
+  state: RunState,
+  update: Partial<GatherDropVisibilityProbeDiagnostic>,
+): void {
+  const current = state.gatherDropVisibilityProbeDiagnostic;
+  if (current !== undefined)
+    state.gatherDropVisibilityProbeDiagnostic = { ...current, ...update };
+}
+
+async function runGatherDropVisibilityProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("gather drop visibility probe deadline")),
+    45_000,
+  );
+  let body: PlayerBody | undefined;
+  let fixture: GatherMultiTargetFixture | undefined;
+  let cleanupConfirmed: boolean | undefined;
+  let origin: Position | undefined;
+  let initialBodyYaw: number | undefined;
+  let initialRconYaw: number | undefined;
+  const emptyCleanup: GatherMultiTargetFixtureCleanupDiagnostic = {
+    stage: "not_started",
+    oakBlockReadbackConfirmed: false,
+    oakBlockAirConfirmed: false,
+    birchBlockReadbackConfirmed: false,
+    birchBlockAirConfirmed: false,
+    inventoryReadbackConfirmed: false,
+    inventoryEmptyConfirmed: false,
+    oakDropReadbackClass: "not_attempted",
+    oakDropReadbackConfirmed: false,
+    oakDropAbsentConfirmed: false,
+    birchDropReadbackClass: "not_attempted",
+    birchDropReadbackConfirmed: false,
+    birchDropAbsentConfirmed: false,
+  };
+  state.gatherDropVisibilityProbeDiagnostic = {
+    clientConnected: false,
+    fixtureSitePreflightConfirmed: false,
+    fixtureSupportConfirmed: false,
+    fixtureConfigured: false,
+    orientationConfirmed: false,
+    initialStage: emptyGatherDropProbeStage(),
+    digAttempted: false,
+    digStatus: "not_attempted",
+    digRecoveryRequired: false,
+    afterDigStage: emptyGatherDropProbeStage(),
+    bodyDropEntityObservedBeforeCollection: false,
+    rconDropPositionObservedBeforeCollection: false,
+    beforeCollectStage: emptyGatherDropProbeStage(),
+    collectAttempted: false,
+    collectStatus: "not_attempted",
+    collectOutcome: "not_attempted",
+    collectPathFailureReason: "not_attempted",
+    collectRecoveryRequired: false,
+    afterCollectStage: emptyGatherDropProbeStage(),
+    fixtureCleanupAttempted: false,
+    fixtureCleanupConfirmed: false,
+    fixtureCleanupReadback: emptyCleanup,
+  };
+
+  const captureStage = async (
+    observation: PlayerBodyObservation | undefined,
+  ): Promise<GatherDropProbeStageDiagnostic> => {
+    if (origin === undefined || fixture === undefined)
+      return emptyGatherDropProbeStage();
+    let rconPositionBucket: GatherDropProbePositionBucket = "unknown";
+    let rconFacingDriftBucket: GatherDropProbeFacingBucket = "unknown";
+    let rconPosition: Position | undefined;
+    let rotation: ReturnType<typeof parseEntityRotation>;
+    try {
+      rconPosition = parsePosition(
+        await rcon.command(`data get entity ${state.botName} Pos`),
+      );
+      rconPositionBucket = bucketGatherDropProbePosition(rconPosition, origin, {
+        x: fixture.birchLog.x + 0.5,
+        y: fixture.birchLog.y + 0.5,
+        z: fixture.birchLog.z + 0.5,
+      });
+    } catch {
+      // Keep the raw RCON reply private and preserve an unknown bucket.
+    }
+    try {
+      rotation = await readLearningFixtureRotation(rcon, state.botName);
+      rconFacingDriftBucket = bucketGatherDropProbeFacing(
+        initialRconYaw,
+        rotation?.yaw,
+        "degrees",
+      );
+    } catch {
+      // Keep the raw RCON reply private and preserve an unknown bucket.
+    }
+    let rconBirchBlockClass: GatherDropProbeBlockClass = "unknown";
+    try {
+      if (await isBlock(rcon, fixture.birchLog, "birch_log"))
+        rconBirchBlockClass = "birch_log";
+      else if (await isBlock(rcon, fixture.birchLog, "air"))
+        rconBirchBlockClass = "air";
+      else rconBirchBlockClass = "other";
+    } catch {
+      // Keep the raw RCON reply private and preserve an unknown class.
+    }
+    let birchInventoryCount: number | undefined;
+    try {
+      birchInventoryCount = (
+        await rconGatherMultiTargetInventoryCounts(rcon, state.botName)
+      ).birch_log;
+    } catch {
+      // Keep the raw RCON reply private and preserve an unknown count bucket.
+    }
+    const rconDropReadbackClass = await rconGatherItemDropReadbackNear(
+      rcon,
+      fixture.birchLog,
+      "birch_log",
+    );
+    const targetVisible =
+      observedBlockName(observation ?? null, fixture.birchLog) === "birch_log";
+    return {
+      bodyObservationObserved: observation !== undefined,
+      bodyPositionBucket:
+        observation === undefined
+          ? "unknown"
+          : bucketGatherDropProbePosition(observation.self.position, origin, {
+              x: fixture.birchLog.x + 0.5,
+              y: fixture.birchLog.y + 0.5,
+              z: fixture.birchLog.z + 0.5,
+            }),
+      bodyFacingDriftBucket: bucketGatherDropProbeFacing(
+        initialBodyYaw,
+        observation?.self.yaw,
+        "radians",
+      ),
+      bodyBirchLogVisible: targetVisible,
+      bodyDropEntityBucket: bucketGatherDropVisibleEntities(
+        observation,
+        fixture.birchLog,
+      ),
+      candidateSearchMayBeTruncated:
+        observation?.perception.candidateSearchMayBeTruncated ?? "unknown",
+      rconPositionBucket,
+      rconFacingDriftBucket,
+      rconBirchBlockClass,
+      rconBirchInventoryCount: bucketGatherDropProbeCount(birchInventoryCount),
+      rconDropReadbackClass,
+    };
+  };
+
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      clientConnected: true,
+    });
+    await removeAutonomousResourceFixture(rcon);
+    origin = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    fixture = await availableGatherMultiTargetFixture(rcon, origin);
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      fixtureSitePreflightConfirmed: true,
+    });
+    const supportConfirmed = await isBlock(
+      rcon,
+      { ...fixture.birchLog, y: fixture.birchLog.y - 1 },
+      PREPARED_FLOOR_BLOCK,
+    );
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      fixtureSupportConfirmed: supportConfirmed,
+    });
+    if (!supportConfirmed)
+      incomplete("GATHER_DROP_PROBE_SUPPORT_NOT_CONFIRMED");
+
+    const staleFixtureCleanupConfirmed = await cleanupGatherMultiTargetFixture(
+      rcon,
+      state.botName,
+      fixture,
+    );
+    if (!staleFixtureCleanupConfirmed)
+      incomplete("GATHER_DROP_PROBE_BASELINE_CLEANUP_NOT_CONFIRMED");
+    await rcon.command(
+      `setblock ${fixture.birchLog.x} ${fixture.birchLog.y} ${fixture.birchLog.z} birch_log`,
+    );
+    if (!(await isBlock(rcon, fixture.birchLog, "birch_log")))
+      incomplete("GATHER_DROP_PROBE_FIXTURE_NOT_CONFIRMED");
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      fixtureConfigured: true,
+    });
+
+    await rcon.command(
+      `tp ${state.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
+    );
+    const confirmedPosition = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    const confirmedRotation = await readLearningFixtureRotation(
+      rcon,
+      state.botName,
+    );
+    if (
+      Math.hypot(
+        confirmedPosition.x - origin.x,
+        confirmedPosition.y - origin.y,
+        confirmedPosition.z - origin.z,
+      ) > 0.5 ||
+      confirmedRotation === undefined ||
+      angularDistance(confirmedRotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
+      Math.abs(confirmedRotation.pitch - LEARNING_FIXTURE_PITCH) > 2
+    ) {
+      incomplete("GATHER_DROP_PROBE_ORIENTATION_NOT_CONFIRMED");
+    }
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      orientationConfirmed: true,
+    });
+
+    await waitMs(250);
+    const configuredAt = Date.now();
+    const initialDeadline = Date.now() + 5_000;
+    let initialObservation: PlayerBodyObservation | undefined;
+    while (!abort.signal.aborted && Date.now() < initialDeadline) {
+      const candidate = await body.observe();
+      if (
+        Date.parse(candidate.observedAt) >= configuredAt &&
+        observedBlockName(candidate, fixture.birchLog) === "birch_log"
+      ) {
+        initialObservation = candidate;
+        break;
+      }
+      await waitMs(100);
+    }
+    if (initialObservation === undefined)
+      incomplete("GATHER_DROP_PROBE_BODY_FIXTURE_NOT_VISIBLE");
+    initialBodyYaw = initialObservation.self.yaw;
+    initialRconYaw = confirmedRotation.yaw;
+    const initialStage = await captureStage(initialObservation);
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      initialStage,
+    });
+
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      digAttempted: true,
+    });
+    const digResult = await body.execute(
+      { kind: "dig", position: fixture.birchLog },
+      abort.signal,
+    );
+    updateGatherDropVisibilityProbeDiagnostic(state, {
+      digStatus: digResult.status,
+      digRecoveryRequired: digResult.recoveryRequired,
+    });
+    const afterDigObservation = digResult.after ?? (await body.observe());
+    const afterDigStage = await captureStage(afterDigObservation);
+    updateGatherDropVisibilityProbeDiagnostic(state, { afterDigStage });
+
+    const dropObservationDeadline = Date.now() + 5_000;
+    let beforeCollectStage = afterDigStage;
+    let collectEntityId: number | undefined;
+    let preCollectObservation: PlayerBodyObservation | undefined;
+    while (
+      !abort.signal.aborted &&
+      Date.now() < dropObservationDeadline &&
+      collectEntityId === undefined
+    ) {
+      const observation = await body.observe();
+      const stage = await captureStage(observation);
+      beforeCollectStage = stage;
+      const visibleDrops = visibleGatherDropEntitiesNear(
+        observation,
+        fixture.birchLog,
+      );
+      if (visibleDrops.length === 1) {
+        const visibleDrop = visibleDrops[0];
+        if (visibleDrop !== undefined) {
+          collectEntityId = visibleDrop.id;
+          preCollectObservation = observation;
+          updateGatherDropVisibilityProbeDiagnostic(state, {
+            bodyDropEntityObservedBeforeCollection: true,
+            rconDropPositionObservedBeforeCollection:
+              stage.rconDropReadbackClass === "position",
+            beforeCollectStage: stage,
+          });
+          break;
+        }
+      }
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        beforeCollectStage: stage,
+      });
+      if (stage.rconBirchInventoryCount === "one_or_more") break;
+      await waitMs(100);
+    }
+
+    if (collectEntityId !== undefined && preCollectObservation !== undefined) {
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        collectAttempted: true,
+      });
+      const collectResult = await body.execute(
+        { kind: "collect_item", entityId: collectEntityId },
+        abort.signal,
+      );
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        collectStatus: collectResult.status,
+        collectOutcome: collectResult.itemCollectionOutcome ?? "none",
+        collectPathFailureReason:
+          collectResult.itemCollectionPathFailureReason ?? "none",
+        collectRecoveryRequired: collectResult.recoveryRequired,
+      });
+      const afterCollectObservation =
+        collectResult.after ?? (await body.observe());
+      const afterCollectStage = await captureStage(afterCollectObservation);
+      updateGatherDropVisibilityProbeDiagnostic(state, { afterCollectStage });
+    } else {
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        beforeCollectStage,
+      });
+    }
+  } finally {
+    if (fixture !== undefined) {
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        fixtureCleanupAttempted: true,
+      });
+      try {
+        cleanupConfirmed = await cleanupGatherMultiTargetFixture(
+          rcon,
+          state.botName,
+          fixture,
+          (progress) => {
+            const current = state.gatherDropVisibilityProbeDiagnostic;
+            if (current !== undefined)
+              updateGatherDropVisibilityProbeDiagnostic(state, {
+                fixtureCleanupReadback: {
+                  ...current.fixtureCleanupReadback,
+                  ...progress,
+                },
+              });
+          },
+        );
+      } catch {
+        cleanupConfirmed = false;
+      }
+      updateGatherDropVisibilityProbeDiagnostic(state, {
+        fixtureCleanupConfirmed: cleanupConfirmed,
+      });
+    }
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("gather_drop_visibility_probe_finished");
+  }
+  if (cleanupConfirmed !== true) {
+    incomplete("GATHER_DROP_PROBE_CLEANUP_NOT_CONFIRMED");
+  }
 }
 
 async function runEquipmentRconProbe(
@@ -12075,6 +12571,8 @@ async function writeArtifact(state: RunState): Promise<void> {
         state.gatherMultiTargetContinuityDiagnostic ?? null,
       gatherMultiTargetBodyVisibilityProbe:
         state.gatherBodyVisibilityProbeDiagnostic ?? null,
+      gatherDropVisibilityProbe:
+        state.gatherDropVisibilityProbeDiagnostic ?? null,
       armorCapability:
         state.armorCapabilityDiagnostic ??
         (state.targetCase === "armor_capability"
