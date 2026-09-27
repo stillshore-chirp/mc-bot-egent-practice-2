@@ -4262,6 +4262,8 @@ async function main(): Promise<void> {
       CASE_DEADLINES.damage_response,
       requireLiveContext(),
       async (context) => {
+        const expectedHealth = 20;
+        const expectedFood = 20;
         const initialEvidence = await collect(context.runtime.app);
         const initialHealth = initialEvidence.game?.health;
         const initialRconHealth = await rconEntityHealth(rcon, context.botName);
@@ -4272,26 +4274,108 @@ async function main(): Promise<void> {
           context.botName,
         );
         const naturalRegeneration = await rconNaturalRegeneration(rcon);
-        if (
-          initialHealth !== 20 ||
-          initialRconHealth !== 20 ||
-          initialFood !== 20 ||
-          initialRconFood !== 20 ||
-          effectsBaseline !== "empty"
-        )
-          incomplete("DAMAGE_RESPONSE_BASELINE_NOT_SAFE");
 
         let naturalRegenerationMayNeedRestore = false;
         let hungerEffectMayBeActive = false;
-        let damageMayNeedCleanup = false;
-        let foodMayNeedCleanup = false;
+        let damageMayNeedCleanup =
+          initialHealth !== expectedHealth ||
+          initialRconHealth !== expectedHealth;
+        let foodMayNeedCleanup =
+          initialFood !== expectedFood || initialRconFood !== expectedFood;
         let fixturePosition: Position | undefined;
         try {
+          if (effectsBaseline === "unknown")
+            incomplete("DAMAGE_RESPONSE_BASELINE_EFFECTS_STATE_UNAVAILABLE");
           fixturePosition = parsePosition(
             await rcon.command(`data get entity ${context.botName} Pos`),
           );
           naturalRegenerationMayNeedRestore = true;
           await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
+
+          if (effectsBaseline === "active") {
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              incomplete("DAMAGE_RESPONSE_BASELINE_EFFECTS_NOT_CLEARED");
+          }
+          if (
+            initialHealth !== expectedHealth ||
+            initialRconHealth !== expectedHealth
+          ) {
+            damageMayNeedCleanup = true;
+            await rcon.command(
+              `effect give ${context.botName} minecraft:instant_health 1 4 true`,
+            );
+            const healthDeadline = Date.now() + 5_000;
+            let healthReady = false;
+            while (Date.now() < healthDeadline) {
+              const bodyHealth = (await collect(context.runtime.app)).game
+                ?.health;
+              const rconHealth = await rconEntityHealth(rcon, context.botName);
+              if (
+                bodyHealth === expectedHealth &&
+                rconHealth === expectedHealth
+              ) {
+                healthReady = true;
+                break;
+              }
+              await waitMs(100);
+            }
+            if (!healthReady) {
+              const bodyHealth = (await collect(context.runtime.app)).game
+                ?.health;
+              const rconHealth = await rconEntityHealth(rcon, context.botName);
+              incomplete(
+                rconHealth !== expectedHealth
+                  ? "DAMAGE_RESPONSE_RCON_HEALTH_BASELINE_NOT_RESTORED"
+                  : bodyHealth !== expectedHealth
+                    ? "DAMAGE_RESPONSE_BODY_HEALTH_BASELINE_NOT_CONFIRMED"
+                    : "DAMAGE_RESPONSE_HEALTH_BASELINE_NOT_CONFIRMED",
+              );
+            }
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              incomplete("DAMAGE_RESPONSE_HEALTH_EFFECT_CLEANUP_NOT_CONFIRMED");
+          }
+          if (
+            initialFood !== expectedFood ||
+            initialRconFood !== expectedFood
+          ) {
+            foodMayNeedCleanup = true;
+            await rcon.command(
+              `effect give ${context.botName} minecraft:saturation 1 20 true`,
+            );
+            const foodDeadline = Date.now() + 5_000;
+            let foodReady = false;
+            while (Date.now() < foodDeadline) {
+              const bodyFood = (await collect(context.runtime.app)).game?.food;
+              const rconFood = await rconFoodLevel(rcon, context.botName);
+              if (bodyFood === expectedFood && rconFood === expectedFood) {
+                foodReady = true;
+                break;
+              }
+              await waitMs(100);
+            }
+            if (!foodReady) {
+              const bodyFood = (await collect(context.runtime.app)).game?.food;
+              const rconFood = await rconFoodLevel(rcon, context.botName);
+              incomplete(
+                rconFood !== expectedFood
+                  ? "DAMAGE_RESPONSE_RCON_FOOD_BASELINE_NOT_RESTORED"
+                  : bodyFood !== expectedFood
+                    ? "DAMAGE_RESPONSE_BODY_FOOD_BASELINE_NOT_CONFIRMED"
+                    : "DAMAGE_RESPONSE_FOOD_BASELINE_NOT_CONFIRMED",
+              );
+            }
+            await rcon.command(`effect clear ${context.botName}`);
+            if (
+              (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
+            )
+              incomplete("DAMAGE_RESPONSE_FOOD_EFFECT_CLEANUP_NOT_CONFIRMED");
+          }
 
           hungerEffectMayBeActive = true;
           foodMayNeedCleanup = true;
@@ -4323,7 +4407,7 @@ async function main(): Promise<void> {
           const preparedBodyHealth = preparedEvidence.game?.health;
           const preparedBodyFood = preparedEvidence.game?.food;
           if (
-            preparedBodyHealth !== initialHealth ||
+            preparedBodyHealth !== expectedHealth ||
             preparedBodyFood !== preparedFood ||
             preparedFood < 12 ||
             preparedFood > 15
@@ -4348,11 +4432,11 @@ async function main(): Promise<void> {
           const damagedEvidence = await collect(context.runtime.app);
           const damagedHealth = damagedEvidence.game?.health;
           if (
-            damagedRconHealth >= initialRconHealth ||
+            damagedRconHealth >= expectedHealth ||
             damagedRconHealth <= 0 ||
             damagedRconHealth > 6 ||
             damagedHealth === undefined ||
-            damagedHealth >= initialHealth ||
+            damagedHealth >= expectedHealth ||
             damagedHealth > 6
           )
             incomplete("DAMAGE_RESPONSE_DAMAGE_NOT_CONFIRMED_BY_BOTH_ORACLES");
@@ -4540,11 +4624,10 @@ async function main(): Promise<void> {
             const restoredBodyFood = restoredBody?.food;
             if (
               (await rconEntityHealth(rcon, context.botName)) !==
-                initialRconHealth ||
-              restoredBodyHealth !== initialHealth ||
-              (await rconFoodLevel(rcon, context.botName)) !==
-                initialRconFood ||
-              restoredBodyFood !== initialFood ||
+                expectedHealth ||
+              restoredBodyHealth !== expectedHealth ||
+              (await rconFoodLevel(rcon, context.botName)) !== expectedFood ||
+              restoredBodyFood !== expectedFood ||
               (await rconActiveEffectsState(rcon, context.botName)) !== "empty"
             )
               cleanupConfirmed = false;
