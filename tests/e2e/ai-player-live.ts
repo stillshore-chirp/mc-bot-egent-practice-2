@@ -156,13 +156,16 @@ import {
 import {
   countCompletedGatherActions,
   confirmsSecondGatheredTarget,
+  gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
   GATHER_MULTI_TARGET_ITEMS,
   hasNewBirchGatherIntent,
+  hasNewPostFollowupDigJudgment,
+  hasNewPostFollowupDigJudgmentBeforeSecondDig,
   hasResolvedBirchGatherOwnerGoal,
-  hasGatherContinuationDigDecision,
   identifyFirstGatheredTarget,
   newBirchGatherProposalIds,
+  postFollowupGatherActionPairs,
   successfulGatherActionPairs,
   type GatherMultiTargetContinuityDiagnostic,
   type GatherMultiTargetItem,
@@ -2067,7 +2070,9 @@ function beginGatherMultiTargetContinuityDiagnostic(state: RunState): void {
     followupOwnerResolutionObserved: false,
     followupOwnerIntentObserved: false,
     firstTargetServerAndBodyProgressObserved: false,
-    continuationDigDecisionObserved: false,
+    postFollowupDigJudgmentObserved: false,
+    postFollowupDigJudgmentBeforeSecondTargetObserved: false,
+    secondTargetGatherPairObserved: false,
     secondTargetServerAndBodyProgressObserved: false,
     fixtureCleanupConfirmed: false,
     oakDropReadbackClass: "not_attempted",
@@ -3943,9 +3948,6 @@ async function main(): Promise<void> {
           >();
           let lastOracleSampleAt = 0;
           let latestOracleSample: GatherMultiTargetOracleSample | undefined;
-          let firstPickupAt: string | undefined;
-          let secondDigAt: string | undefined;
-          let continuationDigDecisionObserved = false;
           const sampleGatherProgress = async (
             player: PlayerEvidence,
           ): Promise<GatherMultiTargetOracleSample> => {
@@ -3957,6 +3959,7 @@ async function main(): Promise<void> {
                 continue;
               }
               observedGatherOutcomes.set(outcome.operationId, {
+                operationId: outcome.operationId,
                 kind: outcome.kind,
                 status: outcome.status,
                 observedAt: outcome.observedAt,
@@ -3965,16 +3968,6 @@ async function main(): Promise<void> {
             const gatherOutcomes = [...observedGatherOutcomes.values()];
             const gatherPairs = successfulGatherActionPairs(gatherOutcomes);
             const completedGatherCount = gatherPairs.length;
-            const firstGatherPair = gatherPairs[0];
-            firstPickupAt ??=
-              firstGatherPair === undefined
-                ? undefined
-                : new Date(firstGatherPair.pickupAt).toISOString();
-            const secondGatherPair = gatherPairs[1];
-            secondDigAt ??=
-              secondGatherPair === undefined
-                ? undefined
-                : new Date(secondGatherPair.digAt).toISOString();
 
             if (
               latestOracleSample === undefined ||
@@ -4015,6 +4008,15 @@ async function main(): Promise<void> {
           const proposalIdsBeforeFollowup = new Set(
             beforeFollowup.proposals.map(({ id }) => id),
           );
+          const judgmentKeysBeforeFollowup = new Set(
+            beforeFollowup.recentJudgments.map(gatherMultiTargetJudgmentKey),
+          );
+          const outcomeIdsBeforeFollowup = new Set([
+            ...beforeFollowup.recentOutcomes.map(
+              ({ operationId }) => operationId,
+            ),
+            ...observedGatherOutcomes.keys(),
+          ]);
           const followupSentAt = new Date().toISOString();
           sendChat(context.owner, "白樺の原木もお願い。");
           updateGatherMultiTargetContinuityDiagnostic(state, {
@@ -4047,23 +4049,50 @@ async function main(): Promise<void> {
           if (followupProposalIds.size !== 1)
             incomplete("GATHER_MULTI_TARGET_FOLLOWUP_PROPOSAL_ID_AMBIGUOUS");
           let followupOwnerResolutionObserved = false;
+          let postFollowupDigJudgmentObserved = false;
+          let postFollowupDigJudgmentBeforeSecondTargetObserved = false;
+          let secondTargetGatherPairObserved = false;
 
           const secondGathered = await observeForPlayer(
             context,
             150_000,
             async (player) => {
               const sample = await sampleGatherProgress(player);
-              continuationDigDecisionObserved ||=
-                hasGatherContinuationDigDecision(
-                  player.recentJudgments,
-                  firstPickupAt,
-                  secondDigAt,
-                  followupSentAt,
-                );
-              if (continuationDigDecisionObserved) {
+              postFollowupDigJudgmentObserved ||= hasNewPostFollowupDigJudgment(
+                player.recentJudgments,
+                judgmentKeysBeforeFollowup,
+                followupSentAt,
+              );
+              if (postFollowupDigJudgmentObserved) {
                 updateGatherMultiTargetContinuityDiagnostic(state, {
-                  continuationDigDecisionObserved: true,
+                  postFollowupDigJudgmentObserved: true,
                 });
+              }
+              const postFollowupPairs = postFollowupGatherActionPairs({
+                outcomes: [...observedGatherOutcomes.values()],
+                previousOutcomeIds: outcomeIdsBeforeFollowup,
+                followupSentAt,
+              });
+              const secondPostFollowupPair = postFollowupPairs[0];
+              if (secondPostFollowupPair !== undefined) {
+                secondTargetGatherPairObserved = true;
+                updateGatherMultiTargetContinuityDiagnostic(state, {
+                  secondTargetGatherPairObserved: true,
+                });
+                postFollowupDigJudgmentBeforeSecondTargetObserved ||=
+                  hasNewPostFollowupDigJudgmentBeforeSecondDig({
+                    judgments: player.recentJudgments,
+                    previousJudgmentKeys: judgmentKeysBeforeFollowup,
+                    followupSentAt,
+                    secondDigAt: new Date(
+                      secondPostFollowupPair.digAt,
+                    ).toISOString(),
+                  });
+                if (postFollowupDigJudgmentBeforeSecondTargetObserved) {
+                  updateGatherMultiTargetContinuityDiagnostic(state, {
+                    postFollowupDigJudgmentBeforeSecondTargetObserved: true,
+                  });
+                }
               }
               followupOwnerResolutionObserved ||=
                 hasResolvedBirchGatherOwnerGoal({
@@ -4081,7 +4110,8 @@ async function main(): Promise<void> {
               const secondTargetObserved = confirmsSecondGatheredTarget({
                 sample,
                 baseline,
-                continuationDigDecisionObserved,
+                postFollowupDigJudgmentBeforeSecondTargetObserved,
+                secondTargetGatherPairObserved,
               });
               if (secondTargetObserved) {
                 updateGatherMultiTargetContinuityDiagnostic(state, {

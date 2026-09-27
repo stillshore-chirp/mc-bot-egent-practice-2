@@ -3,12 +3,15 @@ import { describe, expect, it } from "vitest";
 import {
   countCompletedGatherActions,
   confirmsSecondGatheredTarget,
+  gatherMultiTargetJudgmentKey,
   gatherMultiTargetPassEvidence,
+  hasNewPostFollowupDigJudgment,
+  hasNewPostFollowupDigJudgmentBeforeSecondDig,
   hasNewBirchGatherIntent,
   hasResolvedBirchGatherOwnerGoal,
-  hasGatherContinuationDigDecision,
   identifyFirstGatheredTarget,
   newBirchGatherProposalIds,
+  postFollowupGatherActionPairs,
   successfulGatherActionPairs,
 } from "../e2e/gather-multi-target-acceptance.js";
 
@@ -27,7 +30,9 @@ describe("multi-target gather E2E acceptance", () => {
           followupOwnerIntentObserved: true,
           followupOwnerResolutionObserved: true,
           firstTargetServerAndBodyProgressObserved: true,
-          continuationDigDecisionObserved: true,
+          postFollowupDigJudgmentObserved: true,
+          postFollowupDigJudgmentBeforeSecondTargetObserved: true,
+          secondTargetGatherPairObserved: true,
           secondTargetServerAndBodyProgressObserved: true,
           fixtureCleanupConfirmed: true,
           oakDropReadbackClass: "known_negative",
@@ -44,7 +49,9 @@ describe("multi-target gather E2E acceptance", () => {
       followupOwnerIntentObserved: true,
       followupOwnerResolutionObserved: true,
       firstTargetServerAndBodyProgressObserved: true,
-      continuationDigDecisionObserved: true,
+      postFollowupDigJudgmentObserved: true,
+      postFollowupDigJudgmentBeforeSecondTargetObserved: true,
+      secondTargetGatherPairObserved: true,
       secondTargetServerAndBodyProgressObserved: true,
       fixtureCleanupConfirmed: true,
       oakDropReadbackClass: "known_negative",
@@ -293,73 +300,175 @@ describe("multi-target gather E2E acceptance", () => {
     ).toBeUndefined();
   });
 
-  it("requires a post-followup dig decision between first pickup and second dig", () => {
+  it("observes only a new dig judgment after follow-up", () => {
+    const followupAt = "2026-01-01T00:00:02.500Z";
+    const prior = {
+      revision: 1,
+      kind: "act",
+      operationKind: "dig",
+      decidedAt: "2026-01-01T00:00:02Z",
+    } as const;
+    const newDig = {
+      revision: 2,
+      kind: "act",
+      operationKind: "dig",
+      decidedAt: "2026-01-01T00:00:03Z",
+    } as const;
+    const priorKeys = new Set([gatherMultiTargetJudgmentKey(prior)]);
+
+    expect(
+      hasNewPostFollowupDigJudgment([prior, newDig], priorKeys, followupAt),
+    ).toBe(true);
+    expect(hasNewPostFollowupDigJudgment([prior], priorKeys, followupAt)).toBe(
+      false,
+    );
+    expect(
+      hasNewPostFollowupDigJudgment(
+        [{ ...newDig, decidedAt: "2026-01-01T00:00:02Z" }],
+        priorKeys,
+        followupAt,
+      ),
+    ).toBe(false);
+    expect(
+      hasNewPostFollowupDigJudgment(
+        [{ ...newDig, kind: "wait" }],
+        priorKeys,
+        followupAt,
+      ),
+    ).toBe(false);
+    expect(hasNewPostFollowupDigJudgment([newDig], priorKeys, "invalid")).toBe(
+      false,
+    );
+  });
+
+  it("requires the new dig judgment to precede the second target dig", () => {
     const judgments = [
       {
+        revision: 2,
         kind: "act",
         operationKind: "dig",
         decidedAt: "2026-01-01T00:00:03Z",
       },
     ];
+    const input = {
+      judgments,
+      previousJudgmentKeys: new Set<string>(),
+      followupSentAt: "2026-01-01T00:00:02.500Z",
+    };
     expect(
-      hasGatherContinuationDigDecision(
-        judgments,
-        "2026-01-01T00:00:02Z",
-        "2026-01-01T00:00:04Z",
-        "2026-01-01T00:00:02.500Z",
-      ),
+      hasNewPostFollowupDigJudgmentBeforeSecondDig({
+        ...input,
+        secondDigAt: "2026-01-01T00:00:04Z",
+      }),
     ).toBe(true);
     expect(
-      hasGatherContinuationDigDecision(
-        judgments,
-        "2026-01-01T00:00:02Z",
-        "2026-01-01T00:00:04Z",
-        "2026-01-01T00:00:03Z",
-      ),
+      hasNewPostFollowupDigJudgmentBeforeSecondDig({
+        ...input,
+        secondDigAt: "2026-01-01T00:00:03Z",
+      }),
     ).toBe(false);
     expect(
-      hasGatherContinuationDigDecision(
-        judgments,
-        "2026-01-01T00:00:02Z",
-        "2026-01-01T00:00:04Z",
-        "2026-01-01T00:00:01Z",
-      ),
+      hasNewPostFollowupDigJudgmentBeforeSecondDig({
+        ...input,
+        secondDigAt: "2026-01-01T00:00:02Z",
+      }),
     ).toBe(false);
     expect(
-      hasGatherContinuationDigDecision(
-        [{ ...judgments[0], kind: "wait" }],
-        "2026-01-01T00:00:02Z",
-        "2026-01-01T00:00:04Z",
-        "2026-01-01T00:00:02.500Z",
-      ),
+      hasNewPostFollowupDigJudgmentBeforeSecondDig({
+        ...input,
+        secondDigAt: undefined,
+      }),
     ).toBe(false);
   });
 
-  it("requires the second server and Body result plus the continuation decision", () => {
+  it("pairs only a new post-follow-up dig with its later pickup", () => {
+    const outcomes = [
+      {
+        operationId: "first-dig",
+        kind: "dig",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:01Z",
+      },
+      {
+        operationId: "first-pickup",
+        kind: "collect_item",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:02Z",
+      },
+      {
+        operationId: "second-dig",
+        kind: "dig",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:03Z",
+      },
+      {
+        operationId: "second-pickup",
+        kind: "collect_item",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:04Z",
+      },
+    ] as const;
+    const input = {
+      outcomes,
+      previousOutcomeIds: new Set(["first-dig", "first-pickup"]),
+      followupSentAt: "2026-01-01T00:00:02.500Z",
+    };
+    expect(postFollowupGatherActionPairs(input)).toEqual([
+      {
+        digAt: Date.parse("2026-01-01T00:00:03Z"),
+        pickupAt: Date.parse("2026-01-01T00:00:04Z"),
+      },
+    ]);
+    expect(
+      postFollowupGatherActionPairs({
+        ...input,
+        previousOutcomeIds: new Set(),
+        followupSentAt: "2026-01-01T00:00:03.500Z",
+      }),
+    ).toEqual([]);
+    expect(
+      postFollowupGatherActionPairs({
+        ...input,
+        outcomes: outcomes.slice(0, 3),
+      }),
+    ).toEqual([]);
+    expect(
+      postFollowupGatherActionPairs({
+        ...input,
+        outcomes: [outcomes[2], { ...outcomes[3], status: "failed" }],
+      }),
+    ).toEqual([]);
+  });
+
+  it("requires distinct post-follow-up judgment, gather pair, and server/Body evidence", () => {
     const sample = {
       blockPresent: { oak_log: false, birch_log: false },
       inventoryCount: { oak_log: 1, birch_log: 1 },
       completedGatherCount: 2,
     } as const;
+    const valid = {
+      sample,
+      baseline,
+      postFollowupDigJudgmentBeforeSecondTargetObserved: true,
+      secondTargetGatherPairObserved: true,
+    };
+    expect(confirmsSecondGatheredTarget(valid)).toBe(true);
     expect(
       confirmsSecondGatheredTarget({
-        sample,
-        baseline,
-        continuationDigDecisionObserved: true,
-      }),
-    ).toBe(true);
-    expect(
-      confirmsSecondGatheredTarget({
-        sample,
-        baseline,
-        continuationDigDecisionObserved: false,
+        ...valid,
+        postFollowupDigJudgmentBeforeSecondTargetObserved: false,
       }),
     ).toBe(false);
     expect(
       confirmsSecondGatheredTarget({
+        ...valid,
+        secondTargetGatherPairObserved: false,
+      }),
+    ).toBe(false);
+    expect(
+      confirmsSecondGatheredTarget({
+        ...valid,
         sample: { ...sample, inventoryCount: { oak_log: 1, birch_log: 0 } },
-        baseline,
-        continuationDigDecisionObserved: true,
       }),
     ).toBe(false);
   });

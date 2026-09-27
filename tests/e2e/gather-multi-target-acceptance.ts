@@ -10,6 +10,7 @@ export interface GatherMultiTargetOracleSample {
 }
 
 export interface GatherOperationOutcome {
+  readonly operationId?: string | undefined;
   readonly kind?: string | undefined;
   readonly status?: string | undefined;
   readonly observedAt?: string | undefined;
@@ -24,7 +25,11 @@ export interface GatherMultiTargetContinuityDiagnostic {
   readonly followupOwnerIntentObserved: boolean;
   readonly followupOwnerResolutionObserved: boolean;
   readonly firstTargetServerAndBodyProgressObserved: boolean;
-  readonly continuationDigDecisionObserved: boolean;
+  /** A new dig judgment was observed after follow-up; no owner-goal link is implied. */
+  readonly postFollowupDigJudgmentObserved: boolean;
+  /** A post-follow-up dig judgment preceded the second successful dig/pickup pair. */
+  readonly postFollowupDigJudgmentBeforeSecondTargetObserved: boolean;
+  readonly secondTargetGatherPairObserved: boolean;
   readonly secondTargetServerAndBodyProgressObserved: boolean;
   readonly fixtureCleanupConfirmed: boolean;
   readonly oakDropReadbackClass: GatherDropReadbackClass;
@@ -52,6 +57,13 @@ export interface GatherOwnerGoalSummary {
 export interface GatherOwnerJudgmentSummary {
   readonly proposalId?: string;
   readonly proposalDisposition?: string;
+}
+
+export interface GatherMultiTargetJudgment {
+  readonly revision?: number | undefined;
+  readonly decidedAt?: string | undefined;
+  readonly kind?: string | undefined;
+  readonly operationKind?: string | undefined;
 }
 
 export function gatherMultiTargetPassEvidence(
@@ -191,10 +203,12 @@ export function identifyFirstGatheredTarget(
 export function confirmsSecondGatheredTarget(input: {
   readonly sample: GatherMultiTargetOracleSample;
   readonly baseline: Readonly<Record<GatherMultiTargetItem, number>>;
-  readonly continuationDigDecisionObserved: boolean;
+  readonly postFollowupDigJudgmentBeforeSecondTargetObserved: boolean;
+  readonly secondTargetGatherPairObserved: boolean;
 }): boolean {
   return (
-    input.continuationDigDecisionObserved &&
+    input.postFollowupDigJudgmentBeforeSecondTargetObserved &&
+    input.secondTargetGatherPairObserved &&
     input.sample.completedGatherCount >= 2 &&
     GATHER_MULTI_TARGET_ITEMS.every(
       (item) =>
@@ -204,39 +218,87 @@ export function confirmsSecondGatheredTarget(input: {
   );
 }
 
-export interface GatherMultiTargetJudgment {
-  readonly decidedAt?: string;
-  readonly kind?: string;
-  readonly operationKind?: string;
+export function gatherMultiTargetJudgmentKey(
+  judgment: GatherMultiTargetJudgment,
+): string {
+  return `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
 }
 
-export function hasGatherContinuationDigDecision(
+/** Observe a new post-follow-up dig judgment without claiming proposal causality. */
+export function hasNewPostFollowupDigJudgment(
   judgments: readonly GatherMultiTargetJudgment[],
-  firstPickupAt: string | undefined,
-  secondDigAt: string | undefined,
+  previousJudgmentKeys: ReadonlySet<string>,
   followupSentAt: string | undefined,
 ): boolean {
-  const firstPickupTime = Date.parse(firstPickupAt ?? "");
-  const secondDigTime = Date.parse(secondDigAt ?? "");
   const followupTime = Date.parse(followupSentAt ?? "");
+  if (!Number.isFinite(followupTime)) return false;
+  return hasNewPostFollowupDigJudgmentInWindow(
+    judgments,
+    previousJudgmentKeys,
+    followupTime,
+  );
+}
+
+/**
+ * Confirms temporal evidence before the second dig without claiming that the
+ * judgment is causally linked to an owner proposal.
+ */
+export function hasNewPostFollowupDigJudgmentBeforeSecondDig(input: {
+  readonly judgments: readonly GatherMultiTargetJudgment[];
+  readonly previousJudgmentKeys: ReadonlySet<string>;
+  readonly followupSentAt: string | undefined;
+  readonly secondDigAt: string | undefined;
+}): boolean {
+  const followupTime = Date.parse(input.followupSentAt ?? "");
+  const secondDigTime = Date.parse(input.secondDigAt ?? "");
   if (
-    !Number.isFinite(firstPickupTime) ||
-    !Number.isFinite(secondDigTime) ||
     !Number.isFinite(followupTime) ||
-    firstPickupTime >= followupTime ||
+    !Number.isFinite(secondDigTime) ||
     followupTime >= secondDigTime
   ) {
     return false;
   }
+  return hasNewPostFollowupDigJudgmentInWindow(
+    input.judgments,
+    input.previousJudgmentKeys,
+    followupTime,
+    secondDigTime,
+  );
+}
+
+/** Return successful dig/pickup pairs first observed after the follow-up. */
+export function postFollowupGatherActionPairs(input: {
+  readonly outcomes: readonly GatherOperationOutcome[];
+  readonly previousOutcomeIds: ReadonlySet<string>;
+  readonly followupSentAt: string | undefined;
+}): readonly GatherActionPairTimes[] {
+  const followupTime = Date.parse(input.followupSentAt ?? "");
+  if (!Number.isFinite(followupTime)) return [];
+  const postFollowupOutcomes = input.outcomes.filter(
+    (outcome) =>
+      outcome.operationId !== undefined &&
+      !input.previousOutcomeIds.has(outcome.operationId),
+  );
+  return successfulGatherActionPairs(postFollowupOutcomes).filter(
+    ({ digAt, pickupAt }) => followupTime < digAt && digAt < pickupAt,
+  );
+}
+
+function hasNewPostFollowupDigJudgmentInWindow(
+  judgments: readonly GatherMultiTargetJudgment[],
+  previousJudgmentKeys: ReadonlySet<string>,
+  followupTime: number,
+  beforeTime = Number.POSITIVE_INFINITY,
+): boolean {
   return judgments.some((judgment) => {
     const decidedAt = Date.parse(judgment.decidedAt ?? "");
     return (
       judgment.kind === "act" &&
       judgment.operationKind === "dig" &&
+      !previousJudgmentKeys.has(gatherMultiTargetJudgmentKey(judgment)) &&
       Number.isFinite(decidedAt) &&
-      firstPickupTime < decidedAt &&
       followupTime < decidedAt &&
-      decidedAt < secondDigTime
+      decidedAt < beforeTime
     );
   });
 }
