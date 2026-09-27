@@ -190,8 +190,8 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   totalTokens: 75_000,
 } as const;
 export const NO_FOOD_REPLAN_CASE_BUDGET = {
-  llmCalls: 8,
-  totalTokens: 75_000,
+  llmCalls: 10,
+  totalTokens: 100_000,
 } as const;
 export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
 const CASE_BUDGETS = {

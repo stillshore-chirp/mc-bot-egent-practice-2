@@ -47,7 +47,10 @@ describe("no-food replan targeted E2E case", () => {
     ).toBe(true);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 7, totalTokens: 75_000 },
+        {
+          llmCalls: NO_FOOD_REPLAN_CASE_BUDGET.llmCalls - 1,
+          totalTokens: NO_FOOD_REPLAN_CASE_BUDGET.totalTokens,
+        },
         NO_FOOD_REPLAN_CASE_BUDGET,
       ),
     ).toBe(false);
