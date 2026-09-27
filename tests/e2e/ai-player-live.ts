@@ -185,6 +185,10 @@ const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 const LEARNING_FIXTURE_PITCH = 15;
 const ROTATION_READ_MAX_ATTEMPTS = 3;
 const ROTATION_READ_RETRY_DELAY_MS = 100;
+export const DAMAGE_RESPONSE_CASE_BUDGET = {
+  llmCalls: 8,
+  totalTokens: 75_000,
+} as const;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
@@ -199,7 +203,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
-  damage_response: { llmCalls: 6, totalTokens: 35_000 },
+  damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -2103,6 +2107,16 @@ function runBudgetFromEnvironment(): RunBudget {
       RUN_BUDGET_LIMITS.totalTokens,
     ),
   };
+}
+
+export function runBudgetCoversCase(
+  runBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  caseBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+): boolean {
+  return (
+    runBudget.llmCalls >= caseBudget.llmCalls &&
+    runBudget.totalTokens >= caseBudget.totalTokens
+  );
 }
 
 async function unusedLoopbackPort(): Promise<number> {
@@ -6123,6 +6137,14 @@ async function prepareRun(): Promise<RunState> {
     incomplete("JAVA_21_NOT_FOUND");
   }
   const runBudget = runBudgetFromEnvironment();
+  const targetCaseBudget =
+    targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
+  if (
+    targetCaseBudget !== undefined &&
+    !runBudgetCoversCase(runBudget, targetCaseBudget)
+  ) {
+    incomplete("RUN_BUDGET_BELOW_TARGET_CASE_BUDGET");
+  }
   const cacheDirectoryValue =
     process.env.AI_PLAYER_E2E_SERVER_CACHE_DIR?.trim();
   const serverCacheDirectory =
