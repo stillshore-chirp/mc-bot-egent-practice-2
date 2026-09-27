@@ -426,6 +426,73 @@ type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 type BodyMoveErrorClass =
   "none" | "no_path" | "timeout" | "probe_deadline" | "interrupted" | "other";
 type ProgressiveNavigationDoorState = "closed" | "open" | "unknown";
+type ProgressiveNavigationSide =
+  "owner_side" | "doorway" | "return_side" | "unknown";
+type ProgressiveNavigationSamplePoint =
+  "start" | "sample_1" | "sample_2" | "sample_3" | "final";
+type ProgressiveNavigationSampleElapsedBucket =
+  "0-10s" | "10-20s" | "20-30s" | "30-40s" | "40s+" | "unknown";
+type ProgressiveNavigationStallElapsedBucket =
+  "under20s" | "20-30s" | "30-40s" | "40s+" | "none";
+type ProgressiveNavigationUseSkipReason =
+  | "initial_route_confirmed"
+  | "run_deadline"
+  | "door_not_closed"
+  | "operation_unresolved"
+  | "door_not_observed"
+  | "door_out_of_reach"
+  | "attempted";
+
+interface ProgressiveNavigationMovementSample {
+  readonly point: ProgressiveNavigationSamplePoint;
+  readonly elapsed: ProgressiveNavigationSampleElapsedBucket;
+  readonly bodySide: ProgressiveNavigationSide;
+  readonly rconSide: ProgressiveNavigationSide;
+  readonly bodyDoorDistance: BodyPositionDriftBucket | "unknown";
+  readonly rconDoorDistance: BodyPositionDriftBucket | "unknown";
+  readonly doorState: ProgressiveNavigationDoorState;
+  readonly bodyBlockSearchMayBeTruncated: boolean | "unknown";
+}
+
+interface ProgressiveNavigationDoorUseDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason: ProgressiveNavigationUseSkipReason;
+  readonly doorObserved: boolean | "unknown";
+  readonly bodyBlockSearchMayBeTruncated: boolean | "unknown";
+  readonly doorWithinReach: boolean | "unknown";
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired?: boolean;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+}
+
+interface ProgressiveNavigationDoorUseOperationResult {
+  readonly status: BodyOperationStatus;
+  readonly errorClass: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired: boolean;
+  readonly probeDeadlineReached: boolean;
+}
+
+interface ProgressiveNavigationRetryDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason:
+    | "door_not_open"
+    | "run_deadline"
+    | "operation_unresolved"
+    | "initial_route_confirmed"
+    | "use_not_attempted"
+    | "attempted";
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyMoveErrorClass;
+  readonly pathStatus?: BodyPathStatus;
+  readonly pathUpdateCount?: number;
+  readonly stallEventCountBucket?: "0" | "1" | "2+";
+  readonly stallElapsedBucket?: ProgressiveNavigationStallElapsedBucket;
+  readonly bodySideAfter?: ProgressiveNavigationSide;
+  readonly rconSideAfter?: ProgressiveNavigationSide;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+  readonly routeConfirmed?: boolean;
+}
 type BodyDigErrorClass =
   | "out_of_view"
   | "occluded"
@@ -456,6 +523,15 @@ interface BodyMovePathDiagnostic {
   readonly pathUpdateCount: number;
   readonly probeDeadlineReached: boolean;
   readonly recoveryRequired: boolean;
+  readonly stallEventCountBucket?: "0" | "1" | "2+";
+  readonly stallElapsedBucket?: ProgressiveNavigationStallElapsedBucket;
+}
+
+interface BodyMovePathProbeOptions {
+  readonly captureStallEvents?: boolean;
+  readonly sampleIntervalMs?: number;
+  readonly maxSamples?: number;
+  readonly onSample?: (elapsedMs: number) => Promise<void>;
 }
 
 interface ReturnPathProbeDiagnostic {
@@ -593,6 +669,7 @@ async function executeBodyMovePathProbe(
   },
   parentSignal: AbortSignal,
   deadlineMs = 20_000,
+  options: BodyMovePathProbeOptions = {},
 ): Promise<BodyMovePathDiagnostic> {
   let pathStatus: BodyPathStatus = "none";
   let pathLength = 0;
@@ -601,6 +678,12 @@ async function executeBodyMovePathProbe(
   let detail: string | undefined;
   let status: BodyOperationStatus;
   let recoveryRequired = false;
+  let activeMoveOperationId: string | undefined;
+  let stallEventCount = 0;
+  let firstStallElapsedMs: number | undefined;
+  let sampledCount = 0;
+  let inFlightSample: Promise<void> | undefined;
+  const startedAt = Date.now();
   const probeAbort = new AbortController();
   const timer = setTimeout(() => {
     probeDeadlineReached = true;
@@ -608,11 +691,50 @@ async function executeBodyMovePathProbe(
   }, deadlineMs);
   const signal = AbortSignal.any([parentSignal, probeAbort.signal]);
   const unsubscribe = body.onEvent((event) => {
-    if (event.type !== "operation_path_updated") return;
-    pathStatus = event.status;
-    pathLength = event.pathLength;
-    pathUpdateCount += 1;
+    if (event.type === "operation_started") {
+      if (event.operation === "move_to" && activeMoveOperationId === undefined)
+        activeMoveOperationId = event.operationId;
+      return;
+    }
+    if (
+      activeMoveOperationId === undefined ||
+      !("operationId" in event) ||
+      event.operationId !== activeMoveOperationId
+    )
+      return;
+    if (event.type === "operation_path_updated") {
+      pathStatus = event.status;
+      pathLength = event.pathLength;
+      pathUpdateCount += 1;
+    } else if (
+      options.captureStallEvents === true &&
+      event.type === "operation_stalled"
+    ) {
+      stallEventCount += 1;
+      firstStallElapsedMs ??= event.elapsedMs;
+    }
   });
+  const sampleTimer =
+    options.onSample === undefined || (options.maxSamples ?? 0) <= 0
+      ? undefined
+      : setInterval(() => {
+          if (
+            sampledCount >= (options.maxSamples ?? 0) ||
+            inFlightSample !== undefined ||
+            activeMoveOperationId === undefined ||
+            probeAbort.signal.aborted ||
+            parentSignal.aborted
+          )
+            return;
+          sampledCount += 1;
+          inFlightSample = options
+            .onSample?.(Date.now() - startedAt)
+            .then(() => undefined)
+            .catch(() => undefined)
+            .finally(() => {
+              inFlightSample = undefined;
+            });
+        }, options.sampleIntervalMs ?? 10_000);
   try {
     const result = await body.execute(operation, signal);
     status = result.status;
@@ -624,6 +746,8 @@ async function executeBodyMovePathProbe(
     status = parentSignal.aborted ? "interrupted" : "failed";
   } finally {
     clearTimeout(timer);
+    if (sampleTimer !== undefined) clearInterval(sampleTimer);
+    if (inFlightSample !== undefined) await inFlightSample;
     unsubscribe();
   }
   return {
@@ -634,7 +758,40 @@ async function executeBodyMovePathProbe(
     pathUpdateCount,
     probeDeadlineReached,
     recoveryRequired,
+    ...(options.captureStallEvents === true
+      ? {
+          stallEventCountBucket: progressiveEventCountBucket(stallEventCount),
+          stallElapsedBucket:
+            progressiveNavigationStallElapsedBucket(firstStallElapsedMs),
+        }
+      : {}),
   };
+}
+
+function progressiveEventCountBucket(count: number): "0" | "1" | "2+" {
+  if (count === 0) return "0";
+  if (count === 1) return "1";
+  return "2+";
+}
+
+function progressiveNavigationStallElapsedBucket(
+  elapsedMs: number | undefined,
+): ProgressiveNavigationStallElapsedBucket {
+  if (elapsedMs === undefined) return "none";
+  if (elapsedMs < 20_000) return "under20s";
+  if (elapsedMs < 30_000) return "20-30s";
+  if (elapsedMs < 40_000) return "30-40s";
+  return "40s+";
+}
+
+function progressiveNavigationSampleElapsedBucket(
+  elapsedMs: number,
+): ProgressiveNavigationSampleElapsedBucket {
+  if (elapsedMs < 10_000) return "0-10s";
+  if (elapsedMs < 20_000) return "10-20s";
+  if (elapsedMs < 30_000) return "20-30s";
+  if (elapsedMs < 40_000) return "30-40s";
+  return "40s+";
 }
 
 type BodyDetailClass =
@@ -734,6 +891,13 @@ interface BodySmokeDiagnostic {
   readonly progressiveNavigationBodyPassedDoor?: boolean;
   readonly progressiveNavigationRconPassedDoor?: boolean;
   readonly progressiveNavigationRouteConfirmed?: boolean;
+  readonly progressiveNavigationMoveTrace?: {
+    readonly stallEventCountBucket: "0" | "1" | "2+";
+    readonly stallElapsedBucket: ProgressiveNavigationStallElapsedBucket;
+    readonly samples: readonly ProgressiveNavigationMovementSample[];
+  };
+  readonly progressiveNavigationDoorUse?: ProgressiveNavigationDoorUseDiagnostic;
+  readonly progressiveNavigationRetryMove?: ProgressiveNavigationRetryDiagnostic;
   readonly progressiveNavigationFixtureCleanupConfirmed?: boolean;
   readonly progressiveNavigationOriginalFixtureRestored?: boolean;
   readonly returnPathProbe?: ReturnPathProbeDiagnostic;
@@ -6059,7 +6223,7 @@ async function runOperationSmoke(
   const progressiveNavigationProbeOnly =
     process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES";
   const smokeDeadlineMs = progressiveNavigationProbeOnly
-    ? 100_000
+    ? 135_000
     : returnPathProbeOnly
       ? 150_000
       : 90_000;
@@ -7214,11 +7378,66 @@ async function runProgressiveNavigationProbe(
       ),
       progressiveNavigationStage: "move",
     });
+    const movementSamples: ProgressiveNavigationMovementSample[] = [
+      progressiveNavigationMovementSample(
+        "start",
+        0,
+        bodyBefore,
+        rconBefore,
+        door,
+        doorStateBefore,
+      ),
+    ];
+    const moveStartedAt = Date.now();
+    let intervalSampleCount = 0;
     const move = await executeBodyMovePathProbe(
       body,
       { kind: "move_to", position: ownerBefore, range: 1 },
       signal,
-      20_000,
+      40_000,
+      {
+        captureStallEvents: true,
+        sampleIntervalMs: 10_000,
+        maxSamples: 3,
+        onSample: async (elapsedMs) => {
+          intervalSampleCount += 1;
+          const point = progressiveNavigationSamplePoint(intervalSampleCount);
+          try {
+            const [observation, position] = await Promise.all([
+              body.observe(),
+              rcon
+                .command(`data get entity ${state.botName} Pos`)
+                .then(parsePosition),
+            ]);
+            const doorState = await readProgressiveNavigationDoorState(
+              rcon,
+              door,
+              state.botName,
+            );
+            movementSamples.push(
+              progressiveNavigationMovementSample(
+                point,
+                elapsedMs,
+                observation,
+                position,
+                door,
+                doorState,
+              ),
+            );
+          } catch {
+            movementSamples.push(
+              progressiveNavigationMovementSample(
+                point,
+                elapsedMs,
+                undefined,
+                undefined,
+                door,
+                "unknown",
+              ),
+            );
+          }
+        },
+      },
     );
     const [bodyAfter, rconAfter] = await Promise.all([
       body.observe(),
@@ -7231,6 +7450,16 @@ async function runProgressiveNavigationProbe(
       rcon,
       door,
       state.botName,
+    );
+    movementSamples.push(
+      progressiveNavigationMovementSample(
+        "final",
+        Date.now() - moveStartedAt,
+        bodyAfter,
+        rconAfter,
+        door,
+        doorStateAfter,
+      ),
     );
     const bodyDistanceAfter = Math.hypot(
       bodyAfter.self.position.x - ownerAfter.x,
@@ -7251,6 +7480,155 @@ async function runProgressiveNavigationProbe(
       rconPassedDoor &&
       bodyDistanceAfter <= 1.75 &&
       rconDistanceAfter <= 1.75;
+    const doorUseReadiness = progressiveNavigationDoorUseReadiness(
+      bodyAfter,
+      door,
+    );
+    let doorUseDiagnostic: ProgressiveNavigationDoorUseDiagnostic;
+    let retryDiagnostic: ProgressiveNavigationRetryDiagnostic;
+    if (isProgressiveNavigationSignalAborted(signal)) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "run_deadline",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "run_deadline" };
+    } else if (routeConfirmed) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "initial_route_confirmed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = {
+        attempted: false,
+        skipReason: "initial_route_confirmed",
+      };
+    } else if (doorStateAfter !== "closed") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_not_closed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (move.recoveryRequired) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "operation_unresolved",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = {
+        attempted: false,
+        skipReason: "operation_unresolved",
+      };
+    } else if (!doorUseReadiness.doorObserved) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_not_observed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (!doorUseReadiness.doorWithinReach) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_out_of_reach",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else {
+      const use = await executeProgressiveNavigationDoorUse(
+        body,
+        door,
+        signal,
+        15_000,
+      );
+      let doorStateAfterUse: ProgressiveNavigationDoorState = "unknown";
+      try {
+        doorStateAfterUse = await readProgressiveNavigationDoorState(
+          rcon,
+          door,
+          state.botName,
+        );
+      } catch {
+        doorStateAfterUse = "unknown";
+      }
+      doorUseDiagnostic = {
+        attempted: true,
+        skipReason: "attempted",
+        ...doorUseReadiness,
+        status: use.status,
+        errorClass: use.errorClass,
+        recoveryRequired: use.recoveryRequired,
+        doorStateAfter: doorStateAfterUse,
+      };
+      if (isProgressiveNavigationSignalAborted(signal)) {
+        retryDiagnostic = { attempted: false, skipReason: "run_deadline" };
+      } else if (use.recoveryRequired) {
+        retryDiagnostic = {
+          attempted: false,
+          skipReason: "operation_unresolved",
+        };
+      } else if (doorStateAfterUse !== "open") {
+        retryDiagnostic = { attempted: false, skipReason: "door_not_open" };
+      } else {
+        const retry = await executeBodyMovePathProbe(
+          body,
+          { kind: "move_to", position: ownerAfter, range: 1 },
+          signal,
+          15_000,
+          { captureStallEvents: true },
+        );
+        const [bodyAfterRetry, rconAfterRetry] = await Promise.all([
+          body.observe(),
+          rcon
+            .command(`data get entity ${state.botName} Pos`)
+            .then(parsePosition),
+        ]);
+        let doorStateAfterRetry: ProgressiveNavigationDoorState = "unknown";
+        try {
+          doorStateAfterRetry = await readProgressiveNavigationDoorState(
+            rcon,
+            door,
+            state.botName,
+          );
+        } catch {
+          doorStateAfterRetry = "unknown";
+        }
+        const bodyPassedDoorAfterRetry =
+          bodyAfterRetry.self.position.x < door.x - 0.5;
+        const rconPassedDoorAfterRetry = rconAfterRetry.x < door.x - 0.5;
+        const retryRouteConfirmed =
+          retry.status === "successful" &&
+          bodyPassedDoorAfterRetry &&
+          rconPassedDoorAfterRetry &&
+          Math.hypot(
+            bodyAfterRetry.self.position.x - ownerAfter.x,
+            bodyAfterRetry.self.position.y - ownerAfter.y,
+            bodyAfterRetry.self.position.z - ownerAfter.z,
+          ) <= 1.75 &&
+          Math.hypot(
+            rconAfterRetry.x - ownerAfter.x,
+            rconAfterRetry.y - ownerAfter.y,
+            rconAfterRetry.z - ownerAfter.z,
+          ) <= 1.75;
+        retryDiagnostic = {
+          attempted: true,
+          skipReason: "attempted",
+          status: retry.status,
+          errorClass: retry.errorClass,
+          pathStatus: retry.pathStatus,
+          pathUpdateCount: retry.pathUpdateCount,
+          stallEventCountBucket: retry.stallEventCountBucket ?? "0",
+          stallElapsedBucket: retry.stallElapsedBucket ?? "none",
+          bodySideAfter: progressiveNavigationSide(
+            bodyAfterRetry.self.position,
+            door.x,
+          ),
+          rconSideAfter: progressiveNavigationSide(rconAfterRetry, door.x),
+          doorStateAfter: doorStateAfterRetry,
+          routeConfirmed: retryRouteConfirmed,
+        };
+      }
+    }
     update({
       progressiveNavigationDoorStateAfter: doorStateAfter,
       progressiveNavigationBodySideAfter: progressiveNavigationSide(
@@ -7281,6 +7659,13 @@ async function runProgressiveNavigationProbe(
       progressiveNavigationBodyPassedDoor: bodyPassedDoor,
       progressiveNavigationRconPassedDoor: rconPassedDoor,
       progressiveNavigationRouteConfirmed: routeConfirmed,
+      progressiveNavigationMoveTrace: {
+        stallEventCountBucket: move.stallEventCountBucket ?? "0",
+        stallElapsedBucket: move.stallElapsedBucket ?? "none",
+        samples: movementSamples.slice(0, 5),
+      },
+      progressiveNavigationDoorUse: doorUseDiagnostic,
+      progressiveNavigationRetryMove: retryDiagnostic,
     });
     if (!routeConfirmed)
       incomplete("PROGRESSIVE_NAVIGATION_BODY_ROUTE_NOT_CONFIRMED");
@@ -7335,6 +7720,137 @@ async function runProgressiveNavigationProbe(
         incomplete("PROGRESSIVE_NAVIGATION_FIXTURE_CLEANUP_UNCONFIRMED");
     }
   }
+}
+
+function progressiveNavigationMovementSample(
+  point: ProgressiveNavigationSamplePoint,
+  elapsedMs: number,
+  observation: Awaited<ReturnType<PlayerBody["observe"]>> | undefined,
+  rconPosition: Position | undefined,
+  door: BlockPosition,
+  doorState: ProgressiveNavigationDoorState,
+): ProgressiveNavigationMovementSample {
+  const doorCenter = {
+    x: door.x + 0.5,
+    y: door.y + 0.5,
+    z: door.z + 0.5,
+  };
+  return {
+    point,
+    elapsed: progressiveNavigationSampleElapsedBucket(elapsedMs),
+    bodySide:
+      observation === undefined
+        ? "unknown"
+        : progressiveNavigationSide(observation.self.position, door.x),
+    rconSide:
+      rconPosition === undefined
+        ? "unknown"
+        : progressiveNavigationSide(rconPosition, door.x),
+    bodyDoorDistance:
+      observation === undefined
+        ? "unknown"
+        : positionDistanceBucket(observation.self.position, doorCenter),
+    rconDoorDistance:
+      rconPosition === undefined
+        ? "unknown"
+        : positionDistanceBucket(rconPosition, doorCenter),
+    doorState,
+    bodyBlockSearchMayBeTruncated:
+      observation?.perception.candidateSearchMayBeTruncated ?? "unknown",
+  };
+}
+
+function progressiveNavigationSamplePoint(
+  sampleNumber: number,
+): ProgressiveNavigationSamplePoint {
+  if (sampleNumber === 1) return "sample_1";
+  if (sampleNumber === 2) return "sample_2";
+  return "sample_3";
+}
+
+function isProgressiveNavigationSignalAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+function progressiveNavigationDoorUseReadiness(
+  observation: Awaited<ReturnType<PlayerBody["observe"]>>,
+  door: BlockPosition,
+): Pick<
+  ProgressiveNavigationDoorUseDiagnostic,
+  "doorObserved" | "bodyBlockSearchMayBeTruncated" | "doorWithinReach"
+> {
+  const visibleDoor = observation.perception.blocks.find(
+    (block) =>
+      block.name === "oak_door" &&
+      block.position.x === door.x &&
+      block.position.y === door.y &&
+      block.position.z === door.z,
+  );
+  const target = { x: door.x + 0.5, y: door.y + 0.5, z: door.z + 0.5 };
+  const eye = {
+    x: observation.self.position.x,
+    y: observation.self.position.y + observation.self.eyeHeight,
+    z: observation.self.position.z,
+  };
+  const eyeDistance = Math.hypot(
+    eye.x - target.x,
+    eye.y - target.y,
+    eye.z - target.z,
+  );
+  return {
+    doorObserved: visibleDoor !== undefined,
+    bodyBlockSearchMayBeTruncated:
+      observation.perception.candidateSearchMayBeTruncated,
+    doorWithinReach: eyeDistance <= 4.65,
+  };
+}
+
+async function executeProgressiveNavigationDoorUse(
+  body: PlayerBody,
+  door: BlockPosition,
+  parentSignal: AbortSignal,
+  deadlineMs: number,
+): Promise<ProgressiveNavigationDoorUseOperationResult> {
+  const probeAbort = new AbortController();
+  let probeDeadlineReached = false;
+  let status: BodyOperationStatus;
+  let detail: string | undefined;
+  let recoveryRequired = false;
+  const timer = setTimeout(() => {
+    probeDeadlineReached = true;
+    probeAbort.abort(new Error("progressive navigation door use deadline"));
+  }, deadlineMs);
+  try {
+    const result = await body.execute(
+      { kind: "use", target: { kind: "block", position: door } },
+      AbortSignal.any([parentSignal, probeAbort.signal]),
+    );
+    status = result.status;
+    detail = result.detail;
+    recoveryRequired = result.recoveryRequired;
+  } catch (error) {
+    detail = error instanceof Error ? error.message : undefined;
+    status = parentSignal.aborted ? "interrupted" : "failed";
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    status,
+    errorClass: classifyProgressiveDoorUseErrorClass(
+      detail,
+      probeDeadlineReached,
+    ),
+    recoveryRequired,
+    probeDeadlineReached,
+  };
+}
+
+function classifyProgressiveDoorUseErrorClass(
+  detail: string | undefined,
+  probeDeadlineReached: boolean,
+): BodyDetailClass | "probe_deadline" {
+  if (probeDeadlineReached) return "probe_deadline";
+  return classifyBodyOperationDetail(detail);
 }
 
 function progressiveNavigationSide(
