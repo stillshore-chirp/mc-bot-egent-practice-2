@@ -1434,6 +1434,134 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("provides bounded closed-door recovery context after a stalled owner return", async () => {
+    const observedAt = new Date().toISOString();
+    const baseObservation = bodyObservationFixture();
+    const observation: PlayerBodyObservation = {
+      ...baseObservation,
+      observedAt,
+      perception: {
+        ...baseObservation.perception,
+        blocks: [
+          {
+            name: "oak_door",
+            stateId: 1000,
+            position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+            distance: 1,
+            properties: { half: "lower", open: false },
+          },
+        ],
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "wait-after-stalled-owner-return",
+          "commit_action_decision",
+          {
+            ...actionArguments(),
+            kind: "wait",
+            purpose: "Return to the owner",
+            operationJson: "{}",
+            expectedOutcome: "",
+            reason:
+              "The route needs a fresh observation before another attempt.",
+            wakeOn: ["body_outcome"],
+            wakeAt: "",
+          },
+        ),
+      ],
+      () => undefined,
+      createMemoryPort(),
+      async () => observation,
+    );
+    const proposal = fixture.mind.addProposal({
+      title: "Return to the owner",
+      reason: "The owner asked the player to come back.",
+      priority: 4,
+    });
+    const started = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision: {
+        kind: "act",
+        purpose: proposal.title,
+        operation: {
+          kind: "move_to",
+          position: { x: 8, y: 64, z: 0 },
+          range: 1,
+        },
+        operationId: "owner-return-stalled-move",
+        expectedOutcome: "Reach the owner's currently observed location.",
+        wakeOn: ["body_outcome"],
+      },
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "Keep the return request as an active owner goal.",
+      },
+    });
+    expect(started.accepted).toBe(true);
+    const ownerGoal = started.snapshot.goals.find(
+      (goal) => goal.ownerProposalId === proposal.id,
+    );
+    expect(ownerGoal).toMatchObject({ source: "owner", status: "active" });
+    const stalled = fixture.mind.enqueueEvent(
+      "operation_stalled",
+      "move_to stalled before reaching the owner.",
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [stalled],
+      });
+
+      expect(result.accepted).toBe(true);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const instructions = String(request.instructions);
+      expect(instructions).toContain("閉じたドアへの回復を一度だけ");
+      expect(instructions).toContain("同じ回復手順を繰り返さず");
+
+      const payload = requestUserPayload(fixture.requests[0]);
+      expect(payload.events).toContainEqual(
+        expect.objectContaining({ kind: "operation_stalled" }),
+      );
+      const runtime = z.record(z.string(), z.unknown()).parse(payload.runtime);
+      expect(runtime.activeOperation).toMatchObject({ kind: "move_to" });
+      expect(runtime.goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal?.id,
+          ownerProposalId: proposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
+      const observed = z
+        .record(z.string(), z.unknown())
+        .parse(payload.observation);
+      expect(observed.observedAt).toBe(observedAt);
+      const perception = z
+        .record(z.string(), z.unknown())
+        .parse(observed.perception);
+      expect(perception.blocks).toContainEqual(
+        expect.objectContaining({
+          name: "oak_door",
+          properties: { half: "lower", open: false },
+        }),
+      );
+      expect(fixture.mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal?.id,
+          status: "active",
+        }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("shows a successful look's expected step and observed result to the next judgment", async () => {
     const expectedOutcome =
       "The view exposes the wall gap for the next repair step.";
