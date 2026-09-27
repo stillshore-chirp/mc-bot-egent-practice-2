@@ -41,10 +41,12 @@ describe("multi-target gather E2E acceptance", () => {
     });
     expect(single).toEqual({
       reason: "parsed",
+      parseStage: "parsed",
       counts: { oak_log: 1, birch_log: 0 },
     });
     expect(twoStack).toEqual({
       reason: "parsed",
+      parseStage: "parsed",
       counts: { oak_log: 1, birch_log: 1 },
     });
     expect(readCount).toBe(1);
@@ -69,6 +71,22 @@ describe("multi-target gather E2E acceptance", () => {
     const targetCountInvalid = parseGatherMultiTargetInventoryReplyDetailed(
       'Entity data: [{id:"minecraft:birch_log",count:"1"}]',
     );
+    const rootInvalid = parseGatherMultiTargetInventoryReplyDetailed(
+      'Entity data: {id:"minecraft:oak_log",count:1}',
+    );
+    const nestedTokenInvalid = parseGatherMultiTargetInventoryReplyDetailed(
+      'Entity data: [{id:"minecraft:oak_log",count:1,display:{Name:}}]',
+    );
+    const trailingContent = parseGatherMultiTargetInventoryReplyDetailed(
+      'Entity data: [{id:"minecraft:oak_log",count:1}] trailing',
+    );
+    const stackIdInvalid = parseGatherMultiTargetInventoryReplyDetailed(
+      "Entity data: [{count:1}]",
+    );
+    const responseTruncatedPossible =
+      parseGatherMultiTargetInventoryReplyDetailed(
+        'Entity data: [{id:"minecraft:oak_log",count:1',
+      );
 
     expect([
       readFailed.reason,
@@ -76,13 +94,28 @@ describe("multi-target gather E2E acceptance", () => {
       markerMissing.reason,
       structureInvalid.reason,
       targetCountInvalid.reason,
+      rootInvalid.parseStage,
+      nestedTokenInvalid.parseStage,
+      trailingContent.parseStage,
+      stackIdInvalid.parseStage,
+      responseTruncatedPossible.parseStage,
     ]).toEqual([
       "read_failed",
       "command_rejected",
       "marker_missing",
       "structure_invalid",
       "target_count_invalid",
+      "root_invalid",
+      "nested_token_invalid",
+      "trailing_content",
+      "stack_id_invalid",
+      "response_truncated_possible",
     ]);
+    expect(readFailed.parseStage).toBe("not_parsed");
+    expect(commandRejected.parseStage).toBe("not_parsed");
+    expect(markerMissing.parseStage).toBe("marker_missing");
+    expect(structureInvalid.parseStage).toBe("root_invalid");
+    expect(targetCountInvalid.parseStage).toBe("target_count_invalid");
     expect(
       JSON.stringify({
         readFailed,
@@ -90,6 +123,11 @@ describe("multi-target gather E2E acceptance", () => {
         markerMissing,
         structureInvalid,
         targetCountInvalid,
+        rootInvalid,
+        nestedTokenInvalid,
+        trailingContent,
+        stackIdInvalid,
+        responseTruncatedPossible,
       }),
     ).not.toContain("PRIVATE_RCON_SENTINEL");
   });

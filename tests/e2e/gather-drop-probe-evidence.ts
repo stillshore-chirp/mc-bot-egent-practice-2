@@ -6,6 +6,7 @@ import type {
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import type {
+  GatherMultiTargetInventoryParseStage,
   GatherMultiTargetInventoryReadReason,
   GatherMultiTargetItem,
 } from "./gather-multi-target-acceptance.js";
@@ -57,10 +58,14 @@ export interface GatherDropProbeTwoStackInventoryEvidence {
   readonly seedRcon: GatherDropProbeInventorySeedEvidence;
   readonly seedRconReadReason:
     GatherMultiTargetInventoryReadReason | "not_attempted";
+  readonly seedRconParseStage:
+    GatherMultiTargetInventoryParseStage | "not_attempted";
   readonly afterBody: GatherDropProbeInventoryTransitionEvidence;
   readonly afterRcon: GatherDropProbeInventoryTransitionEvidence;
   readonly afterRconReadReason:
     GatherMultiTargetInventoryReadReason | "not_attempted";
+  readonly afterRconParseStage:
+    GatherMultiTargetInventoryParseStage | "not_attempted";
 }
 
 /** Keep the opt-in oak/birch comparison to safe count buckets and deltas. */
@@ -69,10 +74,14 @@ export function gatherDropProbeTwoStackInventoryEvidence(input: {
   readonly seedRcon?: GatherDropProbeInventoryCounts | undefined;
   readonly seedRconReadReason?:
     GatherMultiTargetInventoryReadReason | "not_attempted" | undefined;
+  readonly seedRconParseStage?:
+    GatherMultiTargetInventoryParseStage | "not_attempted" | undefined;
   readonly afterBody?: GatherDropProbeInventoryCounts | undefined;
   readonly afterRcon?: GatherDropProbeInventoryCounts | undefined;
   readonly afterRconReadReason?:
     GatherMultiTargetInventoryReadReason | "not_attempted" | undefined;
+  readonly afterRconParseStage?:
+    GatherMultiTargetInventoryParseStage | "not_attempted" | undefined;
 }): GatherDropProbeTwoStackInventoryEvidence {
   const countBucket = (
     count: number | undefined,
@@ -129,9 +138,11 @@ export function gatherDropProbeTwoStackInventoryEvidence(input: {
     seedBody: seedEvidence(input.seedBody),
     seedRcon: seedEvidence(input.seedRcon),
     seedRconReadReason: input.seedRconReadReason ?? "not_attempted",
+    seedRconParseStage: input.seedRconParseStage ?? "not_attempted",
     afterBody: transitionEvidence(input.seedBody, input.afterBody),
     afterRcon: transitionEvidence(input.seedRcon, input.afterRcon),
     afterRconReadReason: input.afterRconReadReason ?? "not_attempted",
+    afterRconParseStage: input.afterRconParseStage ?? "not_attempted",
   };
 }
 

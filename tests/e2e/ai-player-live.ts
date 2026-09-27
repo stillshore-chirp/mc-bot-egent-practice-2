@@ -171,6 +171,7 @@ import {
   postFollowupGatherActionPairs,
   successfulGatherActionPairs,
   type GatherMultiTargetContinuityDiagnostic,
+  type GatherMultiTargetInventoryParseStage,
   type GatherMultiTargetInventoryReadReason,
   type GatherMultiTargetItem,
   type GatherMultiTargetOracleSample,
@@ -8949,10 +8950,14 @@ async function runGatherDropVisibilityProbe(
   let seedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
   let seedRconInventoryReadReason:
     GatherMultiTargetInventoryReadReason | undefined;
+  let seedRconInventoryParseStage:
+    GatherMultiTargetInventoryParseStage | undefined;
   let capturedBodyInventoryCounts: GatherDropProbeInventoryCounts | undefined;
   let capturedRconInventoryCounts: GatherDropProbeInventoryCounts | undefined;
   let capturedRconInventoryReadReason:
     GatherMultiTargetInventoryReadReason | undefined;
+  let capturedRconInventoryParseStage:
+    GatherMultiTargetInventoryParseStage | undefined;
   const emptyCleanup: GatherMultiTargetFixtureCleanupDiagnostic = {
     stage: "not_started",
     oakBlockReadbackConfirmed: false,
@@ -9006,6 +9011,7 @@ async function runGatherDropVisibilityProbe(
     capturedBodyInventoryCounts = undefined;
     capturedRconInventoryCounts = undefined;
     capturedRconInventoryReadReason = undefined;
+    capturedRconInventoryParseStage = undefined;
     if (origin === undefined || fixture === undefined)
       return emptyGatherDropProbeStage();
     let rconPositionBucket: GatherDropProbePositionBucket = "unknown";
@@ -9050,6 +9056,7 @@ async function runGatherDropVisibilityProbe(
     const rconInventoryCounts =
       inventoryRead.reason === "parsed" ? inventoryRead.counts : undefined;
     capturedRconInventoryReadReason = inventoryRead.reason;
+    capturedRconInventoryParseStage = inventoryRead.parseStage;
     const bodyInventoryCounts = twoStackProbeEnabled
       ? gatherDropProbeBodyInventoryCounts(observation)
       : undefined;
@@ -9132,6 +9139,7 @@ async function runGatherDropVisibilityProbe(
         rcon.command(`data get entity ${state.botName} Inventory`),
       );
       seedRconInventoryReadReason = seedInventoryRead.reason;
+      seedRconInventoryParseStage = seedInventoryRead.parseStage;
       seedRconInventoryCounts =
         seedInventoryRead.reason === "parsed"
           ? seedInventoryRead.counts
@@ -9139,6 +9147,7 @@ async function runGatherDropVisibilityProbe(
       const seedEvidence = gatherDropProbeTwoStackInventoryEvidence({
         seedRcon: seedRconInventoryCounts,
         seedRconReadReason: seedRconInventoryReadReason,
+        seedRconParseStage: seedRconInventoryParseStage,
       });
       updateGatherDropVisibilityProbeDiagnostic(state, {
         twoStackInventoryEvidence: seedEvidence,
@@ -9207,6 +9216,7 @@ async function runGatherDropVisibilityProbe(
         seedBody: seedBodyInventoryCounts,
         seedRcon: seedRconInventoryCounts,
         seedRconReadReason: seedRconInventoryReadReason,
+        seedRconParseStage: seedRconInventoryParseStage,
       });
       updateGatherDropVisibilityProbeDiagnostic(state, {
         initialStage,
@@ -9298,10 +9308,13 @@ async function runGatherDropVisibilityProbe(
             seedBody: seedBodyInventoryCounts,
             seedRcon: seedRconInventoryCounts,
             seedRconReadReason: seedRconInventoryReadReason,
+            seedRconParseStage: seedRconInventoryParseStage,
             afterBody: afterBodyInventoryCounts,
             afterRcon: afterRconInventoryCounts,
             afterRconReadReason:
               capturedRconInventoryReadReason ?? "not_attempted",
+            afterRconParseStage:
+              capturedRconInventoryParseStage ?? "not_attempted",
           }),
         });
       }

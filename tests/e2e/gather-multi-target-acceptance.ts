@@ -26,14 +26,38 @@ export type GatherMultiTargetInventoryReadReason =
   | "target_count_invalid"
   | "parsed";
 
+export type GatherMultiTargetInventoryParseStage =
+  | "not_parsed"
+  | "marker_missing"
+  | "root_invalid"
+  | "nested_token_invalid"
+  | "trailing_content"
+  | "stack_id_invalid"
+  | "target_count_invalid"
+  | "response_truncated_possible"
+  | "parsed";
+
 export type GatherMultiTargetInventoryReadResult =
   | {
       readonly reason: "parsed";
+      readonly parseStage: "parsed";
       readonly counts: Readonly<Record<GatherMultiTargetItem, number>>;
     }
   | {
       readonly reason: Exclude<GatherMultiTargetInventoryReadReason, "parsed">;
+      readonly parseStage: GatherMultiTargetInventoryParseStage;
     };
+
+type InventoryTagParserFailureStage = Extract<
+  GatherMultiTargetInventoryParseStage,
+  "root_invalid" | "nested_token_invalid" | "response_truncated_possible"
+>;
+
+class InventoryTagParseError extends Error {
+  public constructor(readonly stage: InventoryTagParserFailureStage) {
+    super(stage);
+  }
+}
 
 /** Parse only top-level inventory stacks; malformed or ambiguous replies fail closed. */
 export function parseGatherMultiTargetInventoryReply(
@@ -48,60 +72,77 @@ export function parseGatherMultiTargetInventoryReplyDetailed(
   reply: string,
 ): GatherMultiTargetInventoryReadResult {
   const marker = /entity data:\s*/iu.exec(reply);
-  if (marker === null) return { reason: "marker_missing" };
+  if (marker === null)
+    return { reason: "marker_missing", parseStage: "marker_missing" };
 
+  let root: Extract<ParsedInventoryTag, { kind: "list" }>;
+  const parser = new InventoryTagParser(
+    reply.slice(marker.index + marker[0].length),
+  );
   try {
-    const parser = new InventoryTagParser(
-      reply.slice(marker.index + marker[0].length),
-    );
-    const root = parser.parseRootList();
-    if (
-      !parser.isAtEnd() ||
-      root.values.some((value) => value.kind !== "compound")
-    )
-      return { reason: "structure_invalid" };
-
-    const counts: Record<GatherMultiTargetItem, number> = {
-      oak_log: 0,
-      birch_log: 0,
+    root = parser.parseRootList();
+  } catch (error) {
+    return {
+      reason: "structure_invalid",
+      parseStage:
+        error instanceof InventoryTagParseError
+          ? error.stage
+          : "nested_token_invalid",
     };
-    for (const value of root.values) {
-      if (value.kind !== "compound") return { reason: "structure_invalid" };
-      const ids = value.fields.filter(({ key }) => key === "id");
-      if (ids.length !== 1 || ids[0]?.value.kind !== "scalar")
-        return { reason: "structure_invalid" };
-      const id = ids[0].value.value;
-      const target = GATHER_MULTI_TARGET_ITEMS.find(
-        (item) => id === `minecraft:${item}`,
-      );
-      if (target === undefined) continue;
-
-      const stackCounts = value.fields.filter(
-        ({ key }) => key === "count" || key === "Count",
-      );
-      const stackCount = stackCounts[0]?.value;
-      if (
-        stackCounts.length !== 1 ||
-        stackCount?.kind !== "scalar" ||
-        stackCount.quoted ||
-        !/^\d+[bBsSlL]?$/u.test(stackCount.value)
-      ) {
-        return { reason: "target_count_invalid" };
-      }
-      const amount = Number.parseInt(
-        stackCount.value.replace(/[bBsSlL]$/u, ""),
-        10,
-      );
-      if (!Number.isSafeInteger(amount) || amount < 0)
-        return { reason: "target_count_invalid" };
-      counts[target] += amount;
-      if (!Number.isSafeInteger(counts[target]))
-        return { reason: "target_count_invalid" };
-    }
-    return { reason: "parsed", counts };
-  } catch {
-    return { reason: "structure_invalid" };
   }
+  if (!parser.isAtEnd())
+    return { reason: "structure_invalid", parseStage: "trailing_content" };
+  if (root.values.some((value) => value.kind !== "compound"))
+    return { reason: "structure_invalid", parseStage: "root_invalid" };
+
+  const counts: Record<GatherMultiTargetItem, number> = {
+    oak_log: 0,
+    birch_log: 0,
+  };
+  for (const value of root.values) {
+    if (value.kind !== "compound")
+      return { reason: "structure_invalid", parseStage: "root_invalid" };
+    const ids = value.fields.filter(({ key }) => key === "id");
+    if (ids.length !== 1 || ids[0]?.value.kind !== "scalar")
+      return { reason: "structure_invalid", parseStage: "stack_id_invalid" };
+    const id = ids[0].value.value;
+    const target = GATHER_MULTI_TARGET_ITEMS.find(
+      (item) => id === `minecraft:${item}`,
+    );
+    if (target === undefined) continue;
+
+    const stackCounts = value.fields.filter(
+      ({ key }) => key === "count" || key === "Count",
+    );
+    const stackCount = stackCounts[0]?.value;
+    if (
+      stackCounts.length !== 1 ||
+      stackCount?.kind !== "scalar" ||
+      stackCount.quoted ||
+      !/^\d+[bBsSlL]?$/u.test(stackCount.value)
+    ) {
+      return {
+        reason: "target_count_invalid",
+        parseStage: "target_count_invalid",
+      };
+    }
+    const amount = Number.parseInt(
+      stackCount.value.replace(/[bBsSlL]$/u, ""),
+      10,
+    );
+    if (!Number.isSafeInteger(amount) || amount < 0)
+      return {
+        reason: "target_count_invalid",
+        parseStage: "target_count_invalid",
+      };
+    counts[target] += amount;
+    if (!Number.isSafeInteger(counts[target]))
+      return {
+        reason: "target_count_invalid",
+        parseStage: "target_count_invalid",
+      };
+  }
+  return { reason: "parsed", parseStage: "parsed", counts };
 }
 
 /** Read once, returning only safe classification and parsed counts. */
@@ -112,13 +153,13 @@ export async function readGatherMultiTargetInventory(
   try {
     reply = await readReply();
   } catch {
-    return { reason: "read_failed" };
+    return { reason: "read_failed", parseStage: "not_parsed" };
   }
 
   const parsed = parseGatherMultiTargetInventoryReplyDetailed(reply);
   if (parsed.reason === "parsed") return parsed;
   if (isGatherMultiTargetInventoryCommandRejection(reply))
-    return { reason: "command_rejected" };
+    return { reason: "command_rejected", parseStage: "not_parsed" };
   return parsed;
 }
 
@@ -130,13 +171,28 @@ function isGatherMultiTargetInventoryCommandRejection(reply: string): boolean {
 
 class InventoryTagParser {
   private position = 0;
+  private containerDepth = 0;
 
   constructor(private readonly source: string) {}
 
   parseRootList(): Extract<ParsedInventoryTag, { kind: "list" }> {
-    const parsed = this.parseValue();
-    if (parsed.kind !== "list") throw new Error("expected list");
+    let parsed: ParsedInventoryTag;
+    try {
+      parsed = this.parseValue();
+    } catch (error) {
+      if (error instanceof InventoryTagParseError) throw error;
+      throw new InventoryTagParseError(
+        this.isAtInputEnd() ? "response_truncated_possible" : "root_invalid",
+      );
+    }
+    if (parsed.kind !== "list")
+      throw new InventoryTagParseError("root_invalid");
     return parsed;
+  }
+
+  private isAtInputEnd(): boolean {
+    this.skipWhitespace();
+    return this.position >= this.source.length;
   }
 
   isAtEnd(): boolean {
@@ -165,32 +221,62 @@ class InventoryTagParser {
 
   private parseCompound(): Extract<ParsedInventoryTag, { kind: "compound" }> {
     this.expect("{");
-    this.skipWhitespace();
-    const fields: { key: string; value: ParsedInventoryTag }[] = [];
-    if (this.consume("}")) return { kind: "compound", fields };
-    while (this.position < this.source.length) {
-      const key = this.parseKey();
-      this.expect(":");
-      fields.push({ key, value: this.parseValue() });
+    const isRoot = this.containerDepth === 0;
+    this.containerDepth += 1;
+    try {
       this.skipWhitespace();
+      const fields: { key: string; value: ParsedInventoryTag }[] = [];
       if (this.consume("}")) return { kind: "compound", fields };
-      this.expect(",");
+      while (this.position < this.source.length) {
+        const key = this.parseKey();
+        this.expect(":");
+        fields.push({ key, value: this.parseValue() });
+        this.skipWhitespace();
+        if (this.consume("}")) return { kind: "compound", fields };
+        this.expect(",");
+      }
+      throw new Error("unterminated compound");
+    } catch (error) {
+      if (error instanceof InventoryTagParseError) throw error;
+      throw new InventoryTagParseError(
+        this.isAtInputEnd()
+          ? "response_truncated_possible"
+          : isRoot
+            ? "root_invalid"
+            : "nested_token_invalid",
+      );
+    } finally {
+      this.containerDepth -= 1;
     }
-    throw new Error("unterminated compound");
   }
 
   private parseList(): Extract<ParsedInventoryTag, { kind: "list" }> {
     this.expect("[");
-    this.skipWhitespace();
-    const values: ParsedInventoryTag[] = [];
-    if (this.consume("]")) return { kind: "list", values };
-    while (this.position < this.source.length) {
-      values.push(this.parseValue());
+    const isRoot = this.containerDepth === 0;
+    this.containerDepth += 1;
+    try {
       this.skipWhitespace();
+      const values: ParsedInventoryTag[] = [];
       if (this.consume("]")) return { kind: "list", values };
-      this.expect(",");
+      while (this.position < this.source.length) {
+        values.push(this.parseValue());
+        this.skipWhitespace();
+        if (this.consume("]")) return { kind: "list", values };
+        this.expect(",");
+      }
+      throw new Error("unterminated list");
+    } catch (error) {
+      if (error instanceof InventoryTagParseError) throw error;
+      throw new InventoryTagParseError(
+        this.isAtInputEnd()
+          ? "response_truncated_possible"
+          : isRoot
+            ? "root_invalid"
+            : "nested_token_invalid",
+      );
+    } finally {
+      this.containerDepth -= 1;
     }
-    throw new Error("unterminated list");
   }
 
   private parseKey(): string {
