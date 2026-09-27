@@ -425,6 +425,7 @@ type LookSweepStatusDiagnostic = BodyOperationStatus | "unavailable";
 type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 type BodyMoveErrorClass =
   "none" | "no_path" | "timeout" | "probe_deadline" | "interrupted" | "other";
+type ProgressiveNavigationDoorState = "closed" | "open" | "unknown";
 type BodyDigErrorClass =
   | "out_of_view"
   | "occluded"
@@ -525,7 +526,8 @@ interface ReturnPathProbeDiagnostic {
 function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES"
   );
 }
 
@@ -697,6 +699,43 @@ interface BodySmokeDiagnostic {
   readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
   readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
+  readonly progressiveNavigationStage?:
+    "fixture_setup" | "preflight" | "move" | "cleanup" | "complete";
+  readonly progressiveNavigationFixtureConfigured?: boolean;
+  readonly progressiveNavigationStairBlocksConfirmed?: boolean;
+  readonly progressiveNavigationStepSupportsConfirmed?: boolean;
+  readonly progressiveNavigationCorridorWallsConfirmed?: boolean;
+  readonly progressiveNavigationDoorHalvesConfirmed?: boolean;
+  readonly progressiveNavigationDoorStateBefore?: ProgressiveNavigationDoorState;
+  readonly progressiveNavigationDoorStateAfter?: ProgressiveNavigationDoorState;
+  readonly progressiveNavigationBodySideBefore?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationBodySideAfter?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationRconSideBefore?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationRconSideAfter?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationBodyDistanceBefore?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationBodyDistanceAfter?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationRconDistanceBefore?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationRconDistanceAfter?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationBodyDistanceReduced?: boolean;
+  readonly progressiveNavigationRconDistanceReduced?: boolean;
+  readonly progressiveNavigationMoveStatus?: BodyOperationStatus;
+  readonly progressiveNavigationMoveErrorClass?: BodyMoveErrorClass;
+  readonly progressiveNavigationPathStatus?: BodyPathStatus;
+  readonly progressiveNavigationPathUpdateCount?: number;
+  readonly progressiveNavigationProbeDeadlineReached?: boolean;
+  readonly progressiveNavigationBodyPassedDoor?: boolean;
+  readonly progressiveNavigationRconPassedDoor?: boolean;
+  readonly progressiveNavigationRouteConfirmed?: boolean;
+  readonly progressiveNavigationFixtureCleanupConfirmed?: boolean;
+  readonly progressiveNavigationOriginalFixtureRestored?: boolean;
   readonly returnPathProbe?: ReturnPathProbeDiagnostic;
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
@@ -1399,7 +1438,7 @@ function bodySmokeEvidence(
   };
   for (const [key, value] of Object.entries(diagnostic)) {
     if (
-      key.startsWith("furnace") &&
+      (key.startsWith("furnace") || key.startsWith("progressiveNavigation")) &&
       (typeof value === "boolean" ||
         typeof value === "number" ||
         typeof value === "string")
@@ -5629,10 +5668,12 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  if (
-    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
-  ) {
+  const diagnosticProbeFlags = [
+    "AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY",
+    "AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY",
+    "AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY",
+  ].filter((name) => process.env[name] === "YES");
+  if (diagnosticProbeFlags.length > 1) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
@@ -6015,7 +6056,13 @@ async function runOperationSmoke(
 ): Promise<SafeCaseResult> {
   const returnPathProbeOnly =
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES";
-  const smokeDeadlineMs = returnPathProbeOnly ? 150_000 : 90_000;
+  const progressiveNavigationProbeOnly =
+    process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES";
+  const smokeDeadlineMs = progressiveNavigationProbeOnly
+    ? 100_000
+    : returnPathProbeOnly
+      ? 150_000
+      : 90_000;
   const result = await runCase(
     state,
     "body_operation_smoke",
@@ -6694,6 +6741,15 @@ async function runOperationSmoke(
         );
         if (!positionMatchesSmokeSpawn(smokeEndPosition))
           incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
+        if (progressiveNavigationProbeOnly) {
+          await runProgressiveNavigationProbe(
+            state,
+            rcon,
+            body,
+            smokeSpawn,
+            abort.signal,
+          );
+        }
         let obstacleRouteVerifiedByServer = false;
         if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
           await removeHiddenContainerFixture(rcon, smokeSpawn, {
@@ -6949,6 +7005,9 @@ async function runOperationSmoke(
           ...(process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES"
             ? { obstacleRouteVerifiedByServer }
             : {}),
+          ...(progressiveNavigationProbeOnly
+            ? { progressiveNavigationDiagnosticOnly: true }
+            : {}),
           ...(state.bodySmokeDiagnostic.obstacleRestoreProbeVerified === true
             ? { obstacleRestoreProbeVerified: true }
             : {}),
@@ -6972,6 +7031,340 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runProgressiveNavigationProbe(
+  state: RunState,
+  rcon: LocalRcon,
+  body: PlayerBody,
+  spawn: Position,
+  signal: AbortSignal,
+): Promise<void> {
+  const door = fixturePoint(spawn, 2, 0);
+  const start = { x: door.x + 6.5, y: 68, z: door.z + 0.5 };
+  const stairBlocks = [
+    { x: door.x + 1, y: 64, z: door.z },
+    { x: door.x + 2, y: 65, z: door.z },
+    { x: door.x + 3, y: 66, z: door.z },
+    { x: door.x + 4, y: 67, z: door.z },
+  ] as const;
+  const supports = [
+    { x: door.x + 2, y: 64, z: door.z },
+    { x: door.x + 3, y: 64, z: door.z },
+    { x: door.x + 3, y: 65, z: door.z },
+    { x: door.x + 4, y: 64, z: door.z },
+    { x: door.x + 4, y: 65, z: door.z },
+    { x: door.x + 4, y: 66, z: door.z },
+  ] as const;
+  const platform = [
+    { x: door.x + 5, y: 67, z: door.z },
+    { x: door.x + 6, y: 67, z: door.z },
+  ] as const;
+  const hiddenFixture = { chest: fixturePoint(spawn, 6, 0) };
+  const update = (patch: Partial<BodySmokeDiagnostic>): void => {
+    const current = state.bodySmokeDiagnostic;
+    if (current === undefined) incomplete("BODY_SMOKE_DIAGNOSTIC_MISSING");
+    state.bodySmokeDiagnostic = { ...current, ...patch };
+  };
+  let fixtureMutationStarted = false;
+  update({ progressiveNavigationStage: "fixture_setup" });
+  try {
+    fixtureMutationStarted = true;
+    await removeHiddenContainerFixture(rcon, spawn, hiddenFixture);
+    await rcon.command(
+      `kill @e[type=minecraft:item,x=${hiddenFixture.chest.x},y=${hiddenFixture.chest.y},z=${hiddenFixture.chest.z},distance=..3]`,
+    );
+    await rcon.command(
+      `fill ${door.x} 64 ${door.z - 1} ${Math.floor(start.x)} 69 ${door.z - 1} stone`,
+    );
+    await rcon.command(
+      `fill ${door.x} 64 ${door.z + 1} ${Math.floor(start.x)} 69 ${door.z + 1} stone`,
+    );
+    for (const support of supports) {
+      await rcon.command(
+        `setblock ${support.x} ${support.y} ${support.z} stone`,
+      );
+    }
+    for (const block of platform) {
+      await rcon.command(`setblock ${block.x} ${block.y} ${block.z} stone`);
+    }
+    await rcon.command(
+      `setblock ${door.x} ${door.y} ${door.z} oak_door[facing=west,half=lower,hinge=left,open=false,powered=false]`,
+    );
+    await rcon.command(
+      `setblock ${door.x} ${door.y + 1} ${door.z} oak_door[facing=west,half=upper,hinge=left,open=false,powered=false]`,
+    );
+    for (const stair of stairBlocks) {
+      await rcon.command(
+        `setblock ${stair.x} ${stair.y} ${stair.z} oak_stairs[facing=west,half=bottom,shape=straight,waterlogged=false]`,
+      );
+    }
+    let stairsConfirmed = true;
+    for (const stair of stairBlocks) {
+      stairsConfirmed =
+        (await isBlock(rcon, stair, "oak_stairs")) && stairsConfirmed;
+    }
+    let supportsConfirmed = true;
+    for (const support of [...supports, ...platform]) {
+      supportsConfirmed =
+        (await isBlock(rcon, support, "stone")) && supportsConfirmed;
+    }
+    const corridorWallsConfirmed =
+      (await isBlock(rcon, { x: door.x + 2, y: 64, z: door.z - 1 }, "stone")) &&
+      (await isBlock(rcon, { x: door.x + 2, y: 69, z: door.z + 1 }, "stone"));
+    const doorLowerConfirmed = await isBlock(rcon, door, "oak_door");
+    const doorUpperConfirmed = await isBlock(
+      rcon,
+      { ...door, y: door.y + 1, z: door.z },
+      "oak_door",
+    );
+    const doorStateBefore = await readProgressiveNavigationDoorState(
+      rcon,
+      door,
+      state.botName,
+    );
+    update({
+      progressiveNavigationFixtureConfigured:
+        stairsConfirmed &&
+        supportsConfirmed &&
+        corridorWallsConfirmed &&
+        doorLowerConfirmed &&
+        doorUpperConfirmed,
+      progressiveNavigationStairBlocksConfirmed: stairsConfirmed,
+      progressiveNavigationStepSupportsConfirmed: supportsConfirmed,
+      progressiveNavigationCorridorWallsConfirmed: corridorWallsConfirmed,
+      progressiveNavigationDoorHalvesConfirmed:
+        doorLowerConfirmed && doorUpperConfirmed,
+      progressiveNavigationDoorStateBefore: doorStateBefore,
+      progressiveNavigationStage: "preflight",
+    });
+    if (!stairsConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_STAIRS_UNCONFIRMED");
+    if (!supportsConfirmed || !corridorWallsConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_ROUTE_FIXTURE_UNCONFIRMED");
+    if (!doorLowerConfirmed || !doorUpperConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_DOOR_UNCONFIRMED");
+    if (doorStateBefore !== "closed")
+      incomplete("PROGRESSIVE_NAVIGATION_DOOR_NOT_CLOSED_BEFORE_MOVE");
+
+    await rcon.command(
+      `tp ${state.botName} ${start.x} ${start.y} ${start.z} 90 0`,
+    );
+    const rconBefore = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    const ownerBefore = parsePosition(
+      await rcon.command(`data get entity ${state.ownerName} Pos`),
+    );
+    const bodyReadyBy = Date.now() + 5_000;
+    let bodyBefore = await body.observe();
+    while (
+      Date.now() < bodyReadyBy &&
+      Math.hypot(
+        bodyBefore.self.position.x - start.x,
+        bodyBefore.self.position.y - start.y,
+        bodyBefore.self.position.z - start.z,
+      ) > 1.5
+    ) {
+      await waitMs(100);
+      bodyBefore = await body.observe();
+    }
+    if (
+      Math.hypot(
+        rconBefore.x - start.x,
+        rconBefore.y - start.y,
+        rconBefore.z - start.z,
+      ) > 1.5
+    )
+      incomplete("PROGRESSIVE_NAVIGATION_RCON_START_NOT_CONFIRMED");
+    if (
+      Math.hypot(
+        bodyBefore.self.position.x - start.x,
+        bodyBefore.self.position.y - start.y,
+        bodyBefore.self.position.z - start.z,
+      ) > 1.5
+    )
+      incomplete("PROGRESSIVE_NAVIGATION_BODY_START_NOT_CONFIRMED");
+    const bodyDistanceBefore = Math.hypot(
+      bodyBefore.self.position.x - ownerBefore.x,
+      bodyBefore.self.position.y - ownerBefore.y,
+      bodyBefore.self.position.z - ownerBefore.z,
+    );
+    const rconDistanceBefore = Math.hypot(
+      rconBefore.x - ownerBefore.x,
+      rconBefore.y - ownerBefore.y,
+      rconBefore.z - ownerBefore.z,
+    );
+    update({
+      progressiveNavigationBodySideBefore: progressiveNavigationSide(
+        bodyBefore.self.position,
+        door.x,
+      ),
+      progressiveNavigationRconSideBefore: progressiveNavigationSide(
+        rconBefore,
+        door.x,
+      ),
+      progressiveNavigationBodyDistanceBefore: positionDistanceBucket(
+        bodyBefore.self.position,
+        ownerBefore,
+      ),
+      progressiveNavigationRconDistanceBefore: positionDistanceBucket(
+        rconBefore,
+        ownerBefore,
+      ),
+      progressiveNavigationStage: "move",
+    });
+    const move = await executeBodyMovePathProbe(
+      body,
+      { kind: "move_to", position: ownerBefore, range: 1 },
+      signal,
+      20_000,
+    );
+    const [bodyAfter, rconAfter] = await Promise.all([
+      body.observe(),
+      rcon.command(`data get entity ${state.botName} Pos`).then(parsePosition),
+    ]);
+    const ownerAfter = parsePosition(
+      await rcon.command(`data get entity ${state.ownerName} Pos`),
+    );
+    const doorStateAfter = await readProgressiveNavigationDoorState(
+      rcon,
+      door,
+      state.botName,
+    );
+    const bodyDistanceAfter = Math.hypot(
+      bodyAfter.self.position.x - ownerAfter.x,
+      bodyAfter.self.position.y - ownerAfter.y,
+      bodyAfter.self.position.z - ownerAfter.z,
+    );
+    const rconDistanceAfter = Math.hypot(
+      rconAfter.x - ownerAfter.x,
+      rconAfter.y - ownerAfter.y,
+      rconAfter.z - ownerAfter.z,
+    );
+    const bodyPassedDoor = bodyAfter.self.position.x < door.x - 0.5;
+    const rconPassedDoor = rconAfter.x < door.x - 0.5;
+    const routeConfirmed =
+      doorStateAfter !== "unknown" &&
+      move.status === "successful" &&
+      bodyPassedDoor &&
+      rconPassedDoor &&
+      bodyDistanceAfter <= 1.75 &&
+      rconDistanceAfter <= 1.75;
+    update({
+      progressiveNavigationDoorStateAfter: doorStateAfter,
+      progressiveNavigationBodySideAfter: progressiveNavigationSide(
+        bodyAfter.self.position,
+        door.x,
+      ),
+      progressiveNavigationRconSideAfter: progressiveNavigationSide(
+        rconAfter,
+        door.x,
+      ),
+      progressiveNavigationBodyDistanceAfter: positionDistanceBucket(
+        bodyAfter.self.position,
+        ownerAfter,
+      ),
+      progressiveNavigationRconDistanceAfter: positionDistanceBucket(
+        rconAfter,
+        ownerAfter,
+      ),
+      progressiveNavigationBodyDistanceReduced:
+        bodyDistanceBefore - bodyDistanceAfter >= 1.5,
+      progressiveNavigationRconDistanceReduced:
+        rconDistanceBefore - rconDistanceAfter >= 1.5,
+      progressiveNavigationMoveStatus: move.status,
+      progressiveNavigationMoveErrorClass: move.errorClass,
+      progressiveNavigationPathStatus: move.pathStatus,
+      progressiveNavigationPathUpdateCount: move.pathUpdateCount,
+      progressiveNavigationProbeDeadlineReached: move.probeDeadlineReached,
+      progressiveNavigationBodyPassedDoor: bodyPassedDoor,
+      progressiveNavigationRconPassedDoor: rconPassedDoor,
+      progressiveNavigationRouteConfirmed: routeConfirmed,
+    });
+    if (!routeConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_BODY_ROUTE_NOT_CONFIRMED");
+  } finally {
+    if (fixtureMutationStarted) {
+      update({ progressiveNavigationStage: "cleanup" });
+      const fixtureCleanupConfirmed = await (async () => {
+        try {
+          await rcon.command(
+            `fill ${door.x} 64 ${door.z - 1} ${Math.floor(start.x)} 69 ${door.z + 1} air`,
+          );
+          const cleanupCells = [
+            door,
+            { ...door, y: door.y + 1 },
+            ...stairBlocks,
+            ...supports,
+            ...platform,
+            { x: door.x + 2, y: 64, z: door.z - 1 },
+            { x: door.x + 2, y: 69, z: door.z - 1 },
+            { x: door.x + 2, y: 64, z: door.z + 1 },
+            { x: door.x + 2, y: 69, z: door.z + 1 },
+          ];
+          let cleared = true;
+          for (const position of cleanupCells) {
+            cleared = (await isBlock(rcon, position, "air")) && cleared;
+          }
+          return cleared;
+        } catch {
+          return false;
+        }
+      })();
+      const originalFixtureRestored = await (async () => {
+        try {
+          await configureHiddenContainer(rcon, spawn);
+          return (
+            (await isBlock(rcon, fixturePoint(spawn, 2, 0), "stone")) &&
+            (await isBlock(rcon, hiddenFixture.chest, "chest"))
+          );
+        } catch {
+          return false;
+        }
+      })();
+      update({
+        progressiveNavigationFixtureCleanupConfirmed: fixtureCleanupConfirmed,
+        progressiveNavigationOriginalFixtureRestored: originalFixtureRestored,
+        progressiveNavigationStage:
+          fixtureCleanupConfirmed && originalFixtureRestored
+            ? "complete"
+            : "cleanup",
+      });
+      if (!fixtureCleanupConfirmed || !originalFixtureRestored)
+        incomplete("PROGRESSIVE_NAVIGATION_FIXTURE_CLEANUP_UNCONFIRMED");
+    }
+  }
+}
+
+function progressiveNavigationSide(
+  position: Position,
+  doorX: number,
+): "owner_side" | "doorway" | "return_side" {
+  if (position.x < doorX - 0.5) return "owner_side";
+  if (position.x > doorX + 0.5) return "return_side";
+  return "doorway";
+}
+
+async function readProgressiveNavigationDoorState(
+  rcon: LocalRcon,
+  door: BlockPosition,
+  botName: string,
+): Promise<ProgressiveNavigationDoorState> {
+  const closed = await rcon.command(
+    `execute if block ${door.x} ${door.y} ${door.z} minecraft:oak_door[open=false] run data get entity ${botName} Pos`,
+  );
+  const open = await rcon.command(
+    `execute if block ${door.x} ${door.y} ${door.z} minecraft:oak_door[open=true] run data get entity ${botName} Pos`,
+  );
+  const containsPosition = (reply: string): boolean =>
+    /\[\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*\]/u.test(
+      reply,
+    );
+  const closedConfirmed = containsPosition(closed);
+  const openConfirmed = containsPosition(open);
+  if (closedConfirmed === openConfirmed) return "unknown";
+  return closedConfirmed ? "closed" : "open";
 }
 
 async function runUnknownReturnPathProbe(
