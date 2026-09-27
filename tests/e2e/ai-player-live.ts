@@ -1626,6 +1626,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     state.damageResponseCleanupFailureCode !== undefined
       ? { cleanupFailureCode: state.damageResponseCleanupFailureCode }
       : {}),
+    ...(caseId === "damage_response"
+      ? (state.damageResponseFailureDiagnostic ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2332,6 +2335,12 @@ interface RunState {
   parallelDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
   damageResponseCleanupFailureCode?: string;
+  damageResponseFailureDiagnostic?: {
+    readonly damageResponseFreshPurposeCommitObserved: boolean;
+    readonly damageResponsePostDamageJudgment:
+      "candidate" | "other" | "not_observed" | "unknown";
+    readonly damageResponseLinkedSuccessfulOutcomeObserved: boolean;
+  };
   usageUncertain?: boolean;
   failureCode?: string;
   status?: Status;
@@ -4508,9 +4517,8 @@ async function main(): Promise<void> {
               );
             });
           };
-
-          const decided = await waitForPlayer(context, 150_000, (player) => {
-            const freshActivity = (player.recentAgentActivity ?? []).some(
+          const hasFreshPurposeCommit = (player: PlayerEvidence): boolean =>
+            (player.recentAgentActivity ?? []).some(
               (activity) =>
                 activity.role === "purpose" &&
                 !priorActivity.has(
@@ -4522,7 +4530,37 @@ async function main(): Promise<void> {
                     toolCall.resultClass === "ok",
                 ),
             );
-            return freshActivity && hasJudgmentLinkedOutcome(player);
+
+          const decided = await waitForPlayer(
+            context,
+            150_000,
+            (player) =>
+              hasFreshPurposeCommit(player) && hasJudgmentLinkedOutcome(player),
+          ).catch(async (error: unknown) => {
+            if (
+              error instanceof HarnessError &&
+              (error.code === "RUN_LLM_BUDGET_EXCEEDED" ||
+                error.code === "CASE_LLM_BUDGET_EXCEEDED")
+            ) {
+              try {
+                const player = playerOf(await collect(context.runtime.app));
+                state.damageResponseFailureDiagnostic = {
+                  damageResponseFreshPurposeCommitObserved:
+                    hasFreshPurposeCommit(player),
+                  damageResponsePostDamageJudgment:
+                    classifyDamageResponsePostDamageJudgment(
+                      player.recentJudgments,
+                      priorJudgments,
+                      damageAppliedAt,
+                    ),
+                  damageResponseLinkedSuccessfulOutcomeObserved:
+                    hasJudgmentLinkedOutcome(player),
+                };
+              } catch {
+                // Preserve the budget failure if diagnostic collection fails.
+              }
+            }
+            throw error;
           });
           if (!hasJudgmentLinkedOutcome(decided))
             incomplete("DAMAGE_RESPONSE_BODY_OUTCOME_NOT_CONFIRMED");
@@ -8108,6 +8146,51 @@ async function rconActiveEffectsState(
     .command(`data get entity ${botName} active_effects`)
     .catch(() => "");
   return classifyRconActiveEffectsReply(reply);
+}
+
+const DAMAGE_RESPONSE_CANDIDATE_OPERATIONS = new Set([
+  "look_sweep",
+  "consume",
+  "equip",
+  "move_to",
+  "move_relative",
+]);
+
+export function classifyDamageResponsePostDamageJudgment(
+  judgments: PlayerEvidence["recentJudgments"],
+  priorJudgments: ReadonlySet<string>,
+  damageAppliedAt: number,
+): "candidate" | "other" | "not_observed" | "unknown" {
+  const fresh = judgments.filter(
+    (judgment) =>
+      !priorJudgments.has(
+        `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+      ),
+  );
+  const postDamage = fresh.filter((judgment) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    return Number.isFinite(decidedAt) && decidedAt >= damageAppliedAt;
+  });
+  if (
+    postDamage.some((judgment) =>
+      DAMAGE_RESPONSE_CANDIDATE_OPERATIONS.has(
+        safeOperationKind(judgment.operationKind) ?? "",
+      ),
+    )
+  )
+    return "candidate";
+  if (
+    fresh.some((judgment) => {
+      const decidedAt = Date.parse(judgment.decidedAt ?? "");
+      return (
+        !Number.isFinite(decidedAt) ||
+        (decidedAt >= damageAppliedAt &&
+          safeOperationKind(judgment.operationKind) === undefined)
+      );
+    })
+  )
+    return "unknown";
+  return postDamage.length > 0 ? "other" : "not_observed";
 }
 
 export function classifyRconActiveEffectsReply(

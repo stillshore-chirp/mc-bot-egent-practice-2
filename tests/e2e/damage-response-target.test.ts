@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DAMAGE_RESPONSE_CASE_BUDGET,
+  classifyDamageResponsePostDamageJudgment,
   classifyRconActiveEffectsReply,
   damageResponseCleanupDisposition,
   runBudgetCoversCase,
@@ -49,6 +50,39 @@ describe("damage response targeted E2E case", () => {
 });
 
 describe("damage response fixture diagnostics", () => {
+  it("classifies only fresh post-damage judgments as candidate or other", () => {
+    const damageAppliedAt = Date.parse("2026-09-28T12:00:00.000Z");
+    const classify = (
+      operationKind?: string,
+      decidedAt?: string,
+      prior = new Set<string>(),
+    ) =>
+      classifyDamageResponsePostDamageJudgment(
+        [
+          {
+            revision: 1,
+            ...(operationKind === undefined ? {} : { operationKind }),
+            ...(decidedAt === undefined ? {} : { decidedAt }),
+          },
+        ],
+        prior,
+        damageAppliedAt,
+      );
+    expect(classify("consume", "2026-09-28T12:01:00.000Z")).toBe("candidate");
+    expect(classify("dig", "2026-09-28T12:01:00.000Z")).toBe("other");
+    expect(classify("consume", "2026-09-28T11:59:00.000Z")).toBe(
+      "not_observed",
+    );
+    expect(classify("consume")).toBe("unknown");
+    expect(
+      classify(
+        "consume",
+        "2026-09-28T12:01:00.000Z",
+        new Set(["1:2026-09-28T12:01:00.000Z"]),
+      ),
+    ).toBe("not_observed");
+  });
+
   it("recognizes the known no-effects reply and keeps other replies unknown", () => {
     expect(
       classifyRconActiveEffectsReply(
