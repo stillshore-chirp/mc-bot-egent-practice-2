@@ -111,8 +111,17 @@ export class ReturnToPlayerSkill implements Skill<
         const player = final.players.find(
           (candidate) => candidate.username === input.username,
         );
+        if (player === undefined || player.distance > input.range) {
+          throw new AppError({
+            category: "observation",
+            code: "RETURN_NOT_VERIFIED",
+            message: "Return position could not be verified",
+            retryable: true,
+            failedAt: "return_to_player",
+          });
+        }
         return {
-          distance: player?.distance ?? Number.POSITIVE_INFINITY,
+          distance: player.distance,
           usedDescent,
           predictedMaxDamage,
           healthBefore: initial.health,

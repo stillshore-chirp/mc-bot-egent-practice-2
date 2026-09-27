@@ -109,6 +109,65 @@ describe("CompanionGameController", () => {
     }
   });
 
+  it.each([5, 6])(
+    "keeps the task and report consistent when the owner disappears at observation %i",
+    async (vanishAt) => {
+      class VanishingOwnerMinecraft extends FakeMinecraft {
+        private observationCount = 0;
+
+        public override async observe() {
+          this.observationCount += 1;
+          if (this.observationCount === vanishAt) {
+            this.snapshot = { ...this.snapshot, players: [] };
+          }
+          return super.observe();
+        }
+      }
+
+      const minecraft = new VanishingOwnerMinecraft(
+        createSnapshot({
+          players: [
+            {
+              username: "owner",
+              position: { x: 0, y: 64, z: 0 },
+              distance: 0,
+            },
+          ],
+        }),
+      );
+      const { game, tasks, close } = createController(minecraft);
+      try {
+        const report = await game.returnToOwner(
+          3,
+          new AbortController().signal,
+        );
+
+        const disappearedBeforeTaskCompletion = vanishAt === 5;
+        expect(report.outcome).toBe(
+          disappearedBeforeTaskCompletion ? "failed" : "completed",
+        );
+        expect(report.failureCode).toBe(
+          disappearedBeforeTaskCompletion ? "RETURN_NOT_VERIFIED" : undefined,
+        );
+        if (disappearedBeforeTaskCompletion) {
+          expect(tasks.current?.status).toBe("failed");
+          expect(report.summary).not.toContain("戻りました");
+        } else {
+          expect(tasks.current?.status).toBe("completed");
+          expect(report.confirmedState).toMatchObject({
+            distanceAtCompletion: 0,
+            ownerCurrentlyObserved: false,
+            ownerCurrentlyWithinSafeDistance: false,
+          });
+          expect(report.summary).toContain("現在の距離は未確認です。");
+          expect(report.summary).not.toContain("現在位置へ戻りました");
+        }
+      } finally {
+        close();
+      }
+    },
+  );
+
   it("explains a refused high-place return without exposing an internal error name", async () => {
     class UnsafeLandingMinecraft extends FakeMinecraft {
       public override async moveToWithSafeDescent(
