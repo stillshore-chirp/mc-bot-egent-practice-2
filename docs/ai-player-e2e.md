@@ -6,6 +6,12 @@
 
 各必須動作は隔離Paperと実GPTを使い、ゲーム内結果で判定します。各部分runは独立したruntime・DBを持ち、そのrun内で複数能力の接続を確認します。複数runは重なりのある能力証拠で統合を支えますが、run間のDB永続性は主張しません。全caseを一度の長時間runで連続passさせる耐久評価は #76、開始時に遮蔽された目標の探索は #77 で扱います。
 
+## Issue #91の0-call fixture確認
+
+`AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY=YES` は、既定applicationを起動せずに隔離Paper上のfixtureだけを確認します。通常の隔離jar・EULA設定を用意し、`AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts` で実行します。probe用Body clientが接続した後、全inventoryを空にし、hunger effectでFoodを12〜15へ下げ、effect cleanupを確認してから一度だけdamageを適用します。BodyとRCONがHealth 1〜6、Food 12〜15、空inventoryをそれぞれ確認した時だけcaseをpassにします。Health/Foodのbaseline、effect状態、inventoryのいずれかを読み戻せない場合は固定codeで未完了にし、値を推測しません。fixture中はnatural regenerationを無効にしますが、probe終了時には隔離worldごと削除します。artifactには固定booleanとHealth/Foodの数値だけを残します。
+
+このprobeでは実GPT、既定runtime、Purpose判断を実行しません。したがって証明するのはfixture準備と独立readbackだけで、接続後のno-food時の判断、失敗したconsumeの反復抑制、代案・理由付きwait、再評価契機の受け入れには数えません。
+
 新しい既定経路と責務の境界は[自律プレイヤー](autonomous-player.md)、操作・可視範囲の契約は[プレイヤー操作アダプター](player-body.md)、判断に使うゲーム内知識は[MC Bot Skills](mc-bot-skills.md)を参照してください。
 
 ## 隔離と公開境界

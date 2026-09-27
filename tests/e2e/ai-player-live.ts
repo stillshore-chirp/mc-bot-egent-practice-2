@@ -540,7 +540,8 @@ interface ReturnPathProbeDiagnostic {
 function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES"
   );
 }
 
@@ -2603,6 +2604,21 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES") {
+      const fixture = await runCase(
+        state,
+        "no_food_fixture_probe",
+        120_000,
+        0,
+        0,
+        () => prepareNoFoodFixtureProbe(state, rcon),
+      );
+      state.status = fixture.status;
+      if (fixture.status !== "pass")
+        state.failureCode ??=
+          fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+      return;
+    }
     const owner = await connectPublicClient(state.serverPort, state.ownerName);
     ownerForCleanup = owner;
     const guest = await connectPublicClient(state.serverPort, state.guestName);
@@ -6095,10 +6111,12 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  if (
-    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
-  ) {
+  const selectedNoGptProbeCount = [
+    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY,
+  ].filter((value) => value === "YES").length;
+  if (selectedNoGptProbeCount > 1) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
@@ -6497,6 +6515,173 @@ async function assertNoOperators(state: RunState): Promise<void> {
   ) as unknown;
   if (!Array.isArray(ops) || ops.length !== 0)
     fail("ISOLATED_SERVER_HAS_OPERATOR");
+}
+
+async function prepareNoFoodFixtureProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<Readonly<Record<string, string | number | boolean>>> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("no-food fixture probe deadline")),
+    110_000,
+  );
+  let body: ReturnType<typeof client.createPlayerBody> | undefined;
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    await rcon.command(`tp ${state.botName} 0.5 64 0.5 0 0`);
+    const baselineBody = await body.observe();
+    const baselineRconHealth = await rconEntityHealth(rcon, state.botName);
+    const baselineRconFood = await rconFoodLevel(rcon, state.botName);
+    if (
+      baselineBody.self.health !== 20 ||
+      baselineBody.self.food !== 20 ||
+      baselineRconHealth !== 20 ||
+      baselineRconFood !== 20
+    )
+      incomplete("NO_FOOD_FIXTURE_FULL_BASELINE_NOT_CONFIRMED");
+
+    const effectsBaseline = await rconActiveEffectsState(rcon, state.botName);
+    if (effectsBaseline === "unknown")
+      incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_UNAVAILABLE");
+    if (effectsBaseline === "active") {
+      await rcon.command(`effect clear ${state.botName}`);
+      if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+        incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_NOT_CLEARED");
+    }
+
+    await rcon.command(`clear ${state.botName}`);
+    await rcon.command(
+      `effect give ${state.botName} minecraft:hunger 120 8 true`,
+    );
+    if (!(await rconHasActiveEffect(rcon, state.botName, "hunger")))
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_NOT_CONFIRMED");
+    const foodDeadline = Date.now() + 60_000;
+    let preparedFood = await rconFoodLevel(rcon, state.botName);
+    while (preparedFood > 15 && Date.now() < foodDeadline) {
+      await waitMs(250);
+      preparedFood = await rconFoodLevel(rcon, state.botName);
+    }
+    if (preparedFood < 12 || preparedFood > 15)
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED");
+    await rcon.command(`effect clear ${state.botName} minecraft:hunger`);
+    if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+
+    await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
+    await rcon.command(`damage ${state.botName} 14 minecraft:generic`);
+    const healthDeadline = Date.now() + 3_000;
+    let finalBody = await body.observe();
+    let bodyHealth = finalBody.self.health;
+    let rconHealth: number | null = null;
+    while (Date.now() < healthDeadline) {
+      try {
+        rconHealth = await rconEntityHealth(
+          rcon,
+          state.botName,
+          Math.max(1, Math.min(500, healthDeadline - Date.now())),
+        );
+      } catch {
+        rconHealth = null;
+      }
+      try {
+        finalBody = await body.observe();
+        bodyHealth = finalBody.self.health;
+      } catch {
+        bodyHealth = null;
+      }
+      if (
+        typeof bodyHealth === "number" &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6
+      )
+        break;
+      await waitMs(100);
+    }
+    const bodyFood = finalBody.self.food;
+    const rconFood = await rconFoodLevel(rcon, state.botName);
+    const bodyInventoryItemCount = finalBody.self.inventory.reduce(
+      (total, item) => total + item.count,
+      0,
+    );
+    const bodyEquipmentEmpty = Object.values(finalBody.self.equipment).every(
+      (item) => item === null,
+    );
+    const rconInventoryEmpty = await rconInventoryIsEmpty(rcon, state.botName);
+    if (
+      typeof bodyHealth !== "number" ||
+      bodyHealth <= 0 ||
+      bodyHealth > 6 ||
+      rconHealth === null ||
+      rconHealth <= 0 ||
+      rconHealth > 6
+    )
+      incomplete("NO_FOOD_FIXTURE_LOW_HEALTH_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      typeof bodyFood !== "number" ||
+      bodyFood < 12 ||
+      bodyFood > 15 ||
+      rconFood < 12 ||
+      rconFood > 15 ||
+      bodyFood !== rconFood
+    )
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      bodyInventoryItemCount !== 0 ||
+      !bodyEquipmentEmpty ||
+      !rconInventoryEmpty
+    )
+      incomplete(
+        "NO_FOOD_FIXTURE_EMPTY_INVENTORY_NOT_CONFIRMED_BY_BOTH_ORACLES",
+      );
+
+    return {
+      applicationStarted: false,
+      purposeDecisionStarted: false,
+      llmCalls: 0,
+      baselineBodyHealth: baselineBody.self.health,
+      baselineRconHealth,
+      baselineBodyFood: baselineBody.self.food,
+      baselineRconFood,
+      bodyHealth,
+      rconHealth,
+      bodyFood,
+      rconFood,
+      bodyInventoryItemCount,
+      bodyEquipmentEmpty,
+      rconInventoryEmpty,
+      hungerEffectCleanupConfirmed: true,
+      naturalRegenerationDisabled: true,
+    };
+  } finally {
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("no_food_fixture_probe").catch(() => undefined);
+  }
 }
 
 async function runOperationSmoke(
@@ -8082,6 +8267,16 @@ async function rconInventoryItemCount(
   return count;
 }
 
+async function rconInventoryIsEmpty(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<boolean> {
+  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  if (!/\[\s*\]\s*$/u.test(inventory.trim()))
+    incomplete("NO_FOOD_FIXTURE_RCON_INVENTORY_NOT_EMPTY_OR_UNAVAILABLE");
+  return true;
+}
+
 async function rconFoodLevel(
   rcon: LocalRcon,
   botName: string,
@@ -8785,6 +8980,7 @@ async function runCase(
       error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
+      id !== "no_food_fixture_probe" &&
       (/BUDGET|DEADLINE/u.test(reason) ||
         delta.usageUnknownCalls > 0 ||
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
@@ -10244,7 +10440,8 @@ async function writeArtifact(state: RunState): Promise<void> {
       seed: state.seed,
       seedIsSynthetic: true,
       fixture: state.worldFixture,
-      nonOperatorClients: 3,
+      nonOperatorClients:
+        process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ? 1 : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
