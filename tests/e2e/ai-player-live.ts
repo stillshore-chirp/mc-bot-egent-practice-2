@@ -283,6 +283,20 @@ interface GatherMultiTargetFixture {
   readonly oakLog: BlockPosition;
   readonly birchLog: BlockPosition;
 }
+interface GatherBodyVisibilityProbeDiagnostic {
+  clientConnected: boolean;
+  fixtureSitePreflightConfirmed: boolean;
+  fixtureSupportBlocksConfirmed: boolean;
+  fixtureBlocksRconConfirmed: boolean;
+  orientationConfirmed: boolean;
+  freshBodyObservationObserved: boolean;
+  oakTargetVisibleInBody: boolean;
+  birchTargetVisibleInBody: boolean;
+  bothTargetsVisibleInBody: boolean;
+  candidateSearchMayBeTruncated?: boolean;
+  fixtureCleanupAttempted: boolean;
+  fixtureCleanupConfirmed: boolean;
+}
 type LearningFixturePhase = "initial" | "reuse";
 type SkillExchangeStage =
   | "export_requested"
@@ -583,12 +597,21 @@ function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_GATHER_BODY_VISIBILITY_PROBE_ONLY === "YES"
   );
 }
 
 function isEquipmentRconProbeOnly(): boolean {
   return process.env.AI_PLAYER_E2E_EQUIPMENT_RCON_PROBE_ONLY === "YES";
+}
+
+function isGatherBodyVisibilityProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_GATHER_BODY_VISIBILITY_PROBE_ONLY === "YES";
+}
+
+function isSingleClientProbeOnly(): boolean {
+  return isEquipmentRconProbeOnly() || isGatherBodyVisibilityProbeOnly();
 }
 
 function classifyBodyMoveError(
@@ -2412,6 +2435,7 @@ interface RunState {
   learningReuseStage?: LearningReuseStage;
   learningReuseOwnerProposalRecorded?: boolean;
   gatherMultiTargetContinuityDiagnostic?: GatherMultiTargetContinuityDiagnostic;
+  gatherBodyVisibilityProbeDiagnostic?: GatherBodyVisibilityProbeDiagnostic;
   firstDigLearningDiagnostic?: FirstDigLearningDiagnostic;
   learningFixtureDiagnostic?: LearningFixtureDiagnostic;
   skillExchangeStage?: SkillExchangeStage;
@@ -2874,6 +2898,11 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (isGatherBodyVisibilityProbeOnly()) {
+      await runGatherBodyVisibilityProbe(state, rcon);
+      state.status = "pass";
+      return;
+    }
     if (isEquipmentRconProbeOnly()) {
       await runEquipmentRconProbe(state, rcon);
       state.status = "pass";
@@ -6723,6 +6752,14 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
+  if (
+    isGatherBodyVisibilityProbeOnly() &&
+    (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
+      process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+      isEquipmentRconProbeOnly())
+  ) {
+    incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
+  }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
@@ -6734,8 +6771,16 @@ async function prepareRun(): Promise<RunState> {
     incomplete("E2E_TARGET_CASE_INVALID");
   const targetCase =
     requestedTargetCase === undefined || requestedTargetCase.length === 0
-      ? undefined
+      ? isGatherBodyVisibilityProbeOnly()
+        ? "gather_multi_target_continuity"
+        : undefined
       : (requestedTargetCase as TargetableCase);
+  if (
+    isGatherBodyVisibilityProbeOnly() &&
+    targetCase !== "gather_multi_target_continuity"
+  ) {
+    incomplete("GATHER_BODY_VISIBILITY_PROBE_TARGET_CASE_MISMATCH");
+  }
   const serverJarValue = process.env.AI_PLAYER_E2E_SERVER_JAR;
   if (serverJarValue === undefined || serverJarValue.trim() === "")
     incomplete("SERVER_JAR_REQUIRED");
@@ -8060,6 +8105,142 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runGatherBodyVisibilityProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("gather visibility probe deadline")),
+    30_000,
+  );
+  let body: PlayerBody | undefined;
+  let fixture: GatherMultiTargetFixture | undefined;
+  const diagnostic: GatherBodyVisibilityProbeDiagnostic = {
+    clientConnected: false,
+    fixtureSitePreflightConfirmed: false,
+    fixtureSupportBlocksConfirmed: false,
+    fixtureBlocksRconConfirmed: false,
+    orientationConfirmed: false,
+    freshBodyObservationObserved: false,
+    oakTargetVisibleInBody: false,
+    birchTargetVisibleInBody: false,
+    bothTargetsVisibleInBody: false,
+    fixtureCleanupAttempted: false,
+    fixtureCleanupConfirmed: false,
+  };
+  state.gatherBodyVisibilityProbeDiagnostic = diagnostic;
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    diagnostic.clientConnected = true;
+
+    await removeAutonomousResourceFixture(rcon);
+    const origin = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    fixture = await availableGatherMultiTargetFixture(rcon, origin);
+    diagnostic.fixtureSitePreflightConfirmed = true;
+    const supportBlocksConfirmed = await Promise.all(
+      [fixture.oakLog, fixture.birchLog].map((target) =>
+        isBlock(rcon, { ...target, y: target.y - 1 }, PREPARED_FLOOR_BLOCK),
+      ),
+    ).then((results) => results.every(Boolean));
+    diagnostic.fixtureSupportBlocksConfirmed = supportBlocksConfirmed;
+    if (!supportBlocksConfirmed)
+      incomplete("GATHER_BODY_VISIBILITY_PROBE_SUPPORT_NOT_CONFIRMED");
+
+    await configureGatherMultiTargetFixture(rcon, state.botName, fixture);
+    diagnostic.fixtureBlocksRconConfirmed = true;
+    await rcon.command(
+      `tp ${state.botName} ${origin.x} ${origin.y} ${origin.z} 0 ${LEARNING_FIXTURE_PITCH}`,
+    );
+    const orientedPosition = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    const rotation = await readLearningFixtureRotation(rcon, state.botName);
+    const orientationConfirmed =
+      Math.hypot(
+        orientedPosition.x - origin.x,
+        orientedPosition.y - origin.y,
+        orientedPosition.z - origin.z,
+      ) <= 0.5 &&
+      rotation !== undefined &&
+      angularDistance(rotation.yaw, 0) <= 2 &&
+      Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) <= 2;
+    diagnostic.orientationConfirmed = orientationConfirmed;
+    if (!orientationConfirmed)
+      incomplete("GATHER_BODY_VISIBILITY_PROBE_ORIENTATION_NOT_CONFIRMED");
+
+    await waitMs(250);
+    const fixtureConfiguredAt = Date.now();
+    const observationDeadline = Date.now() + 5_000;
+    let observation: PlayerBodyObservation | undefined;
+    while (!abort.signal.aborted && Date.now() < observationDeadline) {
+      const candidate = await body.observe();
+      const observedAt = Date.parse(candidate.observedAt);
+      if (Number.isFinite(observedAt) && observedAt >= fixtureConfiguredAt) {
+        observation = candidate;
+        diagnostic.freshBodyObservationObserved = true;
+        break;
+      }
+      await waitMs(50);
+    }
+    if (observation !== undefined) {
+      const oakTargetVisibleInBody =
+        observedBlockName(observation, fixture.oakLog) === "oak_log";
+      const birchTargetVisibleInBody =
+        observedBlockName(observation, fixture.birchLog) === "birch_log";
+      diagnostic.oakTargetVisibleInBody = oakTargetVisibleInBody;
+      diagnostic.birchTargetVisibleInBody = birchTargetVisibleInBody;
+      diagnostic.bothTargetsVisibleInBody =
+        oakTargetVisibleInBody && birchTargetVisibleInBody;
+      diagnostic.candidateSearchMayBeTruncated =
+        observation.perception.candidateSearchMayBeTruncated;
+    }
+  } finally {
+    if (fixture !== undefined) {
+      diagnostic.fixtureCleanupAttempted = true;
+      try {
+        diagnostic.fixtureCleanupConfirmed =
+          await cleanupGatherMultiTargetFixture(rcon, state.botName, fixture);
+      } catch {
+        diagnostic.fixtureCleanupConfirmed = false;
+      }
+    }
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("gather_body_visibility_probe_finished");
+  }
+  if (!diagnostic.freshBodyObservationObserved)
+    incomplete("GATHER_BODY_VISIBILITY_PROBE_FRESH_OBSERVATION_UNAVAILABLE");
+  if (
+    !diagnostic.fixtureCleanupAttempted ||
+    !diagnostic.fixtureCleanupConfirmed
+  )
+    incomplete("GATHER_BODY_VISIBILITY_PROBE_CLEANUP_NOT_CONFIRMED");
 }
 
 async function runEquipmentRconProbe(
@@ -11446,7 +11627,7 @@ async function writeArtifact(state: RunState): Promise<void> {
       seed: state.seed,
       seedIsSynthetic: true,
       fixture: state.worldFixture,
-      nonOperatorClients: isEquipmentRconProbeOnly() ? 1 : 3,
+      nonOperatorClients: isSingleClientProbeOnly() ? 1 : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
@@ -11477,6 +11658,8 @@ async function writeArtifact(state: RunState): Promise<void> {
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
       gatherMultiTargetContinuity:
         state.gatherMultiTargetContinuityDiagnostic ?? null,
+      gatherMultiTargetBodyVisibilityProbe:
+        state.gatherBodyVisibilityProbeDiagnostic ?? null,
       armorCapability:
         state.armorCapabilityDiagnostic ??
         (state.targetCase === "armor_capability"
