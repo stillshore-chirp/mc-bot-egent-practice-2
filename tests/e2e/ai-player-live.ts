@@ -213,6 +213,9 @@ const UNKNOWN_OBSTACLE_READINESS_WINDOW_MS = 1_000;
 const UNKNOWN_OBSTACLE_READINESS_POLL_MS = 100;
 const UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS = 200;
 const UNKNOWN_POST_PICKUP_SAMPLE_LIMIT = 64;
+// Java yaw 180° faces -Z; Mineflayer maps it to the Body's yaw 0 radians.
+const GATHER_FIXTURE_JAVA_YAW = 180;
+const GATHER_FIXTURE_BODY_YAW_DEGREES = 0;
 const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
@@ -3849,7 +3852,7 @@ async function main(): Promise<void> {
             configuredFixture,
           );
           await context.rcon.command(
-            `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} 0 ${LEARNING_FIXTURE_PITCH}`,
+            `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
           );
           const orientedPosition = parsePosition(
             await context.rcon.command(
@@ -3867,7 +3870,7 @@ async function main(): Promise<void> {
               orientedPosition.z - origin.z,
             ) > 0.5 ||
             rotation === undefined ||
-            angularDistance(rotation.yaw, 0) > 2 ||
+            angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
             Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
           ) {
             incomplete("GATHER_MULTI_TARGET_ORIENTATION_NOT_CONFIRMED");
@@ -8425,7 +8428,7 @@ async function runGatherBodyVisibilityProbe(
     await configureGatherMultiTargetFixture(rcon, state.botName, fixture);
     diagnostic.fixtureBlocksRconConfirmed = true;
     await rcon.command(
-      `tp ${state.botName} ${origin.x} ${origin.y} ${origin.z} 0 ${LEARNING_FIXTURE_PITCH}`,
+      `tp ${state.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
     );
     const orientedPosition = parsePosition(
       await rcon.command(`data get entity ${state.botName} Pos`),
@@ -8438,7 +8441,7 @@ async function runGatherBodyVisibilityProbe(
         orientedPosition.z - origin.z,
       ) <= 0.5 &&
       rotation !== undefined &&
-      angularDistance(rotation.yaw, 0) <= 2 &&
+      angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) <= 2 &&
       Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) <= 2;
     diagnostic.orientationConfirmed = orientationConfirmed;
     if (!orientationConfirmed)
@@ -10699,7 +10702,7 @@ async function verifyUnknownFixtureSightline(
   rcon: LocalRcon,
   eye: Position,
   target: BlockPosition,
-  yaw: number,
+  bodyYawDegrees: number,
   fieldOfViewFailureCode: string,
   corridorFailureCode: string,
 ): Promise<void> {
@@ -10713,7 +10716,7 @@ async function verifyUnknownFixtureSightline(
   const dz = targetCenter.z - eye.z;
   const horizontalDistance = Math.hypot(dx, dz);
   const expectedYaw = (Math.atan2(-dx, -dz) * 180) / Math.PI;
-  const horizontalAngle = angularDistance(expectedYaw, yaw);
+  const horizontalAngle = angularDistance(expectedYaw, bodyYawDegrees);
   const verticalAngle = Math.abs(
     (Math.atan2(dy, horizontalDistance) * 180) / Math.PI,
   );
@@ -10951,7 +10954,7 @@ async function availableGatherMultiTargetFixture(
           rcon,
           { x: origin.x, y: origin.y + 1.62, z: origin.z },
           target,
-          0,
+          GATHER_FIXTURE_BODY_YAW_DEGREES,
           "GATHER_FIXTURE_TARGET_OUT_OF_VIEW",
           "GATHER_FIXTURE_TARGET_OCCLUDED",
         );
