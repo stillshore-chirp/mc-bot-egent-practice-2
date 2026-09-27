@@ -806,6 +806,8 @@ interface SafeApplicationStartDiagnostic {
 interface Counters {
   readonly llmCalls: number;
   readonly usageUnknownCalls: number;
+  readonly usageUnknownRequestErrorCalls: number;
+  readonly usageUnknownResponseUsageMissingCalls: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly latencyMs: number;
@@ -1439,6 +1441,8 @@ function playerOf(evidence: Evidence): PlayerEvidence {
   const counterFields = [
     "llmCalls",
     "usageUnknownCalls",
+    "usageUnknownRequestErrorCalls",
+    "usageUnknownResponseUsageMissingCalls",
     "inputTokens",
     "outputTokens",
     "latencyMs",
@@ -1473,6 +1477,12 @@ function countersOf(evidence: Evidence): Counters {
   return {
     llmCalls: positiveNumber(counters.llmCalls),
     usageUnknownCalls: positiveNumber(counters.usageUnknownCalls),
+    usageUnknownRequestErrorCalls: positiveNumber(
+      counters.usageUnknownRequestErrorCalls,
+    ),
+    usageUnknownResponseUsageMissingCalls: positiveNumber(
+      counters.usageUnknownResponseUsageMissingCalls,
+    ),
     inputTokens: positiveNumber(counters.inputTokens),
     outputTokens: positiveNumber(counters.outputTokens),
     latencyMs: positiveNumber(counters.latencyMs),
@@ -2057,6 +2067,16 @@ function subtractCounters(after: Counters, before: Counters): Counters {
       0,
       after.usageUnknownCalls - before.usageUnknownCalls,
     ),
+    usageUnknownRequestErrorCalls: Math.max(
+      0,
+      after.usageUnknownRequestErrorCalls -
+        before.usageUnknownRequestErrorCalls,
+    ),
+    usageUnknownResponseUsageMissingCalls: Math.max(
+      0,
+      after.usageUnknownResponseUsageMissingCalls -
+        before.usageUnknownResponseUsageMissingCalls,
+    ),
     inputTokens: Math.max(0, after.inputTokens - before.inputTokens),
     outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
     latencyMs: Math.max(0, after.latencyMs - before.latencyMs),
@@ -2065,6 +2085,18 @@ function subtractCounters(after: Counters, before: Counters): Counters {
       0,
       after.learningUpdates - before.learningUpdates,
     ),
+  };
+}
+
+function safeUsageUnknownReasonEvidence(
+  caseId: string,
+  counters: Counters,
+): SafeEvidence {
+  if (caseId !== "damage_response") return {};
+  return {
+    usageUnknownRequestErrorCalls: counters.usageUnknownRequestErrorCalls,
+    usageUnknownResponseUsageMissingCalls:
+      counters.usageUnknownResponseUsageMissingCalls,
   };
 }
 
@@ -8689,7 +8721,10 @@ async function runCase(
       latencyMs: delta.latencyMs,
       usageStatus:
         delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
-      evidence,
+      evidence: {
+        ...evidence,
+        ...safeUsageUnknownReasonEvidence(id, delta),
+      },
     };
     await retainCasePlayerSnapshot(
       state,
@@ -8781,6 +8816,7 @@ async function runCase(
         ...(id === "game_action_discretion" && /BUDGET|DEADLINE/u.test(reason)
           ? safeGameActionFailureEvidence(state, lastEvidence)
           : {}),
+        ...safeUsageUnknownReasonEvidence(id, delta),
       },
       reason,
     };
@@ -9687,6 +9723,8 @@ function zeroCounters(): Counters {
   return {
     llmCalls: 0,
     usageUnknownCalls: 0,
+    usageUnknownRequestErrorCalls: 0,
+    usageUnknownResponseUsageMissingCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,

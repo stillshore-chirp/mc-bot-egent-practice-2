@@ -269,6 +269,8 @@ export interface PlayerRuntimeSnapshot {
   readonly counters: {
     readonly llmCalls: number;
     readonly usageUnknownCalls: number;
+    readonly usageUnknownRequestErrorCalls: number;
+    readonly usageUnknownResponseUsageMissingCalls: number;
     readonly inputTokens: number;
     readonly outputTokens: number;
     readonly latencyMs: number;

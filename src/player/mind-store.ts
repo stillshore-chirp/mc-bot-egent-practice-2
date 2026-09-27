@@ -15,6 +15,7 @@ import {
   playerAgentToolNames,
   playerSkillLearningRejectionCodes,
   type PlayerAgentRoundActivity,
+  type PlayerAgentUsageUnknownReason,
 } from "./responses.js";
 import type {
   OwnerProposal,
@@ -319,6 +320,16 @@ const stateSchema = z
       .object({
         llmCalls: z.number().int().nonnegative(),
         usageUnknownCalls: z.number().int().nonnegative().default(0),
+        usageUnknownRequestErrorCalls: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(0),
+        usageUnknownResponseUsageMissingCalls: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(0),
         inputTokens: z.number().int().nonnegative(),
         outputTokens: z.number().int().nonnegative(),
         latencyMs: z.number().int().nonnegative(),
@@ -399,6 +410,8 @@ const initialState: StoredState = {
   counters: {
     llmCalls: 0,
     usageUnknownCalls: 0,
+    usageUnknownRequestErrorCalls: 0,
+    usageUnknownResponseUsageMissingCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
     latencyMs: 0,
@@ -1449,6 +1462,7 @@ export class PlayerMindStore {
     readonly latencyMs: number;
     readonly learningUpdate?: boolean;
     readonly usageUnknown?: boolean;
+    readonly usageUnknownReason?: PlayerAgentUsageUnknownReason;
   }): void {
     const transaction = this.database.transaction(() => {
       const current = this.readStored();
@@ -1461,6 +1475,18 @@ export class PlayerMindStore {
             usageUnknownCalls:
               current.counters.usageUnknownCalls +
               (metrics.usageUnknown === true ? 1 : 0),
+            usageUnknownRequestErrorCalls:
+              current.counters.usageUnknownRequestErrorCalls +
+              (metrics.usageUnknown === true &&
+              metrics.usageUnknownReason === "request_error"
+                ? 1
+                : 0),
+            usageUnknownResponseUsageMissingCalls:
+              current.counters.usageUnknownResponseUsageMissingCalls +
+              (metrics.usageUnknown === true &&
+              metrics.usageUnknownReason === "response_usage_missing"
+                ? 1
+                : 0),
             inputTokens:
               current.counters.inputTokens + nonnegative(metrics.inputTokens),
             outputTokens:
