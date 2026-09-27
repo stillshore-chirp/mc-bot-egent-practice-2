@@ -68,6 +68,11 @@ import {
 } from "./world-oracle.js";
 import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baseline.js";
 import {
+  createLlmCallAdmission,
+  LlmCallAdmissionError,
+  type LlmCallAdmission,
+} from "./llm-call-admission.js";
+import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   waitForRecoveryObstacleReadiness,
@@ -2260,6 +2265,7 @@ interface RunState {
   readonly startedAt: string;
   readonly seed: string;
   readonly runBudget: RunBudget;
+  llmAdmission?: LlmCallAdmission;
   readonly cases: SafeCaseResult[];
   readonly startedClock: number;
   readonly runDeadlineAt: number;
@@ -2564,7 +2570,7 @@ async function main(): Promise<void> {
     const { createApplication } = await import("../../src/app/application.js");
     restoreGameActionPlacementObservationProbe ??=
       installGameActionPlacementObservationProbe();
-    const activeApp = createApplication(config);
+    const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
     state.preStartPlayer = playerOf(preStartEvidence);
@@ -2953,7 +2959,10 @@ async function main(): Promise<void> {
         await context.runtime.app.shutdown("ai_player_e2e_memory_restart");
         const { createApplication } =
           await import("../../src/app/application.js");
-        const nextApp = createApplication(context.runtime.config);
+        const nextApp = createApplication(
+          context.runtime.config,
+          state.llmAdmission?.beforeCall,
+        );
         appForCleanup = nextApp;
         await connectApplication(nextApp, state);
         const restartedContext: CaseContext = {
@@ -5717,7 +5726,7 @@ async function prepareRun(): Promise<RunState> {
   const runSeed = WORLD_SEED;
   const worldFixture = "flat-platform-dry-wall-container-oak-v1";
   const startedClock = Date.now();
-  return {
+  const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
     startedAt: new Date().toISOString(),
@@ -5747,6 +5756,22 @@ async function prepareRun(): Promise<RunState> {
     privateServerLogStream: undefined,
     responses: [],
   };
+  const admission = createLlmCallAdmission(runBudget.llmCalls, (code) => {
+    state.failureCode ??= code;
+  });
+  state.llmAdmission = {
+    ...admission,
+    beforeCall: () => {
+      try {
+        admission.beforeCall();
+      } catch (error) {
+        if (error instanceof LlmCallAdmissionError)
+          throw new HarnessError("incomplete", error.code);
+        throw error;
+      }
+    },
+  };
+  return state;
 }
 
 async function startServer(state: RunState): Promise<void> {
@@ -7765,7 +7790,10 @@ async function stopAndRestartForUnknownCase(
   });
 
   const { createApplication } = await import("../../src/app/application.js");
-  const nextApp = createApplication(context.runtime.config);
+  const nextApp = createApplication(
+    context.runtime.config,
+    state.llmAdmission?.beforeCall,
+  );
   appForCleanup = nextApp;
   await connectApplication(nextApp, state);
   const restartedEvidence = await collect(nextApp);
@@ -7965,42 +7993,50 @@ async function recordCase(
     ([caseId]) => caseId === id,
   )?.[1];
   if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
-  return runCase(
-    state,
-    id,
-    deadlineMs,
-    caseBudget.llmCalls,
-    caseBudget.totalTokens,
-    async () => {
-      const baseline = countersOf(await collect(context.runtime.app));
-      const caseStarted = Date.now();
-      const caseContext: CaseContext = {
-        ...context,
-        usageAtStart: baseline,
-        runUsageAtStart: context.runUsageAtStart,
-        startedAt: caseStarted,
-        caseDeadlineAt: Math.min(caseStarted + deadlineMs, state.runDeadlineAt),
-        runBudget: state.runBudget,
-        caseBudget,
-      };
-      const measured = await runCaseBody(caseContext);
-      const finalUsage = countersOf(
-        await collect(requireLiveContext().runtime.app),
-      );
-      const delta = subtractCounters(finalUsage, baseline);
-      if (
-        delta.llmCalls > caseBudget.llmCalls ||
-        totalTokens(delta) > caseBudget.totalTokens
-      ) {
-        incomplete("CASE_LLM_BUDGET_EXCEEDED");
-      }
-      return {
-        ...measured,
-        llmCalls: delta.llmCalls,
-        tokens: totalTokens(delta),
-      };
-    },
-  );
+  state.llmAdmission?.beginCase(caseBudget.llmCalls);
+  try {
+    return await runCase(
+      state,
+      id,
+      deadlineMs,
+      caseBudget.llmCalls,
+      caseBudget.totalTokens,
+      async () => {
+        const baseline = countersOf(await collect(context.runtime.app));
+        const caseStarted = Date.now();
+        const caseContext: CaseContext = {
+          ...context,
+          usageAtStart: baseline,
+          runUsageAtStart: context.runUsageAtStart,
+          startedAt: caseStarted,
+          caseDeadlineAt: Math.min(
+            caseStarted + deadlineMs,
+            state.runDeadlineAt,
+          ),
+          runBudget: state.runBudget,
+          caseBudget,
+        };
+        const measured = await runCaseBody(caseContext);
+        const finalUsage = countersOf(
+          await collect(requireLiveContext().runtime.app),
+        );
+        const delta = subtractCounters(finalUsage, baseline);
+        if (
+          delta.llmCalls > caseBudget.llmCalls ||
+          totalTokens(delta) > caseBudget.totalTokens
+        ) {
+          incomplete("CASE_LLM_BUDGET_EXCEEDED");
+        }
+        return {
+          ...measured,
+          llmCalls: delta.llmCalls,
+          tokens: totalTokens(delta),
+        };
+      },
+    );
+  } finally {
+    state.llmAdmission?.endCase();
+  }
 }
 
 async function runCase(
@@ -8288,6 +8324,13 @@ async function observeForPlayer(
     context.runDeadlineAt,
   );
   while (Date.now() < deadline) {
+    const admissionFailure = currentRunState?.failureCode;
+    if (
+      admissionFailure === "RUN_LLM_BUDGET_EXCEEDED" ||
+      admissionFailure === "CASE_LLM_BUDGET_EXCEEDED"
+    ) {
+      incomplete(admissionFailure);
+    }
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
     const runDelta = subtractCounters(player.counters, context.runUsageAtStart);

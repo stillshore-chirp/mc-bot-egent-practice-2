@@ -304,6 +304,7 @@ export interface ConversationAgentOptions {
   readonly memory: PlayerMemoryPort;
   readonly logger: Logger;
   readonly trace?: TraceService;
+  readonly beforeCall?: () => void;
   readonly say: (text: string) => Promise<void>;
   readonly onProposal: () => void;
   readonly onStop: () => Promise<void>;
@@ -509,6 +510,9 @@ export class PlayerConversationAgent {
       tools,
       logger: this.options.logger,
       role: "conversation",
+      ...(this.options.beforeCall === undefined
+        ? {}
+        : { beforeCall: this.options.beforeCall }),
       initialObservationChars: safeSerializedLength(
         initial.lastObservation ?? null,
       ),
@@ -692,6 +696,7 @@ export interface PurposeAgentOptions {
   readonly ownerPlayerId: string;
   readonly logger: Logger;
   readonly trace?: TraceService;
+  readonly beforeCall?: () => void;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
   readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
   readonly onObservation?: (observation: PlayerBodyObservation) => void;
@@ -1326,6 +1331,9 @@ export class PlayerPurposeAgent {
             logger: this.options.logger,
             role: "purpose",
             maxRounds: 1,
+            ...(this.options.beforeCall === undefined
+              ? {}
+              : { beforeCall: this.options.beforeCall }),
             ...(this.options.trace === undefined
               ? {}
               : { trace: this.options.trace }),
@@ -1412,6 +1420,9 @@ export class PlayerPurposeAgent {
         tools: availableTools,
         logger: this.options.logger,
         role: "purpose",
+        ...(this.options.beforeCall === undefined
+          ? {}
+          : { beforeCall: this.options.beforeCall }),
         initialObservationChars: safeSerializedLength(decisionObservation),
         ...(this.options.trace === undefined
           ? {}
