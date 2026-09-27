@@ -558,6 +558,65 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it.each([
+    {
+      label: "matching post-operation slot",
+      status: "successful",
+      equipment: { head: observedStack("iron_helmet", 5) },
+      expected: "実行後、頭の装備欄にiron_helmetがあることを観測しました。",
+      unexpected: "原因は観測から特定できていません",
+    },
+    {
+      label: "different post-operation item",
+      status: "successful",
+      equipment: { head: observedStack("leather_helmet", 5) },
+      expected: "iron_helmetは確認できませんでした。",
+      unexpected: "実行後、頭の装備欄にiron_helmetがあることを観測しました",
+    },
+    {
+      label: "missing post-operation slot",
+      status: "unverified",
+      equipment: {},
+      expected: "実行後の頭の装備欄は観測できませんでした。",
+      unexpected: "装備操作は成功と判定されました",
+    },
+    {
+      label: "failed operation",
+      status: "failed",
+      equipment: { head: null },
+      expected: "装備操作は失敗しました。",
+      unexpected: "装備操作は成功と判定されました",
+    },
+  ] as const)("reports equip outcome from $label", async (scenario) => {
+    const fixture = createRuntimeFixture();
+    const before = observation();
+    fixture.body.setResultObservations(before, {
+      ...before,
+      self: { ...before.self, equipment: scenario.equipment },
+    });
+    const decision = action("equip-result", {
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+    });
+    if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive(scenario.status);
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toContain(scenario.expected);
+      expect(fixture.messages[0]).not.toContain(scenario.unexpected);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("preserves a non-meal owner resolution when consuming food as preparation", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -2739,6 +2798,23 @@ function makeLookSweepEvidence(): PlayerBodyLookSweep {
     complete: true,
     candidateSearchMayBeTruncated: false,
     worldAbsenceEstablished: false,
+  };
+}
+
+function observedStack(
+  name: string,
+  slot: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId: 1,
+    name,
+    count: 1,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
+    customName: null,
+    enchantments: [],
   };
 }
 
