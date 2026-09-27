@@ -285,6 +285,7 @@ export async function runPlayerAgent(
           } satisfies ResponseCreateParamsNonStreaming,
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(input.beforeCall === undefined ? {} : { maxRetries: 0 }),
           },
         );
       response =

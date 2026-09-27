@@ -94,6 +94,47 @@ describe("Responses server-side compaction", () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  it("disables SDK retries only for admission-budgeted requests", async () => {
+    const budgetedOptions: unknown[] = [];
+    const budgetedClient = {
+      responses: {
+        create: async (...args: unknown[]) => {
+          budgetedOptions.push(args[1]);
+          return terminalResponse("Done.");
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+    await runPlayerAgent({
+      client: budgetedClient,
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Input.",
+      tools: [],
+      logger: silentLogger(),
+      beforeCall: () => undefined,
+    });
+    expect(budgetedOptions[0]).toMatchObject({ maxRetries: 0 });
+
+    const ordinaryOptions: unknown[] = [];
+    const ordinaryClient = {
+      responses: {
+        create: async (...args: unknown[]) => {
+          ordinaryOptions.push(args[1]);
+          return terminalResponse("Done.");
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+    await runPlayerAgent({
+      client: ordinaryClient,
+      model: "test-model",
+      instructions: "Instructions.",
+      input: "Input.",
+      tools: [],
+      logger: silentLogger(),
+    });
+    expect(ordinaryOptions[0]).not.toHaveProperty("maxRetries");
+  });
+
   it("persists requests whose token usage was not returned", async () => {
     const mind = PlayerMindStore.open(":memory:");
     const requestError = new Error("TEST_REQUEST_INTERRUPTED");
