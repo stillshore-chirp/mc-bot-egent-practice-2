@@ -11035,6 +11035,17 @@ async function runGatherMultiTargetContinuityCase(
       baseline,
       requestedCounts,
     );
+    const progressExplanationStatus =
+      state.gatherMultiTargetDiagnostic?.gatherProgressExplanationStatus;
+    if (
+      progressExplanationStatus ===
+      "sampled_world_changed_pending_private_review"
+    )
+      incomplete(
+        "GATHER_MULTI_TARGET_PROGRESS_WORLD_CHANGED_PENDING_PRIVATE_REVIEW",
+      );
+    if (progressExplanationStatus === "sampled_pending_private_review")
+      incomplete("GATHER_MULTI_TARGET_PROGRESS_PRIVATE_REVIEW_PENDING");
 
     const requestGate = state.gatherMultiTargetRequestGate;
     if (requestGate === undefined)
