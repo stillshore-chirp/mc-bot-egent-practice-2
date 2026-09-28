@@ -198,9 +198,15 @@ const LEARNING_FIXTURE_PITCH = 15;
 const ROTATION_READ_MAX_ATTEMPTS = 3;
 const ROTATION_READ_RETRY_DELAY_MS = 100;
 export const DAMAGE_RESPONSE_CASE_BUDGET = {
-  llmCalls: 8,
-  totalTokens: 75_000,
+  llmCalls: 16,
+  totalTokens: 150_000,
 } as const;
+export function damageResponseObservationTimeoutMs(
+  caseDeadlineAt: number,
+  now = Date.now(),
+): number {
+  return Math.max(1, caseDeadlineAt - now);
+}
 export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
   llmCalls: 24,
   totalTokens: 160_000,
@@ -243,7 +249,7 @@ const CASE_DEADLINES = {
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
-  damage_response: 4 * 60_000,
+  damage_response: 8 * 60_000,
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
@@ -5955,7 +5961,7 @@ async function main(): Promise<void> {
 
           const decided = await waitForPlayer(
             context,
-            150_000,
+            damageResponseObservationTimeoutMs(context.caseDeadlineAt),
             (player) =>
               hasFreshPurposeCommit(player) && hasJudgmentLinkedOutcome(player),
           ).catch(async (error: unknown) => {
