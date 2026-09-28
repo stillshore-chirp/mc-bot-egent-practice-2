@@ -4032,6 +4032,7 @@ async function main(): Promise<void> {
     const ownerReturnRequestTracking = createOwnerReturnRequestTracking(
       state.targetCase,
       preStartCounters,
+      state.ownerReturnRequestGate,
     );
     if (ownerReturnRequestTracking !== undefined) {
       state.ownerReturnCaseUsageStart = ownerReturnRequestTracking.usageStart;
@@ -7657,6 +7658,9 @@ async function prepareRun(): Promise<RunState> {
   const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
+    ...(ownerReturnRequestGateEnabled(targetCase)
+      ? { ownerReturnRequestGate: new AcceptedProviderRequestGate() }
+      : {}),
     startedAt: new Date().toISOString(),
     seed: runSeed,
     runBudget,
@@ -7749,11 +7753,10 @@ async function prepareRun(): Promise<RunState> {
         admitNoFoodRequest();
         return;
       }
-      if (
-        ownerReturnRequestGateEnabled(state.targetCase) &&
-        state.ownerReturnRequestGate !== undefined
-      ) {
-        state.ownerReturnRequestGate.beforeCall(
+      if (ownerReturnRequestGateEnabled(state.targetCase)) {
+        admitOwnerReturnProviderRequest(
+          state.ownerReturnRequestGate,
+          OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
           () => {
             try {
               admission.beforeCall();
@@ -7763,11 +7766,10 @@ async function prepareRun(): Promise<RunState> {
               throw error;
             }
           },
-          () =>
-            new HarnessError(
-              "incomplete",
-              "OWNER_RETURN_REQUEST_ADMISSION_LATCHED",
-            ),
+          (code) => {
+            state.failureCode ??= code;
+            return new HarnessError("incomplete", code);
+          },
         );
         return;
       }
@@ -9272,9 +9274,56 @@ export function ownerReturnRequestGateEnabled(
   return targetCase === "owner_return_through_door";
 }
 
+export function ownerReturnCaseCallLimit(
+  targetCase: TargetableCase | undefined,
+  configuredCalls: number,
+  gate: Pick<AcceptedProviderRequestGate, "requestsStarted"> | undefined,
+): number | undefined {
+  if (!ownerReturnRequestGateEnabled(targetCase)) return configuredCalls;
+  if (
+    gate === undefined ||
+    !Number.isSafeInteger(configuredCalls) ||
+    configuredCalls < 0 ||
+    !Number.isSafeInteger(gate.requestsStarted) ||
+    gate.requestsStarted < 0
+  ) {
+    return undefined;
+  }
+  return Math.max(0, configuredCalls - gate.requestsStarted);
+}
+
+export type OwnerReturnRequestAdmissionErrorCode =
+  | "OWNER_RETURN_REQUEST_GATE_NOT_READY"
+  | "CASE_LLM_BUDGET_EXCEEDED"
+  | "OWNER_RETURN_REQUEST_ADMISSION_LATCHED";
+
+export function admitOwnerReturnProviderRequest(
+  gate: AcceptedProviderRequestGate | undefined,
+  caseCallLimit: number,
+  admit: () => void,
+  createError: (code: OwnerReturnRequestAdmissionErrorCode) => Error,
+): void {
+  if (
+    gate === undefined ||
+    !Number.isSafeInteger(caseCallLimit) ||
+    caseCallLimit < 1
+  ) {
+    throw createError("OWNER_RETURN_REQUEST_GATE_NOT_READY");
+  }
+  gate.beforeCall(
+    () => {
+      if (gate.requestsStarted >= caseCallLimit)
+        throw createError("CASE_LLM_BUDGET_EXCEEDED");
+      admit();
+    },
+    () => createError("OWNER_RETURN_REQUEST_ADMISSION_LATCHED"),
+  );
+}
+
 export function createOwnerReturnRequestTracking(
   targetCase: TargetableCase | undefined,
   preStartCounters: Counters,
+  existingGate?: AcceptedProviderRequestGate,
 ):
   | Readonly<{
       usageStart: Counters;
@@ -9284,7 +9333,7 @@ export function createOwnerReturnRequestTracking(
   if (!ownerReturnRequestGateEnabled(targetCase)) return undefined;
   return {
     usageStart: preStartCounters,
-    gate: new AcceptedProviderRequestGate(),
+    gate: existingGate ?? new AcceptedProviderRequestGate(),
   };
 }
 
@@ -11985,7 +12034,14 @@ async function recordCase(
     ([caseId]) => caseId === id,
   )?.[1];
   if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
-  state.llmAdmission?.beginCase(caseBudget.llmCalls);
+  const caseAdmissionLimit = ownerReturnCaseCallLimit(
+    state.targetCase,
+    caseBudget.llmCalls,
+    state.ownerReturnRequestGate,
+  );
+  if (caseAdmissionLimit === undefined)
+    incomplete("OWNER_RETURN_REQUEST_GATE_NOT_READY");
+  state.llmAdmission?.beginCase(caseAdmissionLimit);
   try {
     return await runCase(
       state,

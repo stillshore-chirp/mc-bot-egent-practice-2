@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  admitOwnerReturnProviderRequest,
   createOwnerReturnRequestSettlementOnce,
   createOwnerReturnApplicationWithBodyCapture,
   createOwnerReturnRequestTracking,
+  ownerReturnCaseCallLimit,
   ownerReturnProposalDisposition,
   isOwnerProposalProgressable,
   ownerReturnAcceptanceEvidenceConfirmed,
@@ -33,6 +35,7 @@ import {
   classifyAcceptedProviderRequestUsage,
   waitForAcceptedProviderRequestsSettled,
 } from "./no-food-replan-request-gate.js";
+import { createLlmCallAdmission } from "./llm-call-admission.js";
 
 describe("owner return through door targeted E2E case", () => {
   it("captures the Body created by the real application factory before startup", async () => {
@@ -158,13 +161,16 @@ describe("owner return through door targeted E2E case", () => {
       thoughts: 0,
       learningUpdates: 0,
     } satisfies Parameters<typeof createOwnerReturnRequestTracking>[1];
+    const startupGate = new AcceptedProviderRequestGate();
     const tracking = createOwnerReturnRequestTracking(
       "owner_return_through_door",
       preStartCounters,
+      startupGate,
     );
     if (tracking === undefined) throw new Error("OWNER_TRACKING_NOT_CREATED");
     expect(tracking.usageStart).toBe(preStartCounters);
     const gate = tracking.gate;
+    expect(gate).toBe(startupGate);
     gate.beforeCall(() => undefined);
 
     const recordedCallsAfterCaseStart = 1;
@@ -193,6 +199,77 @@ describe("owner return through door targeted E2E case", () => {
         caseTokenLimit: 160_000,
       }),
     ).toBe("settled");
+  });
+
+  it("counts startup admissions inside the owner target's total case call cap", () => {
+    const admitOwnerTargetCalls = (startupCalls: number): void => {
+      const gate = new AcceptedProviderRequestGate();
+      const admission = createLlmCallAdmission(48, () => undefined);
+      const baseAdmission = vi.fn(() => admission.beforeCall());
+      const beforeCall = (): void =>
+        admitOwnerReturnProviderRequest(
+          gate,
+          OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+          baseAdmission,
+          (code) => new Error(code),
+        );
+      for (let index = 0; index < startupCalls; index += 1) {
+        beforeCall();
+      }
+
+      const remainingCalls = ownerReturnCaseCallLimit(
+        "owner_return_through_door",
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+        gate,
+      );
+      expect(remainingCalls).toBe(24 - startupCalls);
+      if (remainingCalls === undefined)
+        throw new Error("OWNER_RETURN_CALL_LIMIT_NOT_AVAILABLE");
+
+      admission.beginCase(remainingCalls);
+      for (let index = 0; index < remainingCalls; index += 1) {
+        beforeCall();
+      }
+
+      expect(gate.requestsStarted).toBe(24);
+      expect(beforeCall).toThrow("CASE_LLM_BUDGET_EXCEEDED");
+      expect(gate.requestsStarted).toBe(24);
+      expect(baseAdmission).toHaveBeenCalledTimes(24);
+      admission.endCase();
+    };
+
+    admitOwnerTargetCalls(0);
+    admitOwnerTargetCalls(1);
+
+    const startupGate = new AcceptedProviderRequestGate();
+    const startupAdmission = createLlmCallAdmission(48, () => undefined);
+    const startupBaseAdmission = vi.fn(() => startupAdmission.beforeCall());
+    const admitStartupRequest = (): void =>
+      admitOwnerReturnProviderRequest(
+        startupGate,
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+        startupBaseAdmission,
+        (code) => new Error(code),
+      );
+    for (let index = 0; index < 24; index += 1) admitStartupRequest();
+    expect(startupGate.requestsStarted).toBe(24);
+    expect(admitStartupRequest).toThrow("CASE_LLM_BUDGET_EXCEEDED");
+    expect(startupGate.requestsStarted).toBe(24);
+    expect(startupBaseAdmission).toHaveBeenCalledTimes(24);
+
+    expect(ownerReturnCaseCallLimit("no_food_replan", 24, undefined)).toBe(24);
+    expect(ownerReturnCaseCallLimit(undefined, 24, undefined)).toBe(24);
+    expect(
+      ownerReturnCaseCallLimit("owner_return_through_door", 24, undefined),
+    ).toBeUndefined();
+    expect(() =>
+      admitOwnerReturnProviderRequest(
+        undefined,
+        24,
+        vi.fn(),
+        (code) => new Error(code),
+      ),
+    ).toThrow("OWNER_RETURN_REQUEST_GATE_NOT_READY");
   });
 
   it("uses the new owner case budget and deadline", () => {
