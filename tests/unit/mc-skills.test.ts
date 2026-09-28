@@ -79,6 +79,32 @@ function open(options: McSkillRepositoryOptions): McSkillRepository {
   return repository;
 }
 
+function importedLedgerCounts(
+  databasePath: string,
+  skillId: string,
+): { readonly receipts: number; readonly statistics: number } {
+  const database = new Database(databasePath, {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    const count = (
+      table: "mc_bot_skill_import_receipts" | "mc_bot_skill_import_statistics",
+    ): number => {
+      const row = database
+        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE skill_id = ?`)
+        .get(skillId) as { readonly count: number };
+      return row.count;
+    };
+    return {
+      receipts: count("mc_bot_skill_import_receipts"),
+      statistics: count("mc_bot_skill_import_statistics"),
+    };
+  } finally {
+    database.close();
+  }
+}
+
 function createDigSkill(
   repository: McSkillRepository,
   id = "sample-dig-skill",
@@ -886,9 +912,10 @@ describe("McSkillRepository", () => {
     expect(exported.content).toContain("```mc-bot-skill");
     expect(exported.content).toContain("## 本文");
 
+    const recipientDatabasePath = join(directory, "recipient.sqlite");
     const recipient = open({
       ...options,
-      databasePath: join(directory, "recipient.sqlite"),
+      databasePath: recipientDatabasePath,
     });
     const firstImport = recipient.importSkill(exported.fileName);
     expect(firstImport.idempotent).toBe(false);
@@ -905,7 +932,37 @@ describe("McSkillRepository", () => {
     expect(editedImport.skill.body).toContain("増えた時だけ");
     expect(editedImport.skill.nativeStatistics.successful).toBe(0);
     expect(editedImport.skill.importedStatistics).toHaveLength(1);
+    const skillBeforeDuplicate = recipient.get(skill.id);
+    const historyBeforeDuplicate = recipient.getHistory(skill.id);
+    const ledgerCountsBeforeDuplicate = importedLedgerCounts(
+      recipientDatabasePath,
+      skill.id,
+    );
+    expect(ledgerCountsBeforeDuplicate.receipts).toBeGreaterThan(0);
+    expect(ledgerCountsBeforeDuplicate.statistics).toBeGreaterThan(0);
+
     expect(recipient.importSkill(exported.fileName).idempotent).toBe(true);
+
+    const reopenedRecipient = open({
+      ...options,
+      databasePath: recipientDatabasePath,
+    });
+    const skillAfterDuplicate = reopenedRecipient.get(skill.id);
+    const historyAfterDuplicate = reopenedRecipient.getHistory(skill.id);
+    const ledgerCountsAfterDuplicate = importedLedgerCounts(
+      recipientDatabasePath,
+      skill.id,
+    );
+
+    expect(skillAfterDuplicate.version).toBe(skillBeforeDuplicate.version);
+    expect(historyAfterDuplicate).toEqual(historyBeforeDuplicate);
+    expect(skillAfterDuplicate.nativeStatistics).toEqual(
+      skillBeforeDuplicate.nativeStatistics,
+    );
+    expect(skillAfterDuplicate.importedStatistics).toEqual(
+      skillBeforeDuplicate.importedStatistics,
+    );
+    expect(ledgerCountsAfterDuplicate).toEqual(ledgerCountsBeforeDuplicate);
 
     const invalidExport = source.exportSkill(skill.id, "invalid-operation.md");
     updateMetadata(invalidExport.path, (metadata) => {
