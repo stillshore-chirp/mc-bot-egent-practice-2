@@ -60,6 +60,7 @@ export interface PlayerPurposePort {
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
     readonly shouldStopAfterResponse?: () => boolean;
+    readonly onResponsesRequestState?: (active: boolean) => void;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -95,6 +96,7 @@ export class PlayerRuntime {
   #activeBody: ActiveBodyRun | undefined;
   #activeThought: AbortController | undefined;
   #activeThoughtCommitted = false;
+  #activeResponsesRequest = false;
   #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
   #ownerProposalSettlementThought: AbortController | undefined;
   #pendingThoughtWake: PendingThoughtWake | undefined;
@@ -564,7 +566,12 @@ export class PlayerRuntime {
     if (activeThought !== undefined) {
       this.#queueThoughtWake(kind, reason);
       if (kind === "owner_proposal") {
-        this.#boundOwnerProposalSettlement(activeThought);
+        if (this.#activeResponsesRequest) {
+          this.#boundOwnerProposalSettlement(activeThought);
+        } else {
+          this.#clearOwnerProposalSettlement(activeThought);
+          activeThought.abort(new Error("owner_proposal_preempted_thought"));
+        }
       } else if (
         !this.#activeThoughtCommitted &&
         kind !== "body_outcome" &&
@@ -579,6 +586,7 @@ export class PlayerRuntime {
     const controller = new AbortController();
     this.#activeThought = controller;
     this.#activeThoughtCommitted = false;
+    this.#activeResponsesRequest = false;
     const events = this.options.mind.pendingEvents(32);
     let retry = false;
     void this.#traceCall("autonomous purpose thought", async () => {
@@ -600,6 +608,10 @@ export class PlayerRuntime {
           shouldStopAfterResponse: () =>
             this.#pendingThoughtWake?.kind === "body_outcome" ||
             this.#pendingThoughtWake?.kind === "owner_proposal",
+          onResponsesRequestState: (active) => {
+            if (this.#activeThought === controller)
+              this.#activeResponsesRequest = active;
+          },
         });
         if (
           !result.accepted &&
@@ -644,6 +656,7 @@ export class PlayerRuntime {
     this.#clearOwnerProposalSettlement(controller);
     this.#activeThought = undefined;
     this.#activeThoughtCommitted = false;
+    this.#activeResponsesRequest = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
       return;
@@ -886,6 +899,7 @@ export class PlayerRuntime {
   #cancelThought(reason: string): void {
     const thought = this.#activeThought;
     this.#clearOwnerProposalSettlement(thought);
+    this.#activeResponsesRequest = false;
     this.#pendingThoughtWake = undefined;
     this.#activeThoughtCommitted = false;
     thought?.abort(new Error(reason));

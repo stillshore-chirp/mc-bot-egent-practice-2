@@ -110,6 +110,84 @@ describe("player owner intent context", () => {
     },
   );
 
+  it("cancels a read-only body observation wait after an owner proposal", async () => {
+    let observationCount = 0;
+    let markToolObservationStarted!: () => void;
+    const toolObservationStarted = new Promise<void>((resolve) => {
+      markToolObservationStarted = resolve;
+    });
+    let resolvePendingObservation!: (
+      observation: PlayerBodyObservation,
+    ) => void;
+    const pendingObservation = new Promise<PlayerBodyObservation>((resolve) => {
+      resolvePendingObservation = resolve;
+    });
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      undefined,
+      async () => {
+        observationCount += 1;
+        if (observationCount === 1)
+          throw new Error("INITIAL_OBSERVATION_UNAVAILABLE");
+        markToolObservationStarted();
+        return pendingObservation;
+      },
+    );
+    fixture.responses.push(
+      functionCallResponse(
+        "owner-proposal-observe",
+        "observe_body",
+        {},
+        responseUsage(19, 7),
+      ),
+    );
+    const controller = new AbortController();
+    const requestStates: boolean[] = [];
+    let usageRecordedBeforeRequestSettled = false;
+
+    try {
+      const thought = fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        signal: controller.signal,
+        shouldStopAfterResponse: () => controller.signal.aborted,
+        onResponsesRequestState: (active) => {
+          requestStates.push(active);
+          if (!active) {
+            const recordedCall = fixture.calls.at(0);
+            usageRecordedBeforeRequestSettled =
+              recordedCall?.inputTokens === 19 &&
+              recordedCall.outputTokens === 7;
+          }
+        },
+      });
+      await toolObservationStarted;
+      fixture.mind.addProposal({
+        title: "Return to the owner",
+        reason: "The owner requested a new destination.",
+      });
+      controller.abort(new Error("owner_proposal_preempted_thought"));
+
+      await expect(thought).rejects.toThrow("owner_proposal_preempted_thought");
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.calls).toHaveLength(1);
+      expect(fixture.calls[0]).toMatchObject({
+        inputTokens: 19,
+        outputTokens: 7,
+      });
+      expect(requestStates).toEqual([true, false]);
+      expect(usageRecordedBeforeRequestSettled).toBe(true);
+      expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+        responseStatus: "completed",
+        processingStatus: "interrupted",
+      });
+    } finally {
+      resolvePendingObservation(bodyObservationFixture());
+      fixture.close();
+    }
+  });
+
   it("records owner proposal settlement timeout as unknown usage with its cause", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const controller = new AbortController();
@@ -1237,6 +1315,7 @@ function openPurposeFixture(
   memory: PlayerMemoryPort,
   ownerPositionExceptions: boolean[] = [],
   onRoundActivity?: (activity: PlayerAgentRoundActivity) => void,
+  observeBody?: PlayerBody["observe"],
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -1252,6 +1331,7 @@ function openPurposeFixture(
   const calls: Omit<PlayerAgentCallResult, "text">[] = [];
   const body = {
     observe: async (options?: { ownerPositionException?: boolean }) => {
+      if (observeBody !== undefined) return observeBody(options);
       const observation = bodyObservationFixture();
       if (options?.ownerPositionException === true) {
         ownerPositionExceptions.push(true);

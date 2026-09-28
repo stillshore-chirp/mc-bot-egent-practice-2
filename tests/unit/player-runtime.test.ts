@@ -1730,8 +1730,8 @@ describe("integrated player runtime", () => {
     }
   });
 
-  it.each(["response", "timeout"] as const)(
-    "settles an owner proposal thought on %s without overlapping or resetting its deadline",
+  it.each(["response", "timeout", "outside_http"] as const)(
+    "handles owner proposal thoughts in the %s phase without overlapping or resetting the deadline",
     async (settlement) => {
       const directory = temporaryDirectory();
       const databasePath = join(directory, "player.sqlite");
@@ -1768,6 +1768,7 @@ describe("integrated player runtime", () => {
             events,
             signal,
             shouldStopAfterResponse: isStale,
+            onResponsesRequestState,
           }) => {
             thoughtCount += 1;
             activeThoughts += 1;
@@ -1776,6 +1777,8 @@ describe("integrated player runtime", () => {
               if (thoughtCount === 1) {
                 firstSignal = signal;
                 shouldStopAfterResponse = isStale;
+                if (settlement !== "outside_http")
+                  onResponsesRequestState?.(true);
                 await Promise.race([
                   firstThoughtGate,
                   new Promise<void>((_resolve, reject) => {
@@ -1795,7 +1798,10 @@ describe("integrated player runtime", () => {
                       once: true,
                     });
                   }),
-                ]);
+                ]).finally(() => {
+                  if (settlement !== "outside_http")
+                    onResponsesRequestState?.(false);
+                });
                 return { accepted: false };
               }
               followupKinds = events.map(({ kind }) => kind);
@@ -1820,29 +1826,37 @@ describe("integrated player runtime", () => {
         mind.addProposal({ title: "Visit the village", reason: "Meet there" });
         runtime.onOwnerProposal();
 
-        expect(firstSignal?.aborted).toBe(false);
+        expect(firstSignal?.aborted).toBe(settlement === "outside_http");
         expect(shouldStopAfterResponse?.()).toBe(true);
         expect(thoughtCount).toBe(1);
         expect(maxActiveThoughts).toBe(1);
 
-        await vi.advanceTimersByTimeAsync(20_000);
-        mind.addProposal({
-          title: "Come to the owner",
-          reason: "Please come here",
-        });
-        runtime.onOwnerProposal();
-        if (settlement === "timeout") {
-          await vi.advanceTimersByTimeAsync(10_000);
+        if (settlement === "outside_http") {
           expect(firstSignal?.aborted).toBe(true);
           expect((firstSignal?.reason as Error).message).toBe(
-            "owner_proposal_settlement_timeout",
+            "owner_proposal_preempted_thought",
           );
-        } else {
-          expect(firstSignal?.aborted).toBe(false);
-          releaseFirstThought?.();
           await followupStarted;
-          await vi.advanceTimersByTimeAsync(30_000);
-          expect(firstSignal?.aborted).toBe(false);
+        } else {
+          await vi.advanceTimersByTimeAsync(20_000);
+          mind.addProposal({
+            title: "Come to the owner",
+            reason: "Please come here",
+          });
+          runtime.onOwnerProposal();
+          if (settlement === "timeout") {
+            await vi.advanceTimersByTimeAsync(10_000);
+            expect(firstSignal?.aborted).toBe(true);
+            expect((firstSignal?.reason as Error).message).toBe(
+              "owner_proposal_settlement_timeout",
+            );
+          } else {
+            expect(firstSignal?.aborted).toBe(false);
+            releaseFirstThought?.();
+            await followupStarted;
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(firstSignal?.aborted).toBe(false);
+          }
         }
         releaseFirstThought?.();
 
@@ -1850,7 +1864,11 @@ describe("integrated player runtime", () => {
         expect(thoughtCount).toBe(2);
         expect(maxActiveThoughts).toBe(1);
         expect(followupKinds).toContain("owner_proposal");
-        expect(followupProposalTitles).toContain("Come to the owner");
+        expect(followupProposalTitles).toContain(
+          settlement === "outside_http"
+            ? "Visit the village"
+            : "Come to the owner",
+        );
       } finally {
         releaseFirstThought?.();
         await runtime.shutdown();
@@ -2050,7 +2068,11 @@ describe("integrated player runtime", () => {
         handleOwnerMessage: async () => undefined,
       },
       purpose: {
-        think: async ({ snapshot, signal: currentSignal }) => {
+        think: async ({
+          snapshot,
+          signal: currentSignal,
+          onResponsesRequestState,
+        }) => {
           thoughtCount += 1;
           signal = currentSignal;
           if (thoughtCount === 1) {
@@ -2066,7 +2088,9 @@ describe("integrated player runtime", () => {
               );
             return { accepted: saved.accepted, decision };
           }
+          onResponsesRequestState?.(true);
           await thoughtGate;
+          onResponsesRequestState?.(false);
           return { accepted: false };
         },
       },
