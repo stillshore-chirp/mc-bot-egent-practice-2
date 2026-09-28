@@ -93,6 +93,43 @@ const maxRelatedLearningHypotheses = 6;
 const cachedOperationSchemaInstructionsPrefix =
   "以前に確認した操作schema（現在の定義）:\n";
 
+function waitForPurposeObservation<T>(
+  observation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal === undefined) return observation;
+  const abortReason = (): Error => {
+    const reason: unknown = signal.reason;
+    return reason instanceof Error
+      ? reason
+      : new Error("PLAYER_PURPOSE_THOUGHT_ABORTED");
+  };
+  if (signal.aborted) return Promise.reject(abortReason());
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => reject(abortReason()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    observation.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) =>
+        finish(() =>
+          reject(
+            error instanceof Error
+              ? error
+              : new Error("PLAYER_PURPOSE_OBSERVATION_FAILED"),
+          ),
+        ),
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
 function bodyOutcomeEventMatches(
   event: PlayerRuntimeEvent,
   outcome: PlayerRuntimeSnapshot["recentOutcomes"][number],
@@ -996,6 +1033,7 @@ export class PlayerPurposeAgent {
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
     readonly shouldStopAfterResponse?: () => boolean;
+    readonly onResponsesRequestState?: (active: boolean) => void;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -1057,9 +1095,11 @@ export class PlayerPurposeAgent {
         },
       });
     const learningTool = createLearningTool();
-    const bodyObservation = await this.options.body
-      .observe()
-      .catch(() => undefined);
+    input.signal?.throwIfAborted();
+    const bodyObservation = await waitForPurposeObservation(
+      this.options.body.observe(),
+      input.signal,
+    ).catch(() => undefined);
     if (bodyObservation !== undefined)
       this.options.onObservation?.(bodyObservation);
     const latest = this.options.mind.snapshot();
@@ -1074,7 +1114,11 @@ export class PlayerPurposeAgent {
           "現在の自分、手持ち、可視範囲を再観測する。通常観測では所有者の隠れた座標は返らない。",
         schema: observeInput,
         execute: async () => {
-          const observation = await this.options.body.observe();
+          input.signal?.throwIfAborted();
+          const observation = await waitForPurposeObservation(
+            this.options.body.observe(),
+            input.signal,
+          );
           bodyObservationForDecision.current = observation;
           this.options.onObservation?.(observation);
           return observation;
@@ -1106,9 +1150,11 @@ export class PlayerPurposeAgent {
               ))
           )
             return { ok: false, code: "PROPOSAL_NOT_PENDING" };
-          const observation = await this.options.body.observe({
-            ownerPositionException: true,
-          });
+          input.signal?.throwIfAborted();
+          const observation = await waitForPurposeObservation(
+            this.options.body.observe({ ownerPositionException: true }),
+            input.signal,
+          );
           this.options.onObservation?.(observation);
           return { purpose, observation };
         },
@@ -1374,9 +1420,11 @@ export class PlayerPurposeAgent {
             }
             let recoveryObservation = bodyObservationForDecision.current;
             if (value.expectedOutcome.startsWith("[death-recovery:")) {
-              recoveryObservation = await this.options.body
-                .observe()
-                .catch(() => undefined);
+              input.signal?.throwIfAborted();
+              recoveryObservation = await waitForPurposeObservation(
+                this.options.body.observe(),
+                input.signal,
+              ).catch(() => undefined);
               if (recoveryObservation !== undefined) {
                 bodyObservationForDecision.current = recoveryObservation;
                 this.options.onObservation?.(recoveryObservation);
@@ -1650,6 +1698,9 @@ export class PlayerPurposeAgent {
             ...(input.shouldStopAfterResponse === undefined
               ? {}
               : { shouldStopAfterResponse: input.shouldStopAfterResponse }),
+            ...(input.onResponsesRequestState === undefined
+              ? {}
+              : { onResponsesRequestState: input.onResponsesRequestState }),
             ...(this.options.onCall === undefined
               ? {}
               : { onCall: this.options.onCall }),
@@ -1752,6 +1803,9 @@ export class PlayerPurposeAgent {
         ...(input.shouldStopAfterResponse === undefined
           ? {}
           : { shouldStopAfterResponse: input.shouldStopAfterResponse }),
+        ...(input.onResponsesRequestState === undefined
+          ? {}
+          : { onResponsesRequestState: input.onResponsesRequestState }),
         shouldFinishAfterTool: (toolName, result) => {
           const outcome = asRecord(result);
           if (toolName !== "commit_action_decision") return false;

@@ -31,6 +31,89 @@ afterEach(() => {
 });
 
 describe("death recovery judgment policy", () => {
+  it("abandons a pending fresh validation observation when the thought is aborted", async () => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const anchor = { x: 10, y: 64, z: 0 };
+    let observationCount = 0;
+    let notifyDeathObservationStarted!: () => void;
+    let rejectPendingObservation: ((error: Error) => void) | undefined;
+    const deathObservationStarted = new Promise<void>((resolve) => {
+      notifyDeathObservationStarted = resolve;
+    });
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "death-validation-observation",
+          "commit_action_decision",
+          deathRecoveryActionArguments(deathAt, "approach", {
+            kind: "move_to",
+            position: anchor,
+            range: 1,
+          }),
+        ),
+      ],
+      () => {
+        observationCount += 1;
+        if (observationCount === 1)
+          return Promise.resolve(
+            bodyObservationFixture("2026-09-25T00:00:20.000Z"),
+          );
+        notifyDeathObservationStarted();
+        return new Promise<PlayerBodyObservation>((_resolve, reject) => {
+          rejectPendingObservation = reject;
+        });
+      },
+    );
+    const controller = new AbortController();
+    let thought: ReturnType<typeof fixture.agent.think> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      recordDeathScenario(
+        fixture.mind,
+        toObservationEvidence(
+          bodyObservationFixture("2026-09-25T00:00:00.000Z"),
+        ),
+        deathAt,
+        toObservationEvidence(
+          bodyObservationFixture("2026-09-25T00:00:08.000Z"),
+        ),
+      );
+      thought = fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        signal: controller.signal,
+      });
+      await deathObservationStarted;
+      controller.abort(new Error("TEST_THOUGHT_ABORTED"));
+
+      const settled = await Promise.race([
+        thought.then(
+          () => true,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 1_000);
+        }),
+      ]);
+      if (timeout !== undefined) clearTimeout(timeout);
+      expect(settled).toBe(true);
+      await expect(thought).rejects.toThrow("TEST_THOUGHT_ABORTED");
+      expect(observationCount).toBe(2);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
+      expect(
+        fixture.mind.snapshot().latestDeath?.recoveryStagesUsed,
+      ).toBeUndefined();
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      controller.abort(new Error("TEST_CLEANUP_ABORT"));
+      rejectPendingObservation?.(new Error("TEST_CLEANUP_OBSERVATION"));
+      await thought?.catch(() => undefined);
+      fixture.close();
+    }
+  });
+
   it("treats danger as Purpose context and permits a same-stage redecision after a new outcome and observation", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
     const anchor = { x: 10, y: 64, z: 0 };
