@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DAMAGE_RESPONSE_CASE_BUDGET,
+  damageResponseObservationTimeoutMs,
   classifyDamageResponsePostDamageJudgment,
   classifyRconActiveEffectsReply,
   damageResponseCleanupDisposition,
@@ -17,8 +18,8 @@ import {
 describe("damage response targeted E2E case", () => {
   it("keeps one bounded measurement within the run wrapper", () => {
     expect(DAMAGE_RESPONSE_CASE_BUDGET).toEqual({
-      llmCalls: 8,
-      totalTokens: 75_000,
+      llmCalls: 16,
+      totalTokens: 150_000,
     });
     expect(
       runBudgetCoversCase(
@@ -48,6 +49,13 @@ describe("damage response targeted E2E case", () => {
     ]) {
       expect(isCaseSelectedForTarget("damage_response", caseId)).toBe(false);
     }
+  });
+
+  it("bounds post-damage observation by the remaining case deadline", () => {
+    expect(damageResponseObservationTimeoutMs(480_000, 0)).toBe(480_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 330_000)).toBe(150_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 470_000)).toBe(10_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 480_000)).toBe(1);
   });
 });
 
