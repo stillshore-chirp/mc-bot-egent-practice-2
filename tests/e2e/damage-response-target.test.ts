@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DAMAGE_RESPONSE_CASE_BUDGET,
+  damageResponseObservationTimeoutMs,
   classifyDamageResponsePostDamageJudgment,
   classifyRconActiveEffectsReply,
   damageResponseCleanupDisposition,
@@ -48,6 +49,13 @@ describe("damage response targeted E2E case", () => {
     ]) {
       expect(isCaseSelectedForTarget("damage_response", caseId)).toBe(false);
     }
+  });
+
+  it("bounds post-damage observation by the remaining case deadline", () => {
+    expect(damageResponseObservationTimeoutMs(480_000, 0)).toBe(480_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 330_000)).toBe(150_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 470_000)).toBe(10_000);
+    expect(damageResponseObservationTimeoutMs(480_000, 480_000)).toBe(1);
   });
 });
 

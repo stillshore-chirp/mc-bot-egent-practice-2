@@ -201,6 +201,12 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   llmCalls: 16,
   totalTokens: 150_000,
 } as const;
+export function damageResponseObservationTimeoutMs(
+  caseDeadlineAt: number,
+  now = Date.now(),
+): number {
+  return Math.max(1, caseDeadlineAt - now);
+}
 export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
   llmCalls: 24,
   totalTokens: 160_000,
@@ -5955,7 +5961,7 @@ async function main(): Promise<void> {
 
           const decided = await waitForPlayer(
             context,
-            150_000,
+            damageResponseObservationTimeoutMs(context.caseDeadlineAt),
             (player) =>
               hasFreshPurposeCommit(player) && hasJudgmentLinkedOutcome(player),
           ).catch(async (error: unknown) => {
