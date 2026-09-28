@@ -5063,6 +5063,10 @@ async function main(): Promise<void> {
           beforeExport.proposals.map(({ id }) => id),
         );
         const exportedCandidateSkillIds = new Set<string>();
+        const exportedCandidateVersionsBySkillId = new Map<
+          string,
+          Set<number>
+        >();
         const exportResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
@@ -5101,6 +5105,19 @@ async function main(): Promise<void> {
             )
               return false;
             exportedCandidateSkillIds.add(activity.skillId);
+            if (
+              Number.isSafeInteger(activity.version) &&
+              activity.version > 0
+            ) {
+              const versions =
+                exportedCandidateVersionsBySkillId.get(activity.skillId) ??
+                new Set<number>();
+              versions.add(activity.version);
+              exportedCandidateVersionsBySkillId.set(
+                activity.skillId,
+                versions,
+              );
+            }
             return true;
           });
           return (
@@ -5114,6 +5131,8 @@ async function main(): Promise<void> {
         ).filter((file) => !beforeFiles.has(file));
         let exportedFile: string | undefined;
         let exportedSkillId: string | undefined;
+        let exportedSkillVersion: number | undefined;
+        let exportedSourceVersionUnmatched = false;
         for (const file of newFiles) {
           const markdown = await readFile(
             resolve(state.exchangeDirectory, file),
@@ -5138,13 +5157,43 @@ async function main(): Promise<void> {
             exchangeSkillIds.includes(skillId) &&
             exportedCandidateSkillIds.has(skillId)
           ) {
-            exportedFile = file;
-            exportedSkillId = skillId;
-            break;
+            const sourceVersion = isRecord(metadata)
+              ? metadata.sourceVersion
+              : undefined;
+            if (
+              typeof sourceVersion === "number" &&
+              Number.isSafeInteger(sourceVersion) &&
+              sourceVersion > 0 &&
+              exportedCandidateVersionsBySkillId
+                .get(skillId)
+                ?.has(sourceVersion)
+            ) {
+              exportedFile = file;
+              exportedSkillId = skillId;
+              exportedSkillVersion = sourceVersion;
+              break;
+            }
+            exportedSourceVersionUnmatched = true;
           }
         }
-        if (exportedFile === undefined || exportedSkillId === undefined)
+        if (exportedFile === undefined || exportedSkillId === undefined) {
+          if (exportedSourceVersionUnmatched) {
+            incomplete("SKILL_EXPORT_REVISION_NOT_CONFIRMED");
+          }
           fail("SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
+        }
+        const exportedSnapshot = readSkillSnapshot(state.databasePath);
+        const exportedRevisionReadBack =
+          exportedSkillVersion !== undefined &&
+          exportedSnapshot.revisionVersionsBySkill
+            .get(exportedSkillId)
+            ?.has(exportedSkillVersion) === true &&
+          exportedSnapshot.revisionDefinitionsBySkill
+            .get(exportedSkillId)
+            ?.has(exportedSkillVersion) === true;
+        if (!exportedRevisionReadBack) {
+          incomplete("SKILL_EXPORT_REVISION_NOT_CONFIRMED");
+        }
         state.skillExchangeStage = "export_confirmed";
         const filePath = resolve(state.exchangeDirectory, exportedFile);
         const exported = await readFile(filePath, "utf8");
@@ -5585,6 +5634,7 @@ async function main(): Promise<void> {
             repositorySeedFixtureUsed: standaloneSeedExchange,
             seedHasNoSuccessfulDerivedHypothesis: standaloneSeedExchange,
             markdownExportCreated: true,
+            sameExportedSkillRevisionConfirmed: true,
             humanConditionAndBodyEditImported: true,
             sameSkillRevisionAndImportReceiptReadBack: importedRevision,
             duplicateImportPreservedVersionMembershipDefinitionBodyAndPerSkillReceiptCount:
