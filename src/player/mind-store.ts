@@ -21,6 +21,7 @@ import type {
   OwnerProposal,
   PlayerGoal,
   PlayerGoalChange,
+  PlayerDeathRecoveryStage,
   PlayerProposalResolution,
   PlayerObservationEvidence,
   PlayerObservedDisplacement,
@@ -271,8 +272,15 @@ const deathMemorySchema = z
     observedAt: z.iso.datetime(),
     beforeObservation: observationSchema.optional(),
     firstPostDeathObservation: observationSchema.optional(),
+    recoveryStagesUsed: z
+      .array(z.enum(["approach", "sweep", "collect"]))
+      .max(3)
+      .optional(),
   })
   .strict();
+
+const deathRecoveryStageMarker =
+  /^\[death-recovery:([^\]]+):(approach|sweep|collect)\]/u;
 
 const stateSchema = z
   .object({
@@ -938,6 +946,21 @@ export class PlayerMindStore {
         resolutionChanged || input.goal !== undefined || understanding.changed;
       const nextRevision =
         current.revision + (stateChanged || actionChanged ? 1 : 0);
+      let latestDeath = current.latestDeath;
+      if (input.decision.kind === "act" && latestDeath !== undefined) {
+        const marker = deathRecoveryStageMarker.exec(
+          input.decision.expectedOutcome,
+        );
+        if (marker?.[1] === latestDeath.observedAt) {
+          const stage = marker[2] as PlayerDeathRecoveryStage;
+          const recoveryStagesUsed = latestDeath.recoveryStagesUsed ?? [];
+          if (!recoveryStagesUsed.includes(stage))
+            latestDeath = {
+              ...latestDeath,
+              recoveryStagesUsed: [...recoveryStagesUsed, stage],
+            };
+        }
+      }
       const judgment = {
         revision: nextRevision,
         decidedAt: now,
@@ -973,6 +996,7 @@ export class PlayerMindStore {
         purpose,
         goals,
         proposals,
+        ...(latestDeath === undefined ? {} : { latestDeath }),
         stateFacts: understanding.stateFacts,
         uncertainties: understanding.uncertainties,
         ...(activeOperation === undefined

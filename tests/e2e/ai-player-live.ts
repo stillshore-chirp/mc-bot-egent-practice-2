@@ -73,6 +73,11 @@ import {
 } from "./world-oracle.js";
 import { captureReproducibleUnknownWorldBaseline } from "./unknown-world-baseline.js";
 import {
+  deathRecoveryDropConfirmed,
+  isNoEntitySelectionReply,
+  safeEntityCountBucket,
+} from "./death-recovery-fixture.js";
+import {
   createLlmCallAdmission,
   LlmCallAdmissionError,
   type LlmCallAdmission,
@@ -826,8 +831,13 @@ function isNoGptDiagnosticProbeOnly(): boolean {
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES" ||
+    isDeathRecoveryFixtureProbeOnly()
   );
+}
+
+function isDeathRecoveryFixtureProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY === "YES";
 }
 
 function isNoFoodContinuityProbeOnly(): boolean {
@@ -2148,6 +2158,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
             state.damageResponseDamageHealthReadback.rconHealth,
         }
       : {}),
+    ...(caseId === "body_operation_smoke"
+      ? (state.deathRecoveryFixtureDiagnostic ?? {})
+      : {}),
     ...(progress === undefined
       ? {}
       : {
@@ -2921,6 +2934,7 @@ interface RunState {
   serverReadyObserved?: boolean;
   applicationStartDiagnostic?: SafeApplicationStartDiagnostic;
   bodySmokeDiagnostic?: BodySmokeDiagnostic;
+  deathRecoveryFixtureDiagnostic?: SafeEvidence;
   observationBoundaryCapture?: {
     readonly responseStart: number;
     responseEnd?: number;
@@ -7561,14 +7575,19 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  const selectedNoGptProbeCount = [
+  const selectedDiagnosticProbeCount = [
     "AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY",
     "AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY",
     "AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY",
+    "AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY",
   ].filter((name) => process.env[name] === "YES").length;
-  if (selectedNoGptProbeCount > 1) {
+  if (
+    selectedDiagnosticProbeCount > 1 ||
+    (isDeathRecoveryFixtureProbeOnly() &&
+      process.env.AI_PLAYER_E2E_OBSTACLE_RESTORE_PROBE_ONLY === "YES")
+  ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
@@ -8270,6 +8289,14 @@ async function runOperationSmoke(
       try {
         await client.connect(abort.signal);
         body = client.createPlayerBody();
+        if (isDeathRecoveryFixtureProbeOnly())
+          return await runDeathRecoveryFixtureProbe(
+            state,
+            rcon,
+            client,
+            body,
+            abort.signal,
+          );
         const names = new Set(playerOperationNames);
         if (
           names.size !== 31 ||
@@ -9199,6 +9226,359 @@ async function runOperationSmoke(
     },
   );
   return result;
+}
+
+async function runDeathRecoveryFixtureProbe(
+  state: RunState,
+  rcon: LocalRcon,
+  client: MineflayerClient,
+  body: PlayerBody,
+  signal: AbortSignal,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const fixtureSpawn = { x: 0.5, y: 64, z: 0.5 };
+  let deathObservedAt: string | undefined;
+  let removeDeathListener: (() => void) | undefined;
+  let operationError: unknown;
+  let cleanupConfirmed: boolean;
+  let cleanupKeepInventoryRestored: boolean;
+  let cleanupDropsAbsentConfirmed: boolean;
+  let cleanupTestItemAbsentConfirmed = false;
+  let cleanupBotAliveConfirmed: boolean;
+  let cleanupBotPositionRestoredConfirmed = false;
+  const diagnostic = (values: SafeEvidence): void => {
+    state.deathRecoveryFixtureDiagnostic = {
+      ...(state.deathRecoveryFixtureDiagnostic ?? {}),
+      ...values,
+    };
+  };
+  let evidence: Readonly<Record<string, boolean | number | string>> = {
+    deathRecoveryFixtureProbeSelected: true,
+    gptCalls: 0,
+  };
+
+  try {
+    await rcon.command(`clear ${state.botName}`);
+    await rcon.command(
+      `tp ${state.botName} ${fixtureSpawn.x} ${fixtureSpawn.y} ${fixtureSpawn.z} 0 0`,
+    );
+    await rcon.command(`give ${state.botName} minecraft:blue_wool 1`);
+
+    const setupDeadline = Date.now() + 5_000;
+    let beforeDeath: PlayerBodyObservation | undefined;
+    while (!signal.aborted && Date.now() < setupDeadline) {
+      try {
+        const observed = await body.observe();
+        if (
+          observed.self.inventory.some(
+            (item) => item.name === "blue_wool" && item.count === 1,
+          ) &&
+          Math.hypot(
+            observed.self.position.x - fixtureSpawn.x,
+            observed.self.position.y - fixtureSpawn.y,
+            observed.self.position.z - fixtureSpawn.z,
+          ) <= 0.5
+        ) {
+          beforeDeath = observed;
+          break;
+        }
+      } catch {
+        // The fixed failure below represents missing setup readback.
+      }
+      await waitMs(100);
+    }
+    if (beforeDeath === undefined)
+      incomplete("DEATH_RECOVERY_FIXTURE_BASELINE_NOT_CONFIRMED");
+    if (
+      beforeDeath.self.health === null ||
+      beforeDeath.self.health <= 0 ||
+      beforeDeath.self.inLava ||
+      beforeDeath.self.onFire ||
+      beforeDeath.self.suffocating
+    ) {
+      incomplete("DEATH_RECOVERY_FIXTURE_BASELINE_UNSAFE");
+    }
+    const serverBeforeDeath = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    if (
+      Math.hypot(
+        serverBeforeDeath.x - beforeDeath.self.position.x,
+        serverBeforeDeath.y - beforeDeath.self.position.y,
+        serverBeforeDeath.z - beforeDeath.self.position.z,
+      ) > 0.5
+    ) {
+      incomplete("DEATH_RECOVERY_FIXTURE_BODY_RCON_POSITION_MISMATCH");
+    }
+    const deathSite = beforeDeath.self.position;
+    if ((await rconBlueWoolDropCountNear(rcon, deathSite, 4)) !== 0)
+      incomplete("DEATH_RECOVERY_FIXTURE_DROP_BASELINE_NOT_EMPTY");
+    if (!(await rconInventoryHasBlueWool(rcon, state.botName)))
+      incomplete("DEATH_RECOVERY_FIXTURE_ITEM_NOT_CONFIRMED_BEFORE_DEATH");
+    diagnostic({
+      testItemConfirmedBeforeDeath: true,
+      bodyRconPositionAgreementConfirmed: true,
+      emptyDropBaselineConfirmed: true,
+    });
+
+    await setAndVerifyGamerule(rcon, "keepInventory", false);
+    diagnostic({ keepInventoryFalseReadbackConfirmed: true });
+    removeDeathListener = client.onDeath((at) => {
+      deathObservedAt ??= at;
+    });
+    await rcon.command(`kill ${state.botName}`);
+    const deathDeadline = Date.now() + 5_000;
+    while (deathObservedAt === undefined && Date.now() < deathDeadline) {
+      if (signal.aborted) incomplete("DEATH_RECOVERY_FIXTURE_CANCELLED");
+      await waitMs(50);
+    }
+    if (
+      deathObservedAt === undefined ||
+      !Number.isFinite(Date.parse(deathObservedAt))
+    )
+      incomplete("DEATH_RECOVERY_FIXTURE_DEATH_EVENT_NOT_OBSERVED");
+    diagnostic({ deathEventObserved: true });
+
+    const respawnDeadline = Date.now() + 10_000;
+    let afterDeath: PlayerBodyObservation | undefined;
+    while (!signal.aborted && Date.now() < respawnDeadline) {
+      try {
+        const observed = await body.observe();
+        const health = await rconEntityHealth(rcon, state.botName, 500);
+        if (
+          Date.parse(observed.observedAt) > Date.parse(deathObservedAt) &&
+          observed.dimension === beforeDeath.dimension &&
+          observed.self.health !== null &&
+          observed.self.health > 0 &&
+          health > 0
+        ) {
+          afterDeath = observed;
+          break;
+        }
+      } catch {
+        // A missing player entity or Body snapshot is not respawn evidence.
+      }
+      await waitMs(100);
+    }
+    if (afterDeath === undefined)
+      incomplete("DEATH_RECOVERY_FIXTURE_RESPAWN_NOT_CONFIRMED");
+    const testItemStillInInventory =
+      afterDeath.self.inventory.some((item) => item.name === "blue_wool") ||
+      (await rconInventoryHasBlueWool(rcon, state.botName));
+    if (testItemStillInInventory) {
+      incomplete("DEATH_RECOVERY_FIXTURE_DROP_NOT_REMOVED_FROM_INVENTORY");
+    }
+    diagnostic({
+      respawnConfirmedByFreshBodyAndRcon: true,
+      postDeathBodyObservationFresh: true,
+      postDeathDimensionMatched: true,
+      testItemAbsentFromBodyAndRconInventory: true,
+    });
+
+    const dropDeadline = Date.now() + 5_000;
+    let dropCount = 0;
+    while (!signal.aborted && Date.now() < dropDeadline) {
+      dropCount = await rconBlueWoolDropCountNear(rcon, deathSite, 4);
+      if (dropCount > 0) break;
+      await waitMs(100);
+    }
+    if (dropCount !== 1)
+      incomplete(
+        dropCount === 0
+          ? "DEATH_RECOVERY_FIXTURE_DROP_NOT_CONFIRMED_BY_RCON"
+          : "DEATH_RECOVERY_FIXTURE_DROP_NOT_UNIQUE_BY_RCON",
+      );
+    const visibilityDeadline = Date.now() + 2_500;
+    let visibilityObservationCount = 0;
+    let observationAvailable = false;
+    let visibleCount: number | undefined;
+    let freshAfterDeath = false;
+    let dimensionMatched = false;
+    let perceptionTruncated = false;
+    let dropVisibilityConfirmed = false;
+    while (
+      !signal.aborted &&
+      visibilityObservationCount < 8 &&
+      Date.now() < visibilityDeadline
+    ) {
+      visibilityObservationCount += 1;
+      try {
+        const observed = await body.observe();
+        observationAvailable = true;
+        visibleCount = observed.perception.entities.filter(
+          (entity) =>
+            !entity.isPlayer &&
+            entity.name === "item" &&
+            Math.hypot(
+              entity.position.x - deathSite.x,
+              entity.position.y - deathSite.y,
+              entity.position.z - deathSite.z,
+            ) <= 4,
+        ).length;
+        freshAfterDeath =
+          Date.parse(observed.observedAt) > Date.parse(deathObservedAt);
+        dimensionMatched = observed.dimension === beforeDeath.dimension;
+        perceptionTruncated =
+          observed.perception.candidateSearchMayBeTruncated ||
+          observed.perception.omittedEntityCandidates > 0;
+        dropVisibilityConfirmed = deathRecoveryDropConfirmed({
+          deathEventObserved: Number.isFinite(Date.parse(deathObservedAt)),
+          freshBodyAfterDeath: freshAfterDeath,
+          dimensionMatched,
+          testItemAbsentFromInventory: !testItemStillInInventory,
+          rconDropCount: dropCount,
+          bodyVisibleDropCount: visibleCount,
+          bodyVisibilityComplete: !perceptionTruncated,
+        });
+      } catch {
+        observationAvailable = false;
+        visibleCount = undefined;
+        freshAfterDeath = false;
+        dimensionMatched = false;
+        perceptionTruncated = false;
+        dropVisibilityConfirmed = false;
+      }
+      diagnostic({
+        dropVisibilityObservationCount: visibilityObservationCount,
+        dropVisibilityReobserved: visibilityObservationCount > 1,
+        dropVisibilityBodyObservationAvailable: observationAvailable,
+        dropVisibilityCandidateCountBucket:
+          visibleCount === undefined
+            ? "unknown"
+            : safeEntityCountBucket(visibleCount),
+        dropVisibilityFreshAfterDeath: freshAfterDeath,
+        dropVisibilityDimensionMatched: dimensionMatched,
+        dropVisibilityPerceptionTruncated: perceptionTruncated,
+        freshBodyDropVisibilityConfirmed: dropVisibilityConfirmed,
+      });
+      if (dropVisibilityConfirmed) break;
+      if (Date.now() < visibilityDeadline && visibilityObservationCount < 8)
+        await waitMs(200);
+    }
+    if (signal.aborted) incomplete("DEATH_RECOVERY_FIXTURE_CANCELLED");
+    if (!dropVisibilityConfirmed) {
+      incomplete("DEATH_RECOVERY_FIXTURE_DROP_NOT_VISIBLE_TO_FRESH_BODY");
+    }
+    diagnostic({
+      deathDropConfirmedByRcon: true,
+      freshBodyDropVisibilityConfirmed: true,
+    });
+    evidence = {
+      deathRecoveryFixtureProbeSelected: true,
+      testItemConfirmedBeforeDeath: true,
+      keepInventoryFalseReadbackConfirmed: true,
+      deathEventObserved: true,
+      respawnConfirmedByFreshBodyAndRcon: true,
+      testItemAbsentFromBodyAndRconInventory: true,
+      deathDropConfirmedByRcon: true,
+      freshBodyDropVisibilityConfirmed: true,
+      gptCalls: 0,
+    };
+  } catch (error) {
+    operationError = error;
+  } finally {
+    removeDeathListener?.();
+    try {
+      await setAndVerifyGamerule(rcon, "keepInventory", true);
+      cleanupKeepInventoryRestored = true;
+    } catch {
+      cleanupKeepInventoryRestored = false;
+    }
+    try {
+      await rcon.command(
+        `execute positioned ${fixtureSpawn.x} ${fixtureSpawn.y} ${fixtureSpawn.z} run kill @e[type=minecraft:item,distance=..8,nbt={Item:{id:"minecraft:blue_wool"}}]`,
+      );
+      cleanupDropsAbsentConfirmed =
+        (await rconBlueWoolDropCountNear(rcon, fixtureSpawn, 8)) === 0;
+    } catch {
+      cleanupDropsAbsentConfirmed = false;
+    }
+    const aliveDeadline = Date.now() + 5_000;
+    let alive = false;
+    while (!alive && Date.now() < aliveDeadline) {
+      try {
+        alive = (await rconEntityHealth(rcon, state.botName, 500)) > 0;
+      } catch {
+        // Wait for the isolated client to finish respawning before cleanup.
+      }
+      if (!alive) await waitMs(100);
+    }
+    cleanupBotAliveConfirmed = alive;
+    if (alive) {
+      try {
+        await rcon.command(`clear ${state.botName} minecraft:blue_wool`);
+        cleanupTestItemAbsentConfirmed = !(await rconInventoryHasBlueWool(
+          rcon,
+          state.botName,
+        ));
+      } catch {
+        cleanupTestItemAbsentConfirmed = false;
+      }
+      try {
+        await rcon.command(
+          `tp ${state.botName} ${fixtureSpawn.x} ${fixtureSpawn.y} ${fixtureSpawn.z} 0 0`,
+        );
+        const restoredPosition = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        cleanupBotPositionRestoredConfirmed =
+          Math.hypot(
+            restoredPosition.x - fixtureSpawn.x,
+            restoredPosition.y - fixtureSpawn.y,
+            restoredPosition.z - fixtureSpawn.z,
+          ) <= 0.5;
+      } catch {
+        cleanupBotPositionRestoredConfirmed = false;
+      }
+    }
+    cleanupConfirmed =
+      cleanupKeepInventoryRestored &&
+      cleanupDropsAbsentConfirmed &&
+      cleanupTestItemAbsentConfirmed &&
+      cleanupBotAliveConfirmed &&
+      cleanupBotPositionRestoredConfirmed;
+    diagnostic({
+      cleanupConfirmed,
+      cleanupKeepInventoryRestored,
+      cleanupDropsAbsentConfirmed,
+      cleanupTestItemAbsentConfirmed,
+      cleanupBotAliveConfirmed,
+      cleanupBotPositionRestoredConfirmed,
+    });
+    if (!cleanupConfirmed)
+      state.failureCode ??= "DEATH_RECOVERY_FIXTURE_CLEANUP_NOT_CONFIRMED";
+  }
+  if (operationError instanceof Error) throw operationError;
+  if (operationError !== undefined)
+    incomplete("DEATH_RECOVERY_FIXTURE_OPERATION_FAILED");
+  if (!cleanupConfirmed)
+    incomplete("DEATH_RECOVERY_FIXTURE_CLEANUP_NOT_CONFIRMED");
+  return { ...evidence, deathRecoveryFixtureCleanupConfirmed: true };
+}
+
+async function rconBlueWoolDropCountNear(
+  rcon: LocalRcon,
+  center: Position,
+  radius: 4 | 8,
+): Promise<number> {
+  const holder = "#death_fixture_drop";
+  const reset = await rcon.command(`scoreboard players set ${holder} ai_e2e 0`);
+  if (classifyRconReply(reset) !== "success")
+    incomplete("DEATH_RECOVERY_FIXTURE_DROP_RCON_READBACK_UNAVAILABLE");
+  const countReply = await rcon.command(
+    `execute positioned ${center.x} ${center.y} ${center.z} as @e[type=minecraft:item,distance=..${radius},nbt={Item:{id:"minecraft:blue_wool"}}] run scoreboard players add ${holder} ai_e2e 1`,
+  );
+  if (
+    !isNoEntitySelectionReply(countReply) &&
+    classifyRconReply(countReply) !== "success"
+  )
+    incomplete("DEATH_RECOVERY_FIXTURE_DROP_RCON_READBACK_UNAVAILABLE");
+  const scoreReply = await rcon.command(
+    `scoreboard players get ${holder} ai_e2e`,
+  );
+  const count = parseScore(scoreReply, holder);
+  if (count === undefined || !Number.isInteger(count) || count < 0)
+    incomplete("DEATH_RECOVERY_FIXTURE_DROP_RCON_READBACK_UNAVAILABLE");
+  return count;
 }
 
 function updateOwnerReturnDiagnostic(
@@ -13833,6 +14213,7 @@ async function writeArtifact(state: RunState): Promise<void> {
       serverReadyObserved: state.serverReadyObserved === true,
       applicationStart: state.applicationStartDiagnostic ?? null,
       bodyOperationSmoke: state.bodySmokeDiagnostic ?? null,
+      deathRecoveryFixtureProbe: state.deathRecoveryFixtureDiagnostic ?? null,
       observationBoundary: {
         replyReceived:
           state.observationBoundaryDiagnostic?.replyReceived === true,

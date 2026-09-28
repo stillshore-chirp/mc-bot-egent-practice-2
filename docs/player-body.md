@@ -30,7 +30,7 @@ Mineflayer は`package.json`と`package-lock.json`で`4.37.1`、`mineflayer-path
 
 - `attack`は Bot 自身を攻撃元と特定できる`entityHurt`だけで命中を確認し、命中と死亡は別の結果にします。`dig`・`place`は対象位置のサーバー起点更新を照合し、採掘後の空気または要求した設置 block を確認します。クライアント内の楽観更新だけでは成功にしません。`craft`は要求アイテム数の増加を確認します。
 - window 移送は対象 item と slot ごとの正確な増減を確認します。`consume`は item 数の減少と満腹度の増加の両方を必要とします。
-- `collect_item`は開始時に可視の entity ID だけを受け付け、250ms ごとに可視性と位置を再観測します。視界を失えば停止し、45 秒期限・`AbortSignal`・`stop()`に従います。一致する`playerCollect`だけを成功とし、entity 消失・視界喪失・不正対象・経路失敗・timeout を別の`itemCollectionOutcome`として扱います。
+- `collect_item`は開始時に可視の entity ID だけを受け付け、250ms ごとに可視性と位置を再観測します。視界を失えば停止し、45 秒期限・`AbortSignal`・`stop()`に従います。成功には対象 ID に一致する`playerCollect` eventと、その event から得た item 名の所持数増加を最大 1 秒の再観測内で両方確認する必要があります。増加が不明なら`unverified`とし、entity 消失・視界喪失・不正対象・経路失敗・timeout を別の`itemCollectionOutcome`として扱います。
 - `fish`は浮き・食いつきの粒子を観測し、引き上げ後の回収 item とインベントリ増加を照合します。sleep/wake・乗降・乗り物操作は要求状態や位置・status を確認し、乗り物入力 tick を制限します。
 - `trade`は選択した取引の入出力 item 数、`enchant`は対象へ新しく付いた効果、`anvil`は要求名を確認します。本や看板の内容は接続 protocol が提供する範囲だけを確認します。
 
@@ -56,6 +56,6 @@ Mineflayer が値を取得できない体力、酸素、液体・炎の状態、
 
 `move_to`では、経路探索が`noPath`を報告しても目的地の観測が優先して成功を確認します。`goto()`が正常終了しても到達を観測できず、最新の経路更新が`noPath`なら`failed`を返します。後続の経路更新は古い`noPath`を置き換え、中断と timeout の分類を維持します。
 
-`collect_item`は開始時点で通常の視野内にある item entity だけを受け付けます。追跡中は現在観測できた位置だけへ経路を更新し、対象が遮蔽・視界外・出力上限によって観測できなくなった場合は経路を停止します。`GoalNear`は整数 block node の半径 1 を使い、goal 到達後も可視 item との 3D 距離が 2.5 秒の観測猶予後に 1.25 block を超える場合は`pickup_out_of_range`で停止します。拾得は対象 ID に一致する`playerCollect`イベントで確認し、単なる接近や entity 消失を拾得成功とは扱いません。pathfinder の`noPath`・`timeout`イベントと`goto()`拒否は、結果の`itemCollectionPathFailureReason`で固定 enum に分けます。可視性を失った後の entity 位置や、拒否 error 本文は結果に含めません。
+`collect_item`は開始時点で通常の視野内にあるitem entityだけを受け付けます。追跡中は現在観測できた位置だけへ経路を更新し、対象が遮蔽・視界外・出力上限によって観測できなくなった場合は経路を停止します。`GoalNear`は整数block nodeの半径1を使い、goal到達後も可視itemとの3D距離が2.5秒の観測猶予後に1.25 blockを超える場合は`pickup_out_of_range`で停止します。拾得は対象IDに一致する`playerCollect` eventと、そのitem名の所持数増加を最大1秒の再観測内で確認します。eventだけ届き所持数増加を確認できない場合は`unverified`とし、単なる接近やentity消失を拾得成功とは扱いません。pathfinderの`noPath`・`timeout`イベントと`goto()`拒否は、結果の`itemCollectionPathFailureReason`で固定enumに分けます。可視性を失った後のentity位置や、拒否error本文は結果に含めません。
 
 プロトコルや NBT 形式の違いは成功確認を制限します。`attack`は攻撃元を特定できる`entityHurt`に依存します。攻撃元のない古いプロトコルの hurt イベントや、通常 Mineflayer から不明として返る Mob の体力だけでは命中を確認しません。命中後の`entityDead`は、対象が死亡した別の観測結果として返します。現在のアイテム表現が認識しない記入済みの本のページ NBT、古いプロトコルで利用できない看板の裏面、mod 導入環境の画面、サーバーによる巻き戻し、観測可能な事後状態のない効果は`unverified`になります。汎用ウィンドウ操作では実際に観測したスロット状態を返し、意味上の操作が成功したと推測して補いません。
