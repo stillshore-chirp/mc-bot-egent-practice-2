@@ -75,8 +75,11 @@ import {
   type LlmCallAdmission,
 } from "./llm-call-admission.js";
 import {
+  AcceptedProviderRequestGate,
+  classifyAcceptedProviderRequestUsage,
   NoFoodReplanRequestGate,
-  waitForNoFoodReplanRequestsSettled,
+  waitForAcceptedProviderRequestsSettled,
+  type AcceptedProviderRequestSettleStatus,
 } from "./no-food-replan-request-gate.js";
 import {
   isNewFailureAfterUnfreeze,
@@ -547,6 +550,7 @@ type ProgressiveNavigationObservedDoorHalf = "lower" | "upper" | "neither";
 
 type OwnerReturnStopReason =
   | "owner_arrival"
+  | "budget_stop"
   | "navigation_terminal"
   | "proposal_declined"
   | "observation_window_elapsed"
@@ -575,28 +579,38 @@ interface OwnerReturnDiagnostic {
   readonly bodyDistanceAfter?: OwnerReturnDistanceBucket;
   readonly rconDistanceBefore?: OwnerReturnDistanceBucket;
   readonly rconDistanceAfter?: OwnerReturnDistanceBucket;
-  readonly bodyRconSampleAlignedBefore?: boolean;
-  readonly bodyRconSampleAlignedAfter?: boolean;
-  readonly ownerRequestSent?: boolean;
-  readonly newOwnerProposalObserved?: boolean;
+  readonly bodyRconSampleAlignedBefore?: boolean | "unknown";
+  readonly bodyRconSampleAlignedAfter?: boolean | "unknown";
+  readonly ownerRequestSent?: boolean | "unknown";
+  readonly stopPlayerEvidenceAvailable?: boolean;
+  readonly newOwnerProposalObserved?: boolean | "unknown";
   readonly ownerProposalDisposition?: OwnerReturnProposalDisposition;
-  readonly ownerProposalAdoptedForRequest?: boolean;
-  readonly ownerProposalProgressableForRequest?: boolean;
-  readonly ownerGoalLinked?: boolean;
-  readonly ownerMoveJudgmentObserved?: boolean;
-  readonly toolNamesByRole?: Readonly<{
-    conversation: readonly PlayerAgentToolName[];
-    purpose: readonly PlayerAgentToolName[];
-  }>;
-  readonly moveOutcomeStatus?: BodyOperationStatus;
-  readonly bodyReachedOwnerSide?: boolean;
-  readonly rconReachedOwnerSide?: boolean;
-  readonly bodyAndRconArrivalObserved?: boolean;
+  readonly ownerProposalAdoptedForRequest?: boolean | "unknown";
+  readonly ownerProposalProgressableForRequest?: boolean | "unknown";
+  readonly ownerGoalLinked?: boolean | "unknown";
+  readonly ownerMoveJudgmentObserved?: boolean | "unknown";
+  readonly toolNamesByRole?:
+    | Readonly<{
+        conversation: readonly PlayerAgentToolName[];
+        purpose: readonly PlayerAgentToolName[];
+      }>
+    | "unknown";
+  readonly moveOutcomeStatus?: BodyOperationStatus | "unknown";
+  readonly bodyReachedOwnerSide?: boolean | "unknown";
+  readonly rconReachedOwnerSide?: boolean | "unknown";
+  readonly bodyAndRconArrivalObserved?: boolean | "unknown";
   readonly ownerGoalStatusAtStop?:
     "active" | "paused" | "completed" | "abandoned" | "unknown";
   readonly ownerGoalStatusBeforeParallel?:
     "active" | "paused" | "completed" | "abandoned" | "unknown";
-  readonly activeOperationPresentAtStop?: boolean;
+  readonly activeOperationPresentAtStop?: boolean | "unknown";
+  readonly acceptedProviderRequestsLatched?: boolean;
+  readonly acceptedProviderRequestsStarted?: number;
+  readonly acceptedProviderRequestsRecorded?: number;
+  readonly acceptedProviderRequestsInFlight?: number;
+  readonly acceptedProviderRequestsBlockedAfterLatch?: number;
+  readonly acceptedProviderRequestsSettled?: boolean;
+  readonly acceptedProviderRequestSettleStatus?: AcceptedProviderRequestSettleStatus;
   readonly stopReason?: OwnerReturnStopReason;
   readonly fixtureCleanupConfirmed?: boolean;
   readonly originalFixtureRestored?: boolean;
@@ -2062,6 +2076,25 @@ function noFoodReplanSafeEvidence(state: RunState): SafeEvidence {
   };
 }
 
+function ownerReturnRequestSafeEvidence(state: RunState): SafeEvidence {
+  const gate = state.ownerReturnRequestGate;
+  const diagnostic = state.ownerReturnDiagnostic;
+  return {
+    ownerReturnAcceptedProviderRequestsLatched: gate?.latched === true,
+    ownerReturnAcceptedProviderRequestsStarted: gate?.requestsStarted ?? 0,
+    ownerReturnAcceptedProviderRequestsRecorded: gate?.requestsRecorded ?? 0,
+    ownerReturnAcceptedProviderRequestsInFlight: gate?.inFlightRequests ?? 0,
+    ownerReturnAcceptedProviderRequestsBlockedAfterLatch:
+      gate?.providerRequestsBlockedAfterLatch ?? 0,
+    ownerReturnAcceptedProviderRequestsSettled:
+      diagnostic?.acceptedProviderRequestsSettled === true,
+    ownerReturnAcceptedProviderRequestSettleStatus:
+      diagnostic?.acceptedProviderRequestSettleStatus ?? "unknown",
+    ownerReturnProviderRequestAccountingConsistent:
+      gate === undefined || gate.requestsRecorded <= gate.requestsStarted,
+  };
+}
+
 function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
   const progress =
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
@@ -2071,6 +2104,10 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
       ? noFoodContinuitySafeEvidence(state)
       : {}),
     ...(caseId === "no_food_replan" ? noFoodReplanSafeEvidence(state) : {}),
+    ...(caseId === "owner_return_through_door" &&
+    ownerReturnRequestGateEnabled(state.targetCase)
+      ? ownerReturnRequestSafeEvidence(state)
+      : {}),
     ...(caseId === "observation_boundary"
       ? (state.observationBoundaryDiagnostic ?? {
           replyReceived: false,
@@ -2829,6 +2866,8 @@ interface RunState {
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
   ownerReturnDiagnostic?: OwnerReturnDiagnostic;
   ownerReturnProposalIdForRun?: string;
+  ownerReturnCaseUsageStart?: Counters;
+  ownerReturnRequestGate?: AcceptedProviderRequestGate;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -3277,7 +3316,7 @@ async function settleNoFoodReplanRequests(
   if (!requestGate?.acceptanceLatched)
     incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
   const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
-  const settled = await waitForNoFoodReplanRequestsSettled(
+  const settled = await waitForAcceptedProviderRequestsSettled(
     async () => {
       const player = playerOf(await collect(context.runtime.app));
       assertNoFoodReplanUsage(context, player);
@@ -3289,6 +3328,84 @@ async function settleNoFoodReplanRequests(
     Math.min(NO_FOOD_REPLAN_SETTLE_MAX_MS, remainingMs),
   );
   if (!settled) incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+}
+
+const OWNER_RETURN_REQUEST_SETTLE_MAX_MS = 15_000;
+
+async function settleOwnerReturnRequests(
+  state: RunState,
+  context: CaseContext,
+): Promise<AcceptedProviderRequestSettleStatus> {
+  const gate = state.ownerReturnRequestGate;
+  const caseStart = state.ownerReturnCaseUsageStart;
+  gate?.latch();
+  if (gate === undefined || caseStart === undefined) {
+    updateOwnerReturnDiagnostic(state, {
+      ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
+    });
+    return "unknown";
+  }
+
+  let failureStatus:
+    | Exclude<AcceptedProviderRequestSettleStatus, "settled" | "pending">
+    | undefined;
+  const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
+  let requestsSettled = false;
+  try {
+    requestsSettled = await waitForAcceptedProviderRequestsSettled(
+      async () => {
+        const player = playerOf(await collect(context.runtime.app));
+        const caseDelta = subtractCounters(player.counters, caseStart);
+        const runDelta = subtractCounters(
+          player.counters,
+          context.runUsageAtStart,
+        );
+        gate.observeRecordedCalls(caseDelta.llmCalls);
+        const status = classifyAcceptedProviderRequestUsage({
+          requestsStarted: gate.requestsStarted,
+          requestsRecorded: gate.requestsRecorded,
+          calls: caseDelta.llmCalls,
+          tokens: totalTokens(caseDelta),
+          usageUnknownCalls: caseDelta.usageUnknownCalls,
+          caseCallLimit: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+          caseTokenLimit: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.totalTokens,
+          runCalls: runDelta.llmCalls,
+          runTokens: totalTokens(runDelta),
+          runCallLimit: context.runBudget.llmCalls,
+          runTokenLimit: context.runBudget.totalTokens,
+        });
+        if (status !== "pending" && status !== "settled") {
+          failureStatus = status;
+          throw new Error("OWNER_RETURN_REQUEST_SETTLEMENT_INCOMPLETE");
+        }
+        return gate.inFlightRequests;
+      },
+      Math.min(OWNER_RETURN_REQUEST_SETTLE_MAX_MS, remainingMs),
+    );
+  } catch {
+    failureStatus ??= "unknown";
+  }
+
+  const status = failureStatus ?? (requestsSettled ? "settled" : "timed_out");
+  updateOwnerReturnDiagnostic(state, {
+    ...ownerReturnRequestDiagnosticPatch(state, status, status === "settled"),
+  });
+  return status;
+}
+
+function requireOwnerReturnRequestsSettled(
+  status: AcceptedProviderRequestSettleStatus,
+): void {
+  if (status === "settled") return;
+  if (status === "usage_unknown")
+    incomplete("OWNER_RETURN_LLM_USAGE_PARTIAL_OR_UNKNOWN");
+  if (status === "budget_exceeded")
+    incomplete("OWNER_RETURN_LLM_BUDGET_EXCEEDED");
+  if (status === "accounting_mismatch")
+    incomplete("OWNER_RETURN_REQUEST_ADMISSION_USAGE_MISMATCH");
+  if (status === "timed_out")
+    incomplete("OWNER_RETURN_ACCEPTED_REQUESTS_NOT_SETTLED");
+  incomplete("OWNER_RETURN_REQUEST_SETTLEMENT_UNKNOWN");
 }
 
 async function runNoFoodReplanCase(
@@ -3771,9 +3888,21 @@ async function main(): Promise<void> {
     const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
+    const preStartCounters = countersOf(preStartEvidence);
     state.preStartPlayer = playerOf(preStartEvidence);
-    state.countersInitial = countersOf(preStartEvidence);
+    state.countersInitial = preStartCounters;
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
+    const ownerReturnRequestTracking = createOwnerReturnRequestTracking(
+      state.targetCase,
+      preStartCounters,
+    );
+    if (ownerReturnRequestTracking !== undefined) {
+      state.ownerReturnCaseUsageStart = ownerReturnRequestTracking.usageStart;
+      state.ownerReturnRequestGate = ownerReturnRequestTracking.gate;
+      updateOwnerReturnDiagnostic(state, {
+        ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
+      });
+    }
     if (state.targetCase === "no_food_replan") {
       restoreNoFoodContinuityObservationProbe ??=
         installNoFoodContinuityObservationProbe(state, rcon);
@@ -7469,6 +7598,28 @@ async function prepareRun(): Promise<RunState> {
         admitNoFoodRequest();
         return;
       }
+      if (
+        ownerReturnRequestGateEnabled(state.targetCase) &&
+        state.ownerReturnRequestGate !== undefined
+      ) {
+        state.ownerReturnRequestGate.beforeCall(
+          () => {
+            try {
+              admission.beforeCall();
+            } catch (error) {
+              if (error instanceof LlmCallAdmissionError)
+                throw new HarnessError("incomplete", error.code);
+              throw error;
+            }
+          },
+          () =>
+            new HarnessError(
+              "incomplete",
+              "OWNER_RETURN_REQUEST_ADMISSION_LATCHED",
+            ),
+        );
+        return;
+      }
       try {
         admission.beforeCall();
       } catch (error) {
@@ -8950,6 +9101,59 @@ export function ownerReturnArrivalConfirmed(
   );
 }
 
+export function ownerReturnAcceptanceEvidenceConfirmed(
+  disposition: OwnerReturnProposalDisposition,
+  ownerGoalLinked: boolean,
+  ownerMoveJudgmentObserved: boolean,
+  sample: OwnerReturnWorldSample,
+): boolean {
+  return (
+    isOwnerProposalProgressable(disposition, ownerGoalLinked) &&
+    ownerMoveJudgmentObserved &&
+    ownerReturnArrivalConfirmed(sample)
+  );
+}
+
+export function ownerReturnRequestGateEnabled(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return targetCase === "owner_return_through_door";
+}
+
+export function createOwnerReturnRequestTracking(
+  targetCase: TargetableCase | undefined,
+  preStartCounters: Counters,
+):
+  | Readonly<{
+      usageStart: Counters;
+      gate: AcceptedProviderRequestGate;
+    }>
+  | undefined {
+  if (!ownerReturnRequestGateEnabled(targetCase)) return undefined;
+  return {
+    usageStart: preStartCounters,
+    gate: new AcceptedProviderRequestGate(),
+  };
+}
+
+function ownerReturnRequestDiagnosticPatch(
+  state: RunState,
+  status: AcceptedProviderRequestSettleStatus,
+  settled: boolean,
+): Partial<OwnerReturnDiagnostic> {
+  const gate = state.ownerReturnRequestGate;
+  return {
+    acceptedProviderRequestsLatched: gate?.latched === true,
+    acceptedProviderRequestsStarted: gate?.requestsStarted ?? 0,
+    acceptedProviderRequestsRecorded: gate?.requestsRecorded ?? 0,
+    acceptedProviderRequestsInFlight: gate?.inFlightRequests ?? 0,
+    acceptedProviderRequestsBlockedAfterLatch:
+      gate?.providerRequestsBlockedAfterLatch ?? 0,
+    acceptedProviderRequestsSettled: settled,
+    acceptedProviderRequestSettleStatus: status,
+  };
+}
+
 function ownerReturnGoalStatus(
   value: string | undefined,
 ): NonNullable<OwnerReturnDiagnostic["ownerGoalStatusAtStop"]> {
@@ -9093,6 +9297,62 @@ async function runOwnerReturnThroughDoorCase(
           },
     );
   };
+  let stopWorldSampleAttempted = false;
+  let projectOwnerReturnStopPlayer:
+    ((player: PlayerEvidence) => void) | undefined;
+  let ownerRequestSent = false;
+  const sampleStopWorldOnce = async (): Promise<void> => {
+    if (stopWorldSampleAttempted) return;
+    stopWorldSampleAttempted = true;
+    try {
+      const sample = await sampleWorld();
+      updateWorldDiagnostic(sample, false);
+      update({
+        bodyReachedOwnerSide: sample.bodySide === "owner_side",
+        rconReachedOwnerSide: sample.rconSide === "owner_side",
+        bodyAndRconArrivalObserved: ownerReturnArrivalConfirmed(sample),
+      });
+    } catch {
+      update({
+        bodySideAfter: "unknown",
+        rconSideAfter: "unknown",
+        bodyDistanceAfter: "unknown",
+        rconDistanceAfter: "unknown",
+        bodyRconSampleAlignedAfter: "unknown",
+        doorStateAfter: "unknown",
+        bodyReachedOwnerSide: "unknown",
+        rconReachedOwnerSide: "unknown",
+        bodyAndRconArrivalObserved: "unknown",
+      });
+    }
+  };
+  const finalizeBudgetStop = async (
+    player: PlayerEvidence | undefined,
+    _reason: string,
+  ): Promise<void> => {
+    state.ownerReturnRequestGate?.latch();
+    update({ stopReason: "budget_stop", ownerRequestSent });
+    if (player !== undefined && projectOwnerReturnStopPlayer !== undefined) {
+      projectOwnerReturnStopPlayer(player);
+    } else {
+      update({
+        stopPlayerEvidenceAvailable: player !== undefined,
+        newOwnerProposalObserved: "unknown",
+        ownerProposalDisposition: "unknown",
+        ownerProposalAdoptedForRequest: "unknown",
+        ownerProposalProgressableForRequest: "unknown",
+        ownerGoalLinked: "unknown",
+        ownerGoalStatusAtStop: "unknown",
+        ownerMoveJudgmentObserved: "unknown",
+        moveOutcomeStatus: "unknown",
+        activeOperationPresentAtStop:
+          player === undefined ? "unknown" : isOperationActive(player),
+        toolNamesByRole: "unknown",
+      });
+    }
+    await settleOwnerReturnRequests(state, context);
+    await sampleStopWorldOnce();
+  };
 
   update({ stage: "fixture_setup" });
   try {
@@ -9100,6 +9360,9 @@ async function runOwnerReturnThroughDoorCase(
       context,
       15_000,
       (player) => !isOperationActive(player),
+      ownerReturnRequestGateEnabled(state.targetCase)
+        ? finalizeBudgetStop
+        : undefined,
     );
     if (idle === undefined) incomplete("OWNER_RETURN_BODY_NOT_IDLE");
     fixtureMutationStarted = true;
@@ -9284,10 +9547,85 @@ async function runOwnerReturnThroughDoorCase(
     let requestProposalId: string | undefined;
     let requestProposalObserved = false;
     const requestAt = Date.now();
-    update({ stage: "owner_request", ownerRequestSent: true });
+    update({ stage: "owner_request" });
     sendChat(context.owner, "ドアを通って、こっちまで戻ってきてください。");
+    ownerRequestSent = true;
+    update({ ownerRequestSent: true });
     let lastWorldSampleAt = 0;
     let latestWorldSample = before;
+    const updateNavigationEvidence = (player: PlayerEvidence) => {
+      updateObservedToolNames(player);
+      const newProposals = player.proposals.filter(
+        (proposal) => !baselineProposalIds.has(proposal.id),
+      );
+      requestProposalObserved ||= newProposals.length > 0;
+      const proposal = newProposals.length === 1 ? newProposals[0] : undefined;
+      if (proposal !== undefined) requestProposalId = proposal.id;
+      else if (newProposals.length > 1) requestProposalId = undefined;
+      const disposition = ownerReturnProposalDisposition(proposal);
+      const ownerGoalLinked =
+        proposal !== undefined &&
+        player.goals.some(
+          (goal) =>
+            goal.ownerProposalId === proposal.id && goal.source === "owner",
+        );
+      const ownerProposalAdoptedForRequest =
+        proposal !== undefined && disposition === "adopted" && ownerGoalLinked;
+      const ownerProposalProgressableForRequest =
+        proposal !== undefined &&
+        isOwnerProposalProgressable(disposition, ownerGoalLinked);
+      if (ownerProposalProgressableForRequest)
+        state.ownerReturnProposalIdForRun = proposal.id;
+      const ownerMoveJudgmentObserved = player.recentJudgments.some(
+        (judgment) =>
+          judgment.kind === "act" &&
+          judgment.operationKind === "move_to" &&
+          judgment.decidedAt !== undefined &&
+          Date.parse(judgment.decidedAt) >= requestAt,
+      );
+      const moveOutcome = player.recentOutcomes.findLast(
+        (outcome) =>
+          !baselineOutcomeIds.has(outcome.operationId) &&
+          outcome.kind === "move_to" &&
+          outcome.observedAt !== undefined &&
+          Date.parse(outcome.observedAt) >= requestAt,
+      );
+      const safeMoveOutcomeStatus =
+        moveOutcome === undefined
+          ? "unknown"
+          : (safeOutcomeStatus(moveOutcome.status) ?? "unknown");
+      update({
+        stage: "navigation",
+        stopPlayerEvidenceAvailable: true,
+        newOwnerProposalObserved: requestProposalObserved,
+        ownerProposalDisposition: disposition,
+        ownerProposalAdoptedForRequest,
+        ownerProposalProgressableForRequest,
+        ownerGoalLinked,
+        ownerGoalStatusAtStop: ownerReturnGoalStatus(
+          player.goals.find(
+            (goal) =>
+              proposal !== undefined &&
+              goal.ownerProposalId === proposal.id &&
+              goal.source === "owner",
+          )?.status,
+        ),
+        ownerMoveJudgmentObserved,
+        moveOutcomeStatus:
+          safeMoveOutcomeStatus === "cancelled"
+            ? "interrupted"
+            : safeMoveOutcomeStatus,
+        activeOperationPresentAtStop: isOperationActive(player),
+      });
+      return {
+        disposition,
+        ownerGoalLinked,
+        ownerMoveJudgmentObserved,
+      } as const;
+    };
+    projectOwnerReturnStopPlayer = (player) => {
+      updateNavigationEvidence(player);
+    };
     const observationWindowMs = Math.max(
       1,
       Math.min(150_000, context.caseDeadlineAt - Date.now() - 20_000),
@@ -9296,82 +9634,31 @@ async function runOwnerReturnThroughDoorCase(
       context,
       observationWindowMs,
       async (player) => {
-        updateObservedToolNames(player);
-        const newProposals = player.proposals.filter(
-          (proposal) => !baselineProposalIds.has(proposal.id),
-        );
-        requestProposalObserved ||= newProposals.length > 0;
-        const proposal =
-          newProposals.length === 1 ? newProposals[0] : undefined;
-        if (proposal !== undefined) requestProposalId = proposal.id;
-        else if (newProposals.length > 1) requestProposalId = undefined;
-        const disposition = ownerReturnProposalDisposition(proposal);
-        const ownerGoalLinked =
-          proposal !== undefined &&
-          player.goals.some(
-            (goal) =>
-              goal.ownerProposalId === proposal.id && goal.source === "owner",
-          );
-        const ownerProposalAdoptedForRequest =
-          proposal !== undefined &&
-          disposition === "adopted" &&
-          ownerGoalLinked;
-        const ownerProposalProgressableForRequest =
-          proposal !== undefined &&
-          isOwnerProposalProgressable(disposition, ownerGoalLinked);
-        if (ownerProposalProgressableForRequest)
-          state.ownerReturnProposalIdForRun = proposal.id;
-        const ownerMoveJudgmentObserved = player.recentJudgments.some(
-          (judgment) =>
-            judgment.kind === "act" &&
-            judgment.operationKind === "move_to" &&
-            judgment.decidedAt !== undefined &&
-            Date.parse(judgment.decidedAt) >= requestAt,
-        );
-        const moveOutcome = player.recentOutcomes.findLast(
-          (outcome) =>
-            !baselineOutcomeIds.has(outcome.operationId) &&
-            outcome.kind === "move_to" &&
-            outcome.observedAt !== undefined &&
-            Date.parse(outcome.observedAt) >= requestAt,
-        );
-        const safeMoveOutcomeStatus =
-          moveOutcome === undefined
-            ? undefined
-            : safeOutcomeStatus(moveOutcome.status);
-        update({
-          stage: "navigation",
-          newOwnerProposalObserved: newProposals.length > 0,
-          ownerProposalDisposition: disposition,
-          ownerProposalAdoptedForRequest,
-          ownerProposalProgressableForRequest,
-          ownerGoalLinked,
-          ownerMoveJudgmentObserved,
-          ...(safeMoveOutcomeStatus === undefined
-            ? {}
-            : {
-                moveOutcomeStatus:
-                  safeMoveOutcomeStatus === "cancelled"
-                    ? "interrupted"
-                    : safeMoveOutcomeStatus,
-              }),
-        });
+        const navigationEvidence = updateNavigationEvidence(player);
         if (Date.now() - lastWorldSampleAt >= 10_000) {
           latestWorldSample = await sampleWorld();
           lastWorldSampleAt = Date.now();
           updateWorldDiagnostic(latestWorldSample, false);
-          arrived =
-            ownerProposalProgressableForRequest &&
-            ownerMoveJudgmentObserved &&
-            ownerReturnArrivalConfirmed(latestWorldSample);
           update({
             bodyReachedOwnerSide: latestWorldSample.bodySide === "owner_side",
             rconReachedOwnerSide: latestWorldSample.rconSide === "owner_side",
-            bodyAndRconArrivalObserved: arrived,
+            bodyAndRconArrivalObserved:
+              ownerReturnArrivalConfirmed(latestWorldSample),
           });
         }
+        arrived = ownerReturnAcceptanceEvidenceConfirmed(
+          navigationEvidence.disposition,
+          navigationEvidence.ownerGoalLinked,
+          navigationEvidence.ownerMoveJudgmentObserved,
+          latestWorldSample,
+        );
+        if (arrived && ownerReturnRequestGateEnabled(state.targetCase))
+          state.ownerReturnRequestGate?.latch();
         return arrived;
       },
+      ownerReturnRequestGateEnabled(state.targetCase)
+        ? finalizeBudgetStop
+        : undefined,
     );
     if (reachedPlayer === undefined) {
       latestWorldSample = await sampleWorld();
@@ -9390,6 +9677,12 @@ async function runOwnerReturnThroughDoorCase(
         activeOperationPresentAtStop: isOperationActive(stopPlayer),
       });
     } else {
+      update({ stopReason: "owner_arrival" });
+      if (ownerReturnRequestGateEnabled(state.targetCase)) {
+        requireOwnerReturnRequestsSettled(
+          await settleOwnerReturnRequests(state, context),
+        );
+      }
       arrived = true;
       updateObservedToolNames(reachedPlayer);
       update({
@@ -11603,6 +11896,16 @@ async function runCase(
       initial = countersOf(await collect(liveContext.runtime.app));
       initialCaptured = true;
     }
+    if (
+      id === "owner_return_through_door" &&
+      ownerReturnRequestGateEnabled(state.targetCase)
+    ) {
+      state.ownerReturnCaseUsageStart ??= initial;
+      state.ownerReturnRequestGate ??= new AcceptedProviderRequestGate();
+      updateOwnerReturnDiagnostic(state, {
+        ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
+      });
+    }
     if (Date.now() >= state.runDeadlineAt) incomplete("RUN_DEADLINE_EXCEEDED");
     const timeoutMs = Math.max(
       1,
@@ -11676,6 +11979,10 @@ async function runCase(
       evidence: {
         ...evidence,
         ...(id === "no_food_replan" ? noFoodReplanRequestEvidence(state) : {}),
+        ...(id === "owner_return_through_door" &&
+        ownerReturnRequestGateEnabled(state.targetCase)
+          ? ownerReturnRequestSafeEvidence(state)
+          : {}),
         ...safeUsageUnknownReasonEvidence(id, delta),
       },
     };
@@ -11807,6 +12114,16 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
           ).llmCalls;
           state.noFoodReplanRequestGate?.observeRecordedCalls(caseCalls);
         }
+        if (
+          ownerReturnRequestGateEnabled(state.targetCase) &&
+          state.ownerReturnCaseUsageStart !== undefined
+        ) {
+          const caseCalls = subtractCounters(
+            counters,
+            state.ownerReturnCaseUsageStart,
+          ).llmCalls;
+          state.ownerReturnRequestGate?.observeRecordedCalls(caseCalls);
+        }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,
           counters,
@@ -11886,7 +12203,32 @@ async function observeForPlayer(
   context: CaseContext,
   timeoutMs: number,
   predicate: (player: PlayerEvidence) => boolean | Promise<boolean>,
+  onOwnerReturnBudgetStop?: (
+    player: PlayerEvidence | undefined,
+    reason: string,
+  ) => Promise<void>,
 ): Promise<PlayerEvidence | undefined> {
+  const stopForBudget = async (
+    reason: string,
+    player?: PlayerEvidence,
+  ): Promise<never> => {
+    if (onOwnerReturnBudgetStop !== undefined) {
+      let stopPlayer = player;
+      if (stopPlayer === undefined) {
+        try {
+          stopPlayer = playerOf(await collect(context.runtime.app));
+        } catch {
+          stopPlayer = undefined;
+        }
+      }
+      try {
+        await onOwnerReturnBudgetStop(stopPlayer, reason);
+      } catch {
+        // Preserve the stop reason that initiated target finalization.
+      }
+    }
+    incomplete(reason);
+  };
   const deadline = Math.min(
     Date.now() + timeoutMs,
     context.caseDeadlineAt,
@@ -11898,7 +12240,7 @@ async function observeForPlayer(
       admissionFailure === "RUN_LLM_BUDGET_EXCEEDED" ||
       admissionFailure === "CASE_LLM_BUDGET_EXCEEDED"
     ) {
-      incomplete(admissionFailure);
+      await stopForBudget(admissionFailure);
     }
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
@@ -11907,13 +12249,20 @@ async function observeForPlayer(
       runDelta.llmCalls > context.runBudget.llmCalls ||
       totalTokens(runDelta) > context.runBudget.totalTokens
     )
-      incomplete("RUN_LLM_BUDGET_EXCEEDED");
+      await stopForBudget("RUN_LLM_BUDGET_EXCEEDED", player);
     if (
       context.caseBudget !== undefined &&
       (caseDelta.llmCalls > context.caseBudget.llmCalls ||
         totalTokens(caseDelta) > context.caseBudget.totalTokens)
     ) {
-      incomplete("CASE_LLM_BUDGET_EXCEEDED");
+      await stopForBudget("CASE_LLM_BUDGET_EXCEEDED", player);
+    }
+    if (
+      currentRunState !== undefined &&
+      ownerReturnRequestGateEnabled(currentRunState.targetCase) &&
+      caseDelta.usageUnknownCalls > 0
+    ) {
+      await stopForBudget("LLM_USAGE_PARTIAL_OR_UNKNOWN", player);
     }
     if (await predicate(player)) return player;
     await waitMs(800);

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  createOwnerReturnRequestTracking,
   isOwnerProposalProgressable,
+  ownerReturnAcceptanceEvidenceConfirmed,
+  ownerReturnRequestGateEnabled,
   OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   ownerReturnArrivalConfirmed,
   ownerReturnToolNamesSince,
@@ -11,8 +14,70 @@ import {
   isCaseSelectedForTarget,
   TARGETABLE_CASES,
 } from "./target-case-selection.js";
+import {
+  AcceptedProviderRequestGate,
+  classifyAcceptedProviderRequestUsage,
+  waitForAcceptedProviderRequestsSettled,
+} from "./no-food-replan-request-gate.js";
 
 describe("owner return through door targeted E2E case", () => {
+  it("keeps request admission settling scoped to a targeted owner-return run", () => {
+    expect(ownerReturnRequestGateEnabled("owner_return_through_door")).toBe(
+      true,
+    );
+    expect(ownerReturnRequestGateEnabled(undefined)).toBe(false);
+    expect(ownerReturnRequestGateEnabled("no_food_replan")).toBe(false);
+  });
+
+  it("accounts for a startup request whose usage is recorded after the case baseline", () => {
+    const preStartCounters = {
+      llmCalls: 0,
+      usageUnknownCalls: 0,
+      usageUnknownRequestErrorCalls: 0,
+      usageUnknownResponseUsageMissingCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      latencyMs: 0,
+      thoughts: 0,
+      learningUpdates: 0,
+    } satisfies Parameters<typeof createOwnerReturnRequestTracking>[1];
+    const tracking = createOwnerReturnRequestTracking(
+      "owner_return_through_door",
+      preStartCounters,
+    );
+    if (tracking === undefined) throw new Error("OWNER_TRACKING_NOT_CREATED");
+    expect(tracking.usageStart).toBe(preStartCounters);
+    const gate = tracking.gate;
+    gate.beforeCall(() => undefined);
+
+    const recordedCallsAfterCaseStart = 1;
+    const recordedCallsFromPreStart =
+      recordedCallsAfterCaseStart - preStartCounters.llmCalls;
+    gate.observeRecordedCalls(recordedCallsFromPreStart);
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        requestsStarted: 0,
+        requestsRecorded: recordedCallsFromPreStart,
+        calls: recordedCallsFromPreStart,
+        tokens: 100,
+        usageUnknownCalls: 0,
+        caseCallLimit: 12,
+        caseTokenLimit: 80_000,
+      }),
+    ).toBe("accounting_mismatch");
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        requestsStarted: gate.requestsStarted,
+        requestsRecorded: gate.requestsRecorded,
+        calls: recordedCallsFromPreStart,
+        tokens: 100,
+        usageUnknownCalls: 0,
+        caseCallLimit: 12,
+        caseTokenLimit: 80_000,
+      }),
+    ).toBe("settled");
+  });
+
   it("extends only the call allowance while retaining the known-token cap", () => {
     expect(OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET).toEqual({
       llmCalls: 12,
@@ -91,6 +156,118 @@ describe("owner return through door targeted E2E case", () => {
     expect(
       ownerReturnArrivalConfirmed({ ...confirmed, doorState: "closed" }),
     ).toBe(false);
+  });
+
+  it("keeps proposal, linked-goal, movement, and arrival requirements together", () => {
+    const arrival = {
+      bodySide: "owner_side",
+      rconSide: "owner_side",
+      bodyDistance: "within_1_75",
+      rconDistance: "within_1_75",
+      bodyRconAligned: true,
+      doorState: "open",
+    } as const;
+    expect(
+      ownerReturnAcceptanceEvidenceConfirmed(
+        "compromised",
+        true,
+        true,
+        arrival,
+      ),
+    ).toBe(true);
+    expect(
+      ownerReturnAcceptanceEvidenceConfirmed("declined", true, true, arrival),
+    ).toBe(false);
+    expect(
+      ownerReturnAcceptanceEvidenceConfirmed("adopted", false, true, arrival),
+    ).toBe(false);
+    expect(
+      ownerReturnAcceptanceEvidenceConfirmed("adopted", true, false, arrival),
+    ).toBe(false);
+    expect(
+      ownerReturnAcceptanceEvidenceConfirmed("adopted", true, true, {
+        ...arrival,
+        doorState: "closed",
+      }),
+    ).toBe(false);
+  });
+
+  it("latches accepted provider requests and classifies unknown, pending, and over-budget usage", async () => {
+    const gate = new AcceptedProviderRequestGate();
+    let admitted = 0;
+    gate.beforeCall(() => {
+      admitted += 1;
+    });
+    expect(gate.requestsStarted).toBe(1);
+    expect(gate.inFlightRequests).toBe(1);
+
+    gate.latch();
+    expect(() => gate.beforeCall(() => (admitted += 1))).toThrow(
+      "ACCEPTED_PROVIDER_REQUEST_ADMISSION_LATCHED",
+    );
+    expect(admitted).toBe(1);
+    expect(gate.providerRequestsBlockedAfterLatch).toBe(1);
+
+    const baseline = {
+      requestsStarted: 1,
+      requestsRecorded: 0,
+      calls: 0,
+      tokens: 0,
+      usageUnknownCalls: 0,
+      caseCallLimit: 12,
+      caseTokenLimit: 80_000,
+      runCalls: 1,
+      runTokens: 100,
+      runCallLimit: 12,
+      runTokenLimit: 80_000,
+    } as const;
+    expect(classifyAcceptedProviderRequestUsage(baseline)).toBe("pending");
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        ...baseline,
+        requestsRecorded: 1,
+        calls: 1,
+        tokens: 100,
+      }),
+    ).toBe("settled");
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        ...baseline,
+        requestsRecorded: 1,
+        calls: 1,
+        tokens: 100,
+        usageUnknownCalls: 1,
+      }),
+    ).toBe("usage_unknown");
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        ...baseline,
+        requestsRecorded: 1,
+        calls: 1,
+        tokens: 80_001,
+      }),
+    ).toBe("budget_exceeded");
+    expect(
+      classifyAcceptedProviderRequestUsage({
+        ...baseline,
+        requestsRecorded: 2,
+      }),
+    ).toBe("accounting_mismatch");
+
+    let reads = 0;
+    await expect(
+      waitForAcceptedProviderRequestsSettled(
+        async () => {
+          reads += 1;
+          return reads < 2 ? 1 : 0;
+        },
+        300,
+        1,
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      waitForAcceptedProviderRequestsSettled(async () => 1, 10, 1),
+    ).resolves.toBe(false);
   });
 
   it("records only fresh safe tool names grouped by agent role", () => {
