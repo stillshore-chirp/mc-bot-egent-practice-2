@@ -1252,21 +1252,32 @@ describe("integrated player runtime", () => {
     }
   });
 
-  it("keeps a pending body outcome ahead of a later reconnect wake during retry", async () => {
+  it("soft-stops only for a pending body outcome and retries it before other wakes", async () => {
     let releaseThought: (() => void) | undefined;
     const thoughtGate = new Promise<void>((resolve) => {
       releaseThought = resolve;
     });
     let pendingSignal: AbortSignal | undefined;
+    let shouldStopAfterResponse: (() => boolean) | undefined;
+    let softStopAtSettlement = false;
     let thoughtCount = 0;
     let followupOutcome: string | undefined;
     let followupKinds: readonly string[] = [];
     const fixture = createRuntimeFixture({
-      think: async ({ snapshot, events, signal }) => {
+      think: async ({
+        snapshot,
+        events,
+        signal,
+        shouldStopAfterResponse: isStale,
+      }) => {
         thoughtCount += 1;
         if (thoughtCount === 1) {
           pendingSignal = signal;
-          const decision = action("action with a pending thought");
+          shouldStopAfterResponse = isStale;
+          const decision = {
+            ...action("action with a pending thought"),
+            wakeOn: ["body_outcome", "state_changed"] as const,
+          };
           const saved = fixture.mind.commitThought({
             expectedRevision: snapshot.revision,
             decision,
@@ -1276,6 +1287,7 @@ describe("integrated player runtime", () => {
             fixture.mind.consumeEvents(events.map(({ id }) => id));
           }
           await thoughtGate;
+          softStopAtSettlement = isStale?.() ?? false;
           return { accepted: false };
         }
         followupOutcome = snapshot.lastOutcome?.status;
@@ -1290,11 +1302,29 @@ describe("integrated player runtime", () => {
         () => thoughtCount === 1 && fixture.body.started.length === 1,
       );
 
+      const baseline = observation();
+      fixture.body.setObservation({
+        ...baseline,
+        time: { ...baseline.time, timeOfDay: 16_000, isDay: false },
+      });
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "time",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "state_changed"),
+      );
+      expect(shouldStopAfterResponse?.()).toBe(false);
+
       fixture.body.completeActive("failed");
       await waitFor(
         () => fixture.mind.snapshot().lastOutcome?.status === "failed",
       );
       expect(pendingSignal?.aborted).toBe(false);
+      expect(shouldStopAfterResponse?.()).toBe(true);
 
       fixture.body.emit({ type: "reconnected", at: new Date().toISOString() });
       await waitFor(() =>
@@ -1306,8 +1336,10 @@ describe("integrated player runtime", () => {
 
       releaseThought?.();
       await waitFor(() => thoughtCount === 2);
+      expect(softStopAtSettlement).toBe(true);
       expect(followupOutcome).toBe("failed");
       expect(followupKinds).toContain("body_outcome");
+      expect(followupKinds).toContain("state_changed");
       expect(followupKinds).toContain("reconnected");
     } finally {
       releaseThought?.();

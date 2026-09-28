@@ -55,6 +55,7 @@ export interface PlayerPurposePort {
     readonly snapshot: PlayerRuntimeSnapshot;
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
+    readonly shouldStopAfterResponse?: () => boolean;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -590,6 +591,8 @@ export class PlayerRuntime {
                 ]
               : events,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
+          shouldStopAfterResponse: () =>
+            this.#pendingThoughtWake?.kind === "body_outcome",
         });
         if (
           !result.accepted &&

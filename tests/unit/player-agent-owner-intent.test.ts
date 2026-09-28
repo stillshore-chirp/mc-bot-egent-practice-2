@@ -27,6 +27,7 @@ import {
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   projectSafePlayerAgentActivityTail,
+  type PlayerAgentRoundActivity,
   type PlayerResponsesClient,
 } from "../../src/player/responses.js";
 
@@ -38,6 +39,99 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("keeps completed response usage and skips stale purpose tools and rounds", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let resolveResponse!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    });
+    fixture.responses.push(() => {
+      markRequestStarted();
+      return pendingResponse;
+    });
+
+    try {
+      const thought = fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        shouldStopAfterResponse: () =>
+          fixture.mind
+            .pendingEvents(32)
+            .some(({ kind }) => kind === "body_outcome"),
+      });
+      await requestStarted;
+
+      fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
+      resolveResponse(
+        functionCallResponse(
+          "stale-description",
+          "describe_operation",
+          { kind: "dig" },
+          responseUsage(19, 7),
+        ),
+      );
+      const result = await thought;
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+        responseStatus: "completed",
+        processingStatus: "interrupted",
+        inputTokens: 19,
+        outputTokens: 7,
+        functionCallCount: 1,
+        toolCalls: [],
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rechecks a body outcome from the completed-round callback before another request", async () => {
+    let bodyOutcomeQueued = false;
+    const fixture = openPurposeFixture(createMemoryPort(), [], (activity) => {
+      if (
+        !bodyOutcomeQueued &&
+        activity.round === 1 &&
+        activity.processingStatus === "complete"
+      ) {
+        bodyOutcomeQueued = true;
+        fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
+      }
+    });
+    fixture.responses.push(
+      functionCallResponse("stale-description", "describe_operation", {
+        kind: "dig",
+      }),
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        shouldStopAfterResponse: () =>
+          fixture.mind
+            .pendingEvents(32)
+            .some(({ kind }) => kind === "body_outcome"),
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(bodyOutcomeQueued).toBe(true);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+        processingStatus: "complete",
+        functionCallCount: 1,
+        toolCalls: [{ name: "describe_operation" }],
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("grounds capability answers in the current public operation catalog", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const messages: string[] = [];
@@ -1044,7 +1138,7 @@ describe("player owner intent context", () => {
   });
 });
 
-type ScriptedResponse = Response | (() => Response);
+type ScriptedResponse = Response | (() => Response | Promise<Response>);
 
 interface PurposeFixture {
   readonly agent: PlayerPurposeAgent;
@@ -1057,6 +1151,7 @@ interface PurposeFixture {
 function openPurposeFixture(
   memory: PlayerMemoryPort,
   ownerPositionExceptions: boolean[] = [],
+  onRoundActivity?: (activity: PlayerAgentRoundActivity) => void,
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -1100,7 +1195,10 @@ function openPurposeFixture(
     memory,
     ownerPlayerId: "test-owner",
     logger: pino({ level: "silent" }),
-    onRoundActivity: (activity) => mind.recordAgentActivity(activity),
+    onRoundActivity: (activity) => {
+      mind.recordAgentActivity(activity);
+      onRoundActivity?.(activity);
+    },
     onCommitted: () => undefined,
   });
   return {
@@ -1193,7 +1291,7 @@ function scriptedClient(
         const response = responses.shift();
         if (response === undefined)
           throw new Error("TEST_RESPONSE_QUEUE_EMPTY");
-        return typeof response === "function" ? response() : response;
+        return typeof response === "function" ? await response() : response;
       },
     },
   } as unknown as PlayerResponsesClient;
@@ -1203,6 +1301,7 @@ function functionCallResponse(
   callId: string,
   name: string,
   argumentsValue: unknown,
+  usage: NonNullable<Response["usage"]> = responseUsage(1, 1),
 ): Response {
   return {
     status: "completed",
@@ -1215,8 +1314,21 @@ function functionCallResponse(
       },
     ],
     output_text: "",
-    usage: { input_tokens: 1, output_tokens: 1 },
+    usage,
   } as unknown as Response;
+}
+
+function responseUsage(
+  inputTokens: number,
+  outputTokens: number,
+): NonNullable<Response["usage"]> {
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cache_write_tokens: 0, cached_tokens: 0 },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: inputTokens + outputTokens,
+  };
 }
 
 function terminalResponse(outputText: string): Response {
