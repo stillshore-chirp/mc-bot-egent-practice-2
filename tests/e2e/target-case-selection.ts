@@ -10,6 +10,7 @@ export const TARGETABLE_CASES = [
   "skill_exchange",
   "unknown_composite",
   "parallel_dialogue_stop",
+  "owner_stop_latch",
 ] as const;
 
 export type TargetableCase = (typeof TARGETABLE_CASES)[number];
@@ -31,6 +32,12 @@ export function isCaseSelectedForTarget(
 ): boolean {
   if (targetCase === undefined || caseId === targetCase) return true;
   return TARGET_CASE_PREREQUISITES[targetCase]?.includes(caseId) === true;
+}
+
+export function isOwnerStopLatchTargeted(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return targetCase === "owner_stop_latch";
 }
 
 export function isGatherMultiTargetCaseSelected(
