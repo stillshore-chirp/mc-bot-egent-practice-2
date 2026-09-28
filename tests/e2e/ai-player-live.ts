@@ -73,6 +73,10 @@ import {
   type LlmCallAdmission,
 } from "./llm-call-admission.js";
 import {
+  NoFoodReplanRequestGate,
+  waitForNoFoodReplanRequestsSettled,
+} from "./no-food-replan-request-gate.js";
+import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   waitForRecoveryObstacleReadiness,
@@ -189,6 +193,11 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   llmCalls: 8,
   totalTokens: 75_000,
 } as const;
+export const NO_FOOD_REPLAN_CASE_BUDGET = {
+  llmCalls: 10,
+  totalTokens: 100_000,
+} as const;
+export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
@@ -204,6 +213,7 @@ const CASE_BUDGETS = {
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
+  no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
@@ -219,6 +229,7 @@ const CASE_DEADLINES = {
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
   damage_response: 4 * 60_000,
+  no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -277,6 +288,65 @@ interface GameActionPlacementObservationProbe {
     GameActionPlacementObservationSummary
   >;
 }
+interface NoFoodContinuityDiagnostic {
+  readonly startupBodyObservationAvailable: boolean;
+  readonly startupStateConfirmed: boolean;
+  readonly bodyHealth: number | null;
+  readonly rconHealth: number | null;
+  readonly bodyFood: number | null;
+  readonly rconFood: number | null;
+  readonly bodyInventoryEmpty: boolean;
+  readonly rconInventoryEmpty: boolean;
+}
+type NoFoodReplanDecisionClass =
+  | "consume"
+  | "alternative"
+  | "wait"
+  | "complete"
+  | "continue"
+  | "unknown"
+  | "not_observed";
+type NoFoodReplanOutcomeStatus =
+  | "successful"
+  | "failed"
+  | "interrupted"
+  | "cancelled"
+  | "unverified"
+  | "not_observed";
+interface NoFoodReplanDiagnostic {
+  startupStateConfirmed: boolean;
+  purposeDecision: NoFoodReplanDecisionClass;
+  outcomeStatus: NoFoodReplanOutcomeStatus;
+  alternativeSuccessfulBodyOutcomeObserved: boolean;
+  reassessmentObserved: boolean;
+  repeatedFailedOperationUnderUnchangedState: boolean;
+  waitReasonAndWakeConditionPresent: boolean;
+  waitWakeReassessmentObserved: boolean;
+  postOutcomeNoFoodStateConfirmed: boolean;
+  postOutcomePurposeJudgmentObserved: boolean;
+}
+const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
+  startupStateConfirmed: false,
+  purposeDecision: "not_observed",
+  outcomeStatus: "not_observed",
+  alternativeSuccessfulBodyOutcomeObserved: false,
+  reassessmentObserved: false,
+  repeatedFailedOperationUnderUnchangedState: false,
+  waitReasonAndWakeConditionPresent: false,
+  waitWakeReassessmentObserved: false,
+  postOutcomeNoFoodStateConfirmed: false,
+  postOutcomePurposeJudgmentObserved: false,
+};
+const EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC: NoFoodContinuityDiagnostic = {
+  startupBodyObservationAvailable: false,
+  startupStateConfirmed: false,
+  bodyHealth: null,
+  rconHealth: null,
+  bodyFood: null,
+  rconFood: null,
+  bodyInventoryEmpty: false,
+  rconInventoryEmpty: false,
+};
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
   readonly placementConfirmedCount: number;
@@ -540,8 +610,14 @@ interface ReturnPathProbeDiagnostic {
 function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES"
   );
+}
+
+function isNoFoodContinuityProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES";
 }
 
 function classifyBodyMoveError(
@@ -854,6 +930,7 @@ interface PlayerEvidence {
   readonly wait?: {
     readonly reason?: string;
     readonly wakeOn?: readonly string[];
+    readonly wakeAt?: string;
   };
   readonly lastOutcome?: {
     readonly operationId?: string;
@@ -1614,11 +1691,70 @@ function finalRunCounters(state: RunState): Counters {
   return state.countersFinal ?? state.countersInitial ?? zeroCounters();
 }
 
+function noFoodContinuitySafeEvidence(state: RunState): SafeEvidence {
+  return {
+    ...EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC,
+    ...state.noFoodContinuityDiagnostic,
+    providerRequestBlocked:
+      state.noFoodContinuityProviderRequestBlocked === true,
+    providerRequestBlockedAfterReadback:
+      state.noFoodContinuityProviderRequestBlockedAfterReadback === true,
+  };
+}
+
+function noFoodReplanRequestEvidence(state: RunState): SafeEvidence {
+  const requestGate = state.noFoodReplanRequestGate;
+  return {
+    noFoodReplanAcceptanceLatched: requestGate?.acceptanceLatched === true,
+    noFoodReplanProviderRequestsBlockedAfterAcceptance:
+      (requestGate?.providerRequestsBlockedAfterAcceptance ?? 0) > 0,
+    noFoodReplanAcceptedRequestsSettled:
+      requestGate?.acceptanceLatched === true &&
+      requestGate.inFlightRequests === 0 &&
+      requestGate.requestsRecorded === requestGate.requestsStarted,
+    noFoodReplanAcceptedRequestsStarted: requestGate?.requestsStarted ?? 0,
+    noFoodReplanAcceptedRequestsRecorded: requestGate?.requestsRecorded ?? 0,
+    noFoodReplanAcceptedRequestsInFlight: requestGate?.inFlightRequests ?? 0,
+    noFoodReplanRequestAccountingConsistent:
+      requestGate === undefined ||
+      requestGate.requestsRecorded <= requestGate.requestsStarted,
+  };
+}
+
+function noFoodReplanSafeEvidence(state: RunState): SafeEvidence {
+  const continuity = state.noFoodContinuityDiagnostic;
+  return {
+    ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+    ...state.noFoodReplanDiagnostic,
+    ...noFoodReplanRequestEvidence(state),
+    startupBodyObservationAvailable:
+      continuity?.startupBodyObservationAvailable === true,
+    startupHealthBodyAndRconMatched:
+      continuity?.bodyHealth !== null &&
+      continuity?.bodyHealth !== undefined &&
+      continuity.bodyHealth === continuity.rconHealth,
+    startupFoodBodyAndRconMatched:
+      continuity?.bodyFood !== null &&
+      continuity?.bodyFood !== undefined &&
+      continuity.bodyFood === continuity.rconFood,
+    startupBodyInventoryEmpty: continuity?.bodyInventoryEmpty === true,
+    startupRconInventoryEmpty: continuity?.rconInventoryEmpty === true,
+    startupBodyHealth: continuity?.bodyHealth ?? null,
+    startupRconHealth: continuity?.rconHealth ?? null,
+    startupBodyFood: continuity?.bodyFood ?? null,
+    startupRconFood: continuity?.rconFood ?? null,
+  };
+}
+
 function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
   const progress =
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
   return {
     ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(caseId === "no_food_continuity_probe"
+      ? noFoodContinuitySafeEvidence(state)
+      : {}),
+    ...(caseId === "no_food_replan" ? noFoodReplanSafeEvidence(state) : {}),
     ...(caseId === "observation_boundary"
       ? (state.observationBoundaryDiagnostic ?? {
           replyReceived: false,
@@ -2428,6 +2564,13 @@ interface RunState {
   };
   observationBoundarySidecarRetained?: boolean;
   persistentMemoryDiagnostic?: PersistentMemoryProgress;
+  noFoodContinuityDiagnostic?: NoFoodContinuityDiagnostic;
+  noFoodContinuityProviderRequestBlocked?: boolean;
+  noFoodContinuityProviderRequestBlockedAfterReadback?: boolean;
+  noFoodReplanDiagnostic?: NoFoodReplanDiagnostic;
+  noFoodReplanCaseUsageStart?: Counters;
+  noFoodReplanLatestCounters?: Counters;
+  noFoodReplanRequestGate?: NoFoodReplanRequestGate;
 }
 
 interface FoodIntentContinuityDiagnostic {
@@ -2501,6 +2644,7 @@ let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
+let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
 function installGameActionPlacementObservationProbe(): () => void {
   const prototype = MineflayerPlayerBody.prototype;
@@ -2552,6 +2696,82 @@ function installGameActionPlacementObservationProbe(): () => void {
   };
 }
 
+function installNoFoodContinuityObservationProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): () => void {
+  const prototype = MineflayerPlayerBody.prototype;
+  const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
+    prototype,
+    "observe",
+  );
+  if (typeof originalObserveDescriptor?.value !== "function")
+    throw new Error("PlayerBody observation method is unavailable");
+  const originalObserve =
+    originalObserveDescriptor.value as typeof prototype.observe;
+  let captured = false;
+  const instrumentedObserve = async function (
+    this: MineflayerPlayerBody,
+    options?: PlayerBodyObservationOptions,
+  ): Promise<PlayerBodyObservation> {
+    const observation = await originalObserve.call(this, options);
+    if (!captured) {
+      captured = true;
+      const [rconHealth, rconFood, rconInventoryEmpty] = await Promise.all([
+        rconEntityHealth(rcon, state.botName).catch(() => null),
+        rconFoodLevel(rcon, state.botName).catch(() => null),
+        rconInventoryIsEmpty(rcon, state.botName).catch(() => false),
+      ]);
+      const bodyHealth = observation.self.health;
+      const bodyFood = observation.self.food;
+      const bodyInventoryEmpty =
+        observation.self.inventory.reduce(
+          (count, item) => count + item.count,
+          0,
+        ) === 0 &&
+        Object.values(observation.self.equipment).every(
+          (item) => item === null,
+        );
+      const healthConfirmed =
+        bodyHealth !== null &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6 &&
+        bodyHealth === rconHealth;
+      const foodConfirmed =
+        bodyFood !== null &&
+        bodyFood >= 12 &&
+        bodyFood <= 15 &&
+        rconFood !== null &&
+        rconFood >= 12 &&
+        rconFood <= 15 &&
+        bodyFood === rconFood;
+      state.noFoodContinuityDiagnostic = {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed:
+          healthConfirmed &&
+          foodConfirmed &&
+          bodyInventoryEmpty &&
+          rconInventoryEmpty,
+        bodyHealth,
+        rconHealth,
+        bodyFood,
+        rconFood,
+        bodyInventoryEmpty,
+        rconInventoryEmpty,
+      };
+    }
+    return observation;
+  };
+  prototype.observe = instrumentedObserve;
+  return () => {
+    if (prototype.observe === instrumentedObserve)
+      prototype.observe = originalObserve;
+  };
+}
+
 function gameActionPlacementCandidateEvidence(state: RunState): SafeEvidence {
   const diagnostic = state.gameActionPlacementCandidateDiagnostic;
   if (
@@ -2586,6 +2806,533 @@ function readGameActionPlacementCandidateDiagnostic(
     : { freshBodyObservationMatched: true, ...summary };
 }
 
+export function classifyNoFoodReplanDecision(
+  kind: string | undefined,
+  operationKind: string | undefined,
+): NoFoodReplanDecisionClass {
+  if (kind === "wait") return "wait";
+  if (kind === "continue") return "continue";
+  if (kind === "complete") return "complete";
+  if (kind !== "act") return "unknown";
+  const operation = safeOperationKind(operationKind);
+  if (operation === undefined) return "unknown";
+  return operation === "consume" ? "consume" : "alternative";
+}
+
+export function isNoFoodReplanPurposeAfterOutcome(
+  judgmentAt: string | undefined,
+  outcomeObservedAt: string | undefined,
+): boolean {
+  const judgmentTime = Date.parse(judgmentAt ?? "");
+  const outcomeTime = Date.parse(outcomeObservedAt ?? "");
+  return (
+    Number.isFinite(judgmentTime) &&
+    Number.isFinite(outcomeTime) &&
+    judgmentTime > outcomeTime
+  );
+}
+
+export function noFoodReplanBeforeCallBlockReason(
+  callsStarted: number,
+  usageUnknownCalls: number,
+  knownTokens: number,
+): "LLM_USAGE_PARTIAL_OR_UNKNOWN" | "CASE_LLM_BUDGET_EXCEEDED" | undefined {
+  if (usageUnknownCalls > 0) return "LLM_USAGE_PARTIAL_OR_UNKNOWN";
+  if (
+    callsStarted >= NO_FOOD_REPLAN_CASE_BUDGET.llmCalls ||
+    knownTokens >= NO_FOOD_REPLAN_CASE_BUDGET.totalTokens
+  )
+    return "CASE_LLM_BUDGET_EXCEEDED";
+  return undefined;
+}
+
+export function noFoodReplanOraclesConfirmed(
+  bodyHealth: number | null,
+  rconHealth: number | null,
+  bodyFood: number | null,
+  rconFood: number | null,
+  bodyInventoryEmpty: boolean,
+  rconInventoryEmpty: boolean,
+): boolean {
+  return (
+    bodyHealth !== null &&
+    bodyHealth > 0 &&
+    rconHealth === bodyHealth &&
+    bodyFood !== null &&
+    bodyFood >= 12 &&
+    bodyFood <= 15 &&
+    rconFood === bodyFood &&
+    rconFood >= 12 &&
+    rconFood <= 15 &&
+    bodyInventoryEmpty &&
+    rconInventoryEmpty
+  );
+}
+
+interface NoFoodReplanOracle {
+  readonly bodyHealth: number | null;
+  readonly rconHealth: number | null;
+  readonly bodyFood: number | null;
+  readonly rconFood: number | null;
+  readonly noFoodStateConfirmed: boolean;
+}
+
+async function readNoFoodReplanOracle(
+  context: CaseContext,
+): Promise<NoFoodReplanOracle> {
+  const evidence = await collect(context.runtime.app);
+  const [rconHealth, rconFood, rconInventoryEmpty] = await Promise.all([
+    rconEntityHealth(context.rcon, context.botName).catch(() => null),
+    rconFoodLevel(context.rcon, context.botName).catch(() => null),
+    rconInventoryIsEmpty(context.rcon, context.botName).catch(() => false),
+  ]);
+  const bodyHealth =
+    typeof evidence.game?.health === "number" &&
+    Number.isFinite(evidence.game.health)
+      ? evidence.game.health
+      : null;
+  const bodyFood =
+    typeof evidence.game?.food === "number" &&
+    Number.isFinite(evidence.game.food)
+      ? evidence.game.food
+      : null;
+  const bodyInventoryEmpty = evidence.game?.inventoryTotal === 0;
+  return {
+    bodyHealth,
+    rconHealth,
+    bodyFood,
+    rconFood,
+    noFoodStateConfirmed: noFoodReplanOraclesConfirmed(
+      bodyHealth,
+      rconHealth,
+      bodyFood,
+      rconFood,
+      bodyInventoryEmpty,
+      rconInventoryEmpty,
+    ),
+  };
+}
+
+function noFoodReplanJudgmentKey(
+  judgment: PlayerEvidence["recentJudgments"][number],
+): string {
+  return `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+}
+
+function assertNoFoodReplanUsage(context: CaseContext, player: PlayerEvidence) {
+  const delta = subtractCounters(player.counters, context.usageAtStart);
+  if (delta.usageUnknownCalls > 0) incomplete("LLM_USAGE_PARTIAL_OR_UNKNOWN");
+}
+
+const NO_FOOD_REPLAN_SETTLE_MAX_MS = 15_000;
+
+async function settleNoFoodReplanRequests(
+  state: RunState,
+  context: CaseContext,
+): Promise<void> {
+  const requestGate = state.noFoodReplanRequestGate;
+  if (!requestGate?.acceptanceLatched)
+    incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+  const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
+  const settled = await waitForNoFoodReplanRequestsSettled(
+    async () => {
+      const player = playerOf(await collect(context.runtime.app));
+      assertNoFoodReplanUsage(context, player);
+      if (requestGate.requestsRecorded > requestGate.requestsStarted) {
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      }
+      return requestGate.inFlightRequests;
+    },
+    Math.min(NO_FOOD_REPLAN_SETTLE_MAX_MS, remainingMs),
+  );
+  if (!settled) incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+}
+
+async function runNoFoodReplanCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  state.noFoodReplanCaseUsageStart = context.usageAtStart;
+  state.noFoodReplanLatestCounters = context.usageAtStart;
+  state.noFoodReplanRequestGate = new NoFoodReplanRequestGate();
+  state.noFoodReplanDiagnostic = { ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC };
+  await connectApplication(context.runtime.app, state);
+  const startup = state.noFoodContinuityDiagnostic;
+  if (
+    !startup?.startupBodyObservationAvailable ||
+    !startup.startupStateConfirmed
+  )
+    incomplete("NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED");
+  const before = state.preStartPlayer;
+  if (before === undefined) incomplete("NO_FOOD_REPLAN_BASELINE_NOT_AVAILABLE");
+  state.noFoodReplanDiagnostic = {
+    ...state.noFoodReplanDiagnostic,
+    startupStateConfirmed: true,
+  };
+
+  const knownJudgments = new Set(
+    before.recentJudgments.map(noFoodReplanJudgmentKey),
+  );
+  let knownOutcomes = new Set(
+    before.recentOutcomes.map(({ operationId }) => operationId),
+  );
+  const freshDecision = async (
+    timeoutMs: number,
+  ): Promise<
+    | {
+        readonly player: PlayerEvidence;
+        readonly judgment: PlayerEvidence["recentJudgments"][number];
+      }
+    | undefined
+  > => {
+    let judgment: PlayerEvidence["recentJudgments"][number] | undefined;
+    const player = await observeForPlayer(context, timeoutMs, (snapshot) => {
+      assertNoFoodReplanUsage(context, snapshot);
+      judgment = snapshot.recentJudgments.find(
+        (item) => !knownJudgments.has(noFoodReplanJudgmentKey(item)),
+      );
+      return judgment !== undefined;
+    });
+    if (player === undefined || judgment === undefined) return undefined;
+    for (const item of player.recentJudgments)
+      knownJudgments.add(noFoodReplanJudgmentKey(item));
+    return { player, judgment };
+  };
+  const waitForWakeReassessment = async (
+    player: PlayerEvidence,
+    judgment: PlayerEvidence["recentJudgments"][number],
+  ) => {
+    const wake = player.wait?.wakeOn ?? [];
+    const reasonPresent =
+      (player.wait?.reason?.trim().length ?? 0) > 0 &&
+      (judgment.summary?.trim().length ?? 0) > 0;
+    const wakeConditionPresent = wake.length > 0;
+    state.noFoodReplanDiagnostic = {
+      ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+      ...state.noFoodReplanDiagnostic,
+      waitReasonAndWakeConditionPresent: reasonPresent && wakeConditionPresent,
+    };
+    if (!reasonPresent || !wakeConditionPresent)
+      incomplete("NO_FOOD_WAIT_REASON_OR_WAKE_CONDITION_NOT_CONFIRMED");
+    const wakeAt = Date.parse(player.wait?.wakeAt ?? "");
+    const remaining = context.caseDeadlineAt - Date.now();
+    if (Number.isFinite(wakeAt) && wakeAt > context.caseDeadlineAt)
+      incomplete("NO_FOOD_WAIT_WAKE_OUTSIDE_CASE_BUDGET");
+    if (
+      !wake.includes("state_changed") &&
+      !(wake.includes("deadline") && Number.isFinite(wakeAt))
+    )
+      incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
+    const timeout = Number.isFinite(wakeAt)
+      ? Math.min(remaining, Math.max(1, wakeAt - Date.now() + 15_000))
+      : Math.min(60_000, Math.max(1, remaining));
+    const next = await freshDecision(timeout);
+    if (next === undefined) incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
+    state.noFoodReplanDiagnostic = {
+      ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+      ...state.noFoodReplanDiagnostic,
+      waitWakeReassessmentObserved: true,
+      reassessmentObserved: true,
+    };
+    return next;
+  };
+  const waitForOutcome = async (
+    judgment: PlayerEvidence["recentJudgments"][number],
+    operationKind: PlayerOperationName,
+  ) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    if (!Number.isFinite(decidedAt))
+      incomplete("NO_FOOD_REPLAN_JUDGMENT_TIME_NOT_AVAILABLE");
+    let outcome: PlayerEvidence["recentOutcomes"][number] | undefined;
+    const player = await observeForPlayer(
+      context,
+      Math.min(
+        90_000,
+        Math.max(1, context.caseDeadlineAt - Date.now() - 20_000),
+      ),
+      (snapshot) => {
+        assertNoFoodReplanUsage(context, snapshot);
+        outcome = snapshot.recentOutcomes.find((item) => {
+          const observedAt = Date.parse(item.observedAt ?? "");
+          return (
+            !knownOutcomes.has(item.operationId) &&
+            item.kind === operationKind &&
+            Number.isFinite(observedAt) &&
+            observedAt >= decidedAt
+          );
+        });
+        return outcome !== undefined;
+      },
+    );
+    if (player === undefined || outcome === undefined)
+      incomplete("NO_FOOD_BODY_OUTCOME_NOT_OBSERVED");
+    knownOutcomes = new Set(
+      player.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    return outcome;
+  };
+
+  let decision = await freshDecision(
+    Math.min(
+      120_000,
+      Math.max(1, context.caseDeadlineAt - Date.now() - 30_000),
+    ),
+  );
+  if (decision === undefined)
+    incomplete("NO_FOOD_PURPOSE_DECISION_NOT_OBSERVED");
+  let previousFailedOperation: PlayerOperationName | undefined;
+  let previousFailureState: NoFoodReplanOracle | undefined;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { player } = decision;
+    let { judgment } = decision;
+    const decisionClass = classifyNoFoodReplanDecision(
+      judgment.kind,
+      judgment.operationKind,
+    );
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      ...(attempt === 0
+        ? { purposeDecision: decisionClass }
+        : { reassessmentObserved: true }),
+    };
+    if (decisionClass === "wait") {
+      decision = await waitForWakeReassessment(player, judgment);
+      judgment = decision.judgment;
+      if (
+        classifyNoFoodReplanDecision(judgment.kind, judgment.operationKind) ===
+        "wait"
+      )
+        incomplete("NO_FOOD_WAIT_REASSESSMENT_STILL_WAITING");
+    }
+    const currentClass = classifyNoFoodReplanDecision(
+      judgment.kind,
+      judgment.operationKind,
+    );
+    if (currentClass === "complete" || currentClass === "continue")
+      incomplete("NO_FOOD_REPLAN_ACTION_NOT_OBSERVED");
+    if (currentClass !== "consume" && currentClass !== "alternative")
+      incomplete("NO_FOOD_REPLAN_DECISION_KIND_UNKNOWN");
+    const operationKind = safeOperationKind(judgment.operationKind);
+    if (operationKind === undefined)
+      incomplete("NO_FOOD_REPLAN_OPERATION_KIND_UNKNOWN");
+
+    if (
+      previousFailedOperation === operationKind &&
+      previousFailureState !== undefined
+    ) {
+      const current = await readNoFoodReplanOracle(context);
+      if (
+        current.noFoodStateConfirmed &&
+        current.bodyHealth === previousFailureState.bodyHealth &&
+        current.rconHealth === previousFailureState.rconHealth &&
+        current.bodyFood === previousFailureState.bodyFood &&
+        current.rconFood === previousFailureState.rconFood
+      ) {
+        state.noFoodReplanDiagnostic = {
+          ...state.noFoodReplanDiagnostic,
+          repeatedFailedOperationUnderUnchangedState: true,
+          postOutcomeNoFoodStateConfirmed: true,
+        };
+        if (operationKind === "consume")
+          fail("NO_FOOD_FAILED_CONSUME_REPEATED_WITHOUT_STATE_CHANGE");
+        incomplete("NO_FOOD_REPEATED_OPERATION_KIND_DETAIL_UNAVAILABLE");
+      }
+      incomplete("NO_FOOD_REPLAN_STATE_CHANGED_BEFORE_REASSESSMENT");
+    }
+    if (currentClass === "consume" && previousFailedOperation !== undefined)
+      fail("NO_FOOD_CONSUME_SELECTED_WITH_EMPTY_INVENTORY");
+
+    const outcome = await waitForOutcome(judgment, operationKind);
+    const outcomeStatus = safeOutcomeStatus(outcome.status) ?? "unverified";
+    if (state.noFoodReplanDiagnostic.outcomeStatus === "not_observed")
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        outcomeStatus,
+      };
+    const afterState = await readNoFoodReplanOracle(context);
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      postOutcomeNoFoodStateConfirmed: afterState.noFoodStateConfirmed,
+    };
+    if (!afterState.noFoodStateConfirmed)
+      incomplete("NO_FOOD_POST_OUTCOME_ORACLES_NOT_CONFIRMED");
+    if (outcomeStatus === "successful") {
+      if (currentClass === "consume")
+        fail("NO_FOOD_CONSUME_SUCCESS_CONTRADICTS_EMPTY_INVENTORY");
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        alternativeSuccessfulBodyOutcomeObserved: true,
+      };
+      const outcomeObservedAt = Date.parse(outcome.observedAt ?? "");
+      if (!Number.isFinite(outcomeObservedAt))
+        incomplete("NO_FOOD_BODY_OUTCOME_TIME_NOT_AVAILABLE");
+      const remainingMs = context.caseDeadlineAt - Date.now();
+      const postOutcomePlayer = await observeForPlayer(
+        context,
+        Math.min(60_000, Math.max(1, remainingMs)),
+        (snapshot) => {
+          assertNoFoodReplanUsage(context, snapshot);
+          const postOutcomePurposeJudgmentObserved =
+            snapshot.recentJudgments.some((item) =>
+              isNoFoodReplanPurposeAfterOutcome(
+                item.decidedAt,
+                outcome.observedAt,
+              ),
+            );
+          if (postOutcomePurposeJudgmentObserved) {
+            const acceptanceEvidence = {
+              ...(state.noFoodReplanDiagnostic ??
+                EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC),
+              postOutcomePurposeJudgmentObserved: true,
+            };
+            state.noFoodReplanDiagnostic = acceptanceEvidence;
+            const requestGate = state.noFoodReplanRequestGate;
+            if (!requestGate?.latchIfAcceptedEvidence(acceptanceEvidence)) {
+              return false;
+            }
+          }
+          return postOutcomePurposeJudgmentObserved;
+        },
+      );
+      const postOutcomePurposeJudgmentObserved =
+        postOutcomePlayer?.recentJudgments.some((item) =>
+          isNoFoodReplanPurposeAfterOutcome(item.decidedAt, outcome.observedAt),
+        ) ?? false;
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        postOutcomePurposeJudgmentObserved,
+      };
+      if (!postOutcomePurposeJudgmentObserved)
+        incomplete("NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED");
+      const requestGate = state.noFoodReplanRequestGate;
+      if (!requestGate.acceptanceLatched)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      await settleNoFoodReplanRequests(state, context);
+      return {
+        ...state.noFoodReplanDiagnostic,
+        ...noFoodReplanRequestEvidence(state),
+        startupOraclesConfirmed: true,
+      };
+    }
+    if (outcomeStatus !== "failed")
+      incomplete("NO_FOOD_BODY_OUTCOME_STATUS_UNCONFIRMED");
+    if (
+      afterState.bodyHealth !== startup.bodyHealth ||
+      afterState.rconHealth !== startup.rconHealth ||
+      afterState.bodyFood !== startup.bodyFood ||
+      afterState.rconFood !== startup.rconFood
+    )
+      incomplete("NO_FOOD_FAILED_OPERATION_STATE_CHANGED");
+
+    previousFailedOperation = operationKind;
+    previousFailureState = afterState;
+    decision = await freshDecision(
+      Math.max(1, context.caseDeadlineAt - Date.now() - 20_000),
+    );
+    if (decision === undefined)
+      incomplete("NO_FOOD_REASSESSMENT_AFTER_FAILURE_NOT_OBSERVED");
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      reassessmentObserved: true,
+    };
+  }
+  incomplete("NO_FOOD_REPLAN_OBSERVATION_LIMIT_REACHED");
+}
+
+async function runNoFoodContinuityProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const fixture = await runCase(
+    state,
+    "no_food_fixture_probe",
+    120_000,
+    0,
+    0,
+    () => prepareNoFoodFixtureProbe(state, rcon),
+  );
+  if (fixture.status !== "pass") {
+    state.status = fixture.status;
+    state.failureCode ??=
+      fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+    return;
+  }
+
+  const config = loadConfig({
+    ...process.env,
+    OPENAI_API_KEY: "no-provider-request-e2e-probe",
+    MINECRAFT_HOST: "127.0.0.1",
+    MINECRAFT_PORT: String(state.serverPort),
+    MINECRAFT_USERNAME: state.botName,
+    MINECRAFT_AUTH: "offline",
+    MINECRAFT_VERSION: SERVER_VERSION,
+    OWNER_USERNAME: state.ownerName,
+    OPENAI_MODEL: MODEL,
+    DATABASE_PATH: state.databasePath,
+    PERSONA_PATH: resolve(PROJECT_ROOT, "config/persona.example.json"),
+    LOG_LEVEL: "silent",
+    RECONNECT_ENABLED: "false",
+    DASHBOARD_ENABLED: "false",
+  });
+  const { createApplication } = await import("../../src/app/application.js");
+  const app = createApplication(config, state.llmAdmission?.beforeCall);
+  appForCleanup = app;
+  state.countersInitial = countersOf(await collect(app));
+  restoreNoFoodContinuityObservationProbe ??=
+    installNoFoodContinuityObservationProbe(state, rcon);
+  await connectApplication(app, state);
+
+  const continuity = await runCase(
+    state,
+    "no_food_continuity_probe",
+    15_000,
+    0,
+    0,
+    async () => {
+      const deadline = Date.now() + 10_000;
+      while (
+        state.noFoodContinuityProviderRequestBlocked !== true &&
+        Date.now() < deadline
+      ) {
+        await waitMs(50);
+      }
+      const diagnostic = state.noFoodContinuityDiagnostic;
+      if (diagnostic?.startupBodyObservationAvailable !== true)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_OBSERVATION_NOT_CONFIRMED");
+      if (!diagnostic.startupStateConfirmed)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_STATE_NOT_CONFIRMED");
+      if (state.noFoodContinuityProviderRequestBlocked !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_NOT_REACHED");
+      if (state.noFoodContinuityProviderRequestBlockedAfterReadback !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_BEFORE_READBACK");
+      return {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed: true,
+        bodyInventoryEmpty: true,
+        rconInventoryEmpty: true,
+        providerRequestBlocked: true,
+        providerRequestBlockedAfterReadback: true,
+      };
+    },
+  );
+  state.status = continuity.status;
+  if (continuity.status !== "pass")
+    state.failureCode ??=
+      continuity.reason ?? "NO_FOOD_CONTINUITY_NOT_CONFIRMED";
+  try {
+    state.countersFinal = countersOf(await collect(app));
+  } catch {
+    state.countersFinal = state.countersInitial;
+  }
+  try {
+    await boundedShutdown(app, "no_food_continuity_probe_complete");
+  } catch {
+    state.status = "incomplete";
+    state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+  }
+}
+
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
   loadEnvironmentFile({ path: resolve(repoRoot, ".env.local"), quiet: true });
@@ -2603,6 +3350,25 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (isNoFoodContinuityProbeOnly()) {
+      await runNoFoodContinuityProbe(state, rcon);
+      return;
+    }
+    if (process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES") {
+      const fixture = await runCase(
+        state,
+        "no_food_fixture_probe",
+        120_000,
+        0,
+        0,
+        () => prepareNoFoodFixtureProbe(state, rcon),
+      );
+      state.status = fixture.status;
+      if (fixture.status !== "pass")
+        state.failureCode ??=
+          fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+      return;
+    }
     const owner = await connectPublicClient(state.serverPort, state.ownerName);
     ownerForCleanup = owner;
     const guest = await connectPublicClient(state.serverPort, state.guestName);
@@ -2624,12 +3390,24 @@ async function main(): Promise<void> {
       state.status = "pass";
       return;
     }
+    if (state.targetCase === "no_food_replan") {
+      const fixture = await runCase(
+        state,
+        "no_food_replan_fixture",
+        120_000,
+        0,
+        0,
+        () => prepareNoFoodFixtureProbe(state, rcon),
+      );
+      if (fixture.status !== "pass") {
+        state.status = fixture.status;
+        state.failureCode ??=
+          fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+        return;
+      }
+    }
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
-    const autonomousRegion = state.autonomousRegion;
-    const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
-    if (autonomousRegion === undefined || autonomousSmokeBaseline === undefined)
-      incomplete("AUTONOMOUS_WORLD_BASELINE_MISSING");
 
     const config = loadConfig({
       ...process.env,
@@ -2647,14 +3425,34 @@ async function main(): Promise<void> {
       DASHBOARD_ENABLED: "false",
     });
     const { createApplication } = await import("../../src/app/application.js");
-    restoreGameActionPlacementObservationProbe ??=
-      installGameActionPlacementObservationProbe();
     const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
     state.preStartPlayer = playerOf(preStartEvidence);
     state.countersInitial = countersOf(preStartEvidence);
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
+    if (state.targetCase === "no_food_replan") {
+      restoreNoFoodContinuityObservationProbe ??=
+        installNoFoodContinuityObservationProbe(state, rcon);
+      const noFoodReplanResult = await recordCase(
+        state,
+        "no_food_replan",
+        CASE_DEADLINES.no_food_replan,
+        requireLiveContext(),
+        async (context) => runNoFoodReplanCase(state, context),
+      );
+      state.status = noFoodReplanResult.status;
+      if (noFoodReplanResult.status !== "pass")
+        state.failureCode ??=
+          noFoodReplanResult.reason ?? "NO_FOOD_REPLAN_NOT_CONFIRMED";
+      return;
+    }
+    const autonomousRegion = state.autonomousRegion;
+    const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
+    if (autonomousRegion === undefined || autonomousSmokeBaseline === undefined)
+      incomplete("AUTONOMOUS_WORLD_BASELINE_MISSING");
+    restoreGameActionPlacementObservationProbe ??=
+      installGameActionPlacementObservationProbe();
     await connectApplication(activeApp, state);
     const autonomousSpawn = parsePosition(
       await rcon.command(`data get entity ${state.botName} Pos`),
@@ -6057,7 +6855,7 @@ async function main(): Promise<void> {
     state.status = status;
     state.failureCode ??= code;
     if (state.countersInitial !== undefined && status === "incomplete") {
-      state.usageUncertain = true;
+      if (!isNoFoodContinuityProbeOnly()) state.usageUncertain = true;
     }
   } finally {
     if (liveContext !== undefined && shouldCollectAfterRun(state)) {
@@ -6071,6 +6869,8 @@ async function main(): Promise<void> {
     }
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
+    restoreNoFoodContinuityObservationProbe?.();
+    restoreNoFoodContinuityObservationProbe = undefined;
     activeGameActionPlacementObservationProbe = undefined;
     restoreGameActionPlacementObservationProbe?.();
     restoreGameActionPlacementObservationProbe = undefined;
@@ -6095,10 +6895,13 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
-  if (
-    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
-    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES"
-  ) {
+  const selectedNoGptProbeCount = [
+    process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY,
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY,
+  ].filter((value) => value === "YES").length;
+  if (selectedNoGptProbeCount > 1) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
@@ -6227,6 +7030,65 @@ async function prepareRun(): Promise<RunState> {
   state.llmAdmission = {
     ...admission,
     beforeCall: () => {
+      if (isNoFoodContinuityProbeOnly()) {
+        state.noFoodContinuityProviderRequestBlocked = true;
+        state.noFoodContinuityProviderRequestBlockedAfterReadback =
+          state.noFoodContinuityDiagnostic?.startupBodyObservationAvailable ===
+          true;
+        throw new HarnessError(
+          "incomplete",
+          "NO_FOOD_CONTINUITY_PROVIDER_REQUEST_BLOCKED",
+        );
+      }
+      if (state.targetCase === "no_food_replan") {
+        const caseStart = state.noFoodReplanCaseUsageStart;
+        const requestGate = state.noFoodReplanRequestGate;
+        if (caseStart !== undefined && requestGate === undefined) {
+          state.failureCode ??= "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY";
+          throw new HarnessError(
+            "incomplete",
+            "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY",
+          );
+        }
+        const admitNoFoodRequest = () => {
+          if (caseStart !== undefined) {
+            const current = state.noFoodReplanLatestCounters ?? caseStart;
+            const delta = subtractCounters(current, caseStart);
+            const blockReason = noFoodReplanBeforeCallBlockReason(
+              requestGate?.requestsStarted ?? 0,
+              delta.usageUnknownCalls,
+              totalTokens(delta),
+            );
+            if (blockReason !== undefined) {
+              state.failureCode ??= blockReason;
+              throw new HarnessError("incomplete", blockReason);
+            }
+          }
+          if (
+            state.noFoodContinuityDiagnostic?.startupStateConfirmed !== true
+          ) {
+            state.failureCode ??=
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED";
+            throw new HarnessError(
+              "incomplete",
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED",
+            );
+          }
+          try {
+            admission.beforeCall();
+          } catch (error) {
+            if (error instanceof LlmCallAdmissionError)
+              throw new HarnessError("incomplete", error.code);
+            throw error;
+          }
+        };
+        if (caseStart !== undefined && requestGate !== undefined) {
+          requestGate.beforeCall(admitNoFoodRequest);
+          return;
+        }
+        admitNoFoodRequest();
+        return;
+      }
       try {
         admission.beforeCall();
       } catch (error) {
@@ -6497,6 +7359,173 @@ async function assertNoOperators(state: RunState): Promise<void> {
   ) as unknown;
   if (!Array.isArray(ops) || ops.length !== 0)
     fail("ISOLATED_SERVER_HAS_OPERATOR");
+}
+
+async function prepareNoFoodFixtureProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<Readonly<Record<string, string | number | boolean>>> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("no-food fixture probe deadline")),
+    110_000,
+  );
+  let body: ReturnType<typeof client.createPlayerBody> | undefined;
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    await rcon.command(`tp ${state.botName} 0.5 64 0.5 0 0`);
+    const baselineBody = await body.observe();
+    const baselineRconHealth = await rconEntityHealth(rcon, state.botName);
+    const baselineRconFood = await rconFoodLevel(rcon, state.botName);
+    if (
+      baselineBody.self.health !== 20 ||
+      baselineBody.self.food !== 20 ||
+      baselineRconHealth !== 20 ||
+      baselineRconFood !== 20
+    )
+      incomplete("NO_FOOD_FIXTURE_FULL_BASELINE_NOT_CONFIRMED");
+
+    const effectsBaseline = await rconActiveEffectsState(rcon, state.botName);
+    if (effectsBaseline === "unknown")
+      incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_UNAVAILABLE");
+    if (effectsBaseline === "active") {
+      await rcon.command(`effect clear ${state.botName}`);
+      if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+        incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_NOT_CLEARED");
+    }
+
+    await rcon.command(`clear ${state.botName}`);
+    await rcon.command(
+      `effect give ${state.botName} minecraft:hunger 120 8 true`,
+    );
+    if (!(await rconHasActiveEffect(rcon, state.botName, "hunger")))
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_NOT_CONFIRMED");
+    const foodDeadline = Date.now() + 60_000;
+    let preparedFood = await rconFoodLevel(rcon, state.botName);
+    while (preparedFood > 15 && Date.now() < foodDeadline) {
+      await waitMs(250);
+      preparedFood = await rconFoodLevel(rcon, state.botName);
+    }
+    if (preparedFood < 12 || preparedFood > 15)
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED");
+    await rcon.command(`effect clear ${state.botName} minecraft:hunger`);
+    if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+
+    await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
+    await rcon.command(`damage ${state.botName} 14 minecraft:generic`);
+    const healthDeadline = Date.now() + 3_000;
+    let finalBody = await body.observe();
+    let bodyHealth = finalBody.self.health;
+    let rconHealth: number | null = null;
+    while (Date.now() < healthDeadline) {
+      try {
+        rconHealth = await rconEntityHealth(
+          rcon,
+          state.botName,
+          Math.max(1, Math.min(500, healthDeadline - Date.now())),
+        );
+      } catch {
+        rconHealth = null;
+      }
+      try {
+        finalBody = await body.observe();
+        bodyHealth = finalBody.self.health;
+      } catch {
+        bodyHealth = null;
+      }
+      if (
+        typeof bodyHealth === "number" &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6
+      )
+        break;
+      await waitMs(100);
+    }
+    const bodyFood = finalBody.self.food;
+    const rconFood = await rconFoodLevel(rcon, state.botName);
+    const bodyInventoryItemCount = finalBody.self.inventory.reduce(
+      (total, item) => total + item.count,
+      0,
+    );
+    const bodyEquipmentEmpty = Object.values(finalBody.self.equipment).every(
+      (item) => item === null,
+    );
+    const rconInventoryEmpty = await rconInventoryIsEmpty(rcon, state.botName);
+    if (
+      typeof bodyHealth !== "number" ||
+      bodyHealth <= 0 ||
+      bodyHealth > 6 ||
+      rconHealth === null ||
+      rconHealth <= 0 ||
+      rconHealth > 6
+    )
+      incomplete("NO_FOOD_FIXTURE_LOW_HEALTH_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      typeof bodyFood !== "number" ||
+      bodyFood < 12 ||
+      bodyFood > 15 ||
+      rconFood < 12 ||
+      rconFood > 15 ||
+      bodyFood !== rconFood
+    )
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      bodyInventoryItemCount !== 0 ||
+      !bodyEquipmentEmpty ||
+      !rconInventoryEmpty
+    )
+      incomplete(
+        "NO_FOOD_FIXTURE_EMPTY_INVENTORY_NOT_CONFIRMED_BY_BOTH_ORACLES",
+      );
+
+    return {
+      applicationStarted: false,
+      purposeDecisionStarted: false,
+      llmCalls: 0,
+      baselineBodyHealth: baselineBody.self.health,
+      baselineRconHealth,
+      baselineBodyFood: baselineBody.self.food,
+      baselineRconFood,
+      bodyHealth,
+      rconHealth,
+      bodyFood,
+      rconFood,
+      bodyInventoryItemCount,
+      bodyEquipmentEmpty,
+      rconInventoryEmpty,
+      hungerEffectCleanupConfirmed: true,
+      naturalRegenerationDisabled: true,
+    };
+  } finally {
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("no_food_fixture_probe").catch(() => undefined);
+  }
 }
 
 async function runOperationSmoke(
@@ -8082,6 +9111,16 @@ async function rconInventoryItemCount(
   return count;
 }
 
+async function rconInventoryIsEmpty(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<boolean> {
+  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  if (!/\[\s*\]\s*$/u.test(inventory.trim()))
+    incomplete("NO_FOOD_FIXTURE_RCON_INVENTORY_NOT_EMPTY_OR_UNAVAILABLE");
+  return true;
+}
+
 async function rconFoodLevel(
   rcon: LocalRcon,
   botName: string,
@@ -8714,9 +9753,24 @@ async function runCase(
     const final =
       terminalEvidence === undefined ? initial : countersOf(terminalEvidence);
     const delta = subtractCounters(final, initial);
+    if (id === "no_food_replan" && terminalEvidence !== undefined) {
+      const requestGate = state.noFoodReplanRequestGate;
+      const caseStart = state.noFoodReplanCaseUsageStart;
+      if (!requestGate?.acceptanceLatched || caseStart === undefined)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      requestGate.observeRecordedCalls(
+        subtractCounters(final, caseStart).llmCalls,
+      );
+      if (requestGate.requestsRecorded > requestGate.requestsStarted)
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      if (requestGate.inFlightRequests !== 0)
+        incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+    }
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
     if (delta.usageUnknownCalls > 0) state.usageUncertain = true;
+    if (id === "no_food_replan" && delta.usageUnknownCalls > 0)
+      incomplete("LLM_USAGE_PARTIAL_OR_UNKNOWN");
     if (
       delta.llmCalls > 0 &&
       totalTokens(delta) === 0 &&
@@ -8746,6 +9800,7 @@ async function runCase(
         delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
       evidence: {
         ...evidence,
+        ...(id === "no_food_replan" ? noFoodReplanRequestEvidence(state) : {}),
         ...safeUsageUnknownReasonEvidence(id, delta),
       },
     };
@@ -8785,6 +9840,8 @@ async function runCase(
       error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
+      id !== "no_food_fixture_probe" &&
+      id !== "no_food_continuity_probe" &&
       (/BUDGET|DEADLINE/u.test(reason) ||
         delta.usageUnknownCalls > 0 ||
         (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
@@ -8864,6 +9921,17 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
         const player = playerOf(evidence);
         const counters = countersOf(evidence);
         state.countersFinal = counters;
+        if (
+          state.targetCase === "no_food_replan" &&
+          state.noFoodReplanCaseUsageStart !== undefined
+        ) {
+          state.noFoodReplanLatestCounters = counters;
+          const caseCalls = subtractCounters(
+            counters,
+            state.noFoodReplanCaseUsageStart,
+          ).llmCalls;
+          state.noFoodReplanRequestGate?.observeRecordedCalls(caseCalls);
+        }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,
           counters,
@@ -10244,7 +11312,11 @@ async function writeArtifact(state: RunState): Promise<void> {
       seed: state.seed,
       seedIsSynthetic: true,
       fixture: state.worldFixture,
-      nonOperatorClients: 3,
+      nonOperatorClients:
+        process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+        isNoFoodContinuityProbeOnly()
+          ? 1
+          : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
@@ -10270,6 +11342,9 @@ async function writeArtifact(state: RunState): Promise<void> {
         retained: state.playerSnapshotSidecarRetained === true,
         failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
+      noFoodContinuity: isNoFoodContinuityProbeOnly()
+        ? noFoodContinuitySafeEvidence(state)
+        : null,
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
     },
     budgets: {
