@@ -27,8 +27,12 @@ import mineflayer, { type Bot } from "mineflayer";
 import { ZodError } from "zod";
 
 import { AppError, errorCategories } from "../../src/domain/errors.js";
-import type { CompanionApplication } from "../../src/app/application.js";
+import type {
+  CompanionApplication,
+  createApplication,
+} from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
+import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
   MineflayerPlayerBody,
   type PlayerBody,
@@ -37,11 +41,11 @@ import {
   type PlayerBodyObservationOptions,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
-import type { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
   projectSafePlayerAgentActivityTail,
   type PlayerAgentRoundActivity,
+  type PlayerAgentToolName,
 } from "../../src/player/responses.js";
 import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
@@ -78,6 +82,13 @@ import {
   LlmCallAdmissionError,
   type LlmCallAdmission,
 } from "./llm-call-admission.js";
+import {
+  AcceptedProviderRequestGate,
+  classifyAcceptedProviderRequestUsage,
+  NoFoodReplanRequestGate,
+  waitForAcceptedProviderRequestsSettled,
+  type AcceptedProviderRequestSettleStatus,
+} from "./no-food-replan-request-gate.js";
 import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
@@ -195,8 +206,19 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   llmCalls: 8,
   totalTokens: 75_000,
 } as const;
+export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
+  llmCalls: 24,
+  totalTokens: 160_000,
+} as const;
+export const OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS = 8 * 60_000;
+export const NO_FOOD_REPLAN_CASE_BUDGET = {
+  llmCalls: 10,
+  totalTokens: 100_000,
+} as const;
+export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
+  owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   autonomous_life: { llmCalls: 18, totalTokens: 100_000 },
   unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
@@ -210,11 +232,13 @@ const CASE_BUDGETS = {
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
+  no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
 const CASE_DEADLINES = {
   runtime_contract: 60_000,
+  owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
   autonomous_life: 5 * 60_000,
   unknown_composite: 7 * 60_000,
   observation_boundary: 4 * 60_000,
@@ -225,6 +249,7 @@ const CASE_DEADLINES = {
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
   damage_response: 4 * 60_000,
+  no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: 7 * 60_000,
   integrated_result: 30_000,
 } as const;
@@ -283,6 +308,65 @@ interface GameActionPlacementObservationProbe {
     GameActionPlacementObservationSummary
   >;
 }
+interface NoFoodContinuityDiagnostic {
+  readonly startupBodyObservationAvailable: boolean;
+  readonly startupStateConfirmed: boolean;
+  readonly bodyHealth: number | null;
+  readonly rconHealth: number | null;
+  readonly bodyFood: number | null;
+  readonly rconFood: number | null;
+  readonly bodyInventoryEmpty: boolean;
+  readonly rconInventoryEmpty: boolean;
+}
+type NoFoodReplanDecisionClass =
+  | "consume"
+  | "alternative"
+  | "wait"
+  | "complete"
+  | "continue"
+  | "unknown"
+  | "not_observed";
+type NoFoodReplanOutcomeStatus =
+  | "successful"
+  | "failed"
+  | "interrupted"
+  | "cancelled"
+  | "unverified"
+  | "not_observed";
+interface NoFoodReplanDiagnostic {
+  startupStateConfirmed: boolean;
+  purposeDecision: NoFoodReplanDecisionClass;
+  outcomeStatus: NoFoodReplanOutcomeStatus;
+  alternativeSuccessfulBodyOutcomeObserved: boolean;
+  reassessmentObserved: boolean;
+  repeatedFailedOperationUnderUnchangedState: boolean;
+  waitReasonAndWakeConditionPresent: boolean;
+  waitWakeReassessmentObserved: boolean;
+  postOutcomeNoFoodStateConfirmed: boolean;
+  postOutcomePurposeJudgmentObserved: boolean;
+}
+const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
+  startupStateConfirmed: false,
+  purposeDecision: "not_observed",
+  outcomeStatus: "not_observed",
+  alternativeSuccessfulBodyOutcomeObserved: false,
+  reassessmentObserved: false,
+  repeatedFailedOperationUnderUnchangedState: false,
+  waitReasonAndWakeConditionPresent: false,
+  waitWakeReassessmentObserved: false,
+  postOutcomeNoFoodStateConfirmed: false,
+  postOutcomePurposeJudgmentObserved: false,
+};
+const EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC: NoFoodContinuityDiagnostic = {
+  startupBodyObservationAvailable: false,
+  startupStateConfirmed: false,
+  bodyHealth: null,
+  rconHealth: null,
+  bodyFood: null,
+  rconFood: null,
+  bodyInventoryEmpty: false,
+  rconInventoryEmpty: false,
+};
 interface LearningFixtureDiagnostic {
   readonly phase: LearningFixturePhase;
   readonly placementConfirmedCount: number;
@@ -446,6 +530,189 @@ type LookSweepStatusDiagnostic = BodyOperationStatus | "unavailable";
 type BodyPathStatus = "none" | "noPath" | "timeout" | "success" | "partial";
 type BodyMoveErrorClass =
   "none" | "no_path" | "timeout" | "probe_deadline" | "interrupted" | "other";
+type ProgressiveNavigationDoorState = "closed" | "open" | "unknown";
+type ProgressiveNavigationSide =
+  "owner_side" | "doorway" | "return_side" | "unknown";
+type ProgressiveNavigationSamplePoint =
+  "start" | "sample_1" | "sample_2" | "sample_3" | "final";
+type ProgressiveNavigationSampleElapsedBucket =
+  "0-10s" | "10-20s" | "20-30s" | "30-40s" | "40s+" | "unknown";
+type ProgressiveNavigationStallElapsedBucket =
+  "under20s" | "20-30s" | "30-40s" | "40s+" | "none";
+type ProgressiveNavigationUseSkipReason =
+  | "initial_route_confirmed"
+  | "run_deadline"
+  | "door_not_closed"
+  | "operation_unresolved"
+  | "door_not_observed"
+  | "door_out_of_reach"
+  | "look_not_successful"
+  | "look_observation_unavailable"
+  | "attempted";
+type ProgressiveNavigationDoorLookSkipReason =
+  | "initial_route_confirmed"
+  | "run_deadline"
+  | "door_not_closed"
+  | "operation_unresolved"
+  | "attempted";
+type ProgressiveNavigationObservedDoorHalf = "lower" | "upper" | "neither";
+
+type OwnerReturnStopReason =
+  | "owner_arrival"
+  | "budget_stop"
+  | "navigation_terminal"
+  | "proposal_declined"
+  | "observation_window_elapsed"
+  | "fixture_preflight_failed";
+
+type OwnerReturnDistanceBucket = "within_1_75" | "over_1_75" | "unknown";
+type OwnerReturnProposalDisposition =
+  "pending" | "adopted" | "compromised" | "declined" | "unknown";
+
+interface OwnerReturnDiagnostic {
+  readonly stage:
+    | "not_started"
+    | "fixture_setup"
+    | "preflight"
+    | "owner_request"
+    | "navigation"
+    | "cleanup"
+    | "complete";
+  readonly fixtureConfigured?: boolean;
+  readonly doorStateBefore?: ProgressiveNavigationDoorState;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+  readonly bodySideBefore?: ProgressiveNavigationSide;
+  readonly bodySideAfter?: ProgressiveNavigationSide;
+  readonly rconSideBefore?: ProgressiveNavigationSide;
+  readonly rconSideAfter?: ProgressiveNavigationSide;
+  readonly bodyDistanceBefore?: OwnerReturnDistanceBucket;
+  readonly bodyDistanceAfter?: OwnerReturnDistanceBucket;
+  readonly rconDistanceBefore?: OwnerReturnDistanceBucket;
+  readonly rconDistanceAfter?: OwnerReturnDistanceBucket;
+  readonly bodyRconSampleAlignedBefore?: boolean | "unknown";
+  readonly bodyRconSampleAlignedAfter?: boolean | "unknown";
+  readonly ownerRequestSent?: boolean | "unknown";
+  readonly stopPlayerEvidenceAvailable?: boolean;
+  readonly newOwnerProposalObserved?: boolean | "unknown";
+  readonly ownerProposalDisposition?: OwnerReturnProposalDisposition;
+  readonly ownerProposalAdoptedForRequest?: boolean | "unknown";
+  readonly ownerProposalProgressableForRequest?: boolean | "unknown";
+  readonly ownerGoalLinked?: boolean | "unknown";
+  readonly ownerMoveJudgmentObserved?: boolean | "unknown";
+  readonly toolNamesByRole?:
+    | Readonly<{
+        conversation: readonly PlayerAgentToolName[];
+        purpose: readonly PlayerAgentToolName[];
+      }>
+    | "unknown";
+  readonly moveOutcomeStatus?: BodyOperationStatus | "unknown";
+  readonly bodyReachedOwnerSide?: boolean | "unknown";
+  readonly rconReachedOwnerSide?: boolean | "unknown";
+  readonly bodyAndRconArrivalObserved?: boolean | "unknown";
+  readonly ownerGoalStatusAtStop?:
+    "active" | "paused" | "completed" | "abandoned" | "unknown";
+  readonly ownerGoalStatusBeforeParallel?:
+    "active" | "paused" | "completed" | "abandoned" | "unknown";
+  readonly activeOperationPresentAtStop?: boolean | "unknown";
+  readonly acceptedProviderRequestsLatched?: boolean;
+  readonly acceptedProviderRequestsStarted?: number;
+  readonly acceptedProviderRequestsRecorded?: number;
+  readonly acceptedProviderRequestsInFlight?: number;
+  readonly acceptedProviderRequestsBlockedAfterLatch?: number;
+  readonly acceptedProviderRequestsSettled?: boolean;
+  readonly acceptedProviderRequestSettleStatus?: AcceptedProviderRequestSettleStatus;
+  readonly stopReason?: OwnerReturnStopReason;
+  readonly fixtureCleanupConfirmed?: boolean;
+  readonly originalFixtureRestored?: boolean;
+}
+
+interface OwnerReturnWorldSample {
+  readonly bodySide: ProgressiveNavigationSide;
+  readonly rconSide: ProgressiveNavigationSide;
+  readonly bodyDistance: OwnerReturnDistanceBucket;
+  readonly rconDistance: OwnerReturnDistanceBucket;
+  readonly bodyRconAligned: boolean;
+  readonly doorState: ProgressiveNavigationDoorState;
+}
+
+interface ProgressiveNavigationMovementSample {
+  readonly point: ProgressiveNavigationSamplePoint;
+  readonly elapsed: ProgressiveNavigationSampleElapsedBucket;
+  readonly bodySide: ProgressiveNavigationSide;
+  readonly rconSide: ProgressiveNavigationSide;
+  readonly bodyDoorDistance: BodyPositionDriftBucket | "unknown";
+  readonly rconDoorDistance: BodyPositionDriftBucket | "unknown";
+  readonly doorState: ProgressiveNavigationDoorState;
+  readonly bodyBlockSearchMayBeTruncated: boolean | "unknown";
+}
+
+interface ProgressiveNavigationDoorUseDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason: ProgressiveNavigationUseSkipReason;
+  readonly doorObserved: boolean | "unknown";
+  readonly doorObservedHalf: ProgressiveNavigationObservedDoorHalf;
+  readonly bodyBlockSearchMayBeTruncated: boolean | "unknown";
+  readonly doorWithinReach: boolean | "unknown";
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired?: boolean;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+}
+
+interface ProgressiveNavigationDoorUseOperationResult {
+  readonly status: BodyOperationStatus;
+  readonly errorClass: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired: boolean;
+  readonly probeDeadlineReached: boolean;
+}
+
+interface ProgressiveNavigationDoorUseReadiness {
+  readonly diagnostic: Pick<
+    ProgressiveNavigationDoorUseDiagnostic,
+    | "doorObserved"
+    | "doorObservedHalf"
+    | "bodyBlockSearchMayBeTruncated"
+    | "doorWithinReach"
+  >;
+  readonly targetPosition: BlockPosition | null;
+}
+
+interface ProgressiveNavigationDoorLookDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason: ProgressiveNavigationDoorLookSkipReason;
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyDetailClass | "probe_deadline";
+  readonly recoveryRequired?: boolean;
+  readonly doorObservedHalfBefore: ProgressiveNavigationObservedDoorHalf;
+  readonly doorObservedHalfAfter:
+    ProgressiveNavigationObservedDoorHalf | "unknown" | "not_sampled";
+  readonly bodyBlockSearchMayBeTruncatedBefore: boolean | "unknown";
+  readonly bodyBlockSearchMayBeTruncatedAfter:
+    boolean | "unknown" | "not_sampled";
+  readonly doorStateBefore: ProgressiveNavigationDoorState;
+  readonly doorStateAfter: ProgressiveNavigationDoorState | "not_sampled";
+}
+
+interface ProgressiveNavigationRetryDiagnostic {
+  readonly attempted: boolean;
+  readonly skipReason:
+    | "door_not_open"
+    | "run_deadline"
+    | "operation_unresolved"
+    | "initial_route_confirmed"
+    | "use_not_attempted"
+    | "attempted";
+  readonly status?: BodyOperationStatus;
+  readonly errorClass?: BodyMoveErrorClass;
+  readonly pathStatus?: BodyPathStatus;
+  readonly pathUpdateCount?: number;
+  readonly stallEventCountBucket?: "0" | "1" | "2+";
+  readonly stallElapsedBucket?: ProgressiveNavigationStallElapsedBucket;
+  readonly bodySideAfter?: ProgressiveNavigationSide;
+  readonly rconSideAfter?: ProgressiveNavigationSide;
+  readonly doorStateAfter?: ProgressiveNavigationDoorState;
+  readonly routeConfirmed?: boolean;
+}
 type BodyDigErrorClass =
   | "out_of_view"
   | "occluded"
@@ -476,6 +743,15 @@ interface BodyMovePathDiagnostic {
   readonly pathUpdateCount: number;
   readonly probeDeadlineReached: boolean;
   readonly recoveryRequired: boolean;
+  readonly stallEventCountBucket?: "0" | "1" | "2+";
+  readonly stallElapsedBucket?: ProgressiveNavigationStallElapsedBucket;
+}
+
+interface BodyMovePathProbeOptions {
+  readonly captureStallEvents?: boolean;
+  readonly sampleIntervalMs?: number;
+  readonly maxSamples?: number;
+  readonly onSample?: (elapsedMs: number) => Promise<void>;
 }
 
 interface ReturnPathProbeDiagnostic {
@@ -547,12 +823,19 @@ function isNoGptDiagnosticProbeOnly(): boolean {
   return (
     process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES" ||
     isDeathRecoveryFixtureProbeOnly()
   );
 }
 
 function isDeathRecoveryFixtureProbeOnly(): boolean {
   return process.env.AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY === "YES";
+}
+
+function isNoFoodContinuityProbeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES";
 }
 
 function classifyBodyMoveError(
@@ -617,6 +900,7 @@ async function executeBodyMovePathProbe(
   },
   parentSignal: AbortSignal,
   deadlineMs = 20_000,
+  options: BodyMovePathProbeOptions = {},
 ): Promise<BodyMovePathDiagnostic> {
   let pathStatus: BodyPathStatus = "none";
   let pathLength = 0;
@@ -625,6 +909,12 @@ async function executeBodyMovePathProbe(
   let detail: string | undefined;
   let status: BodyOperationStatus;
   let recoveryRequired = false;
+  let activeMoveOperationId: string | undefined;
+  let stallEventCount = 0;
+  let firstStallElapsedMs: number | undefined;
+  let sampledCount = 0;
+  let inFlightSample: Promise<void> | undefined;
+  const startedAt = Date.now();
   const probeAbort = new AbortController();
   const timer = setTimeout(() => {
     probeDeadlineReached = true;
@@ -632,11 +922,50 @@ async function executeBodyMovePathProbe(
   }, deadlineMs);
   const signal = AbortSignal.any([parentSignal, probeAbort.signal]);
   const unsubscribe = body.onEvent((event) => {
-    if (event.type !== "operation_path_updated") return;
-    pathStatus = event.status;
-    pathLength = event.pathLength;
-    pathUpdateCount += 1;
+    if (event.type === "operation_started") {
+      if (event.operation === "move_to" && activeMoveOperationId === undefined)
+        activeMoveOperationId = event.operationId;
+      return;
+    }
+    if (
+      activeMoveOperationId === undefined ||
+      !("operationId" in event) ||
+      event.operationId !== activeMoveOperationId
+    )
+      return;
+    if (event.type === "operation_path_updated") {
+      pathStatus = event.status;
+      pathLength = event.pathLength;
+      pathUpdateCount += 1;
+    } else if (
+      options.captureStallEvents === true &&
+      event.type === "operation_stalled"
+    ) {
+      stallEventCount += 1;
+      firstStallElapsedMs ??= event.elapsedMs;
+    }
   });
+  const sampleTimer =
+    options.onSample === undefined || (options.maxSamples ?? 0) <= 0
+      ? undefined
+      : setInterval(() => {
+          if (
+            sampledCount >= (options.maxSamples ?? 0) ||
+            inFlightSample !== undefined ||
+            activeMoveOperationId === undefined ||
+            probeAbort.signal.aborted ||
+            parentSignal.aborted
+          )
+            return;
+          sampledCount += 1;
+          inFlightSample = options
+            .onSample?.(Date.now() - startedAt)
+            .then(() => undefined)
+            .catch(() => undefined)
+            .finally(() => {
+              inFlightSample = undefined;
+            });
+        }, options.sampleIntervalMs ?? 10_000);
   try {
     const result = await body.execute(operation, signal);
     status = result.status;
@@ -648,6 +977,8 @@ async function executeBodyMovePathProbe(
     status = parentSignal.aborted ? "interrupted" : "failed";
   } finally {
     clearTimeout(timer);
+    if (sampleTimer !== undefined) clearInterval(sampleTimer);
+    if (inFlightSample !== undefined) await inFlightSample;
     unsubscribe();
   }
   return {
@@ -658,7 +989,40 @@ async function executeBodyMovePathProbe(
     pathUpdateCount,
     probeDeadlineReached,
     recoveryRequired,
+    ...(options.captureStallEvents === true
+      ? {
+          stallEventCountBucket: progressiveEventCountBucket(stallEventCount),
+          stallElapsedBucket:
+            progressiveNavigationStallElapsedBucket(firstStallElapsedMs),
+        }
+      : {}),
   };
+}
+
+function progressiveEventCountBucket(count: number): "0" | "1" | "2+" {
+  if (count === 0) return "0";
+  if (count === 1) return "1";
+  return "2+";
+}
+
+function progressiveNavigationStallElapsedBucket(
+  elapsedMs: number | undefined,
+): ProgressiveNavigationStallElapsedBucket {
+  if (elapsedMs === undefined) return "none";
+  if (elapsedMs < 20_000) return "under20s";
+  if (elapsedMs < 30_000) return "20-30s";
+  if (elapsedMs < 40_000) return "30-40s";
+  return "40s+";
+}
+
+function progressiveNavigationSampleElapsedBucket(
+  elapsedMs: number,
+): ProgressiveNavigationSampleElapsedBucket {
+  if (elapsedMs < 10_000) return "0-10s";
+  if (elapsedMs < 20_000) return "10-20s";
+  if (elapsedMs < 30_000) return "20-30s";
+  if (elapsedMs < 40_000) return "30-40s";
+  return "40s+";
 }
 
 type BodyDetailClass =
@@ -723,6 +1087,51 @@ interface BodySmokeDiagnostic {
   readonly obstacleRouteTargetVisibleAfterLook?: boolean;
   readonly obstacleRestoreProbeVerified?: boolean;
   readonly obstacleRestoreProbeFailureStage?: "stabilize" | "clone" | "compare";
+  readonly progressiveNavigationStage?:
+    "fixture_setup" | "preflight" | "move" | "cleanup" | "complete";
+  readonly progressiveNavigationFixtureConfigured?: boolean;
+  readonly progressiveNavigationStairBlocksConfirmed?: boolean;
+  readonly progressiveNavigationStepSupportsConfirmed?: boolean;
+  readonly progressiveNavigationCorridorWallsConfirmed?: boolean;
+  readonly progressiveNavigationDoorHalvesConfirmed?: boolean;
+  readonly progressiveNavigationDoorStateBefore?: ProgressiveNavigationDoorState;
+  readonly progressiveNavigationDoorStateAfter?: ProgressiveNavigationDoorState;
+  readonly progressiveNavigationBodySideBefore?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationBodySideAfter?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationRconSideBefore?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationRconSideAfter?:
+    "owner_side" | "doorway" | "return_side" | "unknown";
+  readonly progressiveNavigationBodyDistanceBefore?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationBodyDistanceAfter?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationRconDistanceBefore?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationRconDistanceAfter?:
+    BodyPositionDriftBucket | "unknown";
+  readonly progressiveNavigationBodyDistanceReduced?: boolean;
+  readonly progressiveNavigationRconDistanceReduced?: boolean;
+  readonly progressiveNavigationMoveStatus?: BodyOperationStatus;
+  readonly progressiveNavigationMoveErrorClass?: BodyMoveErrorClass;
+  readonly progressiveNavigationPathStatus?: BodyPathStatus;
+  readonly progressiveNavigationPathUpdateCount?: number;
+  readonly progressiveNavigationProbeDeadlineReached?: boolean;
+  readonly progressiveNavigationBodyPassedDoor?: boolean;
+  readonly progressiveNavigationRconPassedDoor?: boolean;
+  readonly progressiveNavigationRouteConfirmed?: boolean;
+  readonly progressiveNavigationMoveTrace?: {
+    readonly stallEventCountBucket: "0" | "1" | "2+";
+    readonly stallElapsedBucket: ProgressiveNavigationStallElapsedBucket;
+    readonly samples: readonly ProgressiveNavigationMovementSample[];
+  };
+  readonly progressiveNavigationDoorUse?: ProgressiveNavigationDoorUseDiagnostic;
+  readonly progressiveNavigationDoorLook?: ProgressiveNavigationDoorLookDiagnostic;
+  readonly progressiveNavigationRetryMove?: ProgressiveNavigationRetryDiagnostic;
+  readonly progressiveNavigationFixtureCleanupConfirmed?: boolean;
+  readonly progressiveNavigationOriginalFixtureRestored?: boolean;
   readonly returnPathProbe?: ReturnPathProbeDiagnostic;
   readonly resourceTargetRconConfirmed?: boolean;
   readonly resourceLookStatus?: BodyOperationStatus;
@@ -840,6 +1249,7 @@ interface PlayerEvidence {
   readonly purpose?: string;
   readonly goals: readonly {
     readonly id: string;
+    readonly ownerProposalId?: string;
     readonly title?: string;
     readonly status?: string;
     readonly priority?: number;
@@ -865,6 +1275,7 @@ interface PlayerEvidence {
   readonly wait?: {
     readonly reason?: string;
     readonly wakeOn?: readonly string[];
+    readonly wakeAt?: string;
   };
   readonly lastOutcome?: {
     readonly operationId?: string;
@@ -1427,7 +1838,7 @@ function bodySmokeEvidence(
   };
   for (const [key, value] of Object.entries(diagnostic)) {
     if (
-      key.startsWith("furnace") &&
+      (key.startsWith("furnace") || key.startsWith("progressiveNavigation")) &&
       (typeof value === "boolean" ||
         typeof value === "number" ||
         typeof value === "string")
@@ -1625,11 +2036,93 @@ function finalRunCounters(state: RunState): Counters {
   return state.countersFinal ?? state.countersInitial ?? zeroCounters();
 }
 
+function noFoodContinuitySafeEvidence(state: RunState): SafeEvidence {
+  return {
+    ...EMPTY_NO_FOOD_CONTINUITY_DIAGNOSTIC,
+    ...state.noFoodContinuityDiagnostic,
+    providerRequestBlocked:
+      state.noFoodContinuityProviderRequestBlocked === true,
+    providerRequestBlockedAfterReadback:
+      state.noFoodContinuityProviderRequestBlockedAfterReadback === true,
+  };
+}
+
+function noFoodReplanRequestEvidence(state: RunState): SafeEvidence {
+  const requestGate = state.noFoodReplanRequestGate;
+  return {
+    noFoodReplanAcceptanceLatched: requestGate?.acceptanceLatched === true,
+    noFoodReplanProviderRequestsBlockedAfterAcceptance:
+      (requestGate?.providerRequestsBlockedAfterAcceptance ?? 0) > 0,
+    noFoodReplanAcceptedRequestsSettled:
+      requestGate?.acceptanceLatched === true &&
+      requestGate.inFlightRequests === 0 &&
+      requestGate.requestsRecorded === requestGate.requestsStarted,
+    noFoodReplanAcceptedRequestsStarted: requestGate?.requestsStarted ?? 0,
+    noFoodReplanAcceptedRequestsRecorded: requestGate?.requestsRecorded ?? 0,
+    noFoodReplanAcceptedRequestsInFlight: requestGate?.inFlightRequests ?? 0,
+    noFoodReplanRequestAccountingConsistent:
+      requestGate === undefined ||
+      requestGate.requestsRecorded <= requestGate.requestsStarted,
+  };
+}
+
+function noFoodReplanSafeEvidence(state: RunState): SafeEvidence {
+  const continuity = state.noFoodContinuityDiagnostic;
+  return {
+    ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+    ...state.noFoodReplanDiagnostic,
+    ...noFoodReplanRequestEvidence(state),
+    startupBodyObservationAvailable:
+      continuity?.startupBodyObservationAvailable === true,
+    startupHealthBodyAndRconMatched:
+      continuity?.bodyHealth !== null &&
+      continuity?.bodyHealth !== undefined &&
+      continuity.bodyHealth === continuity.rconHealth,
+    startupFoodBodyAndRconMatched:
+      continuity?.bodyFood !== null &&
+      continuity?.bodyFood !== undefined &&
+      continuity.bodyFood === continuity.rconFood,
+    startupBodyInventoryEmpty: continuity?.bodyInventoryEmpty === true,
+    startupRconInventoryEmpty: continuity?.rconInventoryEmpty === true,
+    startupBodyHealth: continuity?.bodyHealth ?? null,
+    startupRconHealth: continuity?.rconHealth ?? null,
+    startupBodyFood: continuity?.bodyFood ?? null,
+    startupRconFood: continuity?.rconFood ?? null,
+  };
+}
+
+function ownerReturnRequestSafeEvidence(state: RunState): SafeEvidence {
+  const gate = state.ownerReturnRequestGate;
+  const diagnostic = state.ownerReturnDiagnostic;
+  return {
+    ownerReturnAcceptedProviderRequestsLatched: gate?.latched === true,
+    ownerReturnAcceptedProviderRequestsStarted: gate?.requestsStarted ?? 0,
+    ownerReturnAcceptedProviderRequestsRecorded: gate?.requestsRecorded ?? 0,
+    ownerReturnAcceptedProviderRequestsInFlight: gate?.inFlightRequests ?? 0,
+    ownerReturnAcceptedProviderRequestsBlockedAfterLatch:
+      gate?.providerRequestsBlockedAfterLatch ?? 0,
+    ownerReturnAcceptedProviderRequestsSettled:
+      diagnostic?.acceptedProviderRequestsSettled === true,
+    ownerReturnAcceptedProviderRequestSettleStatus:
+      diagnostic?.acceptedProviderRequestSettleStatus ?? "unknown",
+    ownerReturnProviderRequestAccountingConsistent:
+      gate === undefined || gate.requestsRecorded <= gate.requestsStarted,
+  };
+}
+
 function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
   const progress =
     caseId === "autonomous_life" ? state.autonomousLifeProgress : undefined;
   return {
     ...(state.lastKnownPlayerDiagnostic ?? {}),
+    ...(caseId === "no_food_continuity_probe"
+      ? noFoodContinuitySafeEvidence(state)
+      : {}),
+    ...(caseId === "no_food_replan" ? noFoodReplanSafeEvidence(state) : {}),
+    ...(caseId === "owner_return_through_door" &&
+    ownerReturnRequestGateEnabled(state.targetCase)
+      ? ownerReturnRequestSafeEvidence(state)
+      : {}),
     ...(caseId === "observation_boundary"
       ? (state.observationBoundaryDiagnostic ?? {
           replyReceived: false,
@@ -2389,6 +2882,13 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
+  ownerReturnDiagnostic?: OwnerReturnDiagnostic;
+  ownerReturnProposalIdForRun?: string;
+  ownerReturnCaseUsageStart?: Counters;
+  ownerReturnRequestGate?: AcceptedProviderRequestGate;
+  ownerReturnRequestSettlement?: () => Promise<AcceptedProviderRequestSettleStatus>;
+  ownerReturnRequestSettlementStatus?: AcceptedProviderRequestSettleStatus;
+  ownerReturnCaseDeadlineAt?: number;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -2443,6 +2943,13 @@ interface RunState {
   };
   observationBoundarySidecarRetained?: boolean;
   persistentMemoryDiagnostic?: PersistentMemoryProgress;
+  noFoodContinuityDiagnostic?: NoFoodContinuityDiagnostic;
+  noFoodContinuityProviderRequestBlocked?: boolean;
+  noFoodContinuityProviderRequestBlockedAfterReadback?: boolean;
+  noFoodReplanDiagnostic?: NoFoodReplanDiagnostic;
+  noFoodReplanCaseUsageStart?: Counters;
+  noFoodReplanLatestCounters?: Counters;
+  noFoodReplanRequestGate?: NoFoodReplanRequestGate;
 }
 
 interface FoodIntentContinuityDiagnostic {
@@ -2515,9 +3022,41 @@ let currentRunState: RunState | undefined;
 let activeCaseSnapshotCapture: { latestEvidence?: Evidence } | undefined;
 let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
+let activeApplicationPlayerBody: MineflayerPlayerBody | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
+let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
-function installGameActionPlacementObservationProbe(): () => void {
+type ApplicationFactory = typeof createApplication;
+
+export function createOwnerReturnApplicationWithBodyCapture(
+  targetCase: TargetableCase | undefined,
+  createApplication: ApplicationFactory,
+  config: Parameters<ApplicationFactory>[0],
+  beforeCall?: Parameters<ApplicationFactory>[1],
+  onPlayerBodyCreated?: (body: MineflayerPlayerBody) => void,
+): Readonly<{
+  application: ReturnType<ApplicationFactory>;
+  restoreProbe?: () => void;
+}> {
+  if (!ownerReturnRequestGateEnabled(targetCase))
+    return { application: createApplication(config, beforeCall) };
+
+  const restoreProbe =
+    installGameActionPlacementObservationProbe(onPlayerBodyCreated);
+  try {
+    return {
+      application: createApplication(config, beforeCall),
+      restoreProbe,
+    };
+  } catch (error) {
+    restoreProbe();
+    throw error;
+  }
+}
+
+function installGameActionPlacementObservationProbe(
+  onPlayerBodyCreated?: (body: MineflayerPlayerBody) => void,
+): () => void {
   const prototype = MineflayerPlayerBody.prototype;
   const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
     prototype,
@@ -2527,6 +3066,23 @@ function installGameActionPlacementObservationProbe(): () => void {
     throw new Error("PlayerBody observation method is unavailable");
   const originalObserve =
     originalObserveDescriptor.value as typeof prototype.observe;
+  const createPlayerBodyDescriptor = Object.getOwnPropertyDescriptor(
+    MineflayerClient.prototype,
+    "createPlayerBody",
+  );
+  if (typeof createPlayerBodyDescriptor?.value !== "function")
+    throw new Error("MineflayerClient body factory is unavailable");
+  const originalCreatePlayerBody = createPlayerBodyDescriptor.value as (
+    this: MineflayerClient,
+  ) => PlayerBody;
+  const instrumentedCreatePlayerBody = function (
+    this: MineflayerClient,
+  ): PlayerBody {
+    const body = originalCreatePlayerBody.call(this);
+    activeApplicationPlayerBody = body as MineflayerPlayerBody;
+    onPlayerBodyCreated?.(body as MineflayerPlayerBody);
+    return body;
+  };
   const instrumentedObserve = async function (
     this: MineflayerPlayerBody,
     options?: PlayerBodyObservationOptions,
@@ -2557,6 +3113,90 @@ function installGameActionPlacementObservationProbe(): () => void {
         if (firstObservedAt === undefined) break;
         probe.observationsByTime.delete(firstObservedAt);
       }
+    }
+    return observation;
+  };
+  prototype.observe = instrumentedObserve;
+  MineflayerClient.prototype.createPlayerBody = instrumentedCreatePlayerBody;
+  return () => {
+    if (prototype.observe === instrumentedObserve)
+      prototype.observe = originalObserve;
+    if (
+      MineflayerClient.prototype.createPlayerBody ===
+      instrumentedCreatePlayerBody
+    ) {
+      MineflayerClient.prototype.createPlayerBody = originalCreatePlayerBody;
+    }
+    activeApplicationPlayerBody = undefined;
+  };
+}
+
+function installNoFoodContinuityObservationProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): () => void {
+  const prototype = MineflayerPlayerBody.prototype;
+  const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
+    prototype,
+    "observe",
+  );
+  if (typeof originalObserveDescriptor?.value !== "function")
+    throw new Error("PlayerBody observation method is unavailable");
+  const originalObserve =
+    originalObserveDescriptor.value as typeof prototype.observe;
+  let captured = false;
+  const instrumentedObserve = async function (
+    this: MineflayerPlayerBody,
+    options?: PlayerBodyObservationOptions,
+  ): Promise<PlayerBodyObservation> {
+    const observation = await originalObserve.call(this, options);
+    if (!captured) {
+      captured = true;
+      const [rconHealth, rconFood, rconInventoryEmpty] = await Promise.all([
+        rconEntityHealth(rcon, state.botName).catch(() => null),
+        rconFoodLevel(rcon, state.botName).catch(() => null),
+        rconInventoryIsEmpty(rcon, state.botName).catch(() => false),
+      ]);
+      const bodyHealth = observation.self.health;
+      const bodyFood = observation.self.food;
+      const bodyInventoryEmpty =
+        observation.self.inventory.reduce(
+          (count, item) => count + item.count,
+          0,
+        ) === 0 &&
+        Object.values(observation.self.equipment).every(
+          (item) => item === null,
+        );
+      const healthConfirmed =
+        bodyHealth !== null &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6 &&
+        bodyHealth === rconHealth;
+      const foodConfirmed =
+        bodyFood !== null &&
+        bodyFood >= 12 &&
+        bodyFood <= 15 &&
+        rconFood !== null &&
+        rconFood >= 12 &&
+        rconFood <= 15 &&
+        bodyFood === rconFood;
+      state.noFoodContinuityDiagnostic = {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed:
+          healthConfirmed &&
+          foodConfirmed &&
+          bodyInventoryEmpty &&
+          rconInventoryEmpty,
+        bodyHealth,
+        rconHealth,
+        bodyFood,
+        rconFood,
+        bodyInventoryEmpty,
+        rconInventoryEmpty,
+      };
     }
     return observation;
   };
@@ -2601,6 +3241,700 @@ function readGameActionPlacementCandidateDiagnostic(
     : { freshBodyObservationMatched: true, ...summary };
 }
 
+export function classifyNoFoodReplanDecision(
+  kind: string | undefined,
+  operationKind: string | undefined,
+): NoFoodReplanDecisionClass {
+  if (kind === "wait") return "wait";
+  if (kind === "continue") return "continue";
+  if (kind === "complete") return "complete";
+  if (kind !== "act") return "unknown";
+  const operation = safeOperationKind(operationKind);
+  if (operation === undefined) return "unknown";
+  return operation === "consume" ? "consume" : "alternative";
+}
+
+export function isNoFoodReplanPurposeAfterOutcome(
+  judgmentAt: string | undefined,
+  outcomeObservedAt: string | undefined,
+): boolean {
+  const judgmentTime = Date.parse(judgmentAt ?? "");
+  const outcomeTime = Date.parse(outcomeObservedAt ?? "");
+  return (
+    Number.isFinite(judgmentTime) &&
+    Number.isFinite(outcomeTime) &&
+    judgmentTime > outcomeTime
+  );
+}
+
+export function noFoodReplanBeforeCallBlockReason(
+  callsStarted: number,
+  usageUnknownCalls: number,
+  knownTokens: number,
+): "LLM_USAGE_PARTIAL_OR_UNKNOWN" | "CASE_LLM_BUDGET_EXCEEDED" | undefined {
+  if (usageUnknownCalls > 0) return "LLM_USAGE_PARTIAL_OR_UNKNOWN";
+  if (
+    callsStarted >= NO_FOOD_REPLAN_CASE_BUDGET.llmCalls ||
+    knownTokens >= NO_FOOD_REPLAN_CASE_BUDGET.totalTokens
+  )
+    return "CASE_LLM_BUDGET_EXCEEDED";
+  return undefined;
+}
+
+export function noFoodReplanOraclesConfirmed(
+  bodyHealth: number | null,
+  rconHealth: number | null,
+  bodyFood: number | null,
+  rconFood: number | null,
+  bodyInventoryEmpty: boolean,
+  rconInventoryEmpty: boolean,
+): boolean {
+  return (
+    bodyHealth !== null &&
+    bodyHealth > 0 &&
+    rconHealth === bodyHealth &&
+    bodyFood !== null &&
+    bodyFood >= 12 &&
+    bodyFood <= 15 &&
+    rconFood === bodyFood &&
+    rconFood >= 12 &&
+    rconFood <= 15 &&
+    bodyInventoryEmpty &&
+    rconInventoryEmpty
+  );
+}
+
+interface NoFoodReplanOracle {
+  readonly bodyHealth: number | null;
+  readonly rconHealth: number | null;
+  readonly bodyFood: number | null;
+  readonly rconFood: number | null;
+  readonly noFoodStateConfirmed: boolean;
+}
+
+async function readNoFoodReplanOracle(
+  context: CaseContext,
+): Promise<NoFoodReplanOracle> {
+  const evidence = await collect(context.runtime.app);
+  const [rconHealth, rconFood, rconInventoryEmpty] = await Promise.all([
+    rconEntityHealth(context.rcon, context.botName).catch(() => null),
+    rconFoodLevel(context.rcon, context.botName).catch(() => null),
+    rconInventoryIsEmpty(context.rcon, context.botName).catch(() => false),
+  ]);
+  const bodyHealth =
+    typeof evidence.game?.health === "number" &&
+    Number.isFinite(evidence.game.health)
+      ? evidence.game.health
+      : null;
+  const bodyFood =
+    typeof evidence.game?.food === "number" &&
+    Number.isFinite(evidence.game.food)
+      ? evidence.game.food
+      : null;
+  const bodyInventoryEmpty = evidence.game?.inventoryTotal === 0;
+  return {
+    bodyHealth,
+    rconHealth,
+    bodyFood,
+    rconFood,
+    noFoodStateConfirmed: noFoodReplanOraclesConfirmed(
+      bodyHealth,
+      rconHealth,
+      bodyFood,
+      rconFood,
+      bodyInventoryEmpty,
+      rconInventoryEmpty,
+    ),
+  };
+}
+
+function noFoodReplanJudgmentKey(
+  judgment: PlayerEvidence["recentJudgments"][number],
+): string {
+  return `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+}
+
+function assertNoFoodReplanUsage(context: CaseContext, player: PlayerEvidence) {
+  const delta = subtractCounters(player.counters, context.usageAtStart);
+  if (delta.usageUnknownCalls > 0) incomplete("LLM_USAGE_PARTIAL_OR_UNKNOWN");
+}
+
+const NO_FOOD_REPLAN_SETTLE_MAX_MS = 15_000;
+
+async function settleNoFoodReplanRequests(
+  state: RunState,
+  context: CaseContext,
+): Promise<void> {
+  const requestGate = state.noFoodReplanRequestGate;
+  if (!requestGate?.acceptanceLatched)
+    incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+  const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
+  const settled = await waitForAcceptedProviderRequestsSettled(
+    async () => {
+      const player = playerOf(await collect(context.runtime.app));
+      assertNoFoodReplanUsage(context, player);
+      if (requestGate.requestsRecorded > requestGate.requestsStarted) {
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      }
+      return requestGate.inFlightRequests;
+    },
+    Math.min(NO_FOOD_REPLAN_SETTLE_MAX_MS, remainingMs),
+  );
+  if (!settled) incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+}
+
+const OWNER_RETURN_REQUEST_SETTLE_MAX_MS = 15_000;
+
+function settleOwnerReturnRequests(
+  state: RunState,
+  context: CaseContext | undefined,
+): Promise<AcceptedProviderRequestSettleStatus> {
+  const settleOnce = (state.ownerReturnRequestSettlement ??=
+    createOwnerReturnRequestSettlementOnce(() =>
+      settleOwnerReturnRequestsOnce(state, context).catch(() =>
+        recordOwnerReturnSettlementStatus(state, "unknown", false),
+      ),
+    ));
+  return settleOnce();
+}
+
+export function createOwnerReturnRequestSettlementOnce(
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+): () => Promise<AcceptedProviderRequestSettleStatus> {
+  let pending: Promise<AcceptedProviderRequestSettleStatus> | undefined;
+  return () => {
+    pending ??= Promise.resolve()
+      .then(settle)
+      .catch(() => "unknown");
+    return pending;
+  };
+}
+
+export async function settleOwnerReturnBeforeShutdown(
+  shouldSettle: boolean,
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+  shutdown: () => Promise<void>,
+): Promise<AcceptedProviderRequestSettleStatus | undefined> {
+  let status: AcceptedProviderRequestSettleStatus | undefined;
+  try {
+    if (shouldSettle) status = await settle();
+  } catch {
+    status = "unknown";
+  }
+  await shutdown();
+  return status;
+}
+
+export async function settleOwnerReturnCaseFailure(
+  caseStatus: Exclude<Status, "pass">,
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+  shutdown?: () => Promise<void>,
+): Promise<
+  Readonly<{
+    caseStatus: Exclude<Status, "pass">;
+    settleStatus: AcceptedProviderRequestSettleStatus;
+    usageUnknown: boolean;
+  }>
+> {
+  let settleStatus: AcceptedProviderRequestSettleStatus;
+  try {
+    settleStatus = await settle();
+  } catch {
+    settleStatus = "unknown";
+  }
+  if (shutdown !== undefined) await shutdown();
+  return {
+    caseStatus,
+    settleStatus,
+    usageUnknown: ownerReturnUsageIsUnknown(settleStatus),
+  };
+}
+
+export function ownerReturnUsageIsUnknown(
+  status: AcceptedProviderRequestSettleStatus,
+): boolean {
+  return status !== "settled" && status !== "budget_exceeded";
+}
+
+async function settleOwnerReturnRequestsOnce(
+  state: RunState,
+  context: CaseContext | undefined,
+): Promise<AcceptedProviderRequestSettleStatus> {
+  const gate = state.ownerReturnRequestGate;
+  const caseStart = state.ownerReturnCaseUsageStart;
+  gate?.latch();
+  if (gate === undefined || caseStart === undefined || context === undefined) {
+    return recordOwnerReturnSettlementStatus(state, "unknown", false);
+  }
+
+  let failureStatus:
+    | Exclude<AcceptedProviderRequestSettleStatus, "settled" | "pending">
+    | undefined;
+  const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
+  let requestsSettled = false;
+  try {
+    requestsSettled = await waitForAcceptedProviderRequestsSettled(
+      async () => {
+        const player = playerOf(await collect(context.runtime.app));
+        const caseDelta = subtractCounters(player.counters, caseStart);
+        const runDelta = subtractCounters(
+          player.counters,
+          context.runUsageAtStart,
+        );
+        gate.observeRecordedCalls(caseDelta.llmCalls);
+        const status = classifyAcceptedProviderRequestUsage({
+          requestsStarted: gate.requestsStarted,
+          requestsRecorded: gate.requestsRecorded,
+          calls: caseDelta.llmCalls,
+          tokens: totalTokens(caseDelta),
+          usageUnknownCalls: caseDelta.usageUnknownCalls,
+          caseCallLimit: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+          caseTokenLimit: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.totalTokens,
+          runCalls: runDelta.llmCalls,
+          runTokens: totalTokens(runDelta),
+          runCallLimit: context.runBudget.llmCalls,
+          runTokenLimit: context.runBudget.totalTokens,
+        });
+        if (status !== "pending" && status !== "settled") {
+          failureStatus = status;
+          if (gate.inFlightRequests === 0) {
+            throw new Error("OWNER_RETURN_REQUEST_SETTLEMENT_INCOMPLETE");
+          }
+        }
+        return gate.inFlightRequests;
+      },
+      Math.min(OWNER_RETURN_REQUEST_SETTLE_MAX_MS, remainingMs),
+    );
+  } catch {
+    failureStatus ??= "unknown";
+  }
+
+  const status =
+    failureStatus !== undefined && gate.inFlightRequests === 0
+      ? failureStatus
+      : requestsSettled
+        ? "settled"
+        : "timed_out";
+  return recordOwnerReturnSettlementStatus(
+    state,
+    status,
+    gate.inFlightRequests === 0,
+  );
+}
+
+function recordOwnerReturnSettlementStatus(
+  state: RunState,
+  status: AcceptedProviderRequestSettleStatus,
+  settled: boolean,
+): AcceptedProviderRequestSettleStatus {
+  updateOwnerReturnDiagnostic(state, {
+    ...ownerReturnRequestDiagnosticPatch(state, status, settled),
+  });
+  state.ownerReturnRequestSettlementStatus = status;
+  if (ownerReturnUsageIsUnknown(status)) state.usageUncertain = true;
+  return status;
+}
+
+function requireOwnerReturnRequestsSettled(
+  status: AcceptedProviderRequestSettleStatus,
+): void {
+  if (status === "settled") return;
+  if (status === "usage_unknown")
+    incomplete("OWNER_RETURN_LLM_USAGE_PARTIAL_OR_UNKNOWN");
+  if (status === "budget_exceeded")
+    incomplete("OWNER_RETURN_LLM_BUDGET_EXCEEDED");
+  if (status === "accounting_mismatch")
+    incomplete("OWNER_RETURN_REQUEST_ADMISSION_USAGE_MISMATCH");
+  if (status === "timed_out")
+    incomplete("OWNER_RETURN_ACCEPTED_REQUESTS_NOT_SETTLED");
+  incomplete("OWNER_RETURN_REQUEST_SETTLEMENT_UNKNOWN");
+}
+
+async function runNoFoodReplanCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  state.noFoodReplanCaseUsageStart = context.usageAtStart;
+  state.noFoodReplanLatestCounters = context.usageAtStart;
+  state.noFoodReplanRequestGate = new NoFoodReplanRequestGate();
+  state.noFoodReplanDiagnostic = { ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC };
+  await connectApplication(context.runtime.app, state);
+  const startup = state.noFoodContinuityDiagnostic;
+  if (
+    !startup?.startupBodyObservationAvailable ||
+    !startup.startupStateConfirmed
+  )
+    incomplete("NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED");
+  const before = state.preStartPlayer;
+  if (before === undefined) incomplete("NO_FOOD_REPLAN_BASELINE_NOT_AVAILABLE");
+  state.noFoodReplanDiagnostic = {
+    ...state.noFoodReplanDiagnostic,
+    startupStateConfirmed: true,
+  };
+
+  const knownJudgments = new Set(
+    before.recentJudgments.map(noFoodReplanJudgmentKey),
+  );
+  let knownOutcomes = new Set(
+    before.recentOutcomes.map(({ operationId }) => operationId),
+  );
+  const freshDecision = async (
+    timeoutMs: number,
+  ): Promise<
+    | {
+        readonly player: PlayerEvidence;
+        readonly judgment: PlayerEvidence["recentJudgments"][number];
+      }
+    | undefined
+  > => {
+    let judgment: PlayerEvidence["recentJudgments"][number] | undefined;
+    const player = await observeForPlayer(context, timeoutMs, (snapshot) => {
+      assertNoFoodReplanUsage(context, snapshot);
+      judgment = snapshot.recentJudgments.find(
+        (item) => !knownJudgments.has(noFoodReplanJudgmentKey(item)),
+      );
+      return judgment !== undefined;
+    });
+    if (player === undefined || judgment === undefined) return undefined;
+    for (const item of player.recentJudgments)
+      knownJudgments.add(noFoodReplanJudgmentKey(item));
+    return { player, judgment };
+  };
+  const waitForWakeReassessment = async (
+    player: PlayerEvidence,
+    judgment: PlayerEvidence["recentJudgments"][number],
+  ) => {
+    const wake = player.wait?.wakeOn ?? [];
+    const reasonPresent =
+      (player.wait?.reason?.trim().length ?? 0) > 0 &&
+      (judgment.summary?.trim().length ?? 0) > 0;
+    const wakeConditionPresent = wake.length > 0;
+    state.noFoodReplanDiagnostic = {
+      ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+      ...state.noFoodReplanDiagnostic,
+      waitReasonAndWakeConditionPresent: reasonPresent && wakeConditionPresent,
+    };
+    if (!reasonPresent || !wakeConditionPresent)
+      incomplete("NO_FOOD_WAIT_REASON_OR_WAKE_CONDITION_NOT_CONFIRMED");
+    const wakeAt = Date.parse(player.wait?.wakeAt ?? "");
+    const remaining = context.caseDeadlineAt - Date.now();
+    if (Number.isFinite(wakeAt) && wakeAt > context.caseDeadlineAt)
+      incomplete("NO_FOOD_WAIT_WAKE_OUTSIDE_CASE_BUDGET");
+    if (
+      !wake.includes("state_changed") &&
+      !(wake.includes("deadline") && Number.isFinite(wakeAt))
+    )
+      incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
+    const timeout = Number.isFinite(wakeAt)
+      ? Math.min(remaining, Math.max(1, wakeAt - Date.now() + 15_000))
+      : Math.min(60_000, Math.max(1, remaining));
+    const next = await freshDecision(timeout);
+    if (next === undefined) incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
+    state.noFoodReplanDiagnostic = {
+      ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
+      ...state.noFoodReplanDiagnostic,
+      waitWakeReassessmentObserved: true,
+      reassessmentObserved: true,
+    };
+    return next;
+  };
+  const waitForOutcome = async (
+    judgment: PlayerEvidence["recentJudgments"][number],
+    operationKind: PlayerOperationName,
+  ) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    if (!Number.isFinite(decidedAt))
+      incomplete("NO_FOOD_REPLAN_JUDGMENT_TIME_NOT_AVAILABLE");
+    let outcome: PlayerEvidence["recentOutcomes"][number] | undefined;
+    const player = await observeForPlayer(
+      context,
+      Math.min(
+        90_000,
+        Math.max(1, context.caseDeadlineAt - Date.now() - 20_000),
+      ),
+      (snapshot) => {
+        assertNoFoodReplanUsage(context, snapshot);
+        outcome = snapshot.recentOutcomes.find((item) => {
+          const observedAt = Date.parse(item.observedAt ?? "");
+          return (
+            !knownOutcomes.has(item.operationId) &&
+            item.kind === operationKind &&
+            Number.isFinite(observedAt) &&
+            observedAt >= decidedAt
+          );
+        });
+        return outcome !== undefined;
+      },
+    );
+    if (player === undefined || outcome === undefined)
+      incomplete("NO_FOOD_BODY_OUTCOME_NOT_OBSERVED");
+    knownOutcomes = new Set(
+      player.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    return outcome;
+  };
+
+  let decision = await freshDecision(
+    Math.min(
+      120_000,
+      Math.max(1, context.caseDeadlineAt - Date.now() - 30_000),
+    ),
+  );
+  if (decision === undefined)
+    incomplete("NO_FOOD_PURPOSE_DECISION_NOT_OBSERVED");
+  let previousFailedOperation: PlayerOperationName | undefined;
+  let previousFailureState: NoFoodReplanOracle | undefined;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { player } = decision;
+    let { judgment } = decision;
+    const decisionClass = classifyNoFoodReplanDecision(
+      judgment.kind,
+      judgment.operationKind,
+    );
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      ...(attempt === 0
+        ? { purposeDecision: decisionClass }
+        : { reassessmentObserved: true }),
+    };
+    if (decisionClass === "wait") {
+      decision = await waitForWakeReassessment(player, judgment);
+      judgment = decision.judgment;
+      if (
+        classifyNoFoodReplanDecision(judgment.kind, judgment.operationKind) ===
+        "wait"
+      )
+        incomplete("NO_FOOD_WAIT_REASSESSMENT_STILL_WAITING");
+    }
+    const currentClass = classifyNoFoodReplanDecision(
+      judgment.kind,
+      judgment.operationKind,
+    );
+    if (currentClass === "complete" || currentClass === "continue")
+      incomplete("NO_FOOD_REPLAN_ACTION_NOT_OBSERVED");
+    if (currentClass !== "consume" && currentClass !== "alternative")
+      incomplete("NO_FOOD_REPLAN_DECISION_KIND_UNKNOWN");
+    const operationKind = safeOperationKind(judgment.operationKind);
+    if (operationKind === undefined)
+      incomplete("NO_FOOD_REPLAN_OPERATION_KIND_UNKNOWN");
+
+    if (
+      previousFailedOperation === operationKind &&
+      previousFailureState !== undefined
+    ) {
+      const current = await readNoFoodReplanOracle(context);
+      if (
+        current.noFoodStateConfirmed &&
+        current.bodyHealth === previousFailureState.bodyHealth &&
+        current.rconHealth === previousFailureState.rconHealth &&
+        current.bodyFood === previousFailureState.bodyFood &&
+        current.rconFood === previousFailureState.rconFood
+      ) {
+        state.noFoodReplanDiagnostic = {
+          ...state.noFoodReplanDiagnostic,
+          repeatedFailedOperationUnderUnchangedState: true,
+          postOutcomeNoFoodStateConfirmed: true,
+        };
+        if (operationKind === "consume")
+          fail("NO_FOOD_FAILED_CONSUME_REPEATED_WITHOUT_STATE_CHANGE");
+        incomplete("NO_FOOD_REPEATED_OPERATION_KIND_DETAIL_UNAVAILABLE");
+      }
+      incomplete("NO_FOOD_REPLAN_STATE_CHANGED_BEFORE_REASSESSMENT");
+    }
+    if (currentClass === "consume" && previousFailedOperation !== undefined)
+      fail("NO_FOOD_CONSUME_SELECTED_WITH_EMPTY_INVENTORY");
+
+    const outcome = await waitForOutcome(judgment, operationKind);
+    const outcomeStatus = safeOutcomeStatus(outcome.status) ?? "unverified";
+    if (state.noFoodReplanDiagnostic.outcomeStatus === "not_observed")
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        outcomeStatus,
+      };
+    const afterState = await readNoFoodReplanOracle(context);
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      postOutcomeNoFoodStateConfirmed: afterState.noFoodStateConfirmed,
+    };
+    if (!afterState.noFoodStateConfirmed)
+      incomplete("NO_FOOD_POST_OUTCOME_ORACLES_NOT_CONFIRMED");
+    if (outcomeStatus === "successful") {
+      if (currentClass === "consume")
+        fail("NO_FOOD_CONSUME_SUCCESS_CONTRADICTS_EMPTY_INVENTORY");
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        alternativeSuccessfulBodyOutcomeObserved: true,
+      };
+      const outcomeObservedAt = Date.parse(outcome.observedAt ?? "");
+      if (!Number.isFinite(outcomeObservedAt))
+        incomplete("NO_FOOD_BODY_OUTCOME_TIME_NOT_AVAILABLE");
+      const remainingMs = context.caseDeadlineAt - Date.now();
+      const postOutcomePlayer = await observeForPlayer(
+        context,
+        Math.min(60_000, Math.max(1, remainingMs)),
+        (snapshot) => {
+          assertNoFoodReplanUsage(context, snapshot);
+          const postOutcomePurposeJudgmentObserved =
+            snapshot.recentJudgments.some((item) =>
+              isNoFoodReplanPurposeAfterOutcome(
+                item.decidedAt,
+                outcome.observedAt,
+              ),
+            );
+          if (postOutcomePurposeJudgmentObserved) {
+            const acceptanceEvidence = {
+              ...(state.noFoodReplanDiagnostic ??
+                EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC),
+              postOutcomePurposeJudgmentObserved: true,
+            };
+            state.noFoodReplanDiagnostic = acceptanceEvidence;
+            const requestGate = state.noFoodReplanRequestGate;
+            if (!requestGate?.latchIfAcceptedEvidence(acceptanceEvidence)) {
+              return false;
+            }
+          }
+          return postOutcomePurposeJudgmentObserved;
+        },
+      );
+      const postOutcomePurposeJudgmentObserved =
+        postOutcomePlayer?.recentJudgments.some((item) =>
+          isNoFoodReplanPurposeAfterOutcome(item.decidedAt, outcome.observedAt),
+        ) ?? false;
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        postOutcomePurposeJudgmentObserved,
+      };
+      if (!postOutcomePurposeJudgmentObserved)
+        incomplete("NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED");
+      const requestGate = state.noFoodReplanRequestGate;
+      if (!requestGate.acceptanceLatched)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      await settleNoFoodReplanRequests(state, context);
+      return {
+        ...state.noFoodReplanDiagnostic,
+        ...noFoodReplanRequestEvidence(state),
+        startupOraclesConfirmed: true,
+      };
+    }
+    if (outcomeStatus !== "failed")
+      incomplete("NO_FOOD_BODY_OUTCOME_STATUS_UNCONFIRMED");
+    if (
+      afterState.bodyHealth !== startup.bodyHealth ||
+      afterState.rconHealth !== startup.rconHealth ||
+      afterState.bodyFood !== startup.bodyFood ||
+      afterState.rconFood !== startup.rconFood
+    )
+      incomplete("NO_FOOD_FAILED_OPERATION_STATE_CHANGED");
+
+    previousFailedOperation = operationKind;
+    previousFailureState = afterState;
+    decision = await freshDecision(
+      Math.max(1, context.caseDeadlineAt - Date.now() - 20_000),
+    );
+    if (decision === undefined)
+      incomplete("NO_FOOD_REASSESSMENT_AFTER_FAILURE_NOT_OBSERVED");
+    state.noFoodReplanDiagnostic = {
+      ...state.noFoodReplanDiagnostic,
+      reassessmentObserved: true,
+    };
+  }
+  incomplete("NO_FOOD_REPLAN_OBSERVATION_LIMIT_REACHED");
+}
+
+async function runNoFoodContinuityProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<void> {
+  const fixture = await runCase(
+    state,
+    "no_food_fixture_probe",
+    120_000,
+    0,
+    0,
+    () => prepareNoFoodFixtureProbe(state, rcon),
+  );
+  if (fixture.status !== "pass") {
+    state.status = fixture.status;
+    state.failureCode ??=
+      fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+    return;
+  }
+
+  const config = loadConfig({
+    ...process.env,
+    OPENAI_API_KEY: "no-provider-request-e2e-probe",
+    MINECRAFT_HOST: "127.0.0.1",
+    MINECRAFT_PORT: String(state.serverPort),
+    MINECRAFT_USERNAME: state.botName,
+    MINECRAFT_AUTH: "offline",
+    MINECRAFT_VERSION: SERVER_VERSION,
+    OWNER_USERNAME: state.ownerName,
+    OPENAI_MODEL: MODEL,
+    DATABASE_PATH: state.databasePath,
+    PERSONA_PATH: resolve(PROJECT_ROOT, "config/persona.example.json"),
+    LOG_LEVEL: "silent",
+    RECONNECT_ENABLED: "false",
+    DASHBOARD_ENABLED: "false",
+  });
+  const { createApplication } = await import("../../src/app/application.js");
+  const app = createApplication(config, state.llmAdmission?.beforeCall);
+  appForCleanup = app;
+  state.countersInitial = countersOf(await collect(app));
+  restoreNoFoodContinuityObservationProbe ??=
+    installNoFoodContinuityObservationProbe(state, rcon);
+  await connectApplication(app, state);
+
+  const continuity = await runCase(
+    state,
+    "no_food_continuity_probe",
+    15_000,
+    0,
+    0,
+    async () => {
+      const deadline = Date.now() + 10_000;
+      while (
+        state.noFoodContinuityProviderRequestBlocked !== true &&
+        Date.now() < deadline
+      ) {
+        await waitMs(50);
+      }
+      const diagnostic = state.noFoodContinuityDiagnostic;
+      if (diagnostic?.startupBodyObservationAvailable !== true)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_OBSERVATION_NOT_CONFIRMED");
+      if (!diagnostic.startupStateConfirmed)
+        incomplete("NO_FOOD_CONTINUITY_STARTUP_STATE_NOT_CONFIRMED");
+      if (state.noFoodContinuityProviderRequestBlocked !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_NOT_REACHED");
+      if (state.noFoodContinuityProviderRequestBlockedAfterReadback !== true)
+        incomplete("NO_FOOD_CONTINUITY_PROVIDER_GATE_BEFORE_READBACK");
+      return {
+        startupBodyObservationAvailable: true,
+        startupStateConfirmed: true,
+        bodyInventoryEmpty: true,
+        rconInventoryEmpty: true,
+        providerRequestBlocked: true,
+        providerRequestBlockedAfterReadback: true,
+      };
+    },
+  );
+  state.status = continuity.status;
+  if (continuity.status !== "pass")
+    state.failureCode ??=
+      continuity.reason ?? "NO_FOOD_CONTINUITY_NOT_CONFIRMED";
+  try {
+    state.countersFinal = countersOf(await collect(app));
+  } catch {
+    state.countersFinal = state.countersInitial;
+  }
+  try {
+    await boundedShutdown(app, "no_food_continuity_probe_complete");
+  } catch {
+    state.status = "incomplete";
+    state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+  }
+}
+
 async function main(): Promise<void> {
   const repoRoot = PROJECT_ROOT;
   loadEnvironmentFile({ path: resolve(repoRoot, ".env.local"), quiet: true });
@@ -2618,6 +3952,25 @@ async function main(): Promise<void> {
     const rcon = new LocalRcon(state.rconPort, state.rconPassword);
     await prepareWorld(state, rcon);
     await assertNoOperators(state);
+    if (isNoFoodContinuityProbeOnly()) {
+      await runNoFoodContinuityProbe(state, rcon);
+      return;
+    }
+    if (process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES") {
+      const fixture = await runCase(
+        state,
+        "no_food_fixture_probe",
+        120_000,
+        0,
+        0,
+        () => prepareNoFoodFixtureProbe(state, rcon),
+      );
+      state.status = fixture.status;
+      if (fixture.status !== "pass")
+        state.failureCode ??=
+          fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+      return;
+    }
     const owner = await connectPublicClient(state.serverPort, state.ownerName);
     ownerForCleanup = owner;
     const guest = await connectPublicClient(state.serverPort, state.guestName);
@@ -2639,12 +3992,24 @@ async function main(): Promise<void> {
       state.status = "pass";
       return;
     }
+    if (state.targetCase === "no_food_replan") {
+      const fixture = await runCase(
+        state,
+        "no_food_replan_fixture",
+        120_000,
+        0,
+        0,
+        () => prepareNoFoodFixtureProbe(state, rcon),
+      );
+      if (fixture.status !== "pass") {
+        state.status = fixture.status;
+        state.failureCode ??=
+          fixture.reason ?? "NO_FOOD_FIXTURE_PROBE_NOT_CONFIRMED";
+        return;
+      }
+    }
     if (!shouldCollectAfterRun(state))
       incomplete("RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
-    const autonomousRegion = state.autonomousRegion;
-    const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
-    if (autonomousRegion === undefined || autonomousSmokeBaseline === undefined)
-      incomplete("AUTONOMOUS_WORLD_BASELINE_MISSING");
 
     const config = loadConfig({
       ...process.env,
@@ -2662,14 +4027,56 @@ async function main(): Promise<void> {
       DASHBOARD_ENABLED: "false",
     });
     const { createApplication } = await import("../../src/app/application.js");
-    restoreGameActionPlacementObservationProbe ??=
-      installGameActionPlacementObservationProbe();
-    const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
+    const createdApplication = createOwnerReturnApplicationWithBodyCapture(
+      state.targetCase,
+      createApplication,
+      config,
+      state.llmAdmission?.beforeCall,
+    );
+    const activeApp = createdApplication.application;
+    if (createdApplication.restoreProbe !== undefined)
+      restoreGameActionPlacementObservationProbe =
+        createdApplication.restoreProbe;
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
+    const preStartCounters = countersOf(preStartEvidence);
     state.preStartPlayer = playerOf(preStartEvidence);
-    state.countersInitial = countersOf(preStartEvidence);
+    state.countersInitial = preStartCounters;
     liveContext = makeContext(state, activeApp, config, rcon, owner, guest);
+    const ownerReturnRequestTracking = createOwnerReturnRequestTracking(
+      state.targetCase,
+      preStartCounters,
+      state.ownerReturnRequestGate,
+    );
+    if (ownerReturnRequestTracking !== undefined) {
+      state.ownerReturnCaseUsageStart = ownerReturnRequestTracking.usageStart;
+      state.ownerReturnRequestGate = ownerReturnRequestTracking.gate;
+      updateOwnerReturnDiagnostic(state, {
+        ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
+      });
+    }
+    if (state.targetCase === "no_food_replan") {
+      restoreNoFoodContinuityObservationProbe ??=
+        installNoFoodContinuityObservationProbe(state, rcon);
+      const noFoodReplanResult = await recordCase(
+        state,
+        "no_food_replan",
+        CASE_DEADLINES.no_food_replan,
+        requireLiveContext(),
+        async (context) => runNoFoodReplanCase(state, context),
+      );
+      state.status = noFoodReplanResult.status;
+      if (noFoodReplanResult.status !== "pass")
+        state.failureCode ??=
+          noFoodReplanResult.reason ?? "NO_FOOD_REPLAN_NOT_CONFIRMED";
+      return;
+    }
+    const autonomousRegion = state.autonomousRegion;
+    const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
+    if (autonomousRegion === undefined || autonomousSmokeBaseline === undefined)
+      incomplete("AUTONOMOUS_WORLD_BASELINE_MISSING");
+    restoreGameActionPlacementObservationProbe ??=
+      installGameActionPlacementObservationProbe();
     await connectApplication(activeApp, state);
     const autonomousSpawn = parsePosition(
       await rcon.command(`data get entity ${state.botName} Pos`),
@@ -5782,12 +7189,47 @@ async function main(): Promise<void> {
       },
     );
 
+    const ownerReturnResult = await recordCase(
+      state,
+      "owner_return_through_door",
+      CASE_DEADLINES.owner_return_through_door,
+      requireLiveContext(),
+      async (context) => runOwnerReturnThroughDoorCase(state, context),
+    );
+
     const parallelResult = await recordCase(
       state,
       "parallel_dialogue_stop",
       CASE_DEADLINES.parallel_dialogue_stop,
       requireLiveContext(),
       async (context) => {
+        if (
+          state.targetCase === undefined &&
+          state.ownerReturnProposalIdForRun !== undefined
+        ) {
+          const inheritedPlayer = playerOf(await collect(context.runtime.app));
+          const inheritedGoal = inheritedPlayer.goals.find(
+            (goal) =>
+              goal.source === "owner" &&
+              goal.ownerProposalId === state.ownerReturnProposalIdForRun,
+          );
+          const inheritedGoalStatus = ownerReturnGoalStatus(
+            inheritedGoal?.status,
+          );
+          updateOwnerReturnDiagnostic(state, {
+            ownerGoalLinked: inheritedGoal !== undefined,
+            ownerGoalStatusBeforeParallel: inheritedGoalStatus,
+          });
+          if (
+            inheritedGoalStatus !== "completed" &&
+            inheritedGoalStatus !== "abandoned"
+          ) {
+            state.abortRequested = true;
+            state.failureCode ??=
+              "OWNER_RETURN_GOAL_NOT_TERMINAL_BEFORE_PARALLEL";
+            incomplete(state.failureCode);
+          }
+        }
         const origin = parsePosition(
           await rcon.command(`data get entity ${state.botName} Pos`),
         );
@@ -6017,6 +7459,7 @@ async function main(): Promise<void> {
           exchangeResult,
           discretionResult,
           foodResult,
+          ownerReturnResult,
           damageResult,
           parallelResult,
           operationSmokeResult,
@@ -6072,9 +7515,23 @@ async function main(): Promise<void> {
     state.status = status;
     state.failureCode ??= code;
     if (state.countersInitial !== undefined && status === "incomplete") {
-      state.usageUncertain = true;
+      if (
+        !isNoFoodContinuityProbeOnly() &&
+        !ownerReturnRequestGateEnabled(state.targetCase)
+      ) {
+        state.usageUncertain = true;
+      }
     }
   } finally {
+    if (
+      ownerReturnRequestGateEnabled(state.targetCase) &&
+      state.ownerReturnRequestGate !== undefined
+    ) {
+      await settleOwnerReturnRequests(
+        state,
+        ownerReturnSettlementContext(state),
+      );
+    }
     if (liveContext !== undefined && shouldCollectAfterRun(state)) {
       try {
         state.countersFinal = countersOf(
@@ -6086,6 +7543,8 @@ async function main(): Promise<void> {
     }
     await retainObservationBoundaryReplies(state);
     await cleanup(state);
+    restoreNoFoodContinuityObservationProbe?.();
+    restoreNoFoodContinuityObservationProbe = undefined;
     activeGameActionPlacementObservationProbe = undefined;
     restoreGameActionPlacementObservationProbe?.();
     restoreGameActionPlacementObservationProbe = undefined;
@@ -6110,13 +7569,18 @@ async function main(): Promise<void> {
 async function prepareRun(): Promise<RunState> {
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
+  const selectedDiagnosticProbeCount = [
+    "AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY",
+    "AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY",
+    "AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY",
+    "AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY",
+    "AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY",
+    "AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY",
+  ].filter((name) => process.env[name] === "YES").length;
   if (
-    (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" &&
-      process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES") ||
+    selectedDiagnosticProbeCount > 1 ||
     (isDeathRecoveryFixtureProbeOnly() &&
-      (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES" ||
-        process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES" ||
-        process.env.AI_PLAYER_E2E_OBSTACLE_RESTORE_PROBE_ONLY === "YES"))
+      process.env.AI_PLAYER_E2E_OBSTACLE_RESTORE_PROBE_ONLY === "YES")
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
@@ -6213,6 +7677,9 @@ async function prepareRun(): Promise<RunState> {
   const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
+    ...(ownerReturnRequestGateEnabled(targetCase)
+      ? { ownerReturnRequestGate: new AcceptedProviderRequestGate() }
+      : {}),
     startedAt: new Date().toISOString(),
     seed: runSeed,
     runBudget,
@@ -6246,6 +7713,85 @@ async function prepareRun(): Promise<RunState> {
   state.llmAdmission = {
     ...admission,
     beforeCall: () => {
+      if (isNoFoodContinuityProbeOnly()) {
+        state.noFoodContinuityProviderRequestBlocked = true;
+        state.noFoodContinuityProviderRequestBlockedAfterReadback =
+          state.noFoodContinuityDiagnostic?.startupBodyObservationAvailable ===
+          true;
+        throw new HarnessError(
+          "incomplete",
+          "NO_FOOD_CONTINUITY_PROVIDER_REQUEST_BLOCKED",
+        );
+      }
+      if (state.targetCase === "no_food_replan") {
+        const caseStart = state.noFoodReplanCaseUsageStart;
+        const requestGate = state.noFoodReplanRequestGate;
+        if (caseStart !== undefined && requestGate === undefined) {
+          state.failureCode ??= "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY";
+          throw new HarnessError(
+            "incomplete",
+            "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY",
+          );
+        }
+        const admitNoFoodRequest = () => {
+          if (caseStart !== undefined) {
+            const current = state.noFoodReplanLatestCounters ?? caseStart;
+            const delta = subtractCounters(current, caseStart);
+            const blockReason = noFoodReplanBeforeCallBlockReason(
+              requestGate?.requestsStarted ?? 0,
+              delta.usageUnknownCalls,
+              totalTokens(delta),
+            );
+            if (blockReason !== undefined) {
+              state.failureCode ??= blockReason;
+              throw new HarnessError("incomplete", blockReason);
+            }
+          }
+          if (
+            state.noFoodContinuityDiagnostic?.startupStateConfirmed !== true
+          ) {
+            state.failureCode ??=
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED";
+            throw new HarnessError(
+              "incomplete",
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED",
+            );
+          }
+          try {
+            admission.beforeCall();
+          } catch (error) {
+            if (error instanceof LlmCallAdmissionError)
+              throw new HarnessError("incomplete", error.code);
+            throw error;
+          }
+        };
+        if (caseStart !== undefined && requestGate !== undefined) {
+          requestGate.beforeCall(admitNoFoodRequest);
+          return;
+        }
+        admitNoFoodRequest();
+        return;
+      }
+      if (ownerReturnRequestGateEnabled(state.targetCase)) {
+        admitOwnerReturnProviderRequest(
+          state.ownerReturnRequestGate,
+          OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
+          () => {
+            try {
+              admission.beforeCall();
+            } catch (error) {
+              if (error instanceof LlmCallAdmissionError)
+                throw new HarnessError("incomplete", error.code);
+              throw error;
+            }
+          },
+          (code) => {
+            state.failureCode ??= code;
+            return new HarnessError("incomplete", code);
+          },
+        );
+        return;
+      }
       try {
         admission.beforeCall();
       } catch (error) {
@@ -6518,13 +8064,186 @@ async function assertNoOperators(state: RunState): Promise<void> {
     fail("ISOLATED_SERVER_HAS_OPERATOR");
 }
 
+async function prepareNoFoodFixtureProbe(
+  state: RunState,
+  rcon: LocalRcon,
+): Promise<Readonly<Record<string, string | number | boolean>>> {
+  const [{ MineflayerClient }, { createLogger }] = await Promise.all([
+    import("../../src/minecraft/mineflayer-client.js"),
+    import("../../src/observability/logger.js"),
+  ]);
+  const client = new MineflayerClient(
+    {
+      bot: {
+        host: "127.0.0.1",
+        port: state.serverPort,
+        username: state.botName,
+        auth: "offline",
+        version: SERVER_VERSION,
+      },
+      ownerUsername: state.ownerName,
+      pathfinderThinkTimeoutMs: 15_000,
+      pathfinderTickTimeoutMs: 15_000,
+      collectTimeoutMs: 30_000,
+    },
+    createLogger({ logLevel: "silent" }),
+  );
+  const abort = new AbortController();
+  const abortTimer = setTimeout(
+    () => abort.abort(new Error("no-food fixture probe deadline")),
+    110_000,
+  );
+  let body: ReturnType<typeof client.createPlayerBody> | undefined;
+  try {
+    await client.connect(abort.signal);
+    body = client.createPlayerBody();
+    await rcon.command(`tp ${state.botName} 0.5 64 0.5 0 0`);
+    const baselineBody = await body.observe();
+    const baselineRconHealth = await rconEntityHealth(rcon, state.botName);
+    const baselineRconFood = await rconFoodLevel(rcon, state.botName);
+    if (
+      baselineBody.self.health !== 20 ||
+      baselineBody.self.food !== 20 ||
+      baselineRconHealth !== 20 ||
+      baselineRconFood !== 20
+    )
+      incomplete("NO_FOOD_FIXTURE_FULL_BASELINE_NOT_CONFIRMED");
+
+    const effectsBaseline = await rconActiveEffectsState(rcon, state.botName);
+    if (effectsBaseline === "unknown")
+      incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_UNAVAILABLE");
+    if (effectsBaseline === "active") {
+      await rcon.command(`effect clear ${state.botName}`);
+      if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+        incomplete("NO_FOOD_FIXTURE_BASELINE_EFFECTS_NOT_CLEARED");
+    }
+
+    await rcon.command(`clear ${state.botName}`);
+    await rcon.command(
+      `effect give ${state.botName} minecraft:hunger 120 8 true`,
+    );
+    if (!(await rconHasActiveEffect(rcon, state.botName, "hunger")))
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_NOT_CONFIRMED");
+    const foodDeadline = Date.now() + 60_000;
+    let preparedFood = await rconFoodLevel(rcon, state.botName);
+    while (preparedFood > 15 && Date.now() < foodDeadline) {
+      await waitMs(250);
+      preparedFood = await rconFoodLevel(rcon, state.botName);
+    }
+    if (preparedFood < 12 || preparedFood > 15)
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED");
+    await rcon.command(`effect clear ${state.botName} minecraft:hunger`);
+    if ((await rconActiveEffectsState(rcon, state.botName)) !== "empty")
+      incomplete("NO_FOOD_FIXTURE_HUNGER_EFFECT_CLEANUP_NOT_CONFIRMED");
+
+    await setAndVerifyGamerule(rcon, "naturalRegeneration", false);
+    await rcon.command(`damage ${state.botName} 14 minecraft:generic`);
+    const healthDeadline = Date.now() + 3_000;
+    let finalBody = await body.observe();
+    let bodyHealth = finalBody.self.health;
+    let rconHealth: number | null = null;
+    while (Date.now() < healthDeadline) {
+      try {
+        rconHealth = await rconEntityHealth(
+          rcon,
+          state.botName,
+          Math.max(1, Math.min(500, healthDeadline - Date.now())),
+        );
+      } catch {
+        rconHealth = null;
+      }
+      try {
+        finalBody = await body.observe();
+        bodyHealth = finalBody.self.health;
+      } catch {
+        bodyHealth = null;
+      }
+      if (
+        typeof bodyHealth === "number" &&
+        bodyHealth > 0 &&
+        bodyHealth <= 6 &&
+        rconHealth !== null &&
+        rconHealth > 0 &&
+        rconHealth <= 6
+      )
+        break;
+      await waitMs(100);
+    }
+    const bodyFood = finalBody.self.food;
+    const rconFood = await rconFoodLevel(rcon, state.botName);
+    const bodyInventoryItemCount = finalBody.self.inventory.reduce(
+      (total, item) => total + item.count,
+      0,
+    );
+    const bodyEquipmentEmpty = Object.values(finalBody.self.equipment).every(
+      (item) => item === null,
+    );
+    const rconInventoryEmpty = await rconInventoryIsEmpty(rcon, state.botName);
+    if (
+      typeof bodyHealth !== "number" ||
+      bodyHealth <= 0 ||
+      bodyHealth > 6 ||
+      rconHealth === null ||
+      rconHealth <= 0 ||
+      rconHealth > 6
+    )
+      incomplete("NO_FOOD_FIXTURE_LOW_HEALTH_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      typeof bodyFood !== "number" ||
+      bodyFood < 12 ||
+      bodyFood > 15 ||
+      rconFood < 12 ||
+      rconFood > 15 ||
+      bodyFood !== rconFood
+    )
+      incomplete("NO_FOOD_FIXTURE_SAFE_FOOD_NOT_CONFIRMED_BY_BOTH_ORACLES");
+    if (
+      bodyInventoryItemCount !== 0 ||
+      !bodyEquipmentEmpty ||
+      !rconInventoryEmpty
+    )
+      incomplete(
+        "NO_FOOD_FIXTURE_EMPTY_INVENTORY_NOT_CONFIRMED_BY_BOTH_ORACLES",
+      );
+
+    return {
+      applicationStarted: false,
+      purposeDecisionStarted: false,
+      llmCalls: 0,
+      baselineBodyHealth: baselineBody.self.health,
+      baselineRconHealth,
+      baselineBodyFood: baselineBody.self.food,
+      baselineRconFood,
+      bodyHealth,
+      rconHealth,
+      bodyFood,
+      rconFood,
+      bodyInventoryItemCount,
+      bodyEquipmentEmpty,
+      rconInventoryEmpty,
+      hungerEffectCleanupConfirmed: true,
+      naturalRegenerationDisabled: true,
+    };
+  } finally {
+    clearTimeout(abortTimer);
+    await body?.stop().catch(() => undefined);
+    await client.disconnect("no_food_fixture_probe").catch(() => undefined);
+  }
+}
+
 async function runOperationSmoke(
   state: RunState,
   rcon: LocalRcon,
 ): Promise<SafeCaseResult> {
   const returnPathProbeOnly =
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES";
-  const smokeDeadlineMs = returnPathProbeOnly ? 150_000 : 90_000;
+  const progressiveNavigationProbeOnly =
+    process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES";
+  const smokeDeadlineMs = progressiveNavigationProbeOnly
+    ? 135_000
+    : returnPathProbeOnly
+      ? 150_000
+      : 90_000;
   const result = await runCase(
     state,
     "body_operation_smoke",
@@ -7211,6 +8930,15 @@ async function runOperationSmoke(
         );
         if (!positionMatchesSmokeSpawn(smokeEndPosition))
           incomplete("BODY_SMOKE_SPAWN_RESET_NOT_CONFIRMED");
+        if (progressiveNavigationProbeOnly) {
+          await runProgressiveNavigationProbe(
+            state,
+            rcon,
+            body,
+            smokeSpawn,
+            abort.signal,
+          );
+        }
         let obstacleRouteVerifiedByServer = false;
         if (process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES") {
           await removeHiddenContainerFixture(rcon, smokeSpawn, {
@@ -7465,6 +9193,9 @@ async function runOperationSmoke(
           relativeMoveVerifiedByServer: relativeMoveServerDisplacementObserved,
           ...(process.env.AI_PLAYER_E2E_NAVIGATION_PROBE_ONLY === "YES"
             ? { obstacleRouteVerifiedByServer }
+            : {}),
+          ...(progressiveNavigationProbeOnly
+            ? { progressiveNavigationDiagnosticOnly: true }
             : {}),
           ...(state.bodySmokeDiagnostic.obstacleRestoreProbeVerified === true
             ? { obstacleRestoreProbeVerified: true }
@@ -7842,6 +9573,1673 @@ async function rconBlueWoolDropCountNear(
   if (count === undefined || !Number.isInteger(count) || count < 0)
     incomplete("DEATH_RECOVERY_FIXTURE_DROP_RCON_READBACK_UNAVAILABLE");
   return count;
+}
+
+function updateOwnerReturnDiagnostic(
+  state: RunState,
+  update: Partial<OwnerReturnDiagnostic>,
+): void {
+  state.ownerReturnDiagnostic = {
+    stage: "not_started",
+    ...state.ownerReturnDiagnostic,
+    ...update,
+  };
+}
+
+function ownerReturnDistanceBucket(
+  distance: number,
+): OwnerReturnDistanceBucket {
+  return distance <= 1.75 ? "within_1_75" : "over_1_75";
+}
+
+export function ownerReturnProposalDisposition(
+  proposal: Pick<PlayerEvidence["proposals"][number], "status"> | undefined,
+): OwnerReturnProposalDisposition {
+  const status = proposal?.status;
+  return status === "pending" ||
+    status === "adopted" ||
+    status === "compromised" ||
+    status === "declined"
+    ? status
+    : "unknown";
+}
+
+export function isOwnerProposalProgressable(
+  disposition: OwnerReturnProposalDisposition,
+  ownerGoalLinked: boolean,
+): boolean {
+  return (
+    ownerGoalLinked &&
+    (disposition === "adopted" || disposition === "compromised")
+  );
+}
+
+export function ownerReturnArrivalConfirmed(
+  sample: Pick<
+    OwnerReturnWorldSample,
+    | "bodySide"
+    | "rconSide"
+    | "bodyDistance"
+    | "rconDistance"
+    | "bodyRconAligned"
+    | "doorState"
+  >,
+): boolean {
+  return (
+    sample.bodySide === "owner_side" &&
+    sample.rconSide === "owner_side" &&
+    sample.bodyDistance === "within_1_75" &&
+    sample.rconDistance === "within_1_75" &&
+    sample.bodyRconAligned &&
+    sample.doorState === "open"
+  );
+}
+
+export function ownerReturnAcceptanceEvidenceConfirmed(
+  disposition: OwnerReturnProposalDisposition,
+  ownerGoalLinked: boolean,
+  ownerMoveJudgmentObserved: boolean,
+  sample: OwnerReturnWorldSample,
+): boolean {
+  return (
+    isOwnerProposalProgressable(disposition, ownerGoalLinked) &&
+    ownerMoveJudgmentObserved &&
+    ownerReturnArrivalConfirmed(sample)
+  );
+}
+
+export function ownerReturnRequestGateEnabled(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return targetCase === "owner_return_through_door";
+}
+
+export function ownerReturnCaseCallLimit(
+  targetCase: TargetableCase | undefined,
+  configuredCalls: number,
+  gate: Pick<AcceptedProviderRequestGate, "requestsStarted"> | undefined,
+): number | undefined {
+  if (!ownerReturnRequestGateEnabled(targetCase)) return configuredCalls;
+  if (
+    gate === undefined ||
+    !Number.isSafeInteger(configuredCalls) ||
+    configuredCalls < 0 ||
+    !Number.isSafeInteger(gate.requestsStarted) ||
+    gate.requestsStarted < 0
+  ) {
+    return undefined;
+  }
+  return Math.max(0, configuredCalls - gate.requestsStarted);
+}
+
+export type OwnerReturnRequestAdmissionErrorCode =
+  | "OWNER_RETURN_REQUEST_GATE_NOT_READY"
+  | "CASE_LLM_BUDGET_EXCEEDED"
+  | "OWNER_RETURN_REQUEST_ADMISSION_LATCHED";
+
+export function admitOwnerReturnProviderRequest(
+  gate: AcceptedProviderRequestGate | undefined,
+  caseCallLimit: number,
+  admit: () => void,
+  createError: (code: OwnerReturnRequestAdmissionErrorCode) => Error,
+): void {
+  if (
+    gate === undefined ||
+    !Number.isSafeInteger(caseCallLimit) ||
+    caseCallLimit < 1
+  ) {
+    throw createError("OWNER_RETURN_REQUEST_GATE_NOT_READY");
+  }
+  gate.beforeCall(
+    () => {
+      if (gate.requestsStarted >= caseCallLimit)
+        throw createError("CASE_LLM_BUDGET_EXCEEDED");
+      admit();
+    },
+    () => createError("OWNER_RETURN_REQUEST_ADMISSION_LATCHED"),
+  );
+}
+
+export function createOwnerReturnRequestTracking(
+  targetCase: TargetableCase | undefined,
+  preStartCounters: Counters,
+  existingGate?: AcceptedProviderRequestGate,
+):
+  | Readonly<{
+      usageStart: Counters;
+      gate: AcceptedProviderRequestGate;
+    }>
+  | undefined {
+  if (!ownerReturnRequestGateEnabled(targetCase)) return undefined;
+  return {
+    usageStart: preStartCounters,
+    gate: existingGate ?? new AcceptedProviderRequestGate(),
+  };
+}
+
+function ownerReturnRequestDiagnosticPatch(
+  state: RunState,
+  status: AcceptedProviderRequestSettleStatus,
+  settled: boolean,
+): Partial<OwnerReturnDiagnostic> {
+  const gate = state.ownerReturnRequestGate;
+  return {
+    acceptedProviderRequestsLatched: gate?.latched === true,
+    acceptedProviderRequestsStarted: gate?.requestsStarted ?? 0,
+    acceptedProviderRequestsRecorded: gate?.requestsRecorded ?? 0,
+    acceptedProviderRequestsInFlight: gate?.inFlightRequests ?? 0,
+    acceptedProviderRequestsBlockedAfterLatch:
+      gate?.providerRequestsBlockedAfterLatch ?? 0,
+    acceptedProviderRequestsSettled: settled,
+    acceptedProviderRequestSettleStatus: status,
+  };
+}
+
+function ownerReturnGoalStatus(
+  value: string | undefined,
+): NonNullable<OwnerReturnDiagnostic["ownerGoalStatusAtStop"]> {
+  return value === "active" ||
+    value === "paused" ||
+    value === "completed" ||
+    value === "abandoned"
+    ? value
+    : "unknown";
+}
+
+export function ownerReturnToolNamesSince(
+  activities: readonly Pick<
+    PlayerAgentRoundActivity,
+    "runSequence" | "round" | "role" | "toolCalls"
+  >[],
+  previousActivities: readonly Pick<
+    PlayerAgentRoundActivity,
+    "runSequence" | "round" | "role" | "toolCalls"
+  >[],
+): Readonly<{
+  conversation: readonly PlayerAgentToolName[];
+  purpose: readonly PlayerAgentToolName[];
+}> {
+  const activityKey = (
+    activity: Pick<PlayerAgentRoundActivity, "runSequence" | "round" | "role">,
+  ): string => `${activity.runSequence}:${activity.role}:${activity.round}`;
+  const previousRounds = new Set(previousActivities.map(activityKey));
+  const namesByRole = {
+    conversation: new Set<PlayerAgentToolName>(),
+    purpose: new Set<PlayerAgentToolName>(),
+  };
+  for (const activity of activities) {
+    if (previousRounds.has(activityKey(activity))) continue;
+    const names = namesByRole[activity.role];
+    for (const toolCall of activity.toolCalls) names.add(toolCall.name);
+  }
+  return {
+    conversation: [...namesByRole.conversation].sort(),
+    purpose: [...namesByRole.purpose].sort(),
+  };
+}
+
+async function runOwnerReturnThroughDoorCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const body = activeApplicationPlayerBody;
+  if (body === undefined)
+    incomplete("OWNER_RETURN_APPLICATION_BODY_UNAVAILABLE");
+  const rcon = context.rcon;
+  const origin = { x: 0.5, y: 64, z: 0.5 };
+  const door = fixturePoint(origin, 2, 0);
+  const start = { x: door.x + 6.5, y: 68, z: door.z + 0.5 };
+  const ownerTarget = { x: origin.x, y: origin.y, z: origin.z };
+  const stairBlocks = [
+    { x: door.x + 1, y: 64, z: door.z },
+    { x: door.x + 2, y: 65, z: door.z },
+    { x: door.x + 3, y: 66, z: door.z },
+    { x: door.x + 4, y: 67, z: door.z },
+  ] as const;
+  const supports = [
+    { x: door.x + 2, y: 64, z: door.z },
+    { x: door.x + 3, y: 64, z: door.z },
+    { x: door.x + 3, y: 65, z: door.z },
+    { x: door.x + 4, y: 64, z: door.z },
+    { x: door.x + 4, y: 65, z: door.z },
+    { x: door.x + 4, y: 66, z: door.z },
+  ] as const;
+  const platform = [
+    { x: door.x + 5, y: 67, z: door.z },
+    { x: door.x + 6, y: 67, z: door.z },
+  ] as const;
+  const hiddenFixture = { chest: fixturePoint(origin, 6, 0) };
+  let fixtureMutationStarted = false;
+  let arrived = false;
+  const commandText = (...parts: (string | number)[]): string => parts.join("");
+  const update = (patch: Partial<OwnerReturnDiagnostic>): void =>
+    updateOwnerReturnDiagnostic(state, patch);
+  const sampleWorld = async (): Promise<OwnerReturnWorldSample> => {
+    const [bodyObservation, botPositionText, ownerPositionText] =
+      await Promise.all([
+        body.observe(),
+        rcon.command("data get entity " + context.botName + " Pos"),
+        rcon.command("data get entity " + context.ownerName + " Pos"),
+      ]);
+    const [botPosition, ownerPosition] = [
+      parsePosition(botPositionText),
+      parsePosition(ownerPositionText),
+    ];
+    const bodyPosition = bodyObservation.self.position;
+    const bodyDistance = Math.hypot(
+      bodyPosition.x - ownerPosition.x,
+      bodyPosition.y - ownerPosition.y,
+      bodyPosition.z - ownerPosition.z,
+    );
+    const rconDistance = Math.hypot(
+      botPosition.x - ownerPosition.x,
+      botPosition.y - ownerPosition.y,
+      botPosition.z - ownerPosition.z,
+    );
+    return {
+      bodySide: progressiveNavigationSide(bodyPosition, door.x),
+      rconSide: progressiveNavigationSide(botPosition, door.x),
+      bodyDistance: ownerReturnDistanceBucket(bodyDistance),
+      rconDistance: ownerReturnDistanceBucket(rconDistance),
+      bodyRconAligned:
+        Math.hypot(
+          bodyPosition.x - botPosition.x,
+          bodyPosition.y - botPosition.y,
+          bodyPosition.z - botPosition.z,
+        ) <= 1.5,
+      doorState: await readProgressiveNavigationDoorState(
+        rcon,
+        door,
+        context.botName,
+      ),
+    };
+  };
+  const updateWorldDiagnostic = (
+    sample: OwnerReturnWorldSample,
+    before: boolean,
+  ): void => {
+    update(
+      before
+        ? {
+            bodySideBefore: sample.bodySide,
+            rconSideBefore: sample.rconSide,
+            bodyDistanceBefore: sample.bodyDistance,
+            rconDistanceBefore: sample.rconDistance,
+            bodyRconSampleAlignedBefore: sample.bodyRconAligned,
+            doorStateBefore: sample.doorState,
+          }
+        : {
+            bodySideAfter: sample.bodySide,
+            rconSideAfter: sample.rconSide,
+            bodyDistanceAfter: sample.bodyDistance,
+            rconDistanceAfter: sample.rconDistance,
+            bodyRconSampleAlignedAfter: sample.bodyRconAligned,
+            doorStateAfter: sample.doorState,
+          },
+    );
+  };
+  let stopWorldSampleAttempted = false;
+  let projectOwnerReturnStopPlayer:
+    ((player: PlayerEvidence) => void) | undefined;
+  let ownerRequestSent = false;
+  const sampleStopWorldOnce = async (): Promise<void> => {
+    if (stopWorldSampleAttempted) return;
+    stopWorldSampleAttempted = true;
+    try {
+      const sample = await sampleWorld();
+      updateWorldDiagnostic(sample, false);
+      update({
+        bodyReachedOwnerSide: sample.bodySide === "owner_side",
+        rconReachedOwnerSide: sample.rconSide === "owner_side",
+        bodyAndRconArrivalObserved: ownerReturnArrivalConfirmed(sample),
+      });
+    } catch {
+      update({
+        bodySideAfter: "unknown",
+        rconSideAfter: "unknown",
+        bodyDistanceAfter: "unknown",
+        rconDistanceAfter: "unknown",
+        bodyRconSampleAlignedAfter: "unknown",
+        doorStateAfter: "unknown",
+        bodyReachedOwnerSide: "unknown",
+        rconReachedOwnerSide: "unknown",
+        bodyAndRconArrivalObserved: "unknown",
+      });
+    }
+  };
+  const finalizeBudgetStop = async (
+    player: PlayerEvidence | undefined,
+    _reason: string,
+  ): Promise<void> => {
+    state.ownerReturnRequestGate?.latch();
+    update({ stopReason: "budget_stop", ownerRequestSent });
+    if (player !== undefined && projectOwnerReturnStopPlayer !== undefined) {
+      projectOwnerReturnStopPlayer(player);
+    } else {
+      update({
+        stopPlayerEvidenceAvailable: player !== undefined,
+        newOwnerProposalObserved: "unknown",
+        ownerProposalDisposition: "unknown",
+        ownerProposalAdoptedForRequest: "unknown",
+        ownerProposalProgressableForRequest: "unknown",
+        ownerGoalLinked: "unknown",
+        ownerGoalStatusAtStop: "unknown",
+        ownerMoveJudgmentObserved: "unknown",
+        moveOutcomeStatus: "unknown",
+        activeOperationPresentAtStop:
+          player === undefined ? "unknown" : isOperationActive(player),
+        toolNamesByRole: "unknown",
+      });
+    }
+    await settleOwnerReturnRequests(state, context);
+    await sampleStopWorldOnce();
+  };
+
+  update({ stage: "fixture_setup" });
+  try {
+    const idle = await observeForPlayer(
+      context,
+      15_000,
+      (player) => !isOperationActive(player),
+      ownerReturnRequestGateEnabled(state.targetCase)
+        ? finalizeBudgetStop
+        : undefined,
+    );
+    if (idle === undefined) incomplete("OWNER_RETURN_BODY_NOT_IDLE");
+    fixtureMutationStarted = true;
+    await removeHiddenContainerFixture(rcon, origin, hiddenFixture);
+    await rcon.command(
+      commandText(
+        "kill @e[type=minecraft:item,x=",
+        hiddenFixture.chest.x,
+        ",y=",
+        hiddenFixture.chest.y,
+        ",z=",
+        hiddenFixture.chest.z,
+        ",distance=..3]",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "fill ",
+        door.x,
+        " 64 ",
+        door.z - 1,
+        " ",
+        Math.floor(start.x),
+        " 69 ",
+        door.z - 1,
+        " stone",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "fill ",
+        door.x,
+        " 64 ",
+        door.z + 1,
+        " ",
+        Math.floor(start.x),
+        " 69 ",
+        door.z + 1,
+        " stone",
+      ),
+    );
+    for (const support of supports) {
+      await rcon.command(
+        commandText(
+          "setblock ",
+          support.x,
+          " ",
+          support.y,
+          " ",
+          support.z,
+          " stone",
+        ),
+      );
+    }
+    for (const block of platform) {
+      await rcon.command(
+        commandText("setblock ", block.x, " ", block.y, " ", block.z, " stone"),
+      );
+    }
+    await rcon.command(
+      commandText(
+        "setblock ",
+        door.x,
+        " ",
+        door.y,
+        " ",
+        door.z,
+        " oak_door[facing=west,half=lower,hinge=left,open=false,powered=false]",
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "setblock ",
+        door.x,
+        " ",
+        door.y + 1,
+        " ",
+        door.z,
+        " oak_door[facing=west,half=upper,hinge=left,open=false,powered=false]",
+      ),
+    );
+    for (const stair of stairBlocks) {
+      await rcon.command(
+        commandText(
+          "setblock ",
+          stair.x,
+          " ",
+          stair.y,
+          " ",
+          stair.z,
+          " oak_stairs[facing=west,half=bottom,shape=straight,waterlogged=false]",
+        ),
+      );
+    }
+    const stairsConfirmed = (
+      await Promise.all(
+        stairBlocks.map((stair) => isBlock(rcon, stair, "oak_stairs")),
+      )
+    ).every(Boolean);
+    const supportBlocks = [...supports, ...platform];
+    const supportsConfirmed = (
+      await Promise.all(
+        supportBlocks.map((support) => isBlock(rcon, support, "stone")),
+      )
+    ).every(Boolean);
+    const doorHalvesConfirmed =
+      (await isBlock(rcon, door, "oak_door")) &&
+      (await isBlock(rcon, { ...door, y: door.y + 1 }, "oak_door"));
+    const fixtureConfigured =
+      stairsConfirmed &&
+      supportsConfirmed &&
+      doorHalvesConfirmed &&
+      (await readProgressiveNavigationDoorState(
+        rcon,
+        door,
+        context.botName,
+      )) === "closed";
+    update({ fixtureConfigured, stage: "preflight" });
+    if (!fixtureConfigured) incomplete("OWNER_RETURN_FIXTURE_UNCONFIRMED");
+
+    await rcon.command(
+      commandText(
+        "tp ",
+        context.ownerName,
+        " ",
+        ownerTarget.x,
+        " ",
+        ownerTarget.y,
+        " ",
+        ownerTarget.z,
+      ),
+    );
+    await rcon.command(
+      commandText(
+        "tp ",
+        context.botName,
+        " ",
+        start.x,
+        " ",
+        start.y,
+        " ",
+        start.z,
+        " 90 0",
+      ),
+    );
+    let before = await sampleWorld();
+    const bodyReadyBy = Date.now() + 5_000;
+    while (
+      Date.now() < bodyReadyBy &&
+      (before.bodySide !== "return_side" ||
+        before.rconSide !== "return_side" ||
+        !before.bodyRconAligned)
+    ) {
+      await waitMs(250);
+      before = await sampleWorld();
+    }
+    updateWorldDiagnostic(before, true);
+    if (
+      before.bodySide !== "return_side" ||
+      before.rconSide !== "return_side" ||
+      before.doorState !== "closed" ||
+      !before.bodyRconAligned
+    )
+      incomplete("OWNER_RETURN_START_NOT_CONFIRMED");
+    const baseline = playerOf(await collect(context.runtime.app));
+    if (isOperationActive(baseline))
+      incomplete("OWNER_RETURN_BODY_BECAME_ACTIVE_BEFORE_REQUEST");
+    const baselineActivities = baseline.recentAgentActivity ?? [];
+    const updateObservedToolNames = (player: PlayerEvidence): void =>
+      updateOwnerReturnDiagnostic(state, {
+        toolNamesByRole: ownerReturnToolNamesSince(
+          player.recentAgentActivity ?? [],
+          baselineActivities,
+        ),
+      });
+    const baselineProposalIds = new Set(
+      baseline.proposals.map((proposal) => proposal.id),
+    );
+    const baselineOutcomeIds = new Set(
+      baseline.recentOutcomes.map((outcome) => outcome.operationId),
+    );
+    let requestProposalId: string | undefined;
+    let requestProposalObserved = false;
+    const requestAt = Date.now();
+    update({ stage: "owner_request" });
+    sendChat(context.owner, "ドアを通って、こっちまで戻ってきてください。");
+    ownerRequestSent = true;
+    update({ ownerRequestSent: true });
+    let lastWorldSampleAt = 0;
+    let latestWorldSample = before;
+    const updateNavigationEvidence = (player: PlayerEvidence) => {
+      updateObservedToolNames(player);
+      const newProposals = player.proposals.filter(
+        (proposal) => !baselineProposalIds.has(proposal.id),
+      );
+      requestProposalObserved ||= newProposals.length > 0;
+      const proposal = newProposals.length === 1 ? newProposals[0] : undefined;
+      if (proposal !== undefined) requestProposalId = proposal.id;
+      else if (newProposals.length > 1) requestProposalId = undefined;
+      const disposition = ownerReturnProposalDisposition(proposal);
+      const ownerGoalLinked =
+        proposal !== undefined &&
+        player.goals.some(
+          (goal) =>
+            goal.ownerProposalId === proposal.id && goal.source === "owner",
+        );
+      const ownerProposalAdoptedForRequest =
+        proposal !== undefined && disposition === "adopted" && ownerGoalLinked;
+      const ownerProposalProgressableForRequest =
+        proposal !== undefined &&
+        isOwnerProposalProgressable(disposition, ownerGoalLinked);
+      if (ownerProposalProgressableForRequest)
+        state.ownerReturnProposalIdForRun = proposal.id;
+      const ownerMoveJudgmentObserved = player.recentJudgments.some(
+        (judgment) =>
+          judgment.kind === "act" &&
+          judgment.operationKind === "move_to" &&
+          judgment.decidedAt !== undefined &&
+          Date.parse(judgment.decidedAt) >= requestAt,
+      );
+      const moveOutcome = player.recentOutcomes.findLast(
+        (outcome) =>
+          !baselineOutcomeIds.has(outcome.operationId) &&
+          outcome.kind === "move_to" &&
+          outcome.observedAt !== undefined &&
+          Date.parse(outcome.observedAt) >= requestAt,
+      );
+      const safeMoveOutcomeStatus =
+        moveOutcome === undefined
+          ? "unknown"
+          : (safeOutcomeStatus(moveOutcome.status) ?? "unknown");
+      update({
+        stage: "navigation",
+        stopPlayerEvidenceAvailable: true,
+        newOwnerProposalObserved: requestProposalObserved,
+        ownerProposalDisposition: disposition,
+        ownerProposalAdoptedForRequest,
+        ownerProposalProgressableForRequest,
+        ownerGoalLinked,
+        ownerGoalStatusAtStop: ownerReturnGoalStatus(
+          player.goals.find(
+            (goal) =>
+              proposal !== undefined &&
+              goal.ownerProposalId === proposal.id &&
+              goal.source === "owner",
+          )?.status,
+        ),
+        ownerMoveJudgmentObserved,
+        moveOutcomeStatus:
+          safeMoveOutcomeStatus === "cancelled"
+            ? "interrupted"
+            : safeMoveOutcomeStatus,
+        activeOperationPresentAtStop: isOperationActive(player),
+      });
+      return {
+        disposition,
+        ownerGoalLinked,
+        ownerMoveJudgmentObserved,
+      } as const;
+    };
+    projectOwnerReturnStopPlayer = (player) => {
+      updateNavigationEvidence(player);
+    };
+    const observationWindowMs = Math.max(
+      1,
+      Math.min(150_000, context.caseDeadlineAt - Date.now() - 20_000),
+    );
+    const reachedPlayer = await observeForPlayer(
+      context,
+      observationWindowMs,
+      async (player) => {
+        const navigationEvidence = updateNavigationEvidence(player);
+        if (Date.now() - lastWorldSampleAt >= 10_000) {
+          latestWorldSample = await sampleWorld();
+          lastWorldSampleAt = Date.now();
+          updateWorldDiagnostic(latestWorldSample, false);
+          update({
+            bodyReachedOwnerSide: latestWorldSample.bodySide === "owner_side",
+            rconReachedOwnerSide: latestWorldSample.rconSide === "owner_side",
+            bodyAndRconArrivalObserved:
+              ownerReturnArrivalConfirmed(latestWorldSample),
+          });
+        }
+        arrived = ownerReturnAcceptanceEvidenceConfirmed(
+          navigationEvidence.disposition,
+          navigationEvidence.ownerGoalLinked,
+          navigationEvidence.ownerMoveJudgmentObserved,
+          latestWorldSample,
+        );
+        if (arrived && ownerReturnRequestGateEnabled(state.targetCase))
+          state.ownerReturnRequestGate?.latch();
+        return arrived;
+      },
+      ownerReturnRequestGateEnabled(state.targetCase)
+        ? finalizeBudgetStop
+        : undefined,
+    );
+    if (reachedPlayer === undefined) {
+      latestWorldSample = await sampleWorld();
+      updateWorldDiagnostic(latestWorldSample, false);
+      const stopPlayer = playerOf(await collect(context.runtime.app));
+      updateObservedToolNames(stopPlayer);
+      const stopReason: OwnerReturnStopReason =
+        state.ownerReturnDiagnostic?.ownerProposalDisposition === "declined"
+          ? "proposal_declined"
+          : state.ownerReturnDiagnostic?.moveOutcomeStatus !== undefined &&
+              state.ownerReturnDiagnostic.moveOutcomeStatus !== "successful"
+            ? "navigation_terminal"
+            : "observation_window_elapsed";
+      update({
+        stopReason,
+        activeOperationPresentAtStop: isOperationActive(stopPlayer),
+      });
+    } else {
+      update({ stopReason: "owner_arrival" });
+      if (ownerReturnRequestGateEnabled(state.targetCase)) {
+        requireOwnerReturnRequestsSettled(
+          await settleOwnerReturnRequests(state, context),
+        );
+      }
+      arrived = true;
+      updateObservedToolNames(reachedPlayer);
+      update({
+        stopReason: "owner_arrival",
+        bodyReachedOwnerSide: true,
+        rconReachedOwnerSide: true,
+        bodyAndRconArrivalObserved: true,
+        activeOperationPresentAtStop: isOperationActive(reachedPlayer),
+      });
+    }
+    const terminalPlayer = playerOf(await collect(context.runtime.app));
+    updateObservedToolNames(terminalPlayer);
+    const linkedProposal = terminalPlayer.proposals.find(
+      (proposal) => proposal.id === requestProposalId,
+    );
+    const linkedGoal = terminalPlayer.goals.find(
+      (goal) =>
+        requestProposalId !== undefined &&
+        goal.ownerProposalId === requestProposalId &&
+        goal.source === "owner",
+    );
+    const terminalDisposition = ownerReturnProposalDisposition(linkedProposal);
+    const terminalOwnerGoalLinked = linkedGoal !== undefined;
+    const terminalProposalAdoptedForRequest =
+      linkedProposal !== undefined &&
+      terminalDisposition === "adopted" &&
+      terminalOwnerGoalLinked;
+    const terminalProposalProgressableForRequest =
+      linkedProposal !== undefined &&
+      isOwnerProposalProgressable(terminalDisposition, terminalOwnerGoalLinked);
+    update({
+      newOwnerProposalObserved: requestProposalObserved,
+      ownerProposalDisposition: terminalDisposition,
+      ownerProposalAdoptedForRequest: terminalProposalAdoptedForRequest,
+      ownerProposalProgressableForRequest:
+        terminalProposalProgressableForRequest,
+      ownerGoalLinked: terminalOwnerGoalLinked,
+      ownerGoalStatusAtStop: ownerReturnGoalStatus(linkedGoal?.status),
+      activeOperationPresentAtStop: isOperationActive(terminalPlayer),
+    });
+    if (!arrived) incomplete("OWNER_RETURN_DOOR_CROSSING_NOT_CONFIRMED");
+  } finally {
+    if (fixtureMutationStarted) {
+      update({ stage: "cleanup" });
+      const fixtureCleanupConfirmed = await (async () => {
+        try {
+          await rcon.command(
+            commandText(
+              "fill ",
+              door.x,
+              " 64 ",
+              door.z - 1,
+              " ",
+              Math.floor(start.x),
+              " 69 ",
+              door.z + 1,
+              " air",
+            ),
+          );
+          const cleanupCells = [
+            door,
+            { ...door, y: door.y + 1 },
+            ...stairBlocks,
+            ...supports,
+            ...platform,
+            { x: door.x + 2, y: 64, z: door.z - 1 },
+            { x: door.x + 2, y: 69, z: door.z + 1 },
+          ];
+          return (
+            await Promise.all(
+              cleanupCells.map((position) => isBlock(rcon, position, "air")),
+            )
+          ).every(Boolean);
+        } catch {
+          return false;
+        }
+      })();
+      const originalFixtureRestored = await (async () => {
+        try {
+          await configureHiddenContainer(rcon, origin);
+          return (
+            (await isBlock(rcon, { ...door, y: 64 }, "stone")) &&
+            (await isBlock(rcon, hiddenFixture.chest, "chest"))
+          );
+        } catch {
+          return false;
+        }
+      })();
+      update({
+        fixtureCleanupConfirmed,
+        originalFixtureRestored,
+        stage:
+          fixtureCleanupConfirmed && originalFixtureRestored
+            ? "complete"
+            : "cleanup",
+      });
+      if (!fixtureCleanupConfirmed || !originalFixtureRestored)
+        incomplete("OWNER_RETURN_FIXTURE_CLEANUP_UNCONFIRMED");
+    }
+  }
+  return {
+    ownerRequestSent: true,
+    fixtureConfigured: state.ownerReturnDiagnostic?.fixtureConfigured === true,
+    ownerProposalAdoptedForRequest:
+      state.ownerReturnDiagnostic?.ownerProposalAdoptedForRequest === true,
+    ownerProposalProgressableForRequest:
+      state.ownerReturnDiagnostic?.ownerProposalProgressableForRequest === true,
+    ownerGoalLinked: state.ownerReturnDiagnostic?.ownerGoalLinked === true,
+    ownerMoveJudgmentObserved:
+      state.ownerReturnDiagnostic?.ownerMoveJudgmentObserved === true,
+    bodyAndRconArrivalObserved:
+      state.ownerReturnDiagnostic?.bodyAndRconArrivalObserved === true,
+    doorOpened: state.ownerReturnDiagnostic?.doorStateAfter === "open",
+    fixtureCleanupConfirmed:
+      state.ownerReturnDiagnostic?.fixtureCleanupConfirmed === true,
+    originalFixtureRestored:
+      state.ownerReturnDiagnostic?.originalFixtureRestored === true,
+  };
+}
+
+async function runProgressiveNavigationProbe(
+  state: RunState,
+  rcon: LocalRcon,
+  body: PlayerBody,
+  spawn: Position,
+  signal: AbortSignal,
+): Promise<void> {
+  const door = fixturePoint(spawn, 2, 0);
+  const start = { x: door.x + 6.5, y: 68, z: door.z + 0.5 };
+  const stairBlocks = [
+    { x: door.x + 1, y: 64, z: door.z },
+    { x: door.x + 2, y: 65, z: door.z },
+    { x: door.x + 3, y: 66, z: door.z },
+    { x: door.x + 4, y: 67, z: door.z },
+  ] as const;
+  const supports = [
+    { x: door.x + 2, y: 64, z: door.z },
+    { x: door.x + 3, y: 64, z: door.z },
+    { x: door.x + 3, y: 65, z: door.z },
+    { x: door.x + 4, y: 64, z: door.z },
+    { x: door.x + 4, y: 65, z: door.z },
+    { x: door.x + 4, y: 66, z: door.z },
+  ] as const;
+  const platform = [
+    { x: door.x + 5, y: 67, z: door.z },
+    { x: door.x + 6, y: 67, z: door.z },
+  ] as const;
+  const hiddenFixture = { chest: fixturePoint(spawn, 6, 0) };
+  const update = (patch: Partial<BodySmokeDiagnostic>): void => {
+    const current = state.bodySmokeDiagnostic;
+    if (current === undefined) incomplete("BODY_SMOKE_DIAGNOSTIC_MISSING");
+    state.bodySmokeDiagnostic = { ...current, ...patch };
+  };
+  let fixtureMutationStarted = false;
+  update({ progressiveNavigationStage: "fixture_setup" });
+  try {
+    fixtureMutationStarted = true;
+    await removeHiddenContainerFixture(rcon, spawn, hiddenFixture);
+    await rcon.command(
+      `kill @e[type=minecraft:item,x=${hiddenFixture.chest.x},y=${hiddenFixture.chest.y},z=${hiddenFixture.chest.z},distance=..3]`,
+    );
+    await rcon.command(
+      `fill ${door.x} 64 ${door.z - 1} ${Math.floor(start.x)} 69 ${door.z - 1} stone`,
+    );
+    await rcon.command(
+      `fill ${door.x} 64 ${door.z + 1} ${Math.floor(start.x)} 69 ${door.z + 1} stone`,
+    );
+    for (const support of supports) {
+      await rcon.command(
+        `setblock ${support.x} ${support.y} ${support.z} stone`,
+      );
+    }
+    for (const block of platform) {
+      await rcon.command(`setblock ${block.x} ${block.y} ${block.z} stone`);
+    }
+    await rcon.command(
+      `setblock ${door.x} ${door.y} ${door.z} oak_door[facing=west,half=lower,hinge=left,open=false,powered=false]`,
+    );
+    await rcon.command(
+      `setblock ${door.x} ${door.y + 1} ${door.z} oak_door[facing=west,half=upper,hinge=left,open=false,powered=false]`,
+    );
+    for (const stair of stairBlocks) {
+      await rcon.command(
+        `setblock ${stair.x} ${stair.y} ${stair.z} oak_stairs[facing=west,half=bottom,shape=straight,waterlogged=false]`,
+      );
+    }
+    let stairsConfirmed = true;
+    for (const stair of stairBlocks) {
+      stairsConfirmed =
+        (await isBlock(rcon, stair, "oak_stairs")) && stairsConfirmed;
+    }
+    let supportsConfirmed = true;
+    for (const support of [...supports, ...platform]) {
+      supportsConfirmed =
+        (await isBlock(rcon, support, "stone")) && supportsConfirmed;
+    }
+    const corridorWallsConfirmed =
+      (await isBlock(rcon, { x: door.x + 2, y: 64, z: door.z - 1 }, "stone")) &&
+      (await isBlock(rcon, { x: door.x + 2, y: 69, z: door.z + 1 }, "stone"));
+    const doorLowerConfirmed = await isBlock(rcon, door, "oak_door");
+    const doorUpperConfirmed = await isBlock(
+      rcon,
+      { ...door, y: door.y + 1, z: door.z },
+      "oak_door",
+    );
+    const doorStateBefore = await readProgressiveNavigationDoorState(
+      rcon,
+      door,
+      state.botName,
+    );
+    update({
+      progressiveNavigationFixtureConfigured:
+        stairsConfirmed &&
+        supportsConfirmed &&
+        corridorWallsConfirmed &&
+        doorLowerConfirmed &&
+        doorUpperConfirmed,
+      progressiveNavigationStairBlocksConfirmed: stairsConfirmed,
+      progressiveNavigationStepSupportsConfirmed: supportsConfirmed,
+      progressiveNavigationCorridorWallsConfirmed: corridorWallsConfirmed,
+      progressiveNavigationDoorHalvesConfirmed:
+        doorLowerConfirmed && doorUpperConfirmed,
+      progressiveNavigationDoorStateBefore: doorStateBefore,
+      progressiveNavigationStage: "preflight",
+    });
+    if (!stairsConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_STAIRS_UNCONFIRMED");
+    if (!supportsConfirmed || !corridorWallsConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_ROUTE_FIXTURE_UNCONFIRMED");
+    if (!doorLowerConfirmed || !doorUpperConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_DOOR_UNCONFIRMED");
+    if (doorStateBefore !== "closed")
+      incomplete("PROGRESSIVE_NAVIGATION_DOOR_NOT_CLOSED_BEFORE_MOVE");
+
+    await rcon.command(
+      `tp ${state.botName} ${start.x} ${start.y} ${start.z} 90 0`,
+    );
+    const rconBefore = parsePosition(
+      await rcon.command(`data get entity ${state.botName} Pos`),
+    );
+    const ownerBefore = parsePosition(
+      await rcon.command(`data get entity ${state.ownerName} Pos`),
+    );
+    const bodyReadyBy = Date.now() + 5_000;
+    let bodyBefore = await body.observe();
+    while (
+      Date.now() < bodyReadyBy &&
+      Math.hypot(
+        bodyBefore.self.position.x - start.x,
+        bodyBefore.self.position.y - start.y,
+        bodyBefore.self.position.z - start.z,
+      ) > 1.5
+    ) {
+      await waitMs(100);
+      bodyBefore = await body.observe();
+    }
+    if (
+      Math.hypot(
+        rconBefore.x - start.x,
+        rconBefore.y - start.y,
+        rconBefore.z - start.z,
+      ) > 1.5
+    )
+      incomplete("PROGRESSIVE_NAVIGATION_RCON_START_NOT_CONFIRMED");
+    if (
+      Math.hypot(
+        bodyBefore.self.position.x - start.x,
+        bodyBefore.self.position.y - start.y,
+        bodyBefore.self.position.z - start.z,
+      ) > 1.5
+    )
+      incomplete("PROGRESSIVE_NAVIGATION_BODY_START_NOT_CONFIRMED");
+    const bodyDistanceBefore = Math.hypot(
+      bodyBefore.self.position.x - ownerBefore.x,
+      bodyBefore.self.position.y - ownerBefore.y,
+      bodyBefore.self.position.z - ownerBefore.z,
+    );
+    const rconDistanceBefore = Math.hypot(
+      rconBefore.x - ownerBefore.x,
+      rconBefore.y - ownerBefore.y,
+      rconBefore.z - ownerBefore.z,
+    );
+    update({
+      progressiveNavigationBodySideBefore: progressiveNavigationSide(
+        bodyBefore.self.position,
+        door.x,
+      ),
+      progressiveNavigationRconSideBefore: progressiveNavigationSide(
+        rconBefore,
+        door.x,
+      ),
+      progressiveNavigationBodyDistanceBefore: positionDistanceBucket(
+        bodyBefore.self.position,
+        ownerBefore,
+      ),
+      progressiveNavigationRconDistanceBefore: positionDistanceBucket(
+        rconBefore,
+        ownerBefore,
+      ),
+      progressiveNavigationStage: "move",
+    });
+    const movementSamples: ProgressiveNavigationMovementSample[] = [
+      progressiveNavigationMovementSample(
+        "start",
+        0,
+        bodyBefore,
+        rconBefore,
+        door,
+        doorStateBefore,
+      ),
+    ];
+    const moveStartedAt = Date.now();
+    let intervalSampleCount = 0;
+    const move = await executeBodyMovePathProbe(
+      body,
+      { kind: "move_to", position: ownerBefore, range: 1 },
+      signal,
+      40_000,
+      {
+        captureStallEvents: true,
+        sampleIntervalMs: 10_000,
+        maxSamples: 3,
+        onSample: async (elapsedMs) => {
+          intervalSampleCount += 1;
+          const point = progressiveNavigationSamplePoint(intervalSampleCount);
+          try {
+            const [observation, position] = await Promise.all([
+              body.observe(),
+              rcon
+                .command(`data get entity ${state.botName} Pos`)
+                .then(parsePosition),
+            ]);
+            const doorState = await readProgressiveNavigationDoorState(
+              rcon,
+              door,
+              state.botName,
+            );
+            movementSamples.push(
+              progressiveNavigationMovementSample(
+                point,
+                elapsedMs,
+                observation,
+                position,
+                door,
+                doorState,
+              ),
+            );
+          } catch {
+            movementSamples.push(
+              progressiveNavigationMovementSample(
+                point,
+                elapsedMs,
+                undefined,
+                undefined,
+                door,
+                "unknown",
+              ),
+            );
+          }
+        },
+      },
+    );
+    const [bodyAfter, rconAfter] = await Promise.all([
+      body.observe(),
+      rcon.command(`data get entity ${state.botName} Pos`).then(parsePosition),
+    ]);
+    const ownerAfter = parsePosition(
+      await rcon.command(`data get entity ${state.ownerName} Pos`),
+    );
+    const doorStateAfter = await readProgressiveNavigationDoorState(
+      rcon,
+      door,
+      state.botName,
+    );
+    movementSamples.push(
+      progressiveNavigationMovementSample(
+        "final",
+        Date.now() - moveStartedAt,
+        bodyAfter,
+        rconAfter,
+        door,
+        doorStateAfter,
+      ),
+    );
+    const bodyDistanceAfter = Math.hypot(
+      bodyAfter.self.position.x - ownerAfter.x,
+      bodyAfter.self.position.y - ownerAfter.y,
+      bodyAfter.self.position.z - ownerAfter.z,
+    );
+    const rconDistanceAfter = Math.hypot(
+      rconAfter.x - ownerAfter.x,
+      rconAfter.y - ownerAfter.y,
+      rconAfter.z - ownerAfter.z,
+    );
+    const bodyPassedDoor = bodyAfter.self.position.x < door.x - 0.5;
+    const rconPassedDoor = rconAfter.x < door.x - 0.5;
+    const routeConfirmed =
+      doorStateAfter !== "unknown" &&
+      move.status === "successful" &&
+      bodyPassedDoor &&
+      rconPassedDoor &&
+      bodyDistanceAfter <= 1.75 &&
+      rconDistanceAfter <= 1.75;
+    const doorUseReadinessBeforeLook = progressiveNavigationDoorUseReadiness(
+      bodyAfter,
+      door,
+    );
+    const skippedDoorLook = (
+      skipReason: ProgressiveNavigationDoorLookSkipReason,
+    ): ProgressiveNavigationDoorLookDiagnostic => ({
+      attempted: false,
+      skipReason,
+      doorObservedHalfBefore:
+        doorUseReadinessBeforeLook.diagnostic.doorObservedHalf,
+      doorObservedHalfAfter: "not_sampled",
+      bodyBlockSearchMayBeTruncatedBefore:
+        doorUseReadinessBeforeLook.diagnostic.bodyBlockSearchMayBeTruncated,
+      bodyBlockSearchMayBeTruncatedAfter: "not_sampled",
+      doorStateBefore: doorStateAfter,
+      doorStateAfter: "not_sampled",
+    });
+    let doorUseReadinessResult = doorUseReadinessBeforeLook;
+    let doorStateBeforeUse = doorStateAfter;
+    let doorLookDiagnostic: ProgressiveNavigationDoorLookDiagnostic;
+    let doorLookObservationAvailable = false;
+    if (isProgressiveNavigationSignalAborted(signal)) {
+      doorLookDiagnostic = skippedDoorLook("run_deadline");
+    } else if (routeConfirmed) {
+      doorLookDiagnostic = skippedDoorLook("initial_route_confirmed");
+    } else if (doorStateAfter !== "closed") {
+      doorLookDiagnostic = skippedDoorLook("door_not_closed");
+    } else if (move.recoveryRequired) {
+      doorLookDiagnostic = skippedDoorLook("operation_unresolved");
+    } else {
+      const doorLook = await executeProgressiveNavigationDoorLook(
+        body,
+        {
+          x: door.x + 0.5,
+          y: door.y + 1.5,
+          z: door.z + 0.5,
+        },
+        signal,
+        5_000,
+      );
+      const [bodyAfterLook, doorStateAfterLook] = await Promise.all([
+        body.observe().catch(() => undefined),
+        readProgressiveNavigationDoorState(rcon, door, state.botName).catch(
+          () => "unknown" as const,
+        ),
+      ]);
+      const readinessAfterLook =
+        bodyAfterLook === undefined
+          ? undefined
+          : progressiveNavigationDoorUseReadiness(bodyAfterLook, door);
+      if (readinessAfterLook !== undefined) {
+        doorUseReadinessResult = readinessAfterLook;
+        doorLookObservationAvailable = true;
+      }
+      doorStateBeforeUse = doorStateAfterLook;
+      doorLookDiagnostic = {
+        attempted: true,
+        skipReason: "attempted",
+        status: doorLook.status,
+        errorClass: doorLook.errorClass,
+        recoveryRequired: doorLook.recoveryRequired,
+        doorObservedHalfBefore:
+          doorUseReadinessBeforeLook.diagnostic.doorObservedHalf,
+        doorObservedHalfAfter:
+          readinessAfterLook?.diagnostic.doorObservedHalf ?? "unknown",
+        bodyBlockSearchMayBeTruncatedBefore:
+          doorUseReadinessBeforeLook.diagnostic.bodyBlockSearchMayBeTruncated,
+        bodyBlockSearchMayBeTruncatedAfter:
+          readinessAfterLook?.diagnostic.bodyBlockSearchMayBeTruncated ??
+          "unknown",
+        doorStateBefore: doorStateAfter,
+        doorStateAfter: doorStateAfterLook,
+      };
+    }
+    const doorUseReadiness = doorUseReadinessResult.diagnostic;
+    let doorUseDiagnostic: ProgressiveNavigationDoorUseDiagnostic;
+    let retryDiagnostic: ProgressiveNavigationRetryDiagnostic;
+    if (isProgressiveNavigationSignalAborted(signal)) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "run_deadline",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "run_deadline" };
+    } else if (routeConfirmed) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "initial_route_confirmed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = {
+        attempted: false,
+        skipReason: "initial_route_confirmed",
+      };
+    } else if (doorStateBeforeUse !== "closed") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_not_closed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (
+      move.recoveryRequired ||
+      doorLookDiagnostic.recoveryRequired === true
+    ) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "operation_unresolved",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = {
+        attempted: false,
+        skipReason: "operation_unresolved",
+      };
+    } else if (doorLookDiagnostic.skipReason !== "attempted") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_not_successful",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (doorLookDiagnostic.status !== "successful") {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_not_successful",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (!doorLookObservationAvailable) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "look_observation_unavailable",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (
+      doorUseReadiness.doorObservedHalf === "neither" ||
+      doorUseReadinessResult.targetPosition === null
+    ) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_not_observed",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else if (!doorUseReadiness.doorWithinReach) {
+      doorUseDiagnostic = {
+        attempted: false,
+        skipReason: "door_out_of_reach",
+        ...doorUseReadiness,
+      };
+      retryDiagnostic = { attempted: false, skipReason: "use_not_attempted" };
+    } else {
+      const use = await executeProgressiveNavigationDoorUse(
+        body,
+        doorUseReadinessResult.targetPosition,
+        signal,
+        15_000,
+      );
+      let doorStateAfterUse: ProgressiveNavigationDoorState = "unknown";
+      try {
+        doorStateAfterUse = await readProgressiveNavigationDoorState(
+          rcon,
+          door,
+          state.botName,
+        );
+      } catch {
+        doorStateAfterUse = "unknown";
+      }
+      doorUseDiagnostic = {
+        attempted: true,
+        skipReason: "attempted",
+        ...doorUseReadiness,
+        status: use.status,
+        errorClass: use.errorClass,
+        recoveryRequired: use.recoveryRequired,
+        doorStateAfter: doorStateAfterUse,
+      };
+      if (isProgressiveNavigationSignalAborted(signal)) {
+        retryDiagnostic = { attempted: false, skipReason: "run_deadline" };
+      } else if (use.recoveryRequired) {
+        retryDiagnostic = {
+          attempted: false,
+          skipReason: "operation_unresolved",
+        };
+      } else if (doorStateAfterUse !== "open") {
+        retryDiagnostic = { attempted: false, skipReason: "door_not_open" };
+      } else {
+        const retry = await executeBodyMovePathProbe(
+          body,
+          { kind: "move_to", position: ownerAfter, range: 1 },
+          signal,
+          15_000,
+          { captureStallEvents: true },
+        );
+        const [bodyAfterRetry, rconAfterRetry] = await Promise.all([
+          body.observe(),
+          rcon
+            .command(`data get entity ${state.botName} Pos`)
+            .then(parsePosition),
+        ]);
+        let doorStateAfterRetry: ProgressiveNavigationDoorState = "unknown";
+        try {
+          doorStateAfterRetry = await readProgressiveNavigationDoorState(
+            rcon,
+            door,
+            state.botName,
+          );
+        } catch {
+          doorStateAfterRetry = "unknown";
+        }
+        const bodyPassedDoorAfterRetry =
+          bodyAfterRetry.self.position.x < door.x - 0.5;
+        const rconPassedDoorAfterRetry = rconAfterRetry.x < door.x - 0.5;
+        const retryRouteConfirmed =
+          retry.status === "successful" &&
+          bodyPassedDoorAfterRetry &&
+          rconPassedDoorAfterRetry &&
+          Math.hypot(
+            bodyAfterRetry.self.position.x - ownerAfter.x,
+            bodyAfterRetry.self.position.y - ownerAfter.y,
+            bodyAfterRetry.self.position.z - ownerAfter.z,
+          ) <= 1.75 &&
+          Math.hypot(
+            rconAfterRetry.x - ownerAfter.x,
+            rconAfterRetry.y - ownerAfter.y,
+            rconAfterRetry.z - ownerAfter.z,
+          ) <= 1.75;
+        retryDiagnostic = {
+          attempted: true,
+          skipReason: "attempted",
+          status: retry.status,
+          errorClass: retry.errorClass,
+          pathStatus: retry.pathStatus,
+          pathUpdateCount: retry.pathUpdateCount,
+          stallEventCountBucket: retry.stallEventCountBucket ?? "0",
+          stallElapsedBucket: retry.stallElapsedBucket ?? "none",
+          bodySideAfter: progressiveNavigationSide(
+            bodyAfterRetry.self.position,
+            door.x,
+          ),
+          rconSideAfter: progressiveNavigationSide(rconAfterRetry, door.x),
+          doorStateAfter: doorStateAfterRetry,
+          routeConfirmed: retryRouteConfirmed,
+        };
+      }
+    }
+    update({
+      progressiveNavigationDoorStateAfter: doorStateAfter,
+      progressiveNavigationBodySideAfter: progressiveNavigationSide(
+        bodyAfter.self.position,
+        door.x,
+      ),
+      progressiveNavigationRconSideAfter: progressiveNavigationSide(
+        rconAfter,
+        door.x,
+      ),
+      progressiveNavigationBodyDistanceAfter: positionDistanceBucket(
+        bodyAfter.self.position,
+        ownerAfter,
+      ),
+      progressiveNavigationRconDistanceAfter: positionDistanceBucket(
+        rconAfter,
+        ownerAfter,
+      ),
+      progressiveNavigationBodyDistanceReduced:
+        bodyDistanceBefore - bodyDistanceAfter >= 1.5,
+      progressiveNavigationRconDistanceReduced:
+        rconDistanceBefore - rconDistanceAfter >= 1.5,
+      progressiveNavigationMoveStatus: move.status,
+      progressiveNavigationMoveErrorClass: move.errorClass,
+      progressiveNavigationPathStatus: move.pathStatus,
+      progressiveNavigationPathUpdateCount: move.pathUpdateCount,
+      progressiveNavigationProbeDeadlineReached: move.probeDeadlineReached,
+      progressiveNavigationBodyPassedDoor: bodyPassedDoor,
+      progressiveNavigationRconPassedDoor: rconPassedDoor,
+      progressiveNavigationRouteConfirmed: routeConfirmed,
+      progressiveNavigationMoveTrace: {
+        stallEventCountBucket: move.stallEventCountBucket ?? "0",
+        stallElapsedBucket: move.stallElapsedBucket ?? "none",
+        samples: movementSamples.slice(0, 5),
+      },
+      progressiveNavigationDoorLook: doorLookDiagnostic,
+      progressiveNavigationDoorUse: doorUseDiagnostic,
+      progressiveNavigationRetryMove: retryDiagnostic,
+    });
+    if (!routeConfirmed)
+      incomplete("PROGRESSIVE_NAVIGATION_BODY_ROUTE_NOT_CONFIRMED");
+  } finally {
+    if (fixtureMutationStarted) {
+      update({ progressiveNavigationStage: "cleanup" });
+      const fixtureCleanupConfirmed = await (async () => {
+        try {
+          await rcon.command(
+            `fill ${door.x} 64 ${door.z - 1} ${Math.floor(start.x)} 69 ${door.z + 1} air`,
+          );
+          const cleanupCells = [
+            door,
+            { ...door, y: door.y + 1 },
+            ...stairBlocks,
+            ...supports,
+            ...platform,
+            { x: door.x + 2, y: 64, z: door.z - 1 },
+            { x: door.x + 2, y: 69, z: door.z - 1 },
+            { x: door.x + 2, y: 64, z: door.z + 1 },
+            { x: door.x + 2, y: 69, z: door.z + 1 },
+          ];
+          let cleared = true;
+          for (const position of cleanupCells) {
+            cleared = (await isBlock(rcon, position, "air")) && cleared;
+          }
+          return cleared;
+        } catch {
+          return false;
+        }
+      })();
+      const originalFixtureRestored = await (async () => {
+        try {
+          await configureHiddenContainer(rcon, spawn);
+          return (
+            (await isBlock(rcon, fixturePoint(spawn, 2, 0), "stone")) &&
+            (await isBlock(rcon, hiddenFixture.chest, "chest"))
+          );
+        } catch {
+          return false;
+        }
+      })();
+      update({
+        progressiveNavigationFixtureCleanupConfirmed: fixtureCleanupConfirmed,
+        progressiveNavigationOriginalFixtureRestored: originalFixtureRestored,
+        progressiveNavigationStage:
+          fixtureCleanupConfirmed && originalFixtureRestored
+            ? "complete"
+            : "cleanup",
+      });
+      if (!fixtureCleanupConfirmed || !originalFixtureRestored)
+        incomplete("PROGRESSIVE_NAVIGATION_FIXTURE_CLEANUP_UNCONFIRMED");
+    }
+  }
+}
+
+function progressiveNavigationMovementSample(
+  point: ProgressiveNavigationSamplePoint,
+  elapsedMs: number,
+  observation: Awaited<ReturnType<PlayerBody["observe"]>> | undefined,
+  rconPosition: Position | undefined,
+  door: BlockPosition,
+  doorState: ProgressiveNavigationDoorState,
+): ProgressiveNavigationMovementSample {
+  const doorCenter = {
+    x: door.x + 0.5,
+    y: door.y + 0.5,
+    z: door.z + 0.5,
+  };
+  return {
+    point,
+    elapsed: progressiveNavigationSampleElapsedBucket(elapsedMs),
+    bodySide:
+      observation === undefined
+        ? "unknown"
+        : progressiveNavigationSide(observation.self.position, door.x),
+    rconSide:
+      rconPosition === undefined
+        ? "unknown"
+        : progressiveNavigationSide(rconPosition, door.x),
+    bodyDoorDistance:
+      observation === undefined
+        ? "unknown"
+        : positionDistanceBucket(observation.self.position, doorCenter),
+    rconDoorDistance:
+      rconPosition === undefined
+        ? "unknown"
+        : positionDistanceBucket(rconPosition, doorCenter),
+    doorState,
+    bodyBlockSearchMayBeTruncated:
+      observation?.perception.candidateSearchMayBeTruncated ?? "unknown",
+  };
+}
+
+function progressiveNavigationSamplePoint(
+  sampleNumber: number,
+): ProgressiveNavigationSamplePoint {
+  if (sampleNumber === 1) return "sample_1";
+  if (sampleNumber === 2) return "sample_2";
+  return "sample_3";
+}
+
+function isProgressiveNavigationSignalAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+function progressiveNavigationDoorUseReadiness(
+  observation: Awaited<ReturnType<PlayerBody["observe"]>>,
+  door: BlockPosition,
+): ProgressiveNavigationDoorUseReadiness {
+  const visibleLowerDoor = observation.perception.blocks.find(
+    (block) =>
+      block.name === "oak_door" &&
+      block.position.x === door.x &&
+      block.position.y === door.y &&
+      block.position.z === door.z &&
+      block.properties.half === "lower",
+  );
+  const visibleUpperDoor = observation.perception.blocks.find(
+    (block) =>
+      block.name === "oak_door" &&
+      block.position.x === door.x &&
+      block.position.y === door.y + 1 &&
+      block.position.z === door.z &&
+      block.properties.half === "upper",
+  );
+  const visibleDoor = visibleUpperDoor ?? visibleLowerDoor;
+  const doorObservedHalf: ProgressiveNavigationObservedDoorHalf =
+    visibleUpperDoor !== undefined
+      ? "upper"
+      : visibleLowerDoor !== undefined
+        ? "lower"
+        : "neither";
+  const targetPosition =
+    visibleDoor === undefined
+      ? null
+      : {
+          x: visibleDoor.position.x,
+          y: visibleDoor.position.y,
+          z: visibleDoor.position.z,
+        };
+  const target =
+    visibleDoor === undefined
+      ? undefined
+      : {
+          x: visibleDoor.position.x + 0.5,
+          y: visibleDoor.position.y + 0.5,
+          z: visibleDoor.position.z + 0.5,
+        };
+  const eye = {
+    x: observation.self.position.x,
+    y: observation.self.position.y + observation.self.eyeHeight,
+    z: observation.self.position.z,
+  };
+  const eyeDistance =
+    target === undefined
+      ? undefined
+      : Math.hypot(eye.x - target.x, eye.y - target.y, eye.z - target.z);
+  return {
+    diagnostic: {
+      doorObserved: visibleDoor !== undefined,
+      doorObservedHalf,
+      bodyBlockSearchMayBeTruncated:
+        observation.perception.candidateSearchMayBeTruncated,
+      doorWithinReach:
+        eyeDistance === undefined ? "unknown" : eyeDistance <= 4.65,
+    },
+    targetPosition,
+  };
+}
+
+async function executeProgressiveNavigationDoorUse(
+  body: PlayerBody,
+  door: BlockPosition,
+  parentSignal: AbortSignal,
+  deadlineMs: number,
+): Promise<ProgressiveNavigationDoorUseOperationResult> {
+  const probeAbort = new AbortController();
+  let probeDeadlineReached = false;
+  let status: BodyOperationStatus;
+  let detail: string | undefined;
+  let recoveryRequired = false;
+  const timer = setTimeout(() => {
+    probeDeadlineReached = true;
+    probeAbort.abort(new Error("progressive navigation door use deadline"));
+  }, deadlineMs);
+  try {
+    const result = await body.execute(
+      { kind: "use", target: { kind: "block", position: door } },
+      AbortSignal.any([parentSignal, probeAbort.signal]),
+    );
+    status = result.status;
+    detail = result.detail;
+    recoveryRequired = result.recoveryRequired;
+  } catch (error) {
+    detail = error instanceof Error ? error.message : undefined;
+    status = parentSignal.aborted ? "interrupted" : "failed";
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    status,
+    errorClass: classifyProgressiveDoorUseErrorClass(
+      detail,
+      probeDeadlineReached,
+    ),
+    recoveryRequired,
+    probeDeadlineReached,
+  };
+}
+
+async function executeProgressiveNavigationDoorLook(
+  body: PlayerBody,
+  target: Position,
+  parentSignal: AbortSignal,
+  deadlineMs: number,
+): Promise<ProgressiveNavigationDoorUseOperationResult> {
+  const probeAbort = new AbortController();
+  let probeDeadlineReached = false;
+  let status: BodyOperationStatus;
+  let detail: string | undefined;
+  let recoveryRequired = false;
+  const timer = setTimeout(() => {
+    probeDeadlineReached = true;
+    probeAbort.abort(new Error("progressive navigation door look deadline"));
+  }, deadlineMs);
+  try {
+    const result = await body.execute(
+      { kind: "look", target },
+      AbortSignal.any([parentSignal, probeAbort.signal]),
+    );
+    status = result.status;
+    detail = result.detail;
+    recoveryRequired = result.recoveryRequired;
+  } catch (error) {
+    detail = error instanceof Error ? error.message : undefined;
+    status = parentSignal.aborted ? "interrupted" : "failed";
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    status,
+    errorClass: classifyProgressiveDoorUseErrorClass(
+      detail,
+      probeDeadlineReached,
+    ),
+    recoveryRequired,
+    probeDeadlineReached,
+  };
+}
+
+function classifyProgressiveDoorUseErrorClass(
+  detail: string | undefined,
+  probeDeadlineReached: boolean,
+): BodyDetailClass | "probe_deadline" {
+  if (probeDeadlineReached) return "probe_deadline";
+  return classifyBodyOperationDetail(detail);
+}
+
+function progressiveNavigationSide(
+  position: Position,
+  doorX: number,
+): "owner_side" | "doorway" | "return_side" {
+  if (position.x < doorX - 0.5) return "owner_side";
+  if (position.x > doorX + 0.5) return "return_side";
+  return "doorway";
+}
+
+async function readProgressiveNavigationDoorState(
+  rcon: LocalRcon,
+  door: BlockPosition,
+  botName: string,
+): Promise<ProgressiveNavigationDoorState> {
+  const closed = await rcon.command(
+    `execute if block ${door.x} ${door.y} ${door.z} minecraft:oak_door[open=false] run data get entity ${botName} Pos`,
+  );
+  const open = await rcon.command(
+    `execute if block ${door.x} ${door.y} ${door.z} minecraft:oak_door[open=true] run data get entity ${botName} Pos`,
+  );
+  const containsPosition = (reply: string): boolean =>
+    /\[\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*,\s*-?\d+(?:\.\d+)?d?\s*\]/u.test(
+      reply,
+    );
+  const closedConfirmed = containsPosition(closed);
+  const openConfirmed = containsPosition(open);
+  if (closedConfirmed === openConfirmed) return "unknown";
+  return closedConfirmed ? "closed" : "open";
 }
 
 async function runUnknownReturnPathProbe(
@@ -8462,6 +11860,16 @@ async function rconInventoryItemCount(
   return count;
 }
 
+async function rconInventoryIsEmpty(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<boolean> {
+  const inventory = await rcon.command(`data get entity ${botName} Inventory`);
+  if (!/\[\s*\]\s*$/u.test(inventory.trim()))
+    incomplete("NO_FOOD_FIXTURE_RCON_INVENTORY_NOT_EMPTY_OR_UNAVAILABLE");
+  return true;
+}
+
 async function rconFoodLevel(
   rcon: LocalRcon,
   botName: string,
@@ -8966,6 +12374,17 @@ function requireLiveContext(): CaseContext {
   return liveContext;
 }
 
+function ownerReturnSettlementContext(
+  state: RunState,
+): CaseContext | undefined {
+  if (liveContext === undefined) return undefined;
+  const caseDeadlineAt = state.ownerReturnCaseDeadlineAt;
+  return caseDeadlineAt === undefined ||
+    caseDeadlineAt === liveContext.caseDeadlineAt
+    ? liveContext
+    : { ...liveContext, caseDeadlineAt };
+}
+
 async function recordCase(
   state: RunState,
   id: string,
@@ -8995,7 +12414,14 @@ async function recordCase(
     ([caseId]) => caseId === id,
   )?.[1];
   if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
-  state.llmAdmission?.beginCase(caseBudget.llmCalls);
+  const caseAdmissionLimit = ownerReturnCaseCallLimit(
+    state.targetCase,
+    caseBudget.llmCalls,
+    state.ownerReturnRequestGate,
+  );
+  if (caseAdmissionLimit === undefined)
+    incomplete("OWNER_RETURN_REQUEST_GATE_NOT_READY");
+  state.llmAdmission?.beginCase(caseAdmissionLimit);
   try {
     return await runCase(
       state,
@@ -9018,6 +12444,12 @@ async function recordCase(
           runBudget: state.runBudget,
           caseBudget,
         };
+        if (
+          id === "owner_return_through_door" &&
+          ownerReturnRequestGateEnabled(state.targetCase)
+        ) {
+          state.ownerReturnCaseDeadlineAt = caseContext.caseDeadlineAt;
+        }
         const measured = await runCaseBody(caseContext);
         const finalUsage = countersOf(
           await collect(requireLiveContext().runtime.app),
@@ -9069,6 +12501,16 @@ async function runCase(
       initial = countersOf(await collect(liveContext.runtime.app));
       initialCaptured = true;
     }
+    if (
+      id === "owner_return_through_door" &&
+      ownerReturnRequestGateEnabled(state.targetCase)
+    ) {
+      state.ownerReturnCaseUsageStart ??= initial;
+      state.ownerReturnRequestGate ??= new AcceptedProviderRequestGate();
+      updateOwnerReturnDiagnostic(state, {
+        ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
+      });
+    }
     if (Date.now() >= state.runDeadlineAt) incomplete("RUN_DEADLINE_EXCEEDED");
     const timeoutMs = Math.max(
       1,
@@ -9094,9 +12536,24 @@ async function runCase(
     const final =
       terminalEvidence === undefined ? initial : countersOf(terminalEvidence);
     const delta = subtractCounters(final, initial);
+    if (id === "no_food_replan" && terminalEvidence !== undefined) {
+      const requestGate = state.noFoodReplanRequestGate;
+      const caseStart = state.noFoodReplanCaseUsageStart;
+      if (!requestGate?.acceptanceLatched || caseStart === undefined)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      requestGate.observeRecordedCalls(
+        subtractCounters(final, caseStart).llmCalls,
+      );
+      if (requestGate.requestsRecorded > requestGate.requestsStarted)
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      if (requestGate.inFlightRequests !== 0)
+        incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+    }
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
     if (delta.usageUnknownCalls > 0) state.usageUncertain = true;
+    if (id === "no_food_replan" && delta.usageUnknownCalls > 0)
+      incomplete("LLM_USAGE_PARTIAL_OR_UNKNOWN");
     if (
       delta.llmCalls > 0 &&
       totalTokens(delta) === 0 &&
@@ -9126,6 +12583,11 @@ async function runCase(
         delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
       evidence: {
         ...evidence,
+        ...(id === "no_food_replan" ? noFoodReplanRequestEvidence(state) : {}),
+        ...(id === "owner_return_through_door" &&
+        ownerReturnRequestGateEnabled(state.targetCase)
+          ? ownerReturnRequestSafeEvidence(state)
+          : {}),
         ...safeUsageUnknownReasonEvidence(id, delta),
       },
     };
@@ -9144,6 +12606,38 @@ async function runCase(
     state.cases.push(item);
     return item;
   } catch (error) {
+    const reason =
+      error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
+    const caseStatus =
+      error instanceof HarnessError ? error.status : "incomplete";
+    const ownerReturnCase =
+      id === "owner_return_through_door" &&
+      ownerReturnRequestGateEnabled(state.targetCase);
+    let ownerReturnFailureSettlement:
+      Awaited<ReturnType<typeof settleOwnerReturnCaseFailure>> | undefined;
+    if (ownerReturnCase && state.ownerReturnRequestGate !== undefined) {
+      const settle = () =>
+        settleOwnerReturnRequests(state, ownerReturnSettlementContext(state));
+      ownerReturnFailureSettlement = await settleOwnerReturnCaseFailure(
+        caseStatus,
+        settle,
+        /BUDGET|DEADLINE/u.test(reason)
+          ? async () => {
+              try {
+                await boundedShutdown(
+                  appForCleanup,
+                  "ai_player_e2e_budget_or_deadline",
+                );
+              } catch {
+                state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+              }
+            }
+          : undefined,
+      );
+      if (ownerReturnFailureSettlement.usageUnknown) {
+        state.usageUncertain = true;
+      }
+    }
     let terminalEvidence: Evidence | undefined;
     let final = initial;
     if (
@@ -9157,18 +12651,26 @@ async function runCase(
       } catch {
         final = initialCaptured ? (state.countersFinal ?? initial) : initial;
       }
+    } else if (
+      ownerReturnCase &&
+      state.countersFinal !== undefined &&
+      initialCaptured
+    ) {
+      final = state.countersFinal;
     }
     const delta = subtractCounters(final, initial);
-    const reason =
-      error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
-    const caseStatus =
-      error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
-      (/BUDGET|DEADLINE/u.test(reason) ||
-        delta.usageUnknownCalls > 0 ||
-        (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
-        caseStatus === "incomplete");
+      id !== "no_food_fixture_probe" &&
+      id !== "no_food_continuity_probe" &&
+      (ownerReturnCase
+        ? delta.usageUnknownCalls > 0 ||
+          (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
+          ownerReturnFailureSettlement?.usageUnknown !== false
+        : /BUDGET|DEADLINE/u.test(reason) ||
+          delta.usageUnknownCalls > 0 ||
+          (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
+          caseStatus === "incomplete");
     if (usageUncertain) state.usageUncertain = true;
     const lastEvidence = terminalEvidence ?? snapshotCapture.latestEvidence;
     if (caseExecuted) {
@@ -9188,18 +12690,20 @@ async function runCase(
     if (/BUDGET|DEADLINE/u.test(reason)) {
       state.abortRequested = true;
       state.failureCode ??= reason;
-      try {
-        await boundedShutdown(
-          appForCleanup,
-          "ai_player_e2e_budget_or_deadline",
-        );
-      } catch {
-        state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+      if (!ownerReturnCase) {
+        try {
+          await boundedShutdown(
+            appForCleanup,
+            "ai_player_e2e_budget_or_deadline",
+          );
+        } catch {
+          state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+        }
       }
     }
     const item: SafeCaseResult = {
       id,
-      status: caseStatus,
+      status: ownerReturnFailureSettlement?.caseStatus ?? caseStatus,
       durationMs: Date.now() - started,
       llmCalls: delta.llmCalls,
       inputTokens: delta.inputTokens,
@@ -9244,6 +12748,27 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
         const player = playerOf(evidence);
         const counters = countersOf(evidence);
         state.countersFinal = counters;
+        if (
+          state.targetCase === "no_food_replan" &&
+          state.noFoodReplanCaseUsageStart !== undefined
+        ) {
+          state.noFoodReplanLatestCounters = counters;
+          const caseCalls = subtractCounters(
+            counters,
+            state.noFoodReplanCaseUsageStart,
+          ).llmCalls;
+          state.noFoodReplanRequestGate?.observeRecordedCalls(caseCalls);
+        }
+        if (
+          ownerReturnRequestGateEnabled(state.targetCase) &&
+          state.ownerReturnCaseUsageStart !== undefined
+        ) {
+          const caseCalls = subtractCounters(
+            counters,
+            state.ownerReturnCaseUsageStart,
+          ).llmCalls;
+          state.ownerReturnRequestGate?.observeRecordedCalls(caseCalls);
+        }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,
           counters,
@@ -9323,7 +12848,32 @@ async function observeForPlayer(
   context: CaseContext,
   timeoutMs: number,
   predicate: (player: PlayerEvidence) => boolean | Promise<boolean>,
+  onOwnerReturnBudgetStop?: (
+    player: PlayerEvidence | undefined,
+    reason: string,
+  ) => Promise<void>,
 ): Promise<PlayerEvidence | undefined> {
+  const stopForBudget = async (
+    reason: string,
+    player?: PlayerEvidence,
+  ): Promise<never> => {
+    if (onOwnerReturnBudgetStop !== undefined) {
+      let stopPlayer = player;
+      if (stopPlayer === undefined) {
+        try {
+          stopPlayer = playerOf(await collect(context.runtime.app));
+        } catch {
+          stopPlayer = undefined;
+        }
+      }
+      try {
+        await onOwnerReturnBudgetStop(stopPlayer, reason);
+      } catch {
+        // Preserve the stop reason that initiated target finalization.
+      }
+    }
+    incomplete(reason);
+  };
   const deadline = Math.min(
     Date.now() + timeoutMs,
     context.caseDeadlineAt,
@@ -9335,7 +12885,7 @@ async function observeForPlayer(
       admissionFailure === "RUN_LLM_BUDGET_EXCEEDED" ||
       admissionFailure === "CASE_LLM_BUDGET_EXCEEDED"
     ) {
-      incomplete(admissionFailure);
+      await stopForBudget(admissionFailure);
     }
     const player = playerOf(await collect(context.runtime.app));
     const caseDelta = subtractCounters(player.counters, context.usageAtStart);
@@ -9344,13 +12894,20 @@ async function observeForPlayer(
       runDelta.llmCalls > context.runBudget.llmCalls ||
       totalTokens(runDelta) > context.runBudget.totalTokens
     )
-      incomplete("RUN_LLM_BUDGET_EXCEEDED");
+      await stopForBudget("RUN_LLM_BUDGET_EXCEEDED", player);
     if (
       context.caseBudget !== undefined &&
       (caseDelta.llmCalls > context.caseBudget.llmCalls ||
         totalTokens(caseDelta) > context.caseBudget.totalTokens)
     ) {
-      incomplete("CASE_LLM_BUDGET_EXCEEDED");
+      await stopForBudget("CASE_LLM_BUDGET_EXCEEDED", player);
+    }
+    if (
+      currentRunState !== undefined &&
+      ownerReturnRequestGateEnabled(currentRunState.targetCase) &&
+      caseDelta.usageUnknownCalls > 0
+    ) {
+      await stopForBudget("LLM_USAGE_PARTIAL_OR_UNKNOWN", player);
     }
     if (await predicate(player)) return player;
     await waitMs(800);
@@ -10435,11 +13992,20 @@ async function retainObservationBoundaryReplies(
 }
 
 async function cleanup(state: RunState): Promise<void> {
-  try {
-    await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
-  } catch {
-    markCleanupFailure(state, "APPLICATION_SHUTDOWN_FAILED");
-  }
+  const settleStatus = await settleOwnerReturnBeforeShutdown(
+    ownerReturnRequestGateEnabled(state.targetCase) &&
+      state.ownerReturnRequestGate !== undefined,
+    () => settleOwnerReturnRequests(state, ownerReturnSettlementContext(state)),
+    async () => {
+      try {
+        await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
+      } catch {
+        markCleanupFailure(state, "APPLICATION_SHUTDOWN_FAILED");
+      }
+    },
+  );
+  if (settleStatus !== undefined && ownerReturnUsageIsUnknown(settleStatus))
+    state.usageUncertain = true;
   try {
     ownerForCleanup?.quit();
     guestForCleanup?.quit();
@@ -10624,7 +14190,11 @@ async function writeArtifact(state: RunState): Promise<void> {
       seed: state.seed,
       seedIsSynthetic: true,
       fixture: state.worldFixture,
-      nonOperatorClients: 3,
+      nonOperatorClients:
+        process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
+        isNoFoodContinuityProbeOnly()
+          ? 1
+          : 3,
       loopbackOnly: true,
       serverCacheAreasCopied: state.copiedServerCacheAreas ?? [],
     },
@@ -10651,7 +14221,11 @@ async function writeArtifact(state: RunState): Promise<void> {
         retained: state.playerSnapshotSidecarRetained === true,
         failureCode: state.playerSnapshotSidecarFailureCode ?? null,
       },
+      noFoodContinuity: isNoFoodContinuityProbeOnly()
+        ? noFoodContinuitySafeEvidence(state)
+        : null,
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
+      ownerReturnThroughDoor: state.ownerReturnDiagnostic ?? null,
     },
     budgets: {
       run: state.runBudget,

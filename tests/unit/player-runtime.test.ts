@@ -558,6 +558,65 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it.each([
+    {
+      label: "matching post-operation slot",
+      status: "successful",
+      equipment: { head: observedStack("iron_helmet", 5) },
+      expected: "実行後、頭の装備欄にiron_helmetがあることを観測しました。",
+      unexpected: "原因は観測から特定できていません",
+    },
+    {
+      label: "different post-operation item",
+      status: "successful",
+      equipment: { head: observedStack("leather_helmet", 5) },
+      expected: "iron_helmetは確認できませんでした。",
+      unexpected: "実行後、頭の装備欄にiron_helmetがあることを観測しました",
+    },
+    {
+      label: "missing post-operation slot",
+      status: "unverified",
+      equipment: {},
+      expected: "実行後の頭の装備欄は観測できませんでした。",
+      unexpected: "装備操作は成功と判定されました",
+    },
+    {
+      label: "failed operation",
+      status: "failed",
+      equipment: { head: null },
+      expected: "装備操作は失敗しました。",
+      unexpected: "装備操作は成功と判定されました",
+    },
+  ] as const)("reports equip outcome from $label", async (scenario) => {
+    const fixture = createRuntimeFixture();
+    const before = observation();
+    fixture.body.setResultObservations(before, {
+      ...before,
+      self: { ...before.self, equipment: scenario.equipment },
+    });
+    const decision = action("equip-result", {
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+    });
+    if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive(scenario.status);
+      await waitFor(() => fixture.messages.length === 1);
+      expect(fixture.messages[0]).toContain(scenario.expected);
+      expect(fixture.messages[0]).not.toContain(scenario.unexpected);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("preserves a non-meal owner resolution when consuming food as preparation", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -1066,7 +1125,7 @@ describe("integrated player runtime", () => {
     }
   });
 
-  it("restarts an uncommitted thought after a body outcome with fresh evidence", async () => {
+  it("queues a body outcome until the in-flight thought settles and rejects its stale commit", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
     const mind = PlayerMindStore.open(databasePath);
@@ -1074,9 +1133,16 @@ describe("integrated player runtime", () => {
     const body = new DeferredBody();
     const runtimeRef: { current?: PlayerRuntime } = {};
     let thoughtCount = 0;
+    let activeThoughts = 0;
+    let maxActiveThoughts = 0;
     let pendingSignal: AbortSignal | undefined;
+    let releasePendingThought: (() => void) | undefined;
+    const pendingThoughtGate = new Promise<void>((resolve) => {
+      releasePendingThought = resolve;
+    });
     let resumedOutcome: string | undefined;
     let resumedEventKinds: readonly string[] = [];
+    let staleCommitRejection: string | undefined;
     const runtime = new PlayerRuntime({
       ownerUsername: "owner",
       playerId: "owner-player",
@@ -1091,33 +1157,58 @@ describe("integrated player runtime", () => {
       purpose: {
         think: async ({ snapshot, events, signal }) => {
           thoughtCount += 1;
-          if (thoughtCount === 1) {
-            const decision = action("begin observation");
+          activeThoughts += 1;
+          maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+          try {
+            if (thoughtCount === 1) {
+              const decision = action("begin observation");
+              const saved = mind.commitThought({
+                expectedRevision: snapshot.revision,
+                decision,
+              });
+              if (saved.accepted)
+                runtimeRef.current?.handleCommittedDecision(
+                  saved.snapshot,
+                  decision,
+                );
+              return { accepted: saved.accepted, decision };
+            }
+            if (thoughtCount === 2) {
+              pendingSignal = signal;
+              await pendingThoughtGate;
+              const staleDecision = action("commit after body result");
+              const saved = mind.commitThought({
+                expectedRevision: snapshot.revision,
+                decision: staleDecision,
+              });
+              staleCommitRejection = saved.accepted
+                ? "accepted"
+                : saved.rejectionCode;
+              return { accepted: saved.accepted, decision: staleDecision };
+            }
+            resumedOutcome = snapshot.lastOutcome?.status;
+            resumedEventKinds = events.map(({ kind }) => kind);
+            const decision = {
+              kind: "wait" as const,
+              purpose: "reconsider the latest body result",
+              reason: "the latest body result was observed",
+              wakeOn: ["manual" as const],
+            };
             const saved = mind.commitThought({
               expectedRevision: snapshot.revision,
               decision,
             });
-            if (saved.accepted)
+            if (saved.accepted) {
               runtimeRef.current?.handleCommittedDecision(
                 saved.snapshot,
                 decision,
               );
+              mind.consumeEvents(events.map(({ id }) => id));
+            }
             return { accepted: saved.accepted, decision };
+          } finally {
+            activeThoughts -= 1;
           }
-          if (thoughtCount === 2) {
-            pendingSignal = signal;
-            await new Promise<void>((resolve) => {
-              if (signal?.aborted) resolve();
-              else
-                signal?.addEventListener("abort", () => resolve(), {
-                  once: true,
-                });
-            });
-            return { accepted: false };
-          }
-          resumedOutcome = snapshot.lastOutcome?.status;
-          resumedEventKinds = events.map(({ kind }) => kind);
-          return { accepted: true };
         },
       },
       logger: pino({ level: "silent" }),
@@ -1139,14 +1230,120 @@ describe("integrated player runtime", () => {
       expect(pendingSignal?.aborted).toBe(false);
 
       body.completeActive("failed");
-      await waitFor(() => pendingSignal?.aborted === true);
+      await waitFor(() => mind.snapshot().lastOutcome?.status === "failed");
+      expect(pendingSignal?.aborted).toBe(false);
+      expect(thoughtCount).toBe(2);
+
+      releasePendingThought?.();
       await waitFor(() => thoughtCount === 3);
+      expect(staleCommitRejection).toBe("CAS_STALE");
       expect(resumedOutcome).toBe("failed");
       expect(resumedEventKinds).toContain("body_outcome");
+      expect(mind.snapshot().wait).toMatchObject({
+        reason: "the latest body result was observed",
+        wakeOn: ["manual"],
+      });
+      expect(maxActiveThoughts).toBe(1);
     } finally {
+      releasePendingThought?.();
       await runtime.shutdown();
       skills.close();
       mind.close();
+    }
+  });
+
+  it("soft-stops only for a pending body outcome and retries it before other wakes", async () => {
+    let releaseThought: (() => void) | undefined;
+    const thoughtGate = new Promise<void>((resolve) => {
+      releaseThought = resolve;
+    });
+    let pendingSignal: AbortSignal | undefined;
+    let shouldStopAfterResponse: (() => boolean) | undefined;
+    let softStopAtSettlement = false;
+    let thoughtCount = 0;
+    let followupOutcome: string | undefined;
+    let followupKinds: readonly string[] = [];
+    const fixture = createRuntimeFixture({
+      think: async ({
+        snapshot,
+        events,
+        signal,
+        shouldStopAfterResponse: isStale,
+      }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          pendingSignal = signal;
+          shouldStopAfterResponse = isStale;
+          const decision = {
+            ...action("action with a pending thought"),
+            wakeOn: ["body_outcome", "state_changed"] as const,
+          };
+          const saved = fixture.mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision,
+          });
+          if (saved.accepted) {
+            fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+            fixture.mind.consumeEvents(events.map(({ id }) => id));
+          }
+          await thoughtGate;
+          softStopAtSettlement = isStale?.() ?? false;
+          return { accepted: false };
+        }
+        followupOutcome = snapshot.lastOutcome?.status;
+        followupKinds = events.map(({ kind }) => kind);
+        return { accepted: true };
+      },
+    });
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(
+        () => thoughtCount === 1 && fixture.body.started.length === 1,
+      );
+
+      const baseline = observation();
+      fixture.body.setObservation({
+        ...baseline,
+        time: { ...baseline.time, timeOfDay: 16_000, isDay: false },
+      });
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "time",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() =>
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "state_changed"),
+      );
+      expect(shouldStopAfterResponse?.()).toBe(false);
+
+      fixture.body.completeActive("failed");
+      await waitFor(
+        () => fixture.mind.snapshot().lastOutcome?.status === "failed",
+      );
+      expect(pendingSignal?.aborted).toBe(false);
+      expect(shouldStopAfterResponse?.()).toBe(true);
+
+      fixture.body.emit({ type: "reconnected", at: new Date().toISOString() });
+      await waitFor(() =>
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "reconnected"),
+      );
+      expect(pendingSignal?.aborted).toBe(false);
+
+      releaseThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(softStopAtSettlement).toBe(true);
+      expect(followupOutcome).toBe("failed");
+      expect(followupKinds).toContain("body_outcome");
+      expect(followupKinds).toContain("state_changed");
+      expect(followupKinds).toContain("reconnected");
+    } finally {
+      releaseThought?.();
+      await fixture.close();
     }
   });
 
@@ -1766,12 +1963,13 @@ describe("integrated player runtime", () => {
     }
   });
 
-  it("clears queued thought wakes on stop and does not restart after settlement", async () => {
+  it("clears a queued body outcome on explicit stop and does not restart after settlement", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
     const mind = PlayerMindStore.open(databasePath);
     const skills = openSkills(databasePath, directory);
     const body = new DeferredBody();
+    const runtimeRef: { current?: PlayerRuntime } = {};
     let releaseThought: (() => void) | undefined;
     const thoughtGate = new Promise<void>((resolve) => {
       releaseThought = resolve;
@@ -1790,9 +1988,22 @@ describe("integrated player runtime", () => {
         handleOwnerMessage: async () => undefined,
       },
       purpose: {
-        think: async (input) => {
+        think: async ({ snapshot, signal: currentSignal }) => {
           thoughtCount += 1;
-          signal = input.signal;
+          signal = currentSignal;
+          if (thoughtCount === 1) {
+            const decision = action("action before stop");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            return { accepted: saved.accepted, decision };
+          }
           await thoughtGate;
           return { accepted: false };
         },
@@ -1800,10 +2011,11 @@ describe("integrated player runtime", () => {
       logger: pino({ level: "silent" }),
       say: async () => undefined,
     });
+    runtimeRef.current = runtime;
 
     try {
       await runtime.start();
-      await waitFor(() => thoughtCount === 1);
+      await waitFor(() => body.started.length === 1);
       body.emit({
         type: "operation_stalled",
         operationId: "body-1",
@@ -1811,7 +2023,13 @@ describe("integrated player runtime", () => {
         elapsedMs: 30_000,
         at: new Date().toISOString(),
       });
+      await waitFor(() => thoughtCount === 2);
       expect(mind.snapshot().pendingEventKinds).toContain("operation_stalled");
+
+      body.completeActive("failed");
+      await waitFor(() => mind.snapshot().lastOutcome?.status === "failed");
+      expect(mind.snapshot().pendingEventKinds).toContain("body_outcome");
+      expect(signal?.aborted).toBe(false);
 
       mind.stop();
       await runtime.stopNow();
@@ -1821,7 +2039,7 @@ describe("integrated player runtime", () => {
       body.emit({ type: "reconnected", at: new Date().toISOString() });
       await new Promise((resolve) => setTimeout(resolve, 20));
 
-      expect(thoughtCount).toBe(1);
+      expect(thoughtCount).toBe(2);
       expect(runtime.snapshot.stopped).toBe(true);
     } finally {
       releaseThought?.();
@@ -2612,6 +2830,23 @@ function makeLookSweepEvidence(): PlayerBodyLookSweep {
     complete: true,
     candidateSearchMayBeTruncated: false,
     worldAbsenceEstablished: false,
+  };
+}
+
+function observedStack(
+  name: string,
+  slot: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId: 1,
+    name,
+    count: 1,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
+    customName: null,
+    enchantments: [],
   };
 }
 

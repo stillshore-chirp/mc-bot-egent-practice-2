@@ -1516,6 +1516,7 @@ describe("player body", () => {
 
     expect(fake.candidates).toHaveLength(195);
     expect(fake.findBlockSearches).toEqual([
+      { count: 8, resultCount: 0 },
       { count: 192, resultCount: 192 },
       { count: 192, resultCount: 3 },
     ]);
@@ -1550,7 +1551,8 @@ describe("player body", () => {
 
     const observation = observePlayerBody(fake.bot, "owner");
     expect(fake.candidates).toHaveLength(577);
-    expect(fake.findBlockSearches).toHaveLength(2);
+    expect(fake.findBlockSearches).toHaveLength(3);
+    expect(fake.findBlockSearches.slice(1)).toHaveLength(2);
     expect(observation.perception.blocks.map(({ name }) => name)).toContain(
       "blue_wool",
     );
@@ -1572,13 +1574,86 @@ describe("player body", () => {
         `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`,
     );
 
-    expect(fake.findBlockSearches[0]).toEqual({
+    expect(fake.findBlockSearches.find(({ count }) => count === 192)).toEqual({
       count: 192,
       resultCount: 192,
     });
     expect(observation.perception.blocks).toHaveLength(96);
     expect(observedKeys).toContain(targetKey);
     expect(new Set(observedKeys).size).toBe(96);
+    expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
+  });
+
+  it("keeps nearby hand-operable doors visible when saturated block searches omit them", () => {
+    const fake = makeFakeBot();
+    const ordinaryNames = ["stone", "dirt", "grass_block"];
+    const ordinaryPositions: Vec3[] = [];
+    for (let z = -5; z >= -16; z -= 1) {
+      for (let x = -7; x <= 7; x += 1) {
+        for (let y = 62; y <= 66; y += 1) {
+          const position = new Vec3(x, y, z);
+          if (position.distanceTo(fake.bot.entity.position) <= 16)
+            ordinaryPositions.push(position);
+        }
+      }
+    }
+    expect(ordinaryPositions.length).toBeGreaterThanOrEqual(576);
+    for (let index = 0; index < 576; index += 1) {
+      const position = ordinaryPositions[index];
+      if (position === undefined) throw new Error("Missing fixture position");
+      const name = ordinaryNames[Math.floor(index / 192)];
+      if (name === undefined) throw new Error("Missing fixture block name");
+      fake.blocks.set(
+        `${position.x},${position.y},${position.z}`,
+        makeBlock(name, index + 10, position),
+      );
+      fake.candidates.push(position);
+    }
+
+    const visibleDoorPositions = [new Vec3(0, 64, -2), new Vec3(0, 65, -2)];
+    for (const [index, position] of visibleDoorPositions.entries()) {
+      const door = makeBlock("oak_door", 700 + index, position);
+      door.getProperties = () => ({
+        half: index === 0 ? "lower" : "upper",
+        open: false,
+      });
+      fake.blocks.set(`${position.x},${position.y},${position.z}`, door);
+      fake.candidates.push(position);
+    }
+
+    const hiddenDoorPositions = [new Vec3(1, 64, -2), new Vec3(1, 65, -2)];
+    for (const [index, position] of hiddenDoorPositions.entries()) {
+      const door = makeBlock("oak_door", 710 + index, position);
+      door.getProperties = () => ({ half: index === 0 ? "lower" : "upper" });
+      fake.blocks.set(`${position.x},${position.y},${position.z}`, door);
+      fake.candidates.push(position);
+      fake.hiddenBlockKeys.add(`${position.x},${position.y},${position.z}`);
+    }
+
+    const outsideFovPosition = new Vec3(4, 65, 0);
+    const outsideFovDoor = makeBlock("oak_door", 720, outsideFovPosition);
+    fake.blocks.set("4,65,0", outsideFovDoor);
+    fake.candidates.push(outsideFovPosition);
+
+    const observation = observePlayerBody(fake.bot, "owner");
+    const observedDoorKeys = observation.perception.blocks
+      .filter((block) => block.name === "oak_door")
+      .map(({ position }) => `${position.x},${position.y},${position.z}`);
+
+    expect(fake.findBlockSearches).toEqual([
+      { count: 8, resultCount: 5 },
+      { count: 192, resultCount: 192 },
+      { count: 192, resultCount: 192 },
+      { count: 192, resultCount: 192 },
+    ]);
+    expect([...observedDoorKeys].sort()).toEqual(["0,64,-2", "0,65,-2"].sort());
+    expect(
+      observation.perception.blocks.find(
+        ({ name, position }) =>
+          name === "oak_door" && position.x === 0 && position.y === 64,
+      )?.properties,
+    ).toEqual({ half: "lower", open: false });
+    expect(observation.perception.blocks).toHaveLength(96);
     expect(observation.perception.candidateSearchMayBeTruncated).toBe(true);
   });
 
