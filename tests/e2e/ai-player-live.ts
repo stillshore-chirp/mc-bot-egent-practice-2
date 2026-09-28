@@ -7815,6 +7815,8 @@ async function main(): Promise<void> {
             ownerStopRconMovementObserved: false,
             ownerStopRequested: false,
             ownerStopLatchConfirmed: false,
+            ownerStopOperationReceiptConfirmed: false,
+            ownerStopOperationReceiptStatus: "missing",
             ownerStopQuietWindowConfirmed: false,
             ownerStopRconQuietConfirmed: false,
           });
@@ -7879,19 +7881,56 @@ async function main(): Promise<void> {
           if (activeBeforeStop?.activeOperation === undefined) {
             incomplete("OWNER_STOP_ACTIVE_OPERATION_NOT_CONFIRMED");
           }
+          const capturedOperation = activeBeforeStop.activeOperation;
+          let capturedOperationReceiptStatus:
+            PlayerOutcomeStatus | "missing" | "other" = "missing";
 
           sendChat(context.owner, "今の行動を停止してください。");
           updateOwnerStopLatchDiagnostic(state, {
             ownerStopRequested: true,
           });
-          const stopped = await waitForPlayer(
-            context,
-            45_000,
-            (player) =>
-              player.stopped &&
-              !isOperationActive(player) &&
-              player.stopGeneration > activeBeforeStop.stopGeneration,
-          );
+          const stopped = await waitForPlayer(context, 45_000, (player) => {
+            if (
+              !player.stopped ||
+              isOperationActive(player) ||
+              player.stopGeneration <= activeBeforeStop.stopGeneration
+            ) {
+              return false;
+            }
+            const capturedOutcome = player.recentOutcomes.find(
+              (outcome) =>
+                outcome.operationId === capturedOperation.operationId,
+            );
+            const outcomeStatus = capturedOutcome?.status;
+            capturedOperationReceiptStatus =
+              outcomeStatus === "successful" ||
+              outcomeStatus === "failed" ||
+              outcomeStatus === "interrupted" ||
+              outcomeStatus === "cancelled" ||
+              outcomeStatus === "unverified"
+                ? outcomeStatus
+                : outcomeStatus === undefined
+                  ? "missing"
+                  : "other";
+            const cancellationConfirmed =
+              capturedOperationReceiptStatus === "interrupted" ||
+              capturedOperationReceiptStatus === "cancelled";
+            updateOwnerStopLatchDiagnostic(state, {
+              ownerStopLatchConfirmed: true,
+              ownerStopOperationGone: true,
+              ownerStopGenerationAdvanced: true,
+              ownerStopOperationReceiptConfirmed: cancellationConfirmed,
+              ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
+            });
+            if (
+              capturedOperationReceiptStatus !== "missing" &&
+              capturedOperationReceiptStatus !== "other" &&
+              !cancellationConfirmed
+            ) {
+              fail("OWNER_STOP_CAPTURED_OPERATION_NOT_INTERRUPTED");
+            }
+            return cancellationConfirmed;
+          });
           const stopGeneration = stopped.stopGeneration;
           const actionRevisionAtStop = stopped.actionRevision;
           updateOwnerStopLatchDiagnostic(state, {
@@ -7899,6 +7938,8 @@ async function main(): Promise<void> {
             ownerStopOperationGone: !isOperationActive(stopped),
             ownerStopGenerationAdvanced:
               stopGeneration > activeBeforeStop.stopGeneration,
+            ownerStopOperationReceiptConfirmed: true,
+            ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
           });
 
           const rconPositionAtStop = parsePosition(
@@ -7951,6 +7992,8 @@ async function main(): Promise<void> {
             ownerStopLatchConfirmed: true,
             ownerStopOperationGone: true,
             ownerStopGenerationAdvanced: true,
+            ownerStopOperationReceiptConfirmed: true,
+            ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
             ownerStopQuietWindowConfirmed: true,
             ownerStopRconQuietConfirmed: true,
             quietWindowMs,

@@ -124,7 +124,7 @@ Skill交換caseが停止した時は、export依頼・export確認・import依�
 
 `parallel_dialogue_stop`が未完了の場合は、操作開始、guestの状態不変、owner依頼の解決、ownerへの接近、停止ラッチを固定boolで記録します。接近の照会回数と距離短縮の区分だけをartifactへ載せ、プレイヤー座標や会話本文は保存しません。guest依頼はBody開始済みの操作中に送り、500ms後の状態を確認します。その操作が自然終了した場合は次のBody開始済み操作を待ち、owner依頼は稼働中の操作へ送ります。後から届いたowner提案の採用・妥協を解決とし、どちらの場合も実際の接近を別に要求します。
 
-`owner_stop_latch`は停止の独立targetです。ownerの移動依頼後、Body開始済みoperation中にRCON位置変化を確認してから正規owner chatで停止を送り、`stopped`、operation消失、`stopGeneration`増分を確認します。その後8秒以上、runtimeの停止状態とaction revisionを再確認し、RCON位置も停止時点から0.75ブロックを超えて動かないことを要求します。会話変更・guest拒否・owner接近はこのtargetの受入条件ではなく、`parallel_dialogue_stop`の条件は変えません。
+`owner_stop_latch`は停止の独立targetです。ownerの移動依頼後、Body開始済みoperation中にRCON位置変化を確認してから正規owner chatで停止を送り、`stopped`、operation消失、`stopGeneration`増分に加えて、停止対象と同じoperation IDのterminal outcomeが`interrupted`または`cancelled`であることを確認します。artifactには一致boolと固定statusだけを記録し、operation IDは記録しません。その後8秒以上、runtimeの停止状態とaction revisionを再確認し、RCON位置も停止時点から0.75ブロックを超えて動かないことを要求します。会話変更・guest拒否・owner接近はこのtargetの受入条件ではなく、`parallel_dialogue_stop`の条件は変えません。
 
 2026-09-29の対象runは13 calls、input 122,075・output 2,980・既知125,055 tokens、usage `partial_or_unknown`で停止しました。応答後に120,000-token case上限を超え、owner依頼は送信前でした。この測定はowner変更・停止の成功も製品の失敗も示しません。次の対象runを一度測る有限枠としてcase上限を48 calls / 240,000 known tokens / 14分、単独targetのrun wrapperを64 calls / 400,000 known tokens / 20分に設定します。実行時は`AI_PLAYER_E2E_TARGET_CASE=parallel_dialogue_stop`、`AI_PLAYER_E2E_MAX_LLM_CALLS=64`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS=400000`、`AI_PLAYER_E2E_MAX_DURATION_MINUTES=20`を指定します。全case runの既定160 calls / 800,000 tokens / 45分、owner・guest・停止の成功条件は変えません。上限やdeadlineへの到達、usage不明は未完了のまま記録し、同条件の自動再試行や小刻みな上限延長はしません。
 
