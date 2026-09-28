@@ -163,6 +163,7 @@ import {
 import {
   isCaseSelectedForTarget,
   isGatherMultiTargetCaseSelected,
+  isOwnerStopLatchTargeted,
   TARGETABLE_CASES,
   type TargetableCase,
 } from "./target-case-selection.js";
@@ -245,6 +246,11 @@ export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
   totalTokens: 240_000,
 } as const;
 export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 14 * 60_000;
+export const OWNER_STOP_LATCH_CASE_BUDGET = {
+  llmCalls: 48,
+  totalTokens: 240_000,
+} as const;
+export const OWNER_STOP_LATCH_CASE_DEADLINE_MS = 14 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
@@ -264,6 +270,7 @@ const CASE_BUDGETS = {
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_BUDGET,
+  owner_stop_latch: OWNER_STOP_LATCH_CASE_BUDGET,
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
 const CASE_DEADLINES = {
@@ -282,6 +289,7 @@ const CASE_DEADLINES = {
   damage_response: 8 * 60_000,
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS,
+  owner_stop_latch: OWNER_STOP_LATCH_CASE_DEADLINE_MS,
   integrated_result: 30_000,
 } as const;
 
@@ -2170,6 +2178,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "parallel_dialogue_stop"
       ? (state.parallelDiagnostic ?? {})
       : {}),
+    ...(caseId === "owner_stop_latch"
+      ? (state.ownerStopLatchDiagnostic ?? {})
+      : {}),
     ...(caseId === "gather_multi_target_continuity"
       ? gatherMultiTargetSafeEvidence(state)
       : {}),
@@ -2496,6 +2507,16 @@ function updateParallelDiagnostic(
 ): void {
   state.parallelDiagnostic = {
     ...(state.parallelDiagnostic ?? {}),
+    ...diagnostic,
+  };
+}
+
+function updateOwnerStopLatchDiagnostic(
+  state: RunState,
+  diagnostic: SafeEvidence,
+): void {
+  state.ownerStopLatchDiagnostic = {
+    ...(state.ownerStopLatchDiagnostic ?? {}),
     ...diagnostic,
   };
 }
@@ -2953,6 +2974,7 @@ interface RunState {
   gameActionPlacementCandidateDiagnostic?: GameActionPlacementCandidateDiagnostic;
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
+  ownerStopLatchDiagnostic?: SafeEvidence;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
   ownerReturnDiagnostic?: OwnerReturnDiagnostic;
   ownerReturnProposalIdForRun?: string;
@@ -7781,6 +7803,206 @@ async function main(): Promise<void> {
         };
       },
     );
+
+    if (isOwnerStopLatchTargeted(state.targetCase)) {
+      await recordCase(
+        state,
+        "owner_stop_latch",
+        CASE_DEADLINES.owner_stop_latch,
+        requireLiveContext(),
+        async (context) => {
+          updateOwnerStopLatchDiagnostic(state, {
+            ownerStopTaskSent: false,
+            ownerStopActiveBodyOperationObserved: false,
+            ownerStopRconMovementObserved: false,
+            ownerStopRequested: false,
+            ownerStopLatchConfirmed: false,
+            ownerStopOperationReceiptConfirmed: false,
+            ownerStopOperationReceiptStatus: "missing",
+            ownerStopQuietWindowConfirmed: false,
+            ownerStopRconQuietConfirmed: false,
+          });
+          const before = playerOf(await collect(context.runtime.app));
+          const startPosition = parsePosition(
+            await rcon.command(`data get entity ${state.botName} Pos`),
+          );
+          const taskSentAt = Date.now();
+          sendChat(
+            context.owner,
+            "南へ5ブロック移動してください。途中で止まらず、目標まで歩き続けてください。",
+          );
+          updateOwnerStopLatchDiagnostic(state, { ownerStopTaskSent: true });
+
+          let lastRconCheckAt = 0;
+          let operationAtProgress: PlayerEvidence | undefined;
+          await waitForPlayer(context, 90_000, async (player) => {
+            const operation = player.activeOperation;
+            if (
+              (operation?.kind !== "move_to" &&
+                operation?.kind !== "move_relative") ||
+              typeof operation.bodyStartedAt !== "string" ||
+              !Number.isFinite(Date.parse(operation.bodyStartedAt)) ||
+              Date.parse(operation.bodyStartedAt) < taskSentAt ||
+              operation.operationId === before.activeOperation?.operationId ||
+              player.actionRevision <= before.actionRevision
+            ) {
+              return false;
+            }
+            updateOwnerStopLatchDiagnostic(state, {
+              ownerStopActiveBodyOperationObserved: true,
+            });
+            if (Date.now() - lastRconCheckAt < 1_000) return false;
+            lastRconCheckAt = Date.now();
+            const position = parsePosition(
+              await rcon.command(`data get entity ${state.botName} Pos`),
+            );
+            if (
+              Math.hypot(
+                position.x - startPosition.x,
+                position.z - startPosition.z,
+              ) < 1.5
+            ) {
+              return false;
+            }
+            const latest = playerOf(await collect(context.runtime.app));
+            const latestOperation = latest.activeOperation;
+            if (
+              latestOperation?.operationId !== operation.operationId ||
+              latestOperation.kind !== operation.kind ||
+              typeof latestOperation.bodyStartedAt !== "string"
+            ) {
+              return false;
+            }
+            operationAtProgress = latest;
+            updateOwnerStopLatchDiagnostic(state, {
+              ownerStopRconMovementObserved: true,
+            });
+            return true;
+          });
+          const activeBeforeStop = operationAtProgress;
+          if (activeBeforeStop?.activeOperation === undefined) {
+            incomplete("OWNER_STOP_ACTIVE_OPERATION_NOT_CONFIRMED");
+          }
+          const capturedOperation = activeBeforeStop.activeOperation;
+          let capturedOperationReceiptStatus:
+            PlayerOutcomeStatus | "missing" | "other" = "missing";
+
+          sendChat(context.owner, "今の行動を停止してください。");
+          updateOwnerStopLatchDiagnostic(state, {
+            ownerStopRequested: true,
+          });
+          const stopped = await waitForPlayer(context, 45_000, (player) => {
+            if (
+              !player.stopped ||
+              isOperationActive(player) ||
+              player.stopGeneration <= activeBeforeStop.stopGeneration
+            ) {
+              return false;
+            }
+            const capturedOutcome = player.recentOutcomes.find(
+              (outcome) =>
+                outcome.operationId === capturedOperation.operationId,
+            );
+            const outcomeStatus = capturedOutcome?.status;
+            capturedOperationReceiptStatus =
+              outcomeStatus === "successful" ||
+              outcomeStatus === "failed" ||
+              outcomeStatus === "interrupted" ||
+              outcomeStatus === "cancelled" ||
+              outcomeStatus === "unverified"
+                ? outcomeStatus
+                : outcomeStatus === undefined
+                  ? "missing"
+                  : "other";
+            const cancellationConfirmed =
+              capturedOperationReceiptStatus === "interrupted" ||
+              capturedOperationReceiptStatus === "cancelled";
+            updateOwnerStopLatchDiagnostic(state, {
+              ownerStopLatchConfirmed: true,
+              ownerStopOperationGone: true,
+              ownerStopGenerationAdvanced: true,
+              ownerStopOperationReceiptConfirmed: cancellationConfirmed,
+              ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
+            });
+            if (
+              capturedOperationReceiptStatus !== "missing" &&
+              capturedOperationReceiptStatus !== "other" &&
+              !cancellationConfirmed
+            ) {
+              fail("OWNER_STOP_CAPTURED_OPERATION_NOT_INTERRUPTED");
+            }
+            return cancellationConfirmed;
+          });
+          const stopGeneration = stopped.stopGeneration;
+          const actionRevisionAtStop = stopped.actionRevision;
+          updateOwnerStopLatchDiagnostic(state, {
+            ownerStopLatchConfirmed: true,
+            ownerStopOperationGone: !isOperationActive(stopped),
+            ownerStopGenerationAdvanced:
+              stopGeneration > activeBeforeStop.stopGeneration,
+            ownerStopOperationReceiptConfirmed: true,
+            ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
+          });
+
+          const rconPositionAtStop = parsePosition(
+            await rcon.command(`data get entity ${state.botName} Pos`),
+          );
+          const quietStartedAt = Date.now();
+          const quietUntil = Math.min(
+            quietStartedAt + 8_000,
+            context.caseDeadlineAt,
+            context.runDeadlineAt,
+          );
+          if (quietUntil - quietStartedAt < 8_000)
+            incomplete("OWNER_STOP_QUIET_WINDOW_UNAVAILABLE");
+          while (Date.now() < quietUntil) {
+            await waitMs(Math.min(1_000, quietUntil - Date.now()));
+            const sample = playerOf(await collect(context.runtime.app));
+            if (
+              !sample.stopped ||
+              sample.stopGeneration !== stopGeneration ||
+              sample.actionRevision !== actionRevisionAtStop ||
+              isOperationActive(sample)
+            ) {
+              fail("OWNER_STOP_RUNTIME_RESUMED_WITHOUT_OWNER_REQUEST");
+            }
+            const currentPosition = parsePosition(
+              await rcon.command(`data get entity ${state.botName} Pos`),
+            );
+            if (
+              Math.hypot(
+                currentPosition.x - rconPositionAtStop.x,
+                currentPosition.y - rconPositionAtStop.y,
+                currentPosition.z - rconPositionAtStop.z,
+              ) > 0.75
+            ) {
+              fail("OWNER_STOP_RCON_MOVEMENT_AFTER_LATCH");
+            }
+          }
+          const quietWindowMs = Date.now() - quietStartedAt;
+          if (quietWindowMs < 8_000)
+            incomplete("OWNER_STOP_QUIET_WINDOW_INCOMPLETE");
+          updateOwnerStopLatchDiagnostic(state, {
+            ownerStopQuietWindowConfirmed: true,
+            ownerStopRconQuietConfirmed: true,
+          });
+          return {
+            ownerStopTaskSent: true,
+            ownerStopActiveBodyOperationObserved: true,
+            ownerStopRconMovementObserved: true,
+            ownerStopRequested: true,
+            ownerStopLatchConfirmed: true,
+            ownerStopOperationGone: true,
+            ownerStopGenerationAdvanced: true,
+            ownerStopOperationReceiptConfirmed: true,
+            ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
+            ownerStopQuietWindowConfirmed: true,
+            ownerStopRconQuietConfirmed: true,
+            quietWindowMs,
+          };
+        },
+      );
+    }
 
     await recordCase(
       state,
