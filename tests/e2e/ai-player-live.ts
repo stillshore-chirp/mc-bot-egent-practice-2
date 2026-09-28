@@ -240,6 +240,11 @@ export const NO_FOOD_REPLAN_CASE_BUDGET = {
   totalTokens: 100_000,
 } as const;
 export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
+export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
+  llmCalls: 48,
+  totalTokens: 240_000,
+} as const;
+export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 14 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
@@ -258,7 +263,7 @@ const CASE_BUDGETS = {
   gather_multi_target_continuity: { llmCalls: 32, totalTokens: 300_000 },
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
-  parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
+  parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_BUDGET,
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
 const CASE_DEADLINES = {
@@ -276,7 +281,7 @@ const CASE_DEADLINES = {
   gather_multi_target_continuity: 8 * 60_000,
   damage_response: 8 * 60_000,
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
-  parallel_dialogue_stop: 7 * 60_000,
+  parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS,
   integrated_result: 30_000,
 } as const;
 
