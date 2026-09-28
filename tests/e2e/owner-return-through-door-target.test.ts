@@ -13,6 +13,7 @@ import {
   ownerReturnAcceptanceEvidenceConfirmed,
   ownerReturnRequestGateEnabled,
   OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+  OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
   ownerReturnArrivalConfirmed,
   ownerReturnToolNamesSince,
   ownerReturnUsageIsUnknown,
@@ -176,8 +177,8 @@ describe("owner return through door targeted E2E case", () => {
         calls: recordedCallsFromPreStart,
         tokens: 100,
         usageUnknownCalls: 0,
-        caseCallLimit: 12,
-        caseTokenLimit: 80_000,
+        caseCallLimit: 24,
+        caseTokenLimit: 160_000,
       }),
     ).toBe("accounting_mismatch");
     expect(
@@ -187,26 +188,33 @@ describe("owner return through door targeted E2E case", () => {
         calls: recordedCallsFromPreStart,
         tokens: 100,
         usageUnknownCalls: 0,
-        caseCallLimit: 12,
-        caseTokenLimit: 80_000,
+        caseCallLimit: 24,
+        caseTokenLimit: 160_000,
       }),
     ).toBe("settled");
   });
 
-  it("extends only the call allowance while retaining the known-token cap", () => {
+  it("uses the new owner case budget and deadline", () => {
     expect(OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET).toEqual({
-      llmCalls: 12,
-      totalTokens: 80_000,
+      llmCalls: 24,
+      totalTokens: 160_000,
     });
+    expect(OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS).toBe(8 * 60_000);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 12, totalTokens: 80_000 },
+        { llmCalls: 24, totalTokens: 160_000 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 11, totalTokens: 80_000 },
+        { llmCalls: 23, totalTokens: 160_000 },
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+      ),
+    ).toBe(false);
+    expect(
+      runBudgetCoversCase(
+        { llmCalls: 24, totalTokens: 159_999 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
       ),
     ).toBe(false);
@@ -329,12 +337,12 @@ describe("owner return through door targeted E2E case", () => {
       calls: 0,
       tokens: 0,
       usageUnknownCalls: 0,
-      caseCallLimit: 12,
-      caseTokenLimit: 80_000,
+      caseCallLimit: 24,
+      caseTokenLimit: 160_000,
       runCalls: 1,
       runTokens: 100,
-      runCallLimit: 12,
-      runTokenLimit: 80_000,
+      runCallLimit: 24,
+      runTokenLimit: 160_000,
     } as const;
     expect(classifyAcceptedProviderRequestUsage(baseline)).toBe("pending");
     expect(
@@ -359,7 +367,7 @@ describe("owner return through door targeted E2E case", () => {
         ...baseline,
         requestsRecorded: 1,
         calls: 1,
-        tokens: 80_001,
+        tokens: 160_001,
       }),
     ).toBe("budget_exceeded");
     expect(

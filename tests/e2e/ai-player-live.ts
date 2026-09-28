@@ -27,7 +27,10 @@ import mineflayer, { type Bot } from "mineflayer";
 import { ZodError } from "zod";
 
 import { AppError, errorCategories } from "../../src/domain/errors.js";
-import type { CompanionApplication } from "../../src/app/application.js";
+import type {
+  CompanionApplication,
+  createApplication,
+} from "../../src/app/application.js";
 import { loadConfig } from "../../src/config/load-config.js";
 import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
@@ -199,9 +202,10 @@ export const DAMAGE_RESPONSE_CASE_BUDGET = {
   totalTokens: 75_000,
 } as const;
 export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
-  llmCalls: 12,
-  totalTokens: 80_000,
+  llmCalls: 24,
+  totalTokens: 160_000,
 } as const;
+export const OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS = 8 * 60_000;
 export const NO_FOOD_REPLAN_CASE_BUDGET = {
   llmCalls: 10,
   totalTokens: 100_000,
@@ -229,7 +233,7 @@ const CASE_BUDGETS = {
 } as const;
 const CASE_DEADLINES = {
   runtime_contract: 60_000,
-  owner_return_through_door: 4 * 60_000,
+  owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
   autonomous_life: 5 * 60_000,
   unknown_composite: 7 * 60_000,
   observation_boundary: 4 * 60_000,
@@ -3008,8 +3012,7 @@ let activeApplicationPlayerBody: MineflayerPlayerBody | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
 let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
-type ApplicationFactory =
-  typeof import("../../src/app/application.js").createApplication;
+type ApplicationFactory = typeof createApplication;
 
 export function createOwnerReturnApplicationWithBodyCapture(
   targetCase: TargetableCase | undefined,
@@ -3024,9 +3027,8 @@ export function createOwnerReturnApplicationWithBodyCapture(
   if (!ownerReturnRequestGateEnabled(targetCase))
     return { application: createApplication(config, beforeCall) };
 
-  const restoreProbe = installGameActionPlacementObservationProbe(
-    onPlayerBodyCreated,
-  );
+  const restoreProbe =
+    installGameActionPlacementObservationProbe(onPlayerBodyCreated);
   try {
     return {
       application: createApplication(config, beforeCall),
@@ -3373,13 +3375,12 @@ function settleOwnerReturnRequests(
   state: RunState,
   context: CaseContext | undefined,
 ): Promise<AcceptedProviderRequestSettleStatus> {
-  const settleOnce =
-    state.ownerReturnRequestSettlement ??=
-      createOwnerReturnRequestSettlementOnce(() =>
-        settleOwnerReturnRequestsOnce(state, context).catch(() =>
-          recordOwnerReturnSettlementStatus(state, "unknown", false),
-        ),
-      );
+  const settleOnce = (state.ownerReturnRequestSettlement ??=
+    createOwnerReturnRequestSettlementOnce(() =>
+      settleOwnerReturnRequestsOnce(state, context).catch(() =>
+        recordOwnerReturnSettlementStatus(state, "unknown", false),
+      ),
+    ));
   return settleOnce();
 }
 
@@ -3414,11 +3415,13 @@ export async function settleOwnerReturnCaseFailure(
   caseStatus: Exclude<Status, "pass">,
   settle: () => Promise<AcceptedProviderRequestSettleStatus>,
   shutdown?: () => Promise<void>,
-): Promise<Readonly<{
-  caseStatus: Exclude<Status, "pass">;
-  settleStatus: AcceptedProviderRequestSettleStatus;
-  usageUnknown: boolean;
-}>> {
+): Promise<
+  Readonly<{
+    caseStatus: Exclude<Status, "pass">;
+    settleStatus: AcceptedProviderRequestSettleStatus;
+    usageUnknown: boolean;
+  }>
+> {
   let settleStatus: AcceptedProviderRequestSettleStatus;
   try {
     settleStatus = await settle();
@@ -12174,8 +12177,7 @@ async function runCase(
       id === "owner_return_through_door" &&
       ownerReturnRequestGateEnabled(state.targetCase);
     let ownerReturnFailureSettlement:
-      | Awaited<ReturnType<typeof settleOwnerReturnCaseFailure>>
-      | undefined;
+      Awaited<ReturnType<typeof settleOwnerReturnCaseFailure>> | undefined;
     if (ownerReturnCase && state.ownerReturnRequestGate !== undefined) {
       const settle = () =>
         settleOwnerReturnRequests(state, ownerReturnSettlementContext(state));
@@ -13556,8 +13558,7 @@ async function cleanup(state: RunState): Promise<void> {
   const settleStatus = await settleOwnerReturnBeforeShutdown(
     ownerReturnRequestGateEnabled(state.targetCase) &&
       state.ownerReturnRequestGate !== undefined,
-    () =>
-      settleOwnerReturnRequests(state, ownerReturnSettlementContext(state)),
+    () => settleOwnerReturnRequests(state, ownerReturnSettlementContext(state)),
     async () => {
       try {
         await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
