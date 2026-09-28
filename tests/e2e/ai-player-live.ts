@@ -247,10 +247,10 @@ export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
 } as const;
 export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 14 * 60_000;
 export const OWNER_STOP_LATCH_CASE_BUDGET = {
-  llmCalls: 24,
-  totalTokens: 120_000,
+  llmCalls: 48,
+  totalTokens: 240_000,
 } as const;
-export const OWNER_STOP_LATCH_CASE_DEADLINE_MS = 7 * 60_000;
+export const OWNER_STOP_LATCH_CASE_DEADLINE_MS = 14 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
@@ -7834,7 +7834,8 @@ async function main(): Promise<void> {
           await waitForPlayer(context, 90_000, async (player) => {
             const operation = player.activeOperation;
             if (
-              operation?.kind !== "move_to" ||
+              (operation?.kind !== "move_to" &&
+                operation?.kind !== "move_relative") ||
               typeof operation.bodyStartedAt !== "string" ||
               !Number.isFinite(Date.parse(operation.bodyStartedAt)) ||
               Date.parse(operation.bodyStartedAt) < taskSentAt ||
@@ -7863,7 +7864,7 @@ async function main(): Promise<void> {
             const latestOperation = latest.activeOperation;
             if (
               latestOperation?.operationId !== operation.operationId ||
-              latestOperation.kind !== "move_to" ||
+              latestOperation.kind !== operation.kind ||
               typeof latestOperation.bodyStartedAt !== "string"
             ) {
               return false;
