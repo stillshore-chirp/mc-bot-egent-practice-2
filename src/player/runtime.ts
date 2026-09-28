@@ -55,6 +55,7 @@ export interface PlayerPurposePort {
     readonly snapshot: PlayerRuntimeSnapshot;
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
+    readonly shouldStopAfterResponse?: () => boolean;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -560,10 +561,11 @@ export class PlayerRuntime {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
       } else if (
         !this.#activeThoughtCommitted &&
+        kind !== "body_outcome" &&
         (kind !== "state_changed" || reason.includes("vitals"))
       ) {
-        // Decision-invalidating events advance CAS. Ordinary observation
-        // changes remain queued for the next thought after this one settles.
+        // Body outcomes advance CAS but let the in-flight request settle; its
+        // stale commit will be rejected before the queued outcome is retried.
         activeThought.abort(new Error(`new_event_preempted_thought:${kind}`));
       }
       return;
@@ -589,6 +591,8 @@ export class PlayerRuntime {
                 ]
               : events,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
+          shouldStopAfterResponse: () =>
+            this.#pendingThoughtWake?.kind === "body_outcome",
         });
         if (
           !result.accepted &&
@@ -622,6 +626,8 @@ export class PlayerRuntime {
       this.#pendingThoughtWake = { kind, reason };
       return;
     }
+    // Keep a durable body result as the next wake; owner proposals preempt above.
+    if (pending.kind === "body_outcome" && kind !== "body_outcome") return;
     if (kind !== "state_changed" || pending.kind === "state_changed")
       this.#pendingThoughtWake = { kind, reason };
   }
@@ -632,6 +638,10 @@ export class PlayerRuntime {
     this.#activeThoughtCommitted = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
+      return;
+    }
+    if (this.#pendingThoughtWake?.kind === "body_outcome") {
+      this.#dispatchPendingThought();
       return;
     }
     if (retry) {

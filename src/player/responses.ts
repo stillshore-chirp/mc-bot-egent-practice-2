@@ -158,6 +158,8 @@ export interface RunPlayerAgentInput {
   readonly logger: Logger;
   readonly trace?: TraceService;
   readonly signal?: AbortSignal;
+  /** Stop processing a completed response when its Purpose thought is stale. */
+  readonly shouldStopAfterResponse?: () => boolean;
   readonly maxRounds?: number;
   /** Restrict a formatting-only request from invoking tools. */
   readonly toolChoice?: "auto" | "none";
@@ -424,6 +426,19 @@ export async function runPlayerAgent(
         compactionItemPresent: containsCompactionItem(response.output),
         toolCalls: activityToolCalls,
       });
+    const responseResult = (): PlayerAgentCallResult => ({
+      text: response.output_text.trim(),
+      calls,
+      inputTokens,
+      outputTokens,
+      latencyMs,
+      toolCalls,
+    });
+    const finishIfStale = (): PlayerAgentCallResult | undefined => {
+      if (input.shouldStopAfterResponse?.() !== true) return undefined;
+      emitCompletedResponseActivity("interrupted");
+      return responseResult();
+    };
 
     // onCall may consume the remaining run budget and abort the active signal.
     // Keep the received model calls count, but record no fabricated tool result.
@@ -431,16 +446,11 @@ export async function runPlayerAgent(
       emitCompletedResponseActivity("interrupted");
       input.signal.throwIfAborted();
     }
+    const staleResponseResult = finishIfStale();
+    if (staleResponseResult !== undefined) return staleResponseResult;
     if (functionCalls.length === 0) {
       emitCompletedResponseActivity("complete");
-      return {
-        text: response.output_text.trim(),
-        calls,
-        inputTokens,
-        outputTokens,
-        latencyMs,
-        toolCalls,
-      };
+      return responseResult();
     }
     for (const call of functionCalls) {
       if (input.signal?.aborted) {
@@ -501,17 +511,15 @@ export async function runPlayerAgent(
         input.shouldFinishAfterTool?.(call.name, result) === true
       ) {
         emitCompletedResponseActivity("complete");
-        return {
-          text: response.output_text.trim(),
-          calls,
-          inputTokens,
-          outputTokens,
-          latencyMs,
-          toolCalls,
-        };
+        return responseResult();
       }
+      const staleToolResult = finishIfStale();
+      if (staleToolResult !== undefined) return staleToolResult;
     }
     emitCompletedResponseActivity("complete");
+    // Activity callbacks run synchronously and can enqueue a Body outcome.
+    // Recheck at the round boundary before the next request starts.
+    if (input.shouldStopAfterResponse?.() === true) return responseResult();
     pruneMessagesBeforeLatestCompaction(messages);
   }
   throw new Error("PLAYER_AGENT_TOOL_ROUND_LIMIT");

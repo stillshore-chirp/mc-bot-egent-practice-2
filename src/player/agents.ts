@@ -788,6 +788,7 @@ export class PlayerPurposeAgent {
     readonly snapshot: PlayerRuntimeSnapshot;
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
+    readonly shouldStopAfterResponse?: () => boolean;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -1402,6 +1403,9 @@ export class PlayerPurposeAgent {
               ? {}
               : { trace: this.options.trace }),
             ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(input.shouldStopAfterResponse === undefined
+              ? {}
+              : { shouldStopAfterResponse: input.shouldStopAfterResponse }),
             ...(this.options.onCall === undefined
               ? {}
               : { onCall: this.options.onCall }),
@@ -1412,6 +1416,7 @@ export class PlayerPurposeAgent {
               toolName === "propose_skill_learning",
           });
         await runLearningReview(learningInstructions, learningInput);
+        if (input.shouldStopAfterResponse?.()) return { accepted: false };
         this.#rememberLearningReview(latestOutcome.operationId);
         if (
           this.options.mind
@@ -1495,6 +1500,9 @@ export class PlayerPurposeAgent {
           ? {}
           : { trace: this.options.trace }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(input.shouldStopAfterResponse === undefined
+          ? {}
+          : { shouldStopAfterResponse: input.shouldStopAfterResponse }),
         shouldFinishAfterTool: (toolName, result) => {
           const outcome = asRecord(result);
           if (toolName !== "commit_action_decision") return false;
