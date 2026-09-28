@@ -7834,8 +7834,7 @@ async function main(): Promise<void> {
           await waitForPlayer(context, 90_000, async (player) => {
             const operation = player.activeOperation;
             if (
-              operation === undefined ||
-              operation.kind !== "move_to" ||
+              operation?.kind !== "move_to" ||
               typeof operation.bodyStartedAt !== "string" ||
               !Number.isFinite(Date.parse(operation.bodyStartedAt)) ||
               Date.parse(operation.bodyStartedAt) < taskSentAt ||
@@ -7863,8 +7862,7 @@ async function main(): Promise<void> {
             const latest = playerOf(await collect(context.runtime.app));
             const latestOperation = latest.activeOperation;
             if (
-              latestOperation === undefined ||
-              latestOperation.operationId !== operation.operationId ||
+              latestOperation?.operationId !== operation.operationId ||
               latestOperation.kind !== "move_to" ||
               typeof latestOperation.bodyStartedAt !== "string"
             ) {
@@ -7877,10 +7875,7 @@ async function main(): Promise<void> {
             return true;
           });
           const activeBeforeStop = operationAtProgress;
-          if (
-            activeBeforeStop === undefined ||
-            activeBeforeStop.activeOperation === undefined
-          ) {
+          if (activeBeforeStop?.activeOperation === undefined) {
             incomplete("OWNER_STOP_ACTIVE_OPERATION_NOT_CONFIRMED");
           }
 
