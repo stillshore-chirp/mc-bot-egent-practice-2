@@ -56,32 +56,47 @@ describe("targeted E2E case selection", () => {
     );
   });
 
-  it("runs skill acceptance targets with only their bounded learning chain", () => {
-    const skillTargets = [
-      "skill_compactness_and_knowledge_separation",
+  it("keeps compactness on its bounded learning chain", () => {
+    const targetCase = "skill_compactness_and_knowledge_separation";
+    expect(TARGETABLE_CASES).toContain(targetCase);
+    for (const selectedCase of [
+      "autonomous_life",
+      "learning_reuse",
+      targetCase,
+    ]) {
+      expect(isCaseSelectedForTarget(targetCase, selectedCase)).toBe(true);
+    }
+    for (const skippedCase of [
+      "runtime_contract",
+      "observation_boundary",
+      "persistent_memory_restart",
       "skill_exchange",
-    ] as const;
-    for (const targetCase of skillTargets) {
-      expect(TARGETABLE_CASES).toContain(targetCase);
-      for (const selectedCase of [
-        "autonomous_life",
-        "learning_reuse",
-        targetCase,
-      ]) {
-        expect(isCaseSelectedForTarget(targetCase, selectedCase)).toBe(true);
-      }
-      for (const skippedCase of [
-        "runtime_contract",
-        "observation_boundary",
-        "persistent_memory_restart",
-        ...skillTargets.filter((skillCase) => skillCase !== targetCase),
-        "game_action_discretion",
-        "unknown_composite",
-        "parallel_dialogue_stop",
-        "integrated_result",
-      ]) {
-        expect(isCaseSelectedForTarget(targetCase, skippedCase)).toBe(false);
-      }
+      "game_action_discretion",
+      "unknown_composite",
+      "parallel_dialogue_stop",
+      "integrated_result",
+    ]) {
+      expect(isCaseSelectedForTarget(targetCase, skippedCase)).toBe(false);
+    }
+  });
+
+  it("runs skill_exchange without learning prerequisites", () => {
+    const targetCase = "skill_exchange";
+    expect(TARGETABLE_CASES).toContain(targetCase);
+    expect(isCaseSelectedForTarget(targetCase, targetCase)).toBe(true);
+    expect(isCaseSelectedForTarget(targetCase, "autonomous_life")).toBe(false);
+    expect(isCaseSelectedForTarget(targetCase, "learning_reuse")).toBe(false);
+    for (const skippedCase of [
+      "runtime_contract",
+      "observation_boundary",
+      "persistent_memory_restart",
+      "skill_compactness_and_knowledge_separation",
+      "game_action_discretion",
+      "unknown_composite",
+      "parallel_dialogue_stop",
+      "integrated_result",
+    ]) {
+      expect(isCaseSelectedForTarget(targetCase, skippedCase)).toBe(false);
     }
   });
 

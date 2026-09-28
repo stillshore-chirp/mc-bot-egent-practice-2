@@ -22,7 +22,6 @@ const TARGET_CASE_PREREQUISITES: Partial<
     "autonomous_life",
     "learning_reuse",
   ],
-  skill_exchange: ["autonomous_life", "learning_reuse"],
   unknown_composite: ["autonomous_life"],
 };
 
