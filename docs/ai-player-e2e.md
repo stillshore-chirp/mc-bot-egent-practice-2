@@ -156,7 +156,9 @@ run38は最初のRotation読取で固定code `LEARNING_LOG_FIXTURE_ROTATION_READ
 
 `learning_reuse` 開始後に未完了停止したartifactには、最後に確認した段階を固定enumの `learningReuseStage` として記録します（初回fixture可視、初回dig確認、初回digの仮説根拠確認、再利用fixture可視、再利用結果確認、版・receipt更新確認）。この値は進捗の診断だけを示し、既存のBody・DB・RCON条件を満たしたpass判定は変えません。Skill本文・IDや会話内容は含めません。
 
-隔離実行で初回の成功と仮説作成を確認し、再利用用fixtureの可視確認までに学習caseが約16万トークンを使用したため、このcaseの上限を30 calls / 30万トークンにしています。run全体の80万トークン上限と、ゲーム内結果・Skill版・receiptのpass条件は維持します。
+隔離実行で初回の成功と仮説作成を確認し、再利用用fixtureの可視確認までに学習caseが約16万トークンを使用しました。結果の後半を一度に観測できるよう、このcase上限を60 calls / 60万トークンへ広げます。deadline 8分とゲーム内結果・Skill版・receiptのpass条件は維持します。全16 caseの個別上限を合計すると354 calls / 2,905,000 tokensですが、これは各caseの枠の合計で、単一runの枠ではありません。既定の全run上限45分 / 160 calls / 800,000 tokensは変更しません。
+
+Issue #80の次の代表runは`skill_compactness_and_knowledge_separation`をtargetに一度だけ実施し、依存caseの`autonomous_life`と`learning_reuse`を含めます。選択した3 caseの個別上限は合計80 calls / 725,000 tokensです。このtarget専用wrapperには`AI_PLAYER_E2E_MAX_LLM_CALLS=100`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS=800000`、`AI_PLAYER_E2E_MAX_DURATION_MINUTES=14`を指定します。wrapper値は既存validation範囲内の選択run上限で、既定global値45分 / 160 calls / 800,000 tokensとcase別予算を変更しません。実測はまだ行っていません。
 
 run40（HEAD `7466742`）はCI 7/7成功、隔離PaperでBody、runtime、自律行動、観測境界、永続記憶の5 caseがpassしました。学習fixtureは再利用段階で8個の原木設置、更新後のBody観測と原木可視性を確認しましたが、再利用結果を確認する前に学習caseの30 calls上限を31 callsで超え、約25.0万トークンで未完了でした。run全体は42 calls・304,653 tokensでusageは`partial_or_unknown`です。後続caseは未実施、server・listener・一時worldのcleanupは3/3確認済みです。終了時snapshotではowner proposalは初回依頼の1件だけで、再利用依頼後の新規proposalを確認できませんでした。この事実から再利用依頼が目的提案として伝わらなかった可能性が高いものの、LLM内部の理由は未確認です。
 

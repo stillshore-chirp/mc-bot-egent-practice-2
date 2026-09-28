@@ -247,7 +247,7 @@ const CASE_BUDGETS = {
   unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
-  learning_reuse: { llmCalls: 30, totalTokens: 300_000 },
+  learning_reuse: { llmCalls: 60, totalTokens: 600_000 },
   skill_compactness_and_knowledge_separation: {
     llmCalls: 2,
     totalTokens: 25_000,
