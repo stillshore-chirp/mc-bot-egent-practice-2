@@ -6,6 +6,30 @@
 
 各必須動作は隔離Paperと実GPTを使い、ゲーム内結果で判定します。各部分runは独立したruntime・DBを持ち、そのrun内で複数能力の接続を確認します。複数runは重なりのある能力証拠で統合を支えますが、run間のDB永続性は主張しません。全caseを一度の長時間runで連続passさせる耐久評価は #76、開始時に遮蔽された目標の探索は #77 で扱います。
 
+## Issue #91の0-call fixture確認
+
+`AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY=YES` は、既定applicationを起動せずに隔離Paper上のfixtureだけを確認します。通常の隔離jar・EULA設定を用意し、`AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts` で実行します。probe用Body clientが接続した後、全inventoryを空にし、hunger effectでFoodを12〜15へ下げ、effect cleanupを確認してから一度だけdamageを適用します。BodyとRCONがHealth 1〜6、Food 12〜15、空inventoryをそれぞれ確認した時だけcaseをpassにします。Health/Foodのbaseline、effect状態、inventoryのいずれかを読み戻せない場合は固定codeで未完了にし、値を推測しません。fixture中はnatural regenerationを無効にしますが、probe終了時には隔離worldごと削除します。artifactには固定booleanとHealth/Foodの数値だけを残します。
+
+このprobeでは実GPT、既定runtime、Purpose判断を実行しません。したがって証明するのはfixture準備と独立readbackだけで、接続後のno-food時の判断、失敗したconsumeの反復抑制、代案・理由付きwait、再評価契機の受け入れには数えません。
+
+`AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY=YES` はfixtureを作った同じ隔離worldへ既定applicationを接続し、startupの最初のBody observationでHealth 1〜6、Food 12〜15、空inventoryをBody/RCON双方から読み戻します。HealthとFoodは各oracle間の一致も要求します。Body observation wrapperはreadbackを完了してからruntimeへ戻り、startup Purposeがscheduleされた後の最初の`beforeCall` gateはResponses API送信前に必ず停止します。実API keyなしで実行し、artifactではprovider要求の遮断、Body/RCONの数値とempty確認、LLM calls 0を照合できます。`AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts` で一度実行します。
+
+continuity probeのpassが示すのは、既定application接続後の最初のBody observationまでno-food fixtureがBody/RCON間で維持され、最初のprovider要求を送信前に止めたことです。Purpose判断の完了、consume失敗の反復抑制、代案・理由付きwait、再評価契機の受け入れは確認しません。readback・停止・cleanupのいずれかが確認できない場合は固定codeで未完了にします。
+
+実GPTの代表caseは`AI_PLAYER_E2E_TARGET_CASE=no_food_replan`で選びます。Body smoke後に隔離worldでHealth 1〜6、Food 12〜15、Body/RCON inventory emptyを準備し、既定applicationの起動前snapshotを保存します。`recordCase`のbudgetを開始してからapplicationを初接続し、startupの最初のBody observationで同じHealth/Food/inventory状態をBody/RCON照合します。照合前に最初のprovider要求が発生した場合は`beforeCall`で送信を拒否します。owner/guest clientは待機させ、追加のowner指示は送信しません。
+
+case上限は10 calls / 100,000 known tokens / 240秒です。caseのrun上限はcase上限以上であることをPaper起動前に確認し、実行時間はcase期限・run期限の早い方で停止します。callsは`beforeCall`で送信前に同期判定し、10回目の送信後は次の要求を拒否します。known tokensとusage unknownは直近の`collect`で得たusageから要求前に判定し、usage unknownの観測後は次の要求を拒否してcaseを未完了にします。usageは応答後に観測されるため、一つの応答で100,000 tokensを越えることがあります。その場合は越過した応答を取り消せず、次の要求を止めます。health/food/inventoryのoracle不一致、operation outcome未確認、期限・予算到達、wait後の新しいPurpose判断未観測はpassにしません。
+
+固定診断はPurpose判断class、Body outcome status、失敗後の再評価有無、同じ失敗operation kindを同じHealth/Food・空inventory状態で選び直したか、waitの理由/wake条件の存在、wake後の新しいPurpose判断、outcome後のno-food Body/RCON一致です。自由文reason、会話、operation引数、座標、RCON返信は保存しません。
+
+失敗outcome後は新しいPurpose判断を待ち、同じconsumeを状態不変で再選択した場合はfailします。その他のoperation kindが再選択されてもoperation引数を保持しないため同じ移動先か判別できず、未完了にします。異なるoperationはBody outcome成功とoutcome後のBody/RCON no-food oracleを要求します。
+
+成功した代案Body outcomeの後も、最大60秒またはcase残時間の短い方だけPurpose判断を観測し、`decidedAt`がoutcomeの`observedAt`より後の判断を一つ確認した場合にpassします。この判断を観測したpredicate内で受入ラッチを同期設定し、その後の`beforeCall`はadmission/budget計数前にResponses API送信を拒否します。既に許可した要求は中断せず、`onCall`が記録したcase開始時baseline以降の`llmCalls`を`collect`で読み、最大15秒またはcase期限までsettleを待ちます。usage unknown、admission数と記録call数の不一致、または期限内にsettleしない要求は未完了です。最終collectでも未settled要求がないことを照合してからcaseをpassにし、ラッチによる送信拒否はbudget failureへ分類しません。見つからない場合は`NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED`で未完了にします。
+
+waitは理由とwakeOnの存在だけで十分とせず、owner入力なしで対象wakeがcase期限内に設定され、後続の新しいPurpose判断が観測できた時だけ再評価済みとします。artifactはwake種別そのものを保存しないため、再評価をどのeventが起こしたかは断定しません。期限内に新しい判断がなければ未完了です。このtarget runは一度の代表測定であり、失敗しても同条件を自動反復しません。
+
+実GPT target runは一度だけ、次のselectorで起動します: `AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=no_food_replan npm exec -- tsx tests/e2e/ai-player-live.ts`。実行環境には既存の`OPENAI_API_KEY`、隔離Paper用の`AI_PLAYER_E2E_SERVER_JAR`・`AI_PLAYER_E2E_EULA_FILE`、必要な場合だけ`AI_PLAYER_E2E_SERVER_CACHE_DIR`を設定します。case上限10 calls / 100,000 known tokens / 240秒とrun全体上限を使い、追加延長や同条件自動再実行はしません。安全artifactは`os.tmpdir()/ai-player-e2e-results/<run-id>.json`にmode `0600`で保存され、起動時に表示されるそのJSONだけを確認します。失敗時のprivate diagnostics/logは本文やRCON返信を含む可能性があるため、公開・出力しません。
+
 新しい既定経路と責務の境界は[自律プレイヤー](autonomous-player.md)、操作・可視範囲の契約は[プレイヤー操作アダプター](player-body.md)、判断に使うゲーム内知識は[MC Bot Skills](mc-bot-skills.md)を参照してください。
 
 ## 隔離と公開境界
@@ -18,7 +42,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。`damage_response`のcase evidenceには`usageUnknownRequestErrorCalls`と`usageUnknownResponseUsageMissingCalls`の集計件数を記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
-後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`game_action_discretion`、`food_intent_continuity`、`damage_response`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`game_action_discretion`、`food_intent_continuity`、`damage_response`、`parallel_dialogue_stop`は前提caseなしで対象caseだけを実行します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`と`skill_exchange`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`は前提caseなしで対象caseだけを実行します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`と`skill_exchange`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
 
 `owner_return_through_door`は、既定runtimeへ自然なowner帰還依頼を一度送り、階段と閉じた木製ドアを含む隔離fixtureを通過する挙動を測ります。RCONはfixtureの設置と位置・door状態の独立readbackだけに使い、移動は既定PlayerBodyを通るGPT判断に任せます。成功には今回の依頼後に生じた一件のproposalがadoptedまたはcompromisedとなり、その同じproposalへowner goalが結び付いていること、依頼後のmove_to判断、BodyとRCON双方のowner側到達、ownerから1.75ブロック以内、両観測の位置一致、door openを要求します。declined、pending、unknown、proposalに結び付かないowner goalは成功条件を満たしません。`ownerProposalAdoptedForRequest`はadoptedのみを表し、adoptedまたはcompromisedでgoalがリンク済みかは`ownerProposalProgressableForRequest`に記録します。
 

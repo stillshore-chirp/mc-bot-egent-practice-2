@@ -55,6 +55,7 @@ export interface PlayerPurposePort {
     readonly snapshot: PlayerRuntimeSnapshot;
     readonly events: readonly PlayerRuntimeEvent[];
     readonly signal?: AbortSignal;
+    readonly shouldStopAfterResponse?: () => boolean;
   }): Promise<{
     readonly accepted: boolean;
     readonly decision?: PlayerThoughtDecision;
@@ -560,10 +561,11 @@ export class PlayerRuntime {
         activeThought.abort(new Error("owner_proposal_preempted_thought"));
       } else if (
         !this.#activeThoughtCommitted &&
+        kind !== "body_outcome" &&
         (kind !== "state_changed" || reason.includes("vitals"))
       ) {
-        // Decision-invalidating events advance CAS. Ordinary observation
-        // changes remain queued for the next thought after this one settles.
+        // Body outcomes advance CAS but let the in-flight request settle; its
+        // stale commit will be rejected before the queued outcome is retried.
         activeThought.abort(new Error(`new_event_preempted_thought:${kind}`));
       }
       return;
@@ -589,6 +591,8 @@ export class PlayerRuntime {
                 ]
               : events,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
+          shouldStopAfterResponse: () =>
+            this.#pendingThoughtWake?.kind === "body_outcome",
         });
         if (
           !result.accepted &&
@@ -622,6 +626,8 @@ export class PlayerRuntime {
       this.#pendingThoughtWake = { kind, reason };
       return;
     }
+    // Keep a durable body result as the next wake; owner proposals preempt above.
+    if (pending.kind === "body_outcome" && kind !== "body_outcome") return;
     if (kind !== "state_changed" || pending.kind === "state_changed")
       this.#pendingThoughtWake = { kind, reason };
   }
@@ -632,6 +638,10 @@ export class PlayerRuntime {
     this.#activeThoughtCommitted = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
+      return;
+    }
+    if (this.#pendingThoughtWake?.kind === "body_outcome") {
+      this.#dispatchPendingThought();
       return;
     }
     if (retry) {
@@ -698,6 +708,7 @@ export class PlayerRuntime {
     const reportOwnerConsume = this.#ownerConsumeOperations.delete(
       run.operationId,
     );
+    const reportEquip = operation.kind === "equip" ? operation : undefined;
     let result: PlayerOperationResult | undefined;
     try {
       result = await this.options.body.execute(
@@ -780,6 +791,10 @@ export class PlayerRuntime {
     if (this.#activeBody === run) this.#activeBody = undefined;
     if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)
       await this.#sayWhileActive(ownerConsumeOutcomeMessage(result, outcome));
+    if (reportEquip !== undefined && !saved.stopped && !this.#shuttingDown)
+      await this.#sayWhileActive(
+        equipmentOutcomeMessage(reportEquip, result, outcome),
+      );
     if (
       !recoveryRequired &&
       !saved.stopped &&
@@ -1145,6 +1160,62 @@ function ownerConsumeOutcomeMessage(
   };
   return `${statusMessage[outcome]}${foodChange}原因は観測から特定できていません。`;
 }
+
+function equipmentOutcomeMessage(
+  operation: Extract<PlayerOperation, { kind: "equip" }>,
+  result: PlayerOperationResult | undefined,
+  outcome: McSkillOutcomeStatus,
+): string {
+  const operationMatches =
+    result?.operation.kind === "equip" &&
+    result.operation.item === operation.item &&
+    result.operation.destination === operation.destination;
+  const observedEquipment =
+    operationMatches && result.after != null
+      ? result.after.self.equipment
+      : undefined;
+  const slotObserved =
+    observedEquipment !== undefined &&
+    Object.prototype.hasOwnProperty.call(
+      observedEquipment,
+      operation.destination,
+    );
+  const equipment = slotObserved
+    ? observedEquipment[operation.destination]
+    : undefined;
+  const equipmentArea = `${equipmentDestinationLabel[operation.destination]}の装備欄`;
+  const statusMessage: Record<McSkillOutcomeStatus, string> = {
+    successful: "装備操作は成功と判定されました。",
+    failed: "装備操作は失敗しました。",
+    interrupted: "装備操作は中断されました。",
+    cancelled: "装備操作は取り消されました。",
+    unverified: "装備操作の結果を確認できていません。",
+  };
+  const observedMessage = !slotObserved
+    ? `実行後の${equipmentArea}は観測できませんでした。`
+    : equipment === null
+      ? `実行後の${equipmentArea}は空で、${operation.item}は確認できませんでした。`
+      : equipment?.name === operation.item
+        ? `実行後、${equipmentArea}に${operation.item}があることを観測しました。`
+        : equipment === undefined
+          ? `実行後の${equipmentArea}は観測できませんでした。`
+          : `実行後、${equipmentArea}には${equipment.name}があり、${operation.item}は確認できませんでした。`;
+  if (outcome === "successful" && equipment?.name === operation.item)
+    return `${statusMessage[outcome]}${observedMessage}`;
+  return `${statusMessage[outcome]}${observedMessage}原因は観測から特定できていません。`;
+}
+
+const equipmentDestinationLabel: Record<
+  Extract<PlayerOperation, { kind: "equip" }>["destination"],
+  string
+> = {
+  hand: "手",
+  head: "頭",
+  torso: "胴体",
+  legs: "脚",
+  feet: "足",
+  "off-hand": "利き手と反対側の手",
+};
 
 function consumeItemCountDecreased(result: PlayerOperationResult): boolean {
   if (

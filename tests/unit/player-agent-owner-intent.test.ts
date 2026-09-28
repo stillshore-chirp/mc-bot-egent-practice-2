@@ -22,10 +22,12 @@ import {
   compactSnapshot,
   PlayerConversationAgent,
   PlayerPurposeAgent,
+  playerOperationCatalog,
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   projectSafePlayerAgentActivityTail,
+  type PlayerAgentRoundActivity,
   type PlayerResponsesClient,
 } from "../../src/player/responses.js";
 
@@ -37,6 +39,408 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("keeps completed response usage and skips stale purpose tools and rounds", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let resolveResponse!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    });
+    fixture.responses.push(() => {
+      markRequestStarted();
+      return pendingResponse;
+    });
+
+    try {
+      const thought = fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        shouldStopAfterResponse: () =>
+          fixture.mind
+            .pendingEvents(32)
+            .some(({ kind }) => kind === "body_outcome"),
+      });
+      await requestStarted;
+
+      fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
+      resolveResponse(
+        functionCallResponse(
+          "stale-description",
+          "describe_operation",
+          { kind: "dig" },
+          responseUsage(19, 7),
+        ),
+      );
+      const result = await thought;
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+        responseStatus: "completed",
+        processingStatus: "interrupted",
+        inputTokens: 19,
+        outputTokens: 7,
+        functionCallCount: 1,
+        toolCalls: [],
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("rechecks a body outcome from the completed-round callback before another request", async () => {
+    let bodyOutcomeQueued = false;
+    const fixture = openPurposeFixture(createMemoryPort(), [], (activity) => {
+      if (
+        !bodyOutcomeQueued &&
+        activity.round === 1 &&
+        activity.processingStatus === "complete"
+      ) {
+        bodyOutcomeQueued = true;
+        fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
+      }
+    });
+    fixture.responses.push(
+      functionCallResponse("stale-description", "describe_operation", {
+        kind: "dig",
+      }),
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+        shouldStopAfterResponse: () =>
+          fixture.mind
+            .pendingEvents(32)
+            .some(({ kind }) => kind === "body_outcome"),
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(bodyOutcomeQueued).toBe(true);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
+        processingStatus: "complete",
+        functionCallCount: 1,
+        toolCalls: [{ name: "describe_operation" }],
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("grounds capability answers in the current public operation catalog", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("digは使えます。"));
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "digは使えますか？",
+        turn: conversation.nextTurn(),
+      });
+
+      const request = record(fixture.requests[0]);
+      expect(String(request.instructions)).toContain(
+        "能力や実行条件の相談には",
+      );
+      expect(String(request.instructions)).toContain(playerOperationCatalog);
+      expect(request.tool_choice).toBe("auto");
+      expect(messages).toEqual(["digは使えます。"]);
+      expect(fixture.mind.snapshot().proposals).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("regenerates an overlong reply once without tools and keeps call admission", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    let admittedCalls = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      beforeCall: () => {
+        admittedCalls += 1;
+      },
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const draft = "長い回答".repeat(61);
+    fixture.responses.push(
+      terminalResponse(draft),
+      terminalResponse("digとequipを利用できます。"),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "どんな操作ができますか？",
+        turn: conversation.nextTurn(),
+      });
+
+      const initialRequest = record(fixture.requests[0]);
+      const compactRequest = record(fixture.requests[1]);
+      expect(initialRequest.tool_choice).toBe("auto");
+      expect(compactRequest.tool_choice).toBe("none");
+      expect(compactRequest.tools).toEqual([]);
+      expect(JSON.stringify(compactRequest.input)).toContain(draft);
+      expect(admittedCalls).toBe(2);
+      expect(messages).toEqual(["digとequipを利用できます。"]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "a committed owner proposal",
+      ownerMessage: "近くの木を集めてください。",
+      response: functionCallResponse("gather-proposal", "propose_goal_change", {
+        title: "Gather nearby wood",
+        reason: "The owner asked me to gather wood.",
+        priority: 3,
+      }),
+      currentStateMarker: "Gather nearby wood",
+    },
+    {
+      name: "a saved owner fact",
+      ownerMessage: "次回から短い文章で答えてください。",
+      response: functionCallResponse("save-owner-fact", "remember_owner_fact", {
+        summary: "The owner prefers concise replies",
+      }),
+      currentStateMarker: "The owner prefers concise replies",
+    },
+    {
+      name: "a committed stop request",
+      ownerMessage: "自律行動を止めてください。",
+      response: functionCallResponse("stop-autonomy", "stop_autonomy", {
+        reason: "The owner requested a pause.",
+      }),
+      currentStateMarker: '"stopped":true',
+    },
+  ])(
+    "keeps original conversation rules and post-tool state while shortening $name",
+    async ({ ownerMessage, response, currentStateMarker }) => {
+      const fixture = openPurposeFixture(createMemoryPort());
+      const messages: string[] = [];
+      fixture.mind.recordDeathEvent(
+        new Date().toISOString(),
+        "Synthetic death event",
+      );
+      const conversation = new PlayerConversationAgent({
+        client: scriptedClient(fixture.responses, fixture.requests),
+        apiKey: "test-only",
+        model: "test-model",
+        ownerUsername: "owner",
+        mind: fixture.mind,
+        memory: createMemoryPort(),
+        logger: pino({ level: "silent" }),
+        say: async (message) => {
+          messages.push(message);
+        },
+        onProposal: () => undefined,
+        onStop: async () => undefined,
+        onResume: () => undefined,
+      });
+      fixture.responses.push(
+        response,
+        terminalResponse("長い回答".repeat(61)),
+        terminalResponse("現状を確認しました。"),
+      );
+
+      try {
+        await conversation.handleOwnerMessage({
+          username: "owner",
+          message: ownerMessage,
+          turn: conversation.nextTurn(),
+        });
+
+        const regenerationRequest = record(fixture.requests[2]);
+        const regenerationMessage = record(
+          (regenerationRequest.input as unknown[])[0],
+        );
+        const regenerationPayload = record(
+          JSON.parse(String(regenerationMessage.content)),
+        );
+        const regenerationState = JSON.parse(
+          String(regenerationPayload.currentState),
+        ) as unknown;
+        const serializedRegenerationState = JSON.stringify(regenerationState);
+        const regenerationInstructions = String(
+          regenerationRequest.instructions,
+        );
+        expect(regenerationRequest.tool_choice).toBe("none");
+        expect(regenerationRequest.tools).toEqual([]);
+        expect(serializedRegenerationState).toContain(currentStateMarker);
+        expect(serializedRegenerationState).toContain('"latestDeath"');
+        expect(regenerationInstructions).toContain(
+          "runtime.latestDeathがある場合",
+        );
+        expect(regenerationInstructions).toContain(
+          "remember_owner_factを必ず呼び",
+        );
+        expect(regenerationInstructions).toContain(
+          "stop_autonomyやresume_autonomy",
+        );
+        expect(regenerationInstructions).toContain("propose_goal_change");
+        expect(regenerationInstructions).toContain("直近4件までのowner会話");
+        expect(messages).toEqual(["現状を確認しました。"]);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
+  it("does not invite a duplicate proposal when shortening fails after proposal commit", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("gather-proposal", "propose_goal_change", {
+        title: "Gather nearby wood",
+        reason: "The owner asked me to gather wood.",
+        priority: 3,
+      }),
+      terminalResponse("長い回答".repeat(61)),
+      () => {
+        throw new Error("TEST_REGENERATION_FAILED");
+      },
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "近くの木を集めてください。",
+        turn: conversation.nextTurn(),
+      });
+      expect(fixture.mind.snapshot().proposals).toHaveLength(1);
+      expect(messages).toEqual(["うまく短く整理できず、説明が不十分です。"]);
+      expect(messages[0]).not.toMatch(/もう一度|再度|頼んで/u);
+      expect(fixture.requests).toHaveLength(3);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses a generic fallback when reply regeneration fails", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("長い回答".repeat(61)), () => {
+      throw new Error("TEST_REGENERATION_FAILED");
+    });
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "この操作の使い方を教えてください。",
+        turn: conversation.nextTurn(),
+      });
+      expect(messages).toEqual(["うまく短く整理できず、説明が不十分です。"]);
+      expect(messages[0]).not.toMatch(/操作は|完了|覚えました/u);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not swallow call-admission rejection during reply regeneration", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    let admittedCalls = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      beforeCall: () => {
+        admittedCalls += 1;
+        if (admittedCalls > 1) throw new Error("TEST_BUDGET_EXHAUSTED");
+      },
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(terminalResponse("長い回答".repeat(61)));
+
+    try {
+      await expect(
+        conversation.handleOwnerMessage({
+          username: "owner",
+          message: "どんな操作ができますか？",
+          turn: conversation.nextTurn(),
+        }),
+      ).rejects.toThrow("TEST_BUDGET_EXHAUSTED");
+      expect(admittedCalls).toBe(2);
+      expect(fixture.requests).toHaveLength(1);
+      expect(messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("carries bounded owner chat context into a short follow-up proposal", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const memory = createMemoryPort();
@@ -734,7 +1138,7 @@ describe("player owner intent context", () => {
   });
 });
 
-type ScriptedResponse = Response | (() => Response);
+type ScriptedResponse = Response | (() => Response | Promise<Response>);
 
 interface PurposeFixture {
   readonly agent: PlayerPurposeAgent;
@@ -747,6 +1151,7 @@ interface PurposeFixture {
 function openPurposeFixture(
   memory: PlayerMemoryPort,
   ownerPositionExceptions: boolean[] = [],
+  onRoundActivity?: (activity: PlayerAgentRoundActivity) => void,
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -790,7 +1195,10 @@ function openPurposeFixture(
     memory,
     ownerPlayerId: "test-owner",
     logger: pino({ level: "silent" }),
-    onRoundActivity: (activity) => mind.recordAgentActivity(activity),
+    onRoundActivity: (activity) => {
+      mind.recordAgentActivity(activity);
+      onRoundActivity?.(activity);
+    },
     onCommitted: () => undefined,
   });
   return {
@@ -883,7 +1291,7 @@ function scriptedClient(
         const response = responses.shift();
         if (response === undefined)
           throw new Error("TEST_RESPONSE_QUEUE_EMPTY");
-        return typeof response === "function" ? response() : response;
+        return typeof response === "function" ? await response() : response;
       },
     },
   } as unknown as PlayerResponsesClient;
@@ -893,6 +1301,7 @@ function functionCallResponse(
   callId: string,
   name: string,
   argumentsValue: unknown,
+  usage: NonNullable<Response["usage"]> = responseUsage(1, 1),
 ): Response {
   return {
     status: "completed",
@@ -905,8 +1314,21 @@ function functionCallResponse(
       },
     ],
     output_text: "",
-    usage: { input_tokens: 1, output_tokens: 1 },
+    usage,
   } as unknown as Response;
+}
+
+function responseUsage(
+  inputTokens: number,
+  outputTokens: number,
+): NonNullable<Response["usage"]> {
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cache_write_tokens: 0, cached_tokens: 0 },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: inputTokens + outputTokens,
+  };
 }
 
 function terminalResponse(outputText: string): Response {
