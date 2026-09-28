@@ -3,10 +3,30 @@ import { describe, expect, it } from "vitest";
 import {
   isGatherMultiTargetCaseSelected,
   isCaseSelectedForTarget,
+  isOwnerStopLatchTargeted,
   TARGETABLE_CASES,
 } from "../e2e/target-case-selection.js";
 
 describe("targeted E2E case selection", () => {
+  it("keeps owner_stop_latch as an explicit standalone target", () => {
+    expect(TARGETABLE_CASES).toContain("owner_stop_latch");
+    expect(isOwnerStopLatchTargeted("owner_stop_latch")).toBe(true);
+    expect(isOwnerStopLatchTargeted(undefined)).toBe(false);
+    expect(isOwnerStopLatchTargeted("parallel_dialogue_stop")).toBe(false);
+    expect(
+      isCaseSelectedForTarget("owner_stop_latch", "owner_stop_latch"),
+    ).toBe(true);
+    for (const unrelatedCase of [
+      "autonomous_life",
+      "parallel_dialogue_stop",
+      "integrated_result",
+    ]) {
+      expect(isCaseSelectedForTarget("owner_stop_latch", unrelatedCase)).toBe(
+        false,
+      );
+    }
+  });
+
   it("runs the owner door return case without unrelated prerequisites", () => {
     expect(TARGETABLE_CASES).toContain("owner_return_through_door");
     expect(
