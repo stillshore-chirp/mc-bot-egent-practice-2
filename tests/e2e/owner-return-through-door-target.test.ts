@@ -9,6 +9,7 @@ import {
   createOwnerReturnRequestSettlementOnce,
   createOwnerReturnApplicationWithBodyCapture,
   createOwnerReturnRequestTracking,
+  ownerReturnProposalDisposition,
   isOwnerProposalProgressable,
   ownerReturnAcceptanceEvidenceConfirmed,
   ownerReturnRequestGateEnabled,
@@ -242,6 +243,36 @@ describe("owner return through door targeted E2E case", () => {
     }
     expect(isOwnerProposalProgressable("adopted", false)).toBe(false);
     expect(isOwnerProposalProgressable("compromised", false)).toBe(false);
+  });
+
+  it("uses the proposal status enum when the Japanese resolution is explanatory", () => {
+    const proposals = [
+      {
+        status: "adopted",
+        resolution: "提案された方針を採用して帰還します。",
+      },
+      {
+        status: "compromised",
+        resolution: "条件を一部調整して帰還します。",
+      },
+      {
+        status: "declined",
+        resolution: "今回はこの提案を実行しません。",
+      },
+      {
+        status: "pending",
+        resolution: "危険がないか確認してから判断します。",
+      },
+    ] as const;
+
+    for (const proposal of proposals) {
+      const disposition = ownerReturnProposalDisposition(proposal);
+      expect(disposition).toBe(proposal.status);
+      expect(isOwnerProposalProgressable(disposition, true)).toBe(
+        proposal.status === "adopted" || proposal.status === "compromised",
+      );
+    }
+    expect(ownerReturnProposalDisposition(undefined)).toBe("unknown");
   });
 
   it("requires matching owner-side arrival, distance, and an open door", () => {

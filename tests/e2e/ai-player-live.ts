@@ -9210,15 +9210,16 @@ function ownerReturnDistanceBucket(
   return distance <= 1.75 ? "within_1_75" : "over_1_75";
 }
 
-function ownerReturnProposalDisposition(
-  proposal: PlayerEvidence["proposals"][number] | undefined,
+export function ownerReturnProposalDisposition(
+  proposal: Pick<PlayerEvidence["proposals"][number], "status"> | undefined,
 ): OwnerReturnProposalDisposition {
-  const status = (proposal?.resolution ?? proposal?.status ?? "").toLowerCase();
-  if (status.includes("declin")) return "declined";
-  if (status.includes("compromis")) return "compromised";
-  if (status.includes("adopt") || status.includes("accept")) return "adopted";
-  if (status.includes("pending")) return "pending";
-  return "unknown";
+  const status = proposal?.status;
+  return status === "pending" ||
+    status === "adopted" ||
+    status === "compromised" ||
+    status === "declined"
+    ? status
+    : "unknown";
 }
 
 export function isOwnerProposalProgressable(
