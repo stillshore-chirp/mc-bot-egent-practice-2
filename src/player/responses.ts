@@ -160,6 +160,8 @@ export interface RunPlayerAgentInput {
   readonly signal?: AbortSignal;
   /** Stop processing a completed response when its Purpose thought is stale. */
   readonly shouldStopAfterResponse?: () => boolean;
+  /** Tracks only the provider HTTP wait, excluding tool and observation work. */
+  readonly onResponsesRequestState?: (active: boolean) => void;
   readonly maxRounds?: number;
   /** Restrict a formatting-only request from invoking tools. */
   readonly toolChoice?: "auto" | "none";
@@ -269,6 +271,7 @@ export async function runPlayerAgent(
   for (let round = 0; round < maxRounds; round += 1) {
     input.signal?.throwIfAborted();
     input.beforeCall?.();
+    input.onResponsesRequestState?.(true);
     const started = performance.now();
     let response: Response;
     const requestInputChars = safeSerializedLength(messages);
@@ -335,15 +338,19 @@ export async function runPlayerAgent(
         compactionItemPresent: false,
         toolCalls: [],
       });
-      input.onCall?.({
-        calls: 1,
-        inputTokens: 0,
-        outputTokens: 0,
-        latencyMs: Math.round(performance.now() - started),
-        toolCalls,
-        usageUnknown: true,
-        usageUnknownReason: "request_error",
-      });
+      try {
+        input.onCall?.({
+          calls: 1,
+          inputTokens: 0,
+          outputTokens: 0,
+          latencyMs: Math.round(performance.now() - started),
+          toolCalls,
+          usageUnknown: true,
+          usageUnknownReason: "request_error",
+        });
+      } finally {
+        input.onResponsesRequestState?.(false);
+      }
       throw error;
     }
     calls += 1;
@@ -351,19 +358,24 @@ export async function runPlayerAgent(
     latencyMs += elapsed;
     inputTokens += safeCount(response.usage?.input_tokens);
     outputTokens += safeCount(response.usage?.output_tokens);
-    input.onCall?.({
-      calls: 1,
-      inputTokens: safeCount(response.usage?.input_tokens),
-      outputTokens: safeCount(response.usage?.output_tokens),
-      latencyMs: elapsed,
-      toolCalls: 0,
-      ...(response.usage === undefined
-        ? {
-            usageUnknown: true,
-            usageUnknownReason: "response_usage_missing" as const,
-          }
-        : {}),
-    });
+    try {
+      input.onCall?.({
+        calls: 1,
+        inputTokens: safeCount(response.usage?.input_tokens),
+        outputTokens: safeCount(response.usage?.output_tokens),
+        latencyMs: elapsed,
+        toolCalls: 0,
+        ...(response.usage === undefined
+          ? {
+              usageUnknown: true,
+              usageUnknownReason: "response_usage_missing" as const,
+            }
+          : {}),
+      });
+    } finally {
+      // Report settled only after the response usage has been recorded.
+      input.onResponsesRequestState?.(false);
+    }
     const responseStatus = response.status ?? "unknown";
     const activityToolCalls: PlayerAgentToolRoundActivity[] = [];
     input.logger.info(
@@ -646,7 +658,11 @@ function classifyRequestErrorCause(
   if (signal?.aborted !== true) return "request_failed";
   const reason: unknown = signal.reason;
   const message = reason instanceof Error ? reason.message : "";
-  if (message === "owner_proposal_preempted_thought") return "owner_proposal";
+  if (
+    message === "owner_proposal_preempted_thought" ||
+    message === "owner_proposal_settlement_timeout"
+  )
+    return "owner_proposal";
   if (
     message === "owner_stop" ||
     message === "autonomy_stopped" ||
