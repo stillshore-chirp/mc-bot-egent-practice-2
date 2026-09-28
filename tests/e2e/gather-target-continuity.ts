@@ -94,17 +94,15 @@ function resolvedGatherTargetProposalIds(input: {
       )
       .map(({ id }) => id),
     ...input.judgments
-      .filter(
-        (judgment): judgment is ResolvedGatherTargetJudgment => {
-          const { proposalId, proposalDisposition } = judgment;
-          return (
-            proposalId !== undefined &&
-            input.proposalIds.has(proposalId) &&
-            (proposalDisposition === "adopted" ||
-              proposalDisposition === "compromised")
-          );
-        },
-      )
+      .filter((judgment): judgment is ResolvedGatherTargetJudgment => {
+        const { proposalId, proposalDisposition } = judgment;
+        return (
+          proposalId !== undefined &&
+          input.proposalIds.has(proposalId) &&
+          (proposalDisposition === "adopted" ||
+            proposalDisposition === "compromised")
+        );
+      })
       .map(({ proposalId }) => proposalId),
   ]);
 }

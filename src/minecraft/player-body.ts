@@ -68,6 +68,7 @@ const placeServerUpdateGraceMs = 5_000;
 const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
 const itemCollectionVisibilityGraceMs = 1_000;
+const itemCollectionInventoryObservationGraceMs = 1_000;
 // GoalNear evaluates floored block nodes; radius one includes adjacent nodes as goals.
 const itemCollectionGoalRange = 1;
 const itemCollectionPickupDistance = 1.25;
@@ -277,6 +278,7 @@ interface ActiveOperation {
     readonly outputCount: number;
   };
   fishingCollectedItem?: { readonly name: string; readonly count: number };
+  itemCollectionItem?: { readonly name: string };
   targetHitObserved?: boolean;
   targetDiedObserved?: boolean;
   itemCollectionOutcome?: PlayerItemCollectionOutcome;
@@ -702,8 +704,15 @@ function captureItemCollectionEvidence(
   if (operation.kind !== "collect_item") return undefined;
   const targetId = operation.entityId;
   const onPlayerCollect = (collector: Entity, collected: Entity): void => {
-    if (collector.id === bot.entity.id && collected.id === targetId)
-      active.itemCollectionOutcome = "collected";
+    if (collector.id !== bot.entity.id || collected.id !== targetId) return;
+    active.itemCollectionOutcome = "collected";
+    try {
+      const item = collected.getDroppedItem();
+      if (item !== null && item.name.length > 0)
+        active.itemCollectionItem = { name: item.name };
+    } catch {
+      // Keep the pickup event, but do not infer an item identity from bad metadata.
+    }
   };
   bot.on("playerCollect", onPlayerCollect);
   return () => bot.removeListener("playerCollect", onPlayerCollect);
@@ -718,8 +727,17 @@ function operationEvidence(
   active: ActiveOperation,
 ): boolean {
   if (operation.kind === "attack") return active.targetHitObserved === true;
-  if (operation.kind === "collect_item")
-    return active.itemCollectionOutcome === "collected";
+  if (operation.kind === "collect_item") {
+    const collectedItem = active.itemCollectionItem;
+    return (
+      active.itemCollectionOutcome === "collected" &&
+      collectedItem !== undefined &&
+      before !== null &&
+      after !== null &&
+      countNamedItem(after, collectedItem.name) >
+        countNamedItem(before, collectedItem.name)
+    );
+  }
   if (before === null || after === null) return false;
   const beforePos = before.self.position;
   const afterPos = after.self.position;
@@ -1403,6 +1421,13 @@ export class MineflayerPlayerBody implements PlayerBody {
             before,
             active,
           );
+        if (operation.kind === "collect_item")
+          await this.waitForItemCollectionInventoryConfirmation(
+            bot,
+            operation,
+            before,
+            active,
+          );
         if (operation.kind === "dig" && blockEvidence !== undefined)
           await blockEvidence.waitForTargetAirUpdate(
             controller.signal,
@@ -1456,8 +1481,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     );
     const interrupted = controller.signal.aborted && !active.timedOut;
     const recoveryRequired = !active.actionSettled;
-    const observedEffect =
-      operation.kind === "attack" && active.targetHitObserved === true
+    const observedEffect = confirmed
+      ? operation.kind === "attack" && active.targetHitObserved === true
         ? {
             type:
               active.targetDiedObserved === true
@@ -1471,7 +1496,8 @@ export class MineflayerPlayerBody implements PlayerBody {
               type: "item_collected" as const,
               entityId: operation.entityId,
             }
-          : undefined;
+          : undefined
+      : undefined;
     const itemCollectionOutcome =
       operation.kind !== "collect_item"
         ? undefined
@@ -1487,13 +1513,15 @@ export class MineflayerPlayerBody implements PlayerBody {
             ? "Mineflayer observed this player damage the target and then observed the target die."
             : "Mineflayer observed this player damage the target; target death was not observed."
           : operation.kind === "collect_item"
-            ? "Mineflayer observed this player collect the requested item entity."
+            ? "Mineflayer observed this player collect the requested item entity and the matching inventory count increased."
             : "Observed post-action state confirms the requested effect.";
     } else if (active.timedOut) {
       status = "unverified";
       detail =
         operation.kind === "collect_item"
-          ? "The bounded item collection deadline expired without an observed pickup."
+          ? active.itemCollectionOutcome === "collected"
+            ? "A matching pickup event was observed, but the matching inventory increase was not confirmed before the bounded deadline."
+            : "The bounded item collection deadline expired without an observed pickup."
           : "The bounded action wait expired; the requested world effect was not confirmed.";
     } else if (interrupted) {
       status = "interrupted";
@@ -1503,6 +1531,13 @@ export class MineflayerPlayerBody implements PlayerBody {
     } else if (commandError !== undefined) {
       status = "failed";
       detail = errorDetail(commandError);
+    } else if (
+      operation.kind === "collect_item" &&
+      active.itemCollectionOutcome === "collected"
+    ) {
+      status = "unverified";
+      detail =
+        "A matching pickup event was observed, but the matching inventory increase was not confirmed.";
     } else {
       status = "unverified";
       detail =
@@ -1605,6 +1640,39 @@ export class MineflayerPlayerBody implements PlayerBody {
         consumeEffectObservationPollTicks,
         active.controller.signal,
       );
+    }
+  }
+
+  private async waitForItemCollectionInventoryConfirmation(
+    bot: Bot,
+    operation: Extract<PlayerOperation, { kind: "collect_item" }>,
+    before: PlayerBodyObservation | null,
+    active: ActiveOperation,
+  ): Promise<void> {
+    if (
+      before === null ||
+      active.itemCollectionOutcome !== "collected" ||
+      active.itemCollectionItem === undefined
+    )
+      return;
+
+    const finalAttempt = Math.ceil(
+      itemCollectionInventoryObservationGraceMs / itemCollectionPollMs,
+    );
+    for (let attempt = 0; attempt <= finalAttempt; attempt += 1) {
+      if (
+        operationEvidence(
+          bot,
+          operation,
+          before,
+          this.safeObserve(bot),
+          new Map<string, ServerBlockUpdate>(),
+          active,
+        )
+      )
+        return;
+      if (attempt === finalAttempt) return;
+      await waitForItemCollectionPoll(active.controller.signal);
     }
   }
 
