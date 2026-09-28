@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isGatherMultiTargetCaseSelected,
   isCaseSelectedForTarget,
   TARGETABLE_CASES,
 } from "../e2e/target-case-selection.js";
@@ -93,8 +94,39 @@ describe("targeted E2E case selection", () => {
     ).toBe(false);
   });
 
+  it("runs the multi-target gather case without unrelated prerequisites", () => {
+    expect(TARGETABLE_CASES).toContain("gather_multi_target_continuity");
+    expect(
+      isCaseSelectedForTarget(
+        "gather_multi_target_continuity",
+        "gather_multi_target_continuity",
+      ),
+    ).toBe(true);
+    for (const caseId of [
+      "autonomous_life",
+      "learning_reuse",
+      "unknown_composite",
+      "integrated_result",
+    ]) {
+      expect(
+        isCaseSelectedForTarget("gather_multi_target_continuity", caseId),
+      ).toBe(false);
+    }
+  });
+
+  it("selects the gather request gate for targeted and all-case runs", () => {
+    expect(isGatherMultiTargetCaseSelected(undefined)).toBe(true);
+    expect(
+      isGatherMultiTargetCaseSelected("gather_multi_target_continuity"),
+    ).toBe(true);
+    expect(isGatherMultiTargetCaseSelected("damage_response")).toBe(false);
+  });
+
   it("selects every case when no target is configured", () => {
     expect(isCaseSelectedForTarget(undefined, "autonomous_life")).toBe(true);
+    expect(
+      isCaseSelectedForTarget(undefined, "gather_multi_target_continuity"),
+    ).toBe(true);
     expect(isCaseSelectedForTarget(undefined, "integrated_result")).toBe(true);
   });
 });

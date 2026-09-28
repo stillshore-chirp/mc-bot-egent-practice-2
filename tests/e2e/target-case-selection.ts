@@ -2,6 +2,7 @@ export const TARGETABLE_CASES = [
   "owner_return_through_door",
   "game_action_discretion",
   "food_intent_continuity",
+  "gather_multi_target_continuity",
   "damage_response",
   "no_food_replan",
   "learning_reuse",
@@ -31,4 +32,10 @@ export function isCaseSelectedForTarget(
 ): boolean {
   if (targetCase === undefined || caseId === targetCase) return true;
   return TARGET_CASE_PREREQUISITES[targetCase]?.includes(caseId) === true;
+}
+
+export function isGatherMultiTargetCaseSelected(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return isCaseSelectedForTarget(targetCase, "gather_multi_target_continuity");
 }

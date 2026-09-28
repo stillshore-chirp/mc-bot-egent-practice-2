@@ -49,6 +49,23 @@ import {
 } from "../../src/player/responses.js";
 import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
+  GATHER_MULTI_TARGET_ITEMS,
+  readGatherMultiTargetInventory,
+  type GatherMultiTargetItem,
+} from "./gather-multi-target-acceptance.js";
+import {
+  classifyGatherDropReadbackFailure,
+  classifyGatherDropReadbackReply,
+  gatherFixtureCleanupProofConfirmed,
+  type GatherDropReadbackClass,
+} from "./gather-drop-readback.js";
+import {
+  countCompletedGatherActions,
+  gatherTargetAcceptedGoalCount,
+  hasResolvedGatherTargetOwnerGoal,
+  newGatherTargetProposalIds,
+} from "./gather-target-continuity.js";
+import {
   explainsFullHunger,
   hasNewConsumeDecisionSince,
   hasNewNonConsumingDecisionSince,
@@ -145,6 +162,7 @@ import {
 } from "./learning-reuse-acceptance.js";
 import {
   isCaseSelectedForTarget,
+  isGatherMultiTargetCaseSelected,
   TARGETABLE_CASES,
   type TargetableCase,
 } from "./target-case-selection.js";
@@ -237,6 +255,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 20, totalTokens: 190_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
+  gather_multi_target_continuity: { llmCalls: 32, totalTokens: 300_000 },
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: { llmCalls: 24, totalTokens: 120_000 },
@@ -254,6 +273,7 @@ const CASE_DEADLINES = {
   skill_exchange: 6 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
+  gather_multi_target_continuity: 8 * 60_000,
   damage_response: 8 * 60_000,
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: 7 * 60_000,
@@ -2142,6 +2162,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "parallel_dialogue_stop"
       ? (state.parallelDiagnostic ?? {})
       : {}),
+    ...(caseId === "gather_multi_target_continuity"
+      ? gatherMultiTargetSafeEvidence(state)
+      : {}),
     ...(caseId === "damage_response" &&
     state.damageResponseCleanupFailureCode !== undefined
       ? { cleanupFailureCode: state.damageResponseCleanupFailureCode }
@@ -2298,6 +2321,41 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "game_action_discretion"
       ? gameActionPlacementCandidateEvidence(state)
       : {}),
+  };
+}
+
+function gatherMultiTargetSafeEvidence(state: RunState): SafeEvidence {
+  const gate = state.gatherMultiTargetRequestGate;
+  return {
+    ...(state.gatherMultiTargetRequestedCounts === undefined
+      ? {}
+      : {
+          gatherRequestedOakLogCount:
+            state.gatherMultiTargetRequestedCounts.oak_log,
+          gatherRequestedBirchLogCount:
+            state.gatherMultiTargetRequestedCounts.birch_log,
+        }),
+    ...(state.gatherMultiTargetDiagnostic ?? {}),
+    ...(gate === undefined
+      ? {}
+      : {
+          gatherAcceptanceLatched: gate.latched,
+          gatherAcceptedRequestsStarted: gate.requestsStarted,
+          gatherAcceptedRequestsRecorded: gate.requestsRecorded,
+          gatherAcceptedRequestsInFlight: gate.inFlightRequests,
+          gatherProviderRequestsBlockedAfterLatch:
+            gate.providerRequestsBlockedAfterLatch,
+        }),
+  };
+}
+
+function updateGatherMultiTargetDiagnostic(
+  state: RunState,
+  patch: SafeEvidence,
+): void {
+  state.gatherMultiTargetDiagnostic = {
+    ...(state.gatherMultiTargetDiagnostic ?? {}),
+    ...patch,
   };
 }
 
@@ -2895,6 +2953,12 @@ interface RunState {
   ownerReturnRequestSettlement?: () => Promise<AcceptedProviderRequestSettleStatus>;
   ownerReturnRequestSettlementStatus?: AcceptedProviderRequestSettleStatus;
   ownerReturnCaseDeadlineAt?: number;
+  gatherMultiTargetRequestGate?: AcceptedProviderRequestGate;
+  gatherMultiTargetCaseUsageStart?: Counters;
+  gatherMultiTargetRequestedCounts?: Readonly<
+    Record<GatherMultiTargetItem, number | "unknown">
+  >;
+  gatherMultiTargetDiagnostic?: SafeEvidence;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -4888,6 +4952,14 @@ async function main(): Promise<void> {
         activeLearningLogs = [];
       }
     });
+
+    const gatherResult = await recordCase(
+      state,
+      "gather_multi_target_continuity",
+      CASE_DEADLINES.gather_multi_target_continuity,
+      requireLiveContext(),
+      async (context) => runGatherMultiTargetContinuityCase(state, context),
+    );
 
     const skillQualityResult = await recordCase(
       state,
@@ -7461,6 +7533,7 @@ async function main(): Promise<void> {
           observationResult,
           memoryResult,
           learningResult,
+          gatherResult,
           skillQualityResult,
           exchangeResult,
           discretionResult,
@@ -7728,6 +7801,25 @@ async function prepareRun(): Promise<RunState> {
           "incomplete",
           "NO_FOOD_CONTINUITY_PROVIDER_REQUEST_BLOCKED",
         );
+      }
+      if (state.gatherMultiTargetRequestGate !== undefined) {
+        state.gatherMultiTargetRequestGate.beforeCall(
+          () => {
+            try {
+              admission.beforeCall();
+            } catch (error) {
+              if (error instanceof LlmCallAdmissionError)
+                throw new HarnessError("incomplete", error.code);
+              throw error;
+            }
+          },
+          () =>
+            new HarnessError(
+              "incomplete",
+              "GATHER_MULTI_TARGET_PROVIDER_REQUEST_LATCHED",
+            ),
+        );
+        return;
       }
       if (state.targetCase === "no_food_replan") {
         const caseStart = state.noFoodReplanCaseUsageStart;
@@ -9652,6 +9744,553 @@ export function ownerReturnAcceptanceEvidenceConfirmed(
     ownerMoveJudgmentObserved &&
     ownerReturnArrivalConfirmed(sample)
   );
+}
+
+interface GatherMultiTargetFixture {
+  readonly oakLog: BlockPosition;
+  readonly birchLog: BlockPosition;
+}
+
+const GATHER_FIXTURE_JAVA_YAW = 180;
+
+async function findGatherMultiTargetFixture(
+  rcon: LocalRcon,
+  origin: Position,
+): Promise<GatherMultiTargetFixture> {
+  for (const radius of [3, 4, 5, 6]) {
+    const fixture = {
+      oakLog: fixturePoint(origin, -1, -radius, Math.floor(origin.y)),
+      birchLog: fixturePoint(origin, 1, -radius, Math.floor(origin.y)),
+    };
+    let sitesAvailable = true;
+    for (const target of [fixture.oakLog, fixture.birchLog]) {
+      if (
+        !(await isBlock(rcon, target, "air")) ||
+        !(await isBlock(rcon, { ...target, y: target.y + 1 }, "air")) ||
+        !(await isBlock(rcon, { ...target, y: target.y - 1 }, "stone"))
+      ) {
+        sitesAvailable = false;
+        break;
+      }
+    }
+    if (!sitesAvailable) continue;
+    try {
+      for (const target of [fixture.oakLog, fixture.birchLog]) {
+        await verifyUnknownFixtureSightline(
+          rcon,
+          { x: origin.x, y: origin.y + 1.62, z: origin.z },
+          target,
+          GATHER_FIXTURE_JAVA_YAW,
+          "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW",
+          "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED",
+        );
+      }
+      return fixture;
+    } catch (error) {
+      if (
+        error instanceof HarnessError &&
+        (error.code === "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW" ||
+          error.code === "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED")
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  incomplete("GATHER_MULTI_TARGET_FIXTURE_SITE_UNAVAILABLE");
+}
+
+async function readGatherMultiTargetInventoryCounts(
+  state: RunState,
+  rcon: LocalRcon,
+  botName: string,
+): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
+  const result = await readGatherMultiTargetInventory(() =>
+    rcon.command(`data get entity ${botName} Inventory`),
+  );
+  if (result.reason !== "parsed") {
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherInventoryReadAvailable: false,
+      gatherInventoryReadReason: result.reason,
+    });
+    incomplete("GATHER_MULTI_TARGET_INVENTORY_ORACLE_UNAVAILABLE");
+  }
+  return result.counts;
+}
+
+async function cleanupGatherMultiTargetFixture(
+  state: RunState,
+  rcon: LocalRcon,
+  botName: string,
+  fixture: GatherMultiTargetFixture,
+): Promise<void> {
+  updateGatherMultiTargetDiagnostic(state, {
+    gatherFixtureCleanupConfirmed: false,
+  });
+  const dropReadbacks: GatherDropReadbackClass[] = [];
+  let sourceBlocksAbsent = true;
+  for (const [item, target] of [
+    ["oak_log", fixture.oakLog],
+    ["birch_log", fixture.birchLog],
+  ] as const) {
+    await rcon.command(
+      `fill ${target.x} ${target.y} ${target.z} ${target.x} ${target.y} ${target.z} air replace ${item}`,
+    );
+    await rcon.command(
+      `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} run kill @e[type=minecraft:item,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`,
+    );
+    const nearbyDrops = `@e[type=minecraft:item,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`;
+    const singleNearbyDrop = `@e[type=minecraft:item,distance=..3,limit=1,nbt={Item:{id:"minecraft:${item}"}}]`;
+    let dropReadback: GatherDropReadbackClass;
+    try {
+      const reply = await rcon.command(
+        `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${nearbyDrops} run data get entity ${singleNearbyDrop} Pos`,
+      );
+      dropReadback = classifyGatherDropReadbackReply(reply);
+    } catch (error) {
+      dropReadback = classifyGatherDropReadbackFailure(
+        error instanceof HarnessError ? error.code : undefined,
+      );
+    }
+    dropReadbacks.push(dropReadback);
+    updateGatherMultiTargetDiagnostic(
+      state,
+      item === "oak_log"
+        ? { gatherOakFixtureDropReadback: dropReadback }
+        : { gatherBirchFixtureDropReadback: dropReadback },
+    );
+    sourceBlocksAbsent =
+      sourceBlocksAbsent && !(await isBlock(rcon, target, item));
+  }
+  for (const item of GATHER_MULTI_TARGET_ITEMS) {
+    await rcon.command(`clear ${botName} minecraft:${item}`);
+  }
+  const inventory = await readGatherMultiTargetInventory(() =>
+    rcon.command(`data get entity ${botName} Inventory`),
+  );
+  const fixtureInventoryEmpty =
+    inventory.reason === "parsed" &&
+    GATHER_MULTI_TARGET_ITEMS.every((item) => inventory.counts[item] === 0);
+  if (
+    !gatherFixtureCleanupProofConfirmed(
+      dropReadbacks,
+      sourceBlocksAbsent,
+      fixtureInventoryEmpty,
+    )
+  ) {
+    incomplete("GATHER_MULTI_TARGET_FIXTURE_CLEANUP_UNVERIFIED");
+  }
+  updateGatherMultiTargetDiagnostic(state, {
+    gatherFixtureCleanupConfirmed: true,
+  });
+}
+
+async function runGatherMultiTargetContinuityCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  let fixture: GatherMultiTargetFixture | undefined;
+  try {
+    const quiet = await observeForPlayer(
+      context,
+      30_000,
+      (player) => !player.stopped && !isOperationActive(player),
+    );
+    if (quiet === undefined)
+      incomplete("GATHER_MULTI_TARGET_PRECONDITION_NOT_QUIET");
+
+    await removeAutonomousResourceFixture(context.rcon);
+    const origin = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    const activeFixture = await findGatherMultiTargetFixture(
+      context.rcon,
+      origin,
+    );
+    fixture = activeFixture;
+    for (const item of GATHER_MULTI_TARGET_ITEMS) {
+      await context.rcon.command(`clear ${context.botName} minecraft:${item}`);
+    }
+    const baseline = await readGatherMultiTargetInventoryCounts(
+      state,
+      context.rcon,
+      context.botName,
+    );
+    if (GATHER_MULTI_TARGET_ITEMS.some((item) => baseline[item] !== 0))
+      incomplete("GATHER_MULTI_TARGET_INVENTORY_NOT_EMPTY");
+
+    await context.rcon.command(
+      `setblock ${activeFixture.oakLog.x} ${activeFixture.oakLog.y} ${activeFixture.oakLog.z} oak_log`,
+    );
+    await context.rcon.command(
+      `setblock ${activeFixture.birchLog.x} ${activeFixture.birchLog.y} ${activeFixture.birchLog.z} birch_log`,
+    );
+    if (
+      !(await isBlock(context.rcon, activeFixture.oakLog, "oak_log")) ||
+      !(await isBlock(context.rcon, activeFixture.birchLog, "birch_log"))
+    ) {
+      incomplete("GATHER_MULTI_TARGET_FIXTURE_NOT_CONFIRMED");
+    }
+    await context.rcon.command(
+      `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
+    );
+    const rotation = await readLearningFixtureRotation(
+      context.rcon,
+      context.botName,
+    );
+    if (
+      rotation === undefined ||
+      angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
+      Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
+    ) {
+      incomplete("GATHER_MULTI_TARGET_ORIENTATION_NOT_CONFIRMED");
+    }
+    const fixtureConfiguredAt = Date.now();
+    const visible = await observeForPlayer(context, 20_000, (player) => {
+      const observedAt = Date.parse(player.lastObservation?.observedAt ?? "");
+      const names = player.lastObservation?.visibleBlockNames ?? [];
+      return (
+        Number.isFinite(observedAt) &&
+        observedAt >= fixtureConfiguredAt &&
+        names.includes("oak_log") &&
+        names.includes("birch_log")
+      );
+    });
+    if (visible === undefined)
+      incomplete("GATHER_MULTI_TARGET_BODY_FIXTURE_NOT_VISIBLE");
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherFixtureConfigured: true,
+      gatherFreshBodyObservationConfirmed: true,
+      gatherRequestedOakLogCount: "unknown",
+      gatherRequestedBirchLogCount: "unknown",
+      gatherRemainingQuantity: "unknown",
+      gatherInventoryBaselineOakLogCount: baseline.oak_log,
+      gatherInventoryBaselineBirchLogCount: baseline.birch_log,
+    });
+
+    const beforeTask = playerOf(await collect(context.runtime.app));
+    const priorProposalIds = new Set(beforeTask.proposals.map(({ id }) => id));
+    const priorOutcomeIds = new Set(
+      beforeTask.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    const observedOutcomes = new Map<
+      string,
+      PlayerEvidence["recentOutcomes"][number]
+    >();
+    const rememberOutcomes = (player: PlayerEvidence): void => {
+      for (const outcome of player.recentOutcomes) {
+        if (
+          !priorOutcomeIds.has(outcome.operationId) &&
+          (outcome.kind === "dig" || outcome.kind === "collect_item")
+        ) {
+          observedOutcomes.set(outcome.operationId, outcome);
+        }
+      }
+    };
+
+    sendChat(context.owner, "近くのオークの原木を集めてきて。進め方は任せる。");
+    const initialIntent = await observeForPlayer(context, 45_000, (player) => {
+      const proposalIds = newGatherTargetProposalIds({
+        item: "oak_log",
+        proposals: player.proposals,
+        goals: player.goals,
+        previousProposalIds: priorProposalIds,
+      });
+      return (
+        proposalIds.length === 1 &&
+        hasResolvedGatherTargetOwnerGoal({
+          proposals: player.proposals,
+          judgments: player.recentJudgments,
+          goals: player.goals,
+          proposalIds: new Set(proposalIds),
+        })
+      );
+    });
+    if (initialIntent === undefined)
+      incomplete("GATHER_MULTI_TARGET_INITIAL_OAK_GOAL_NOT_ACCEPTED");
+    const oakGoalProposalIds = new Set(
+      newGatherTargetProposalIds({
+        item: "oak_log",
+        proposals: initialIntent.proposals,
+        goals: initialIntent.goals,
+        previousProposalIds: priorProposalIds,
+      }),
+    );
+    const oakGoalCount = gatherTargetAcceptedGoalCount({
+      item: "oak_log",
+      proposals: initialIntent.proposals,
+      judgments: initialIntent.recentJudgments,
+      goals: initialIntent.goals,
+      proposalIds: oakGoalProposalIds,
+    });
+    state.gatherMultiTargetRequestedCounts = {
+      oak_log: oakGoalCount ?? "unknown",
+      birch_log: "unknown",
+    };
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherRequestedOakLogCount: oakGoalCount ?? "unknown",
+      gatherRequestedBirchLogCount: "unknown",
+    });
+
+    let firstSampleAt = 0;
+    const firstOakProgress = await observeForPlayer(
+      context,
+      120_000,
+      async (player) => {
+        rememberOutcomes(player);
+        const successfulDig = [...observedOutcomes.values()].some(
+          (outcome) =>
+            outcome.kind === "dig" && outcome.status === "successful",
+        );
+        if (!successfulDig || Date.now() - firstSampleAt < 1_200) return false;
+        firstSampleAt = Date.now();
+        return (
+          !(await isBlock(context.rcon, activeFixture.oakLog, "oak_log")) &&
+          (await isBlock(context.rcon, activeFixture.birchLog, "birch_log"))
+        );
+      },
+    );
+    if (firstOakProgress === undefined)
+      incomplete("GATHER_MULTI_TARGET_FIRST_OAK_PROGRESS_NOT_CONFIRMED");
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherInitialOakBodyDigAndServerBlockConfirmed: true,
+    });
+
+    const beforeFollowup = playerOf(await collect(context.runtime.app));
+    rememberOutcomes(beforeFollowup);
+    const outcomeIdsBeforeFollowup = new Set(
+      beforeFollowup.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    const proposalIdsBeforeFollowup = new Set(
+      beforeFollowup.proposals.map(({ id }) => id),
+    );
+    const followupSentAt = Date.now();
+    sendChat(context.owner, "白樺の原木もお願い。");
+    let birchProposalIds: readonly string[] = [];
+    let birchAcceptedAt = Number.NaN;
+    const birchIntent = await observeForPlayer(context, 45_000, (player) => {
+      birchProposalIds = newGatherTargetProposalIds({
+        item: "birch_log",
+        proposals: player.proposals,
+        goals: player.goals,
+        previousProposalIds: proposalIdsBeforeFollowup,
+      });
+      if (
+        birchProposalIds.length !== 1 ||
+        !hasResolvedGatherTargetOwnerGoal({
+          proposals: player.proposals,
+          judgments: player.recentJudgments,
+          goals: player.goals,
+          proposalIds: new Set(birchProposalIds),
+        })
+      ) {
+        return false;
+      }
+      const accepted = player.recentJudgments.findLast(
+        ({ proposalId, proposalDisposition, decidedAt }) =>
+          birchProposalIds.includes(proposalId ?? "") &&
+          (proposalDisposition === "adopted" ||
+            proposalDisposition === "compromised") &&
+          Date.parse(decidedAt ?? "") >= followupSentAt,
+      );
+      if (accepted === undefined) return false;
+      birchAcceptedAt = Date.parse(accepted.decidedAt ?? "");
+      return Number.isFinite(birchAcceptedAt);
+    });
+    if (birchIntent === undefined)
+      incomplete("GATHER_MULTI_TARGET_BIRCH_FOLLOWUP_NOT_ACCEPTED");
+    const birchGoalCount = gatherTargetAcceptedGoalCount({
+      item: "birch_log",
+      proposals: birchIntent.proposals,
+      judgments: birchIntent.recentJudgments,
+      goals: birchIntent.goals,
+      proposalIds: new Set(birchProposalIds),
+    });
+    state.gatherMultiTargetRequestedCounts = {
+      oak_log: state.gatherMultiTargetRequestedCounts.oak_log,
+      birch_log: birchGoalCount ?? "unknown",
+    };
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherBirchFollowupOwnerGoalAccepted: true,
+      gatherFollowupAcceptedJudgmentObserved: true,
+      gatherRequestedBirchLogCount: birchGoalCount ?? "unknown",
+    });
+
+    const postFollowupOutcomes = new Map<
+      string,
+      PlayerEvidence["recentOutcomes"][number]
+    >();
+    let finalInventory:
+      Readonly<Record<GatherMultiTargetItem, number>> | undefined;
+    let finalOakRemoved = false;
+    let finalBirchRemoved = false;
+    let lastSampleAt = 0;
+    const complete = await observeForPlayer(
+      context,
+      180_000,
+      async (player) => {
+        rememberOutcomes(player);
+        for (const outcome of player.recentOutcomes) {
+          if (
+            !outcomeIdsBeforeFollowup.has(outcome.operationId) &&
+            Date.parse(outcome.observedAt ?? "") >= birchAcceptedAt &&
+            (outcome.kind === "dig" || outcome.kind === "collect_item")
+          ) {
+            postFollowupOutcomes.set(outcome.operationId, outcome);
+          }
+        }
+        const bodyPairs = countCompletedGatherActions([
+          ...observedOutcomes.values(),
+        ]);
+        const followupPairs = countCompletedGatherActions([
+          ...postFollowupOutcomes.values(),
+        ]);
+        if (Date.now() - lastSampleAt < 1_200) return false;
+        lastSampleAt = Date.now();
+
+        const inventory = await readGatherMultiTargetInventory(() =>
+          context.rcon.command(`data get entity ${context.botName} Inventory`),
+        );
+        if (inventory.reason !== "parsed") return false;
+        finalInventory = inventory.counts;
+        finalOakRemoved = !(await isBlock(
+          context.rcon,
+          activeFixture.oakLog,
+          "oak_log",
+        ));
+        finalBirchRemoved = !(await isBlock(
+          context.rcon,
+          activeFixture.birchLog,
+          "birch_log",
+        ));
+        return (
+          finalOakRemoved &&
+          finalBirchRemoved &&
+          inventory.counts.oak_log - baseline.oak_log === 1 &&
+          inventory.counts.birch_log - baseline.birch_log === 1 &&
+          bodyPairs >= 2 &&
+          followupPairs >= 1
+        );
+      },
+    );
+    if (complete === undefined || finalInventory === undefined)
+      incomplete("GATHER_MULTI_TARGET_SERVER_AND_BODY_PROGRESS_NOT_CONFIRMED");
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOakLogInventoryDelta: finalInventory.oak_log - baseline.oak_log,
+      gatherBirchLogInventoryDelta:
+        finalInventory.birch_log - baseline.birch_log,
+      gatherOakBlockRemovedByServer: finalOakRemoved,
+      gatherBirchBlockRemovedByServer: finalBirchRemoved,
+      gatherSuccessfulBodyGatherPairs: countCompletedGatherActions([
+        ...observedOutcomes.values(),
+      ]),
+      gatherPostFollowupBodyGatherPairs: countCompletedGatherActions([
+        ...postFollowupOutcomes.values(),
+      ]),
+    });
+    const oakDelta = finalInventory.oak_log - baseline.oak_log;
+    const birchDelta = finalInventory.birch_log - baseline.birch_log;
+    const requestedCounts = state.gatherMultiTargetRequestedCounts ?? {
+      oak_log: "unknown",
+      birch_log: "unknown",
+    };
+    const oakRemaining =
+      typeof requestedCounts.oak_log === "number"
+        ? Math.max(0, requestedCounts.oak_log - oakDelta)
+        : "unknown";
+    const birchRemaining =
+      typeof requestedCounts.birch_log === "number"
+        ? Math.max(0, requestedCounts.birch_log - birchDelta)
+        : "unknown";
+    const goalCountsKnown =
+      typeof requestedCounts.oak_log === "number" &&
+      typeof requestedCounts.birch_log === "number";
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherRemainingOakLogCount: oakRemaining,
+      gatherRemainingBirchLogCount: birchRemaining,
+      gatherRemainingQuantity: !goalCountsKnown
+        ? "unknown"
+        : oakRemaining === 0 && birchRemaining === 0
+          ? "none_by_known_goal_counts"
+          : "known_remaining",
+      gatherGoalCompletionStatus: !goalCountsKnown
+        ? "unknown_target_quantity_unspecified"
+        : oakRemaining === 0 && birchRemaining === 0
+          ? "target_counts_reached"
+          : "target_counts_remaining",
+    });
+
+    const requestGate = state.gatherMultiTargetRequestGate;
+    if (requestGate === undefined)
+      incomplete("GATHER_MULTI_TARGET_ACCEPTANCE_GATE_MISSING");
+    requestGate.latch();
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherAcceptanceLatched: true,
+      gatherProgressExplanationStatus: "unverified_not_sampled",
+    });
+    if (!(await settleGatherMultiTargetProviderRequests(context, state)))
+      incomplete("GATHER_MULTI_TARGET_ACCEPTED_REQUESTS_NOT_SETTLED");
+
+    await cleanupGatherMultiTargetFixture(
+      state,
+      context.rcon,
+      context.botName,
+      activeFixture,
+    );
+    fixture = undefined;
+    return {
+      ...gatherMultiTargetSafeEvidence(state),
+      gatherIndependentServerCountsConfirmed: true,
+      gatherBodyDigAndPickupPairsConfirmed: true,
+      gatherProgressExplanationStatus: "unverified_not_sampled",
+      gatherGoalCompletionStatus: !goalCountsKnown
+        ? "unknown_target_quantity_unspecified"
+        : oakRemaining === 0 && birchRemaining === 0
+          ? "target_counts_reached"
+          : "target_counts_remaining",
+    };
+  } finally {
+    if (fixture !== undefined) {
+      await cleanupGatherMultiTargetFixture(
+        state,
+        context.rcon,
+        context.botName,
+        fixture,
+      );
+    }
+  }
+}
+
+async function settleGatherMultiTargetProviderRequests(
+  context: CaseContext,
+  state: RunState,
+): Promise<boolean> {
+  const gate = state.gatherMultiTargetRequestGate;
+  const usageStart = state.gatherMultiTargetCaseUsageStart;
+  if (gate === undefined || usageStart === undefined || !gate.latched)
+    return false;
+  const deadline = Math.min(
+    Date.now() + 15_000,
+    context.caseDeadlineAt,
+    context.runDeadlineAt,
+  );
+  while (Date.now() < deadline) {
+    const player = playerOf(await collect(context.runtime.app));
+    gate.observeRecordedCalls(
+      subtractCounters(player.counters, usageStart).llmCalls,
+    );
+    if (gate.requestsRecorded > gate.requestsStarted) return false;
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherAcceptedRequestsStarted: gate.requestsStarted,
+      gatherAcceptedRequestsRecorded: gate.requestsRecorded,
+      gatherAcceptedRequestsInFlight: gate.inFlightRequests,
+      gatherProviderRequestsBlockedAfterLatch:
+        gate.providerRequestsBlockedAfterLatch,
+    });
+    if (gate.inFlightRequests === 0) return true;
+    await waitMs(150);
+  }
+  return false;
 }
 
 export function ownerReturnRequestGateEnabled(
@@ -12476,6 +13115,12 @@ async function recordCase(
     );
   } finally {
     state.llmAdmission?.endCase();
+    if (id === "gather_multi_target_continuity") {
+      if (state.gatherMultiTargetRequestGate?.inFlightRequests === 0) {
+        delete state.gatherMultiTargetRequestGate;
+      }
+      delete state.gatherMultiTargetCaseUsageStart;
+    }
   }
 }
 
@@ -12517,6 +13162,25 @@ async function runCase(
         ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
       });
     }
+    if (
+      id === "gather_multi_target_continuity" &&
+      isGatherMultiTargetCaseSelected(state.targetCase)
+    ) {
+      state.gatherMultiTargetCaseUsageStart = initial;
+      state.gatherMultiTargetRequestGate = new AcceptedProviderRequestGate();
+      state.gatherMultiTargetRequestedCounts = {
+        oak_log: "unknown",
+        birch_log: "unknown",
+      };
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherCaseStarted: true,
+        gatherRequestedOakLogCount: "unknown",
+        gatherRequestedBirchLogCount: "unknown",
+        gatherRemainingQuantity: "unknown",
+        gatherGoalCompletionStatus: "unknown_target_quantity_unspecified",
+        gatherProgressExplanationStatus: "unverified_not_sampled",
+      });
+    }
     if (Date.now() >= state.runDeadlineAt) incomplete("RUN_DEADLINE_EXCEEDED");
     const timeoutMs = Math.max(
       1,
@@ -12555,6 +13219,20 @@ async function runCase(
       if (requestGate.inFlightRequests !== 0)
         incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
     }
+    if (id === "gather_multi_target_continuity") {
+      const requestGate = state.gatherMultiTargetRequestGate;
+      if (!requestGate?.latched)
+        incomplete("GATHER_MULTI_TARGET_ACCEPTANCE_NOT_LATCHED");
+      requestGate.observeRecordedCalls(delta.llmCalls);
+      if (
+        requestGate.requestsRecorded > requestGate.requestsStarted ||
+        requestGate.inFlightRequests !== 0
+      ) {
+        incomplete("GATHER_MULTI_TARGET_ACCEPTED_REQUESTS_NOT_SETTLED");
+      }
+      if (delta.usageUnknownCalls > 0)
+        incomplete("GATHER_MULTI_TARGET_USAGE_PARTIAL_OR_UNKNOWN");
+    }
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
     if (delta.usageUnknownCalls > 0) state.usageUncertain = true;
@@ -12590,6 +13268,9 @@ async function runCase(
       evidence: {
         ...evidence,
         ...(id === "no_food_replan" ? noFoodReplanRequestEvidence(state) : {}),
+        ...(id === "gather_multi_target_continuity"
+          ? gatherMultiTargetSafeEvidence(state)
+          : {}),
         ...(id === "owner_return_through_door" &&
         ownerReturnRequestGateEnabled(state.targetCase)
           ? ownerReturnRequestSafeEvidence(state)
@@ -12616,6 +13297,16 @@ async function runCase(
       error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
     const caseStatus =
       error instanceof HarnessError ? error.status : "incomplete";
+    if (
+      id === "gather_multi_target_continuity" &&
+      state.gatherMultiTargetRequestGate !== undefined
+    ) {
+      state.gatherMultiTargetRequestGate.latch();
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherAcceptanceLatched: true,
+        gatherProgressExplanationStatus: "unverified_not_sampled",
+      });
+    }
     const ownerReturnCase =
       id === "owner_return_through_door" &&
       ownerReturnRequestGateEnabled(state.targetCase);
@@ -12774,6 +13465,16 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
             state.ownerReturnCaseUsageStart,
           ).llmCalls;
           state.ownerReturnRequestGate?.observeRecordedCalls(caseCalls);
+        }
+        if (
+          state.gatherMultiTargetRequestGate !== undefined &&
+          state.gatherMultiTargetCaseUsageStart !== undefined
+        ) {
+          const caseCalls = subtractCounters(
+            counters,
+            state.gatherMultiTargetCaseUsageStart,
+          ).llmCalls;
+          state.gatherMultiTargetRequestGate.observeRecordedCalls(caseCalls);
         }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,
