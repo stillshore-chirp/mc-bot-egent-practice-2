@@ -40,6 +40,7 @@ export type GatherMultiTargetInventoryReadResult =
       readonly reason: "parsed";
       readonly parseStage: "parsed";
       readonly counts: Readonly<Record<GatherMultiTargetItem, number>>;
+      readonly stackCounts: Readonly<Record<GatherMultiTargetItem, number>>;
     }
   | {
       readonly reason: Exclude<GatherMultiTargetInventoryReadReason, "parsed">;
@@ -97,6 +98,10 @@ export function parseGatherMultiTargetInventoryReplyDetailed(
     oak_log: 0,
     birch_log: 0,
   };
+  const stackCounts: Record<GatherMultiTargetItem, number> = {
+    oak_log: 0,
+    birch_log: 0,
+  };
   for (const value of root.values) {
     if (value.kind !== "compound")
       return { reason: "structure_invalid", parseStage: "root_invalid" };
@@ -109,12 +114,12 @@ export function parseGatherMultiTargetInventoryReplyDetailed(
     );
     if (target === undefined) continue;
 
-    const stackCounts = value.fields.filter(
+    const stackCountFields = value.fields.filter(
       ({ key }) => key === "count" || key === "Count",
     );
-    const stackCount = stackCounts[0]?.value;
+    const stackCount = stackCountFields[0]?.value;
     if (
-      stackCounts.length !== 1 ||
+      stackCountFields.length !== 1 ||
       stackCount?.kind !== "scalar" ||
       stackCount.quoted ||
       !/^\d+[bBsSlL]?$/u.test(stackCount.value)
@@ -134,13 +139,14 @@ export function parseGatherMultiTargetInventoryReplyDetailed(
         parseStage: "target_count_invalid",
       };
     counts[target] += amount;
+    stackCounts[target] += 1;
     if (!Number.isSafeInteger(counts[target]))
       return {
         reason: "target_count_invalid",
         parseStage: "target_count_invalid",
       };
   }
-  return { reason: "parsed", parseStage: "parsed", counts };
+  return { reason: "parsed", parseStage: "parsed", counts, stackCounts };
 }
 
 /** Read once, returning only safe classification and parsed counts. */
