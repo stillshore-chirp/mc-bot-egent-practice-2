@@ -5149,7 +5149,7 @@ async function main(): Promise<void> {
         await waitForPlayer(context, 120_000, async () => {
           const now = readSkillSnapshot(state.databasePath);
           const currentPlayer = playerOf(await collect(context.runtime.app));
-          const importedActivity = currentPlayer.skillActivity.some(
+          const importedActivity = currentPlayer.skillActivity.find(
             (activity) =>
               activity.kind === "imported" &&
               activity.skillId === exportedSkillId &&
@@ -5157,27 +5157,33 @@ async function main(): Promise<void> {
                 `未信頼の交換用Markdown ${editedName} を知識として取込` &&
               !importActivityKeys.has(skillActivityKey(activity)),
           );
+          if (
+            importedActivity === undefined ||
+            !Number.isSafeInteger(importedActivity.version) ||
+            importedActivity.version <= 0
+          )
+            return false;
           const beforeVersions =
             beforeImport.revisionVersionsBySkill.get(exportedSkillId) ??
             new Set<number>();
           const currentVersions =
             now.revisionVersionsBySkill.get(exportedSkillId) ??
             new Set<number>();
-          const sameSkillRevisionAdvanced = [...currentVersions].some(
-            (version) => !beforeVersions.has(version),
-          );
-          const currentVersion = Math.max(0, ...currentVersions);
-          const currentDefinition = now.revisionDefinitionsBySkill
+          const importedActivityVersionIsNew =
+            currentVersions.has(importedActivity.version) &&
+            !beforeVersions.has(importedActivity.version);
+          const importedActivityDefinition = now.revisionDefinitionsBySkill
             .get(exportedSkillId)
-            ?.get(currentVersion);
+            ?.get(importedActivity.version);
           const editedBodyObserved =
-            currentDefinition?.body.includes(SYNTHETIC_SKILL_EDIT_MARKER) ===
-              true &&
+            importedActivityDefinition?.body.includes(
+              SYNTHETIC_SKILL_EDIT_MARKER,
+            ) === true &&
             now.learnedBodiesBySkill
               .get(exportedSkillId)
               ?.includes(SYNTHETIC_SKILL_EDIT_MARKER) === true;
           const editedConditionObserved =
-            currentDefinition?.conditions.includes(
+            importedActivityDefinition?.conditions.includes(
               SYNTHETIC_SKILL_CONDITION_MARKER,
             ) === true;
           const sameSkillReceiptCount =
@@ -5185,11 +5191,10 @@ async function main(): Promise<void> {
           const priorSkillReceiptCount =
             beforeImport.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
           return (
-            sameSkillRevisionAdvanced &&
+            importedActivityVersionIsNew &&
             editedBodyObserved &&
             editedConditionObserved &&
             sameSkillReceiptCount > priorSkillReceiptCount &&
-            importedActivity &&
             context.responseQueue.length > importResponseStart
           );
         });
@@ -5211,13 +5216,19 @@ async function main(): Promise<void> {
         const afterImportedVersions =
           afterImport.revisionVersionsBySkill.get(exportedSkillId) ??
           new Set<number>();
-        const importedSkillVersion = Math.max(0, ...afterImportedVersions);
-        const importedDefinition = afterImport.revisionDefinitionsBySkill
-          .get(exportedSkillId)
-          ?.get(importedSkillVersion);
-        const importedRevision = [...afterImportedVersions].some(
-          (version) => !beforeImportedVersions.has(version),
-        );
+        const importedSkillVersion = importedSkillActivity?.version;
+        const importedDefinition =
+          importedSkillVersion === undefined
+            ? undefined
+            : afterImport.revisionDefinitionsBySkill
+                .get(exportedSkillId)
+                ?.get(importedSkillVersion);
+        const importedRevision =
+          importedSkillVersion !== undefined &&
+          Number.isSafeInteger(importedSkillVersion) &&
+          importedSkillVersion > 0 &&
+          afterImportedVersions.has(importedSkillVersion) &&
+          !beforeImportedVersions.has(importedSkillVersion);
         const editedBodyImported =
           importedDefinition?.body.includes(SYNTHETIC_SKILL_EDIT_MARKER) ===
             true &&
@@ -5295,29 +5306,56 @@ async function main(): Promise<void> {
         const afterDuplicate = readSkillSnapshot(state.databasePath);
         const duplicateReceiptCount =
           afterDuplicate.importReceiptCountsBySkill.get(exportedSkillId) ?? 0;
-        if (duplicateReceiptCount !== receiptsBeforeDuplicate)
-          fail("DUPLICATE_IMPORT_CREATED_NEW_RECEIPT");
         const afterDuplicateVersions =
           afterDuplicate.revisionVersionsBySkill.get(exportedSkillId) ??
           new Set<number>();
-        const duplicateRevisionChanged =
-          afterDuplicateVersions.size !== afterImportedVersions.size ||
-          [...afterImportedVersions].some(
-            (version) => !afterDuplicateVersions.has(version),
+        const duplicatePreservedVersionMembership =
+          afterDuplicateVersions.size === afterImportedVersions.size &&
+          [...afterImportedVersions].every((version) =>
+            afterDuplicateVersions.has(version),
           );
         const duplicateDefinition = afterDuplicate.revisionDefinitionsBySkill
           .get(exportedSkillId)
           ?.get(importedSkillVersion);
-        if (
-          duplicateRevisionChanged ||
-          JSON.stringify(duplicateDefinition) !==
-            JSON.stringify(importedDefinition) ||
-          afterDuplicate.learnedBodiesBySkill.get(exportedSkillId) !==
-            afterImport.learnedBodiesBySkill.get(exportedSkillId)
-        )
-          fail("DUPLICATE_IMPORT_CHANGED_SKILL_REVISION");
+        const duplicatePreservedImportedDefinition =
+          JSON.stringify(duplicateDefinition) ===
+          JSON.stringify(importedDefinition);
+        const duplicatePreservedLearnedBody =
+          afterDuplicate.learnedBodiesBySkill.get(exportedSkillId) ===
+          afterImport.learnedBodiesBySkill.get(exportedSkillId);
+        const duplicatePreservedPerSkillReceiptCount =
+          duplicateReceiptCount === receiptsBeforeDuplicate;
+        const duplicateImportPreservedCheckedState =
+          duplicatePreservedPerSkillReceiptCount &&
+          duplicatePreservedVersionMembership &&
+          duplicatePreservedImportedDefinition &&
+          duplicatePreservedLearnedBody;
+        if (!duplicateImportPreservedCheckedState)
+          fail("DUPLICATE_IMPORT_CHANGED_CHECKED_SKILL_STATE");
         state.skillExchangeStage = "duplicate_confirmed";
         let skillExchangeFixture: BlockPosition | undefined;
+        let skillExchangeFixtureRestoredToAir = false;
+        const restoreSkillExchangeFixture = async (): Promise<void> => {
+          if (skillExchangeFixture === undefined) return;
+          const fixture = skillExchangeFixture;
+          try {
+            await context.rcon.command(
+              `setblock ${fixture.x} ${fixture.y} ${fixture.z} air`,
+            );
+          } catch {
+            incomplete("SKILL_EXCHANGE_FIXTURE_CLEANUP_UNVERIFIED");
+          }
+          let restoredToAir: boolean;
+          try {
+            restoredToAir = await isBlock(context.rcon, fixture, "air");
+          } catch {
+            incomplete("SKILL_EXCHANGE_FIXTURE_CLEANUP_UNVERIFIED");
+          }
+          if (!restoredToAir)
+            incomplete("SKILL_EXCHANGE_FIXTURE_CLEANUP_UNVERIFIED");
+          skillExchangeFixtureRestoredToAir = true;
+          skillExchangeFixture = undefined;
+        };
         try {
           const origin = parsePosition(
             await context.rcon.command(
@@ -5340,7 +5378,8 @@ async function main(): Promise<void> {
           };
           if (
             !(await isBlock(context.rcon, fixtureHead, "air")) ||
-            (await isBlock(context.rcon, fixtureSupport, "air"))
+            (await isBlock(context.rcon, fixtureSupport, "air")) ||
+            !(await isBlock(context.rcon, activeSkillExchangeFixture, "air"))
           )
             incomplete("SKILL_EXCHANGE_FIXTURE_SITE_UNAVAILABLE");
           skillExchangeFixture = activeSkillExchangeFixture;
@@ -5434,11 +5473,7 @@ async function main(): Promise<void> {
                 consultedImportedRevision &&
                 successfulDigObserved &&
                 !isOperationActive(player) &&
-                !(await isBlock(
-                  context.rcon,
-                  activeSkillExchangeFixture,
-                  "oak_log",
-                ))
+                (await isBlock(context.rcon, activeSkillExchangeFixture, "air"))
               );
             },
           );
@@ -5462,13 +5497,14 @@ async function main(): Promise<void> {
           );
           if (!postUseConsultation || confirmedDigOutcome === undefined)
             incomplete("SKILL_EXCHANGE_IMPORTED_REVISION_DIG_NOT_CONFIRMED");
-          const serverConfirmedBlockRemoval = !(await isBlock(
+          const serverConfirmedAirAfterDig = await isBlock(
             context.rcon,
             activeSkillExchangeFixture,
-            "oak_log",
-          ));
-          if (!serverConfirmedBlockRemoval)
-            incomplete("SKILL_EXCHANGE_SERVER_BLOCK_CHANGE_MISSING");
+            "air",
+          );
+          if (!serverConfirmedAirAfterDig)
+            incomplete("SKILL_EXCHANGE_SERVER_AIR_READBACK_MISSING");
+          await restoreSkillExchangeFixture();
           state.skillExchangeStage = "game_action_confirmed";
           return {
             repositorySeedFixtureUsed: standaloneSeedExchange,
@@ -5476,20 +5512,19 @@ async function main(): Promise<void> {
             markdownExportCreated: true,
             humanConditionAndBodyEditImported: true,
             sameSkillRevisionAndImportReceiptReadBack: importedRevision,
-            repeatedImportDidNotChangeDatabase: true,
+            duplicateImportPreservedVersionMembershipDefinitionBodyAndPerSkillReceiptCount:
+              duplicateImportPreservedCheckedState,
             sameImportedRevisionConsulted: true,
             oneSuccessfulBodyDigObserved: true,
             successfulDigUsedImportedSkillRevision: true,
-            serverConfirmedBlockRemoval,
+            serverConfirmedAirAfterDig,
+            fixtureRestoredToAir: skillExchangeFixtureRestoredToAir,
             dbSkillCount: afterDuplicate.skillCount,
             importReceiptCount: afterDuplicate.importReceiptCount,
           };
         } finally {
-          if (skillExchangeFixture !== undefined) {
-            await removeLearningLogFixture(context.rcon, [
-              skillExchangeFixture,
-            ]);
-          }
+          if (skillExchangeFixture !== undefined)
+            await restoreSkillExchangeFixture();
         }
       },
     );
