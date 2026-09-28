@@ -17,8 +17,8 @@ import {
 describe("damage response targeted E2E case", () => {
   it("keeps one bounded measurement within the run wrapper", () => {
     expect(DAMAGE_RESPONSE_CASE_BUDGET).toEqual({
-      llmCalls: 8,
-      totalTokens: 75_000,
+      llmCalls: 16,
+      totalTokens: 150_000,
     });
     expect(
       runBudgetCoversCase(
