@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { Response } from "openai/resources/responses/responses.js";
 import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { McSkillRepository } from "../../src/mc-skills/index.js";
@@ -1730,74 +1730,136 @@ describe("integrated player runtime", () => {
     }
   });
 
-  it("preempts a slow thought for an owner proposal and waits for settlement", async () => {
-    const directory = temporaryDirectory();
-    const databasePath = join(directory, "player.sqlite");
-    const mind = PlayerMindStore.open(databasePath);
-    const skills = openSkills(databasePath, directory);
-    let releaseFirstThought: (() => void) | undefined;
-    const firstThoughtGate = new Promise<void>((resolve) => {
-      releaseFirstThought = resolve;
-    });
-    let thoughtCount = 0;
-    let activeThoughts = 0;
-    let maxActiveThoughts = 0;
-    let firstSignal: AbortSignal | undefined;
-    let followupKinds: readonly string[] = [];
-    const runtime = new PlayerRuntime({
-      ownerUsername: "owner",
-      playerId: "owner-player",
-      body: new DeferredBody(),
-      mind,
-      memory: createMemoryPort(),
-      skills,
-      conversation: {
-        nextTurn: () => 1,
-        handleOwnerMessage: async () => undefined,
-      },
-      purpose: {
-        think: async ({ events, signal }) => {
-          thoughtCount += 1;
-          activeThoughts += 1;
-          maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
-          try {
-            if (thoughtCount === 1) {
-              firstSignal = signal;
-              await firstThoughtGate;
-              return { accepted: false };
-            }
-            followupKinds = events.map(({ kind }) => kind);
-            return { accepted: false };
-          } finally {
-            activeThoughts -= 1;
-          }
+  it.each(["response", "timeout"] as const)(
+    "settles an owner proposal thought on %s without overlapping or resetting its deadline",
+    async (settlement) => {
+      const directory = temporaryDirectory();
+      const databasePath = join(directory, "player.sqlite");
+      const mind = PlayerMindStore.open(databasePath);
+      const skills = openSkills(databasePath, directory);
+      let releaseFirstThought: (() => void) | undefined;
+      const firstThoughtGate = new Promise<void>((resolve) => {
+        releaseFirstThought = resolve;
+      });
+      let thoughtCount = 0;
+      let activeThoughts = 0;
+      let maxActiveThoughts = 0;
+      let firstSignal: AbortSignal | undefined;
+      let shouldStopAfterResponse: (() => boolean) | undefined;
+      let finishFollowup!: () => void;
+      const followupStarted = new Promise<void>((resolve) => {
+        finishFollowup = resolve;
+      });
+      let followupKinds: readonly string[] = [];
+      let followupProposalTitles: readonly string[] = [];
+      const runtime = new PlayerRuntime({
+        ownerUsername: "owner",
+        playerId: "owner-player",
+        body: new DeferredBody(),
+        mind,
+        memory: createMemoryPort(),
+        skills,
+        conversation: {
+          nextTurn: () => 1,
+          handleOwnerMessage: async () => undefined,
         },
-      },
-      logger: pino({ level: "silent" }),
-      say: async () => undefined,
-    });
+        purpose: {
+          think: async ({
+            events,
+            signal,
+            shouldStopAfterResponse: isStale,
+          }) => {
+            thoughtCount += 1;
+            activeThoughts += 1;
+            maxActiveThoughts = Math.max(maxActiveThoughts, activeThoughts);
+            try {
+              if (thoughtCount === 1) {
+                firstSignal = signal;
+                shouldStopAfterResponse = isStale;
+                await Promise.race([
+                  firstThoughtGate,
+                  new Promise<void>((_resolve, reject) => {
+                    const rejectAbortedThought = (): void => {
+                      const reason: unknown = signal?.reason;
+                      reject(
+                        reason instanceof Error
+                          ? reason
+                          : new Error("thought_aborted"),
+                      );
+                    };
+                    if (signal?.aborted) {
+                      rejectAbortedThought();
+                      return;
+                    }
+                    signal?.addEventListener("abort", rejectAbortedThought, {
+                      once: true,
+                    });
+                  }),
+                ]);
+                return { accepted: false };
+              }
+              followupKinds = events.map(({ kind }) => kind);
+              followupProposalTitles = mind
+                .snapshot()
+                .proposals.map(({ title }) => title);
+              finishFollowup();
+              return { accepted: true };
+            } finally {
+              activeThoughts -= 1;
+            }
+          },
+        },
+        logger: pino({ level: "silent" }),
+        say: async () => undefined,
+      });
 
-    try {
-      await runtime.start();
-      await waitFor(() => thoughtCount === 1);
-      mind.addProposal({ title: "Visit the village", reason: "Meet there" });
-      runtime.onOwnerProposal();
+      try {
+        await runtime.start();
+        await waitFor(() => thoughtCount === 1);
+        vi.useFakeTimers();
+        mind.addProposal({ title: "Visit the village", reason: "Meet there" });
+        runtime.onOwnerProposal();
 
-      expect(firstSignal?.aborted).toBe(true);
-      expect(thoughtCount).toBe(1);
-      expect(maxActiveThoughts).toBe(1);
-      releaseFirstThought?.();
+        expect(firstSignal?.aborted).toBe(false);
+        expect(shouldStopAfterResponse?.()).toBe(true);
+        expect(thoughtCount).toBe(1);
+        expect(maxActiveThoughts).toBe(1);
 
-      await waitFor(() => thoughtCount === 2);
-      expect(maxActiveThoughts).toBe(1);
-      expect(followupKinds).toContain("owner_proposal");
-    } finally {
-      releaseFirstThought?.();
-      await runtime.shutdown();
-      skills.close();
-      mind.close();
-    }
-  });
+        await vi.advanceTimersByTimeAsync(20_000);
+        mind.addProposal({
+          title: "Come to the owner",
+          reason: "Please come here",
+        });
+        runtime.onOwnerProposal();
+        if (settlement === "timeout") {
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(firstSignal?.aborted).toBe(true);
+          expect((firstSignal?.reason as Error).message).toBe(
+            "owner_proposal_settlement_timeout",
+          );
+        } else {
+          expect(firstSignal?.aborted).toBe(false);
+          releaseFirstThought?.();
+          await followupStarted;
+          await vi.advanceTimersByTimeAsync(30_000);
+          expect(firstSignal?.aborted).toBe(false);
+        }
+        releaseFirstThought?.();
+
+        await followupStarted;
+        expect(thoughtCount).toBe(2);
+        expect(maxActiveThoughts).toBe(1);
+        expect(followupKinds).toContain("owner_proposal");
+        expect(followupProposalTitles).toContain("Come to the owner");
+      } finally {
+        releaseFirstThought?.();
+        await runtime.shutdown();
+        skills.close();
+        mind.close();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("preempts an uncommitted thought when a state event advances the revision", async () => {
     const directory = temporaryDirectory();
@@ -2031,9 +2093,17 @@ describe("integrated player runtime", () => {
       expect(mind.snapshot().pendingEventKinds).toContain("body_outcome");
       expect(signal?.aborted).toBe(false);
 
+      mind.addProposal({
+        title: "Return to the owner",
+        reason: "The owner requested a new goal.",
+      });
+      runtime.onOwnerProposal();
+      expect(signal?.aborted).toBe(false);
+
       mind.stop();
       await runtime.stopNow();
       expect(signal?.aborted).toBe(true);
+      expect((signal?.reason as Error).message).toBe("autonomy_stopped");
       releaseThought?.();
       await new Promise((resolve) => setTimeout(resolve, 20));
       body.emit({ type: "reconnected", at: new Date().toISOString() });

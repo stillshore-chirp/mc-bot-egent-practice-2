@@ -31,6 +31,10 @@ import {
   trustedConditions,
 } from "./observation-evidence.js";
 
+// Keep owner changes responsive while giving an accepted HTTP one
+// bounded drain window.
+const ownerProposalSettlementTimeoutMs = 30_000;
+
 interface ActiveBodyRun {
   readonly operationId: string;
   readonly operation: PlayerOperation;
@@ -91,6 +95,8 @@ export class PlayerRuntime {
   #activeBody: ActiveBodyRun | undefined;
   #activeThought: AbortController | undefined;
   #activeThoughtCommitted = false;
+  #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
+  #ownerProposalSettlementThought: AbortController | undefined;
   #pendingThoughtWake: PendingThoughtWake | undefined;
   #replacementTail: Promise<void> = Promise.resolve();
   #retryTimer: NodeJS.Timeout | undefined;
@@ -558,7 +564,7 @@ export class PlayerRuntime {
     if (activeThought !== undefined) {
       this.#queueThoughtWake(kind, reason);
       if (kind === "owner_proposal") {
-        activeThought.abort(new Error("owner_proposal_preempted_thought"));
+        this.#boundOwnerProposalSettlement(activeThought);
       } else if (
         !this.#activeThoughtCommitted &&
         kind !== "body_outcome" &&
@@ -592,7 +598,8 @@ export class PlayerRuntime {
               : events,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
           shouldStopAfterResponse: () =>
-            this.#pendingThoughtWake?.kind === "body_outcome",
+            this.#pendingThoughtWake?.kind === "body_outcome" ||
+            this.#pendingThoughtWake?.kind === "owner_proposal",
         });
         if (
           !result.accepted &&
@@ -634,13 +641,17 @@ export class PlayerRuntime {
 
   #finishThought(controller: AbortController, retry: boolean): void {
     if (this.#activeThought !== controller) return;
+    this.#clearOwnerProposalSettlement(controller);
     this.#activeThought = undefined;
     this.#activeThoughtCommitted = false;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
       return;
     }
-    if (this.#pendingThoughtWake?.kind === "body_outcome") {
+    if (
+      this.#pendingThoughtWake?.kind === "body_outcome" ||
+      this.#pendingThoughtWake?.kind === "owner_proposal"
+    ) {
       this.#dispatchPendingThought();
       return;
     }
@@ -874,9 +885,42 @@ export class PlayerRuntime {
 
   #cancelThought(reason: string): void {
     const thought = this.#activeThought;
+    this.#clearOwnerProposalSettlement(thought);
     this.#pendingThoughtWake = undefined;
     this.#activeThoughtCommitted = false;
     thought?.abort(new Error(reason));
+  }
+
+  #boundOwnerProposalSettlement(controller: AbortController): void {
+    if (
+      controller.signal.aborted ||
+      this.#ownerProposalSettlementTimer !== undefined
+    )
+      return;
+    this.#ownerProposalSettlementThought = controller;
+    this.#ownerProposalSettlementTimer = setTimeout(() => {
+      this.#ownerProposalSettlementTimer = undefined;
+      this.#ownerProposalSettlementThought = undefined;
+      if (
+        this.#activeThought === controller &&
+        this.#pendingThoughtWake?.kind === "owner_proposal" &&
+        !controller.signal.aborted
+      )
+        controller.abort(new Error("owner_proposal_settlement_timeout"));
+    }, ownerProposalSettlementTimeoutMs);
+    this.#ownerProposalSettlementTimer.unref();
+  }
+
+  #clearOwnerProposalSettlement(controller?: AbortController): void {
+    if (
+      controller !== undefined &&
+      this.#ownerProposalSettlementThought !== controller
+    )
+      return;
+    if (this.#ownerProposalSettlementTimer !== undefined)
+      clearTimeout(this.#ownerProposalSettlementTimer);
+    this.#ownerProposalSettlementTimer = undefined;
+    this.#ownerProposalSettlementThought = undefined;
   }
 
   async #sampleSemanticState(): Promise<void> {

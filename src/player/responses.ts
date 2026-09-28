@@ -646,7 +646,11 @@ function classifyRequestErrorCause(
   if (signal?.aborted !== true) return "request_failed";
   const reason: unknown = signal.reason;
   const message = reason instanceof Error ? reason.message : "";
-  if (message === "owner_proposal_preempted_thought") return "owner_proposal";
+  if (
+    message === "owner_proposal_preempted_thought" ||
+    message === "owner_proposal_settlement_timeout"
+  )
+    return "owner_proposal";
   if (
     message === "owner_stop" ||
     message === "autonomy_stopped" ||

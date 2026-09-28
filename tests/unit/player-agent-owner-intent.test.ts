@@ -27,6 +27,7 @@ import {
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import {
   projectSafePlayerAgentActivityTail,
+  type PlayerAgentCallResult,
   type PlayerAgentRoundActivity,
   type PlayerResponsesClient,
 } from "../../src/player/responses.js";
@@ -39,52 +40,127 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
-  it("keeps completed response usage and skips stale purpose tools and rounds", async () => {
+  it.each(["body_outcome", "owner_proposal"] as const)(
+    "keeps completed response usage and skips stale purpose tools and rounds when %s arrives",
+    async (staleKind) => {
+      const fixture = openPurposeFixture(createMemoryPort());
+      let markRequestStarted!: () => void;
+      const requestStarted = new Promise<void>((resolve) => {
+        markRequestStarted = resolve;
+      });
+      let resolveResponse!: (response: Response) => void;
+      const pendingResponse = new Promise<Response>((resolve) => {
+        resolveResponse = resolve;
+      });
+      fixture.responses.push(() => {
+        markRequestStarted();
+        return pendingResponse;
+      });
+
+      try {
+        const thought = fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+          shouldStopAfterResponse: () =>
+            fixture.mind
+              .pendingEvents(32)
+              .some(({ kind }) => kind === staleKind),
+        });
+        await requestStarted;
+
+        if (staleKind === "owner_proposal") {
+          fixture.mind.addProposal({
+            title: "Meet at the bridge",
+            reason: "The owner requested a new destination.",
+          });
+        } else {
+          fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
+        }
+        resolveResponse(
+          functionCallResponse(
+            "stale-description",
+            "describe_operation",
+            { kind: "dig" },
+            responseUsage(19, 7),
+          ),
+        );
+        const result = await thought;
+
+        expect(result.accepted).toBe(false);
+        expect(fixture.requests).toHaveLength(1);
+        expect(fixture.calls).toHaveLength(1);
+        expect(fixture.calls[0]).toMatchObject({
+          calls: 1,
+          inputTokens: 19,
+          outputTokens: 7,
+        });
+        expect(
+          fixture.mind.snapshot().recentAgentActivity.at(-1),
+        ).toMatchObject({
+          responseStatus: "completed",
+          processingStatus: "interrupted",
+          inputTokens: 19,
+          outputTokens: 7,
+          functionCallCount: 1,
+          toolCalls: [],
+        });
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
+  it("records owner proposal settlement timeout as unknown usage with its cause", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
+    const controller = new AbortController();
     let markRequestStarted!: () => void;
     const requestStarted = new Promise<void>((resolve) => {
       markRequestStarted = resolve;
     });
-    let resolveResponse!: (response: Response) => void;
-    const pendingResponse = new Promise<Response>((resolve) => {
-      resolveResponse = resolve;
-    });
-    fixture.responses.push(() => {
+    fixture.responses.push((_request, options) => {
       markRequestStarted();
-      return pendingResponse;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = options?.signal;
+        const rejectAbortedRequest = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(
+            reason instanceof Error ? reason : new Error("request_aborted"),
+          );
+        };
+        if (signal?.aborted) {
+          rejectAbortedRequest();
+          return;
+        }
+        signal?.addEventListener("abort", rejectAbortedRequest, {
+          once: true,
+        });
+      });
     });
 
     try {
       const thought = fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
-        shouldStopAfterResponse: () =>
-          fixture.mind
-            .pendingEvents(32)
-            .some(({ kind }) => kind === "body_outcome"),
+        signal: controller.signal,
       });
       await requestStarted;
+      controller.abort(new Error("owner_proposal_settlement_timeout"));
 
-      fixture.mind.enqueueEvent("body_outcome", "test body result arrived");
-      resolveResponse(
-        functionCallResponse(
-          "stale-description",
-          "describe_operation",
-          { kind: "dig" },
-          responseUsage(19, 7),
-        ),
+      await expect(thought).rejects.toThrow(
+        "owner_proposal_settlement_timeout",
       );
-      const result = await thought;
-
-      expect(result.accepted).toBe(false);
-      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.calls).toHaveLength(1);
+      expect(fixture.calls[0]).toMatchObject({
+        calls: 1,
+        inputTokens: 0,
+        outputTokens: 0,
+        usageUnknown: true,
+        usageUnknownReason: "request_error",
+      });
       expect(fixture.mind.snapshot().recentAgentActivity.at(-1)).toMatchObject({
-        responseStatus: "completed",
+        responseStatus: "request_error",
         processingStatus: "interrupted",
-        inputTokens: 19,
-        outputTokens: 7,
-        functionCallCount: 1,
-        toolCalls: [],
+        requestErrorCause: "owner_proposal",
       });
     } finally {
       fixture.close();
@@ -1138,13 +1214,22 @@ describe("player owner intent context", () => {
   });
 });
 
-type ScriptedResponse = Response | (() => Response | Promise<Response>);
+interface ScriptedRequestOptions {
+  readonly signal?: AbortSignal;
+}
+type ScriptedResponse =
+  | Response
+  | ((
+      request: unknown,
+      options?: ScriptedRequestOptions,
+    ) => Response | Promise<Response>);
 
 interface PurposeFixture {
   readonly agent: PlayerPurposeAgent;
   readonly mind: PlayerMindStore;
   readonly requests: unknown[];
   readonly responses: ScriptedResponse[];
+  readonly calls: Omit<PlayerAgentCallResult, "text">[];
   close(): void;
 }
 
@@ -1164,6 +1249,7 @@ function openPurposeFixture(
   });
   const requests: unknown[] = [];
   const responses: ScriptedResponse[] = [];
+  const calls: Omit<PlayerAgentCallResult, "text">[] = [];
   const body = {
     observe: async (options?: { ownerPositionException?: boolean }) => {
       const observation = bodyObservationFixture();
@@ -1199,6 +1285,7 @@ function openPurposeFixture(
       mind.recordAgentActivity(activity);
       onRoundActivity?.(activity);
     },
+    onCall: (metrics) => calls.push(metrics),
     onCommitted: () => undefined,
   });
   return {
@@ -1206,6 +1293,7 @@ function openPurposeFixture(
     mind,
     requests,
     responses,
+    calls,
     close: () => {
       skills.close();
       mind.close();
@@ -1286,12 +1374,14 @@ function scriptedClient(
 ): PlayerResponsesClient {
   return {
     responses: {
-      create: async (request: unknown) => {
+      create: async (request: unknown, options?: ScriptedRequestOptions) => {
         requests.push(request);
         const response = responses.shift();
         if (response === undefined)
           throw new Error("TEST_RESPONSE_QUEUE_EMPTY");
-        return typeof response === "function" ? await response() : response;
+        return typeof response === "function"
+          ? await response(request, options)
+          : response;
       },
     },
   } as unknown as PlayerResponsesClient;
