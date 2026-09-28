@@ -73,6 +73,10 @@ import {
   type LlmCallAdmission,
 } from "./llm-call-admission.js";
 import {
+  NoFoodReplanRequestGate,
+  waitForNoFoodReplanRequestsSettled,
+} from "./no-food-replan-request-gate.js";
+import {
   isNewFailureAfterUnfreeze,
   recoveryCagePlan,
   waitForRecoveryObstacleReadiness,
@@ -313,6 +317,7 @@ interface NoFoodReplanDiagnostic {
   startupStateConfirmed: boolean;
   purposeDecision: NoFoodReplanDecisionClass;
   outcomeStatus: NoFoodReplanOutcomeStatus;
+  alternativeSuccessfulBodyOutcomeObserved: boolean;
   reassessmentObserved: boolean;
   repeatedFailedOperationUnderUnchangedState: boolean;
   waitReasonAndWakeConditionPresent: boolean;
@@ -324,6 +329,7 @@ const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
   startupStateConfirmed: false,
   purposeDecision: "not_observed",
   outcomeStatus: "not_observed",
+  alternativeSuccessfulBodyOutcomeObserved: false,
   reassessmentObserved: false,
   repeatedFailedOperationUnderUnchangedState: false,
   waitReasonAndWakeConditionPresent: false,
@@ -1696,11 +1702,31 @@ function noFoodContinuitySafeEvidence(state: RunState): SafeEvidence {
   };
 }
 
+function noFoodReplanRequestEvidence(state: RunState): SafeEvidence {
+  const requestGate = state.noFoodReplanRequestGate;
+  return {
+    noFoodReplanAcceptanceLatched: requestGate?.acceptanceLatched === true,
+    noFoodReplanProviderRequestsBlockedAfterAcceptance:
+      (requestGate?.providerRequestsBlockedAfterAcceptance ?? 0) > 0,
+    noFoodReplanAcceptedRequestsSettled:
+      requestGate?.acceptanceLatched === true &&
+      requestGate.inFlightRequests === 0 &&
+      requestGate.requestsRecorded === requestGate.requestsStarted,
+    noFoodReplanAcceptedRequestsStarted: requestGate?.requestsStarted ?? 0,
+    noFoodReplanAcceptedRequestsRecorded: requestGate?.requestsRecorded ?? 0,
+    noFoodReplanAcceptedRequestsInFlight: requestGate?.inFlightRequests ?? 0,
+    noFoodReplanRequestAccountingConsistent:
+      requestGate === undefined ||
+      requestGate.requestsRecorded <= requestGate.requestsStarted,
+  };
+}
+
 function noFoodReplanSafeEvidence(state: RunState): SafeEvidence {
   const continuity = state.noFoodContinuityDiagnostic;
   return {
     ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
     ...state.noFoodReplanDiagnostic,
+    ...noFoodReplanRequestEvidence(state),
     startupBodyObservationAvailable:
       continuity?.startupBodyObservationAvailable === true,
     startupHealthBodyAndRconMatched:
@@ -2544,7 +2570,7 @@ interface RunState {
   noFoodReplanDiagnostic?: NoFoodReplanDiagnostic;
   noFoodReplanCaseUsageStart?: Counters;
   noFoodReplanLatestCounters?: Counters;
-  noFoodReplanCallsStarted?: number;
+  noFoodReplanRequestGate?: NoFoodReplanRequestGate;
 }
 
 interface FoodIntentContinuityDiagnostic {
@@ -2898,13 +2924,37 @@ function assertNoFoodReplanUsage(context: CaseContext, player: PlayerEvidence) {
   if (delta.usageUnknownCalls > 0) incomplete("LLM_USAGE_PARTIAL_OR_UNKNOWN");
 }
 
+const NO_FOOD_REPLAN_SETTLE_MAX_MS = 15_000;
+
+async function settleNoFoodReplanRequests(
+  state: RunState,
+  context: CaseContext,
+): Promise<void> {
+  const requestGate = state.noFoodReplanRequestGate;
+  if (!requestGate?.acceptanceLatched)
+    incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+  const remainingMs = Math.max(0, context.caseDeadlineAt - Date.now() - 250);
+  const settled = await waitForNoFoodReplanRequestsSettled(
+    async () => {
+      const player = playerOf(await collect(context.runtime.app));
+      assertNoFoodReplanUsage(context, player);
+      if (requestGate.requestsRecorded > requestGate.requestsStarted) {
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      }
+      return requestGate.inFlightRequests;
+    },
+    Math.min(NO_FOOD_REPLAN_SETTLE_MAX_MS, remainingMs),
+  );
+  if (!settled) incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+}
+
 async function runNoFoodReplanCase(
   state: RunState,
   context: CaseContext,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   state.noFoodReplanCaseUsageStart = context.usageAtStart;
   state.noFoodReplanLatestCounters = context.usageAtStart;
-  state.noFoodReplanCallsStarted = 0;
+  state.noFoodReplanRequestGate = new NoFoodReplanRequestGate();
   state.noFoodReplanDiagnostic = { ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC };
   await connectApplication(context.runtime.app, state);
   const startup = state.noFoodContinuityDiagnostic;
@@ -3110,6 +3160,10 @@ async function runNoFoodReplanCase(
     if (outcomeStatus === "successful") {
       if (currentClass === "consume")
         fail("NO_FOOD_CONSUME_SUCCESS_CONTRADICTS_EMPTY_INVENTORY");
+      state.noFoodReplanDiagnostic = {
+        ...state.noFoodReplanDiagnostic,
+        alternativeSuccessfulBodyOutcomeObserved: true,
+      };
       const outcomeObservedAt = Date.parse(outcome.observedAt ?? "");
       if (!Number.isFinite(outcomeObservedAt))
         incomplete("NO_FOOD_BODY_OUTCOME_TIME_NOT_AVAILABLE");
@@ -3119,12 +3173,26 @@ async function runNoFoodReplanCase(
         Math.min(60_000, Math.max(1, remainingMs)),
         (snapshot) => {
           assertNoFoodReplanUsage(context, snapshot);
-          return snapshot.recentJudgments.some((item) =>
-            isNoFoodReplanPurposeAfterOutcome(
-              item.decidedAt,
-              outcome.observedAt,
-            ),
-          );
+          const postOutcomePurposeJudgmentObserved =
+            snapshot.recentJudgments.some((item) =>
+              isNoFoodReplanPurposeAfterOutcome(
+                item.decidedAt,
+                outcome.observedAt,
+              ),
+            );
+          if (postOutcomePurposeJudgmentObserved) {
+            const acceptanceEvidence = {
+              ...(state.noFoodReplanDiagnostic ??
+                EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC),
+              postOutcomePurposeJudgmentObserved: true,
+            };
+            state.noFoodReplanDiagnostic = acceptanceEvidence;
+            const requestGate = state.noFoodReplanRequestGate;
+            if (!requestGate?.latchIfAcceptedEvidence(acceptanceEvidence)) {
+              return false;
+            }
+          }
+          return postOutcomePurposeJudgmentObserved;
         },
       );
       const postOutcomePurposeJudgmentObserved =
@@ -3137,10 +3205,14 @@ async function runNoFoodReplanCase(
       };
       if (!postOutcomePurposeJudgmentObserved)
         incomplete("NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED");
+      const requestGate = state.noFoodReplanRequestGate;
+      if (!requestGate.acceptanceLatched)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      await settleNoFoodReplanRequests(state, context);
       return {
         ...state.noFoodReplanDiagnostic,
+        ...noFoodReplanRequestEvidence(state),
         startupOraclesConfirmed: true,
-        alternativeSuccessfulBodyOutcomeObserved: true,
       };
     }
     if (outcomeStatus !== "failed")
@@ -6970,36 +7042,55 @@ async function prepareRun(): Promise<RunState> {
       }
       if (state.targetCase === "no_food_replan") {
         const caseStart = state.noFoodReplanCaseUsageStart;
-        if (caseStart !== undefined) {
-          const current = state.noFoodReplanLatestCounters ?? caseStart;
-          const delta = subtractCounters(current, caseStart);
-          const blockReason = noFoodReplanBeforeCallBlockReason(
-            state.noFoodReplanCallsStarted ?? 0,
-            delta.usageUnknownCalls,
-            totalTokens(delta),
-          );
-          if (blockReason !== undefined) {
-            state.failureCode ??= blockReason;
-            throw new HarnessError("incomplete", blockReason);
-          }
-        }
-        if (state.noFoodContinuityDiagnostic?.startupStateConfirmed !== true) {
-          state.failureCode ??= "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED";
+        const requestGate = state.noFoodReplanRequestGate;
+        if (caseStart !== undefined && requestGate === undefined) {
+          state.failureCode ??= "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY";
           throw new HarnessError(
             "incomplete",
-            "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED",
+            "NO_FOOD_REPLAN_REQUEST_GATE_NOT_READY",
           );
         }
+        const admitNoFoodRequest = () => {
+          if (caseStart !== undefined) {
+            const current = state.noFoodReplanLatestCounters ?? caseStart;
+            const delta = subtractCounters(current, caseStart);
+            const blockReason = noFoodReplanBeforeCallBlockReason(
+              requestGate?.requestsStarted ?? 0,
+              delta.usageUnknownCalls,
+              totalTokens(delta),
+            );
+            if (blockReason !== undefined) {
+              state.failureCode ??= blockReason;
+              throw new HarnessError("incomplete", blockReason);
+            }
+          }
+          if (
+            state.noFoodContinuityDiagnostic?.startupStateConfirmed !== true
+          ) {
+            state.failureCode ??=
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED";
+            throw new HarnessError(
+              "incomplete",
+              "NO_FOOD_REPLAN_STARTUP_ORACLES_NOT_CONFIRMED",
+            );
+          }
+          try {
+            admission.beforeCall();
+          } catch (error) {
+            if (error instanceof LlmCallAdmissionError)
+              throw new HarnessError("incomplete", error.code);
+            throw error;
+          }
+        };
+        if (caseStart !== undefined && requestGate !== undefined) {
+          requestGate.beforeCall(admitNoFoodRequest);
+          return;
+        }
+        admitNoFoodRequest();
+        return;
       }
       try {
         admission.beforeCall();
-        if (
-          state.targetCase === "no_food_replan" &&
-          state.noFoodReplanCaseUsageStart !== undefined
-        ) {
-          state.noFoodReplanCallsStarted =
-            (state.noFoodReplanCallsStarted ?? 0) + 1;
-        }
       } catch (error) {
         if (error instanceof LlmCallAdmissionError)
           throw new HarnessError("incomplete", error.code);
@@ -9662,6 +9753,19 @@ async function runCase(
     const final =
       terminalEvidence === undefined ? initial : countersOf(terminalEvidence);
     const delta = subtractCounters(final, initial);
+    if (id === "no_food_replan" && terminalEvidence !== undefined) {
+      const requestGate = state.noFoodReplanRequestGate;
+      const caseStart = state.noFoodReplanCaseUsageStart;
+      if (!requestGate?.acceptanceLatched || caseStart === undefined)
+        incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+      requestGate.observeRecordedCalls(
+        subtractCounters(final, caseStart).llmCalls,
+      );
+      if (requestGate.requestsRecorded > requestGate.requestsStarted)
+        incomplete("NO_FOOD_REPLAN_ADMISSION_USAGE_MISMATCH");
+      if (requestGate.inFlightRequests !== 0)
+        incomplete("NO_FOOD_REPLAN_ACCEPTED_REQUESTS_NOT_SETTLED");
+    }
     if (delta.llmCalls > maxCalls || totalTokens(delta) > maxTokens)
       incomplete("CASE_BUDGET_EXCEEDED");
     if (delta.usageUnknownCalls > 0) state.usageUncertain = true;
@@ -9696,6 +9800,7 @@ async function runCase(
         delta.usageUnknownCalls > 0 ? "partial_or_unknown" : "runtime_reported",
       evidence: {
         ...evidence,
+        ...(id === "no_food_replan" ? noFoodReplanRequestEvidence(state) : {}),
         ...safeUsageUnknownReasonEvidence(id, delta),
       },
     };
@@ -9821,6 +9926,11 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
           state.noFoodReplanCaseUsageStart !== undefined
         ) {
           state.noFoodReplanLatestCounters = counters;
+          const caseCalls = subtractCounters(
+            counters,
+            state.noFoodReplanCaseUsageStart,
+          ).llmCalls;
+          state.noFoodReplanRequestGate?.observeRecordedCalls(caseCalls);
         }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,

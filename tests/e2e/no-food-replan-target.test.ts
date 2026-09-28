@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { Response } from "openai/resources/responses/responses.js";
 
+import { PlayerMindStore } from "../../src/player/mind-store.js";
+import {
+  runPlayerAgent,
+  type PlayerResponsesClient,
+} from "../../src/player/responses.js";
 import {
   classifyNoFoodReplanDecision,
   isNoFoodReplanPurposeAfterOutcome,
@@ -12,6 +18,11 @@ import {
   isCaseSelectedForTarget,
   TARGETABLE_CASES,
 } from "./target-case-selection.js";
+import {
+  NoFoodReplanAcceptanceLatchedError,
+  NoFoodReplanRequestGate,
+  waitForNoFoodReplanRequestsSettled,
+} from "./no-food-replan-request-gate.js";
 
 describe("no-food replan targeted E2E case", () => {
   it("blocks provider sends at the call, observed-token, and unknown-usage boundary", () => {
@@ -106,5 +117,116 @@ describe("no-food replan targeted E2E case", () => {
     expect(classifyNoFoodReplanDecision("act", "untrusted-value")).toBe(
       "unknown",
     );
+  });
+
+  it("settles recorded usage and rejects a new request after full acceptance evidence", async () => {
+    const gate = new NoFoodReplanRequestGate();
+    const evidence = {
+      startupStateConfirmed: true,
+      alternativeSuccessfulBodyOutcomeObserved: true,
+      postOutcomeNoFoodStateConfirmed: true,
+      postOutcomePurposeJudgmentObserved: false,
+    };
+    const response = {
+      status: "completed",
+      output: [],
+      output_text: "Done.",
+      usage: { input_tokens: 123, output_tokens: 45 },
+    } as unknown as Response;
+    const create = vi.fn(async () => response);
+    const client = {
+      responses: { create },
+    } as unknown as PlayerResponsesClient;
+    const mind = PlayerMindStore.open(":memory:");
+    let admittedCalls = 0;
+    let recordedCalls = 0;
+    const invoke = () =>
+      runPlayerAgent({
+        client,
+        model: "test-model",
+        instructions: "Instructions.",
+        input: "Input.",
+        tools: [],
+        logger: { info: () => undefined } as never,
+        beforeCall: () =>
+          gate.beforeCall(() => {
+            admittedCalls += 1;
+          }),
+        onCall: (metrics) => {
+          recordedCalls += metrics.calls;
+          mind.recordCall({
+            inputTokens: metrics.inputTokens,
+            outputTokens: metrics.outputTokens,
+            latencyMs: metrics.latencyMs,
+            ...(metrics.usageUnknown === true ? { usageUnknown: true } : {}),
+            ...(metrics.usageUnknownReason === undefined
+              ? {}
+              : { usageUnknownReason: metrics.usageUnknownReason }),
+          });
+        },
+      });
+
+    try {
+      await invoke();
+      const usageAfterResponse = mind.snapshot().counters;
+      gate.observeRecordedCalls(usageAfterResponse.llmCalls);
+      expect(usageAfterResponse).toMatchObject({
+        llmCalls: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+        usageUnknownCalls: 0,
+      });
+      expect(gate.inFlightRequests).toBe(0);
+
+      expect(gate.latchIfAcceptedEvidence(evidence)).toBe(false);
+      expect(
+        gate.latchIfAcceptedEvidence({
+          ...evidence,
+          postOutcomePurposeJudgmentObserved: true,
+        }),
+      ).toBe(true);
+      await expect(invoke()).rejects.toBeInstanceOf(
+        NoFoodReplanAcceptanceLatchedError,
+      );
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(admittedCalls).toBe(1);
+      expect(recordedCalls).toBe(1);
+      expect(gate.requestsStarted).toBe(1);
+      expect(gate.requestsRecorded).toBe(1);
+      expect(gate.providerRequestsBlockedAfterAcceptance).toBe(1);
+      expect(gate.inFlightRequests).toBe(0);
+      expect(mind.snapshot().counters).toMatchObject({
+        llmCalls: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+        usageUnknownCalls: 0,
+      });
+    } finally {
+      mind.close();
+    }
+  });
+
+  it("waits for recorded requests to settle and fails at its finite deadline", async () => {
+    let reads = 0;
+    await expect(
+      waitForNoFoodReplanRequestsSettled(
+        async () => {
+          reads += 1;
+          return reads < 3 ? 1 : 0;
+        },
+        500,
+        1,
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      waitForNoFoodReplanRequestsSettled(async () => 1, 10, 1),
+    ).resolves.toBe(false);
+    await expect(
+      waitForNoFoodReplanRequestsSettled(
+        () => new Promise<number>(() => undefined),
+        10,
+        1,
+      ),
+    ).resolves.toBe(false);
   });
 });
