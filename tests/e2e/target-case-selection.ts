@@ -33,3 +33,9 @@ export function isCaseSelectedForTarget(
   if (targetCase === undefined || caseId === targetCase) return true;
   return TARGET_CASE_PREREQUISITES[targetCase]?.includes(caseId) === true;
 }
+
+export function isGatherMultiTargetCaseSelected(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return isCaseSelectedForTarget(targetCase, "gather_multi_target_continuity");
+}

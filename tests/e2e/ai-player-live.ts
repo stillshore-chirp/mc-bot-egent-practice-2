@@ -156,6 +156,7 @@ import {
 } from "./learning-reuse-acceptance.js";
 import {
   isCaseSelectedForTarget,
+  isGatherMultiTargetCaseSelected,
   TARGETABLE_CASES,
   type TargetableCase,
 } from "./target-case-selection.js";
@@ -7795,10 +7796,7 @@ async function prepareRun(): Promise<RunState> {
           "NO_FOOD_CONTINUITY_PROVIDER_REQUEST_BLOCKED",
         );
       }
-      if (
-        state.targetCase === "gather_multi_target_continuity" &&
-        state.gatherMultiTargetRequestGate !== undefined
-      ) {
+      if (state.gatherMultiTargetRequestGate !== undefined) {
         state.gatherMultiTargetRequestGate.beforeCall(
           () => {
             try {
@@ -13080,6 +13078,12 @@ async function recordCase(
     );
   } finally {
     state.llmAdmission?.endCase();
+    if (id === "gather_multi_target_continuity") {
+      if (state.gatherMultiTargetRequestGate?.inFlightRequests === 0) {
+        delete state.gatherMultiTargetRequestGate;
+      }
+      delete state.gatherMultiTargetCaseUsageStart;
+    }
   }
 }
 
@@ -13123,7 +13127,7 @@ async function runCase(
     }
     if (
       id === "gather_multi_target_continuity" &&
-      state.targetCase === "gather_multi_target_continuity"
+      isGatherMultiTargetCaseSelected(state.targetCase)
     ) {
       state.gatherMultiTargetCaseUsageStart = initial;
       state.gatherMultiTargetRequestGate = new AcceptedProviderRequestGate();
@@ -13426,14 +13430,14 @@ async function collect(app: CompanionApplication): Promise<Evidence> {
           state.ownerReturnRequestGate?.observeRecordedCalls(caseCalls);
         }
         if (
-          state.targetCase === "gather_multi_target_continuity" &&
+          state.gatherMultiTargetRequestGate !== undefined &&
           state.gatherMultiTargetCaseUsageStart !== undefined
         ) {
           const caseCalls = subtractCounters(
             counters,
             state.gatherMultiTargetCaseUsageStart,
           ).llmCalls;
-          state.gatherMultiTargetRequestGate?.observeRecordedCalls(caseCalls);
+          state.gatherMultiTargetRequestGate.observeRecordedCalls(caseCalls);
         }
         state.lastKnownPlayerDiagnostic = safePlayerDiagnostic(
           player,
