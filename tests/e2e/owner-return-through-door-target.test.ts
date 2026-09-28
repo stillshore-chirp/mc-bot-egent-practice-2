@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it, vi } from "vitest";
 
 import {
+  createOwnerReturnApplicationWithBodyCapture,
   createOwnerReturnRequestTracking,
   isOwnerProposalProgressable,
   ownerReturnAcceptanceEvidenceConfirmed,
@@ -10,6 +16,8 @@ import {
   ownerReturnToolNamesSince,
   runBudgetCoversCase,
 } from "./ai-player-live.js";
+import { createApplication } from "../../src/app/application.js";
+import type { AppConfig } from "../../src/config/schema.js";
 import {
   isCaseSelectedForTarget,
   TARGETABLE_CASES,
@@ -21,6 +29,74 @@ import {
 } from "./no-food-replan-request-gate.js";
 
 describe("owner return through door targeted E2E case", () => {
+  it("captures the Body created by the real application factory before startup", async () => {
+    const temporaryRoot = mkdtempSync(
+      join(tmpdir(), "owner-return-body-capture-"),
+    );
+    const config: AppConfig = {
+      minecraft: {
+        host: "127.0.0.1",
+        port: 25565,
+        username: "body-capture-bot",
+        auth: "offline",
+        version: "1.21.11",
+      },
+      ownerUsername: "body-capture-owner",
+      openai: { apiKey: "test-only-value", model: "test-model" },
+      databasePath: join(temporaryRoot, "player.sqlite"),
+      personaPath: fileURLToPath(
+        new URL("../../config/persona.example.json", import.meta.url),
+      ),
+      logLevel: "silent",
+      limits: {
+        maxMoveDistance: 128,
+        maxGatherCount: 64,
+        taskTimeoutMs: 900_000,
+        skillRetryLimit: 2,
+        followDistance: 3,
+        hungerThreshold: 14,
+        memoryContextLimit: 12,
+      },
+      reconnect: { enabled: false, maxAttempts: 0, delayMs: 250 },
+      dashboard: {
+        enabled: false,
+        host: "127.0.0.1",
+        port: 4310,
+        staticDirectory: "dashboard/dist",
+        maxAgeDays: 30,
+        maxTraces: 500,
+      },
+    };
+    const beforeCall = vi.fn(() => {
+      throw new Error("PROVIDER_REQUEST_NOT_EXPECTED_IN_FACTORY_TEST");
+    });
+    let capturedBodies = 0;
+    let application: ReturnType<typeof createApplication> | undefined;
+    let restoreProbe: (() => void) | undefined;
+    try {
+      const created = createOwnerReturnApplicationWithBodyCapture(
+        "owner_return_through_door",
+        createApplication,
+        config,
+        beforeCall,
+        () => {
+          capturedBodies += 1;
+        },
+      );
+      application = created.application;
+      restoreProbe = created.restoreProbe;
+      expect(capturedBodies).toBe(1);
+      expect(beforeCall).not.toHaveBeenCalled();
+    } finally {
+      try {
+        await application?.shutdown("test_complete");
+      } finally {
+        restoreProbe?.();
+        rmSync(temporaryRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("keeps request admission settling scoped to a targeted owner-return run", () => {
     expect(ownerReturnRequestGateEnabled("owner_return_through_door")).toBe(
       true,

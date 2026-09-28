@@ -3004,7 +3004,39 @@ let activeApplicationPlayerBody: MineflayerPlayerBody | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
 let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
-function installGameActionPlacementObservationProbe(): () => void {
+type ApplicationFactory =
+  typeof import("../../src/app/application.js").createApplication;
+
+export function createOwnerReturnApplicationWithBodyCapture(
+  targetCase: TargetableCase | undefined,
+  createApplication: ApplicationFactory,
+  config: Parameters<ApplicationFactory>[0],
+  beforeCall?: Parameters<ApplicationFactory>[1],
+  onPlayerBodyCreated?: (body: MineflayerPlayerBody) => void,
+): Readonly<{
+  application: ReturnType<ApplicationFactory>;
+  restoreProbe?: () => void;
+}> {
+  if (!ownerReturnRequestGateEnabled(targetCase))
+    return { application: createApplication(config, beforeCall) };
+
+  const restoreProbe = installGameActionPlacementObservationProbe(
+    onPlayerBodyCreated,
+  );
+  try {
+    return {
+      application: createApplication(config, beforeCall),
+      restoreProbe,
+    };
+  } catch (error) {
+    restoreProbe();
+    throw error;
+  }
+}
+
+function installGameActionPlacementObservationProbe(
+  onPlayerBodyCreated?: (body: MineflayerPlayerBody) => void,
+): () => void {
   const prototype = MineflayerPlayerBody.prototype;
   const originalObserveDescriptor = Object.getOwnPropertyDescriptor(
     prototype,
@@ -3028,6 +3060,7 @@ function installGameActionPlacementObservationProbe(): () => void {
   ): PlayerBody {
     const body = originalCreatePlayerBody.call(this);
     activeApplicationPlayerBody = body as MineflayerPlayerBody;
+    onPlayerBodyCreated?.(body as MineflayerPlayerBody);
     return body;
   };
   const instrumentedObserve = async function (
@@ -3885,7 +3918,16 @@ async function main(): Promise<void> {
       DASHBOARD_ENABLED: "false",
     });
     const { createApplication } = await import("../../src/app/application.js");
-    const activeApp = createApplication(config, state.llmAdmission?.beforeCall);
+    const createdApplication = createOwnerReturnApplicationWithBodyCapture(
+      state.targetCase,
+      createApplication,
+      config,
+      state.llmAdmission?.beforeCall,
+    );
+    const activeApp = createdApplication.application;
+    if (createdApplication.restoreProbe !== undefined)
+      restoreGameActionPlacementObservationProbe =
+        createdApplication.restoreProbe;
     appForCleanup = activeApp;
     const preStartEvidence = await collect(activeApp);
     const preStartCounters = countersOf(preStartEvidence);
