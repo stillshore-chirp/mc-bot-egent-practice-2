@@ -42,7 +42,24 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。`damage_response`のcase evidenceには`usageUnknownRequestErrorCalls`と`usageUnknownResponseUsageMissingCalls`の集計件数を記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
-後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`は前提caseなしで対象caseだけを実行します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`と`skill_exchange`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`は前提caseなしで対象caseだけを実行します。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`と`skill_exchange`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+
+## Issue #83の代表的な複数対象採集case
+
+`gather_multi_target_continuity`は、新しい隔離worldで視認できる合成oak/birch原木を各1個だけ用意し、所持数のRCON baselineを0と確認してから実GPTへ数量を指定しない自然なoak採集依頼と、短いbirch追記を送ります。fixtureの各1個はworld確認用で、依頼数量を意味しません。birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。Botの進捗説明本文はこのcaseでは解析せず、証跡を常に`unverified`と記録します。説明から数量や完了を推測しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱わずcaseを未完了にします。artifactへ残すのは固定boolean、数値、分類codeだけで、チャット本文やRCON返信は保存しません。
+
+case上限は32 calls / 300,000 known tokens / 8分、targeted wrapper全体は32 calls / 300,000 known tokens / 12分です。1回の対象runでは次のように選択し、同条件の自動再試行はしません。
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity \
+AI_PLAYER_E2E_MAX_LLM_CALLS=32 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=300000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=12 \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
+
+この説明はcaseの実装契約です。実GPTを使った対象runがpassするまでは、Issue #83の実ゲーム受入証拠として数えません。
 
 `owner_return_through_door`は、既定runtimeへ自然なowner帰還依頼を一度送り、階段と閉じた木製ドアを含む隔離fixtureを通過する挙動を測ります。RCONはfixtureの設置と位置・door状態の独立readbackだけに使い、移動は既定PlayerBodyを通るGPT判断に任せます。成功には今回の依頼後に生じた一件のproposalがadoptedまたはcompromisedとなり、その同じproposalへowner goalが結び付いていること、依頼後のmove_to判断、BodyとRCON双方のowner側到達、ownerから1.75ブロック以内、両観測の位置一致、door openを要求します。declined、pending、unknown、proposalに結び付かないowner goalは成功条件を満たしません。`ownerProposalAdoptedForRequest`はadoptedのみを表し、adoptedまたはcompromisedでgoalがリンク済みかは`ownerProposalProgressableForRequest`に記録します。
 

@@ -2,6 +2,7 @@ export const TARGETABLE_CASES = [
   "owner_return_through_door",
   "game_action_discretion",
   "food_intent_continuity",
+  "gather_multi_target_continuity",
   "damage_response",
   "no_food_replan",
   "learning_reuse",
