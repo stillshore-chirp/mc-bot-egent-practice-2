@@ -56,14 +56,14 @@ fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度�
 
 二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にworld状態が安定していたかを記録します。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
 
-case上限は32 calls / 300,000 known tokens / 8分、targeted wrapper全体は32 calls / 300,000 known tokens / 12分です。1回の対象runでは次のように選択し、同条件の自動再試行はしません。
+case上限は64 calls / 600,000 known tokens / 12分、targeted wrapper全体は72 calls / 660,000 known tokens / 16分です。1回の対象runでは次のように選択し、同条件の自動再試行はしません。
 
 ```sh
 AI_PLAYER_E2E_CONFIRMED=YES \
 AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity \
-AI_PLAYER_E2E_MAX_LLM_CALLS=32 \
-AI_PLAYER_E2E_MAX_TOTAL_TOKENS=300000 \
-AI_PLAYER_E2E_MAX_DURATION_MINUTES=12 \
+AI_PLAYER_E2E_MAX_LLM_CALLS=72 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=660000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=16 \
 npm exec -- tsx tests/e2e/ai-player-live.ts
 ```
 
