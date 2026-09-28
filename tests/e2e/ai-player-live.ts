@@ -5063,6 +5063,10 @@ async function main(): Promise<void> {
           beforeExport.proposals.map(({ id }) => id),
         );
         const exportedCandidateSkillIds = new Set<string>();
+        const exportedCandidateVersionsBySkillId = new Map<
+          string,
+          Set<number>
+        >();
         const exportResponseStart = context.responseQueue.length;
         sendChat(
           context.owner,
@@ -5101,6 +5105,19 @@ async function main(): Promise<void> {
             )
               return false;
             exportedCandidateSkillIds.add(activity.skillId);
+            if (
+              Number.isSafeInteger(activity.version) &&
+              activity.version > 0
+            ) {
+              const versions =
+                exportedCandidateVersionsBySkillId.get(activity.skillId) ??
+                new Set<number>();
+              versions.add(activity.version);
+              exportedCandidateVersionsBySkillId.set(
+                activity.skillId,
+                versions,
+              );
+            }
             return true;
           });
           return (
@@ -5114,6 +5131,8 @@ async function main(): Promise<void> {
         ).filter((file) => !beforeFiles.has(file));
         let exportedFile: string | undefined;
         let exportedSkillId: string | undefined;
+        let exportedSkillVersion: number | undefined;
+        let exportedSourceVersionUnmatched = false;
         for (const file of newFiles) {
           const markdown = await readFile(
             resolve(state.exchangeDirectory, file),
@@ -5138,13 +5157,43 @@ async function main(): Promise<void> {
             exchangeSkillIds.includes(skillId) &&
             exportedCandidateSkillIds.has(skillId)
           ) {
-            exportedFile = file;
-            exportedSkillId = skillId;
-            break;
+            const sourceVersion = isRecord(metadata)
+              ? metadata.sourceVersion
+              : undefined;
+            if (
+              typeof sourceVersion === "number" &&
+              Number.isSafeInteger(sourceVersion) &&
+              sourceVersion > 0 &&
+              exportedCandidateVersionsBySkillId
+                .get(skillId)
+                ?.has(sourceVersion)
+            ) {
+              exportedFile = file;
+              exportedSkillId = skillId;
+              exportedSkillVersion = sourceVersion;
+              break;
+            }
+            exportedSourceVersionUnmatched = true;
           }
         }
-        if (exportedFile === undefined || exportedSkillId === undefined)
+        if (exportedFile === undefined || exportedSkillId === undefined) {
+          if (exportedSourceVersionUnmatched) {
+            incomplete("SKILL_EXPORT_REVISION_NOT_CONFIRMED");
+          }
           fail("SKILL_EXPORT_FILE_ACTIVITY_MISMATCH");
+        }
+        const exportedSnapshot = readSkillSnapshot(state.databasePath);
+        const exportedRevisionReadBack =
+          exportedSkillVersion !== undefined &&
+          exportedSnapshot.revisionVersionsBySkill
+            .get(exportedSkillId)
+            ?.has(exportedSkillVersion) === true &&
+          exportedSnapshot.revisionDefinitionsBySkill
+            .get(exportedSkillId)
+            ?.has(exportedSkillVersion) === true;
+        if (!exportedRevisionReadBack) {
+          incomplete("SKILL_EXPORT_REVISION_NOT_CONFIRMED");
+        }
         state.skillExchangeStage = "export_confirmed";
         const filePath = resolve(state.exchangeDirectory, exportedFile);
         const exported = await readFile(filePath, "utf8");
@@ -5484,6 +5533,47 @@ async function main(): Promise<void> {
           const skillActivityBeforeUse = new Set(
             beforeSkillUse.skillActivity.map(skillActivityKey),
           );
+          const agentActivityKey = (
+            activity: PlayerAgentRoundActivity,
+          ): string =>
+            `${activity.runSequence}:${activity.role}:${activity.round}`;
+          const agentActivityBeforeUse = new Set(
+            (beforeSkillUse.recentAgentActivity ?? []).map(agentActivityKey),
+          );
+          const hasNewPurposeSearchToolCall = (
+            player: PlayerEvidence,
+          ): boolean =>
+            (player.recentAgentActivity ?? []).some(
+              (activity) =>
+                activity.role === "purpose" &&
+                !agentActivityBeforeUse.has(agentActivityKey(activity)) &&
+                activity.toolCalls.some(
+                  (toolCall) => toolCall.name === "search_skills",
+                ),
+            );
+          const findImportedRevisionSearchActivity = (
+            player: PlayerEvidence,
+          ): PlayerEvidence["skillActivity"][number] | undefined =>
+            player.skillActivity.find(
+              (activity) =>
+                activity.kind === "consulted" &&
+                activity.skillId === exportedSkillId &&
+                activity.version === importedSkillVersion &&
+                (activity.summary === "目的に関連する技能候補を検索" ||
+                  activity.summary ===
+                    "語句不一致のため基礎技能のカテゴリ候補を提示") &&
+                !skillActivityBeforeUse.has(skillActivityKey(activity)),
+            );
+          const findImportedRevisionSuccessfulDig = (
+            player: PlayerEvidence,
+          ): PlayerEvidence["recentOutcomes"][number] | undefined =>
+            newOutcomes(beforeSkillUse, player).find(
+              (outcome) =>
+                outcome.kind === "dig" &&
+                outcome.status === "successful" &&
+                outcome.skillId === exportedSkillId &&
+                outcome.skillVersion === importedSkillVersion,
+            );
           sendChat(
             context.owner,
             `編集して取り込んだ採集Skill「${exportedSkillId}」を参考に、見えているオーク原木を1本だけ採掘して結果を確かめてください。`,
@@ -5493,50 +5583,43 @@ async function main(): Promise<void> {
             context,
             120_000,
             async (player) => {
-              const consultedImportedRevision = player.skillActivity.some(
-                (activity) =>
-                  activity.kind === "consulted" &&
-                  activity.skillId === exportedSkillId &&
-                  activity.version === importedSkillVersion &&
-                  !skillActivityBeforeUse.has(skillActivityKey(activity)),
-              );
-              const successfulDigObserved = newOutcomes(
-                beforeSkillUse,
-                player,
-              ).some(
-                (outcome) =>
-                  outcome.kind === "dig" &&
-                  outcome.status === "successful" &&
-                  outcome.skillId === exportedSkillId &&
-                  outcome.skillVersion === importedSkillVersion,
-              );
+              const searchActivity = findImportedRevisionSearchActivity(player);
+              const successfulDig = findImportedRevisionSuccessfulDig(player);
+              const searchAt = Date.parse(searchActivity?.at ?? "");
+              const digObservedAt = Date.parse(successfulDig?.observedAt ?? "");
               return (
-                consultedImportedRevision &&
-                successfulDigObserved &&
+                hasNewPurposeSearchToolCall(player) &&
+                searchActivity !== undefined &&
+                successfulDig !== undefined &&
+                Number.isFinite(searchAt) &&
+                Number.isFinite(digObservedAt) &&
+                searchAt <= digObservedAt &&
                 !isOperationActive(player) &&
                 (await isBlock(context.rcon, activeSkillExchangeFixture, "air"))
               );
             },
           );
           state.skillExchangeStage = "consulted";
-          const postUseConsultation = skillUseAndWorldChange.skillActivity.some(
-            (activity) =>
-              activity.kind === "consulted" &&
-              activity.skillId === exportedSkillId &&
-              activity.version === importedSkillVersion &&
-              !skillActivityBeforeUse.has(skillActivityKey(activity)),
-          );
-          const confirmedDigOutcome = newOutcomes(
-            beforeSkillUse,
+          const postUsePurposeSearch = hasNewPurposeSearchToolCall(
             skillUseAndWorldChange,
-          ).find(
-            (outcome) =>
-              outcome.kind === "dig" &&
-              outcome.status === "successful" &&
-              outcome.skillId === exportedSkillId &&
-              outcome.skillVersion === importedSkillVersion,
           );
-          if (!postUseConsultation || confirmedDigOutcome === undefined)
+          const postUseImportedRevisionSearch =
+            findImportedRevisionSearchActivity(skillUseAndWorldChange);
+          const confirmedDigOutcome = findImportedRevisionSuccessfulDig(
+            skillUseAndWorldChange,
+          );
+          const searchAt = Date.parse(postUseImportedRevisionSearch?.at ?? "");
+          const digObservedAt = Date.parse(
+            confirmedDigOutcome?.observedAt ?? "",
+          );
+          if (
+            !postUsePurposeSearch ||
+            postUseImportedRevisionSearch === undefined ||
+            confirmedDigOutcome === undefined ||
+            !Number.isFinite(searchAt) ||
+            !Number.isFinite(digObservedAt) ||
+            searchAt > digObservedAt
+          )
             incomplete("SKILL_EXCHANGE_IMPORTED_REVISION_DIG_NOT_CONFIRMED");
           const serverConfirmedAirAfterDig = await isBlock(
             context.rcon,
@@ -5551,11 +5634,15 @@ async function main(): Promise<void> {
             repositorySeedFixtureUsed: standaloneSeedExchange,
             seedHasNoSuccessfulDerivedHypothesis: standaloneSeedExchange,
             markdownExportCreated: true,
+            sameExportedSkillRevisionConfirmed: true,
             humanConditionAndBodyEditImported: true,
             sameSkillRevisionAndImportReceiptReadBack: importedRevision,
             duplicateImportPreservedVersionMembershipDefinitionBodyAndPerSkillReceiptCount:
               duplicateImportPreservedCheckedState,
             sameImportedRevisionConsulted: true,
+            postImportPurposeSearchToolCallObserved: true,
+            sameImportedRevisionSearchActivityObserved: true,
+            importedRevisionSearchPrecededSuccessfulDig: true,
             oneSuccessfulBodyDigObserved: true,
             successfulDigUsedImportedSkillRevision: true,
             serverConfirmedAirAfterDig,
