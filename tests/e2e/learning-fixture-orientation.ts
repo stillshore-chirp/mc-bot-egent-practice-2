@@ -11,6 +11,11 @@ export interface EntityRotation {
 
 const ROTATION_MATCH_TOLERANCE_DEGREES = 2;
 
+/** Return Minecraft Java yaw for a horizontal direction from the observer. */
+export function javaYawForDirection(deltaX: number, deltaZ: number): number {
+  return (Math.atan2(-deltaX, deltaZ) * 180) / Math.PI;
+}
+
 export function angularDistance(left: number, right: number): number {
   return Math.abs(((((left - right) % 360) + 540) % 360) - 180);
 }

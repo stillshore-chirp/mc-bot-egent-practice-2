@@ -150,6 +150,7 @@ import {
 import {
   angularDistance,
   classifyLearningFixtureOrientation,
+  javaYawForDirection,
   type LearningFixtureOrientationDiagnostic,
 } from "./learning-fixture-orientation.js";
 import {
@@ -14894,7 +14895,7 @@ async function verifyUnknownFixtureSightline(
   const dy = targetCenter.y - eye.y;
   const dz = targetCenter.z - eye.z;
   const horizontalDistance = Math.hypot(dx, dz);
-  const expectedYaw = (Math.atan2(-dx, -dz) * 180) / Math.PI;
+  const expectedYaw = javaYawForDirection(dx, dz);
   const horizontalAngle = angularDistance(expectedYaw, yaw);
   const verticalAngle = Math.abs(
     (Math.atan2(dy, horizontalDistance) * 180) / Math.PI,
