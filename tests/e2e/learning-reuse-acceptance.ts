@@ -198,7 +198,7 @@ export function firstDigLearningDiagnostic(
   };
 }
 
-/** Select a trusted hypothesis created by this dig or already used by it. */
+/** Select learning evidence created from this dig or a trusted hypothesis it used. */
 export function firstDigLearningEvidence(
   outcome: FirstDigOutcome,
   baseline: LearningHypothesisSnapshot,
@@ -224,15 +224,12 @@ export function firstDigLearningEvidence(
     };
   }
 
-  const evidenceRevision = evidenceRevisionForOutcome(outcome, current);
-  const noNewSkills = [...current.skillIds].every((skillId) =>
-    baseline.skillIds.has(skillId),
+  const evidenceRevision = newReceiptLinkedRevisionForOutcome(
+    outcome,
+    baseline,
+    current,
   );
-  if (
-    evidenceRevision !== undefined &&
-    baseline.skillIds.has(evidenceRevision.skillId) &&
-    noNewSkills
-  ) {
+  if (evidenceRevision !== undefined) {
     return {
       source: "receipt_linked_revision_from_first_dig",
       skillId: evidenceRevision.skillId,
@@ -255,6 +252,50 @@ export function firstDigLearningEvidence(
     source: "preexisting_hypothesis_used",
     skillId,
   };
+}
+
+/** Link a consulted Skill use to its newly recorded, material receipt revision. */
+export function receiptLinkedConsultedRevisionForOutcome(
+  outcome: FirstDigOutcome,
+  baseline: LearningHypothesisSnapshot,
+  current: LearningHypothesisSnapshot,
+  verifiedLearnedSkillIds: ReadonlySet<string>,
+  consultedSkillVersionsById: ReadonlyMap<string, ReadonlySet<number>>,
+): LearningEvidenceRevision | undefined {
+  const evidenceRevision = newReceiptLinkedRevisionForOutcome(
+    outcome,
+    baseline,
+    current,
+  );
+  if (
+    evidenceRevision === undefined ||
+    !verifiedLearnedSkillIds.has(evidenceRevision.skillId) ||
+    !consultedSkillVersionsById
+      .get(evidenceRevision.skillId)
+      ?.has(evidenceRevision.skillVersionAtUse)
+  ) {
+    return undefined;
+  }
+  return evidenceRevision;
+}
+
+function newReceiptLinkedRevisionForOutcome(
+  outcome: FirstDigOutcome,
+  baseline: LearningHypothesisSnapshot,
+  current: LearningHypothesisSnapshot,
+): LearningEvidenceRevision | undefined {
+  const evidenceRevision = evidenceRevisionForOutcome(outcome, current);
+  if (
+    evidenceRevision === undefined ||
+    !baseline.skillIds.has(evidenceRevision.skillId) ||
+    baseline.evidenceRevisionsByRunId.has(outcome.operationId) ||
+    baseline.revisionVersionsBySkill
+      .get(evidenceRevision.skillId)
+      ?.has(evidenceRevision.revisionVersion)
+  ) {
+    return undefined;
+  }
+  return evidenceRevision;
 }
 
 /** Verify an exact successful operation-to-revision link with a material change. */

@@ -154,9 +154,9 @@ import {
 } from "./learning-fixture-orientation.js";
 import {
   countBoundedConsultedSkillIds,
-  evidenceRevisionForOutcome,
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
+  receiptLinkedConsultedRevisionForOutcome,
   type FirstDigLearningDiagnostic,
   type LearningHypothesisSnapshot,
 } from "./learning-reuse-acceptance.js";
@@ -4901,35 +4901,19 @@ async function main(): Promise<void> {
               ?.has(outcome.skillVersion),
         );
         const repeatedDig = repeatedDigOutcome !== undefined;
+        const verifiedLearnedSkillIdSet = new Set(verifiedLearnedSkillIds);
         const findReceiptLinkedConsultedSkillId = (
           snapshot: SkillSnapshot,
         ): string | undefined => {
           if (repeatedDigOutcome === undefined) return undefined;
-          const evidenceRevision = evidenceRevisionForOutcome(
+          const evidenceRevision = receiptLinkedConsultedRevisionForOutcome(
             repeatedDigOutcome,
+            beforeReuse,
             snapshot,
+            verifiedLearnedSkillIdSet,
+            consultedLearnedSkillVersionsById,
           );
-          if (
-            evidenceRevision === undefined ||
-            evidenceRevision.skillId !== repeatedDigOutcome.skillId ||
-            evidenceRevision.skillVersionAtUse !==
-              repeatedDigOutcome.skillVersion ||
-            !verifiedLearnedSkillIds.includes(evidenceRevision.skillId) ||
-            !consultedLearnedSkillVersionsById
-              .get(evidenceRevision.skillId)
-              ?.has(evidenceRevision.skillVersionAtUse) ||
-            ![...snapshot.skillIds].every((skillId) =>
-              beforeReuse.skillIds.has(skillId),
-            ) ||
-            beforeReuse.evidenceRevisionsByRunId.has(
-              repeatedDigOutcome.operationId,
-            ) ||
-            beforeReuse.revisionVersionsBySkill
-              .get(evidenceRevision.skillId)
-              ?.has(evidenceRevision.revisionVersion)
-          )
-            return undefined;
-          return evidenceRevision.skillId;
+          return evidenceRevision?.skillId;
         };
         if (
           !repeatedDig ||
