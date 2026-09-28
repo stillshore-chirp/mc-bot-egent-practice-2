@@ -5,6 +5,7 @@ import {
   evidenceRevisionForOutcome,
   firstDigLearningDiagnostic,
   firstDigLearningEvidence,
+  receiptLinkedConsultedRevisionForOutcome,
   type LearningEvidenceRevision,
   type LearningSkillDefinition,
   type LearningHypothesisSnapshot,
@@ -208,7 +209,7 @@ describe("first dig learning acceptance", () => {
     });
   });
 
-  it("rejects the existing-Skill revision path when a new Skill was added", () => {
+  it("accepts the exact receipt revision when another fixture Skill was added", () => {
     const usedDefinition = definition();
     const current = snapshot({
       skillIds: ["existing-skill", "new-skill"],
@@ -236,24 +237,30 @@ describe("first dig learning acceptance", () => {
       ],
     });
 
+    const outcome = {
+      operationId: "first-dig",
+      kind: "dig",
+      status: "successful",
+      skillId: "existing-skill",
+      skillVersion: 1,
+    };
+    const baseline = snapshot({
+      skillIds: ["existing-skill"],
+      revisionVersionsBySkill: [["existing-skill", [1]]],
+      revisionDefinitionsBySkill: [["existing-skill", [[1, usedDefinition]]]],
+    });
+
+    expect(firstDigLearningEvidence(outcome, baseline, current)).toEqual({
+      source: "receipt_linked_revision_from_first_dig",
+      skillId: "existing-skill",
+    });
     expect(
-      firstDigLearningEvidence(
-        {
-          operationId: "first-dig",
-          kind: "dig",
-          status: "successful",
-          skillId: "existing-skill",
-          skillVersion: 1,
-        },
-        snapshot({
-          skillIds: ["existing-skill"],
-          revisionDefinitionsBySkill: [
-            ["existing-skill", [[1, usedDefinition]]],
-          ],
-        }),
-        current,
-      ),
-    ).toBeUndefined();
+      firstDigLearningDiagnostic(outcome, baseline, current),
+    ).toMatchObject({
+      firstDigEvidenceRevisionMatchesOutcome: true,
+      firstDigEvidenceRevisionHasMaterialChange: true,
+      firstDigEvidenceRevisionHasNoNewSkills: false,
+    });
   });
 
   it("requires exact receipt operation, outcome, skill, and used version", () => {
@@ -427,6 +434,162 @@ describe("first dig learning acceptance", () => {
       skillVersionAtUse: 2,
       revisionVersion: 3,
     });
+  });
+
+  it("links a consulted receipt revision while allowing another fixture Skill", () => {
+    const usedDefinition = definition();
+    const baseline = snapshot({
+      skillIds: ["learned-skill"],
+      revisionVersionsBySkill: [["learned-skill", [1]]],
+      revisionDefinitionsBySkill: [["learned-skill", [[1, usedDefinition]]]],
+    });
+    const current = snapshot({
+      skillIds: ["learned-skill", "another-skill"],
+      revisionVersionsBySkill: [["learned-skill", [1, 2]]],
+      revisionDefinitionsBySkill: [
+        [
+          "learned-skill",
+          [
+            [1, usedDefinition],
+            [2, definition({ body: "materially revised" })],
+          ],
+        ],
+      ],
+      evidenceRevisionsByRunId: [
+        [
+          "reuse-dig",
+          {
+            skillId: "learned-skill",
+            operationName: "dig",
+            observedOutcome: "successful",
+            skillVersionAtUse: 1,
+            revisionVersion: 2,
+          },
+        ],
+      ],
+    });
+    const outcome = {
+      operationId: "reuse-dig",
+      kind: "dig",
+      status: "successful",
+      skillId: "learned-skill",
+      skillVersion: 1,
+    };
+    const verifiedSkillIds = new Set(["learned-skill"]);
+    const consultedVersionsById = new Map([["learned-skill", new Set([1])]]);
+
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        baseline,
+        current,
+        verifiedSkillIds,
+        consultedVersionsById,
+      ),
+    ).toMatchObject({
+      skillId: "learned-skill",
+      skillVersionAtUse: 1,
+      revisionVersion: 2,
+    });
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        baseline,
+        current,
+        verifiedSkillIds,
+        new Map([["learned-skill", new Set([2])]]),
+      ),
+    ).toBeUndefined();
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        baseline,
+        current,
+        new Set(["another-skill"]),
+        consultedVersionsById,
+      ),
+    ).toBeUndefined();
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        snapshot(),
+        current,
+        verifiedSkillIds,
+        consultedVersionsById,
+      ),
+    ).toBeUndefined();
+    const laterUsedVersion = 2;
+    const afterUseBaseline = snapshot({
+      skillIds: ["learned-skill"],
+      revisionVersionsBySkill: [["learned-skill", [1]]],
+      revisionDefinitionsBySkill: [["learned-skill", [[1, usedDefinition]]]],
+    });
+    const afterUseCurrent = snapshot({
+      skillIds: ["learned-skill", "another-skill"],
+      revisionVersionsBySkill: [["learned-skill", [1, 2, 3]]],
+      revisionDefinitionsBySkill: [
+        [
+          "learned-skill",
+          [
+            [1, usedDefinition],
+            [2, definition({ body: "second version" })],
+            [3, definition({ body: "third material version" })],
+          ],
+        ],
+      ],
+      evidenceRevisionsByRunId: [
+        [
+          "later-version-dig",
+          {
+            skillId: "learned-skill",
+            operationName: "dig",
+            observedOutcome: "successful",
+            skillVersionAtUse: laterUsedVersion,
+            revisionVersion: 3,
+          },
+        ],
+      ],
+    });
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        {
+          operationId: "later-version-dig",
+          kind: "dig",
+          status: "successful",
+          skillId: "learned-skill",
+          skillVersion: laterUsedVersion,
+        },
+        afterUseBaseline,
+        afterUseCurrent,
+        verifiedSkillIds,
+        new Map([["learned-skill", new Set([laterUsedVersion])]]),
+      ),
+    ).toMatchObject({
+      skillId: "learned-skill",
+      skillVersionAtUse: laterUsedVersion,
+      revisionVersion: 3,
+    });
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        snapshot({
+          skillIds: ["learned-skill"],
+          revisionVersionsBySkill: [["learned-skill", [1, 2]]],
+        }),
+        current,
+        verifiedSkillIds,
+        consultedVersionsById,
+      ),
+    ).toBeUndefined();
+    expect(
+      receiptLinkedConsultedRevisionForOutcome(
+        outcome,
+        baseline,
+        snapshot({ skillIds: ["learned-skill", "another-skill"] }),
+        verifiedSkillIds,
+        consultedVersionsById,
+      ),
+    ).toBeUndefined();
   });
 
   it.each([
