@@ -158,7 +158,13 @@ run38は最初のRotation読取で固定code `LEARNING_LOG_FIXTURE_ROTATION_READ
 
 隔離実行で初回の成功と仮説作成を確認し、再利用用fixtureの可視確認までに学習caseが約16万トークンを使用しました。結果の後半を一度に観測できるよう、このcase上限を60 calls / 60万トークンへ広げます。deadline 8分とゲーム内結果・Skill版・receiptのpass条件は維持します。全16 caseの個別上限を合計すると354 calls / 2,905,000 tokensですが、これは各caseの枠の合計で、単一runの枠ではありません。既定の全run上限45分 / 160 calls / 800,000 tokensは変更しません。
 
-Issue #80の次の代表runは`skill_compactness_and_knowledge_separation`をtargetに一度だけ実施し、依存caseの`autonomous_life`と`learning_reuse`を含めます。選択した3 caseの個別上限は合計80 calls / 725,000 tokensです。このtarget専用wrapperには`AI_PLAYER_E2E_MAX_LLM_CALLS=100`、`AI_PLAYER_E2E_MAX_TOTAL_TOKENS=800000`、`AI_PLAYER_E2E_MAX_DURATION_MINUTES=14`を指定します。wrapper値は既存validation範囲内の選択run上限で、既定global値45分 / 160 calls / 800,000 tokensとcase別予算を変更しません。実測はまだ行っていません。
+HEAD `10f2330`で`skill_compactness_and_knowledge_separation`と依存case`autonomous_life`・`learning_reuse`を含むtargeted隔離runを1回実施しました。選択3 caseの個別上限合計は80 calls / 725,000 tokens、wrapper上限は100 calls / 800,000 tokens / 14分で、既定global上限は変更していません。
+
+runはexit 1・`incomplete`でした。16 case中、Body smokeと`autonomous_life`の2件がpassし、未選択12件を含む14件がincompleteでした。`learning_reuse`は14 calls・報告137,640 tokensで`FIRST_DIG_DID_NOT_CREATE_OR_USE_VERIFIED_HYPOTHESIS`、compactness caseは0 callsで`ON_DEMAND_SKILL_REFERENCE_EVIDENCE_MISSING`となりました。
+
+run全体は22 reported calls・既知token下限211,482で、usageは`partial_or_unknown`です。未知usage内訳はなく、cleanupは3/3でした。
+
+再利用時のconsultation/outcome版一致、必要なSkill参照数、registry知識分離、条件保持は未確認です。Issue #80のACは0/4で、残件は同Issueで継続します。
 
 run40（HEAD `7466742`）はCI 7/7成功、隔離PaperでBody、runtime、自律行動、観測境界、永続記憶の5 caseがpassしました。学習fixtureは再利用段階で8個の原木設置、更新後のBody観測と原木可視性を確認しましたが、再利用結果を確認する前に学習caseの30 calls上限を31 callsで超え、約25.0万トークンで未完了でした。run全体は42 calls・304,653 tokensでusageは`partial_or_unknown`です。後続caseは未実施、server・listener・一時worldのcleanupは3/3確認済みです。終了時snapshotではowner proposalは初回依頼の1件だけで、再利用依頼後の新規proposalを確認できませんでした。この事実から再利用依頼が目的提案として伝わらなかった可能性が高いものの、LLM内部の理由は未確認です。
 
