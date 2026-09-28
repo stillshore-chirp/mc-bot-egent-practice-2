@@ -50,6 +50,8 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 `gather_multi_target_continuity`は既定application起動前に、既存`body_operation_smoke`の非OP Body clientとRCONでoak log 64個から65個への所持差分を測ります。この区間はruntimeが未起動なのでGPT受付やruntime actionと競合しません。1 stackから2 stacksへの変化、対象block消失、RCONが数えたitem drop 1個の生成、Bodyの`collect_item`後のdrop消失を独立に照合します。終了後はinventory・block・dropの空状態をRCONで確認し、その後に視認できる合成oak/birch原木を各1個だけ用意して所持数のRCON baselineを0と確認します。このfixtureの各1個はworld確認用で、依頼数量を意味しません。
 
+失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
+
 fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度は+X、+90度は-X、180度は-Z）に合わせ、観測者から対象への方向で角度を算出します。候補位置が空気・上部空気・石の足場を満たし、視線経路が開いていることをRCONで確認してから採用します。
 
 続いて実GPTへ数量を指定しない自然なoak採集依頼と、短いbirch追記を送り、birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。

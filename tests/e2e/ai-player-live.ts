@@ -50,6 +50,10 @@ import {
 import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
   GATHER_MULTI_TARGET_ITEMS,
+  gatherMultiTargetBodySmokeSafeFailureEvidence,
+  gatherMultiTargetInventorySafeEvidence,
+  gatherMultiTargetOracleProbeBaselineFailureFields,
+  gatherMultiTargetOracleProbeResultFailureFields,
   readGatherMultiTargetInventory,
   type GatherMultiTargetItem,
 } from "./gather-multi-target-acceptance.js";
@@ -2204,6 +2208,11 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "body_operation_smoke"
       ? (state.deathRecoveryFixtureDiagnostic ?? {})
       : {}),
+    ...gatherMultiTargetBodySmokeSafeFailureEvidence(
+      caseId,
+      state.targetCase,
+      gatherMultiTargetSafeEvidence(state),
+    ),
     ...(progress === undefined
       ? {}
       : {
@@ -10468,6 +10477,11 @@ async function runGatherStackOracleProbe(
     gatherOracleProbeProviderRequestsRecorded: 0,
     gatherOracleProbeBlockedProviderRequests: "not_applicable_prestart",
     gatherOracleProbeCleanupConfirmed: false,
+    ...gatherMultiTargetInventorySafeEvidence("Baseline", undefined),
+    ...gatherMultiTargetInventorySafeEvidence("Final", undefined),
+    gatherOracleProbeBaselineDropCount: null,
+    gatherOracleProbeDropCountBeforeCollection: null,
+    gatherOracleProbeDropCountAfterCollection: null,
   });
   try {
     await rcon.command(`clear ${botName}`);
@@ -10489,12 +10503,16 @@ async function runGatherStackOracleProbe(
     const baseline = await readGatherMultiTargetInventory(() =>
       rcon.command(`data get entity ${botName} Inventory`),
     );
-    if (
-      baseline.reason !== "parsed" ||
-      baseline.counts.oak_log !== 64 ||
-      baseline.stackCounts.oak_log !== 1 ||
-      baseline.counts.birch_log !== 0
-    ) {
+    updateGatherMultiTargetDiagnostic(state, {
+      ...gatherMultiTargetInventorySafeEvidence("Baseline", baseline),
+    });
+    const baselineFailureFields =
+      gatherMultiTargetOracleProbeBaselineFailureFields(baseline);
+    if (baselineFailureFields.length > 0) {
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherOracleProbeBaselineMismatchFields:
+          baselineFailureFields.join(","),
+      });
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_STACK_BASELINE_UNCONFIRMED");
     }
     const dropBaseline = await rconGatherLogDropCountNear(
@@ -10502,10 +10520,21 @@ async function runGatherStackOracleProbe(
       targetCenter,
       "oak_log",
     );
-    if (dropBaseline !== 0)
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeBaselineDropCount: dropBaseline,
+    });
+    if (dropBaseline !== 0) {
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherOracleProbeBaselineMismatchFields: "drop_baseline",
+      });
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_DROP_BASELINE_NOT_EMPTY");
+    }
     await rcon.command(`setblock ${target.x} ${target.y} ${target.z} oak_log`);
-    if (!(await isBlock(rcon, target, "oak_log")))
+    const blockPlaced = await isBlock(rcon, target, "oak_log");
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeBlockPlacedByServer: blockPlaced,
+    });
+    if (!blockPlaced)
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_BLOCK_NOT_CONFIRMED");
     const initialBody = await body.observe();
     if (
@@ -10540,13 +10569,24 @@ async function runGatherStackOracleProbe(
       AbortSignal.timeout(30_000),
     );
     const blockRemoved = !(await isBlock(rcon, target, "oak_log"));
-    if (dig.status !== "successful" || !blockRemoved)
+    const digConfirmed = dig.status === "successful" && blockRemoved;
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeBodyDigConfirmed: digConfirmed,
+      gatherOracleProbeBlockRemovedByServer: blockRemoved,
+    });
+    if (!digConfirmed)
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_DIG_UNCONFIRMED");
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeDropCountBeforeCollection: null,
+    });
     let dropCount = await rconGatherLogDropCountNear(
       rcon,
       targetCenter,
       "oak_log",
     );
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeDropCountBeforeCollection: dropCount,
+    });
     const dropDeadline = Date.now() + 2_000;
     while (dropCount === 0 && Date.now() < dropDeadline) {
       await waitMs(100);
@@ -10555,9 +10595,16 @@ async function runGatherStackOracleProbe(
         targetCenter,
         "oak_log",
       );
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherOracleProbeDropCountBeforeCollection: dropCount,
+      });
     }
-    if (dropCount !== 1)
+    if (dropCount !== 1) {
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherOracleProbeDropMismatch: true,
+      });
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_DROP_NOT_UNIQUE");
+    }
     const dropPosition = await rconGatherLogDropPositionNear(
       rcon,
       targetCenter,
@@ -10602,36 +10649,38 @@ async function runGatherStackOracleProbe(
       collection.status === "successful" &&
       collection.observedEffect?.type === "item_collected" &&
       collection.observedEffect.entityId === visibleDrop.id;
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeBodyCollectionConfirmed: collectionConfirmed,
+    });
     if (!collectionConfirmed)
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_COLLECTION_UNCONFIRMED");
     const inventoryAfter = await readGatherMultiTargetInventory(() =>
       rcon.command(`data get entity ${botName} Inventory`),
     );
+    updateGatherMultiTargetDiagnostic(state, {
+      ...gatherMultiTargetInventorySafeEvidence("Final", inventoryAfter),
+      gatherOracleProbeDropCountAfterCollection: null,
+    });
     const dropCountAfter = await rconGatherLogDropCountNear(
       rcon,
       targetCenter,
       "oak_log",
     );
-    if (
-      inventoryAfter.reason !== "parsed" ||
-      inventoryAfter.counts.oak_log !== 65 ||
-      inventoryAfter.stackCounts.oak_log !== 2 ||
-      inventoryAfter.counts.birch_log !== 0 ||
-      dropCountAfter !== 0
-    ) {
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherOracleProbeDropCountAfterCollection: dropCountAfter,
+    });
+    const resultFailureFields = gatherMultiTargetOracleProbeResultFailureFields(
+      inventoryAfter,
+      dropCountAfter,
+    );
+    if (resultFailureFields.length > 0) {
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherOracleProbeResultMismatchFields: resultFailureFields.join(","),
+      });
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_RESULT_UNCONFIRMED");
     }
     updateGatherMultiTargetDiagnostic(state, {
       gatherOracleProbeGptFreeConfirmed: true,
-      gatherOracleProbeBaselineOakCount: baseline.counts.oak_log,
-      gatherOracleProbeBaselineOakStackCount: baseline.stackCounts.oak_log,
-      gatherOracleProbeBodyDigConfirmed: true,
-      gatherOracleProbeBlockRemovedByServer: blockRemoved,
-      gatherOracleProbeDropCountBeforeCollection: dropCount,
-      gatherOracleProbeBodyCollectionConfirmed: collectionConfirmed,
-      gatherOracleProbeDropCountAfterCollection: dropCountAfter,
-      gatherOracleProbeFinalOakCount: inventoryAfter.counts.oak_log,
-      gatherOracleProbeFinalOakStackCount: inventoryAfter.stackCounts.oak_log,
     });
   } finally {
     let targetBlockRemoved = false;

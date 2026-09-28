@@ -47,6 +47,68 @@ export type GatherMultiTargetInventoryReadResult =
       readonly parseStage: GatherMultiTargetInventoryParseStage;
     };
 
+export type GatherMultiTargetOracleProbePhase = "Baseline" | "Final";
+
+/** Publish only fixed read classifications and counts; unknown counts stay null. */
+export function gatherMultiTargetInventorySafeEvidence(
+  phase: GatherMultiTargetOracleProbePhase,
+  result: GatherMultiTargetInventoryReadResult | undefined,
+): Readonly<Record<string, number | string | null>> {
+  const parsed = result?.reason === "parsed" ? result : undefined;
+  const prefix = `gatherOracleProbe${phase}`;
+  return {
+    [`${prefix}InventoryReadReason`]: result?.reason ?? "not_read",
+    [`${prefix}InventoryParseStage`]: result?.parseStage ?? "not_parsed",
+    [`${prefix}OakCount`]: parsed?.counts.oak_log ?? null,
+    [`${prefix}BirchCount`]: parsed?.counts.birch_log ?? null,
+    [`${prefix}OakStackCount`]: parsed?.stackCounts.oak_log ?? null,
+    [`${prefix}BirchStackCount`]: parsed?.stackCounts.birch_log ?? null,
+  };
+}
+
+/** Keep prestart gather diagnostics on the Body smoke failure artifact only. */
+export function gatherMultiTargetBodySmokeSafeFailureEvidence<
+  T extends Readonly<Record<string, unknown>>,
+>(
+  caseId: string,
+  targetCase: string | undefined,
+  evidence: T,
+): T | Readonly<Record<string, never>> {
+  return caseId === "body_operation_smoke" &&
+    targetCase === "gather_multi_target_continuity"
+    ? evidence
+    : {};
+}
+
+/** Return only confirmed mismatches; an unparsed inventory is not an empty one. */
+export function gatherMultiTargetOracleProbeBaselineFailureFields(
+  result: GatherMultiTargetInventoryReadResult | undefined,
+): readonly string[] {
+  if (result?.reason !== "parsed") return ["inventory_read"];
+  const fields: string[] = [];
+  if (result.counts.oak_log !== 64) fields.push("oak_count");
+  if (result.stackCounts.oak_log !== 1) fields.push("oak_stack_count");
+  if (result.counts.birch_log !== 0) fields.push("birch_count");
+  return fields;
+}
+
+/** Return only confirmed mismatches from the final server inventory and drop readback. */
+export function gatherMultiTargetOracleProbeResultFailureFields(
+  result: GatherMultiTargetInventoryReadResult | undefined,
+  dropCountAfterCollection: number,
+): readonly string[] {
+  const fields: string[] = [];
+  if (result?.reason !== "parsed") {
+    fields.push("inventory_read");
+  } else {
+    if (result.counts.oak_log !== 65) fields.push("oak_count");
+    if (result.stackCounts.oak_log !== 2) fields.push("oak_stack_count");
+    if (result.counts.birch_log !== 0) fields.push("birch_count");
+  }
+  if (dropCountAfterCollection !== 0) fields.push("drop_after_collection");
+  return fields;
+}
+
 type InventoryTagParserFailureStage = Extract<
   GatherMultiTargetInventoryParseStage,
   "root_invalid" | "nested_token_invalid" | "response_truncated_possible"
