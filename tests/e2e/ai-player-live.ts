@@ -247,7 +247,7 @@ const CASE_BUDGETS = {
   unknown_composite: { llmCalls: 48, totalTokens: 390_000 },
   observation_boundary: { llmCalls: 6, totalTokens: 35_000 },
   persistent_memory_restart: { llmCalls: 8, totalTokens: 60_000 },
-  learning_reuse: { llmCalls: 30, totalTokens: 300_000 },
+  learning_reuse: { llmCalls: 60, totalTokens: 600_000 },
   skill_compactness_and_knowledge_separation: {
     llmCalls: 2,
     totalTokens: 25_000,
@@ -4813,7 +4813,10 @@ async function main(): Promise<void> {
         const existingProposalIds = new Set(
           reuseStart.proposals.map(({ id }) => id),
         );
-        const consultedLearnedSkillIds = new Set<string>();
+        const consultedLearnedSkillVersionsById = new Map<
+          string,
+          Set<number>
+        >();
         const reuseResponseStart = context.responseQueue.length;
         state.learningReuseOwnerProposalRecorded = false;
         sendChat(
@@ -4848,19 +4851,33 @@ async function main(): Promise<void> {
               !existingActivityKeys.has(skillActivityKey(activity)),
           );
           for (const activity of newConsultedSkills) {
-            consultedLearnedSkillIds.add(activity.skillId);
+            const versions =
+              consultedLearnedSkillVersionsById.get(activity.skillId) ??
+              new Set<number>();
+            versions.add(activity.version);
+            consultedLearnedSkillVersionsById.set(activity.skillId, versions);
           }
           if (Date.now() - reuseFixtureCheckAt > 3_000) {
             reuseFixtureLogRemoved =
               (await fixtureLogsRemaining(rcon, reuseLogs)) < reuseLogs.length;
             reuseFixtureCheckAt = Date.now();
           }
+          const successfulDigUsedConsultedVersion = newOutcomes(
+            reuseStart,
+            player,
+          ).some(
+            (outcome) =>
+              outcome.kind === "dig" &&
+              outcome.status === "successful" &&
+              outcome.skillId !== undefined &&
+              outcome.skillVersion !== undefined &&
+              consultedLearnedSkillVersionsById
+                .get(outcome.skillId)
+                ?.has(outcome.skillVersion),
+          );
           return (
             player.actionRevision > reuseRevision &&
-            newOutcomes(reuseStart, player).some(
-              (outcome) =>
-                outcome.kind === "dig" && outcome.status === "successful",
-            ) &&
+            successfulDigUsedConsultedVersion &&
             !isOperationActive(player) &&
             newConsultedSkills.length > 0 &&
             reuseFixtureLogRemoved
@@ -4875,7 +4892,13 @@ async function main(): Promise<void> {
         const repeatedOutcomes = newOutcomes(reuseStart, reused);
         const repeatedDigOutcome = repeatedOutcomes.find(
           (outcome) =>
-            outcome.kind === "dig" && outcome.status === "successful",
+            outcome.kind === "dig" &&
+            outcome.status === "successful" &&
+            outcome.skillId !== undefined &&
+            outcome.skillVersion !== undefined &&
+            consultedLearnedSkillVersionsById
+              .get(outcome.skillId)
+              ?.has(outcome.skillVersion),
         );
         const repeatedDig = repeatedDigOutcome !== undefined;
         const findReceiptLinkedConsultedSkillId = (
@@ -4888,8 +4911,13 @@ async function main(): Promise<void> {
           );
           if (
             evidenceRevision === undefined ||
+            evidenceRevision.skillId !== repeatedDigOutcome.skillId ||
+            evidenceRevision.skillVersionAtUse !==
+              repeatedDigOutcome.skillVersion ||
             !verifiedLearnedSkillIds.includes(evidenceRevision.skillId) ||
-            !consultedLearnedSkillIds.has(evidenceRevision.skillId) ||
+            !consultedLearnedSkillVersionsById
+              .get(evidenceRevision.skillId)
+              ?.has(evidenceRevision.skillVersionAtUse) ||
             ![...snapshot.skillIds].every((skillId) =>
               beforeReuse.skillIds.has(skillId),
             ) ||
