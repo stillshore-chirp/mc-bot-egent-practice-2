@@ -12,6 +12,19 @@ export function gatherDropReadbackConfirmsAbsence(
   return classification === "known_negative";
 }
 
+export function gatherFixtureCleanupProofConfirmed(
+  dropReadbacks: readonly GatherDropReadbackClass[],
+  sourceBlocksAbsent: boolean,
+  fixtureInventoryEmpty: boolean,
+): boolean {
+  return (
+    dropReadbacks.length === 2 &&
+    dropReadbacks.every(gatherDropReadbackConfirmsAbsence) &&
+    sourceBlocksAbsent &&
+    fixtureInventoryEmpty
+  );
+}
+
 export function classifyGatherDropReadbackReply(
   reply: string,
 ): "position" | "known_negative" | "unknown_reply" {

@@ -54,6 +54,12 @@ import {
   type GatherMultiTargetItem,
 } from "./gather-multi-target-acceptance.js";
 import {
+  classifyGatherDropReadbackFailure,
+  classifyGatherDropReadbackReply,
+  gatherFixtureCleanupProofConfirmed,
+  type GatherDropReadbackClass,
+} from "./gather-drop-readback.js";
+import {
   countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
   hasResolvedGatherTargetOwnerGoal,
@@ -9818,6 +9824,11 @@ async function cleanupGatherMultiTargetFixture(
   botName: string,
   fixture: GatherMultiTargetFixture,
 ): Promise<void> {
+  updateGatherMultiTargetDiagnostic(state, {
+    gatherFixtureCleanupConfirmed: false,
+  });
+  const dropReadbacks: GatherDropReadbackClass[] = [];
+  let sourceBlocksAbsent = true;
   for (const [item, target] of [
     ["oak_log", fixture.oakLog],
     ["birch_log", fixture.birchLog],
@@ -9828,8 +9839,28 @@ async function cleanupGatherMultiTargetFixture(
     await rcon.command(
       `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} run kill @e[type=minecraft:item,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`,
     );
-    if (await isBlock(rcon, target, item))
-      incomplete("GATHER_MULTI_TARGET_FIXTURE_CLEANUP_UNVERIFIED");
+    const nearbyDrops = `@e[type=minecraft:item,distance=..3,nbt={Item:{id:"minecraft:${item}"}}]`;
+    const singleNearbyDrop = `@e[type=minecraft:item,distance=..3,limit=1,nbt={Item:{id:"minecraft:${item}"}}]`;
+    let dropReadback: GatherDropReadbackClass;
+    try {
+      const reply = await rcon.command(
+        `execute positioned ${target.x + 0.5} ${target.y + 0.5} ${target.z + 0.5} if entity ${nearbyDrops} run data get entity ${singleNearbyDrop} Pos`,
+      );
+      dropReadback = classifyGatherDropReadbackReply(reply);
+    } catch (error) {
+      dropReadback = classifyGatherDropReadbackFailure(
+        error instanceof HarnessError ? error.code : undefined,
+      );
+    }
+    dropReadbacks.push(dropReadback);
+    updateGatherMultiTargetDiagnostic(
+      state,
+      item === "oak_log"
+        ? { gatherOakFixtureDropReadback: dropReadback }
+        : { gatherBirchFixtureDropReadback: dropReadback },
+    );
+    sourceBlocksAbsent =
+      sourceBlocksAbsent && !(await isBlock(rcon, target, item));
   }
   for (const item of GATHER_MULTI_TARGET_ITEMS) {
     await rcon.command(`clear ${botName} minecraft:${item}`);
@@ -9837,9 +9868,15 @@ async function cleanupGatherMultiTargetFixture(
   const inventory = await readGatherMultiTargetInventory(() =>
     rcon.command(`data get entity ${botName} Inventory`),
   );
+  const fixtureInventoryEmpty =
+    inventory.reason === "parsed" &&
+    GATHER_MULTI_TARGET_ITEMS.every((item) => inventory.counts[item] === 0);
   if (
-    inventory.reason !== "parsed" ||
-    GATHER_MULTI_TARGET_ITEMS.some((item) => inventory.counts[item] !== 0)
+    !gatherFixtureCleanupProofConfirmed(
+      dropReadbacks,
+      sourceBlocksAbsent,
+      fixtureInventoryEmpty,
+    )
   ) {
     incomplete("GATHER_MULTI_TARGET_FIXTURE_CLEANUP_UNVERIFIED");
   }

@@ -4,6 +4,7 @@ import {
   classifyGatherDropReadbackFailure,
   classifyGatherDropReadbackReply,
   gatherDropReadbackConfirmsAbsence,
+  gatherFixtureCleanupProofConfirmed,
 } from "./gather-drop-readback.js";
 
 describe("gather drop readback classification", () => {
@@ -52,5 +53,51 @@ describe("gather drop readback classification", () => {
 
   it("accepts only an explicit known-negative reply as proof of absence", () => {
     expect(gatherDropReadbackConfirmsAbsence("known_negative")).toBe(true);
+  });
+
+  it("confirms fixture cleanup only after two independent negative reads", () => {
+    expect(
+      gatherFixtureCleanupProofConfirmed(
+        ["known_negative", "known_negative"],
+        true,
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      gatherFixtureCleanupProofConfirmed(["known_negative"], true, true),
+    ).toBe(false);
+  });
+
+  it.each([
+    "position",
+    "unknown_reply",
+    "timeout",
+    "unavailable",
+    "not_attempted",
+  ] as const)("keeps cleanup unconfirmed for %s drop readback", (status) => {
+    expect(
+      gatherFixtureCleanupProofConfirmed(
+        ["known_negative", status],
+        true,
+        true,
+      ),
+    ).toBe(false);
+  });
+
+  it("requires source blocks and fixture inventory to be absent too", () => {
+    expect(
+      gatherFixtureCleanupProofConfirmed(
+        ["known_negative", "known_negative"],
+        false,
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      gatherFixtureCleanupProofConfirmed(
+        ["known_negative", "known_negative"],
+        true,
+        false,
+      ),
+    ).toBe(false);
   });
 });
