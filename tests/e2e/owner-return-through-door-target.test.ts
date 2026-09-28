@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createOwnerReturnRequestSettlementOnce,
   createOwnerReturnApplicationWithBodyCapture,
   createOwnerReturnRequestTracking,
   isOwnerProposalProgressable,
@@ -14,7 +15,10 @@ import {
   OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   ownerReturnArrivalConfirmed,
   ownerReturnToolNamesSince,
+  ownerReturnUsageIsUnknown,
   runBudgetCoversCase,
+  settleOwnerReturnCaseFailure,
+  settleOwnerReturnBeforeShutdown,
 } from "./ai-player-live.js";
 import { createApplication } from "../../src/app/application.js";
 import type { AppConfig } from "../../src/config/schema.js";
@@ -95,6 +99,41 @@ describe("owner return through door targeted E2E case", () => {
         rmSync(temporaryRoot, { recursive: true, force: true });
       }
     }
+  });
+
+  it("settles a failed case once before shutdown and keeps usage separate", async () => {
+    const events: string[] = [];
+    const settle = vi.fn(async () => {
+      events.push("settle");
+      return "timed_out" as const;
+    });
+    const settleOnce = createOwnerReturnRequestSettlementOnce(settle);
+    const shutdown = vi.fn(async () => {
+      events.push("shutdown");
+    });
+
+    const caseOutcome = await settleOwnerReturnCaseFailure(
+      "incomplete",
+      settleOnce,
+    );
+    const cleanupStatus = await settleOwnerReturnBeforeShutdown(
+      true,
+      settleOnce,
+      shutdown,
+    );
+    await settleOwnerReturnBeforeShutdown(true, settleOnce, shutdown);
+
+    expect(events).toEqual(["settle", "shutdown", "shutdown"]);
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(caseOutcome.caseStatus).toBe("incomplete");
+    expect(caseOutcome.settleStatus).toBe("timed_out");
+    expect(caseOutcome.usageUnknown).toBe(true);
+    expect(cleanupStatus).toBe("timed_out");
+    expect(ownerReturnUsageIsUnknown("budget_exceeded")).toBe(false);
+
+    const skippedTargetSettle = vi.fn(async () => "settled" as const);
+    await settleOwnerReturnBeforeShutdown(false, skippedTargetSettle, shutdown);
+    expect(skippedTargetSettle).not.toHaveBeenCalled();
   });
 
   it("keeps request admission settling scoped to a targeted owner-return run", () => {

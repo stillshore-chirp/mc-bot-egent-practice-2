@@ -562,6 +562,7 @@ type OwnerReturnProposalDisposition =
 
 interface OwnerReturnDiagnostic {
   readonly stage:
+    | "not_started"
     | "fixture_setup"
     | "preflight"
     | "owner_request"
@@ -2868,6 +2869,9 @@ interface RunState {
   ownerReturnProposalIdForRun?: string;
   ownerReturnCaseUsageStart?: Counters;
   ownerReturnRequestGate?: AcceptedProviderRequestGate;
+  ownerReturnRequestSettlement?: () => Promise<AcceptedProviderRequestSettleStatus>;
+  ownerReturnRequestSettlementStatus?: AcceptedProviderRequestSettleStatus;
+  ownerReturnCaseDeadlineAt?: number;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -3365,18 +3369,85 @@ async function settleNoFoodReplanRequests(
 
 const OWNER_RETURN_REQUEST_SETTLE_MAX_MS = 15_000;
 
-async function settleOwnerReturnRequests(
+function settleOwnerReturnRequests(
   state: RunState,
-  context: CaseContext,
+  context: CaseContext | undefined,
+): Promise<AcceptedProviderRequestSettleStatus> {
+  const settleOnce =
+    state.ownerReturnRequestSettlement ??=
+      createOwnerReturnRequestSettlementOnce(() =>
+        settleOwnerReturnRequestsOnce(state, context).catch(() =>
+          recordOwnerReturnSettlementStatus(state, "unknown", false),
+        ),
+      );
+  return settleOnce();
+}
+
+export function createOwnerReturnRequestSettlementOnce(
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+): () => Promise<AcceptedProviderRequestSettleStatus> {
+  let pending: Promise<AcceptedProviderRequestSettleStatus> | undefined;
+  return () => {
+    pending ??= Promise.resolve()
+      .then(settle)
+      .catch(() => "unknown");
+    return pending;
+  };
+}
+
+export async function settleOwnerReturnBeforeShutdown(
+  shouldSettle: boolean,
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+  shutdown: () => Promise<void>,
+): Promise<AcceptedProviderRequestSettleStatus | undefined> {
+  let status: AcceptedProviderRequestSettleStatus | undefined;
+  try {
+    if (shouldSettle) status = await settle();
+  } catch {
+    status = "unknown";
+  }
+  await shutdown();
+  return status;
+}
+
+export async function settleOwnerReturnCaseFailure(
+  caseStatus: Exclude<Status, "pass">,
+  settle: () => Promise<AcceptedProviderRequestSettleStatus>,
+  shutdown?: () => Promise<void>,
+): Promise<Readonly<{
+  caseStatus: Exclude<Status, "pass">;
+  settleStatus: AcceptedProviderRequestSettleStatus;
+  usageUnknown: boolean;
+}>> {
+  let settleStatus: AcceptedProviderRequestSettleStatus;
+  try {
+    settleStatus = await settle();
+  } catch {
+    settleStatus = "unknown";
+  }
+  if (shutdown !== undefined) await shutdown();
+  return {
+    caseStatus,
+    settleStatus,
+    usageUnknown: ownerReturnUsageIsUnknown(settleStatus),
+  };
+}
+
+export function ownerReturnUsageIsUnknown(
+  status: AcceptedProviderRequestSettleStatus,
+): boolean {
+  return status !== "settled" && status !== "budget_exceeded";
+}
+
+async function settleOwnerReturnRequestsOnce(
+  state: RunState,
+  context: CaseContext | undefined,
 ): Promise<AcceptedProviderRequestSettleStatus> {
   const gate = state.ownerReturnRequestGate;
   const caseStart = state.ownerReturnCaseUsageStart;
   gate?.latch();
-  if (gate === undefined || caseStart === undefined) {
-    updateOwnerReturnDiagnostic(state, {
-      ...ownerReturnRequestDiagnosticPatch(state, "unknown", false),
-    });
-    return "unknown";
+  if (gate === undefined || caseStart === undefined || context === undefined) {
+    return recordOwnerReturnSettlementStatus(state, "unknown", false);
   }
 
   let failureStatus:
@@ -3409,7 +3480,9 @@ async function settleOwnerReturnRequests(
         });
         if (status !== "pending" && status !== "settled") {
           failureStatus = status;
-          throw new Error("OWNER_RETURN_REQUEST_SETTLEMENT_INCOMPLETE");
+          if (gate.inFlightRequests === 0) {
+            throw new Error("OWNER_RETURN_REQUEST_SETTLEMENT_INCOMPLETE");
+          }
         }
         return gate.inFlightRequests;
       },
@@ -3419,10 +3492,29 @@ async function settleOwnerReturnRequests(
     failureStatus ??= "unknown";
   }
 
-  const status = failureStatus ?? (requestsSettled ? "settled" : "timed_out");
+  const status =
+    failureStatus !== undefined && gate.inFlightRequests === 0
+      ? failureStatus
+      : requestsSettled
+        ? "settled"
+        : "timed_out";
+  return recordOwnerReturnSettlementStatus(
+    state,
+    status,
+    gate.inFlightRequests === 0,
+  );
+}
+
+function recordOwnerReturnSettlementStatus(
+  state: RunState,
+  status: AcceptedProviderRequestSettleStatus,
+  settled: boolean,
+): AcceptedProviderRequestSettleStatus {
   updateOwnerReturnDiagnostic(state, {
-    ...ownerReturnRequestDiagnosticPatch(state, status, status === "settled"),
+    ...ownerReturnRequestDiagnosticPatch(state, status, settled),
   });
+  state.ownerReturnRequestSettlementStatus = status;
+  if (ownerReturnUsageIsUnknown(status)) state.usageUncertain = true;
   return status;
 }
 
@@ -7405,9 +7497,23 @@ async function main(): Promise<void> {
     state.status = status;
     state.failureCode ??= code;
     if (state.countersInitial !== undefined && status === "incomplete") {
-      if (!isNoFoodContinuityProbeOnly()) state.usageUncertain = true;
+      if (
+        !isNoFoodContinuityProbeOnly() &&
+        !ownerReturnRequestGateEnabled(state.targetCase)
+      ) {
+        state.usageUncertain = true;
+      }
     }
   } finally {
+    if (
+      ownerReturnRequestGateEnabled(state.targetCase) &&
+      state.ownerReturnRequestGate !== undefined
+    ) {
+      await settleOwnerReturnRequests(
+        state,
+        ownerReturnSettlementContext(state),
+      );
+    }
     if (liveContext !== undefined && shouldCollectAfterRun(state)) {
       try {
         state.countersFinal = countersOf(
@@ -9089,7 +9195,7 @@ function updateOwnerReturnDiagnostic(
   update: Partial<OwnerReturnDiagnostic>,
 ): void {
   state.ownerReturnDiagnostic = {
-    stage: "fixture_setup",
+    stage: "not_started",
     ...state.ownerReturnDiagnostic,
     ...update,
   };
@@ -11835,6 +11941,17 @@ function requireLiveContext(): CaseContext {
   return liveContext;
 }
 
+function ownerReturnSettlementContext(
+  state: RunState,
+): CaseContext | undefined {
+  if (liveContext === undefined) return undefined;
+  const caseDeadlineAt = state.ownerReturnCaseDeadlineAt;
+  return caseDeadlineAt === undefined ||
+    caseDeadlineAt === liveContext.caseDeadlineAt
+    ? liveContext
+    : { ...liveContext, caseDeadlineAt };
+}
+
 async function recordCase(
   state: RunState,
   id: string,
@@ -11887,6 +12004,12 @@ async function recordCase(
           runBudget: state.runBudget,
           caseBudget,
         };
+        if (
+          id === "owner_return_through_door" &&
+          ownerReturnRequestGateEnabled(state.targetCase)
+        ) {
+          state.ownerReturnCaseDeadlineAt = caseContext.caseDeadlineAt;
+        }
         const measured = await runCaseBody(caseContext);
         const finalUsage = countersOf(
           await collect(requireLiveContext().runtime.app),
@@ -12043,6 +12166,39 @@ async function runCase(
     state.cases.push(item);
     return item;
   } catch (error) {
+    const reason =
+      error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
+    const caseStatus =
+      error instanceof HarnessError ? error.status : "incomplete";
+    const ownerReturnCase =
+      id === "owner_return_through_door" &&
+      ownerReturnRequestGateEnabled(state.targetCase);
+    let ownerReturnFailureSettlement:
+      | Awaited<ReturnType<typeof settleOwnerReturnCaseFailure>>
+      | undefined;
+    if (ownerReturnCase && state.ownerReturnRequestGate !== undefined) {
+      const settle = () =>
+        settleOwnerReturnRequests(state, ownerReturnSettlementContext(state));
+      ownerReturnFailureSettlement = await settleOwnerReturnCaseFailure(
+        caseStatus,
+        settle,
+        /BUDGET|DEADLINE/u.test(reason)
+          ? async () => {
+              try {
+                await boundedShutdown(
+                  appForCleanup,
+                  "ai_player_e2e_budget_or_deadline",
+                );
+              } catch {
+                state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+              }
+            }
+          : undefined,
+      );
+      if (ownerReturnFailureSettlement.usageUnknown) {
+        state.usageUncertain = true;
+      }
+    }
     let terminalEvidence: Evidence | undefined;
     let final = initial;
     if (
@@ -12056,20 +12212,26 @@ async function runCase(
       } catch {
         final = initialCaptured ? (state.countersFinal ?? initial) : initial;
       }
+    } else if (
+      ownerReturnCase &&
+      state.countersFinal !== undefined &&
+      initialCaptured
+    ) {
+      final = state.countersFinal;
     }
     const delta = subtractCounters(final, initial);
-    const reason =
-      error instanceof HarnessError ? error.code : "CASE_EXECUTION_ERROR";
-    const caseStatus =
-      error instanceof HarnessError ? error.status : "incomplete";
     const usageUncertain =
       id !== "body_operation_smoke" &&
       id !== "no_food_fixture_probe" &&
       id !== "no_food_continuity_probe" &&
-      (/BUDGET|DEADLINE/u.test(reason) ||
-        delta.usageUnknownCalls > 0 ||
-        (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
-        caseStatus === "incomplete");
+      (ownerReturnCase
+        ? delta.usageUnknownCalls > 0 ||
+          (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
+          ownerReturnFailureSettlement?.usageUnknown !== false
+        : /BUDGET|DEADLINE/u.test(reason) ||
+          delta.usageUnknownCalls > 0 ||
+          (delta.llmCalls > 0 && totalTokens(delta) === 0) ||
+          caseStatus === "incomplete");
     if (usageUncertain) state.usageUncertain = true;
     const lastEvidence = terminalEvidence ?? snapshotCapture.latestEvidence;
     if (caseExecuted) {
@@ -12089,18 +12251,20 @@ async function runCase(
     if (/BUDGET|DEADLINE/u.test(reason)) {
       state.abortRequested = true;
       state.failureCode ??= reason;
-      try {
-        await boundedShutdown(
-          appForCleanup,
-          "ai_player_e2e_budget_or_deadline",
-        );
-      } catch {
-        state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+      if (!ownerReturnCase) {
+        try {
+          await boundedShutdown(
+            appForCleanup,
+            "ai_player_e2e_budget_or_deadline",
+          );
+        } catch {
+          state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
+        }
       }
     }
     const item: SafeCaseResult = {
       id,
-      status: caseStatus,
+      status: ownerReturnFailureSettlement?.caseStatus ?? caseStatus,
       durationMs: Date.now() - started,
       llmCalls: delta.llmCalls,
       inputTokens: delta.inputTokens,
@@ -13389,11 +13553,21 @@ async function retainObservationBoundaryReplies(
 }
 
 async function cleanup(state: RunState): Promise<void> {
-  try {
-    await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
-  } catch {
-    markCleanupFailure(state, "APPLICATION_SHUTDOWN_FAILED");
-  }
+  const settleStatus = await settleOwnerReturnBeforeShutdown(
+    ownerReturnRequestGateEnabled(state.targetCase) &&
+      state.ownerReturnRequestGate !== undefined,
+    () =>
+      settleOwnerReturnRequests(state, ownerReturnSettlementContext(state)),
+    async () => {
+      try {
+        await boundedShutdown(appForCleanup, "ai_player_e2e_finished");
+      } catch {
+        markCleanupFailure(state, "APPLICATION_SHUTDOWN_FAILED");
+      }
+    },
+  );
+  if (settleStatus !== undefined && ownerReturnUsageIsUnknown(settleStatus))
+    state.usageUncertain = true;
   try {
     ownerForCleanup?.quit();
     guestForCleanup?.quit();
