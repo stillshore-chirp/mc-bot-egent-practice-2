@@ -8650,9 +8650,6 @@ async function runOperationSmoke(
       try {
         await client.connect(abort.signal);
         body = client.createPlayerBody();
-        if (state.targetCase === "gather_multi_target_continuity") {
-          await runGatherStackOracleProbe(state, rcon, state.botName, body);
-        }
         if (isDeathRecoveryFixtureProbeOnly())
           return await runDeathRecoveryFixtureProbe(
             state,
@@ -8699,6 +8696,9 @@ async function runOperationSmoke(
         }
         if (!positionMatchesSmokeSpawn(visibleBefore.self.position))
           incomplete("BODY_SMOKE_CLIENT_POSITION_NOT_CONFIRMED");
+        if (state.targetCase === "gather_multi_target_continuity") {
+          await runGatherStackOracleProbe(state, rcon, state.botName, body);
+        }
         const hiddenItemOmitted = !JSON.stringify(visibleBefore)
           .toLowerCase()
           .includes("emerald");
@@ -10324,6 +10324,9 @@ async function runGatherStackOracleProbe(
       gatherOracleProbeFinalOakStackCount: inventoryAfter.stackCounts.oak_log,
     });
   } finally {
+    let targetBlockRemoved = false;
+    let dropsRemoved = false;
+    let inventoryRestored = false;
     try {
       await rcon.command(
         `fill ${target.x} ${target.y} ${target.z} ${target.x} ${target.y} ${target.z} air replace oak_log`,
@@ -10332,20 +10335,68 @@ async function runGatherStackOracleProbe(
         `execute positioned ${targetCenter.x} ${targetCenter.y} ${targetCenter.z} run kill @e[type=minecraft:item,distance=..4,nbt={Item:{id:"minecraft:oak_log"}}]`,
       );
       await rcon.command(`clear ${botName}`);
-      cleanupConfirmed =
-        (await isBlock(rcon, target, "air")) &&
-        (await rconGatherLogDropCountNear(rcon, targetCenter, "oak_log")) ===
-          0 &&
-        (await rconInventoryIsEmpty(
-          rcon,
-          botName,
-          "GATHER_MULTI_TARGET_ORACLE_PROBE_CLEANUP_NOT_CONFIRMED",
-        ));
+      targetBlockRemoved = await isBlock(rcon, target, "air");
+      dropsRemoved =
+        (await rconGatherLogDropCountNear(rcon, targetCenter, "oak_log")) === 0;
+      inventoryRestored = await rconInventoryIsEmpty(
+        rcon,
+        botName,
+        "GATHER_MULTI_TARGET_ORACLE_PROBE_CLEANUP_NOT_CONFIRMED",
+      );
     } catch {
-      cleanupConfirmed = false;
+      // Still restore the known origin even when fixture cleanup failed.
     }
+    let originRestored = false;
+    const restoreDeadline = Date.now() + 5_000;
+    try {
+      await rcon.command(
+        `tp ${botName} ${origin.x} ${origin.y} ${origin.z} 0 0`,
+        Math.max(1, restoreDeadline - Date.now()),
+      );
+      while (Date.now() < restoreDeadline) {
+        const remainingMs = Math.max(1, restoreDeadline - Date.now());
+        const serverPosition = parsePosition(
+          await rcon.command(`data get entity ${botName} Pos`, remainingMs),
+        );
+        const observationRemainingMs = Math.max(
+          1,
+          restoreDeadline - Date.now(),
+        );
+        let observationTimer: ReturnType<typeof setTimeout> | undefined;
+        let observation: PlayerBodyObservation | undefined;
+        try {
+          observation = await Promise.race([
+            body.observe(),
+            new Promise<undefined>((resolve) => {
+              observationTimer = setTimeout(
+                () => resolve(undefined),
+                observationRemainingMs,
+              );
+            }),
+          ]);
+        } finally {
+          if (observationTimer !== undefined) clearTimeout(observationTimer);
+        }
+        if (observation === undefined) break;
+        const bodyPosition = observation.self.position;
+        const positionMatches = (left: Position, right: Position): boolean =>
+          Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z) <=
+          0.5;
+        originRestored =
+          positionMatches(serverPosition, origin) &&
+          positionMatches(bodyPosition, origin) &&
+          positionMatches(serverPosition, bodyPosition);
+        if (originRestored) break;
+        const waitMsRemaining = restoreDeadline - Date.now();
+        if (waitMsRemaining > 0) await waitMs(Math.min(100, waitMsRemaining));
+      }
+    } catch {
+      originRestored = false;
+    }
+    cleanupConfirmed =
+      targetBlockRemoved && dropsRemoved && inventoryRestored && originRestored;
     updateGatherMultiTargetDiagnostic(state, {
-      gatherOracleProbeInventoryRestoredEmpty: cleanupConfirmed,
+      gatherOracleProbeInventoryRestoredEmpty: inventoryRestored,
       gatherOracleProbeCleanupConfirmed: cleanupConfirmed,
     });
     if (!cleanupConfirmed)
