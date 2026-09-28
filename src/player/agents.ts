@@ -305,19 +305,7 @@ function validateDeathRecoveryStep(
   snapshot: PlayerRuntimeSnapshot,
   observation: PlayerBodyObservation | undefined,
 ): string | undefined {
-  if (!expectedOutcome.startsWith("[death-recovery:")) {
-    const anchor = snapshot.latestDeath?.beforeObservation?.position;
-    if (
-      operation.kind === "move_to" &&
-      anchor !== undefined &&
-      finitePosition(anchor) &&
-      operation.position.x === anchor.x &&
-      operation.position.y === anchor.y &&
-      operation.position.z === anchor.z
-    )
-      return "DEATH_RECOVERY_MARKER_REQUIRED";
-    return undefined;
-  }
+  if (!expectedOutcome.startsWith("[death-recovery:")) return undefined;
   const marker = /^\[death-recovery:([^\]]+):(approach|sweep|collect)\]/u.exec(
     expectedOutcome,
   );
@@ -337,13 +325,9 @@ function validateDeathRecoveryStep(
   const recoveryStage = stage as DeathRecoveryStage;
   if (observation === undefined) return "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
 
-  const visibleItem = observation.perception.entities.some(
-    ({ name }) => name === "item",
-  );
   if (recoveryStage === "approach") {
     if (operation.kind !== "move_to")
       return "DEATH_RECOVERY_STEP_KIND_MISMATCH";
-    if (visibleItem) return "DEATH_RECOVERY_ITEM_ALREADY_VISIBLE";
     const anchor = death.beforeObservation?.position;
     if (
       anchor?.x === undefined ||
@@ -355,7 +339,6 @@ function validateDeathRecoveryStep(
   } else if (recoveryStage === "sweep") {
     if (operation.kind !== "look_sweep")
       return "DEATH_RECOVERY_STEP_KIND_MISMATCH";
-    if (visibleItem) return "DEATH_RECOVERY_ITEM_ALREADY_VISIBLE";
     const anchor = death.beforeObservation?.position;
     if (anchor === undefined) return "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
     const distance = Math.hypot(

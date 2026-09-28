@@ -2696,7 +2696,6 @@ describe("player agent response rounds", () => {
     "unavailable current observation",
     "stale current observation",
     "invisible drop",
-    "unmarked anchor approach",
     "sweep beyond visible range",
   ] as const)("does not commit death recovery with %s", async (failure) => {
     const deathAt = "2026-09-25T00:00:05.000Z";
@@ -2740,17 +2739,14 @@ describe("player agent response rounds", () => {
       "unavailable current observation": "current_body_unavailable",
       "stale current observation": "current_observation_not_after_death",
       "invisible drop": "ready",
-      "unmarked anchor approach": "ready",
       "sweep beyond visible range": "ready",
     }[failure];
     const expectedCode =
       failure === "invisible drop"
         ? "DEATH_RECOVERY_TARGET_NOT_CURRENTLY_VISIBLE"
-        : failure === "unmarked anchor approach"
-          ? "DEATH_RECOVERY_MARKER_REQUIRED"
-          : failure === "sweep beyond visible range"
-            ? "DEATH_RECOVERY_APPROACH_REQUIRED"
-            : "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
+        : failure === "sweep beyond visible range"
+          ? "DEATH_RECOVERY_APPROACH_REQUIRED"
+          : "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
     const action =
       failure === "invisible drop"
         ? ({ kind: "collect_item", entityId: 77 } as const)
@@ -2767,22 +2763,15 @@ describe("player agent response rounds", () => {
           expect(requestUserPayload(request).deathRecovery).toMatchObject({
             anchorStatus: expectedAnchorStatus,
           });
-          const actionInput =
-            failure === "unmarked anchor approach"
-              ? {
-                  ...actionArguments(),
-                  operationJson: JSON.stringify(action),
-                  expectedOutcome: "Approach the remembered area once.",
-                }
-              : deathRecoveryActionArguments(
-                  deathAt,
-                  failure === "invisible drop"
-                    ? "collect"
-                    : failure === "sweep beyond visible range"
-                      ? "sweep"
-                      : "approach",
-                  action,
-                );
+          const actionInput = deathRecoveryActionArguments(
+            deathAt,
+            failure === "invisible drop"
+              ? "collect"
+              : failure === "sweep beyond visible range"
+                ? "sweep"
+                : "approach",
+            action,
+          );
           return functionCallResponse(
             `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
             "commit_action_decision",

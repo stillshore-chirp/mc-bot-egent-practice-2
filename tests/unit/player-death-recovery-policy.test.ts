@@ -114,6 +114,119 @@ describe("death recovery judgment policy", () => {
     }
   });
 
+  it("allows ordinary movement to coordinates matching the last death observation", async () => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const anchor = { x: 10, y: 64, z: 0 };
+    const operation: PlayerOperation = {
+      kind: "move_to",
+      position: anchor,
+      range: 1,
+    };
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse("ordinary-home-move", "commit_action_decision", {
+          ...actionArguments(),
+          purpose: "Return to my established home.",
+          operationJson: JSON.stringify(operation),
+          expectedOutcome: "Reach the remembered home area.",
+        }),
+      ],
+      async () => bodyObservationFixture("2026-09-25T00:00:20.000Z"),
+    );
+
+    try {
+      recordDeathScenario(
+        fixture.mind,
+        toObservationEvidence(
+          bodyObservationFixture("2026-09-25T00:00:00.000Z"),
+        ),
+        deathAt,
+        toObservationEvidence(
+          bodyObservationFixture("2026-09-25T00:00:08.000Z"),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(true);
+      if (result.decision?.kind !== "act")
+        throw new Error("TEST_ORDINARY_MOVE_NOT_COMMITTED");
+      expect(result.decision.operation.kind).toBe("move_to");
+      expect(
+        fixture.mind.snapshot().latestDeath?.recoveryStagesUsed,
+      ).toBeUndefined();
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("allows approach and sweep when an unrelated item is visible", async () => {
+    const deathAt = "2026-09-25T00:00:05.000Z";
+    const anchor = { x: 10, y: 64, z: 0 };
+    const scenarios: readonly {
+      readonly stage: "approach" | "sweep";
+      readonly operation: PlayerOperation;
+    }[] = [
+      {
+        stage: "approach",
+        operation: { kind: "move_to", position: anchor, range: 1 },
+      },
+      {
+        stage: "sweep",
+        operation: { kind: "look_sweep", pitchDegrees: -25 },
+      },
+    ];
+
+    for (const { stage, operation } of scenarios) {
+      let observationAt = Date.parse("2026-09-25T00:00:20.000Z");
+      const fixture = openPurposeFixture(
+        [
+          functionCallResponse(
+            `visible-item-${stage}`,
+            "commit_action_decision",
+            deathRecoveryActionArguments(deathAt, stage, operation),
+          ),
+        ],
+        async () => {
+          const observation = bodyObservationWithVisibleItem(
+            new Date(observationAt).toISOString(),
+          );
+          observationAt += 1_000;
+          return observation;
+        },
+      );
+
+      try {
+        recordDeathScenario(
+          fixture.mind,
+          toObservationEvidence(
+            bodyObservationFixture("2026-09-25T00:00:00.000Z"),
+          ),
+          deathAt,
+          toObservationEvidence(
+            bodyObservationFixture("2026-09-25T00:00:08.000Z"),
+          ),
+        );
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+
+        expect(result.accepted).toBe(true);
+        if (result.decision?.kind !== "act")
+          throw new Error("TEST_RECOVERY_ACTION_NOT_COMMITTED");
+        expect(result.decision.operation.kind).toBe(operation.kind);
+        expect(
+          fixture.mind.snapshot().latestDeath?.recoveryStagesUsed,
+        ).toContain(stage);
+      } finally {
+        fixture.close();
+      }
+    }
+  });
+
   it("treats danger as Purpose context and permits a same-stage redecision after a new outcome and observation", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
     const anchor = { x: 10, y: 64, z: 0 };
@@ -413,6 +526,30 @@ function bodyObservationFixture(
       entities: [],
     },
     window: null,
+  };
+}
+
+function bodyObservationWithVisibleItem(
+  observedAt: string,
+): PlayerBodyObservation {
+  const observation = bodyObservationFixture(observedAt);
+  return {
+    ...observation,
+    perception: {
+      ...observation.perception,
+      entities: [
+        {
+          id: 77,
+          name: "item",
+          kind: "item",
+          category: null,
+          position: observation.self.position,
+          distance: 1,
+          health: null,
+          isPlayer: false,
+        },
+      ],
+    },
   };
 }
 
