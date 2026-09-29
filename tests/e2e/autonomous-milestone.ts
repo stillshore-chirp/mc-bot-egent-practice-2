@@ -56,6 +56,17 @@ export function hasTerminalOutcomeForOperation(
   );
 }
 
+export function hasCancellationOutcomeForOperation(
+  operationId: string,
+  outcomes: readonly StopHandoffOutcome[],
+): boolean {
+  return outcomes.some(
+    (outcome) =>
+      outcome.operationId === operationId &&
+      (outcome.status === "interrupted" || outcome.status === "cancelled"),
+  );
+}
+
 export function isStoppedHandoffBoundaryConfirmed(
   boundary: StoppedHandoffBoundary,
 ): boolean {

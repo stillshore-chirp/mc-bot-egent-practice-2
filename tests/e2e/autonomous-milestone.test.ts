@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  hasCancellationOutcomeForOperation,
   hasJudgmentAfterSuccessfulOutcome,
   isStoppedHandoffBoundaryConfirmed,
 } from "./autonomous-milestone.js";
@@ -85,6 +86,34 @@ describe("isStoppedHandoffBoundaryConfirmed", () => {
         outcomes: [],
         stopGeneration: 1,
       }),
+    ).toBe(false);
+  });
+});
+
+describe("hasCancellationOutcomeForOperation", () => {
+  it("requires a matching interrupted or cancelled outcome", () => {
+    expect(
+      hasCancellationOutcomeForOperation("operation-a", [
+        { operationId: "operation-a", status: "interrupted" },
+      ]),
+    ).toBe(true);
+    expect(
+      hasCancellationOutcomeForOperation("operation-a", [
+        { operationId: "operation-a", status: "cancelled" },
+      ]),
+    ).toBe(true);
+  });
+
+  it("rejects a different operation and a naturally completed operation", () => {
+    expect(
+      hasCancellationOutcomeForOperation("operation-a", [
+        { operationId: "operation-b", status: "cancelled" },
+      ]),
+    ).toBe(false);
+    expect(
+      hasCancellationOutcomeForOperation("operation-a", [
+        { operationId: "operation-a", status: "successful" },
+      ]),
     ).toBe(false);
   });
 });
