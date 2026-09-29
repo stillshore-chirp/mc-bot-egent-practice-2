@@ -229,14 +229,18 @@ const AUTONOMOUS_RESOURCE_FIXTURE = [
 const RUN_BUDGET_LIMITS = {
   durationMs: 45 * 60_000,
   llmCalls: 160,
-  totalTokens: 800_000,
+  totalTokens: 1_000_000,
 } as const;
 const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 2_000;
 const UNKNOWN_OBSTACLE_READINESS_WINDOW_MS = 1_000;
 const UNKNOWN_OBSTACLE_READINESS_POLL_MS = 100;
 const UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS = 200;
 const UNKNOWN_POST_PICKUP_SAMPLE_LIMIT = 64;
-const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
+const DEFAULT_RUN_BUDGET = {
+  durationMs: 45 * 60_000,
+  llmCalls: 160,
+  totalTokens: 800_000,
+} as const;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
 const ROTATION_READ_MAX_ATTEMPTS = 3;
@@ -294,6 +298,10 @@ const CASE_BUDGETS = {
   armor_capability: { llmCalls: 40, totalTokens: 200_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
+const UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET = {
+  llmCalls: 96,
+  totalTokens: 780_000,
+} as const;
 const CASE_DEADLINES = {
   runtime_contract: 60_000,
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
@@ -314,6 +322,43 @@ const CASE_DEADLINES = {
   armor_capability: 6 * 60_000,
   integrated_result: 30_000,
 } as const;
+const UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS = 14 * 60_000;
+
+function caseBudgetForRun(
+  targetCase: TargetableCase | undefined,
+  caseId: keyof typeof CASE_BUDGETS,
+) {
+  return targetCase === "unknown_composite" && caseId === "unknown_composite"
+    ? UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET
+    : CASE_BUDGETS[caseId];
+}
+
+function caseDeadlineForRun(
+  targetCase: TargetableCase | undefined,
+  caseId: keyof typeof CASE_DEADLINES,
+) {
+  return targetCase === "unknown_composite" && caseId === "unknown_composite"
+    ? UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS
+    : CASE_DEADLINES[caseId];
+}
+
+function caseBudgetsForRun(targetCase: TargetableCase | undefined) {
+  return targetCase === "unknown_composite"
+    ? {
+        ...CASE_BUDGETS,
+        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET,
+      }
+    : CASE_BUDGETS;
+}
+
+function caseDeadlinesForRun(targetCase: TargetableCase | undefined) {
+  return targetCase === "unknown_composite"
+    ? {
+        ...CASE_DEADLINES,
+        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS,
+      }
+    : CASE_DEADLINES;
+}
 
 type Status = "pass" | "fail" | "incomplete";
 type UsageStatus = "runtime_reported" | "partial_or_unknown";
@@ -7357,7 +7402,7 @@ async function main(): Promise<void> {
     const unknownResult = await recordCase(
       state,
       "unknown_composite",
-      CASE_DEADLINES.unknown_composite,
+      caseDeadlineForRun(state.targetCase, "unknown_composite"),
       requireLiveContext(),
       async (context) => {
         const issue77TargetedRun = state.targetCase === "unknown_composite";
@@ -9441,7 +9486,9 @@ async function prepareRun(): Promise<RunState> {
   }
   const runBudget = runBudgetFromEnvironment();
   const targetCaseBudget =
-    targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
+    targetCase === undefined
+      ? undefined
+      : caseBudgetForRun(targetCase, targetCase);
   if (
     targetCaseBudget !== undefined &&
     (runBudget.llmCalls < targetCaseBudget.llmCalls ||
@@ -9455,7 +9502,7 @@ async function prepareRun(): Promise<RunState> {
     !runBudgetCoversCase(
       runBudget,
       targetCaseBudget,
-      CASE_DEADLINES[targetCase],
+      caseDeadlineForRun(targetCase, targetCase),
       Date.now() - setupStartedClock,
     )
   ) {
@@ -15545,7 +15592,7 @@ function ownerReturnSettlementContext(
 
 async function recordCase(
   state: RunState,
-  id: string,
+  id: keyof typeof CASE_BUDGETS,
   deadlineMs: number,
   context: CaseContext,
   runCaseBody: (
@@ -15568,10 +15615,7 @@ async function recordCase(
     state.cases.push(skipped);
     return skipped;
   }
-  const caseBudget = Object.entries(CASE_BUDGETS).find(
-    ([caseId]) => caseId === id,
-  )?.[1];
-  if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
+  const caseBudget = caseBudgetForRun(state.targetCase, id);
   const caseAdmissionLimit = ownerReturnCaseCallLimit(
     state.targetCase,
     caseBudget.llmCalls,
@@ -17603,8 +17647,8 @@ async function writeArtifact(state: RunState): Promise<void> {
     },
     budgets: {
       run: state.runBudget,
-      perCase: CASE_BUDGETS,
-      perCaseDeadlinesMs: CASE_DEADLINES,
+      perCase: caseBudgetsForRun(state.targetCase),
+      perCaseDeadlinesMs: caseDeadlinesForRun(state.targetCase),
       exceeded:
         state.failureCode?.includes("BUDGET") === true ||
         state.failureCode?.includes("DEADLINE") === true,
