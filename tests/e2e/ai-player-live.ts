@@ -3261,7 +3261,10 @@ export function createOwnerReturnApplicationWithBodyCapture(
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
 }> {
-  if (!ownerReturnRequestGateEnabled(targetCase))
+  if (
+    !ownerReturnRequestGateEnabled(targetCase) &&
+    !isUnderwaterItemRecoveryTargeted(targetCase)
+  )
     return { application: createApplication(config, beforeCall) };
 
   const restoreProbe =
