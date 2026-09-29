@@ -53,6 +53,7 @@ import {
   gatherMultiTargetBodySmokeSafeFailureEvidence,
   gatherMultiTargetItemCountSafeEvidence,
   gatherMultiTargetOracleProbeBaselineCountFailureFields,
+  gatherMultiTargetPostBirchProgressSinceGoalAcceptance,
   gatherMultiTargetOracleProbeResultCountFailureFields,
   readGatherMultiTargetItemCounts,
   shouldRunGatherMultiTargetOracleProbe,
@@ -2402,12 +2403,17 @@ function updateGatherMultiTargetDiagnostic(
 function updateGatherMultiTargetItemCountReadDiagnostic(
   state: RunState,
   result: GatherMultiTargetItemCountReadResult,
-  phase: "Baseline" | "Latest",
+  phase: "Baseline" | "Latest" | "BirchGoalAccepted",
   baseline?: Readonly<Record<GatherMultiTargetItem, number>>,
 ): void {
   const oakCount = result.counts.oak_log;
   const birchCount = result.counts.birch_log;
-  const prefix = phase === "Baseline" ? "gatherBaseline" : "gatherLatest";
+  const prefix =
+    phase === "Baseline"
+      ? "gatherBaseline"
+      : phase === "BirchGoalAccepted"
+        ? "gatherBirchGoalAccepted"
+        : "gatherLatest";
   updateGatherMultiTargetDiagnostic(state, {
     [`${prefix}InventoryReadReason`]: result.reason,
     [`${prefix}InventoryParseStage`]: result.parseStage,
@@ -11407,6 +11413,18 @@ async function runGatherMultiTargetContinuityCase(
       gatherBirchFollowupOwnerGoalAccepted: true,
       gatherRequestedBirchLogCount: birchGoalCount ?? "unknown",
     });
+    const birchGoalAcceptedInventory = await readGatherMultiTargetItemCounts(
+      (item) =>
+        context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+      context.botName,
+    );
+    updateGatherMultiTargetItemCountReadDiagnostic(
+      state,
+      birchGoalAcceptedInventory,
+      "BirchGoalAccepted",
+    );
+    if (birchGoalAcceptedInventory.reason !== "parsed")
+      incomplete("GATHER_MULTI_TARGET_BIRCH_ACCEPTED_INVENTORY_UNCONFIRMED");
 
     const postFollowupOutcomes = new Map<
       string,
@@ -11468,6 +11486,18 @@ async function runGatherMultiTargetContinuityCase(
           "Latest",
           baseline,
         );
+        const birchFollowupProgress =
+          gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+            birchGoalAcceptedInventory,
+            inventory,
+            followupBodyOutcomes.totalCount,
+          );
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherBirchGoalAcceptedInventoryDelta:
+            birchFollowupProgress.birchDelta,
+          gatherBirchFollowupInventoryIncreaseConfirmed:
+            birchFollowupProgress.confirmed,
+        });
         if (!inventoryParsed) return false;
         finalInventory = inventory.counts;
         try {
@@ -11498,7 +11528,7 @@ async function runGatherMultiTargetContinuityCase(
           birchDelta !== undefined &&
           birchDelta >= 1 &&
           bodyOutcomes.totalCount >= 2 &&
-          followupBodyOutcomes.totalCount >= 1
+          birchFollowupProgress.confirmed
         );
       },
     );
