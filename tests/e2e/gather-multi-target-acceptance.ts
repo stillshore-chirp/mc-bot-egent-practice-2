@@ -11,7 +11,7 @@ export function shouldRunGatherMultiTargetOracleProbe(
   );
 }
 
-type ParsedInventoryTag =
+export type ParsedInventoryTag =
   | {
       readonly kind: "scalar";
       readonly value: string;
@@ -25,6 +25,11 @@ type ParsedInventoryTag =
       }[];
     }
   | { readonly kind: "list"; readonly values: readonly ParsedInventoryTag[] };
+
+export type InventoryTagCompound = Extract<
+  ParsedInventoryTag,
+  { readonly kind: "compound" }
+>;
 
 export type GatherMultiTargetInventoryReadReason =
   | "read_failed"
@@ -86,6 +91,30 @@ export function gatherMultiTargetInventorySafeEvidence(
     [`${prefix}OakStackCount`]: parsed?.stackCounts.oak_log ?? null,
     [`${prefix}BirchStackCount`]: parsed?.stackCounts.birch_log ?? null,
   };
+}
+
+/** Parse a complete entity Inventory root without accepting partial replies. */
+export function parseInventoryReplyRootCompounds(
+  reply: string,
+): readonly InventoryTagCompound[] | undefined {
+  const marker = /entity data:\s*/iu.exec(reply);
+  if (marker === null) return undefined;
+  const parser = new InventoryTagParser(
+    reply.slice(marker.index + marker[0].length),
+  );
+  let root: Extract<ParsedInventoryTag, { kind: "list" }>;
+  try {
+    root = parser.parseRootList();
+  } catch {
+    return undefined;
+  }
+  if (!parser.isAtEnd()) return undefined;
+  const compounds: InventoryTagCompound[] = [];
+  for (const value of root.values) {
+    if (value.kind !== "compound") return undefined;
+    compounds.push(value);
+  }
+  return compounds;
 }
 
 export function gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
