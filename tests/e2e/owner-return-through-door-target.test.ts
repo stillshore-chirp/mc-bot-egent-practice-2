@@ -281,20 +281,61 @@ describe("owner return through door targeted E2E case", () => {
     expect(OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS).toBe(8 * 60_000);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 48, totalTokens: 320_000 },
+        { durationMs: 10 * 60_000, llmCalls: 48, totalTokens: 320_000 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 47, totalTokens: 320_000 },
+        { durationMs: 10 * 60_000, llmCalls: 47, totalTokens: 320_000 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
       ),
     ).toBe(false);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 48, totalTokens: 319_999 },
+        { durationMs: 10 * 60_000, llmCalls: 48, totalTokens: 319_999 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
+      ),
+    ).toBe(false);
+  });
+
+  it("reserves the full case deadline after elapsed setup", () => {
+    const runBudget = {
+      durationMs: 10 * 60_000,
+      llmCalls: 48,
+      totalTokens: 320_000,
+    };
+    expect(
+      runBudgetCoversCase(
+        runBudget,
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
+        2 * 60_000,
+      ),
+    ).toBe(true);
+    expect(
+      runBudgetCoversCase(
+        { ...runBudget, durationMs: 7 * 60_000 },
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
+      ),
+    ).toBe(false);
+    expect(
+      runBudgetCoversCase(
+        runBudget,
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
+        2 * 60_000 + 1,
+      ),
+    ).toBe(false);
+    expect(
+      runBudgetCoversCase(
+        { ...runBudget, durationMs: 8 * 60_000 - 1 },
+        OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
+        OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
       ),
     ).toBe(false);
   });

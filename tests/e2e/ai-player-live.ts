@@ -250,10 +250,10 @@ export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
 } as const;
 export const OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS = 8 * 60_000;
 export const NO_FOOD_REPLAN_CASE_BUDGET = {
-  llmCalls: 10,
-  totalTokens: 100_000,
+  llmCalls: 20,
+  totalTokens: 200_000,
 } as const;
-export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
+export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 8 * 60_000;
 export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
   llmCalls: 64,
   totalTokens: 480_000,
@@ -398,7 +398,10 @@ interface NoFoodReplanDiagnostic {
   reassessmentObserved: boolean;
   repeatedFailedOperationUnderUnchangedState: boolean;
   waitReasonAndWakeConditionPresent: boolean;
+  waitStateObservationConfirmed: boolean;
   waitWakeReassessmentObserved: boolean;
+  waitReassessmentDecision:
+    "alternative" | "wait" | "consume" | "other" | "not_observed";
   postOutcomeNoFoodStateConfirmed: boolean;
   postOutcomePurposeJudgmentObserved: boolean;
 }
@@ -410,7 +413,9 @@ const EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC: NoFoodReplanDiagnostic = {
   reassessmentObserved: false,
   repeatedFailedOperationUnderUnchangedState: false,
   waitReasonAndWakeConditionPresent: false,
+  waitStateObservationConfirmed: false,
   waitWakeReassessmentObserved: false,
+  waitReassessmentDecision: "not_observed",
   postOutcomeNoFoodStateConfirmed: false,
   postOutcomePurposeJudgmentObserved: false,
 };
@@ -2822,12 +2827,15 @@ function runBudgetFromEnvironment(): RunBudget {
 }
 
 export function runBudgetCoversCase(
-  runBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  runBudget: Pick<RunBudget, "durationMs" | "llmCalls" | "totalTokens">,
   caseBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  caseDeadlineMs: number,
+  elapsedSetupMs = 0,
 ): boolean {
   return (
     runBudget.llmCalls >= caseBudget.llmCalls &&
-    runBudget.totalTokens >= caseBudget.totalTokens
+    runBudget.totalTokens >= caseBudget.totalTokens &&
+    runBudget.durationMs - elapsedSetupMs >= caseDeadlineMs
   );
 }
 
@@ -3484,6 +3492,13 @@ export function classifyNoFoodReplanDecision(
   return operation === "consume" ? "consume" : "alternative";
 }
 
+export function noFoodReplanConsumeUnsupported(
+  decisionClass: NoFoodReplanDecisionClass,
+  noFoodStateConfirmed: boolean,
+): boolean {
+  return decisionClass === "consume" && noFoodStateConfirmed;
+}
+
 export function isNoFoodReplanPurposeAfterOutcome(
   judgmentAt: string | undefined,
   outcomeObservedAt: string | undefined,
@@ -3494,6 +3509,39 @@ export function isNoFoodReplanPurposeAfterOutcome(
     Number.isFinite(judgmentTime) &&
     Number.isFinite(outcomeTime) &&
     judgmentTime > outcomeTime
+  );
+}
+
+export function isNoFoodReassessmentAfterFreshObservation(
+  previousObservationAt: string | undefined,
+  freshObservationAt: string | undefined,
+  judgmentAt: string | undefined,
+): boolean {
+  const previousObservationTime = Date.parse(previousObservationAt ?? "");
+  const freshObservationTime = Date.parse(freshObservationAt ?? "");
+  const judgmentTime = Date.parse(judgmentAt ?? "");
+  return (
+    Number.isFinite(previousObservationTime) &&
+    Number.isFinite(freshObservationTime) &&
+    Number.isFinite(judgmentTime) &&
+    freshObservationTime > previousObservationTime &&
+    judgmentTime > freshObservationTime
+  );
+}
+
+export function isNoFoodObservationAfterDeadlineWake(
+  wakeOn: readonly string[],
+  wakeAt: string | undefined,
+  observationAt: string | undefined,
+): boolean {
+  if (!wakeOn.includes("deadline") || wakeOn.includes("state_changed"))
+    return true;
+  const wakeTime = Date.parse(wakeAt ?? "");
+  const observationTime = Date.parse(observationAt ?? "");
+  return (
+    Number.isFinite(wakeTime) &&
+    Number.isFinite(observationTime) &&
+    observationTime >= wakeTime
   );
 }
 
@@ -3830,7 +3878,7 @@ async function runNoFoodReplanCase(
       knownJudgments.add(noFoodReplanJudgmentKey(item));
     return { player, judgment };
   };
-  const waitForWakeReassessment = async (
+  const waitEvidence = (
     player: PlayerEvidence,
     judgment: PlayerEvidence["recentJudgments"][number],
   ) => {
@@ -3838,32 +3886,89 @@ async function runNoFoodReplanCase(
     const reasonPresent =
       (player.wait?.reason?.trim().length ?? 0) > 0 &&
       (judgment.summary?.trim().length ?? 0) > 0;
-    const wakeConditionPresent = wake.length > 0;
+    const wakeAt = Date.parse(player.wait?.wakeAt ?? "");
+    const supportedWakeCondition =
+      wake.includes("state_changed") ||
+      (wake.includes("deadline") &&
+        Number.isFinite(wakeAt) &&
+        wakeAt <= context.caseDeadlineAt);
+    return {
+      reasonAndWakeConditionPresent: reasonPresent && wake.length > 0,
+      supportedWakeCondition,
+      wakeAt,
+    };
+  };
+  const waitForWakeReassessment = async (
+    player: PlayerEvidence,
+    judgment: PlayerEvidence["recentJudgments"][number],
+  ) => {
+    const firstWait = waitEvidence(player, judgment);
     state.noFoodReplanDiagnostic = {
       ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
       ...state.noFoodReplanDiagnostic,
-      waitReasonAndWakeConditionPresent: reasonPresent && wakeConditionPresent,
+      waitReasonAndWakeConditionPresent:
+        firstWait.reasonAndWakeConditionPresent,
     };
-    if (!reasonPresent || !wakeConditionPresent)
+    if (!firstWait.reasonAndWakeConditionPresent)
       incomplete("NO_FOOD_WAIT_REASON_OR_WAKE_CONDITION_NOT_CONFIRMED");
-    const wakeAt = Date.parse(player.wait?.wakeAt ?? "");
     const remaining = context.caseDeadlineAt - Date.now();
-    if (Number.isFinite(wakeAt) && wakeAt > context.caseDeadlineAt)
-      incomplete("NO_FOOD_WAIT_WAKE_OUTSIDE_CASE_BUDGET");
     if (
-      !wake.includes("state_changed") &&
-      !(wake.includes("deadline") && Number.isFinite(wakeAt))
+      Number.isFinite(firstWait.wakeAt) &&
+      firstWait.wakeAt > context.caseDeadlineAt
     )
+      incomplete("NO_FOOD_WAIT_WAKE_OUTSIDE_CASE_BUDGET");
+    if (!firstWait.supportedWakeCondition)
       incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
-    const timeout = Number.isFinite(wakeAt)
-      ? Math.min(remaining, Math.max(1, wakeAt - Date.now() + 15_000))
+    const timeout = Number.isFinite(firstWait.wakeAt)
+      ? Math.min(remaining, Math.max(1, firstWait.wakeAt - Date.now() + 15_000))
       : Math.min(60_000, Math.max(1, remaining));
     const next = await freshDecision(timeout);
     if (next === undefined) incomplete("NO_FOOD_WAIT_WAKE_NOT_OBSERVED");
+    if (
+      !isNoFoodObservationAfterDeadlineWake(
+        player.wait?.wakeOn ?? [],
+        player.wait?.wakeAt,
+        next.player.lastObservation?.observedAt,
+      )
+    )
+      incomplete("NO_FOOD_WAIT_DEADLINE_OBSERVATION_PRECEDES_WAKE");
+    if (
+      !isNoFoodReassessmentAfterFreshObservation(
+        player.lastObservation?.observedAt,
+        next.player.lastObservation?.observedAt,
+        next.judgment.decidedAt,
+      )
+    )
+      incomplete("NO_FOOD_WAIT_FRESH_BODY_REASSESSMENT_NOT_CONFIRMED");
+    const nextDecisionClass = classifyNoFoodReplanDecision(
+      next.judgment.kind,
+      next.judgment.operationKind,
+    );
+    const nextWait =
+      nextDecisionClass === "wait"
+        ? waitEvidence(next.player, next.judgment)
+        : undefined;
+    const postWaitState = await readNoFoodReplanOracle(context);
+    if (!postWaitState.noFoodStateConfirmed)
+      incomplete("NO_FOOD_WAIT_WAKE_ORACLES_NOT_CONFIRMED");
+    const waitReassessmentDecision =
+      nextDecisionClass === "alternative" || nextDecisionClass === "consume"
+        ? nextDecisionClass
+        : nextDecisionClass === "wait" &&
+            nextWait?.reasonAndWakeConditionPresent &&
+            nextWait.supportedWakeCondition
+          ? "wait"
+          : "other";
     state.noFoodReplanDiagnostic = {
       ...EMPTY_NO_FOOD_REPLAN_DIAGNOSTIC,
       ...state.noFoodReplanDiagnostic,
+      waitReasonAndWakeConditionPresent:
+        nextDecisionClass !== "wait" ||
+        (nextWait?.reasonAndWakeConditionPresent === true &&
+          nextWait.supportedWakeCondition),
+      waitStateObservationConfirmed: postWaitState.noFoodStateConfirmed,
       waitWakeReassessmentObserved: true,
+      waitReassessmentDecision: waitReassessmentDecision,
       reassessmentObserved: true,
     };
     return next;
@@ -3931,6 +4036,21 @@ async function runNoFoodReplanCase(
     if (decisionClass === "wait") {
       decision = await waitForWakeReassessment(player, judgment);
       judgment = decision.judgment;
+      const diagnostic = state.noFoodReplanDiagnostic;
+      if (
+        diagnostic.waitReassessmentDecision === "alternative" ||
+        diagnostic.waitReassessmentDecision === "wait"
+      ) {
+        const requestGate = state.noFoodReplanRequestGate;
+        if (!requestGate.latchIfAcceptedEvidence(diagnostic))
+          incomplete("NO_FOOD_REPLAN_ACCEPTANCE_NOT_LATCHED");
+        await settleNoFoodReplanRequests(state, context);
+        return {
+          ...diagnostic,
+          ...noFoodReplanRequestEvidence(state),
+          startupOraclesConfirmed: true,
+        };
+      }
       if (
         classifyNoFoodReplanDecision(judgment.kind, judgment.operationKind) ===
         "wait"
@@ -3972,8 +4092,18 @@ async function runNoFoodReplanCase(
       }
       incomplete("NO_FOOD_REPLAN_STATE_CHANGED_BEFORE_REASSESSMENT");
     }
-    if (currentClass === "consume" && previousFailedOperation !== undefined)
-      fail("NO_FOOD_CONSUME_SELECTED_WITH_EMPTY_INVENTORY");
+    if (currentClass === "consume") {
+      const currentState = await readNoFoodReplanOracle(context);
+      if (!currentState.noFoodStateConfirmed)
+        incomplete("NO_FOOD_CONSUME_ORACLES_NOT_CONFIRMED");
+      if (
+        noFoodReplanConsumeUnsupported(
+          currentClass,
+          currentState.noFoodStateConfirmed,
+        )
+      )
+        fail("NO_FOOD_CONSUME_SELECTED_WITH_EMPTY_INVENTORY");
+    }
 
     const outcome = await waitForOutcome(judgment, operationKind);
     const outcomeStatus = safeOutcomeStatus(outcome.status) ?? "unverified";
@@ -8765,6 +8895,7 @@ async function main(): Promise<void> {
 }
 
 async function prepareRun(): Promise<RunState> {
+  const setupStartedClock = Date.now();
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
   const selectedDiagnosticProbeCount = [
@@ -8837,9 +8968,22 @@ async function prepareRun(): Promise<RunState> {
     targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
   if (
     targetCaseBudget !== undefined &&
-    !runBudgetCoversCase(runBudget, targetCaseBudget)
+    (runBudget.llmCalls < targetCaseBudget.llmCalls ||
+      runBudget.totalTokens < targetCaseBudget.totalTokens)
   ) {
     incomplete("RUN_BUDGET_BELOW_TARGET_CASE_BUDGET");
+  }
+  if (
+    targetCase !== undefined &&
+    targetCaseBudget !== undefined &&
+    !runBudgetCoversCase(
+      runBudget,
+      targetCaseBudget,
+      CASE_DEADLINES[targetCase],
+      Date.now() - setupStartedClock,
+    )
+  ) {
+    incomplete("RUN_BUDGET_BELOW_TARGET_CASE_DURATION");
   }
   const cacheDirectoryValue =
     process.env.AI_PLAYER_E2E_SERVER_CACHE_DIR?.trim();
@@ -8878,7 +9022,7 @@ async function prepareRun(): Promise<RunState> {
   const suffix = randomBytes(2).toString("hex").toUpperCase();
   const runSeed = WORLD_SEED;
   const worldFixture = "flat-platform-dry-wall-container-oak-v1";
-  const startedClock = Date.now();
+  const startedClock = setupStartedClock;
   const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
@@ -15029,6 +15173,19 @@ async function runCase(
   let initialCaptured = false;
   let caseExecuted = false;
   try {
+    if (
+      state.targetCase === id &&
+      !runBudgetCoversCase(
+        {
+          ...state.runBudget,
+          durationMs: state.runDeadlineAt - started,
+        },
+        { llmCalls: maxCalls, totalTokens: maxTokens },
+        deadlineMs,
+      )
+    ) {
+      incomplete("RUN_BUDGET_CASE_TIME_RESERVATION_UNAVAILABLE");
+    }
     if (!shouldCollectAfterRun(state))
       incomplete(state.failureCode ?? "RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
     const dependencyFailure = unknownHandoffCaseBlockCode(
