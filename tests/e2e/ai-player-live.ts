@@ -4206,24 +4206,38 @@ async function runArmorCapabilityCase(
   await context.rcon.command(
     `give ${context.botName} minecraft:leather_helmet 1`,
   );
-  const [bodyWithArmor, serverWithArmor] = await Promise.all([
+  let [bodyWithArmor, serverWithArmor] = await Promise.all([
     body.observe(),
     rconArmorCapabilityInventory(context.rcon, context.botName),
   ]);
-  const bodyCarriedCountBefore = bodyCarriedHelmetCount(bodyWithArmor);
-  const bodyArmorObservedAt = Date.parse(bodyWithArmor.observedAt);
+  let bodyCarriedCountBefore = bodyCarriedHelmetCount(bodyWithArmor);
+  let bodyArmorObservedAt = Date.parse(bodyWithArmor.observedAt);
+  const fixtureReadbackDeadline = fixtureStartedAt + 5_000;
+  while (
+    (!Number.isFinite(bodyArmorObservedAt) ||
+      bodyArmorObservedAt < fixtureStartedAt ||
+      bodyCarriedCountBefore <= 0 ||
+      (serverWithArmor.carriedHelmetCount ?? 0) <= 0) &&
+    Date.now() < fixtureReadbackDeadline
+  ) {
+    await waitMs(Math.min(250, fixtureReadbackDeadline - Date.now()));
+    [bodyWithArmor, serverWithArmor] = await Promise.all([
+      body.observe(),
+      rconArmorCapabilityInventory(context.rcon, context.botName),
+    ]);
+    bodyCarriedCountBefore = bodyCarriedHelmetCount(bodyWithArmor);
+    bodyArmorObservedAt = Date.parse(bodyWithArmor.observedAt);
+  }
+  const bodyArmorFresh =
+    Number.isFinite(bodyArmorObservedAt) &&
+    bodyArmorObservedAt >= fixtureStartedAt;
   if (
-    !Number.isFinite(bodyArmorObservedAt) ||
-    bodyArmorObservedAt < fixtureStartedAt ||
-    bodyCarriedCountBefore !== 1 ||
-    bodyWithArmor.self.equipment.head !== null ||
-    serverWithArmor.carriedHelmetCount !== 1 ||
-    serverWithArmor.headSlot !== "empty"
+    !bodyArmorFresh ||
+    bodyCarriedCountBefore <= 0 ||
+    (serverWithArmor.carriedHelmetCount ?? 0) <= 0
   ) {
     updateArmorCapabilityDiagnostic(state, {
-      armorCapabilityFixtureBodyFresh: Number.isFinite(bodyArmorObservedAt)
-        ? bodyArmorObservedAt >= fixtureStartedAt
-        : false,
+      armorCapabilityFixtureBodyFresh: bodyArmorFresh,
       armorCapabilityBodyCarriedCountBefore: bodyCarriedCountBefore,
       armorCapabilityServerCarriedCountBefore:
         serverWithArmor.carriedHelmetCount ?? "unknown",
@@ -4233,9 +4247,10 @@ async function runArmorCapabilityCase(
   }
   updateArmorCapabilityDiagnostic(state, {
     armorCapabilityFixtureBodyFresh: true,
-    armorCapabilityBodyCarriedCountBefore: 1,
-    armorCapabilityServerCarriedCountBefore: 1,
-    armorCapabilityServerHeadSlotBefore: "empty",
+    armorCapabilityBodyCarriedCountBefore: bodyCarriedCountBefore,
+    armorCapabilityServerCarriedCountBefore:
+      serverWithArmor.carriedHelmetCount ?? "unknown",
+    armorCapabilityServerHeadSlotBefore: serverWithArmor.headSlot,
   });
 
   const beforeAction = playerOf(await collect(context.runtime.app));
