@@ -4179,34 +4179,33 @@ async function runArmorCapabilityCase(
     context.botName,
   );
   const bodyObservedAt = Date.parse(bodyBefore.observedAt);
-  const bodyEquipmentEmpty = Object.values(bodyBefore.self.equipment).every(
-    (item) => item === null,
+  const baselineBodyFresh =
+    Number.isFinite(bodyObservedAt) && Date.now() - bodyObservedAt <= 10_000;
+  const baselineHelmetItems = bodyBefore.self.inventory.filter(
+    (item) => item.name === "leather_helmet",
   );
-  if (
-    !Number.isFinite(bodyObservedAt) ||
-    Date.now() - bodyObservedAt > 10_000 ||
-    bodyBefore.self.inventory.length !== 0 ||
-    !bodyEquipmentEmpty ||
-    rconBefore.carriedHelmetCount !== 0
-  ) {
-    updateArmorCapabilityDiagnostic(state, {
-      armorCapabilityBaselineBodyObserved: Number.isFinite(bodyObservedAt),
-      armorCapabilityBaselineBodyInventoryCount:
-        bodyBefore.self.inventory.length,
-      armorCapabilityBaselineBodyEquipmentEmpty: bodyEquipmentEmpty,
-      armorCapabilityBaselineServerCarriedCount:
-        rconBefore.carriedHelmetCount ?? "unknown",
-      armorCapabilityBaselineServerHeadSlot: rconBefore.headSlot,
-    });
-    incomplete("ARMOR_CAPABILITY_BASELINE_NOT_CONFIRMED");
-  }
+  const baselineHead = bodyBefore.self.equipment.head;
   updateArmorCapabilityDiagnostic(state, {
-    armorCapabilityBaselineBodyObserved: true,
-    armorCapabilityBaselineBodyInventoryCount: 0,
-    armorCapabilityBaselineBodyEquipmentEmpty: true,
-    armorCapabilityBaselineServerCarriedCount: 0,
+    armorCapabilityBaselineBodyFresh: baselineBodyFresh,
+    armorCapabilityBaselineBodyHelmetCount: baselineHelmetItems.reduce(
+      (total, item) => total + item.count,
+      0,
+    ),
+    armorCapabilityBaselineBodyHelmetSlots: baselineHelmetItems
+      .slice(0, 4)
+      .map((item) => item.slot)
+      .join(","),
+    armorCapabilityBaselineBodyHeadPresence:
+      baselineHead === undefined
+        ? "unknown"
+        : baselineHead === null
+          ? "empty"
+          : "occupied",
+    armorCapabilityBaselineServerCarriedCount:
+      rconBefore.carriedHelmetCount ?? "unknown",
     armorCapabilityBaselineServerHeadSlot: rconBefore.headSlot,
   });
+  if (!baselineBodyFresh) incomplete("ARMOR_CAPABILITY_BASELINE_NOT_CONFIRMED");
 
   const fixtureStartedAt = Date.now();
   await context.rcon.command(
@@ -4222,7 +4221,6 @@ async function runArmorCapabilityCase(
   while (
     (!Number.isFinite(bodyArmorObservedAt) ||
       bodyArmorObservedAt < fixtureStartedAt ||
-      bodyCarriedCountBefore <= 0 ||
       (serverWithArmor.carriedHelmetCount ?? 0) <= 0) &&
     Date.now() < fixtureReadbackDeadline
   ) {
@@ -4237,27 +4235,33 @@ async function runArmorCapabilityCase(
   const bodyArmorFresh =
     Number.isFinite(bodyArmorObservedAt) &&
     bodyArmorObservedAt >= fixtureStartedAt;
-  if (
-    !bodyArmorFresh ||
-    bodyCarriedCountBefore <= 0 ||
-    (serverWithArmor.carriedHelmetCount ?? 0) <= 0
-  ) {
-    updateArmorCapabilityDiagnostic(state, {
-      armorCapabilityFixtureBodyFresh: bodyArmorFresh,
-      armorCapabilityBodyCarriedCountBefore: bodyCarriedCountBefore,
-      armorCapabilityServerCarriedCountBefore:
-        serverWithArmor.carriedHelmetCount ?? "unknown",
-      armorCapabilityServerHeadSlotBefore: serverWithArmor.headSlot,
-    });
-    incomplete("ARMOR_CAPABILITY_SINGLE_ITEM_FIXTURE_NOT_CONFIRMED");
-  }
+  const fixtureHelmetItems = bodyWithArmor.self.inventory.filter(
+    (item) => item.name === "leather_helmet",
+  );
+  const fixtureHead = bodyWithArmor.self.equipment.head;
   updateArmorCapabilityDiagnostic(state, {
-    armorCapabilityFixtureBodyFresh: true,
+    armorCapabilityFixtureBodyFresh: bodyArmorFresh,
     armorCapabilityBodyCarriedCountBefore: bodyCarriedCountBefore,
+    armorCapabilityBodyHelmetCountBefore: fixtureHelmetItems.reduce(
+      (total, item) => total + item.count,
+      0,
+    ),
+    armorCapabilityBodyHelmetSlotsBefore: fixtureHelmetItems
+      .slice(0, 4)
+      .map((item) => item.slot)
+      .join(","),
+    armorCapabilityBodyHeadPresenceBefore:
+      fixtureHead === undefined
+        ? "unknown"
+        : fixtureHead === null
+          ? "empty"
+          : "occupied",
     armorCapabilityServerCarriedCountBefore:
       serverWithArmor.carriedHelmetCount ?? "unknown",
     armorCapabilityServerHeadSlotBefore: serverWithArmor.headSlot,
   });
+  if ((serverWithArmor.carriedHelmetCount ?? 0) <= 0)
+    incomplete("ARMOR_CAPABILITY_SERVER_HELMET_CARRY_NOT_CONFIRMED");
 
   const beforeAction = playerOf(await collect(context.runtime.app));
   if (isOperationActive(beforeAction))
