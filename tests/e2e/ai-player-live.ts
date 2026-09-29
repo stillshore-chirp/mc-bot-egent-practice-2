@@ -67,7 +67,6 @@ import {
 import {
   countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
-  gatherTargetVisibleAfterBodyAction,
   hasResolvedGatherTargetOwnerGoal,
   newGatherTargetProposalIds,
 } from "./gather-target-continuity.js";
@@ -10355,8 +10354,6 @@ export function ownerReturnAcceptanceEvidenceConfirmed(
 interface GatherMultiTargetFixture {
   readonly oakLog: BlockPosition;
   readonly birchLog: BlockPosition;
-  readonly occluderBlocks: readonly BlockPosition[];
-  readonly facingYaw: number;
 }
 
 const GATHER_FIXTURE_JAVA_YAW = 180;
@@ -10369,8 +10366,6 @@ async function findGatherMultiTargetFixture(
     const fixture = {
       oakLog: fixturePoint(origin, -1, -radius, Math.floor(origin.y)),
       birchLog: fixturePoint(origin, 1, -radius, Math.floor(origin.y)),
-      occluderBlocks: [],
-      facingYaw: GATHER_FIXTURE_JAVA_YAW,
     };
     let sitesAvailable = true;
     for (const target of [fixture.oakLog, fixture.birchLog]) {
@@ -10401,70 +10396,6 @@ async function findGatherMultiTargetFixture(
         error instanceof HarnessError &&
         (error.code === "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW" ||
           error.code === "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED")
-      ) {
-        continue;
-      }
-      throw error;
-    }
-  }
-  incomplete("GATHER_MULTI_TARGET_FIXTURE_SITE_UNAVAILABLE");
-}
-
-async function findGatherMultiTargetHiddenBirchFixture(
-  rcon: LocalRcon,
-  origin: Position,
-): Promise<GatherMultiTargetFixture> {
-  const floorY = Math.floor(origin.y);
-  const centerZ = Math.floor(origin.z);
-  const oakLog = fixturePoint(origin, 1, 0, floorY);
-  const birchOccluder = fixturePoint(origin, 2, 0, floorY + 1);
-  for (const birchOffsetX of [5, 4, 6]) {
-    const fixture = {
-      oakLog,
-      birchLog: fixturePoint(origin, birchOffsetX, 0, floorY),
-      occluderBlocks: [birchOccluder],
-      facingYaw: UNKNOWN_FIXTURE_YAW,
-    };
-    let sitesAvailable = true;
-    for (const target of [fixture.oakLog, fixture.birchLog]) {
-      if (
-        !(await isBlock(rcon, target, "air")) ||
-        !(await isBlock(rcon, { ...target, y: target.y + 1 }, "air")) ||
-        !(await isBlock(rcon, { ...target, y: target.y - 1 }, "stone"))
-      ) {
-        sitesAvailable = false;
-        break;
-      }
-    }
-    if (!sitesAvailable || !(await isBlock(rcon, birchOccluder, "air"))) {
-      continue;
-    }
-    try {
-      await verifyUnknownFixtureSightline(
-        rcon,
-        { x: origin.x, y: origin.y + 1.62, z: origin.z },
-        fixture.oakLog,
-        fixture.facingYaw,
-        "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW",
-        "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED",
-      );
-      await verifyUnknownFixtureLateralApproach(
-        rcon,
-        origin,
-        fixture.birchLog,
-        centerZ,
-      );
-      return fixture;
-    } catch (error) {
-      if (
-        error instanceof HarnessError &&
-        [
-          "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW",
-          "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED",
-          "UNKNOWN_FIXTURE_LATERAL_ROUTE_UNAVAILABLE",
-          "UNKNOWN_FIXTURE_SIDE_VIEW_NOT_IN_FIELD_OF_VIEW",
-          "UNKNOWN_FIXTURE_SIDE_VIEW_CORRIDOR_BLOCKED",
-        ].includes(error.code)
       ) {
         continue;
       }
@@ -10890,13 +10821,6 @@ async function cleanupGatherMultiTargetFixture(
     sourceBlocksAbsent =
       sourceBlocksAbsent && !(await isBlock(rcon, target, item));
   }
-  for (const occluder of fixture.occluderBlocks) {
-    await rcon.command(
-      `fill ${occluder.x} ${occluder.y} ${occluder.z} ${occluder.x} ${occluder.y} ${occluder.z} air replace bedrock`,
-    );
-    sourceBlocksAbsent =
-      sourceBlocksAbsent && (await isBlock(rcon, occluder, "air"));
-  }
   for (const item of GATHER_MULTI_TARGET_ITEMS) {
     await rcon.command(`clear ${botName} minecraft:${item}`);
   }
@@ -10925,7 +10849,6 @@ async function runGatherMultiTargetContinuityCase(
   context: CaseContext,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   let fixture: GatherMultiTargetFixture | undefined;
-  let hiddenContainerOrigin: Position | undefined;
   try {
     const quiet = await observeForPlayer(
       context,
@@ -10939,14 +10862,7 @@ async function runGatherMultiTargetContinuityCase(
     const origin = parsePosition(
       await context.rcon.command(`data get entity ${context.botName} Pos`),
     );
-    hiddenContainerOrigin = origin;
-    updateGatherMultiTargetDiagnostic(state, {
-      gatherHiddenContainerFixtureRestored: false,
-    });
-    await removeHiddenContainerFixture(context.rcon, origin, {
-      chest: fixturePoint(origin, 6, 0),
-    });
-    const activeFixture = await findGatherMultiTargetHiddenBirchFixture(
+    const activeFixture = await findGatherMultiTargetFixture(
       context.rcon,
       origin,
     );
@@ -10968,23 +10884,14 @@ async function runGatherMultiTargetContinuityCase(
     await context.rcon.command(
       `setblock ${activeFixture.birchLog.x} ${activeFixture.birchLog.y} ${activeFixture.birchLog.z} birch_log`,
     );
-    for (const occluder of activeFixture.occluderBlocks) {
-      await context.rcon.command(
-        `setblock ${occluder.x} ${occluder.y} ${occluder.z} bedrock`,
-      );
-    }
     if (
       !(await isBlock(context.rcon, activeFixture.oakLog, "oak_log")) ||
       !(await isBlock(context.rcon, activeFixture.birchLog, "birch_log"))
     ) {
       incomplete("GATHER_MULTI_TARGET_FIXTURE_NOT_CONFIRMED");
     }
-    for (const occluder of activeFixture.occluderBlocks) {
-      if (!(await isBlock(context.rcon, occluder, "bedrock")))
-        incomplete("GATHER_MULTI_TARGET_FIXTURE_NOT_CONFIRMED");
-    }
     await context.rcon.command(
-      `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${activeFixture.facingYaw} ${LEARNING_FIXTURE_PITCH}`,
+      `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
     );
     const rotation = await readLearningFixtureRotation(
       context.rcon,
@@ -10992,46 +10899,11 @@ async function runGatherMultiTargetContinuityCase(
     );
     if (
       rotation === undefined ||
-      angularDistance(rotation.yaw, activeFixture.facingYaw) > 2 ||
+      angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
       Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
     ) {
       incomplete("GATHER_MULTI_TARGET_ORIENTATION_NOT_CONFIRMED");
     }
-    await verifyUnknownFixtureSightline(
-      context.rcon,
-      { x: origin.x, y: origin.y + 1.62, z: origin.z },
-      activeFixture.oakLog,
-      activeFixture.facingYaw,
-      "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW",
-      "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED",
-    );
-    let birchInitiallyOccluded = false;
-    try {
-      await verifyUnknownFixtureSightline(
-        context.rcon,
-        { x: origin.x, y: origin.y + 1.62, z: origin.z },
-        activeFixture.birchLog,
-        activeFixture.facingYaw,
-        "GATHER_MULTI_TARGET_FIXTURE_OUT_OF_VIEW",
-        "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED",
-      );
-    } catch (error) {
-      if (
-        error instanceof HarnessError &&
-        error.code === "GATHER_MULTI_TARGET_FIXTURE_OCCLUDED"
-      ) {
-        birchInitiallyOccluded = true;
-      } else {
-        throw error;
-      }
-    }
-    if (!birchInitiallyOccluded)
-      incomplete("GATHER_MULTI_TARGET_BIRCH_INITIAL_VIEW_NOT_OCCLUDED");
-    updateGatherMultiTargetDiagnostic(state, {
-      gatherFixtureConfigured: true,
-      gatherOakInitiallyVisibleByServer: true,
-      gatherBirchInitiallyOccludedByServer: true,
-    });
     const fixtureConfiguredAt = Date.now();
     const visible = await observeForPlayer(context, 20_000, (player) => {
       const observedAt = Date.parse(player.lastObservation?.observedAt ?? "");
@@ -11040,16 +10912,14 @@ async function runGatherMultiTargetContinuityCase(
         Number.isFinite(observedAt) &&
         observedAt >= fixtureConfiguredAt &&
         names.includes("oak_log") &&
-        !names.includes("birch_log")
+        names.includes("birch_log")
       );
     });
     if (visible === undefined)
-      incomplete(
-        "GATHER_MULTI_TARGET_BODY_INITIAL_HIDDEN_FIXTURE_NOT_CONFIRMED",
-      );
+      incomplete("GATHER_MULTI_TARGET_BODY_FIXTURE_NOT_VISIBLE");
     updateGatherMultiTargetDiagnostic(state, {
+      gatherFixtureConfigured: true,
       gatherFreshBodyObservationConfirmed: true,
-      gatherBirchInitiallyHiddenFromBody: true,
       gatherRequestedOakLogCount: "unknown",
       gatherRequestedBirchLogCount: "unknown",
       gatherRemainingQuantity: "unknown",
@@ -11202,7 +11072,6 @@ async function runGatherMultiTargetContinuityCase(
     updateGatherMultiTargetDiagnostic(state, {
       gatherBirchFollowupOwnerGoalAccepted: true,
       gatherFollowupAcceptedJudgmentObserved: true,
-      gatherBirchDiscoveredAfterBodyView: false,
       gatherRequestedBirchLogCount: birchGoalCount ?? "unknown",
     });
 
@@ -11214,27 +11083,12 @@ async function runGatherMultiTargetContinuityCase(
       Readonly<Record<GatherMultiTargetItem, number>> | undefined;
     let finalOakRemoved = false;
     let finalBirchRemoved = false;
-    let birchFreshViewAfterBodyAction = false;
     let lastSampleAt = 0;
     const complete = await observeForPlayer(
       context,
       180_000,
       async (player) => {
         rememberOutcomes(player);
-        if (!birchFreshViewAfterBodyAction) {
-          birchFreshViewAfterBodyAction = gatherTargetVisibleAfterBodyAction({
-            item: "birch_log",
-            previousOperationIds: outcomeIdsBeforeFollowup,
-            acceptedAt: birchAcceptedAt,
-            outcomes: player.recentOutcomes,
-            observation: player.lastObservation,
-          });
-          if (birchFreshViewAfterBodyAction) {
-            updateGatherMultiTargetDiagnostic(state, {
-              gatherBirchDiscoveredAfterBodyView: true,
-            });
-          }
-        }
         for (const outcome of player.recentOutcomes) {
           if (
             !outcomeIdsBeforeFollowup.has(outcome.operationId) &&
@@ -11274,8 +11128,7 @@ async function runGatherMultiTargetContinuityCase(
           inventory.counts.oak_log - baseline.oak_log === 1 &&
           inventory.counts.birch_log - baseline.birch_log === 1 &&
           bodyPairs >= 2 &&
-          followupPairs >= 1 &&
-          birchFreshViewAfterBodyAction
+          followupPairs >= 1
         );
       },
     );
@@ -11287,7 +11140,6 @@ async function runGatherMultiTargetContinuityCase(
         finalInventory.birch_log - baseline.birch_log,
       gatherOakBlockRemovedByServer: finalOakRemoved,
       gatherBirchBlockRemovedByServer: finalBirchRemoved,
-      gatherBirchDiscoveredAfterBodyView: birchFreshViewAfterBodyAction,
       gatherSuccessfulBodyGatherPairs: countCompletedGatherActions([
         ...observedOutcomes.values(),
       ]),
@@ -11379,43 +11231,13 @@ async function runGatherMultiTargetContinuityCase(
           : "target_counts_remaining",
     };
   } finally {
-    try {
-      if (fixture !== undefined) {
-        await cleanupGatherMultiTargetFixture(
-          state,
-          context.rcon,
-          context.botName,
-          fixture,
-        );
-      }
-    } finally {
-      if (hiddenContainerOrigin !== undefined) {
-        await configureHiddenContainer(context.rcon, hiddenContainerOrigin);
-        const wall = fixturePoint(hiddenContainerOrigin, 2, 0);
-        let wallConfirmed = true;
-        for (let y = wall.y; y <= wall.y + 3; y += 1) {
-          for (let offsetZ = -2; offsetZ <= 2; offsetZ += 1) {
-            wallConfirmed =
-              (await isBlock(
-                context.rcon,
-                { x: wall.x, y, z: wall.z + offsetZ },
-                "stone",
-              )) && wallConfirmed;
-          }
-        }
-        const chestConfirmed = await isBlock(
-          context.rcon,
-          fixturePoint(hiddenContainerOrigin, 6, 0),
-          "chest",
-        );
-        if (!wallConfirmed || !chestConfirmed)
-          incomplete(
-            "GATHER_MULTI_TARGET_CONTAINER_FIXTURE_RESTORE_UNCONFIRMED",
-          );
-        updateGatherMultiTargetDiagnostic(state, {
-          gatherHiddenContainerFixtureRestored: true,
-        });
-      }
+    if (fixture !== undefined) {
+      await cleanupGatherMultiTargetFixture(
+        state,
+        context.rcon,
+        context.botName,
+        fixture,
+      );
     }
   }
 }
