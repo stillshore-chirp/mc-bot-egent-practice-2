@@ -88,6 +88,28 @@ export function gatherMultiTargetInventorySafeEvidence(
   };
 }
 
+export function gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+  accepted: GatherMultiTargetItemCountReadResult | undefined,
+  latest: GatherMultiTargetItemCountReadResult | undefined,
+  postBirchBodyOutcomeCount: number,
+): Readonly<{ birchDelta: number | null; confirmed: boolean }> {
+  const acceptedBirch =
+    accepted?.reason === "parsed" ? accepted.counts.birch_log : null;
+  const latestBirch =
+    latest?.reason === "parsed" ? latest.counts.birch_log : null;
+  const birchDelta =
+    acceptedBirch !== null && latestBirch !== null
+      ? latestBirch - acceptedBirch
+      : null;
+  const postBirchBodyProgress =
+    Number.isSafeInteger(postBirchBodyOutcomeCount) &&
+    postBirchBodyOutcomeCount >= 1;
+  return {
+    birchDelta,
+    confirmed: birchDelta !== null && birchDelta >= 1 && postBirchBodyProgress,
+  };
+}
+
 /** Publish scalar item totals; stack counts are deliberately unmeasured. */
 export function gatherMultiTargetItemCountSafeEvidence(
   phase: GatherMultiTargetOracleProbePhase,
