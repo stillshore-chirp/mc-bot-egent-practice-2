@@ -54,6 +54,7 @@ import {
   gatherMultiTargetInventorySafeEvidence,
   gatherMultiTargetOracleProbeBaselineFailureFields,
   gatherMultiTargetOracleProbeResultFailureFields,
+  parseInventoryReplyRootCompounds,
   readGatherMultiTargetInventory,
   type GatherMultiTargetItem,
 } from "./gather-multi-target-acceptance.js";
@@ -170,6 +171,7 @@ import {
 } from "./learning-reuse-acceptance.js";
 import {
   isCaseSelectedForTarget,
+  isArmorCapabilityTargeted,
   isGatherMultiTargetCaseSelected,
   isOwnerStopLatchTargeted,
   TARGETABLE_CASES,
@@ -279,6 +281,7 @@ const CASE_BUDGETS = {
   no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_BUDGET,
   owner_stop_latch: OWNER_STOP_LATCH_CASE_BUDGET,
+  armor_capability: { llmCalls: 40, totalTokens: 200_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
 const CASE_DEADLINES = {
@@ -298,6 +301,7 @@ const CASE_DEADLINES = {
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS,
   owner_stop_latch: OWNER_STOP_LATCH_CASE_DEADLINE_MS,
+  armor_capability: 6 * 60_000,
   integrated_result: 30_000,
 } as const;
 
@@ -2189,6 +2193,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "owner_stop_latch"
       ? (state.ownerStopLatchDiagnostic ?? {})
       : {}),
+    ...(caseId === "armor_capability"
+      ? (state.armorCapabilityDiagnostic ?? {})
+      : {}),
     ...(caseId === "gather_multi_target_continuity"
       ? gatherMultiTargetSafeEvidence(state)
       : {}),
@@ -2530,6 +2537,16 @@ function updateOwnerStopLatchDiagnostic(
 ): void {
   state.ownerStopLatchDiagnostic = {
     ...(state.ownerStopLatchDiagnostic ?? {}),
+    ...diagnostic,
+  };
+}
+
+function updateArmorCapabilityDiagnostic(
+  state: RunState,
+  diagnostic: SafeEvidence,
+): void {
+  state.armorCapabilityDiagnostic = {
+    ...(state.armorCapabilityDiagnostic ?? {}),
     ...diagnostic,
   };
 }
@@ -2988,6 +3005,9 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   ownerStopLatchDiagnostic?: SafeEvidence;
+  armorCapabilityDiagnostic?: SafeEvidence;
+  armorCapabilityReplyHash?: string;
+  armorCapabilityReplySidecarRetained?: boolean;
   foodIntentContinuityDiagnostic?: FoodIntentContinuityDiagnostic;
   ownerReturnDiagnostic?: OwnerReturnDiagnostic;
   ownerReturnProposalIdForRun?: string;
@@ -3153,7 +3173,10 @@ export function createOwnerReturnApplicationWithBodyCapture(
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
 }> {
-  if (!ownerReturnRequestGateEnabled(targetCase))
+  if (
+    !ownerReturnRequestGateEnabled(targetCase) &&
+    !isArmorCapabilityTargeted(targetCase)
+  )
     return { application: createApplication(config, beforeCall) };
 
   const restoreProbe =
@@ -4048,6 +4071,298 @@ async function runNoFoodContinuityProbe(
     state.status = "incomplete";
     state.failureCode ??= "APPLICATION_SHUTDOWN_FAILED";
   }
+}
+
+async function runArmorCapabilityCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const body = activeApplicationPlayerBody;
+  if (body === undefined)
+    incomplete("ARMOR_CAPABILITY_APPLICATION_BODY_UNAVAILABLE");
+
+  const bodyBefore = await body.observe();
+  const rconBefore = await rconArmorCapabilityInventory(
+    context.rcon,
+    context.botName,
+  );
+  const bodyObservedAt = Date.parse(bodyBefore.observedAt);
+  const bodyEquipmentEmpty = Object.values(bodyBefore.self.equipment).every(
+    (item) => item === null,
+  );
+  if (
+    !Number.isFinite(bodyObservedAt) ||
+    Date.now() - bodyObservedAt > 10_000 ||
+    bodyBefore.self.inventory.length !== 0 ||
+    !bodyEquipmentEmpty ||
+    rconBefore.carriedHelmetCount !== 0 ||
+    rconBefore.headSlot !== "empty"
+  ) {
+    updateArmorCapabilityDiagnostic(state, {
+      armorCapabilityBaselineBodyObserved: Number.isFinite(bodyObservedAt),
+      armorCapabilityBaselineBodyInventoryCount:
+        bodyBefore.self.inventory.length,
+      armorCapabilityBaselineBodyEquipmentEmpty: bodyEquipmentEmpty,
+      armorCapabilityBaselineServerCarriedCount:
+        rconBefore.carriedHelmetCount ?? "unknown",
+      armorCapabilityBaselineServerHeadSlot: rconBefore.headSlot,
+    });
+    incomplete("ARMOR_CAPABILITY_BASELINE_NOT_CONFIRMED");
+  }
+  updateArmorCapabilityDiagnostic(state, {
+    armorCapabilityBaselineBodyObserved: true,
+    armorCapabilityBaselineBodyInventoryCount: 0,
+    armorCapabilityBaselineBodyEquipmentEmpty: true,
+    armorCapabilityBaselineServerCarriedCount: 0,
+    armorCapabilityBaselineServerHeadSlot: "empty",
+  });
+
+  const fixtureStartedAt = Date.now();
+  await context.rcon.command(
+    `give ${context.botName} minecraft:leather_helmet 1`,
+  );
+  const [bodyWithArmor, serverWithArmor] = await Promise.all([
+    body.observe(),
+    rconArmorCapabilityInventory(context.rcon, context.botName),
+  ]);
+  const bodyCarriedCountBefore = bodyWithArmor.self.inventory
+    .filter((item) => item.name === "leather_helmet")
+    .reduce((total, item) => total + item.count, 0);
+  const bodyArmorObservedAt = Date.parse(bodyWithArmor.observedAt);
+  if (
+    !Number.isFinite(bodyArmorObservedAt) ||
+    bodyArmorObservedAt < fixtureStartedAt ||
+    bodyCarriedCountBefore !== 1 ||
+    bodyWithArmor.self.equipment.head !== null ||
+    serverWithArmor.carriedHelmetCount !== 1 ||
+    serverWithArmor.headSlot !== "empty"
+  ) {
+    updateArmorCapabilityDiagnostic(state, {
+      armorCapabilityFixtureBodyFresh: Number.isFinite(bodyArmorObservedAt)
+        ? bodyArmorObservedAt >= fixtureStartedAt
+        : false,
+      armorCapabilityBodyCarriedCountBefore: bodyCarriedCountBefore,
+      armorCapabilityServerCarriedCountBefore:
+        serverWithArmor.carriedHelmetCount ?? "unknown",
+      armorCapabilityServerHeadSlotBefore: serverWithArmor.headSlot,
+    });
+    incomplete("ARMOR_CAPABILITY_SINGLE_ITEM_FIXTURE_NOT_CONFIRMED");
+  }
+  updateArmorCapabilityDiagnostic(state, {
+    armorCapabilityFixtureBodyFresh: true,
+    armorCapabilityBodyCarriedCountBefore: 1,
+    armorCapabilityServerCarriedCountBefore: 1,
+    armorCapabilityServerHeadSlotBefore: "empty",
+  });
+
+  const beforeAction = playerOf(await collect(context.runtime.app));
+  if (isOperationActive(beforeAction))
+    incomplete("ARMOR_CAPABILITY_PREEXISTING_OPERATION_ACTIVE");
+  let requestSentAt = 0;
+  const priorJudgmentKeys = new Set(
+    beforeAction.recentJudgments.map(
+      (judgment) => `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
+    ),
+  );
+  const activityKey = (activity: PlayerAgentRoundActivity): string =>
+    `${activity.runSequence}:${activity.role}:${activity.round}`;
+  const priorActivityKeys = new Set(
+    (beforeAction.recentAgentActivity ?? []).map(activityKey),
+  );
+  const purposeBodyEquipSelected = (player: PlayerEvidence): boolean => {
+    const freshEquipJudgment = player.recentJudgments.some((judgment) => {
+      const key = `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`;
+      const decidedAt = Date.parse(judgment.decidedAt ?? "");
+      return (
+        !priorJudgmentKeys.has(key) &&
+        judgment.kind === "act" &&
+        safeOperationKind(judgment.operationKind) === "equip" &&
+        Number.isFinite(decidedAt) &&
+        decidedAt >= requestSentAt
+      );
+    });
+    const committedByPurpose = (player.recentAgentActivity ?? []).some(
+      (activity) =>
+        activity.role === "purpose" &&
+        !priorActivityKeys.has(activityKey(activity)) &&
+        activity.responseStatus === "completed" &&
+        activity.processingStatus === "complete" &&
+        activity.toolCalls.some(
+          (toolCall) =>
+            toolCall.name === "commit_action_decision" &&
+            toolCall.resultClass === "ok",
+        ),
+    );
+    return freshEquipJudgment && committedByPurpose;
+  };
+  const bodyEquipOutcome = (player: PlayerEvidence) =>
+    newOutcomes(beforeAction, player).find(
+      (outcome) => outcome.kind === "equip",
+    );
+  const originalEquipAvailableArmorDescriptor = Object.getOwnPropertyDescriptor(
+    MineflayerClient.prototype,
+    "equipAvailableArmor",
+  );
+  if (typeof originalEquipAvailableArmorDescriptor?.value !== "function")
+    incomplete("ARMOR_CAPABILITY_HELPER_INSTRUMENTATION_UNAVAILABLE");
+  const originalEquipAvailableArmor =
+    originalEquipAvailableArmorDescriptor.value as (
+      this: MineflayerClient,
+      signal: AbortSignal,
+    ) => Promise<Awaited<ReturnType<MineflayerClient["equipAvailableArmor"]>>>;
+  const helperCapture = {
+    callStarted: false,
+    callSettled: false,
+    callSucceeded: false,
+  };
+  const capturedEquipAvailableArmor = async function (
+    this: MineflayerClient,
+    signal: AbortSignal,
+  ) {
+    helperCapture.callStarted = true;
+    try {
+      const result = await originalEquipAvailableArmor.call(this, signal);
+      helperCapture.callSucceeded =
+        !result.failed && result.equipped.length === 1;
+      return result;
+    } catch (error) {
+      helperCapture.callSucceeded = false;
+      throw error;
+    } finally {
+      helperCapture.callSettled = true;
+    }
+  };
+  MineflayerClient.prototype.equipAvailableArmor = capturedEquipAvailableArmor;
+  try {
+    requestSentAt = Date.now();
+    sendChat(context.owner, "手持ちの防具を着てください。");
+    updateArmorCapabilityDiagnostic(state, {
+      armorCapabilityWearRequestSent: true,
+    });
+    const afterAction = await waitForPlayer(
+      context,
+      120_000,
+      (player) =>
+        helperCapture.callSettled ||
+        (purposeBodyEquipSelected(player) &&
+          bodyEquipOutcome(player) !== undefined),
+    );
+    const equipOutcome = bodyEquipOutcome(afterAction);
+    const purposeBodyRouteSelected =
+      purposeBodyEquipSelected(afterAction) && equipOutcome !== undefined;
+    if (helperCapture.callStarted && purposeBodyRouteSelected) {
+      updateArmorCapabilityDiagnostic(state, {
+        armorCapabilitySelectedRoute: "ambiguous",
+      });
+      incomplete("ARMOR_CAPABILITY_ROUTE_AMBIGUOUS");
+    }
+    let selectedRoute: "purpose_body" | "owner_helper";
+    if (helperCapture.callStarted && helperCapture.callSettled) {
+      selectedRoute = "owner_helper";
+      updateArmorCapabilityDiagnostic(state, {
+        armorCapabilitySelectedRoute: selectedRoute,
+        armorCapabilityEquipMethodSucceeded: helperCapture.callSucceeded,
+      });
+      if (!helperCapture.callSucceeded)
+        incomplete("ARMOR_CAPABILITY_OWNER_HELPER_NOT_SUCCESSFUL");
+    } else if (purposeBodyRouteSelected) {
+      selectedRoute = "purpose_body";
+      updateArmorCapabilityDiagnostic(state, {
+        armorCapabilitySelectedRoute: selectedRoute,
+        armorCapabilityPurposeEquipOutcome: equipOutcome.status ?? "unknown",
+      });
+      if (equipOutcome.status !== "successful")
+        incomplete("ARMOR_CAPABILITY_BODY_EQUIP_NOT_SUCCESSFUL");
+    } else {
+      incomplete("ARMOR_CAPABILITY_EQUIP_ROUTE_NOT_OBSERVED");
+    }
+
+    const readbackDeadline = Math.min(
+      Date.now() + 20_000,
+      context.caseDeadlineAt,
+      context.runDeadlineAt,
+    );
+    let bodyAfter = await body.observe();
+    let serverAfter = await rconArmorCapabilityInventory(
+      context.rcon,
+      context.botName,
+    );
+    let bodyCarriedCountAfter = bodyAfter.self.inventory
+      .filter((item) => item.name === "leather_helmet")
+      .reduce((total, item) => total + item.count, 0);
+    const bodyEquipped = (): boolean =>
+      bodyAfter.self.equipment.head?.name === "leather_helmet" &&
+      bodyCarriedCountAfter === 0 &&
+      Date.parse(bodyAfter.observedAt) >= requestSentAt;
+    while (
+      (!bodyEquipped() ||
+        serverAfter.headSlot !== "expected_item" ||
+        serverAfter.carriedHelmetCount !== 0) &&
+      Date.now() < readbackDeadline
+    ) {
+      await waitMs(500);
+      bodyAfter = await body.observe();
+      serverAfter = await rconArmorCapabilityInventory(
+        context.rcon,
+        context.botName,
+      );
+      bodyCarriedCountAfter = bodyAfter.self.inventory
+        .filter((item) => item.name === "leather_helmet")
+        .reduce((total, item) => total + item.count, 0);
+    }
+    const serverEquipped = serverAfter.headSlot === "expected_item";
+    if (
+      !bodyEquipped() ||
+      !serverEquipped ||
+      serverAfter.carriedHelmetCount !== 0
+    ) {
+      updateArmorCapabilityDiagnostic(state, {
+        armorCapabilitySelectedRoute: selectedRoute,
+        armorCapabilityBodyEquipped: bodyEquipped(),
+        armorCapabilityServerEquipped: serverEquipped,
+        armorCapabilityBodyCarriedCountAfter: bodyCarriedCountAfter,
+        armorCapabilityServerCarriedCountAfter:
+          serverAfter.carriedHelmetCount ?? "unknown",
+        armorCapabilityServerHeadSlotAfter: serverAfter.headSlot,
+      });
+      incomplete("ARMOR_CAPABILITY_INDEPENDENT_EQUIPMENT_READBACK_MISMATCH");
+    }
+    updateArmorCapabilityDiagnostic(state, {
+      armorCapabilitySelectedRoute: selectedRoute,
+      armorCapabilityBodyEquipped: true,
+      armorCapabilityServerEquipped: true,
+      armorCapabilityBodyCarriedCountAfter: 0,
+      armorCapabilityServerCarriedCountAfter: 0,
+      armorCapabilityServerHeadSlotAfter: "expected_item",
+    });
+  } finally {
+    if (
+      MineflayerClient.prototype.equipAvailableArmor ===
+      capturedEquipAvailableArmor
+    ) {
+      MineflayerClient.prototype.equipAvailableArmor =
+        originalEquipAvailableArmor;
+    }
+  }
+
+  const responseStart = context.responseQueue.length;
+  const questionSentAt = Date.now();
+  sendChat(context.owner, "今、あなたができることを教えてください。");
+  updateArmorCapabilityDiagnostic(state, {
+    armorCapabilityQuestionSent: true,
+  });
+  await waitForPlayer(context, 90_000, () =>
+    context.responseQueue
+      .slice(responseStart)
+      .some((response) => response.at >= questionSentAt),
+  );
+  const reply = context.responseQueue
+    .slice(responseStart)
+    .find((response) => response.at >= questionSentAt)?.text;
+  if (reply === undefined || reply.trim().length === 0)
+    incomplete("ARMOR_CAPABILITY_REPLY_NOT_OBSERVED");
+  await retainArmorCapabilityReply(state, reply);
+  incomplete("ARMOR_CAPABILITY_REPLY_PRIVATE_REVIEW_PENDING");
 }
 
 async function main(): Promise<void> {
@@ -8199,6 +8514,16 @@ async function main(): Promise<void> {
       );
     }
 
+    if (isArmorCapabilityTargeted(state.targetCase)) {
+      await recordCase(
+        state,
+        "armor_capability",
+        CASE_DEADLINES.armor_capability,
+        requireLiveContext(),
+        (context) => runArmorCapabilityCase(state, context),
+      );
+    }
+
     await recordCase(
       state,
       "integrated_result",
@@ -8323,6 +8648,11 @@ async function main(): Promise<void> {
     if (state.gatherProgressReplySidecarRetained === true) {
       process.stdout.write(
         `PRIVATE_GATHER_PROGRESS_REPLY ${gatherProgressReplySidecarPath(state)}\n`,
+      );
+    }
+    if (state.armorCapabilityReplySidecarRetained === true) {
+      process.stdout.write(
+        `PRIVATE_ARMOR_CAPABILITY_REPLY ${armorCapabilityReplySidecarPath(state)}\n`,
       );
     }
     process.exitCode = state.status === "pass" ? 0 : 1;
@@ -13697,6 +14027,85 @@ async function rconInventoryItemCount(
   return count;
 }
 
+export type ArmorCapabilityServerSlotStatus =
+  "expected_item" | "empty" | "other_item" | "unknown";
+
+export interface ArmorCapabilityInventoryReadback {
+  readonly carriedHelmetCount: number | null;
+  readonly headSlot: ArmorCapabilityServerSlotStatus;
+}
+
+export function parseArmorCapabilityInventoryReply(
+  reply: string,
+): ArmorCapabilityInventoryReadback {
+  const compounds = parseInventoryReplyRootCompounds(reply);
+  if (compounds === undefined)
+    return { carriedHelmetCount: null, headSlot: "unknown" };
+  let carriedHelmetCount = 0;
+  let headSlot: ArmorCapabilityServerSlotStatus = "empty";
+  const seenSlots = new Set<number>();
+  for (const compound of compounds) {
+    const idFields = compound.fields.filter(({ key }) => key === "id");
+    const slotFields = compound.fields.filter(({ key }) => key === "Slot");
+    const countFields = compound.fields.filter(
+      ({ key }) => key === "count" || key === "Count",
+    );
+    const id = idFields[0]?.value;
+    const slotValue = slotFields[0]?.value;
+    const countValue = countFields[0]?.value;
+    if (
+      idFields.length !== 1 ||
+      id?.kind !== "scalar" ||
+      id.value.length === 0 ||
+      slotFields.length !== 1 ||
+      slotValue?.kind !== "scalar" ||
+      slotValue.quoted ||
+      countFields.length !== 1 ||
+      countValue?.kind !== "scalar" ||
+      countValue.quoted
+    ) {
+      return { carriedHelmetCount: null, headSlot: "unknown" };
+    }
+    const slotMatch = /^(-?\d+)[bB]?$/u.exec(slotValue.value);
+    const countMatch = /^(\d+)(?:[bBsSlL])?$/u.exec(countValue.value);
+    if (slotMatch === null || countMatch === null)
+      return { carriedHelmetCount: null, headSlot: "unknown" };
+    const slot = Number(slotMatch[1]);
+    const count = Number(countMatch[1]);
+    if (
+      !Number.isSafeInteger(slot) ||
+      slot < -128 ||
+      slot > 127 ||
+      !Number.isSafeInteger(count) ||
+      count < 1 ||
+      seenSlots.has(slot)
+    ) {
+      return { carriedHelmetCount: null, headSlot: "unknown" };
+    }
+    seenSlots.add(slot);
+    if (id.value === "minecraft:leather_helmet") {
+      if (slot === 103) headSlot = "expected_item";
+      else if (slot >= 0 && slot <= 35) carriedHelmetCount += count;
+      if (!Number.isSafeInteger(carriedHelmetCount))
+        return { carriedHelmetCount: null, headSlot: "unknown" };
+    } else if (slot === 103) {
+      headSlot = "other_item";
+    }
+  }
+  return {
+    carriedHelmetCount,
+    headSlot,
+  };
+}
+
+async function rconArmorCapabilityInventory(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<ArmorCapabilityInventoryReadback> {
+  const reply = await rcon.command(`data get entity ${botName} Inventory`);
+  return parseArmorCapabilityInventoryReply(reply);
+}
+
 async function rconInventoryIsEmpty(
   rcon: LocalRcon,
   botName: string,
@@ -15896,6 +16305,49 @@ function gatherProgressReplySidecarPath(state: RunState): string {
   );
 }
 
+function armorCapabilityReplySidecarPath(state: RunState): string {
+  return join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+    `${state.id}-armor-capability-reply.jsonl`,
+  );
+}
+
+async function retainArmorCapabilityReply(
+  state: RunState,
+  reply: string,
+): Promise<string> {
+  if (reply.length > 4_000)
+    incomplete("ARMOR_CAPABILITY_REPLY_EXCEEDS_PRIVATE_SAMPLE_LIMIT");
+  const destination = armorCapabilityReplySidecarPath(state);
+  try {
+    const directory = dirname(destination);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    await writePlayerSnapshotRecord(
+      destination,
+      {
+        schema: "ai-player-e2e-private-armor-capability-reply/v1",
+        reply,
+      },
+      true,
+    );
+  } catch {
+    state.armorCapabilityReplySidecarRetained = false;
+    incomplete("ARMOR_CAPABILITY_REPLY_SIDECAR_WRITE_FAILED");
+  }
+  const hash = createHash("sha256").update(reply).digest("hex");
+  state.armorCapabilityReplyHash = hash;
+  state.armorCapabilityReplySidecarRetained = true;
+  updateArmorCapabilityDiagnostic(state, {
+    armorCapabilityReplyPresent: true,
+    armorCapabilityReplyHash: hash,
+    armorCapabilityReplySidecarRetained: true,
+    armorCapabilityReplyReviewStatus: "pending_private_review",
+  });
+  return hash;
+}
+
 async function retainGatherProgressReply(
   state: RunState,
   reply: string,
@@ -16211,6 +16663,7 @@ async function writeArtifact(state: RunState): Promise<void> {
         : null,
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
       ownerReturnThroughDoor: state.ownerReturnDiagnostic ?? null,
+      armorCapability: state.armorCapabilityDiagnostic ?? null,
     },
     budgets: {
       run: state.runBudget,

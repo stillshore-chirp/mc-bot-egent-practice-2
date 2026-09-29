@@ -11,6 +11,7 @@ export const TARGETABLE_CASES = [
   "unknown_composite",
   "parallel_dialogue_stop",
   "owner_stop_latch",
+  "armor_capability",
 ] as const;
 
 export type TargetableCase = (typeof TARGETABLE_CASES)[number];
@@ -38,6 +39,12 @@ export function isOwnerStopLatchTargeted(
   targetCase: TargetableCase | undefined,
 ): boolean {
   return targetCase === "owner_stop_latch";
+}
+
+export function isArmorCapabilityTargeted(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return targetCase === "armor_capability";
 }
 
 export function isGatherMultiTargetCaseSelected(
