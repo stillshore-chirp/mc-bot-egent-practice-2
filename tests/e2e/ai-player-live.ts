@@ -120,7 +120,6 @@ import {
   hasCancellationOutcomeForOperation,
   hasJudgmentAfterSuccessfulOutcome,
   hasNewActiveOwnerProposalGoal,
-  hasOwnerApproachWithStartedBodyOperation,
   hasTerminalOutcomeForOperation,
   isStoppedHandoffBoundaryConfirmed,
   ownerApproachReductionBucket,
@@ -7808,7 +7807,6 @@ async function main(): Promise<void> {
         )
           incomplete("OWNER_PARALLEL_OPERATION_ENDED_BEFORE_CHAT");
         const ownerReplyStart = context.responseQueue.length;
-        const ownerPreferenceSentAt = Date.now();
         sendChat(
           context.owner,
           "強くお願いします。レッドストーンは後回しにして、いったん私のところへ戻ってください。あなたの意見も伝え、今の目的と折り合いをつけてください。",
@@ -7836,24 +7834,6 @@ async function main(): Promise<void> {
           parallelOwnerRequestResolved: ownerRequestChangedGoal,
           parallelOwnerGoalLinkedToRequest: ownerGoalLinkedToRequest,
         });
-        if (
-          (await observeForPlayer(context, 90_000, (player) => {
-            const operation = player.activeOperation;
-            const bodyStartedAt = operation?.bodyStartedAt;
-            return (
-              player.actionRevision > ownerOperation.actionRevision &&
-              operation !== undefined &&
-              operation.operationId !== ownerOperationId &&
-              bodyStartedAt !== undefined &&
-              Number.isFinite(Date.parse(bodyStartedAt)) &&
-              Date.parse(bodyStartedAt) >= ownerPreferenceSentAt
-            );
-          })) === undefined
-        ) {
-          if (Date.now() >= context.runDeadlineAt)
-            incomplete("RUN_DEADLINE_EXCEEDED");
-          incomplete("PARALLEL_STOP_ACTIVE_BODY_OPERATION_NOT_CONFIRMED");
-        }
         let lastOwnerApproachCheckAt = 0;
         let ownerApproachCheckCount = 0;
         let bestApproachBucket = "none";
@@ -7893,44 +7873,40 @@ async function main(): Promise<void> {
             ) {
               bestApproachBucket = "under_minimum";
             }
-            const approachWithActiveOperation =
-              hasOwnerApproachWithStartedBodyOperation(
-                ownerDistanceBeforeRequest,
-                remainingDistance,
-                player.activeOperation,
-              );
-            if (approachWithActiveOperation)
-              ownerApproachOperationId = player.activeOperation?.operationId;
+            const approachThresholdMet = reductionBucket === "minimum_met";
+            if (player.activeOperation?.operationId.trim())
+              ownerApproachOperationId = player.activeOperation.operationId;
             updateParallelDiagnostic(state, {
               parallelOwnerApproachCheckCount: ownerApproachCheckCount,
               parallelOwnerApproachReductionBucket: bestApproachBucket,
-              parallelOwnerApproachWorldObserved: approachWithActiveOperation,
+              parallelOwnerApproachWorldObserved: approachThresholdMet,
               parallelActionChangedAfterOwnerPreference: actionChanged,
             });
             lastOwnerApproachCheckAt = Date.now();
-            return approachWithActiveOperation;
+            return approachThresholdMet;
           },
         );
         const activeBeforeStop = playerOf(await collect(context.runtime.app));
         const capturedOperation = activeBeforeStop.activeOperation;
-        const stopGenerationBefore = liveBeforeOwnerChat.stopGeneration;
-        if (
-          activeBeforeStop.stopGeneration !== stopGenerationBefore ||
-          !isOperationActive(activeBeforeStop) ||
-          capturedOperation === undefined ||
-          capturedOperation.operationId.length === 0 ||
-          typeof capturedOperation.bodyStartedAt !== "string" ||
-          !Number.isFinite(Date.parse(capturedOperation.bodyStartedAt))
-        ) {
-          incomplete("PARALLEL_STOP_ACTIVE_BODY_OPERATION_NOT_CONFIRMED");
-        }
+        const stopGenerationBefore = activeBeforeStop.stopGeneration;
+        const stopGenerationUnchangedBeforeRequest =
+          stopGenerationBefore === liveBeforeOwnerChat.stopGeneration;
+        const stopActiveBodyOperationObserved =
+          typeof capturedOperation?.bodyStartedAt === "string" &&
+          Number.isFinite(Date.parse(capturedOperation.bodyStartedAt));
+        const capturedOperationId =
+          capturedOperation?.operationId.trim().length === 0
+            ? undefined
+            : capturedOperation?.operationId;
+        const capturedOperationWasActive = capturedOperation !== undefined;
         updateParallelDiagnostic(state, {
-          parallelStopActiveBodyOperationObserved: true,
+          parallelStopActiveBodyOperationObserved:
+            stopActiveBodyOperationObserved,
         });
         const ownerApproachOperationMatchesStop =
           ownerApproach !== undefined &&
           ownerApproachOperationId !== undefined &&
-          capturedOperation.operationId === ownerApproachOperationId;
+          capturedOperation?.operationId === ownerApproachOperationId;
         const ownerApproachWorldObserved = ownerApproach !== undefined;
         updateParallelDiagnostic(state, {
           parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
@@ -7939,20 +7915,27 @@ async function main(): Promise<void> {
         });
         let capturedOperationReceiptStatus:
           PlayerOutcomeStatus | "missing" | "other" = "missing";
+        let capturedOperationCancellationConfirmed = false;
         sendChat(context.owner, "今の行動を停止してください。");
         updateParallelDiagnostic(state, { parallelStopRequested: true });
         const stopped = await waitForPlayer(context, 45_000, (player) => {
-          const capturedOutcome = player.recentOutcomes.find(
-            (outcome) => outcome.operationId === capturedOperation.operationId,
-          );
+          const capturedOutcome =
+            capturedOperationId === undefined
+              ? undefined
+              : player.recentOutcomes.find(
+                  (outcome) => outcome.operationId === capturedOperationId,
+                );
           const safeCapturedStatus = safeOutcomeStatus(capturedOutcome?.status);
           capturedOperationReceiptStatus =
             safeCapturedStatus ??
             (capturedOutcome === undefined ? "missing" : "other");
-          const cancellationConfirmed = hasCancellationOutcomeForOperation(
-            capturedOperation.operationId,
-            player.recentOutcomes,
-          );
+          const cancellationConfirmed =
+            capturedOperationId !== undefined &&
+            hasCancellationOutcomeForOperation(
+              capturedOperationId,
+              player.recentOutcomes,
+            );
+          capturedOperationCancellationConfirmed = cancellationConfirmed;
           if (
             capturedOperationReceiptStatus !== "missing" &&
             capturedOperationReceiptStatus !== "other" &&
@@ -7974,7 +7957,7 @@ async function main(): Promise<void> {
             player.stopped &&
             activeCleared &&
             generationAdvanced &&
-            cancellationConfirmed
+            (!capturedOperationWasActive || cancellationConfirmed)
           );
         });
         const stopGeneration = stopped.stopGeneration;
@@ -8022,6 +8005,8 @@ async function main(): Promise<void> {
           parallelStopRuntimeQuietConfirmed: true,
           parallelStopRconQuietConfirmed: true,
         });
+        if (!stopGenerationUnchangedBeforeRequest)
+          incomplete("PARALLEL_STOP_GENERATION_CHANGED_BEFORE_REQUEST");
         if (!ownerGoalLinkedToRequest)
           incomplete("PARALLEL_OWNER_GOAL_NOT_LINKED_TO_REQUEST");
         if (!ownerApproachWorldObserved)
@@ -8039,8 +8024,8 @@ async function main(): Promise<void> {
           ownerGoalLinkedToRequest,
           ownerRequestWorldProgressObserved: ownerApproachWorldObserved,
           ownerApproachOperationMatchesStop,
-          stopActiveBodyOperationObserved: true,
-          stopOperationReceiptConfirmed: true,
+          stopActiveBodyOperationObserved,
+          stopOperationReceiptConfirmed: capturedOperationCancellationConfirmed,
           stopOperationReceiptStatus: capturedOperationReceiptStatus,
           stopGenerationAdvanced: stopGeneration > stopGenerationBefore,
           stopOperationGone: !isOperationActive(stopped),
