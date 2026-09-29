@@ -14423,7 +14423,7 @@ export interface ArmorCapabilityInventoryReadback {
 function bodyCarriedHelmetCount(observation: PlayerBodyObservation): number {
   return countCarriedHelmetBodyItems(
     observation.self.inventory,
-    Object.values(observation.self.equipment),
+    observation.self.equipment,
   );
 }
 
@@ -14433,10 +14433,14 @@ export function countCarriedHelmetBodyItems(
     readonly name: string;
     readonly count: number;
   }[],
-  equipment: readonly ({ readonly slot: number } | null)[],
+  equipment: Readonly<Record<string, { readonly slot: number } | null>>,
 ): number {
+  const armorSlots = ["head", "torso", "legs", "feet"] as const;
   const equipmentSlots = new Set(
-    equipment.flatMap((item) => (item === null ? [] : [item.slot])),
+    armorSlots.flatMap((slot) => {
+      const item = equipment[slot];
+      return item === null || item === undefined ? [] : [item.slot];
+    }),
   );
   return inventory
     .filter(

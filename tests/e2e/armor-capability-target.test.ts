@@ -31,11 +31,19 @@ describe("armor capability targeted E2E case", () => {
       countCarriedHelmetBodyItems(
         [
           { slot: 0, name: "leather_helmet", count: 1 },
+          { slot: 1, name: "leather_helmet", count: 1 },
           { slot: 5, name: "leather_helmet", count: 1 },
         ],
-        [{ slot: 5 }, null],
+        {
+          hand: { slot: 0 },
+          "off-hand": { slot: 1 },
+          head: { slot: 5 },
+          torso: null,
+          legs: null,
+          feet: null,
+        },
       ),
-    ).toBe(1);
+    ).toBe(2);
     expect(
       parseArmorCapabilityInventoryReply(
         `Bot has the following entity data: [{Slot:0b,id:"minecraft:leather_helmet",count:1,components:{"minecraft:custom_data":{value:1}}}]`,
