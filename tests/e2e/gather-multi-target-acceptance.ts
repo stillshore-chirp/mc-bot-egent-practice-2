@@ -1,6 +1,16 @@
 export const GATHER_MULTI_TARGET_ITEMS = ["oak_log", "birch_log"] as const;
 export type GatherMultiTargetItem = (typeof GATHER_MULTI_TARGET_ITEMS)[number];
 
+/** Keep the strict pre-app probe opt-in for the matching no-GPT diagnostic run. */
+export function shouldRunGatherMultiTargetOracleProbe(
+  targetCase: string | undefined,
+  probeOnlyValue: string | undefined,
+): boolean {
+  return (
+    targetCase === "gather_multi_target_continuity" && probeOnlyValue === "YES"
+  );
+}
+
 type ParsedInventoryTag =
   | {
       readonly kind: "scalar";

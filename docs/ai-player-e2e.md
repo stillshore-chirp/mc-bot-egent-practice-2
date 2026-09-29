@@ -48,7 +48,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 ## Issue #83の代表的な複数対象採集case
 
-`gather_multi_target_continuity`は既定application起動前に、既存`body_operation_smoke`の非OP Body clientとRCONでoak log 64個から65個への所持差分を測ります。この区間はruntimeが未起動なのでGPT受付やruntime actionと競合しません。1 stackから2 stacksへの変化、対象block消失、RCONが数えたitem drop 1個の生成、Bodyの`collect_item`後のdrop消失を独立に照合します。終了後はinventory・block・dropの空状態をRCONで確認し、その後に視認できる合成oak/birch原木を各1個だけ用意して所持数のRCON baselineを0と確認します。このfixtureの各1個はworld確認用で、依頼数量を意味しません。
+通常の`gather_multi_target_continuity` runでは、共通`body_operation_smoke`後に既定applicationを起動し、natural gather case内の独立したBody/RCON確認へ進みます。stack数・drop個数を事前probeで厳密照合することは通常runの必須gateではありません。旧pre-app oracle probeは診断専用で、`AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY=YES`と`AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity`を明示した場合だけ実行します。このno-GPT診断は既定application起動前に終了し、probe自身のinventory・stack・block・drop照合とcleanupを引き続き要求します。診断passはnatural gather受け入れの証拠には数えません。実行例: `AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts`。
 
 失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
 

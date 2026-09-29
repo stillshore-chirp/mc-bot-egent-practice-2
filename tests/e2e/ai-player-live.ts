@@ -55,6 +55,7 @@ import {
   gatherMultiTargetOracleProbeBaselineFailureFields,
   gatherMultiTargetOracleProbeResultFailureFields,
   readGatherMultiTargetInventory,
+  shouldRunGatherMultiTargetOracleProbe,
   type GatherMultiTargetItem,
 } from "./gather-multi-target-acceptance.js";
 import {
@@ -873,6 +874,7 @@ function isNoGptDiagnosticProbeOnly(): boolean {
     process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" ||
     isDeathRecoveryFixtureProbeOnly()
   );
 }
@@ -8240,6 +8242,7 @@ async function prepareRun(): Promise<RunState> {
     "AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY",
+    "AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY",
     "AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY",
   ].filter((name) => process.env[name] === "YES").length;
   if (
@@ -8252,6 +8255,12 @@ async function prepareRun(): Promise<RunState> {
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
+  if (
+    process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" &&
+    requestedTargetCase !== "gather_multi_target_continuity"
+  ) {
+    incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_TARGET_REQUIRED");
+  }
   if (
     requestedTargetCase !== undefined &&
     requestedTargetCase.length > 0 &&
@@ -9015,7 +9024,12 @@ async function runOperationSmoke(
         }
         if (!positionMatchesSmokeSpawn(visibleBefore.self.position))
           incomplete("BODY_SMOKE_CLIENT_POSITION_NOT_CONFIRMED");
-        if (state.targetCase === "gather_multi_target_continuity") {
+        if (
+          shouldRunGatherMultiTargetOracleProbe(
+            state.targetCase,
+            process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY,
+          )
+        ) {
           await runGatherStackOracleProbe(state, rcon, state.botName, body);
         }
         const hiddenItemOmitted = !JSON.stringify(visibleBefore)
