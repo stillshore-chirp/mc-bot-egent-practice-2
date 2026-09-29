@@ -11427,6 +11427,8 @@ async function runDeathRecoveryTargetCase(
   let boundedRecoveryFinished = false;
   let serverInventoryIncreaseConfirmed = false;
   let serverDropRemovalConfirmed = false;
+  let ownerGoalContinuityObserved = false;
+  let ownerGoalContinuityOutcome = "unconfirmed";
   const ownerReportMatchesServerResult = false;
   let ownerReportPrivateRetained = false;
   let restoreDeathRecoveryContextProbe: (() => void) | undefined;
@@ -11504,6 +11506,65 @@ async function runDeathRecoveryTargetCase(
       beforeSnapshot.latestDeath !== undefined
     )
       incomplete("DEATH_RECOVERY_DATABASE_NOT_FRESH_BEFORE_DEATH");
+    const previousProposalIds = new Set(
+      playerOf(await collect(context.runtime.app)).proposals.map(
+        ({ id }) => id,
+      ),
+    );
+    sendChat(
+      context.owner,
+      "ここで私を待ちながら、周りの様子を見ていて。危険なら逃げていいよ。",
+    );
+    const adoptedIntent = await observeForPlayer(context, 45_000, (player) => {
+      const accepted = player.proposals.filter(
+        ({ id, status }) =>
+          !previousProposalIds.has(id) && status === "adopted",
+      );
+      if (
+        accepted.length === 1 &&
+        hasNewActiveOwnerProposalGoal(
+          [...previousProposalIds],
+          player.proposals,
+          player.goals,
+        ) &&
+        player.goals.some(
+          ({ ownerProposalId, source, status }) =>
+            ownerProposalId === accepted[0]?.id &&
+            source === "owner" &&
+            status === "active",
+        )
+      )
+        return true;
+      return false;
+    });
+    if (adoptedIntent === undefined)
+      incomplete("DEATH_RECOVERY_PREDEATH_OWNER_GOAL_NOT_ADOPTED");
+    const adoptedProposal = adoptedIntent.proposals.find(
+      ({ id, status }) => !previousProposalIds.has(id) && status === "adopted",
+    );
+    const preDeathOwnerGoal = adoptedIntent.goals.find(
+      ({ ownerProposalId, source, status }) =>
+        ownerProposalId === adoptedProposal?.id &&
+        source === "owner" &&
+        status === "active",
+    );
+    if (adoptedProposal === undefined || preDeathOwnerGoal === undefined)
+      incomplete("DEATH_RECOVERY_PREDEATH_OWNER_GOAL_LINK_MISSING");
+    const beforeKill = await appBody.observe();
+    const bodyItemCount = beforeKill.self.inventory.find(
+      ({ name }) => name === "blue_wool",
+    )?.count;
+    if (
+      Math.hypot(
+        beforeKill.self.position.x - fixture.position.x,
+        beforeKill.self.position.y - fixture.position.y,
+        beforeKill.self.position.z - fixture.position.z,
+      ) > 0.75 ||
+      bodyItemCount !== 1
+    )
+      incomplete("DEATH_RECOVERY_OWNER_GOAL_MOVED_FIXTURE_BEFORE_DEATH");
+    beforeDeath = beforeKill;
+    deathSite = beforeKill.self.position;
     const deathSiteBlock = {
       x: Math.floor(deathSite.x),
       y: Math.floor(deathSite.y),
@@ -11662,6 +11723,33 @@ async function runDeathRecoveryTargetCase(
     if (!deathRecordReopenedUnchanged)
       incomplete("DEATH_RECOVERY_INDEPENDENT_DB_REOPEN_CHANGED_RECORD");
 
+    const goalAfterRespawn = playerOf(
+      await collect(context.runtime.app),
+    ).goals.find(
+      ({ id, ownerProposalId, source }) =>
+        id === preDeathOwnerGoal.id &&
+        ownerProposalId === adoptedProposal.id &&
+        source === "owner",
+    );
+    if (goalAfterRespawn === undefined)
+      incomplete("DEATH_RECOVERY_OWNER_GOAL_MISSING_AFTER_RESPAWN");
+    const goalChangedWithReason =
+      ["paused", "completed", "abandoned"].includes(
+        goalAfterRespawn.status ?? "",
+      ) &&
+      (goalAfterRespawn.changeReason?.trim().length ?? 0) > 0 &&
+      Date.parse(goalAfterRespawn.updatedAt ?? "") > Date.parse(deathAt);
+    ownerGoalContinuityObserved =
+      goalAfterRespawn.status === "active" || goalChangedWithReason;
+    ownerGoalContinuityOutcome =
+      goalAfterRespawn.status === "active"
+        ? "maintained"
+        : goalChangedWithReason
+          ? "changed_with_reason"
+          : "unconfirmed";
+    if (!ownerGoalContinuityObserved)
+      incomplete("DEATH_RECOVERY_OWNER_GOAL_CONTINUITY_UNCONFIRMED");
+
     const dropCountBefore = await rconBlueWoolDropCountNear(
       context.rcon,
       deathSite,
@@ -11678,7 +11766,7 @@ async function runDeathRecoveryTargetCase(
       incomplete("DEATH_RECOVERY_TARGET_DROP_POSITION_NOT_READABLE");
     state.deathRecoveryTargetPickupPosition = dropPosition;
     const recoveryRequest =
-      "さっきの死亡記録で持ち物に何が起きたか、確度も含めて教えてください。そのうえで死亡地点付近の青い羊毛を、見える範囲で探して回収し、最後に実際にできたことを報告してください。見つからない場合は未確認と教えてください。";
+      "さっきの死亡記録で持ち物に何が起きたか、確度も含めて教えてください。先ほどの見張りの依頼を今どう扱っているか、その理由も教えてください。そのうえで死亡地点付近の青い羊毛を、見える範囲で探して回収し、最後に実際にできたことを報告してください。見つからない場合は未確認と教えてください。";
     const contextPrototype = CompanionContextFactory.prototype;
     const contextDescriptor = Object.getOwnPropertyDescriptor(
       contextPrototype,
@@ -11878,7 +11966,7 @@ async function runDeathRecoveryTargetCase(
     proof.firstChatAfterRequestObserved = firstChatAfterRequestObserved;
     proof.ownerRequestReplyCorrelationVerified = false;
     proof.ownerRecordStableAfterRequest = ownerRecordStableAfterRequest;
-    proof.ownerGoalContinuityObserved = false;
+    proof.ownerGoalContinuityObserved = ownerGoalContinuityObserved;
     proof.boundedRecoveryFinished = boundedRecoveryFinished;
     proof.targetPickupEventMatched =
       state.deathRecoveryTargetPickupEventMatched === true;
@@ -11896,7 +11984,7 @@ async function runDeathRecoveryTargetCase(
         state.deathRecoveryTargetOwnerReplyHash ?? "unavailable",
       ownerRequestReplyCorrelation: "unverified",
       purposeMarkerScope: "death_record_reference_not_request_start",
-      ownerGoalContinuity: "not_observed_in_this_scene",
+      ownerGoalContinuity: ownerGoalContinuityOutcome,
       privateOwnerReportReview: ownerReportPrivateRetained
         ? "pending"
         : "unavailable",

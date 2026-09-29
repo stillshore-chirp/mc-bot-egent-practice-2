@@ -405,7 +405,7 @@ Targeted `unknown_composite` artifact `3422ee20…` はcase passです。caseは
 
 Issue #72全体の受け入れは未達です。必要なケースの残件と共通runtime・DBを引き継ぐ統合証拠を閉じる必要があります。単一の長時間全case連続runは #76、遮蔽された目標探索は #77 の範囲です。既知usageは部分計測として扱い、不明分を補完しません。
 
-`death_recovery`は、非OP Body smokeで青い羊毛を1個持った死亡地点を設定し、実application接続後に死亡させます。実DBの死亡記録とfresh復帰観測を、applicationを動かしたまま別のreadonly SQLite handleでclose/reopenして照合し、有限探索、対象pickup event、Body/RCON所持数増加、drop消失を独立に記録します。owner contextに同じ死亡時刻が含まれた事実と、依頼後に届いた最初のchatは別証拠で、返信との相関は未確認として残します。Purpose markerは死亡記録への参照を示しますが、依頼後に開始したことの証拠ではありません。owner goal continuityはこのsceneでは観測しません。死亡後の会話と回収報告本文はmode `0600`のprivate sidecarに保持し、回収後のtarget caseは`DEATH_RECOVERY_PRIVATE_REVIEW_PENDING`で未完了とします。主担当がprivate本文を独立oracleと照合するまで`ownerReportMatchesServerResult`はfalseのままです。JSON artifactには本文を含めません。単独実行は64 calls / 600,000 known tokens / 12分を上限とし、共通runの既定budgetは変更しません。
+`death_recovery`は、非OP Body smokeで青い羊毛を1個持った死亡地点を設定し、実application接続後に死亡させます。kill前に自然なowner依頼から新しいadopted proposalとlinked active goalを確認し、respawn後に同goal IDの維持、または死亡後に更新された非空changeReason付きの状態変更を確認します。active維持はstateの観測事実に限り、理由付き判断の証拠とは扱いません。回収依頼では見張りの依頼の扱いと理由も尋ね、理由付き維持のAC受入はprivate返信の主担当レビューまで未確認です。goal不採用・消失・不明、またはkill前にfixture位置を保てない場合は未完了として死亡させません。実DBの死亡記録とfresh復帰観測を、applicationを動かしたまま別のreadonly SQLite handleでclose/reopenして照合し、有限探索、対象pickup event、Body/RCON所持数増加、drop消失を独立に記録します。owner contextに同じ死亡時刻が含まれた事実と、依頼後に届いた最初のchatは別証拠で、返信との相関は未確認として残します。Purpose markerは死亡記録への参照を示しますが、依頼後に開始したことの証拠ではありません。死亡後の会話と回収報告本文はmode `0600`のprivate sidecarに保持し、回収後のtarget caseは`DEATH_RECOVERY_PRIVATE_REVIEW_PENDING`で未完了とします。主担当がprivate本文を独立oracleと照合するまで`ownerReportMatchesServerResult`はfalseのままです。JSON artifactには本文を含めません。単独実行は64 calls / 600,000 known tokens / 12分を上限とし、共通runの既定budgetは変更しません。
 
 ```sh
 AI_PLAYER_E2E_CONFIRMED=YES \
