@@ -2,12 +2,33 @@ import { describe, expect, it } from "vitest";
 
 import {
   gatherMultiTargetBodySmokeSafeFailureEvidence,
+  shouldRunGatherMultiTargetOracleProbe,
   gatherMultiTargetInventorySafeEvidence,
   gatherMultiTargetOracleProbeBaselineFailureFields,
   gatherMultiTargetOracleProbeResultFailureFields,
   parseGatherMultiTargetInventoryReplyDetailed,
   readGatherMultiTargetInventory,
 } from "./gather-multi-target-acceptance.js";
+
+describe("gather multi-target probe routing", () => {
+  it("runs the strict probe only for an explicit matching diagnostic", () => {
+    expect(
+      shouldRunGatherMultiTargetOracleProbe(
+        "gather_multi_target_continuity",
+        "YES",
+      ),
+    ).toBe(true);
+    expect(
+      shouldRunGatherMultiTargetOracleProbe(
+        "gather_multi_target_continuity",
+        undefined,
+      ),
+    ).toBe(false);
+    expect(
+      shouldRunGatherMultiTargetOracleProbe("food_intent_continuity", "YES"),
+    ).toBe(false);
+  });
+});
 
 describe("gather multi-target inventory oracle", () => {
   it("sums target quantities and counts matching stacks independently", () => {
