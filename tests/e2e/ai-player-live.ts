@@ -3234,6 +3234,7 @@ interface RunState {
   deathRecoveryTargetDeathAt?: string;
   deathRecoveryTargetPickupPosition?: Position;
   deathRecoveryTargetEntityIds?: Set<number>;
+  deathRecoveryTargetRecoveryRequestAt?: number;
   deathRecoveryTargetOwnerReplyHash?: string;
   deathRecoveryTargetOwnerReplyRetained?: boolean;
   observationBoundaryCapture?: {
@@ -11511,6 +11512,7 @@ function installDeathRecoveryTargetExecuteProbe(state: RunState): () => void {
     operation: Parameters<typeof original>[0],
     signal?: AbortSignal,
   ): ReturnType<typeof original> {
+    const operationStartedAt = Date.now();
     const actionCount = (state.deathRecoveryTargetBodyActionCount ?? 0) + 1;
     state.deathRecoveryTargetBodyActionCount = actionCount;
     if (actionCount > 24) {
@@ -11521,6 +11523,9 @@ function installDeathRecoveryTargetExecuteProbe(state: RunState): () => void {
     }
     const result = await original.call(this, operation, signal);
     if (operation.kind === "collect_item") {
+      const startedAfterRecoveryRequest =
+        state.deathRecoveryTargetRecoveryRequestAt !== undefined &&
+        operationStartedAt >= state.deathRecoveryTargetRecoveryRequestAt;
       const targetEntity =
         state.deathRecoveryTargetEntityIds?.has(operation.entityId) === true;
       const effectMatches =
@@ -11529,15 +11534,18 @@ function installDeathRecoveryTargetExecuteProbe(state: RunState): () => void {
         result.observedEffect.entityId === operation.entityId;
       state.deathRecoveryTargetPickupEventMatched =
         state.deathRecoveryTargetPickupEventMatched === true ||
-        (targetEntity && effectMatches);
+        (startedAfterRecoveryRequest && targetEntity && effectMatches);
       const itemCount = (observation: PlayerBodyObservation | null): number =>
         observation?.self.inventory
           .filter(({ name }) => name === "blue_wool")
           .reduce((total, item) => total + item.count, 0) ?? 0;
       state.deathRecoveryTargetBodyInventoryIncreased =
         state.deathRecoveryTargetBodyInventoryIncreased === true ||
-        (targetEntity &&
+        (startedAfterRecoveryRequest &&
+          targetEntity &&
           effectMatches &&
+          result.before !== null &&
+          result.after !== null &&
           itemCount(result.after) > itemCount(result.before));
     }
     return result;
@@ -11598,6 +11606,12 @@ async function runDeathRecoveryTargetCase(
   let boundedRecoveryFinished = false;
   let serverInventoryIncreaseConfirmed = false;
   let serverDropRemovalConfirmed = false;
+  let firstRespawnBodyBlueWoolCount: number | undefined;
+  let firstRespawnServerBlueWoolCount: number | undefined;
+  let deathDropReadinessFinalCount: number | undefined;
+  let rconInventoryCountBeforeRecoveryRequest: number | undefined;
+  let rconInventoryCountAfterRecoveryRequest: number | undefined;
+  let rconDropCountAfterRecoveryRequest: number | undefined;
   let ownerGoalContinuityObserved = false;
   let ownerGoalContinuityOutcome = "unconfirmed";
   const ownerReportMatchesServerResult = false;
@@ -11819,8 +11833,23 @@ async function runDeathRecoveryTargetCase(
           typeof respawnBodyObservation.self.health === "number" &&
           respawnBodyObservation.self.health > 0 &&
           respawnHealth > 0
-        )
+        ) {
+          firstRespawnBodyBlueWoolCount = respawnBodyObservation.self.inventory
+            .filter(({ name }) => name === "blue_wool")
+            .reduce((total, item) => total + item.count, 0);
+          firstRespawnServerBlueWoolCount = await rconInventoryItemCount(
+            context.rcon,
+            context.botName,
+            "blue_wool",
+          ).catch(() => undefined);
+          state.deathRecoveryTargetDiagnostic = {
+            ...(state.deathRecoveryTargetDiagnostic ?? {}),
+            firstRespawnBodyBlueWoolCount,
+            firstRespawnServerBlueWoolCount:
+              firstRespawnServerBlueWoolCount ?? null,
+          };
           break;
+        }
       } catch {
         // Missing respawn or DB evidence remains unverified.
       }
@@ -11975,13 +12004,25 @@ async function runDeathRecoveryTargetCase(
     if (!ownerGoalContinuityObserved)
       incomplete("DEATH_RECOVERY_OWNER_GOAL_CONTINUITY_UNCONFIRMED");
 
-    const dropCountBefore = await rconBlueWoolDropCountNear(
-      context.rcon,
-      deathSite,
-      4,
+    let dropCountBefore: number | undefined;
+    const dropReadinessDeadline = Math.min(
+      Date.now() + 5_000,
+      context.caseDeadlineAt,
     );
-    if (dropCountBefore !== 1)
-      incomplete("DEATH_RECOVERY_TARGET_DROP_NOT_UNIQUE_BY_SERVER");
+    while (Date.now() < dropReadinessDeadline) {
+      dropCountBefore = await rconBlueWoolDropCountNear(
+        context.rcon,
+        deathSite,
+        4,
+      ).catch(() => undefined);
+      deathDropReadinessFinalCount = dropCountBefore;
+      if (dropCountBefore !== undefined && dropCountBefore > 0) break;
+      await waitMs(150);
+    }
+    if (dropCountBefore === undefined)
+      incomplete("DEATH_RECOVERY_TARGET_DROP_COUNT_UNAVAILABLE");
+    if (dropCountBefore === 0)
+      incomplete("DEATH_RECOVERY_TARGET_DROP_NOT_OBSERVED");
     const dropPosition = await rconBlueWoolDropPositionWithinRadius(
       context.rcon,
       deathSiteBlock,
@@ -11992,6 +12033,13 @@ async function runDeathRecoveryTargetCase(
     state.deathRecoveryTargetPickupPosition = dropPosition;
     const recoveryRequest =
       "さっきの死亡記録で持ち物に何が起きたか、確度も含めて教えてください。先ほどの見張りの依頼を今どう扱っているか、その理由も教えてください。そのうえで死亡地点付近の青い羊毛を、見える範囲で探して回収し、最後に実際にできたことを報告してください。見つからない場合は未確認と教えてください。";
+    rconInventoryCountBeforeRecoveryRequest = await rconInventoryItemCount(
+      context.rcon,
+      context.botName,
+      "blue_wool",
+    ).catch(() => undefined);
+    if (rconInventoryCountBeforeRecoveryRequest === undefined)
+      incomplete("DEATH_RECOVERY_RECOVERY_REQUEST_INVENTORY_UNAVAILABLE");
     const contextPrototype = CompanionContextFactory.prototype;
     const contextDescriptor = Object.getOwnPropertyDescriptor(
       contextPrototype,
@@ -12024,6 +12072,7 @@ async function runDeathRecoveryTargetCase(
     };
     const conversationStart = state.responses.length;
     const conversationSentAt = Date.now();
+    state.deathRecoveryTargetRecoveryRequestAt = conversationSentAt;
     sendChat(context.owner, recoveryRequest);
     await waitForPlayer(context, 60_000, () =>
       state.responses
@@ -12105,17 +12154,21 @@ async function runDeathRecoveryTargetCase(
         context.botName,
         "blue_wool",
       ).catch(() => undefined);
+      rconInventoryCountAfterRecoveryRequest = rconInventoryCountAfter;
       rconDropCountAfter = await rconBlueWoolDropCountNear(
         context.rcon,
         deathSite,
         4,
       ).catch(() => undefined);
+      rconDropCountAfterRecoveryRequest = rconDropCountAfter;
       if (
         purposeTraceConfirmed &&
         state.deathRecoveryTargetPickupEventMatched &&
         state.deathRecoveryTargetBodyInventoryIncreased &&
-        rconInventoryCountAfter === 1 &&
-        rconDropCountAfter === 0
+        rconInventoryCountAfter !== undefined &&
+        rconInventoryCountAfter > rconInventoryCountBeforeRecoveryRequest &&
+        rconDropCountAfter !== undefined &&
+        rconDropCountAfter < dropCountBefore
       )
         break;
       const latest = playerOf(await collect(context.runtime.app));
@@ -12134,8 +12187,11 @@ async function runDeathRecoveryTargetCase(
       state.deathRecoveryTargetPickupEventMatched === true;
     const bodyInventoryIncreaseConfirmed =
       state.deathRecoveryTargetBodyInventoryIncreased === true;
-    serverInventoryIncreaseConfirmed = rconInventoryCountAfter === 1;
-    serverDropRemovalConfirmed = rconDropCountAfter === 0;
+    serverInventoryIncreaseConfirmed =
+      rconInventoryCountAfter !== undefined &&
+      rconInventoryCountAfter > rconInventoryCountBeforeRecoveryRequest;
+    serverDropRemovalConfirmed =
+      rconDropCountAfter !== undefined && rconDropCountAfter < dropCountBefore;
     if (
       !targetPickupEventMatched ||
       !bodyInventoryIncreaseConfirmed ||
@@ -12196,7 +12252,17 @@ async function runDeathRecoveryTargetCase(
     proof.serverDropRemovalConfirmed = serverDropRemovalConfirmed;
     proof.ownerReportMatchesServerResult = ownerReportMatchesServerResult;
     state.deathRecoveryTargetDiagnostic = {
+      ...(state.deathRecoveryTargetDiagnostic ?? {}),
       ...proof,
+      firstRespawnBodyBlueWoolCount: firstRespawnBodyBlueWoolCount ?? null,
+      firstRespawnServerBlueWoolCount: firstRespawnServerBlueWoolCount ?? null,
+      deathDropReadinessFinalCount: deathDropReadinessFinalCount ?? null,
+      rconInventoryCountBeforeRecoveryRequest:
+        rconInventoryCountBeforeRecoveryRequest ?? null,
+      rconInventoryCountAfterRecoveryRequest:
+        rconInventoryCountAfterRecoveryRequest ?? null,
+      rconDropCountAfterRecoveryRequest:
+        rconDropCountAfterRecoveryRequest ?? null,
       bodyActionCount: state.deathRecoveryTargetBodyActionCount ?? 0,
       ownerReplyRetained: state.deathRecoveryTargetOwnerReplyRetained ?? false,
       ownerReportPrivateRetained,
