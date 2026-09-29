@@ -3,6 +3,11 @@ export interface NoFoodReplanAcceptanceEvidence {
   readonly alternativeSuccessfulBodyOutcomeObserved: boolean;
   readonly postOutcomeNoFoodStateConfirmed: boolean;
   readonly postOutcomePurposeJudgmentObserved: boolean;
+  readonly waitReasonAndWakeConditionPresent: boolean;
+  readonly waitStateObservationConfirmed: boolean;
+  readonly waitWakeReassessmentObserved: boolean;
+  readonly waitReassessmentDecision:
+    "alternative" | "wait" | "consume" | "other" | "not_observed";
 }
 
 export const NO_FOOD_REPLAN_ACCEPTANCE_LATCHED =
@@ -148,11 +153,19 @@ export class NoFoodReplanAcceptanceLatchedError extends Error {
 export function noFoodReplanAcceptanceEvidenceConfirmed(
   evidence: NoFoodReplanAcceptanceEvidence,
 ): boolean {
-  return (
-    evidence.startupStateConfirmed &&
+  const successfulAlternativePath =
     evidence.alternativeSuccessfulBodyOutcomeObserved &&
     evidence.postOutcomeNoFoodStateConfirmed &&
-    evidence.postOutcomePurposeJudgmentObserved
+    evidence.postOutcomePurposeJudgmentObserved;
+  const reasonedWaitPath =
+    evidence.waitReasonAndWakeConditionPresent &&
+    evidence.waitStateObservationConfirmed &&
+    evidence.waitWakeReassessmentObserved &&
+    (evidence.waitReassessmentDecision === "alternative" ||
+      evidence.waitReassessmentDecision === "wait");
+  return (
+    evidence.startupStateConfirmed &&
+    (successfulAlternativePath || reasonedWaitPath)
   );
 }
 

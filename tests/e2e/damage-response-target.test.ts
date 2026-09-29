@@ -23,14 +23,16 @@ describe("damage response targeted E2E case", () => {
     });
     expect(
       runBudgetCoversCase(
-        { llmCalls: 160, totalTokens: 800_000 },
+        { durationMs: 10 * 60_000, llmCalls: 160, totalTokens: 800_000 },
         DAMAGE_RESPONSE_CASE_BUDGET,
+        8 * 60_000,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 6, totalTokens: 35_000 },
+        { durationMs: 10 * 60_000, llmCalls: 6, totalTokens: 35_000 },
         DAMAGE_RESPONSE_CASE_BUDGET,
+        8 * 60_000,
       ),
     ).toBe(false);
   });
