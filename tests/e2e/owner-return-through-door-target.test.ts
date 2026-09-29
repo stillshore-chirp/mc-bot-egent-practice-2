@@ -18,6 +18,7 @@ import {
   OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
   ownerReturnArrivalConfirmed,
+  ownerReturnSideDiagnostics,
   ownerReturnToolNamesSince,
   ownerReturnUsageIsUnknown,
   runBudgetCoversCase,
@@ -184,8 +185,8 @@ describe("owner return through door targeted E2E case", () => {
         calls: recordedCallsFromPreStart,
         tokens: 100,
         usageUnknownCalls: 0,
-        caseCallLimit: 24,
-        caseTokenLimit: 160_000,
+        caseCallLimit: 48,
+        caseTokenLimit: 320_000,
       }),
     ).toBe("accounting_mismatch");
     expect(
@@ -195,8 +196,8 @@ describe("owner return through door targeted E2E case", () => {
         calls: recordedCallsFromPreStart,
         tokens: 100,
         usageUnknownCalls: 0,
-        caseCallLimit: 24,
-        caseTokenLimit: 160_000,
+        caseCallLimit: 48,
+        caseTokenLimit: 320_000,
       }),
     ).toBe("settled");
   });
@@ -222,7 +223,7 @@ describe("owner return through door targeted E2E case", () => {
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET.llmCalls,
         gate,
       );
-      expect(remainingCalls).toBe(24 - startupCalls);
+      expect(remainingCalls).toBe(48 - startupCalls);
       if (remainingCalls === undefined)
         throw new Error("OWNER_RETURN_CALL_LIMIT_NOT_AVAILABLE");
 
@@ -231,10 +232,10 @@ describe("owner return through door targeted E2E case", () => {
         beforeCall();
       }
 
-      expect(gate.requestsStarted).toBe(24);
+      expect(gate.requestsStarted).toBe(48);
       expect(beforeCall).toThrow("CASE_LLM_BUDGET_EXCEEDED");
-      expect(gate.requestsStarted).toBe(24);
-      expect(baseAdmission).toHaveBeenCalledTimes(24);
+      expect(gate.requestsStarted).toBe(48);
+      expect(baseAdmission).toHaveBeenCalledTimes(48);
       admission.endCase();
     };
 
@@ -251,21 +252,21 @@ describe("owner return through door targeted E2E case", () => {
         startupBaseAdmission,
         (code) => new Error(code),
       );
-    for (let index = 0; index < 24; index += 1) admitStartupRequest();
-    expect(startupGate.requestsStarted).toBe(24);
+    for (let index = 0; index < 48; index += 1) admitStartupRequest();
+    expect(startupGate.requestsStarted).toBe(48);
     expect(admitStartupRequest).toThrow("CASE_LLM_BUDGET_EXCEEDED");
-    expect(startupGate.requestsStarted).toBe(24);
-    expect(startupBaseAdmission).toHaveBeenCalledTimes(24);
+    expect(startupGate.requestsStarted).toBe(48);
+    expect(startupBaseAdmission).toHaveBeenCalledTimes(48);
 
     expect(ownerReturnCaseCallLimit("no_food_replan", 24, undefined)).toBe(24);
     expect(ownerReturnCaseCallLimit(undefined, 24, undefined)).toBe(24);
     expect(
-      ownerReturnCaseCallLimit("owner_return_through_door", 24, undefined),
+      ownerReturnCaseCallLimit("owner_return_through_door", 48, undefined),
     ).toBeUndefined();
     expect(() =>
       admitOwnerReturnProviderRequest(
         undefined,
-        24,
+        48,
         vi.fn(),
         (code) => new Error(code),
       ),
@@ -274,25 +275,25 @@ describe("owner return through door targeted E2E case", () => {
 
   it("uses the new owner case budget and deadline", () => {
     expect(OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET).toEqual({
-      llmCalls: 24,
-      totalTokens: 160_000,
+      llmCalls: 48,
+      totalTokens: 320_000,
     });
     expect(OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS).toBe(8 * 60_000);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 24, totalTokens: 160_000 },
+        { llmCalls: 48, totalTokens: 320_000 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 23, totalTokens: 160_000 },
+        { llmCalls: 47, totalTokens: 320_000 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
       ),
     ).toBe(false);
     expect(
       runBudgetCoversCase(
-        { llmCalls: 24, totalTokens: 159_999 },
+        { llmCalls: 48, totalTokens: 319_999 },
         OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
       ),
     ).toBe(false);
@@ -352,7 +353,7 @@ describe("owner return through door targeted E2E case", () => {
     expect(ownerReturnProposalDisposition(undefined)).toBe("unknown");
   });
 
-  it("requires matching owner-side arrival, distance, and an open door", () => {
+  it("requires close aligned observations and an open door, with side as diagnostics", () => {
     const confirmed = {
       bodySide: "owner_side",
       rconSide: "owner_side",
@@ -364,11 +365,15 @@ describe("owner return through door targeted E2E case", () => {
     expect(ownerReturnArrivalConfirmed(confirmed)).toBe(true);
 
     expect(
-      ownerReturnArrivalConfirmed({ ...confirmed, bodySide: "doorway" }),
-    ).toBe(false);
+      ownerReturnArrivalConfirmed({
+        ...confirmed,
+        bodySide: "doorway",
+        rconSide: "doorway",
+      }),
+    ).toBe(true);
     expect(
-      ownerReturnArrivalConfirmed({ ...confirmed, rconSide: "return_side" }),
-    ).toBe(false);
+      ownerReturnArrivalConfirmed({ ...confirmed, bodySide: "doorway" }),
+    ).toBe(true);
     expect(
       ownerReturnArrivalConfirmed({
         ...confirmed,
@@ -387,6 +392,21 @@ describe("owner return through door targeted E2E case", () => {
     expect(
       ownerReturnArrivalConfirmed({ ...confirmed, doorState: "closed" }),
     ).toBe(false);
+    expect(
+      ownerReturnArrivalConfirmed({ ...confirmed, doorState: "unknown" }),
+    ).toBe(false);
+  });
+
+  it("records the sampled owner-side classifications independently of arrival", () => {
+    expect(
+      ownerReturnSideDiagnostics({
+        bodySide: "doorway",
+        rconSide: "owner_side",
+      }),
+    ).toEqual({
+      bodyReachedOwnerSide: false,
+      rconReachedOwnerSide: true,
+    });
   });
 
   it("keeps proposal, linked-goal, movement, and arrival requirements together", () => {
@@ -445,12 +465,12 @@ describe("owner return through door targeted E2E case", () => {
       calls: 0,
       tokens: 0,
       usageUnknownCalls: 0,
-      caseCallLimit: 24,
-      caseTokenLimit: 160_000,
+      caseCallLimit: 48,
+      caseTokenLimit: 320_000,
       runCalls: 1,
       runTokens: 100,
-      runCallLimit: 24,
-      runTokenLimit: 160_000,
+      runCallLimit: 48,
+      runTokenLimit: 320_000,
     } as const;
     expect(classifyAcceptedProviderRequestUsage(baseline)).toBe("pending");
     expect(
@@ -475,7 +495,7 @@ describe("owner return through door targeted E2E case", () => {
         ...baseline,
         requestsRecorded: 1,
         calls: 1,
-        tokens: 160_001,
+        tokens: 320_001,
       }),
     ).toBe("budget_exceeded");
     expect(

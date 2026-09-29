@@ -240,8 +240,8 @@ export function damageResponseObservationTimeoutMs(
   return Math.max(1, caseDeadlineAt - now);
 }
 export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
-  llmCalls: 24,
-  totalTokens: 160_000,
+  llmCalls: 48,
+  totalTokens: 320_000,
 } as const;
 export const OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS = 8 * 60_000;
 export const NO_FOOD_REPLAN_CASE_BUDGET = {
@@ -10413,13 +10413,23 @@ export function ownerReturnArrivalConfirmed(
   >,
 ): boolean {
   return (
-    sample.bodySide === "owner_side" &&
-    sample.rconSide === "owner_side" &&
     sample.bodyDistance === "within_1_75" &&
     sample.rconDistance === "within_1_75" &&
     sample.bodyRconAligned &&
     sample.doorState === "open"
   );
+}
+
+export function ownerReturnSideDiagnostics(
+  sample: Pick<OwnerReturnWorldSample, "bodySide" | "rconSide">,
+): Pick<
+  OwnerReturnDiagnostic,
+  "bodyReachedOwnerSide" | "rconReachedOwnerSide"
+> {
+  return {
+    bodyReachedOwnerSide: sample.bodySide === "owner_side",
+    rconReachedOwnerSide: sample.rconSide === "owner_side",
+  };
 }
 
 export function ownerReturnAcceptanceEvidenceConfirmed(
@@ -12095,9 +12105,9 @@ async function runOwnerReturnThroughDoorCase(
       updateObservedToolNames(reachedPlayer);
       update({
         stopReason: "owner_arrival",
-        bodyReachedOwnerSide: true,
-        rconReachedOwnerSide: true,
-        bodyAndRconArrivalObserved: true,
+        ...ownerReturnSideDiagnostics(latestWorldSample),
+        bodyAndRconArrivalObserved:
+          ownerReturnArrivalConfirmed(latestWorldSample),
         activeOperationPresentAtStop: isOperationActive(reachedPlayer),
       });
     }
