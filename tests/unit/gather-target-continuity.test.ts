@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
+  gatherTargetVisibleAfterBodyAction,
   hasResolvedGatherTargetOwnerGoal,
   newGatherTargetProposalIds,
+  summarizeSuccessfulGatherBodyOutcomes,
 } from "../e2e/gather-target-continuity.js";
 
 describe("gather target continuity predicates", () => {
@@ -86,52 +87,132 @@ describe("gather target continuity predicates", () => {
     ).toBe(undefined);
   });
 
-  it("counts distinct successful dig and later pickup pairs", () => {
+  it("requires a successful new Body view/move before fresh target visibility", () => {
+    const successfulViewOutcome = {
+      operationId: "view",
+      kind: "move_to",
+      status: "successful",
+      observedAt: "2026-01-01T00:00:02Z",
+    };
+    const input = {
+      item: "birch_log" as const,
+      previousOperationIds: new Set(["before"]),
+      acceptedAt: Date.parse("2026-01-01T00:00:01Z"),
+      outcomes: [successfulViewOutcome],
+      observation: {
+        observedAt: "2026-01-01T00:00:03Z",
+        visibleBlockNames: ["oak_log", "minecraft:birch_log"],
+      },
+    };
+    expect(gatherTargetVisibleAfterBodyAction(input)).toBe(true);
     expect(
-      countCompletedGatherActions([
-        {
-          operationId: "failed-dig",
-          kind: "dig",
-          status: "failed",
-          observedAt: "2026-01-01T00:00:00Z",
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        outcomes: [{ ...successfulViewOutcome, operationId: "before" }],
+      }),
+    ).toBe(false);
+    expect(
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        outcomes: [{ ...successfulViewOutcome, status: "failed" }],
+      }),
+    ).toBe(false);
+    expect(
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        observation: {
+          observedAt: "2026-01-01T00:00:02Z",
+          visibleBlockNames: ["birch_log"],
         },
+      }),
+    ).toBe(false);
+  });
+
+  it("counts distinct successful Body operations without requiring dig-pickup pairs", () => {
+    const outcomes = [
+      {
+        operationId: "prior-goal",
+        kind: "dig",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:00Z",
+      },
+      {
+        operationId: "failed-dig",
+        kind: "dig",
+        status: "failed",
+        observedAt: "2026-01-01T00:00:01Z",
+      },
+      {
+        operationId: "move-first",
+        kind: "move_to",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:02Z",
+      },
+      {
+        operationId: "dig-first",
+        kind: "dig",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:03Z",
+      },
+      {
+        operationId: "dig-first",
+        kind: "dig",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:03Z",
+      },
+      {
+        operationId: "pickup-first",
+        kind: "collect_item",
+        status: "successful",
+        observedAt: "2026-01-01T00:00:04Z",
+      },
+      {
+        operationId: "invalid-time",
+        kind: "look",
+        status: "successful",
+        observedAt: "unknown",
+      },
+    ];
+    expect(summarizeSuccessfulGatherBodyOutcomes(outcomes)).toEqual({
+      totalCount: 4,
+      kindCounts: "collect_item=1,dig=2,move_to=1",
+    });
+    expect(
+      summarizeSuccessfulGatherBodyOutcomes(
+        outcomes,
+        Date.parse("2026-01-01T00:00:02Z"),
+      ),
+    ).toEqual({
+      totalCount: 2,
+      kindCounts: "collect_item=1,dig=1",
+    });
+    expect(
+      summarizeSuccessfulGatherBodyOutcomes([
         {
-          operationId: "pickup-first",
-          kind: "collect_item",
+          operationId: "move-only",
+          kind: "move_to",
           status: "successful",
           observedAt: "2026-01-01T00:00:01Z",
         },
         {
-          operationId: "dig-first",
-          kind: "dig",
+          operationId: "look-only",
+          kind: "look",
           status: "successful",
           observedAt: "2026-01-01T00:00:02Z",
         },
+      ]).totalCount,
+    ).toBe(2);
+  });
+
+  it("does not count an outcome missing its operation kind", () => {
+    expect(
+      summarizeSuccessfulGatherBodyOutcomes([
         {
-          operationId: "pickup-second",
-          kind: "collect_item",
+          operationId: "missing-kind",
           status: "successful",
-          observedAt: "2026-01-01T00:00:03Z",
-        },
-        {
-          operationId: "pickup-second",
-          kind: "collect_item",
-          status: "successful",
-          observedAt: "2026-01-01T00:00:03Z",
-        },
-        {
-          operationId: "dig-second",
-          kind: "dig",
-          status: "successful",
-          observedAt: "2026-01-01T00:00:04Z",
-        },
-        {
-          operationId: "pickup-third",
-          kind: "collect_item",
-          status: "successful",
-          observedAt: "2026-01-01T00:00:05Z",
+          observedAt: "2026-01-01T00:00:01Z",
         },
       ]),
-    ).toBe(2);
+    ).toEqual({ totalCount: 0, kindCounts: "none" });
   });
 });

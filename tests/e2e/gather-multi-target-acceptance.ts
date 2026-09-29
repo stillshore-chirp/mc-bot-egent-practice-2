@@ -1,6 +1,16 @@
 export const GATHER_MULTI_TARGET_ITEMS = ["oak_log", "birch_log"] as const;
 export type GatherMultiTargetItem = (typeof GATHER_MULTI_TARGET_ITEMS)[number];
 
+/** Keep the strict pre-app probe opt-in for the matching no-GPT diagnostic run. */
+export function shouldRunGatherMultiTargetOracleProbe(
+  targetCase: string | undefined,
+  probeOnlyValue: string | undefined,
+): boolean {
+  return (
+    targetCase === "gather_multi_target_continuity" && probeOnlyValue === "YES"
+  );
+}
+
 export type ParsedInventoryTag =
   | {
       readonly kind: "scalar";
@@ -52,6 +62,18 @@ export type GatherMultiTargetInventoryReadResult =
       readonly parseStage: GatherMultiTargetInventoryParseStage;
     };
 
+export type GatherMultiTargetItemCountReadResult =
+  | {
+      readonly reason: "parsed";
+      readonly parseStage: "parsed";
+      readonly counts: Readonly<Record<GatherMultiTargetItem, number>>;
+    }
+  | {
+      readonly reason: "read_failed" | "response_unrecognized";
+      readonly parseStage: "not_parsed" | "response_unrecognized";
+      readonly counts: Readonly<Record<GatherMultiTargetItem, number | null>>;
+    };
+
 export type GatherMultiTargetOracleProbePhase = "Baseline" | "Final";
 
 /** Publish only fixed read classifications and counts; unknown counts stay null. */
@@ -95,6 +117,22 @@ export function parseInventoryReplyRootCompounds(
   return compounds;
 }
 
+/** Publish scalar item totals; stack counts are deliberately unmeasured. */
+export function gatherMultiTargetItemCountSafeEvidence(
+  phase: GatherMultiTargetOracleProbePhase,
+  result: GatherMultiTargetItemCountReadResult | undefined,
+): Readonly<Record<string, number | string | null>> {
+  const prefix = `gatherOracleProbe${phase}`;
+  return {
+    [`${prefix}InventoryReadReason`]: result?.reason ?? "not_read",
+    [`${prefix}InventoryParseStage`]: result?.parseStage ?? "not_parsed",
+    [`${prefix}OakCount`]: result?.counts.oak_log ?? null,
+    [`${prefix}BirchCount`]: result?.counts.birch_log ?? null,
+    [`${prefix}OakStackCount`]: null,
+    [`${prefix}BirchStackCount`]: null,
+  };
+}
+
 /** Keep prestart gather diagnostics on the Body smoke failure artifact only. */
 export function gatherMultiTargetBodySmokeSafeFailureEvidence<
   T extends Readonly<Record<string, unknown>>,
@@ -132,6 +170,33 @@ export function gatherMultiTargetOracleProbeResultFailureFields(
   } else {
     if (result.counts.oak_log !== 65) fields.push("oak_count");
     if (result.stackCounts.oak_log !== 2) fields.push("oak_stack_count");
+    if (result.counts.birch_log !== 0) fields.push("birch_count");
+  }
+  if (dropCountAfterCollection !== 0) fields.push("drop_after_collection");
+  return fields;
+}
+
+/** Check only the two queried item totals; unknown scalar replies stay unconfirmed. */
+export function gatherMultiTargetOracleProbeBaselineCountFailureFields(
+  result: GatherMultiTargetItemCountReadResult | undefined,
+): readonly string[] {
+  if (result?.reason !== "parsed") return ["inventory_read"];
+  const fields: string[] = [];
+  if (result.counts.oak_log !== 64) fields.push("oak_count");
+  if (result.counts.birch_log !== 0) fields.push("birch_count");
+  return fields;
+}
+
+/** Check queried final totals and the independent drop readback. */
+export function gatherMultiTargetOracleProbeResultCountFailureFields(
+  result: GatherMultiTargetItemCountReadResult | undefined,
+  dropCountAfterCollection: number,
+): readonly string[] {
+  const fields: string[] = [];
+  if (result?.reason !== "parsed") {
+    fields.push("inventory_read");
+  } else {
+    if (result.counts.oak_log !== 65) fields.push("oak_count");
     if (result.counts.birch_log !== 0) fields.push("birch_count");
   }
   if (dropCountAfterCollection !== 0) fields.push("drop_after_collection");
@@ -256,6 +321,59 @@ export async function readGatherMultiTargetInventory(
   if (isGatherMultiTargetInventoryCommandRejection(reply))
     return { reason: "command_rejected", parseStage: "not_parsed" };
   return parsed;
+}
+
+/** Read only the two requested item totals through vanilla's count-only clear mode. */
+export async function readGatherMultiTargetItemCounts(
+  readItemReply: (item: GatherMultiTargetItem) => Promise<string>,
+  playerName: string,
+): Promise<GatherMultiTargetItemCountReadResult> {
+  const counts: Record<GatherMultiTargetItem, number | null> = {
+    oak_log: null,
+    birch_log: null,
+  };
+  let unrecognizedReply = false;
+  for (const item of GATHER_MULTI_TARGET_ITEMS) {
+    let reply: string;
+    try {
+      reply = await readItemReply(item);
+    } catch {
+      return { reason: "read_failed", parseStage: "not_parsed", counts };
+    }
+    const count = parseGatherMultiTargetItemCountReply(reply, playerName);
+    if (count === undefined) {
+      unrecognizedReply = true;
+      continue;
+    }
+    counts[item] = count;
+  }
+  if (unrecognizedReply) {
+    return {
+      reason: "response_unrecognized",
+      parseStage: "response_unrecognized",
+      counts,
+    };
+  }
+  return {
+    reason: "parsed",
+    parseStage: "parsed",
+    counts: counts as Record<GatherMultiTargetItem, number>,
+  };
+}
+
+/** Parse only exact 1.21.11 clear count feedback; never retain the player text. */
+export function parseGatherMultiTargetItemCountReply(
+  reply: string,
+  playerName: string,
+): number | undefined {
+  const text = reply.trim();
+  if (text === `No items were found on player ${playerName}`) return 0;
+  const match = /^Found ([0-9]+) matching item\(s\) on player (.+)$/u.exec(
+    text,
+  );
+  if (match?.[2] !== playerName) return undefined;
+  const count = Number(match[1]);
+  return Number.isSafeInteger(count) && count >= 0 ? count : undefined;
 }
 
 function isGatherMultiTargetInventoryCommandRejection(reply: string): boolean {
