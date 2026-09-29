@@ -18,17 +18,19 @@ continuity probeのpassが示すのは、既定application接続後の最初のB
 
 実GPTの代表caseは`AI_PLAYER_E2E_TARGET_CASE=no_food_replan`で選びます。Body smoke後に隔離worldでHealth 1〜6、Food 12〜15、Body/RCON inventory emptyを準備し、既定applicationの起動前snapshotを保存します。`recordCase`のbudgetを開始してからapplicationを初接続し、startupの最初のBody observationで同じHealth/Food/inventory状態をBody/RCON照合します。照合前に最初のprovider要求が発生した場合は`beforeCall`で送信を拒否します。owner/guest clientは待機させ、追加のowner指示は送信しません。
 
-case上限は10 calls / 100,000 known tokens / 240秒です。caseのrun上限はcase上限以上であることをPaper起動前に確認し、実行時間はcase期限・run期限の早い方で停止します。callsは`beforeCall`で送信前に同期判定し、10回目の送信後は次の要求を拒否します。known tokensとusage unknownは直近の`collect`で得たusageから要求前に判定し、usage unknownの観測後は次の要求を拒否してcaseを未完了にします。usageは応答後に観測されるため、一つの応答で100,000 tokensを越えることがあります。その場合は越過した応答を取り消せず、次の要求を止めます。health/food/inventoryのoracle不一致、operation outcome未確認、期限・予算到達、wait後の新しいPurpose判断未観測はpassにしません。
+case上限は20 calls / 200,000 known tokens / 480秒です。caseのrun上限はcase上限以上であることをPaper起動前に確認し、実行時間はcase期限・run期限の早い方で停止します。callsは`beforeCall`で送信前に同期判定し、20回目の送信後は次の要求を拒否します。known tokensとusage unknownは直近の`collect`で得たusageから要求前に判定し、usage unknownの観測後は次の要求を拒否してcaseを未完了にします。usageは応答後に観測されるため、一つの応答で200,000 tokensを越えることがあります。その場合は越過した応答を取り消せず、次の要求を止めます。health/food/inventoryのoracle不一致、必要なBody outcomeまたはwait後の状態観測・再判断の未確認、期限・予算到達はpassにしません。
 
-固定診断はPurpose判断class、Body outcome status、失敗後の再評価有無、同じ失敗operation kindを同じHealth/Food・空inventory状態で選び直したか、waitの理由/wake条件の存在、wake後の新しいPurpose判断、outcome後のno-food Body/RCON一致です。自由文reason、会話、operation引数、座標、RCON返信は保存しません。
+固定診断はPurpose判断class、Body outcome status、失敗後の再評価有無、同じ失敗operation kindを同じHealth/Food・空inventory状態で選び直したか、waitの理由/wake条件、wake後の新しいPurpose判断、wake後のBody/RCON no-food state一致、成功outcome後の再判断です。自由文reason、会話、operation引数、座標、RCON返信は保存しません。
 
-失敗outcome後は新しいPurpose判断を待ち、同じconsumeを状態不変で再選択した場合はfailします。その他のoperation kindが再選択されてもoperation引数を保持しないため同じ移動先か判別できず、未完了にします。異なるoperationはBody outcome成功とoutcome後のBody/RCON no-food oracleを要求します。
+受け入れは二つの経路です。代案を実行した場合は成功Body outcome、outcome後のBody/RCON no-food oracle、新しいPurpose判断を要求します。理由あるwaitの場合はwake条件に従った新しいBody observation、その観測後のPurpose判断、Body/RCON no-food oracleを要求します。fresh oracleで空inventoryが確認された状態のconsumeは失敗にし、unknown、complete/continue、観測時刻の順序が不明な再判断もpassにしません。
 
-成功した代案Body outcomeの後も、最大60秒またはcase残時間の短い方だけPurpose判断を観測し、`decidedAt`がoutcomeの`observedAt`より後の判断を一つ確認した場合にpassします。この判断を観測したpredicate内で受入ラッチを同期設定し、その後の`beforeCall`はadmission/budget計数前にResponses API送信を拒否します。既に許可した要求は中断せず、`onCall`が記録したcase開始時baseline以降の`llmCalls`を`collect`で読み、最大15秒またはcase期限までsettleを待ちます。usage unknown、admission数と記録call数の不一致、または期限内にsettleしない要求は未完了です。最終collectでも未settled要求がないことを照合してからcaseをpassにし、ラッチによる送信拒否はbudget failureへ分類しません。見つからない場合は`NO_FOOD_POST_OUTCOME_PURPOSE_JUDGMENT_NOT_OBSERVED`で未完了にします。
+失敗outcomeが実際に観測された場合は新しいPurpose判断を待ち、同じconsumeを状態不変で再選択した場合はfailします。その他のoperation kindが再選択されてもoperation引数を保持しないため同じ移動先か判別できず、未完了にします。失敗outcomeの発生自体は受け入れ条件にしません。
 
-waitは理由とwakeOnの存在だけで十分とせず、owner入力なしで対象wakeがcase期限内に設定され、後続の新しいPurpose判断が観測できた時だけ再評価済みとします。artifactはwake種別そのものを保存しないため、再評価をどのeventが起こしたかは断定しません。期限内に新しい判断がなければ未完了です。このtarget runは一度の代表測定であり、失敗しても同条件を自動反復しません。
+代案Body outcome後は最大60秒またはcase残時間の短い方だけ、outcomeより後のPurpose判断を待ちます。wait経路ではwake後のfresh judgementとBody/RCON no-food oracleを確認した時点で、成功Body outcomeを待たずに受入ラッチを設定できます。どちらの経路もpredicate内でラッチし、その後の`beforeCall`はadmission/budget計数前にResponses API送信を拒否します。既に許可した要求は中断せず、`onCall`が記録したcase開始時baseline以降の`llmCalls`を`collect`で読み、最大15秒またはcase期限までsettleを待ちます。usage unknown、admission数と記録call数の不一致、または期限内にsettleしない要求は未完了です。最終collectでも未settled要求がないことを照合してからcaseをpassにします。どちらかの経路で必要な観測がない場合は未完了です。
 
-実GPT target runは一度だけ、次のselectorで起動します: `AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=no_food_replan npm exec -- tsx tests/e2e/ai-player-live.ts`。実行環境には既存の`OPENAI_API_KEY`、隔離Paper用の`AI_PLAYER_E2E_SERVER_JAR`・`AI_PLAYER_E2E_EULA_FILE`、必要な場合だけ`AI_PLAYER_E2E_SERVER_CACHE_DIR`を設定します。case上限10 calls / 100,000 known tokens / 240秒とrun全体上限を使い、追加延長や同条件自動再実行はしません。安全artifactは`os.tmpdir()/ai-player-e2e-results/<run-id>.json`にmode `0600`で保存され、起動時に表示されるそのJSONだけを確認します。失敗時のprivate diagnostics/logは本文やRCON返信を含む可能性があるため、公開・出力しません。
+waitはreason/wakeOnの意図だけで十分とせず、wait前より新しいBody observation、その観測より後のfresh judgement、Body/RCON no-food stateの一致が観測できた時だけ受け入れます。deadlineだけをwake条件に使う場合は、新しいBody observation時刻がwakeAt以後であることも確認します。fresh judgementがwaitなら、その判断にもreason/wake条件が必要です。artifactはwakeを起こしたevent種別を保存しないため、状態変化の原因は断定しません。期限内に必要な観測がなければ未完了です。このtarget runは一度の代表測定であり、失敗しても同条件を自動反復しません。
+
+実GPT target runは一度だけ、次のselectorで起動します: `AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=no_food_replan npm exec -- tsx tests/e2e/ai-player-live.ts`。実行環境には既存の`OPENAI_API_KEY`、隔離Paper用の`AI_PLAYER_E2E_SERVER_JAR`・`AI_PLAYER_E2E_EULA_FILE`、必要な場合だけ`AI_PLAYER_E2E_SERVER_CACHE_DIR`を設定します。case上限20 calls / 200,000 known tokens / 480秒とrun全体上限を使い、追加延長や同条件自動再実行はしません。安全artifactは`os.tmpdir()/ai-player-e2e-results/<run-id>.json`にmode `0600`で保存され、起動時に表示されるそのJSONだけを確認します。失敗時のprivate diagnostics/logは本文やRCON返信を含む可能性があるため、公開・出力しません。
 
 新しい既定経路と責務の境界は[自律プレイヤー](autonomous-player.md)、操作・可視範囲の契約は[プレイヤー操作アダプター](player-body.md)、判断に使うゲーム内知識は[MC Bot Skills](mc-bot-skills.md)を参照してください。
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
+  UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
   runBudgetCoversCase,
   underwaterRecoveryPickupMatchesTarget,
 } from "./ai-player-live.js";
@@ -64,8 +65,9 @@ describe("underwater item recovery targeted E2E case", () => {
     }
     expect(
       runBudgetCoversCase(
-        { llmCalls: 160, totalTokens: 800_000 },
+        { durationMs: 16 * 60_000, llmCalls: 160, totalTokens: 800_000 },
         UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
+        UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
       ),
     ).toBe(true);
   });
