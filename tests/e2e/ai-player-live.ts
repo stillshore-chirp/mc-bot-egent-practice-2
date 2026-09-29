@@ -248,10 +248,10 @@ export const NO_FOOD_REPLAN_CASE_BUDGET = {
 } as const;
 export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
 export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
-  llmCalls: 48,
-  totalTokens: 240_000,
+  llmCalls: 64,
+  totalTokens: 480_000,
 } as const;
-export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 14 * 60_000;
+export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 20 * 60_000;
 export const OWNER_STOP_LATCH_CASE_BUDGET = {
   llmCalls: 48,
   totalTokens: 240_000,
