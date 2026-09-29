@@ -3323,7 +3323,10 @@ export function createOwnerReturnApplicationWithBodyCapture(
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
 }> {
-  if (!ownerReturnRequestGateEnabled(targetCase))
+  if (
+    targetCase !== "death_recovery" &&
+    !ownerReturnRequestGateEnabled(targetCase)
+  )
     return { application: createApplication(config, beforeCall) };
 
   const restoreProbe =
