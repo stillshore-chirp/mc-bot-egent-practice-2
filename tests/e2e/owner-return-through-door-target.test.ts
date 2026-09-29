@@ -18,6 +18,7 @@ import {
   OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
   OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
   ownerReturnArrivalConfirmed,
+  ownerReturnSideDiagnostics,
   ownerReturnToolNamesSince,
   ownerReturnUsageIsUnknown,
   runBudgetCoversCase,
@@ -394,6 +395,18 @@ describe("owner return through door targeted E2E case", () => {
     expect(
       ownerReturnArrivalConfirmed({ ...confirmed, doorState: "unknown" }),
     ).toBe(false);
+  });
+
+  it("records the sampled owner-side classifications independently of arrival", () => {
+    expect(
+      ownerReturnSideDiagnostics({
+        bodySide: "doorway",
+        rconSide: "owner_side",
+      }),
+    ).toEqual({
+      bodyReachedOwnerSide: false,
+      rconReachedOwnerSide: true,
+    });
   });
 
   it("keeps proposal, linked-goal, movement, and arrival requirements together", () => {

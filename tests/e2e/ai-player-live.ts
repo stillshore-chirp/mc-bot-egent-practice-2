@@ -10420,6 +10420,18 @@ export function ownerReturnArrivalConfirmed(
   );
 }
 
+export function ownerReturnSideDiagnostics(
+  sample: Pick<OwnerReturnWorldSample, "bodySide" | "rconSide">,
+): Pick<
+  OwnerReturnDiagnostic,
+  "bodyReachedOwnerSide" | "rconReachedOwnerSide"
+> {
+  return {
+    bodyReachedOwnerSide: sample.bodySide === "owner_side",
+    rconReachedOwnerSide: sample.rconSide === "owner_side",
+  };
+}
+
 export function ownerReturnAcceptanceEvidenceConfirmed(
   disposition: OwnerReturnProposalDisposition,
   ownerGoalLinked: boolean,
@@ -12093,9 +12105,9 @@ async function runOwnerReturnThroughDoorCase(
       updateObservedToolNames(reachedPlayer);
       update({
         stopReason: "owner_arrival",
-        bodyReachedOwnerSide: true,
-        rconReachedOwnerSide: true,
-        bodyAndRconArrivalObserved: true,
+        ...ownerReturnSideDiagnostics(latestWorldSample),
+        bodyAndRconArrivalObserved:
+          ownerReturnArrivalConfirmed(latestWorldSample),
         activeOperationPresentAtStop: isOperationActive(reachedPlayer),
       });
     }
