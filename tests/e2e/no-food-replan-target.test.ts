@@ -8,10 +8,14 @@ import {
 } from "../../src/player/responses.js";
 import {
   classifyNoFoodReplanDecision,
+  isNoFoodObservationAfterDeadlineWake,
+  isNoFoodReassessmentAfterFreshObservation,
   isNoFoodReplanPurposeAfterOutcome,
   noFoodReplanBeforeCallBlockReason,
+  noFoodReplanConsumeUnsupported,
   noFoodReplanOraclesConfirmed,
   NO_FOOD_REPLAN_CASE_BUDGET,
+  NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   runBudgetCoversCase,
 } from "./ai-player-live.js";
 import {
@@ -26,6 +30,11 @@ import {
 
 describe("no-food replan targeted E2E case", () => {
   it("blocks provider sends at the call, observed-token, and unknown-usage boundary", () => {
+    expect(NO_FOOD_REPLAN_CASE_BUDGET).toEqual({
+      llmCalls: 20,
+      totalTokens: 200_000,
+    });
+    expect(NO_FOOD_REPLAN_CASE_DEADLINE_MS).toBe(8 * 60_000);
     expect(
       noFoodReplanBeforeCallBlockReason(
         NO_FOOD_REPLAN_CASE_BUDGET.llmCalls - 1,
@@ -52,17 +61,20 @@ describe("no-food replan targeted E2E case", () => {
     );
     expect(
       runBudgetCoversCase(
-        { llmCalls: 160, totalTokens: 800_000 },
+        { durationMs: 10 * 60_000, llmCalls: 160, totalTokens: 800_000 },
         NO_FOOD_REPLAN_CASE_BUDGET,
+        NO_FOOD_REPLAN_CASE_DEADLINE_MS,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
         {
+          durationMs: 10 * 60_000,
           llmCalls: NO_FOOD_REPLAN_CASE_BUDGET.llmCalls - 1,
           totalTokens: NO_FOOD_REPLAN_CASE_BUDGET.totalTokens,
         },
         NO_FOOD_REPLAN_CASE_BUDGET,
+        NO_FOOD_REPLAN_CASE_DEADLINE_MS,
       ),
     ).toBe(false);
   });
@@ -94,6 +106,61 @@ describe("no-food replan targeted E2E case", () => {
     ).toBe(false);
   });
 
+  it("requires a new Body observation before the reassessment judgment", () => {
+    expect(
+      isNoFoodReassessmentAfterFreshObservation(
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+        "2026-01-01T00:00:03.000Z",
+      ),
+    ).toBe(true);
+    expect(
+      isNoFoodReassessmentAfterFreshObservation(
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:03.000Z",
+      ),
+    ).toBe(false);
+    expect(
+      isNoFoodReassessmentAfterFreshObservation(
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps deadline wake evidence ordered before the new Body observation", () => {
+    expect(
+      isNoFoodObservationAfterDeadlineWake(
+        ["deadline"],
+        "2026-01-01T00:00:02.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBe(true);
+    expect(
+      isNoFoodObservationAfterDeadlineWake(
+        ["deadline"],
+        "2026-01-01T00:00:02.000Z",
+        "2026-01-01T00:00:01.999Z",
+      ),
+    ).toBe(false);
+    expect(
+      isNoFoodObservationAfterDeadlineWake(
+        ["deadline"],
+        undefined,
+        "2026-01-01T00:00:03.000Z",
+      ),
+    ).toBe(false);
+    expect(
+      isNoFoodObservationAfterDeadlineWake(
+        ["deadline", "state_changed"],
+        undefined,
+        "2026-01-01T00:00:01.000Z",
+      ),
+    ).toBe(true);
+  });
+
   it("selects no_food_replan without unrelated prerequisites", () => {
     expect(TARGETABLE_CASES).toContain("no_food_replan");
     expect(isCaseSelectedForTarget("no_food_replan", "no_food_replan")).toBe(
@@ -119,6 +186,12 @@ describe("no-food replan targeted E2E case", () => {
     );
   });
 
+  it("rejects consume when the fresh no-food oracle confirms empty inventory", () => {
+    expect(noFoodReplanConsumeUnsupported("consume", true)).toBe(true);
+    expect(noFoodReplanConsumeUnsupported("consume", false)).toBe(false);
+    expect(noFoodReplanConsumeUnsupported("alternative", true)).toBe(false);
+  });
+
   it("settles recorded usage and rejects a new request after full acceptance evidence", async () => {
     const gate = new NoFoodReplanRequestGate();
     const evidence = {
@@ -126,6 +199,10 @@ describe("no-food replan targeted E2E case", () => {
       alternativeSuccessfulBodyOutcomeObserved: true,
       postOutcomeNoFoodStateConfirmed: true,
       postOutcomePurposeJudgmentObserved: false,
+      waitReasonAndWakeConditionPresent: false,
+      waitStateObservationConfirmed: false,
+      waitWakeReassessmentObserved: false,
+      waitReassessmentDecision: "not_observed" as const,
     };
     const response = {
       status: "completed",
@@ -203,6 +280,41 @@ describe("no-food replan targeted E2E case", () => {
       });
     } finally {
       mind.close();
+    }
+  });
+
+  it("accepts a reasoned wait path only after independent state observation and fresh reassessment", () => {
+    const evidence = {
+      startupStateConfirmed: true,
+      alternativeSuccessfulBodyOutcomeObserved: false,
+      postOutcomeNoFoodStateConfirmed: false,
+      postOutcomePurposeJudgmentObserved: false,
+      waitReasonAndWakeConditionPresent: true,
+      waitStateObservationConfirmed: true,
+      waitWakeReassessmentObserved: true,
+      waitReassessmentDecision: "wait" as const,
+    };
+    for (const waitReassessmentDecision of ["alternative", "wait"] as const) {
+      const gate = new NoFoodReplanRequestGate();
+      expect(
+        gate.latchIfAcceptedEvidence({ ...evidence, waitReassessmentDecision }),
+      ).toBe(true);
+      expect(gate.acceptanceLatched).toBe(true);
+    }
+
+    for (const incompleteEvidence of [
+      { ...evidence, waitReasonAndWakeConditionPresent: false },
+      { ...evidence, waitStateObservationConfirmed: false },
+      { ...evidence, waitWakeReassessmentObserved: false },
+      { ...evidence, waitReassessmentDecision: "consume" as const },
+      { ...evidence, waitReassessmentDecision: "other" as const },
+      { ...evidence, startupStateConfirmed: false },
+    ]) {
+      expect(
+        new NoFoodReplanRequestGate().latchIfAcceptedEvidence(
+          incompleteEvidence,
+        ),
+      ).toBe(false);
     }
   });
 
