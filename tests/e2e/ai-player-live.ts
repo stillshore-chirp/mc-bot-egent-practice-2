@@ -10700,6 +10700,8 @@ async function rconGatherLogDropPositionNear(
 
 interface UnderwaterItemRecoveryFixture {
   readonly waterCells: readonly BlockPosition[];
+  readonly supportCells: readonly BlockPosition[];
+  readonly boundaryCells: readonly BlockPosition[];
   readonly itemCenter: Position;
 }
 
@@ -10729,50 +10731,26 @@ export function underwaterRecoveryPickupMatchesTarget(
   );
 }
 
-async function underwaterRecoverySupportConfirmed(
-  rcon: LocalRcon,
-  position: BlockPosition,
-): Promise<boolean> {
-  for (const block of ["stone", "dirt", "grass_block", "bedrock"]) {
-    if (await isBlock(rcon, position, block)) return true;
-  }
-  return false;
-}
-
-async function findUnderwaterItemRecoveryFixture(
-  rcon: LocalRcon,
+function findUnderwaterItemRecoveryFixture(
   origin: Position,
-): Promise<UnderwaterItemRecoveryFixture> {
+): UnderwaterItemRecoveryFixture {
   const poolY = Math.floor(origin.y) - 1;
   const waterCells = [0, 1, 2].map((distance) =>
     fixturePoint(origin, 0, 3 + distance, poolY),
   );
-  for (const cell of waterCells) {
-    if (
-      !(await isBlock(rcon, cell, "stone")) ||
-      !(await underwaterRecoverySupportConfirmed(rcon, {
-        ...cell,
-        y: poolY - 1,
-      })) ||
-      !(await isBlock(rcon, { ...cell, y: poolY + 1 }, "air")) ||
-      !(await isBlock(rcon, { x: cell.x - 1, y: poolY, z: cell.z }, "stone")) ||
-      !(await isBlock(rcon, { x: cell.x + 1, y: poolY, z: cell.z }, "stone"))
-    ) {
-      incomplete("UNDERWATER_RECOVERY_FIXTURE_SITE_UNAVAILABLE");
-    }
-  }
-  const first = waterCells[0];
-  const last = waterCells.at(-1);
-  if (
-    first === undefined ||
-    last === undefined ||
-    !(await isBlock(rcon, { x: first.x, y: poolY, z: first.z - 1 }, "stone")) ||
-    !(await isBlock(rcon, { x: last.x, y: poolY, z: last.z + 1 }, "stone"))
-  ) {
-    incomplete("UNDERWATER_RECOVERY_FIXTURE_SITE_UNAVAILABLE");
-  }
+  const first = fixturePoint(origin, 0, 3, poolY);
+  const last = fixturePoint(origin, 0, 5, poolY);
   return {
     waterCells,
+    supportCells: waterCells.map((cell) => ({ ...cell, y: poolY - 1 })),
+    boundaryCells: [
+      ...waterCells.flatMap((cell) => [
+        { x: cell.x - 1, y: poolY, z: cell.z },
+        { x: cell.x + 1, y: poolY, z: cell.z },
+      ]),
+      { x: first.x, y: poolY, z: first.z - 1 },
+      { x: last.x, y: poolY, z: last.z + 1 },
+    ],
     itemCenter: { x: last.x + 0.5, y: last.y + 0.25, z: last.z + 0.5 },
   };
 }
@@ -10817,7 +10795,13 @@ async function runUnderwaterItemRecoveryCase(
   const origin = parsePosition(
     await context.rcon.command(`data get entity ${context.botName} Pos`),
   );
-  const fixture = await findUnderwaterItemRecoveryFixture(context.rcon, origin);
+  const fixture = findUnderwaterItemRecoveryFixture(origin);
+  const ownedFixtureCells = [
+    ...fixture.waterCells,
+    ...fixture.supportCells,
+    ...fixture.boundaryCells,
+    ...fixture.waterCells.map((cell) => ({ ...cell, y: cell.y + 1 })),
+  ];
   const baseline = await readUnderwaterRecoveryInventory(
     context.rcon,
     context.botName,
@@ -10838,8 +10822,20 @@ async function runUnderwaterItemRecoveryCase(
   let primaryFailed = false;
   let restoreCollectionCapture: (() => void) | undefined;
   try {
+    fixtureTouched = true;
+    for (const cell of [...fixture.supportCells, ...fixture.boundaryCells]) {
+      await context.rcon.command(
+        `setblock ${cell.x} ${cell.y} ${cell.z} stone`,
+      );
+      if (!(await isBlock(context.rcon, cell, "stone")))
+        incomplete("UNDERWATER_RECOVERY_FIXTURE_SUPPORT_NOT_CONFIRMED");
+    }
     for (const cell of fixture.waterCells) {
-      fixtureTouched = true;
+      await context.rcon.command(
+        `setblock ${cell.x} ${cell.y + 1} ${cell.z} air`,
+      );
+      if (!(await isBlock(context.rcon, { ...cell, y: cell.y + 1 }, "air")))
+        incomplete("UNDERWATER_RECOVERY_FIXTURE_HEADROOM_NOT_CONFIRMED");
       await context.rcon.command(
         `setblock ${cell.x} ${cell.y} ${cell.z} water`,
       );
@@ -11062,16 +11058,16 @@ async function runUnderwaterItemRecoveryCase(
           `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} 0 0`,
         );
       }
-      for (const cell of fixture.waterCells)
+      for (const cell of ownedFixtureCells)
         await context.rcon.command(
-          `setblock ${cell.x} ${cell.y} ${cell.z} stone`,
+          `setblock ${cell.x} ${cell.y} ${cell.z} air`,
         );
       await context.rcon.command(
         `execute positioned ${fixture.itemCenter.x} ${fixture.itemCenter.y} ${fixture.itemCenter.z} run kill @e[type=minecraft:item,distance=..4,nbt={Item:{id:"minecraft:oak_log"}}]`,
       );
-      const restored = await Promise.all(
-        fixture.waterCells.map((cell) => isBlock(context.rcon, cell, "stone")),
-      );
+      const restored = await Promise.all([
+        ...ownedFixtureCells.map((cell) => isBlock(context.rcon, cell, "air")),
+      ]);
       cleanupConfirmed =
         restored.every(Boolean) &&
         (await rconGatherLogDropCountNear(
