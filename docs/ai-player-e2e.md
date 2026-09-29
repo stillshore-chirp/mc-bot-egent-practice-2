@@ -52,9 +52,11 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
 
-fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度は+X、+90度は-X、180度は-Z）に合わせ、観測者から対象への方向で角度を算出します。候補位置が空気・上部空気・石の足場を満たし、視線経路が開いていることをRCONで確認してから採用します。
+fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度は+X、+90度は-X、180度は-Z）に合わせ、観測者から対象への方向で角度を算出します。候補位置は空気・上部空気・石の足場をRCONで確認し、oakへの初期視線とbirchへの側方視線が開いた場所を採用します。birchへの初期直線視線は、制御した遮蔽物で閉じていることをRCONで個別確認します。
 
-続いて実GPTへ数量を指定しない自然なoak採集依頼と、短いbirch追記を送り、birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。
+fixtureはoakが初期視界に入り、birchの直線視界をRCONで遮る安全な回り込み可能領域を選びます。開始時の新しいBody観測もoakを含みbirchを含まないことを確認します。birch追記の受け入れ後に成功したBodyの`look`、`look_sweep`、`move_to`または`move_relative` outcomeがあり、その後のfresh observationがbirchを含んだ場合にだけ発見を記録します。harnessは採集中にBodyを移動しません。
+
+続いて実GPTへ数量を指定しない自然なoak採集依頼と、短いbirch追記を送り、birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、上記のbirch fresh-view確認に加え、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。
 
 二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にworld状態が安定していたかを記録します。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
 

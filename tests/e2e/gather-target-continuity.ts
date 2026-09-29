@@ -30,6 +30,48 @@ export interface GatherTargetOutcome {
   readonly observedAt?: string;
 }
 
+export interface GatherTargetDiscoveryObservation {
+  readonly observedAt?: string;
+  readonly visibleBlockNames?: readonly string[];
+}
+
+/** Require a new successful Body view/move before a fresh observation reveals the target. */
+export function gatherTargetVisibleAfterBodyAction(input: {
+  readonly item: GatherMultiTargetItem;
+  readonly previousOperationIds: ReadonlySet<string>;
+  readonly acceptedAt: number;
+  readonly outcomes: readonly GatherTargetOutcome[];
+  readonly observation: GatherTargetDiscoveryObservation | undefined;
+}): boolean {
+  const observationAt = Date.parse(input.observation?.observedAt ?? "");
+  if (
+    !Number.isFinite(input.acceptedAt) ||
+    !Number.isFinite(observationAt) ||
+    observationAt <= input.acceptedAt
+  ) {
+    return false;
+  }
+  const visibleTarget = input.observation?.visibleBlockNames?.some(
+    (name) => name.toLowerCase().replace(/^minecraft:/u, "") === input.item,
+  );
+  if (!visibleTarget) return false;
+
+  return input.outcomes.some((outcome) => {
+    const outcomeAt = Date.parse(outcome.observedAt ?? "");
+    return (
+      !input.previousOperationIds.has(outcome.operationId) &&
+      (outcome.kind === "look" ||
+        outcome.kind === "look_sweep" ||
+        outcome.kind === "move_to" ||
+        outcome.kind === "move_relative") &&
+      outcome.status === "successful" &&
+      Number.isFinite(outcomeAt) &&
+      outcomeAt >= input.acceptedAt &&
+      outcomeAt < observationAt
+    );
+  });
+}
+
 function targetTitleMatches(
   title: string | undefined,
   item: GatherMultiTargetItem,

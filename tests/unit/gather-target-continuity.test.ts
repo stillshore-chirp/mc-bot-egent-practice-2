@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
+  gatherTargetVisibleAfterBodyAction,
   hasResolvedGatherTargetOwnerGoal,
   newGatherTargetProposalIds,
 } from "../e2e/gather-target-continuity.js";
@@ -84,6 +85,47 @@ describe("gather target continuity predicates", () => {
         goals: [oakGoal, { ...oakGoal, title: "oak_logを2個集める" }],
       }),
     ).toBe(undefined);
+  });
+
+  it("requires a successful new Body view/move before fresh target visibility", () => {
+    const successfulViewOutcome = {
+      operationId: "view",
+      kind: "move_to",
+      status: "successful",
+      observedAt: "2026-01-01T00:00:02Z",
+    };
+    const input = {
+      item: "birch_log" as const,
+      previousOperationIds: new Set(["before"]),
+      acceptedAt: Date.parse("2026-01-01T00:00:01Z"),
+      outcomes: [successfulViewOutcome],
+      observation: {
+        observedAt: "2026-01-01T00:00:03Z",
+        visibleBlockNames: ["oak_log", "minecraft:birch_log"],
+      },
+    };
+    expect(gatherTargetVisibleAfterBodyAction(input)).toBe(true);
+    expect(
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        outcomes: [{ ...successfulViewOutcome, operationId: "before" }],
+      }),
+    ).toBe(false);
+    expect(
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        outcomes: [{ ...successfulViewOutcome, status: "failed" }],
+      }),
+    ).toBe(false);
+    expect(
+      gatherTargetVisibleAfterBodyAction({
+        ...input,
+        observation: {
+          observedAt: "2026-01-01T00:00:02Z",
+          visibleBlockNames: ["birch_log"],
+        },
+      }),
+    ).toBe(false);
   });
 
   it("counts distinct successful dig and later pickup pairs", () => {
