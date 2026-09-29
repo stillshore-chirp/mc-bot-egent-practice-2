@@ -10925,6 +10925,7 @@ async function runGatherMultiTargetContinuityCase(
   context: CaseContext,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   let fixture: GatherMultiTargetFixture | undefined;
+  let hiddenContainerOrigin: Position | undefined;
   try {
     const quiet = await observeForPlayer(
       context,
@@ -10938,6 +10939,13 @@ async function runGatherMultiTargetContinuityCase(
     const origin = parsePosition(
       await context.rcon.command(`data get entity ${context.botName} Pos`),
     );
+    hiddenContainerOrigin = origin;
+    updateGatherMultiTargetDiagnostic(state, {
+      gatherHiddenContainerFixtureRestored: false,
+    });
+    await removeHiddenContainerFixture(context.rcon, origin, {
+      chest: fixturePoint(origin, 6, 0),
+    });
     const activeFixture = await findGatherMultiTargetHiddenBirchFixture(
       context.rcon,
       origin,
@@ -11371,13 +11379,43 @@ async function runGatherMultiTargetContinuityCase(
           : "target_counts_remaining",
     };
   } finally {
-    if (fixture !== undefined) {
-      await cleanupGatherMultiTargetFixture(
-        state,
-        context.rcon,
-        context.botName,
-        fixture,
-      );
+    try {
+      if (fixture !== undefined) {
+        await cleanupGatherMultiTargetFixture(
+          state,
+          context.rcon,
+          context.botName,
+          fixture,
+        );
+      }
+    } finally {
+      if (hiddenContainerOrigin !== undefined) {
+        await configureHiddenContainer(context.rcon, hiddenContainerOrigin);
+        const wall = fixturePoint(hiddenContainerOrigin, 2, 0);
+        let wallConfirmed = true;
+        for (let y = wall.y; y <= wall.y + 3; y += 1) {
+          for (let offsetZ = -2; offsetZ <= 2; offsetZ += 1) {
+            wallConfirmed =
+              (await isBlock(
+                context.rcon,
+                { x: wall.x, y, z: wall.z + offsetZ },
+                "stone",
+              )) && wallConfirmed;
+          }
+        }
+        const chestConfirmed = await isBlock(
+          context.rcon,
+          fixturePoint(hiddenContainerOrigin, 6, 0),
+          "chest",
+        );
+        if (!wallConfirmed || !chestConfirmed)
+          incomplete(
+            "GATHER_MULTI_TARGET_CONTAINER_FIXTURE_RESTORE_UNCONFIRMED",
+          );
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherHiddenContainerFixtureRestored: true,
+        });
+      }
     }
   }
 }

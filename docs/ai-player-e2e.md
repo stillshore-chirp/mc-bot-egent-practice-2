@@ -52,6 +52,12 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
 
+2026-09-29の初回隔離Paper runは42,558 ms、対象caseは180 msで未完了となり、case理由は`GATHER_MULTI_TARGET_FIXTURE_SITE_UNAVAILABLE`でした。server readyと共通Body smokeは確認しましたが、applicationの起動は記録されず、gather provider requestは0件でした。実際の採集・所持品変化・数量返信は未測定です。run-levelの`LLM_USAGE_PARTIAL_OR_UNKNOWN`は未完了caseのfallbackで、case理由を置き換えません。
+
+ソースのfixture構成を照合すると、共通stone床と迂回路のclearanceは足りる一方、初期worldのhidden-container壁がbirch側の視線を遮り、chestは候補の一つと重なります。自然caseは隔離world内でcontainer fixtureだけを候補探索前に一時撤去し、既存のRCON readbackを通した後、finallyで壁とchestを再設置・確認します。
+
+実採集は再実行していないため、birchの再発見、複数のdig/pickup、独立inventory確認、数量に即した返信は受け入れ未達のままです。
+
 fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度は+X、+90度は-X、180度は-Z）に合わせ、観測者から対象への方向で角度を算出します。候補位置は空気・上部空気・石の足場をRCONで確認し、oakへの初期視線とbirchへの側方視線が開いた場所を採用します。birchへの初期直線視線は、制御した遮蔽物で閉じていることをRCONで個別確認します。
 
 fixtureはoakが初期視界に入り、birchの直線視界をRCONで遮る安全な回り込み可能領域を選びます。開始時の新しいBody観測もoakを含みbirchを含まないことを確認します。birch追記の受け入れ後に成功したBodyの`look`、`look_sweep`、`move_to`または`move_relative` outcomeがあり、その後のfresh observationがbirchを含んだ場合にだけ発見を記録します。harnessは採集中にBodyを移動しません。
