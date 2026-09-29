@@ -3,6 +3,7 @@ export const TARGETABLE_CASES = [
   "game_action_discretion",
   "food_intent_continuity",
   "gather_multi_target_continuity",
+  "death_recovery",
   "underwater_item_recovery",
   "damage_response",
   "no_food_replan",
