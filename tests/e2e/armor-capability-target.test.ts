@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
+  countCarriedHelmetBodyItems,
   createOwnerReturnApplicationWithBodyCapture,
+  parseArmorCapabilityEquipmentHeadReply,
   parseArmorCapabilityInventoryReply,
 } from "./ai-player-live.js";
 import { createApplication } from "../../src/app/application.js";
@@ -26,28 +28,61 @@ describe("armor capability targeted E2E case", () => {
 
   it("separates carried item count from the server head equipment slot", () => {
     expect(
+      countCarriedHelmetBodyItems(
+        [
+          { slot: 0, name: "leather_helmet", count: 1 },
+          { slot: 5, name: "leather_helmet", count: 1 },
+        ],
+        [{ slot: 5 }, null],
+      ),
+    ).toBe(1);
+    expect(
       parseArmorCapabilityInventoryReply(
         `Bot has the following entity data: [{Slot:0b,id:"minecraft:leather_helmet",count:1,components:{"minecraft:custom_data":{value:1}}}]`,
       ),
-    ).toEqual({ carriedHelmetCount: 1, headSlot: "empty" });
+    ).toBe(1);
     expect(
       parseArmorCapabilityInventoryReply(
         `Bot has the following entity data: [{Slot:103b,id:"minecraft:leather_helmet",count:1,components:{"minecraft:custom_data":{value:1}}}]`,
       ),
-    ).toEqual({ carriedHelmetCount: 0, headSlot: "expected_item" });
+    ).toBe(0);
     expect(
       parseArmorCapabilityInventoryReply(
         "Bot has the following entity data: []",
       ),
-    ).toEqual({ carriedHelmetCount: 0, headSlot: "empty" });
-    expect(parseArmorCapabilityInventoryReply("read failed")).toEqual({
-      carriedHelmetCount: null,
-      headSlot: "unknown",
-    });
+    ).toBe(0);
+    expect(parseArmorCapabilityInventoryReply("read failed")).toBeNull();
+    expect(
+      parseArmorCapabilityEquipmentHeadReply(
+        'ArmorBot has the following entity data: "minecraft:leather_helmet"',
+        "ArmorBot",
+      ),
+    ).toBe("expected_item");
+    expect(
+      parseArmorCapabilityEquipmentHeadReply(
+        'ArmorBot has the following entity data: "minecraft:stone"',
+        "ArmorBot",
+      ),
+    ).toBe("other_item");
+    expect(
+      parseArmorCapabilityEquipmentHeadReply(
+        "Found no elements matching equipment.head.id",
+        "ArmorBot",
+      ),
+    ).toBe("empty");
+    for (const reply of [
+      "read failed",
+      'OtherBot has the following entity data: "minecraft:leather_helmet"',
+      'ArmorBot has the following entity data: "minecraft:leather_helmet',
+      'ArmorBot has the following entity data: "minecraft:leather_helmet" "minecraft:stone"',
+    ]) {
+      expect(parseArmorCapabilityEquipmentHeadReply(reply, "ArmorBot")).toBe(
+        "unknown",
+      );
+    }
   });
 
   it("keeps malformed or truncated replies unknown", () => {
-    const unknown = { carriedHelmetCount: null, headSlot: "unknown" };
     const replies = [
       "Found 0 elements: []",
       `Bot has the following entity data: [{Slot:0b,id:"minecraft:stone",count:1}] {Slot:103b,id:"minecraft:leather_helmet"`,
@@ -57,7 +92,7 @@ describe("armor capability targeted E2E case", () => {
       `Bot has the following entity data: [{Slot:0b,id:"minecraft:leather_helmet",count:"1"}]`,
     ];
     for (const reply of replies)
-      expect(parseArmorCapabilityInventoryReply(reply)).toEqual(unknown);
+      expect(parseArmorCapabilityInventoryReply(reply)).toBeNull();
   });
 
   it("reads only top-level stack id, slot, and count fields", () => {
@@ -65,12 +100,12 @@ describe("armor capability targeted E2E case", () => {
       parseArmorCapabilityInventoryReply(
         `Bot has the following entity data: [{Slot:0b,id:"minecraft:stone",count:1,components:{id:"minecraft:leather_helmet",count:64}}]`,
       ),
-    ).toEqual({ carriedHelmetCount: 0, headSlot: "empty" });
+    ).toBe(0);
     expect(
       parseArmorCapabilityInventoryReply(
         `Bot has the following entity data: [{Slot:103b,id:"minecraft:stone",count:1}]`,
       ),
-    ).toEqual({ carriedHelmetCount: 0, headSlot: "other_item" });
+    ).toBe(0);
   });
 
   it("captures the application Body only for the explicit armor target", async () => {

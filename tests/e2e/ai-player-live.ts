@@ -4211,9 +4211,7 @@ async function runArmorCapabilityCase(
     body.observe(),
     rconArmorCapabilityInventory(context.rcon, context.botName),
   ]);
-  const bodyCarriedCountBefore = bodyWithArmor.self.inventory
-    .filter((item) => item.name === "leather_helmet")
-    .reduce((total, item) => total + item.count, 0);
+  const bodyCarriedCountBefore = bodyCarriedHelmetCount(bodyWithArmor);
   const bodyArmorObservedAt = Date.parse(bodyWithArmor.observedAt);
   if (
     !Number.isFinite(bodyArmorObservedAt) ||
@@ -4373,15 +4371,13 @@ async function runArmorCapabilityCase(
       context.rcon,
       context.botName,
     );
-    let bodyCarriedCountAfter = bodyAfter.self.inventory
-      .filter((item) => item.name === "leather_helmet")
-      .reduce((total, item) => total + item.count, 0);
-    const bodyEquipped = (): boolean =>
+    let bodyCarriedCountAfter = bodyCarriedHelmetCount(bodyAfter);
+    const bodyHeadEquipped = (): boolean =>
       bodyAfter.self.equipment.head?.name === "leather_helmet" &&
-      bodyCarriedCountAfter === 0 &&
       Date.parse(bodyAfter.observedAt) >= requestSentAt;
     while (
-      (!bodyEquipped() ||
+      (!bodyHeadEquipped() ||
+        bodyCarriedCountAfter !== 0 ||
         serverAfter.headSlot !== "expected_item" ||
         serverAfter.carriedHelmetCount !== 0) &&
       Date.now() < readbackDeadline
@@ -4392,19 +4388,18 @@ async function runArmorCapabilityCase(
         context.rcon,
         context.botName,
       );
-      bodyCarriedCountAfter = bodyAfter.self.inventory
-        .filter((item) => item.name === "leather_helmet")
-        .reduce((total, item) => total + item.count, 0);
+      bodyCarriedCountAfter = bodyCarriedHelmetCount(bodyAfter);
     }
     const serverEquipped = serverAfter.headSlot === "expected_item";
     if (
-      !bodyEquipped() ||
+      !bodyHeadEquipped() ||
+      bodyCarriedCountAfter !== 0 ||
       !serverEquipped ||
       serverAfter.carriedHelmetCount !== 0
     ) {
       updateArmorCapabilityDiagnostic(state, {
         armorCapabilitySelectedRoute: selectedRoute,
-        armorCapabilityBodyEquipped: bodyEquipped(),
+        armorCapabilityBodyHeadEquipped: bodyHeadEquipped(),
         armorCapabilityServerEquipped: serverEquipped,
         armorCapabilityBodyCarriedCountAfter: bodyCarriedCountAfter,
         armorCapabilityServerCarriedCountAfter:
@@ -4415,7 +4410,7 @@ async function runArmorCapabilityCase(
     }
     updateArmorCapabilityDiagnostic(state, {
       armorCapabilitySelectedRoute: selectedRoute,
-      armorCapabilityBodyEquipped: true,
+      armorCapabilityBodyHeadEquipped: true,
       armorCapabilityServerEquipped: true,
       armorCapabilityBodyCarriedCountAfter: 0,
       armorCapabilityServerCarriedCountAfter: 0,
@@ -14233,14 +14228,38 @@ export interface ArmorCapabilityInventoryReadback {
   readonly headSlot: ArmorCapabilityServerSlotStatus;
 }
 
+function bodyCarriedHelmetCount(observation: PlayerBodyObservation): number {
+  return countCarriedHelmetBodyItems(
+    observation.self.inventory,
+    Object.values(observation.self.equipment),
+  );
+}
+
+export function countCarriedHelmetBodyItems(
+  inventory: readonly {
+    readonly slot: number;
+    readonly name: string;
+    readonly count: number;
+  }[],
+  equipment: readonly ({ readonly slot: number } | null)[],
+): number {
+  const equipmentSlots = new Set(
+    equipment.flatMap((item) => (item === null ? [] : [item.slot])),
+  );
+  return inventory
+    .filter(
+      (item) =>
+        item.name === "leather_helmet" && !equipmentSlots.has(item.slot),
+    )
+    .reduce((total, item) => total + item.count, 0);
+}
+
 export function parseArmorCapabilityInventoryReply(
   reply: string,
-): ArmorCapabilityInventoryReadback {
+): number | null {
   const compounds = parseInventoryReplyRootCompounds(reply);
-  if (compounds === undefined)
-    return { carriedHelmetCount: null, headSlot: "unknown" };
+  if (compounds === undefined) return null;
   let carriedHelmetCount = 0;
-  let headSlot: ArmorCapabilityServerSlotStatus = "empty";
   const seenSlots = new Set<number>();
   for (const compound of compounds) {
     const idFields = compound.fields.filter(({ key }) => key === "id");
@@ -14262,12 +14281,11 @@ export function parseArmorCapabilityInventoryReply(
       countValue?.kind !== "scalar" ||
       countValue.quoted
     ) {
-      return { carriedHelmetCount: null, headSlot: "unknown" };
+      return null;
     }
     const slotMatch = /^(-?\d+)[bB]?$/u.exec(slotValue.value);
     const countMatch = /^(\d+)(?:[bBsSlL])?$/u.exec(countValue.value);
-    if (slotMatch === null || countMatch === null)
-      return { carriedHelmetCount: null, headSlot: "unknown" };
+    if (slotMatch === null || countMatch === null) return null;
     const slot = Number(slotMatch[1]);
     const count = Number(countMatch[1]);
     if (
@@ -14278,30 +14296,54 @@ export function parseArmorCapabilityInventoryReply(
       count < 1 ||
       seenSlots.has(slot)
     ) {
-      return { carriedHelmetCount: null, headSlot: "unknown" };
+      return null;
     }
     seenSlots.add(slot);
-    if (id.value === "minecraft:leather_helmet") {
-      if (slot === 103) headSlot = "expected_item";
-      else if (slot >= 0 && slot <= 35) carriedHelmetCount += count;
-      if (!Number.isSafeInteger(carriedHelmetCount))
-        return { carriedHelmetCount: null, headSlot: "unknown" };
-    } else if (slot === 103) {
-      headSlot = "other_item";
+    if (id.value === "minecraft:leather_helmet" && slot >= 0 && slot <= 35) {
+      carriedHelmetCount += count;
+      if (!Number.isSafeInteger(carriedHelmetCount)) return null;
     }
   }
-  return {
-    carriedHelmetCount,
-    headSlot,
-  };
+  return carriedHelmetCount;
+}
+
+export function parseArmorCapabilityEquipmentHeadReply(
+  reply: string,
+  botName: string,
+): ArmorCapabilityServerSlotStatus {
+  const text = reply.trim();
+  if (text === "Found no elements matching equipment.head.id") return "empty";
+  const prefix = `${botName} has the following entity data: `;
+  if (!text.startsWith(prefix)) return "unknown";
+  const match = /^"([a-z0-9_.-]+:[a-z0-9_./-]+)"$/u.exec(
+    text.slice(prefix.length),
+  );
+  if (match === null) return "unknown";
+  return match[1] === "minecraft:leather_helmet"
+    ? "expected_item"
+    : "other_item";
 }
 
 async function rconArmorCapabilityInventory(
   rcon: LocalRcon,
   botName: string,
 ): Promise<ArmorCapabilityInventoryReadback> {
-  const reply = await rcon.command(`data get entity ${botName} Inventory`);
-  return parseArmorCapabilityInventoryReply(reply);
+  const [inventoryReply, headReply] = await Promise.all([
+    rcon.command(`data get entity ${botName} Inventory`).catch(() => undefined),
+    rcon
+      .command(`data get entity ${botName} equipment.head.id`)
+      .catch(() => undefined),
+  ]);
+  return {
+    carriedHelmetCount:
+      inventoryReply === undefined
+        ? null
+        : parseArmorCapabilityInventoryReply(inventoryReply),
+    headSlot:
+      headReply === undefined
+        ? "unknown"
+        : parseArmorCapabilityEquipmentHeadReply(headReply, botName),
+  };
 }
 
 async function rconInventoryIsEmpty(
