@@ -10708,6 +10708,7 @@ interface UnderwaterItemRecoveryFixture {
   readonly waterCells: readonly BlockPosition[];
   readonly supportCells: readonly BlockPosition[];
   readonly boundaryCells: readonly BlockPosition[];
+  readonly boundaryHeadroomCells: readonly BlockPosition[];
   readonly itemCenter: Position;
 }
 
@@ -10757,6 +10758,14 @@ function findUnderwaterItemRecoveryFixture(
       { x: first.x, y: poolY, z: first.z - 1 },
       { x: last.x, y: poolY, z: last.z + 1 },
     ],
+    boundaryHeadroomCells: [1, 2].flatMap((height) => [
+      ...waterCells.flatMap((cell) => [
+        { x: cell.x - 1, y: poolY + height, z: cell.z },
+        { x: cell.x + 1, y: poolY + height, z: cell.z },
+      ]),
+      { x: first.x, y: poolY + height, z: first.z - 1 },
+      { x: last.x, y: poolY + height, z: last.z + 1 },
+    ]),
     itemCenter: { x: last.x + 0.5, y: last.y + 0.25, z: last.z + 0.5 },
   };
 }
@@ -10786,6 +10795,18 @@ async function runUnderwaterItemRecoveryCase(
     inventoryDelta: null,
     matchingDropCountAfter: null,
     returnedToDryLand: false,
+    movementSuccessfulCount: 0,
+    movementFailedCount: 0,
+    movementInterruptedCount: 0,
+    movementUnverifiedCount: 0,
+    movementRecoveryRequiredCount: 0,
+    movementSignalObservedCount: 0,
+    movementSignalAbortedCount: 0,
+    movementPathNoPathCount: 0,
+    movementPathTimeoutCount: 0,
+    movementPathSuccessCount: 0,
+    movementPathPartialCount: 0,
+    dryReturnFollowupSent: false,
     fixtureCleanupConfirmed: false,
   });
   const body = activeApplicationPlayerBody;
@@ -10806,6 +10827,7 @@ async function runUnderwaterItemRecoveryCase(
     ...fixture.waterCells,
     ...fixture.supportCells,
     ...fixture.boundaryCells,
+    ...fixture.boundaryHeadroomCells,
     ...fixture.waterCells.map((cell) => ({ ...cell, y: cell.y + 1 })),
   ];
   const baseline = await readUnderwaterRecoveryInventory(
@@ -10827,6 +10849,8 @@ async function runUnderwaterItemRecoveryCase(
   let primaryError: unknown;
   let primaryFailed = false;
   let restoreCollectionCapture: (() => void) | undefined;
+  let restoreMovementEventCapture: (() => void) | undefined;
+  let ownerDryReturnFollowupSent = false;
   try {
     fixtureTouched = true;
     for (const cell of [...fixture.supportCells, ...fixture.boundaryCells]) {
@@ -10835,6 +10859,11 @@ async function runUnderwaterItemRecoveryCase(
       );
       if (!(await isBlock(context.rcon, cell, "stone")))
         incomplete("UNDERWATER_RECOVERY_FIXTURE_SUPPORT_NOT_CONFIRMED");
+    }
+    for (const cell of fixture.boundaryHeadroomCells) {
+      await context.rcon.command(`setblock ${cell.x} ${cell.y} ${cell.z} air`);
+      if (!(await isBlock(context.rcon, cell, "air")))
+        incomplete("UNDERWATER_RECOVERY_EXIT_HEADROOM_NOT_CONFIRMED");
     }
     for (const cell of fixture.waterCells) {
       await context.rcon.command(
@@ -10892,11 +10921,11 @@ async function runUnderwaterItemRecoveryCase(
     updateUnderwaterItemRecoveryDiagnostic(state, {
       freshBodyItemVisible: true,
     });
+    const beforeRequest = playerOf(await collect(context.runtime.app));
     const priorOutcomes = new Set(
-      playerOf(await collect(context.runtime.app)).recentOutcomes.map(
-        ({ operationId }) => operationId,
-      ),
+      beforeRequest.recentOutcomes.map(({ operationId }) => operationId),
     );
+    const priorOwnerGoalIds = new Set(beforeRequest.goals.map(({ id }) => id));
     const targetItemEntityId = visibleItemEntityId;
     const originalExecuteDescriptor = Object.getOwnPropertyDescriptor(
       body,
@@ -10904,15 +10933,49 @@ async function runUnderwaterItemRecoveryCase(
     );
     const originalExecute = body.execute.bind(body);
     let matchingPickupObserved = false;
+    const incrementMovementDiagnostic = (key: string): void => {
+      const existing = state.underwaterItemRecoveryDiagnostic?.[key];
+      updateUnderwaterItemRecoveryDiagnostic(state, {
+        [key]: Math.min(99, typeof existing === "number" ? existing + 1 : 1),
+      });
+    };
+    const unsubscribeMovementEvents = body.onEvent((event) => {
+      if (event.type !== "operation_path_updated") return;
+      const countKey = {
+        noPath: "movementPathNoPathCount",
+        timeout: "movementPathTimeoutCount",
+        success: "movementPathSuccessCount",
+        partial: "movementPathPartialCount",
+      }[event.status];
+      incrementMovementDiagnostic(countKey);
+    });
+    restoreMovementEventCapture = unsubscribeMovementEvents;
     const instrumentedExecute: typeof body.execute = async (
       operation,
       signal,
     ) => {
-      const operationResult = await originalExecute.call(
-        body,
-        operation,
-        signal,
-      );
+      const isMovement =
+        operation.kind === "move_to" || operation.kind === "move_relative";
+      let operationResult: Awaited<ReturnType<typeof body.execute>>;
+      try {
+        operationResult = await originalExecute.call(body, operation, signal);
+      } finally {
+        if (isMovement && signal !== undefined)
+          incrementMovementDiagnostic("movementSignalObservedCount");
+        if (isMovement && signal?.aborted === true)
+          incrementMovementDiagnostic("movementSignalAbortedCount");
+      }
+      if (isMovement) {
+        const statusKey = {
+          successful: "movementSuccessfulCount",
+          failed: "movementFailedCount",
+          interrupted: "movementInterruptedCount",
+          unverified: "movementUnverifiedCount",
+        }[operationResult.status];
+        incrementMovementDiagnostic(statusKey);
+        if (operationResult.recoveryRequired)
+          incrementMovementDiagnostic("movementRecoveryRequiredCount");
+      }
       const beforeOakLogs = operationResult.before?.self.inventory
         .filter((item) => item.name === "oak_log")
         .reduce((count, item) => count + item.count, 0);
@@ -11004,6 +11067,30 @@ async function runUnderwaterItemRecoveryCase(
           Date.parse(outcome.observedAt ?? "") >= requestAt &&
           matchingPickupObserved,
       );
+      const completedNewOwnerGoal = player.goals.some(
+        (goal) =>
+          !priorOwnerGoalIds.has(goal.id) &&
+          goal.source === "owner" &&
+          goal.status === "completed",
+      );
+      if (
+        !ownerDryReturnFollowupSent &&
+        collectSucceeded &&
+        completedNewOwnerGoal &&
+        fresh &&
+        gameFresh &&
+        observation.self.inWater === true &&
+        evidence.game?.inWater === true
+      ) {
+        sendChat(
+          context.owner,
+          "原木の拾得は確認できました。まだ水中なので、原木を持ったまま乾いた岸へ移動してください。",
+        );
+        ownerDryReturnFollowupSent = true;
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          dryReturnFollowupSent: true,
+        });
+      }
       if (Date.now() - lastOracleAt >= 1_500) {
         lastOracleAt = Date.now();
         latestInventory = await readUnderwaterRecoveryInventory(
@@ -11039,9 +11126,13 @@ async function runUnderwaterItemRecoveryCase(
           y: Math.floor(serverPosition.y),
           z: Math.floor(serverPosition.z),
         };
+        const head = { ...feet, y: feet.y + 1 };
+        const support = { ...feet, y: feet.y - 1 };
         if (
           (await isBlock(context.rcon, feet, "air")) &&
-          (await isBlock(context.rcon, { ...feet, y: feet.y - 1 }, "stone"))
+          (await isBlock(context.rcon, head, "air")) &&
+          !(await isBlock(context.rcon, support, "air")) &&
+          !(await isBlock(context.rcon, support, "water"))
         ) {
           updateUnderwaterItemRecoveryDiagnostic(state, {
             returnedToDryLand: true,
@@ -11065,6 +11156,7 @@ async function runUnderwaterItemRecoveryCase(
     primaryFailed = true;
     primaryError = error;
   } finally {
+    restoreMovementEventCapture?.();
     restoreCollectionCapture?.();
   }
 
