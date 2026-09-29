@@ -51,12 +51,13 @@ import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
   GATHER_MULTI_TARGET_ITEMS,
   gatherMultiTargetBodySmokeSafeFailureEvidence,
-  gatherMultiTargetInventorySafeEvidence,
-  gatherMultiTargetOracleProbeBaselineFailureFields,
-  gatherMultiTargetOracleProbeResultFailureFields,
-  readGatherMultiTargetInventory,
+  gatherMultiTargetItemCountSafeEvidence,
+  gatherMultiTargetOracleProbeBaselineCountFailureFields,
+  gatherMultiTargetOracleProbeResultCountFailureFields,
+  readGatherMultiTargetItemCounts,
   shouldRunGatherMultiTargetOracleProbe,
   type GatherMultiTargetItem,
+  type GatherMultiTargetItemCountReadResult,
 } from "./gather-multi-target-acceptance.js";
 import {
   classifyGatherDropReadbackFailure,
@@ -2393,27 +2394,32 @@ function updateGatherMultiTargetDiagnostic(
   };
 }
 
-function updateGatherMultiTargetInventoryReadDiagnostic(
+function updateGatherMultiTargetItemCountReadDiagnostic(
   state: RunState,
-  result: Awaited<ReturnType<typeof readGatherMultiTargetInventory>>,
-  baseline: Readonly<Record<GatherMultiTargetItem, number>>,
+  result: GatherMultiTargetItemCountReadResult,
+  phase: "Baseline" | "Latest",
+  baseline?: Readonly<Record<GatherMultiTargetItem, number>>,
 ): void {
-  const parsed = result.reason === "parsed" ? result : undefined;
-  const oakDelta =
-    parsed?.counts.oak_log === undefined
-      ? null
-      : parsed.counts.oak_log - baseline.oak_log;
-  const birchDelta =
-    parsed?.counts.birch_log === undefined
-      ? null
-      : parsed.counts.birch_log - baseline.birch_log;
+  const oakCount = result.counts.oak_log;
+  const birchCount = result.counts.birch_log;
+  const prefix = phase === "Baseline" ? "gatherBaseline" : "gatherLatest";
   updateGatherMultiTargetDiagnostic(state, {
-    gatherLatestInventoryReadReason: result.reason,
-    gatherLatestInventoryParseStage: result.parseStage,
-    gatherLatestOakLogInventoryCount: parsed?.counts.oak_log ?? null,
-    gatherLatestBirchLogInventoryCount: parsed?.counts.birch_log ?? null,
-    gatherOakLogInventoryDelta: oakDelta,
-    gatherBirchLogInventoryDelta: birchDelta,
+    [`${prefix}InventoryReadReason`]: result.reason,
+    [`${prefix}InventoryParseStage`]: result.parseStage,
+    [`${prefix}OakLogInventoryCount`]: oakCount,
+    [`${prefix}BirchLogInventoryCount`]: birchCount,
+    ...(phase === "Latest"
+      ? {
+          gatherOakLogInventoryDelta:
+            oakCount === null || baseline === undefined
+              ? null
+              : oakCount - baseline.oak_log,
+          gatherBirchLogInventoryDelta:
+            birchCount === null || baseline === undefined
+              ? null
+              : birchCount - baseline.birch_log,
+        }
+      : {}),
   });
 }
 
@@ -9206,7 +9212,12 @@ async function runOperationSmoke(
             process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY,
           )
         ) {
-          await runGatherStackOracleProbe(state, rcon, state.botName, body);
+          await runGatherTargetCountOracleProbe(
+            state,
+            rcon,
+            state.botName,
+            body,
+          );
         }
         const hiddenItemOmitted = !JSON.stringify(visibleBefore)
           .toLowerCase()
@@ -10596,9 +10607,11 @@ async function readGatherMultiTargetInventoryCounts(
   rcon: LocalRcon,
   botName: string,
 ): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
-  const result = await readGatherMultiTargetInventory(() =>
-    rcon.command(`data get entity ${botName} Inventory`),
+  const result = await readGatherMultiTargetItemCounts(
+    (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+    botName,
   );
+  updateGatherMultiTargetItemCountReadDiagnostic(state, result, "Baseline");
   if (result.reason !== "parsed") {
     updateGatherMultiTargetDiagnostic(state, {
       gatherInventoryReadAvailable: false,
@@ -10650,7 +10663,7 @@ async function rconGatherLogDropPositionNear(
   incomplete("GATHER_MULTI_TARGET_DROP_ORACLE_UNAVAILABLE");
 }
 
-async function runGatherStackOracleProbe(
+async function runGatherTargetCountOracleProbe(
   state: RunState,
   rcon: LocalRcon,
   botName: string,
@@ -10666,8 +10679,8 @@ async function runGatherStackOracleProbe(
     gatherOracleProbeProviderRequestsRecorded: 0,
     gatherOracleProbeBlockedProviderRequests: "not_applicable_prestart",
     gatherOracleProbeCleanupConfirmed: false,
-    ...gatherMultiTargetInventorySafeEvidence("Baseline", undefined),
-    ...gatherMultiTargetInventorySafeEvidence("Final", undefined),
+    ...gatherMultiTargetItemCountSafeEvidence("Baseline", undefined),
+    ...gatherMultiTargetItemCountSafeEvidence("Final", undefined),
     gatherOracleProbeBaselineDropCount: null,
     gatherOracleProbeDropCountBeforeCollection: null,
     gatherOracleProbeDropCountAfterCollection: null,
@@ -10700,20 +10713,21 @@ async function runGatherStackOracleProbe(
     await rcon.command(
       `item replace entity ${botName} hotbar.0 with minecraft:oak_log 64`,
     );
-    const baseline = await readGatherMultiTargetInventory(() =>
-      rcon.command(`data get entity ${botName} Inventory`),
+    const baseline = await readGatherMultiTargetItemCounts(
+      (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+      botName,
     );
     updateGatherMultiTargetDiagnostic(state, {
-      ...gatherMultiTargetInventorySafeEvidence("Baseline", baseline),
+      ...gatherMultiTargetItemCountSafeEvidence("Baseline", baseline),
     });
     const baselineFailureFields =
-      gatherMultiTargetOracleProbeBaselineFailureFields(baseline);
+      gatherMultiTargetOracleProbeBaselineCountFailureFields(baseline);
     if (baselineFailureFields.length > 0) {
       updateGatherMultiTargetDiagnostic(state, {
         gatherOracleProbeBaselineMismatchFields:
           baselineFailureFields.join(","),
       });
-      incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_STACK_BASELINE_UNCONFIRMED");
+      incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_COUNT_BASELINE_UNCONFIRMED");
     }
     const dropBaseline = await rconGatherLogDropCountNear(
       rcon,
@@ -10854,11 +10868,12 @@ async function runGatherStackOracleProbe(
     });
     if (!collectionConfirmed)
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_COLLECTION_UNCONFIRMED");
-    const inventoryAfter = await readGatherMultiTargetInventory(() =>
-      rcon.command(`data get entity ${botName} Inventory`),
+    const inventoryAfter = await readGatherMultiTargetItemCounts(
+      (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+      botName,
     );
     updateGatherMultiTargetDiagnostic(state, {
-      ...gatherMultiTargetInventorySafeEvidence("Final", inventoryAfter),
+      ...gatherMultiTargetItemCountSafeEvidence("Final", inventoryAfter),
       gatherOracleProbeDropCountAfterCollection: null,
     });
     const dropCountAfter = await rconGatherLogDropCountNear(
@@ -10869,10 +10884,11 @@ async function runGatherStackOracleProbe(
     updateGatherMultiTargetDiagnostic(state, {
       gatherOracleProbeDropCountAfterCollection: dropCountAfter,
     });
-    const resultFailureFields = gatherMultiTargetOracleProbeResultFailureFields(
-      inventoryAfter,
-      dropCountAfter,
-    );
+    const resultFailureFields =
+      gatherMultiTargetOracleProbeResultCountFailureFields(
+        inventoryAfter,
+        dropCountAfter,
+      );
     if (resultFailureFields.length > 0) {
       updateGatherMultiTargetDiagnostic(state, {
         gatherOracleProbeResultMismatchFields: resultFailureFields.join(","),
@@ -11010,8 +11026,9 @@ async function cleanupGatherMultiTargetFixture(
   for (const item of GATHER_MULTI_TARGET_ITEMS) {
     await rcon.command(`clear ${botName} minecraft:${item}`);
   }
-  const inventory = await readGatherMultiTargetInventory(() =>
-    rcon.command(`data get entity ${botName} Inventory`),
+  const inventory = await readGatherMultiTargetItemCounts(
+    (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+    botName,
   );
   const fixtureInventoryEmpty =
     inventory.reason === "parsed" &&
@@ -11304,8 +11321,12 @@ async function runGatherMultiTargetContinuityCase(
         if (Date.now() - lastSampleAt < 1_200) return false;
         lastSampleAt = Date.now();
 
-        const inventory = await readGatherMultiTargetInventory(() =>
-          context.rcon.command(`data get entity ${context.botName} Inventory`),
+        const inventory = await readGatherMultiTargetItemCounts(
+          (item) =>
+            context.rcon.command(
+              `clear ${context.botName} minecraft:${item} 0`,
+            ),
+          context.botName,
         );
         const inventoryParsed = inventory.reason === "parsed";
         const oakDelta = inventoryParsed
@@ -11314,9 +11335,10 @@ async function runGatherMultiTargetContinuityCase(
         const birchDelta = inventoryParsed
           ? inventory.counts.birch_log - baseline.birch_log
           : undefined;
-        updateGatherMultiTargetInventoryReadDiagnostic(
+        updateGatherMultiTargetItemCountReadDiagnostic(
           state,
           inventory,
+          "Latest",
           baseline,
         );
         if (!inventoryParsed) return false;
@@ -11510,10 +11532,17 @@ async function sampleGatherProgressReply(
   );
   if (priorReplySettled === undefined)
     incomplete("GATHER_MULTI_TARGET_PRIOR_REPLY_NOT_SETTLED");
-  const before = await readGatherMultiTargetInventory(() =>
-    context.rcon.command(`data get entity ${context.botName} Inventory`),
+  const before = await readGatherMultiTargetItemCounts(
+    (item) =>
+      context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+    context.botName,
   );
-  updateGatherMultiTargetInventoryReadDiagnostic(state, before, baseline);
+  updateGatherMultiTargetItemCountReadDiagnostic(
+    state,
+    before,
+    "Latest",
+    baseline,
+  );
   if (before.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
   const readBlockRemoved = async (
@@ -11564,10 +11593,17 @@ async function sampleGatherProgressReply(
     incomplete("GATHER_MULTI_TARGET_PROGRESS_REPLY_NOT_SAMPLED");
   }
   const hash = await retainGatherProgressReply(state, reply.text);
-  const after = await readGatherMultiTargetInventory(() =>
-    context.rcon.command(`data get entity ${context.botName} Inventory`),
+  const after = await readGatherMultiTargetItemCounts(
+    (item) =>
+      context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+    context.botName,
   );
-  updateGatherMultiTargetInventoryReadDiagnostic(state, after, baseline);
+  updateGatherMultiTargetItemCountReadDiagnostic(
+    state,
+    after,
+    "Latest",
+    baseline,
+  );
   if (after.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
   const oakBlockRemovedAfter = await readBlockRemoved(
