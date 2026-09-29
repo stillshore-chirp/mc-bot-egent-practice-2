@@ -10458,17 +10458,6 @@ async function runGatherStackOracleProbe(
 ): Promise<void> {
   if (appForCleanup !== undefined)
     incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_NOT_PRESTART");
-  const origin = parsePosition(
-    await rcon.command(`data get entity ${botName} Pos`),
-  );
-  const fixture = await findGatherMultiTargetFixture(rcon, origin);
-  const target = fixture.oakLog;
-  const targetCenter = {
-    x: target.x + 0.5,
-    y: target.y + 0.5,
-    z: target.z + 0.5,
-  };
-  let cleanupConfirmed: boolean;
   updateGatherMultiTargetDiagnostic(state, {
     gatherOracleProbeStarted: true,
     gatherOracleProbeGptFreeConfirmed: false,
@@ -10483,6 +10472,17 @@ async function runGatherStackOracleProbe(
     gatherOracleProbeDropCountBeforeCollection: null,
     gatherOracleProbeDropCountAfterCollection: null,
   });
+  const origin = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const fixture = await findGatherMultiTargetFixture(rcon, origin);
+  const target = fixture.oakLog;
+  const targetCenter = {
+    x: target.x + 0.5,
+    y: target.y + 0.5,
+    z: target.z + 0.5,
+  };
+  let cleanupConfirmed: boolean;
   try {
     await rcon.command(`clear ${botName}`);
     if (
