@@ -37,10 +37,7 @@ const ownerProposalSettlementTimeoutMs = 30_000;
 
 interface ActiveBodyRun {
   readonly operationId: string;
-  readonly actionRevision: number;
-  readonly stopGeneration: number;
   readonly operation: PlayerOperation;
-  readonly expectedOutcome: string;
   readonly skillId?: string;
   readonly skillVersion?: number;
   readonly controller: AbortController;
@@ -319,7 +316,6 @@ export class PlayerRuntime {
   public handleCommittedDecision(
     snapshot: PlayerRuntimeSnapshot,
     decision: PlayerThoughtDecision,
-    retainedActiveOperation = false,
   ): void {
     if (this.#activeThought !== undefined) this.#activeThoughtCommitted = true;
     this.#retryDelayMs = 5_000;
@@ -329,33 +325,6 @@ export class PlayerRuntime {
     this.#handleOwnerProposalResolution(snapshot, decision);
     if (decision.kind === "complete") this.#dispatchNewPurposeCompletionWake();
     if (decision.kind === "act") {
-      if (retainedActiveOperation) {
-        const running = this.#activeBody;
-        if (
-          running !== undefined &&
-          !running.controller.signal.aborted &&
-          !snapshot.stopped &&
-          snapshot.activeOperation?.operationId === running.operationId &&
-          snapshot.activeOperation.actionRevision === running.actionRevision &&
-          snapshot.actionRevision === running.actionRevision &&
-          snapshot.stopGeneration === running.stopGeneration &&
-          running.operationId === decision.operationId &&
-          running.expectedOutcome === decision.expectedOutcome &&
-          running.skillId === decision.skillId &&
-          running.skillVersion === decision.skillVersion &&
-          sameMoveToOperation(running.operation, decision.operation)
-        )
-          return;
-        this.options.logger.warn(
-          {
-            category: "player_runtime",
-            code: "RETAINED_MOVE_TO_NOT_ACTIVE",
-          },
-          "retained move_to could not be matched to its active body run",
-        );
-        this.#abortActiveBody("action_revision_changed");
-        return;
-      }
       this.#abortActiveBody("action_revision_changed");
       this.#replacementTail = this.#replacementTail
         .catch(() => undefined)
@@ -738,10 +707,7 @@ export class PlayerRuntime {
     const controller = new AbortController();
     const run: ActiveBodyRun = {
       operationId: decision.operationId,
-      actionRevision: snapshot.actionRevision,
-      stopGeneration: snapshot.stopGeneration,
       operation: decision.operation,
-      expectedOutcome: decision.expectedOutcome,
       ...(decision.skillId === undefined ? {} : { skillId: decision.skillId }),
       ...(decision.skillVersion === undefined
         ? {}
@@ -1198,20 +1164,6 @@ export class PlayerRuntime {
       "player runtime operation failed",
     );
   }
-}
-
-function sameMoveToOperation(
-  left: PlayerOperation,
-  right: PlayerOperation,
-): boolean {
-  return (
-    left.kind === "move_to" &&
-    right.kind === "move_to" &&
-    left.position.x === right.position.x &&
-    left.position.y === right.position.y &&
-    left.position.z === right.position.z &&
-    left.range === right.range
-  );
 }
 
 function withoutPrivateObservationDetails(
