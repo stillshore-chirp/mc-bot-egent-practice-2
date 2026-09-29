@@ -11603,6 +11603,7 @@ async function runDeathRecoveryTargetCase(
     const deathAt = databaseAfterDeath.latestDeath.observedAt;
     if (typeof deathAt !== "string" || !Number.isFinite(Date.parse(deathAt)))
       incomplete("DEATH_RECOVERY_DEATH_TIMESTAMP_UNKNOWN");
+    const deathAtMs = Date.parse(deathAt);
     state.deathRecoveryTargetDeathAt = deathAt;
     deathEventPersisted = true;
 
@@ -11612,11 +11613,13 @@ async function runDeathRecoveryTargetCase(
     );
     let deathSnapshot: DeathRecoveryDatabaseSnapshot | undefined;
     let respawnHealth: number | undefined;
+    let respawnBodyObservation: PlayerBodyObservation | undefined;
     while (Date.now() < respawnDeadline) {
       if (state.deathRecoveryTargetActionLimitReached)
         incomplete("DEATH_RECOVERY_ACTION_LIMIT_REACHED");
       try {
         deathSnapshot = readDeathRecoveryDatabase(context.runtime.databasePath);
+        respawnBodyObservation = await appBody.observe();
         respawnHealth = await rconEntityHealth(
           context.rcon,
           context.botName,
@@ -11624,13 +11627,29 @@ async function runDeathRecoveryTargetCase(
         );
         const death = deathSnapshot.latestDeath;
         const after = death?.firstPostDeathObservation;
+        const afterObservedAt =
+          isRecord(after) && typeof after.observedAt === "string"
+            ? Date.parse(after.observedAt)
+            : Number.NaN;
+        const afterBodyObservation =
+          isRecord(after) && typeof after.observedAt === "string"
+            ? state.deathRecoveryTargetObservations?.get(after.observedAt)
+            : undefined;
+        const respawnBodyObservedAt = Date.parse(
+          respawnBodyObservation.observedAt,
+        );
         if (
           deathSnapshot.eventCount === 1 &&
+          death?.observedAt === deathAt &&
           isRecord(after) &&
           typeof after.observedAt === "string" &&
-          Date.parse(after.observedAt) > Date.parse(deathAt) &&
-          typeof after.health === "number" &&
-          after.health > 0 &&
+          Number.isFinite(afterObservedAt) &&
+          afterObservedAt > deathAtMs &&
+          afterBodyObservation !== undefined &&
+          Number.isFinite(respawnBodyObservedAt) &&
+          respawnBodyObservedAt > deathAtMs &&
+          typeof respawnBodyObservation.self.health === "number" &&
+          respawnBodyObservation.self.health > 0 &&
           respawnHealth > 0
         )
           break;
@@ -11643,86 +11662,103 @@ async function runDeathRecoveryTargetCase(
     const deathRecord = deathSnapshot.latestDeath;
     if (deathRecord === undefined)
       incomplete("DEATH_RECOVERY_RECORD_MISSING_AFTER_RESPAWN");
+    if (deathSnapshot.eventCount !== 1 || deathRecord.observedAt !== deathAt)
+      incomplete("DEATH_RECOVERY_DEATH_RECORD_IDENTITY_CHANGED");
     const beforeRecord = deathRecord.beforeObservation;
     const afterRecord = deathRecord.firstPostDeathObservation;
     if (!isRecord(beforeRecord) || !isRecord(afterRecord))
       incomplete("DEATH_RECOVERY_OBSERVATION_LINK_MISSING");
     const beforeTimestamp = beforeRecord.observedAt;
     const afterTimestamp = afterRecord.observedAt;
-    const storedItemCount = Array.isArray(beforeRecord.inventoryItems)
-      ? beforeRecord.inventoryItems
-          .filter(
-            (item): item is Record<string, unknown> =>
-              isRecord(item) && item.name === "blue_wool",
-          )
-          .reduce(
-            (total, item) =>
-              total + (typeof item.count === "number" ? item.count : 0),
-            0,
-          )
-      : 0;
-    const storedPosition = isRecord(beforeRecord.position)
-      ? beforeRecord.position
-      : undefined;
+    const beforeObservedAt =
+      typeof beforeTimestamp === "string"
+        ? Date.parse(beforeTimestamp)
+        : Number.NaN;
+    const afterObservedAt =
+      typeof afterTimestamp === "string"
+        ? Date.parse(afterTimestamp)
+        : Number.NaN;
     if (
       typeof beforeTimestamp !== "string" ||
-      Date.parse(beforeTimestamp) > Date.parse(deathAt) ||
+      !Number.isFinite(beforeObservedAt) ||
+      beforeObservedAt > deathAtMs ||
       typeof afterTimestamp !== "string" ||
-      Date.parse(afterTimestamp) <= Date.parse(deathAt) ||
-      beforeRecord.dimension !== fixture.dimension ||
-      afterRecord.dimension !== fixture.dimension ||
-      storedItemCount !== 1 ||
-      storedPosition === undefined ||
-      typeof storedPosition.x !== "number" ||
-      typeof storedPosition.y !== "number" ||
-      typeof storedPosition.z !== "number" ||
-      Math.hypot(
-        storedPosition.x - deathSite.x,
-        storedPosition.y - deathSite.y,
-        storedPosition.z - deathSite.z,
-      ) > 0.75 ||
-      typeof afterRecord.health !== "number" ||
-      afterRecord.health <= 0 ||
-      (Array.isArray(afterRecord.inventoryItems) &&
-        afterRecord.inventoryItems.some(
-          (item) => isRecord(item) && item.name === "blue_wool",
-        ))
+      !Number.isFinite(afterObservedAt) ||
+      afterObservedAt <= deathAtMs
     )
-      incomplete("DEATH_RECOVERY_DATABASE_RECORD_NOT_GROUNDED");
+      incomplete("DEATH_RECOVERY_DATABASE_RECORD_TIMESTAMPS_UNGROUNDED");
+    if (
+      Array.isArray(afterRecord.inventoryItems) &&
+      afterRecord.inventoryItems.some(
+        (item) => isRecord(item) && item.name === "blue_wool",
+      )
+    )
+      incomplete("DEATH_RECOVERY_POSTDEATH_ITEM_REMAINS_IN_INVENTORY");
     const persistedBeforeObservation =
       state.deathRecoveryTargetObservations?.get(beforeTimestamp);
     const persistedAfterObservation =
       state.deathRecoveryTargetObservations?.get(afterTimestamp);
-    unknownFieldsRemainAbsent =
-      persistedBeforeObservation !== undefined &&
-      persistedAfterObservation !== undefined &&
-      deathRecoveryObservationMatches(
+    if (
+      persistedBeforeObservation === undefined ||
+      persistedAfterObservation === undefined ||
+      !deathRecoveryObservationMatches(
         persistedBeforeObservation,
         beforeRecord,
-      ) &&
-      deathRecoveryObservationMatches(persistedAfterObservation, afterRecord);
-    if (!unknownFieldsRemainAbsent)
+      ) ||
+      !deathRecoveryObservationMatches(persistedAfterObservation, afterRecord)
+    )
       incomplete("DEATH_RECOVERY_DB_FIELDS_NOT_TIED_TO_FRESH_BODY_OBSERVATION");
+    const respawnBodyObservedAt =
+      respawnBodyObservation === undefined
+        ? Number.NaN
+        : Date.parse(respawnBodyObservation.observedAt);
+    if (
+      respawnBodyObservation === undefined ||
+      !Number.isFinite(respawnBodyObservedAt) ||
+      respawnBodyObservedAt <= deathAtMs ||
+      typeof respawnBodyObservation.self.health !== "number" ||
+      respawnBodyObservation.self.health <= 0 ||
+      respawnHealth === undefined ||
+      respawnHealth <= 0
+    )
+      incomplete("DEATH_RECOVERY_RESPAWN_ALIVE_OBSERVATION_NOT_CONFIRMED");
+    unknownFieldsRemainAbsent = true;
     respawnBodyObservationFresh = true;
+    const snapshotMatchesDeathRecord = (
+      snapshot: DeathRecoveryDatabaseSnapshot,
+    ): boolean => {
+      const record = snapshot.latestDeath;
+      if (
+        snapshot.eventCount !== 1 ||
+        !isRecord(record) ||
+        record.observedAt !== deathAt
+      )
+        return false;
+      const snapshotBefore = record.beforeObservation;
+      const snapshotAfter = record.firstPostDeathObservation;
+      return (
+        isRecord(snapshotBefore) &&
+        snapshotBefore.observedAt === beforeTimestamp &&
+        deathRecoveryObservationMatches(
+          persistedBeforeObservation,
+          snapshotBefore,
+        ) &&
+        isRecord(snapshotAfter) &&
+        snapshotAfter.observedAt === afterTimestamp &&
+        deathRecoveryObservationMatches(
+          persistedAfterObservation,
+          snapshotAfter,
+        )
+      );
+    };
 
     const reopened = readDeathRecoveryDatabase(context.runtime.databasePath);
     const reopenedAgain = readDeathRecoveryDatabase(
       context.runtime.databasePath,
     );
-    const stripStages = (value: Record<string, unknown>): string => {
-      const copy = { ...value };
-      delete copy.recoveryStagesUsed;
-      return JSON.stringify(copy);
-    };
     deathRecordReopenedUnchanged =
-      reopened.eventCount === 1 &&
-      reopenedAgain.eventCount === 1 &&
-      reopened.latestDeath !== undefined &&
-      reopenedAgain.latestDeath !== undefined &&
-      reopened.latestDeath.observedAt === deathAt &&
-      stripStages(deathRecord) === stripStages(reopened.latestDeath) &&
-      stripStages(reopened.latestDeath) ===
-        stripStages(reopenedAgain.latestDeath);
+      snapshotMatchesDeathRecord(reopened) &&
+      snapshotMatchesDeathRecord(reopenedAgain);
     if (!deathRecordReopenedUnchanged)
       incomplete("DEATH_RECOVERY_INDEPENDENT_DB_REOPEN_CHANGED_RECORD");
 
@@ -11820,14 +11856,12 @@ async function runDeathRecoveryTargetCase(
     );
     firstChatAfterRequestObserved = conversationReply.at >= conversationSentAt;
     ownerContextReferencesDeathRecord = ownerContextDeathAt === deathAt;
-    const conversationRecordAfter = readDeathRecoveryDatabase(
+    const conversationSnapshotAfter = readDeathRecoveryDatabase(
       context.runtime.databasePath,
-    ).latestDeath;
-    ownerRecordStableAfterRequest =
-      conversationRecordAfter?.observedAt === deathAt &&
-      reopenedAgain.latestDeath !== undefined &&
-      stripStages(conversationRecordAfter) ===
-        stripStages(reopenedAgain.latestDeath);
+    );
+    ownerRecordStableAfterRequest = snapshotMatchesDeathRecord(
+      conversationSnapshotAfter,
+    );
 
     const recoverDeadline = Math.min(
       Date.now() + 7 * 60_000,
