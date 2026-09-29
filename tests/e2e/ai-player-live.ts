@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { config as loadEnvironmentFile } from "dotenv";
 import mineflayer, { type Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
 import { ZodError } from "zod";
 
 import { AppError, errorCategories } from "../../src/domain/errors.js";
@@ -54,6 +55,7 @@ import {
   gatherMultiTargetItemCountSafeEvidence,
   gatherMultiTargetOracleProbeBaselineCountFailureFields,
   gatherMultiTargetPostBirchProgressSinceGoalAcceptance,
+  parseGatherMultiTargetItemCountReply,
   gatherMultiTargetOracleProbeResultCountFailureFields,
   parseInventoryReplyRootCompounds,
   readGatherMultiTargetItemCounts,
@@ -136,9 +138,14 @@ import {
   parseEntityRotation,
   safeUnknownOperationKind,
   unknownHandoffCaseBlockCode,
+  hasNewOwnerProposalGoalForUnknownTask,
+  unknownTargetDiscoveredAfterBodyAction,
+  unknownTargetCollectionMatchesFreshBlueWool,
+  unknownTargetPickupConfirmed,
   UNKNOWN_FIXTURE_PITCH,
   UNKNOWN_FIXTURE_YAW,
   type SafeUnknownOperationKind,
+  type UnknownTargetDiscoveryActionKind,
   type UnknownHandoffDependencyState,
 } from "./unknown-composite-diagnostic.js";
 import {
@@ -222,14 +229,18 @@ const AUTONOMOUS_RESOURCE_FIXTURE = [
 const RUN_BUDGET_LIMITS = {
   durationMs: 45 * 60_000,
   llmCalls: 160,
-  totalTokens: 800_000,
+  totalTokens: 1_000_000,
 } as const;
 const UNKNOWN_OBSTACLE_RCON_TIMEOUT_MS = 2_000;
 const UNKNOWN_OBSTACLE_READINESS_WINDOW_MS = 1_000;
 const UNKNOWN_OBSTACLE_READINESS_POLL_MS = 100;
 const UNKNOWN_OBSTACLE_READINESS_RCON_TIMEOUT_MS = 200;
 const UNKNOWN_POST_PICKUP_SAMPLE_LIMIT = 64;
-const DEFAULT_RUN_BUDGET = RUN_BUDGET_LIMITS;
+const DEFAULT_RUN_BUDGET = {
+  durationMs: 45 * 60_000,
+  llmCalls: 160,
+  totalTokens: 800_000,
+} as const;
 // Logs are placed near the player's feet, so observe with a modest downward pitch.
 const LEARNING_FIXTURE_PITCH = 15;
 const ROTATION_READ_MAX_ATTEMPTS = 3;
@@ -287,6 +298,10 @@ const CASE_BUDGETS = {
   armor_capability: { llmCalls: 40, totalTokens: 200_000 },
   integrated_result: { llmCalls: 0, totalTokens: 0 },
 } as const;
+const UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET = {
+  llmCalls: 96,
+  totalTokens: 780_000,
+} as const;
 const CASE_DEADLINES = {
   runtime_contract: 60_000,
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS,
@@ -307,6 +322,43 @@ const CASE_DEADLINES = {
   armor_capability: 6 * 60_000,
   integrated_result: 30_000,
 } as const;
+const UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS = 14 * 60_000;
+
+function caseBudgetForRun(
+  targetCase: TargetableCase | undefined,
+  caseId: keyof typeof CASE_BUDGETS,
+) {
+  return targetCase === "unknown_composite" && caseId === "unknown_composite"
+    ? UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET
+    : CASE_BUDGETS[caseId];
+}
+
+function caseDeadlineForRun(
+  targetCase: TargetableCase | undefined,
+  caseId: keyof typeof CASE_DEADLINES,
+) {
+  return targetCase === "unknown_composite" && caseId === "unknown_composite"
+    ? UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS
+    : CASE_DEADLINES[caseId];
+}
+
+function caseBudgetsForRun(targetCase: TargetableCase | undefined) {
+  return targetCase === "unknown_composite"
+    ? {
+        ...CASE_BUDGETS,
+        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET,
+      }
+    : CASE_BUDGETS;
+}
+
+function caseDeadlinesForRun(targetCase: TargetableCase | undefined) {
+  return targetCase === "unknown_composite"
+    ? {
+        ...CASE_DEADLINES,
+        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS,
+      }
+    : CASE_DEADLINES;
+}
 
 type Status = "pass" | "fail" | "incomplete";
 type UsageStatus = "runtime_reported" | "partial_or_unknown";
@@ -485,6 +537,12 @@ type UnknownObstacleReadinessStatus =
   | "other_entities_not_clear"
   | "oracle_unavailable";
 type UnknownMoveOperationKind = "move_to" | "move_relative";
+type UnknownPreTaskObservationCaptureClass =
+  | "available"
+  | "body_missing"
+  | "observe_threw"
+  | "stale"
+  | "missing_visibility";
 
 interface UnknownCompositeDiagnostic {
   readonly unknownTargetInitiallyPresent?: boolean;
@@ -527,8 +585,23 @@ interface UnknownCompositeDiagnostic {
   readonly unknownFixtureFacingReadbackAvailable?: boolean;
   readonly unknownFixtureFacingConfirmed?: boolean;
   readonly unknownPreTaskObservationStatus?: "available" | "unknown";
+  readonly unknownPreTaskObservationCaptureClass?: UnknownPreTaskObservationCaptureClass;
   readonly unknownPreTaskTargetBlockVisible?: boolean;
   readonly unknownPreTaskWallMaterialVisible?: boolean;
+  readonly unknownTaskStartActiveOperationPresent?: boolean;
+  readonly unknownTaskBaselineOperationIdsHash?: string;
+  readonly unknownTaskOwnerGoalAccepted?: boolean;
+  readonly unknownTargetDiscoveryAfterBodyAction?: boolean;
+  readonly unknownTargetDiscoveryBodyActionKind?: UnknownTargetDiscoveryActionKind;
+  readonly unknownTargetDiscoveryOperationFreshAgainstTaskBaseline?: boolean;
+  readonly unknownTargetInventoryReadStatus?: "parsed" | "unknown";
+  readonly unknownTargetInventoryBaselineCount?: number;
+  readonly unknownTargetInventoryLatestCount?: number;
+  readonly unknownTargetInventoryDelta?: number;
+  readonly unknownTargetCollectItemOutcomeObserved?: boolean;
+  readonly unknownTargetMatchingPickupEventObserved?: boolean;
+  readonly unknownTargetMatchingPickupObservedAt?: string;
+  readonly unknownTargetPickupConfirmed?: boolean;
   readonly unknownFailureObserved?: boolean;
   readonly unknownFailureSource?: "natural" | "controlled_obstacle";
   readonly unknownFailureOperationKind?: SafeUnknownOperationKind;
@@ -3259,6 +3332,7 @@ let activeGameActionPlacementObservationProbe:
   GameActionPlacementObservationProbe | undefined;
 let activeApplicationPlayerBody: MineflayerPlayerBody | undefined;
 let restoreGameActionPlacementObservationProbe: (() => void) | undefined;
+let restoreUnknownTargetPickupObservationProbe: (() => void) | undefined;
 let restoreNoFoodContinuityObservationProbe: (() => void) | undefined;
 
 type ApplicationFactory = typeof createApplication;
@@ -3273,9 +3347,11 @@ export function createOwnerReturnApplicationWithBodyCapture(
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
 }> {
+  const captureBodyForTargetedUnknownCase = targetCase === "unknown_composite";
   if (
     !ownerReturnRequestGateEnabled(targetCase) &&
-    !isArmorCapabilityTargeted(targetCase)
+    !isArmorCapabilityTargeted(targetCase) &&
+    !captureBodyForTargetedUnknownCase
   )
     return { application: createApplication(config, beforeCall) };
 
@@ -3366,6 +3442,100 @@ function installGameActionPlacementObservationProbe(
       MineflayerClient.prototype.createPlayerBody = originalCreatePlayerBody;
     }
     activeApplicationPlayerBody = undefined;
+  };
+}
+
+interface UnknownTargetPickupCapture {
+  matchingTargetPickupEventObserved: boolean;
+  matchingTargetPickupObservedAt?: string;
+}
+
+function installUnknownTargetPickupObservationProbe(
+  taskSentAt: number,
+  capture: UnknownTargetPickupCapture,
+): () => void {
+  const body = activeApplicationPlayerBody;
+  if (body === undefined) return () => undefined;
+  const getBot = (body as unknown as { getBot?: () => Bot }).getBot;
+  if (typeof getBot !== "function") return () => undefined;
+  let bot: Bot;
+  try {
+    bot = getBot.call(body);
+  } catch {
+    return () => undefined;
+  }
+
+  const originalExecute = body.execute.bind(body);
+  const originalOwnExecute = Object.getOwnPropertyDescriptor(body, "execute");
+  const instrumentedExecute = async function (
+    this: MineflayerPlayerBody,
+    operation: Parameters<MineflayerPlayerBody["execute"]>[0],
+    signal?: AbortSignal,
+  ): Promise<Awaited<ReturnType<MineflayerPlayerBody["execute"]>>> {
+    if (operation.kind !== "collect_item")
+      return originalExecute(operation, signal);
+
+    let pickupEntityId: number | undefined;
+    let collectedItemName: string | undefined;
+    let pickupObservedAt: string | undefined;
+    const onPlayerCollect = (collector: Entity, collected: Entity): void => {
+      if (
+        collector.id !== bot.entity.id ||
+        collected.id !== operation.entityId
+      ) {
+        return;
+      }
+      pickupEntityId = collected.id;
+      pickupObservedAt = new Date().toISOString();
+      try {
+        const item = collected.getDroppedItem();
+        if (item !== null && item.name.length > 0)
+          collectedItemName = item.name;
+      } catch {
+        // Missing dropped-item metadata keeps target identity unconfirmed.
+      }
+    };
+    bot.on("playerCollect", onPlayerCollect);
+    try {
+      const result = await originalExecute(operation, signal);
+      const targetVisible = result.before?.perception.entities.find(
+        (entity) =>
+          entity.id === operation.entityId &&
+          entity.name === "item" &&
+          !entity.isPlayer,
+      );
+      if (
+        unknownTargetCollectionMatchesFreshBlueWool({
+          operationKind: result.operation.kind,
+          status: result.status,
+          targetVisibleEntityId: targetVisible?.id,
+          targetVisibleAt: result.before?.observedAt,
+          requestedEntityId: operation.entityId,
+          pickupEntityId,
+          effectType: result.observedEffect?.type,
+          effectEntityId: result.observedEffect?.entityId,
+          collectedItemName,
+          taskSentAt,
+          operationStartedAt: result.startedAt,
+          pickupObservedAt,
+          operationCompletedAt: result.completedAt,
+        }) &&
+        pickupObservedAt !== undefined
+      ) {
+        capture.matchingTargetPickupEventObserved = true;
+        capture.matchingTargetPickupObservedAt = pickupObservedAt;
+      }
+      return result;
+    } finally {
+      bot.removeListener("playerCollect", onPlayerCollect);
+    }
+  };
+  body.execute = instrumentedExecute;
+  return () => {
+    if (body.execute !== instrumentedExecute) return;
+    if (originalOwnExecute === undefined)
+      Reflect.deleteProperty(body, "execute");
+    else Object.defineProperty(body, "execute", originalOwnExecute);
   };
 }
 
@@ -7232,9 +7402,10 @@ async function main(): Promise<void> {
     const unknownResult = await recordCase(
       state,
       "unknown_composite",
-      CASE_DEADLINES.unknown_composite,
+      caseDeadlineForRun(state.targetCase, "unknown_composite"),
       requireLiveContext(),
       async (context) => {
+        const issue77TargetedRun = state.targetCase === "unknown_composite";
         state.unknownHandoffDependency = "pending";
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffDependencyBlocked: true,
@@ -7267,12 +7438,19 @@ async function main(): Promise<void> {
             chest: fixturePoint(origin, 6, 0),
           });
         }
-        await configureUnknownFixture(rcon, origin, state.botName);
+        await configureUnknownFixture(
+          rcon,
+          origin,
+          state.botName,
+          issue77TargetedRun,
+        );
         updateUnknownCompositeDiagnostic(state, {
           unknownWallFixtureConfirmed: true,
           unknownDryGroundFixtureConfirmed: true,
           unknownSideRouteConfirmed: true,
-          unknownInitialViewCorridorConfirmed: true,
+          ...(issue77TargetedRun
+            ? {}
+            : { unknownInitialViewCorridorConfirmed: true }),
           unknownSideViewCorridorConfirmed: true,
         });
         await prepareUnknownObservationClients(
@@ -7340,9 +7518,80 @@ async function main(): Promise<void> {
         if (!fixtureFacingConfirmed)
           incomplete("UNKNOWN_FIXTURE_FACING_NOT_CONFIRMED");
         const facingConfirmedAt = Date.now();
-        const preTaskObservation = playerOf(
-          await collect(context.runtime.app),
-        ).lastObservation;
+        let preTaskObservation: PlayerEvidence["lastObservation"];
+        let preTaskObservationCaptureClass:
+          UnknownPreTaskObservationCaptureClass | undefined;
+        if (issue77TargetedRun) {
+          const body = activeApplicationPlayerBody;
+          if (body === undefined) {
+            preTaskObservationCaptureClass = "body_missing";
+          } else {
+            const observationDeadline = Math.min(
+              facingConfirmedAt + 5_000,
+              context.caseDeadlineAt,
+            );
+            while (
+              Date.now() < observationDeadline &&
+              preTaskObservationCaptureClass !== "available" &&
+              preTaskObservationCaptureClass !== "observe_threw"
+            ) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              let observation:
+                Awaited<ReturnType<typeof body.observe>> | undefined;
+              try {
+                const remainingMs = observationDeadline - Date.now();
+                observation = await Promise.race([
+                  body.observe(),
+                  new Promise<undefined>((resolve) => {
+                    timer = setTimeout(() => resolve(undefined), remainingMs);
+                  }),
+                ]);
+              } catch {
+                preTaskObservationCaptureClass = "observe_threw";
+                break;
+              } finally {
+                if (timer !== undefined) clearTimeout(timer);
+              }
+              if (observation === undefined) {
+                preTaskObservationCaptureClass = "stale";
+                break;
+              }
+              const visibleBlocks = (
+                observation.perception as {
+                  blocks?: readonly { readonly name: string }[];
+                }
+              ).blocks;
+              const observedAt = Date.parse(observation.observedAt);
+              if (
+                !Number.isFinite(observedAt) ||
+                observedAt <= facingConfirmedAt
+              ) {
+                preTaskObservationCaptureClass = "stale";
+              } else if (
+                visibleBlocks === undefined ||
+                visibleBlocks.length === 0
+              ) {
+                preTaskObservationCaptureClass = "missing_visibility";
+              } else {
+                preTaskObservation = {
+                  observedAt: observation.observedAt,
+                  visibleBlockNames: visibleBlocks.map(({ name }) => name),
+                };
+                preTaskObservationCaptureClass = "available";
+              }
+              if (
+                preTaskObservationCaptureClass === "stale" ||
+                preTaskObservationCaptureClass === "missing_visibility"
+              ) {
+                await waitMs(Math.min(125, observationDeadline - Date.now()));
+              }
+            }
+          }
+        } else {
+          preTaskObservation = playerOf(
+            await collect(context.runtime.app),
+          ).lastObservation;
+        }
         const preTaskObservedAt =
           preTaskObservation?.observedAt === undefined
             ? Number.NaN
@@ -7355,6 +7604,12 @@ async function main(): Promise<void> {
           : { status: "unknown" as const };
         updateUnknownCompositeDiagnostic(state, {
           unknownPreTaskObservationStatus: preTaskVisibility.status,
+          ...(preTaskObservationCaptureClass === undefined
+            ? {}
+            : {
+                unknownPreTaskObservationCaptureClass:
+                  preTaskObservationCaptureClass,
+              }),
           ...(preTaskVisibility.targetBlockVisible === undefined
             ? {}
             : {
@@ -7364,6 +7619,12 @@ async function main(): Promise<void> {
                   preTaskVisibility.wallMaterialVisible === true,
               }),
         });
+        if (issue77TargetedRun) {
+          if (preTaskVisibility.status !== "available")
+            incomplete("UNKNOWN_FIXTURE_PRETASK_OBSERVATION_UNAVAILABLE");
+          if (preTaskVisibility.targetBlockVisible !== false)
+            incomplete("UNKNOWN_FIXTURE_TARGET_NOT_HIDDEN_BEFORE_TASK");
+        }
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffFixturePreparedWhileStopped: true,
         });
@@ -7378,6 +7639,12 @@ async function main(): Promise<void> {
         const unknownTaskSentAt: { value: number | undefined } = {
           value: undefined,
         };
+        const targetPickupCapture: UnknownTargetPickupCapture = {
+          matchingTargetPickupEventObserved: false,
+        };
+        let unknownTargetInventoryBaselineCount: number | undefined;
+        let unknownTargetCollectItemOutcomeObserved = false;
+        let unknownTaskOwnerGoalAccepted = false;
         let unknownPickupConfirmedAt: number | undefined;
         let unknownPostPickupSampleCount = 0;
         let unknownPostPickupStartingSpawnDistance: number | undefined;
@@ -7401,9 +7668,24 @@ async function main(): Promise<void> {
               number | undefined) ?? 0;
           try {
             const targetCleared = !(await isBlock(rcon, target, "blue_wool"));
-            const inventory = await rcon.command(
-              `data get entity ${state.botName} Inventory`,
+            const itemCount = parseGatherMultiTargetItemCountReply(
+              await rcon.command(
+                `clear ${state.botName} minecraft:blue_wool 0`,
+              ),
+              state.botName,
             );
+            if (
+              unknownTargetInventoryBaselineCount === undefined &&
+              unknownTaskSentAt.value === undefined &&
+              itemCount !== undefined
+            ) {
+              unknownTargetInventoryBaselineCount = itemCount;
+            }
+            const inventoryDelta =
+              unknownTargetInventoryBaselineCount === undefined ||
+              itemCount === undefined
+                ? undefined
+                : itemCount - unknownTargetInventoryBaselineCount;
             const position = parsePosition(
               await rcon.command(`data get entity ${state.botName} Pos`),
             );
@@ -7419,25 +7701,39 @@ async function main(): Promise<void> {
                 position.y - target.y,
                 position.z - target.z,
               ) < 2;
-            const itemReturned = /minecraft:blue_wool/iu.test(inventory);
+            const itemReturned =
+              inventoryDelta !== undefined && inventoryDelta > 0;
             const returnedToSpawn =
               Math.hypot(
                 position.x - spawn.x,
                 position.y - spawn.y,
                 position.z - spawn.z,
               ) <= 4.5;
-            serverGoalObserved =
-              targetCleared && itemReturned && returnedToSpawn;
             updateUnknownCompositeDiagnostic(state, {
               unknownOracleChecked: true,
               unknownOracleReadStatus: "available",
               unknownOracleReadCount: currentCount + 1,
               unknownTargetCleared: targetCleared,
+              unknownTargetInventoryReadStatus:
+                itemCount === undefined ? "unknown" : "parsed",
+              ...(unknownTargetInventoryBaselineCount === undefined
+                ? {}
+                : {
+                    unknownTargetInventoryBaselineCount,
+                  }),
+              ...(itemCount === undefined
+                ? {}
+                : { unknownTargetInventoryLatestCount: itemCount }),
+              ...(inventoryDelta === undefined
+                ? {}
+                : { unknownTargetInventoryDelta: inventoryDelta }),
               unknownNearTargetServerSampleSeen:
                 state.unknownCompositeDiagnostic
                   ?.unknownNearTargetServerSampleSeen === true ||
                 (unknownTaskSentAt.value !== undefined && nearTarget),
-              unknownItemReturned: itemReturned,
+              ...(inventoryDelta === undefined
+                ? {}
+                : { unknownItemReturned: itemReturned }),
               unknownReturnedToSpawn: returnedToSpawn,
               unknownServerProgressObserved:
                 observedWorldProgress(beforeWorld, currentWorld) !== undefined,
@@ -7555,6 +7851,34 @@ async function main(): Promise<void> {
                 });
               }
             }
+            const targetPickupConfirmed = issue77TargetedRun
+              ? unknownTargetPickupConfirmed({
+                  targetRemoved: targetCleared,
+                  inventoryDelta,
+                  matchingTargetPickupEventObserved:
+                    targetPickupCapture.matchingTargetPickupEventObserved,
+                })
+              : false;
+            updateUnknownCompositeDiagnostic(state, {
+              unknownTargetMatchingPickupEventObserved:
+                targetPickupCapture.matchingTargetPickupEventObserved,
+              ...(targetPickupCapture.matchingTargetPickupObservedAt ===
+              undefined
+                ? {}
+                : {
+                    unknownTargetMatchingPickupObservedAt:
+                      targetPickupCapture.matchingTargetPickupObservedAt,
+                  }),
+            });
+            if (targetPickupConfirmed) {
+              updateUnknownCompositeDiagnostic(state, {
+                unknownTargetCollectItemOutcomeObserved: true,
+                unknownTargetPickupConfirmed: true,
+              });
+            }
+            serverGoalObserved = issue77TargetedRun
+              ? targetPickupConfirmed
+              : targetCleared && itemReturned && returnedToSpawn;
             if (
               unknownTaskSentAt.value !== undefined &&
               Number.isFinite(unknownTaskSentAt.value) &&
@@ -7604,6 +7928,7 @@ async function main(): Promise<void> {
             updateUnknownCompositeDiagnostic(state, {
               unknownOracleReadStatus: "incomplete",
               unknownOracleReadCount: currentCount + 1,
+              unknownTargetInventoryReadStatus: "unknown",
               ...(unknownTaskSentAt.value === undefined ||
               !Number.isFinite(unknownTaskSentAt.value)
                 ? {}
@@ -7629,6 +7954,8 @@ async function main(): Promise<void> {
           }
         };
         await sampleUnknownOracle();
+        if (unknownTargetInventoryBaselineCount === undefined)
+          incomplete("UNKNOWN_TARGET_INVENTORY_BASELINE_UNAVAILABLE");
         const resumed = await resumeAfterUnknownFixture(
           state,
           context,
@@ -7642,6 +7969,25 @@ async function main(): Promise<void> {
           beforePlayer.stopGeneration <= stopGeneration
         )
           incomplete("UNKNOWN_AUTONOMY_RESUME_NOT_CONFIRMED");
+        const preTaskActiveOperationIds =
+          beforePlayer.activeOperation === undefined
+            ? []
+            : [beforePlayer.activeOperation.operationId];
+        const taskBaselineOperationIds = [
+          ...new Set([
+            ...beforePlayer.recentOutcomes.map(
+              (outcome) => outcome.operationId,
+            ),
+            ...preTaskActiveOperationIds,
+          ]),
+        ].sort();
+        updateUnknownCompositeDiagnostic(state, {
+          unknownTaskStartActiveOperationPresent:
+            preTaskActiveOperationIds.length > 0,
+          unknownTaskBaselineOperationIdsHash: createHash("sha256")
+            .update(taskBaselineOperationIds.join("\n"))
+            .digest("hex"),
+        });
         state.unknownHandoffDependency = "resumed";
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffDependencyBlocked: false,
@@ -7654,11 +8000,20 @@ async function main(): Promise<void> {
           context.caseDeadlineAt - Date.now() - 60_000;
         if (unknownObservationBudgetMs < 1)
           incomplete("UNKNOWN_CASE_BUDGET_EXHAUSTED_AT_TASK_START");
+        const taskSentAt = Date.now();
+        unknownTaskSentAt.value = taskSentAt;
+        const restoreTargetPickupProbe =
+          installUnknownTargetPickupObservationProbe(
+            taskSentAt,
+            targetPickupCapture,
+          );
+        restoreUnknownTargetPickupObservationProbe = restoreTargetPickupProbe;
         sendChat(
           context.owner,
-          "近くにある青い羊毛を採集して、この依頼を受けた地点まで持ち帰ってください。所持品は空です。方法は自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
+          issue77TargetedRun
+            ? "青い羊毛を採集してください。所持品は空です。"
+            : "近くにある青い羊毛を採集して、この依頼を受けた地点まで持ち帰ってください。所持品は空です。方法は自分で考え、最初の試みが失敗したら状況を見直して別の手段を選んでください。",
         );
-        unknownTaskSentAt.value = Date.now();
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffTaskSent: true,
           unknownTaskObservationStatus: "unknown",
@@ -7701,11 +8056,58 @@ async function main(): Promise<void> {
               });
             }
             const currentOutcomes = newOutcomes(beforePlayer, currentPlayer);
+            const discoveryActionKind = unknownTargetDiscoveredAfterBodyAction({
+              taskSentAt,
+              preTaskObservation,
+              preTaskActiveOperationIds,
+              outcomes: currentOutcomes,
+              observation: currentPlayer.lastObservation,
+            });
+            if (discoveryActionKind !== undefined) {
+              updateUnknownCompositeDiagnostic(state, {
+                unknownTargetDiscoveryAfterBodyAction: true,
+                unknownTargetDiscoveryBodyActionKind: discoveryActionKind,
+                unknownTargetDiscoveryOperationFreshAgainstTaskBaseline: true,
+              });
+            }
+            unknownTaskOwnerGoalAccepted ||=
+              hasNewOwnerProposalGoalForUnknownTask({
+                previousProposalIds: beforePlayer.proposals.map(
+                  (proposal) => proposal.id,
+                ),
+                proposals: currentPlayer.proposals,
+                goals: currentPlayer.goals,
+                taskSentAt,
+              });
+            if (unknownTaskOwnerGoalAccepted) {
+              updateUnknownCompositeDiagnostic(state, {
+                unknownTaskOwnerGoalAccepted: true,
+              });
+            }
+            const successfulTargetCollectItemOutcome =
+              taskSentAt !== undefined &&
+              currentOutcomes.some((outcome) => {
+                const outcomeAt = Date.parse(outcome.observedAt ?? "");
+                return (
+                  outcome.kind === "collect_item" &&
+                  outcome.status === "successful" &&
+                  Number.isFinite(outcomeAt) &&
+                  outcomeAt >= taskSentAt
+                );
+              });
+            unknownTargetCollectItemOutcomeObserved ||=
+              successfulTargetCollectItemOutcome;
+            if (unknownTargetCollectItemOutcomeObserved) {
+              updateUnknownCompositeDiagnostic(state, {
+                unknownTargetCollectItemOutcomeObserved: true,
+              });
+            }
             const naturalFailureAlreadySeen = currentOutcomes.some(
               (outcome) => outcome.status === "failed",
             );
             const activeOperation = currentPlayer.activeOperation;
             if (
+              !issue77TargetedRun &&
               attemptedObstacleOperationIds.size < 3 &&
               !naturalFailureAlreadySeen &&
               (activeOperation?.kind === "move_to" ||
@@ -8206,6 +8608,17 @@ async function main(): Promise<void> {
                 recoverySnapshotOperationId = recovery.operationId;
               }
             }
+            if (issue77TargetedRun) {
+              return (
+                currentPlayer.actionRevision > beforeRevision &&
+                !isOperationActive(currentPlayer) &&
+                unknownTaskOwnerGoalAccepted &&
+                state.unknownCompositeDiagnostic
+                  ?.unknownTargetDiscoveryAfterBodyAction === true &&
+                state.unknownCompositeDiagnostic
+                  .unknownTargetPickupConfirmed === true
+              );
+            }
             return (
               currentPlayer.actionRevision > beforeRevision &&
               canCheckOracle &&
@@ -8213,12 +8626,29 @@ async function main(): Promise<void> {
             );
           },
         );
+        restoreTargetPickupProbe();
+        restoreUnknownTargetPickupObservationProbe = undefined;
         const outcomes = newOutcomes(beforePlayer, afterPlayer);
         const afterKinds = new Set(
           outcomes
             .map((outcome) => outcome.kind)
             .filter((kind): kind is string => typeof kind === "string"),
         );
+        if (issue77TargetedRun) {
+          const finalDiagnostic = state.unknownCompositeDiagnostic ?? {};
+          if (finalDiagnostic.unknownTaskOwnerGoalAccepted !== true)
+            incomplete("UNKNOWN_TASK_OWNER_GOAL_NOT_ACCEPTED");
+          if (finalDiagnostic.unknownTargetDiscoveryAfterBodyAction !== true)
+            incomplete(
+              "UNKNOWN_TARGET_DISCOVERY_AFTER_BODY_ACTION_UNCONFIRMED",
+            );
+          if (finalDiagnostic.unknownTargetPickupConfirmed !== true)
+            incomplete("UNKNOWN_TARGET_PICKUP_ORACLE_UNCONFIRMED");
+          return {
+            ...finalDiagnostic,
+            distinctOperationKinds: afterKinds.size,
+          };
+        }
         const failedAt = outcomes.findIndex(
           (outcome) => outcome.status === "failed",
         );
@@ -8930,6 +9360,8 @@ async function main(): Promise<void> {
       }
     }
   } finally {
+    restoreUnknownTargetPickupObservationProbe?.();
+    restoreUnknownTargetPickupObservationProbe = undefined;
     if (
       ownerReturnRequestGateEnabled(state.targetCase) &&
       state.ownerReturnRequestGate !== undefined
@@ -9054,7 +9486,9 @@ async function prepareRun(): Promise<RunState> {
   }
   const runBudget = runBudgetFromEnvironment();
   const targetCaseBudget =
-    targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
+    targetCase === undefined
+      ? undefined
+      : caseBudgetForRun(targetCase, targetCase);
   if (
     targetCaseBudget !== undefined &&
     (runBudget.llmCalls < targetCaseBudget.llmCalls ||
@@ -9068,7 +9502,7 @@ async function prepareRun(): Promise<RunState> {
     !runBudgetCoversCase(
       runBudget,
       targetCaseBudget,
-      CASE_DEADLINES[targetCase],
+      caseDeadlineForRun(targetCase, targetCase),
       Date.now() - setupStartedClock,
     )
   ) {
@@ -15158,7 +15592,7 @@ function ownerReturnSettlementContext(
 
 async function recordCase(
   state: RunState,
-  id: string,
+  id: keyof typeof CASE_BUDGETS,
   deadlineMs: number,
   context: CaseContext,
   runCaseBody: (
@@ -15181,10 +15615,7 @@ async function recordCase(
     state.cases.push(skipped);
     return skipped;
   }
-  const caseBudget = Object.entries(CASE_BUDGETS).find(
-    ([caseId]) => caseId === id,
-  )?.[1];
-  if (caseBudget === undefined) incomplete("CASE_BUDGET_NOT_CONFIGURED");
+  const caseBudget = caseBudgetForRun(state.targetCase, id);
   const caseAdmissionLimit = ownerReturnCaseCallLimit(
     state.targetCase,
     caseBudget.llmCalls,
@@ -15906,6 +16337,7 @@ async function configureUnknownFixture(
   rcon: LocalRcon,
   origin: Position,
   botName: string,
+  hideTargetInitially = false,
 ): Promise<void> {
   const wallX = Math.floor(origin.x) + 2;
   const z = Math.floor(origin.z);
@@ -15914,25 +16346,35 @@ async function configureUnknownFixture(
   const targetSupport = { x: target.x, y: target.y - 1, z: target.z };
   await rcon.command(`clear ${botName}`);
   await rcon.command(`fill ${wallX} 64 ${z - 1} ${wallX} 64 ${z + 1} stone`);
+  if (hideTargetInitially) {
+    await rcon.command(`setblock ${wallX} 65 ${z} stone`);
+  }
   await rcon.command(`setblock ${target.x} ${target.y} ${target.z} blue_wool`);
   await setAndVerifyGamerule(rcon, "advanceTime", false);
   await rcon.command("time set 1000");
   if (!(await isBlock(rcon, wall, "stone")))
     incomplete("UNKNOWN_WALL_FIXTURE_NOT_CONFIRMED");
-  if (!(await isBlock(rcon, { x: wallX, y: 65, z }, "air")))
+  const upperWall = { x: wallX, y: 65, z };
+  if (hideTargetInitially) {
+    if (!(await isBlock(rcon, upperWall, "stone")))
+      incomplete("UNKNOWN_TARGET_OCCLUDER_NOT_CONFIRMED");
+  } else if (!(await isBlock(rcon, upperWall, "air"))) {
     incomplete("UNKNOWN_FIXTURE_INITIAL_VIEW_BLOCKED");
+  }
   if (!(await isBlock(rcon, targetSupport, "stone")))
     incomplete("UNKNOWN_DRY_GROUND_FIXTURE_NOT_CONFIRMED");
   if (!(await isBlock(rcon, target, "blue_wool")))
     incomplete("UNKNOWN_TARGET_FIXTURE_NOT_CONFIRMED");
-  await verifyUnknownFixtureSightline(
-    rcon,
-    { x: origin.x, y: origin.y + 1.62, z: origin.z },
-    target,
-    UNKNOWN_FIXTURE_YAW,
-    "UNKNOWN_FIXTURE_INITIAL_VIEW_NOT_IN_FIELD_OF_VIEW",
-    "UNKNOWN_FIXTURE_INITIAL_VIEW_CORRIDOR_BLOCKED",
-  );
+  if (!hideTargetInitially) {
+    await verifyUnknownFixtureSightline(
+      rcon,
+      { x: origin.x, y: origin.y + 1.62, z: origin.z },
+      target,
+      UNKNOWN_FIXTURE_YAW,
+      "UNKNOWN_FIXTURE_INITIAL_VIEW_NOT_IN_FIELD_OF_VIEW",
+      "UNKNOWN_FIXTURE_INITIAL_VIEW_CORRIDOR_BLOCKED",
+    );
+  }
   await verifyUnknownFixtureLateralApproach(rcon, origin, target, z);
 }
 
@@ -17205,8 +17647,8 @@ async function writeArtifact(state: RunState): Promise<void> {
     },
     budgets: {
       run: state.runBudget,
-      perCase: CASE_BUDGETS,
-      perCaseDeadlinesMs: CASE_DEADLINES,
+      perCase: caseBudgetsForRun(state.targetCase),
+      perCaseDeadlinesMs: caseDeadlinesForRun(state.targetCase),
       exceeded:
         state.failureCode?.includes("BUDGET") === true ||
         state.failureCode?.includes("DEADLINE") === true,
