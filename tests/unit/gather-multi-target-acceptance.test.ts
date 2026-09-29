@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   gatherMultiTargetItemCountSafeEvidence,
   gatherMultiTargetOracleProbeBaselineCountFailureFields,
+  gatherMultiTargetPostBirchProgressSinceGoalAcceptance,
   gatherMultiTargetOracleProbeResultCountFailureFields,
   parseGatherMultiTargetInventoryReply,
   parseGatherMultiTargetInventoryReplyDetailed,
@@ -11,6 +12,63 @@ import {
 } from "../e2e/gather-multi-target-acceptance.js";
 
 describe("multi-target gather inventory oracle", () => {
+  it("requires new birch inventory after goal acceptance and a later Body outcome", () => {
+    const acceptedAfterPriorPickup = {
+      reason: "parsed",
+      parseStage: "parsed",
+      counts: { oak_log: 1, birch_log: 1 },
+    } as const;
+    const unchanged = {
+      ...acceptedAfterPriorPickup,
+      counts: { oak_log: 1, birch_log: 1 },
+    } as const;
+    const gainedAfterAcceptance = {
+      ...acceptedAfterPriorPickup,
+      counts: { oak_log: 1, birch_log: 2 },
+    } as const;
+    const unknown = {
+      reason: "response_unrecognized",
+      parseStage: "response_unrecognized",
+      counts: { oak_log: 1, birch_log: null },
+    } as const;
+
+    expect(
+      gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+        acceptedAfterPriorPickup,
+        unchanged,
+        2,
+      ),
+    ).toEqual({ birchDelta: 0, confirmed: false });
+    expect(
+      gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+        acceptedAfterPriorPickup,
+        gainedAfterAcceptance,
+        0,
+      ),
+    ).toEqual({ birchDelta: 1, confirmed: false });
+    expect(
+      gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+        acceptedAfterPriorPickup,
+        gainedAfterAcceptance,
+        1,
+      ),
+    ).toEqual({ birchDelta: 1, confirmed: true });
+    expect(
+      gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+        acceptedAfterPriorPickup,
+        unknown,
+        1,
+      ),
+    ).toEqual({ birchDelta: null, confirmed: false });
+    expect(
+      gatherMultiTargetPostBirchProgressSinceGoalAcceptance(
+        unknown,
+        gainedAfterAcceptance,
+        1,
+      ),
+    ).toEqual({ birchDelta: null, confirmed: false });
+  });
+
   it("parses top-level target stacks regardless of field order and NBT suffix", () => {
     expect(
       parseGatherMultiTargetInventoryReply(
