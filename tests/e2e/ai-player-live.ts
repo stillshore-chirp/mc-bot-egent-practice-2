@@ -10975,13 +10975,25 @@ async function runUnderwaterItemRecoveryCase(
         updateUnderwaterItemRecoveryDiagnostic(state, {
           bodyEnteredWater: true,
         });
-        if (
+        const oxygenConfirmedLow =
+          observation.self.oxygen !== null && observation.self.oxygen <= 5;
+        const oxygenState = evidence.game.oxygenState;
+        const oxygenConfirmedUnsafe =
+          oxygenConfirmedLow || oxygenState === "low";
+        const oxygenUnknown =
           observation.self.oxygen === null ||
-          observation.self.oxygen <= 5 ||
-          evidence.game.oxygenState !== "normal"
-        ) {
+          oxygenState === "unknown" ||
+          oxygenState === "not_applicable";
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          oxygenEvidence: oxygenConfirmedUnsafe
+            ? "low"
+            : oxygenUnknown
+              ? "unknown"
+              : "normal",
+        });
+        if (oxygenConfirmedUnsafe) {
           sendChat(context.owner, "今の行動を停止してください。");
-          incomplete("UNDERWATER_RECOVERY_OXYGEN_NOT_CONFIRMED_SAFE");
+          incomplete("UNDERWATER_RECOVERY_OXYGEN_CONFIRMED_LOW");
         }
       }
       collectSucceeded ||= player.recentOutcomes.some(
