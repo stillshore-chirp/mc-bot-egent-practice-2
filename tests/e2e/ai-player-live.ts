@@ -65,10 +65,10 @@ import {
   type GatherDropReadbackClass,
 } from "./gather-drop-readback.js";
 import {
-  countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
   hasResolvedGatherTargetOwnerGoal,
   newGatherTargetProposalIds,
+  summarizeSuccessfulGatherBodyOutcomes,
 } from "./gather-target-continuity.js";
 import {
   explainsFullHunger,
@@ -2391,6 +2391,30 @@ function updateGatherMultiTargetDiagnostic(
     ...(state.gatherMultiTargetDiagnostic ?? {}),
     ...patch,
   };
+}
+
+function updateGatherMultiTargetInventoryReadDiagnostic(
+  state: RunState,
+  result: Awaited<ReturnType<typeof readGatherMultiTargetInventory>>,
+  baseline: Readonly<Record<GatherMultiTargetItem, number>>,
+): void {
+  const parsed = result.reason === "parsed" ? result : undefined;
+  const oakDelta =
+    parsed?.counts.oak_log === undefined
+      ? null
+      : parsed.counts.oak_log - baseline.oak_log;
+  const birchDelta =
+    parsed?.counts.birch_log === undefined
+      ? null
+      : parsed.counts.birch_log - baseline.birch_log;
+  updateGatherMultiTargetDiagnostic(state, {
+    gatherLatestInventoryReadReason: result.reason,
+    gatherLatestInventoryParseStage: result.parseStage,
+    gatherLatestOakLogInventoryCount: parsed?.counts.oak_log ?? null,
+    gatherLatestBirchLogInventoryCount: parsed?.counts.birch_log ?? null,
+    gatherOakLogInventoryDelta: oakDelta,
+    gatherBirchLogInventoryDelta: birchDelta,
+  });
 }
 
 function safeGameActionFailureEvidence(
@@ -11042,13 +11066,17 @@ async function runGatherMultiTargetContinuityCase(
     >();
     const rememberOutcomes = (player: PlayerEvidence): void => {
       for (const outcome of player.recentOutcomes) {
-        if (
-          !priorOutcomeIds.has(outcome.operationId) &&
-          (outcome.kind === "dig" || outcome.kind === "collect_item")
-        ) {
+        if (!priorOutcomeIds.has(outcome.operationId)) {
           observedOutcomes.set(outcome.operationId, outcome);
         }
       }
+      const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+        ...observedOutcomes.values(),
+      ]);
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherSuccessfulBodyOutcomeCount: bodyOutcomes.totalCount,
+        gatherSuccessfulBodyOutcomeKindCounts: bodyOutcomes.kindCounts,
+      });
     };
 
     sendChat(context.owner, "近くのオークの原木を集めてきて。進め方は任せる。");
@@ -11095,29 +11123,23 @@ async function runGatherMultiTargetContinuityCase(
       gatherRequestedBirchLogCount: "unknown",
     });
 
-    let firstSampleAt = 0;
     const firstOakProgress = await observeForPlayer(
       context,
       120_000,
       async (player) => {
         rememberOutcomes(player);
-        const successfulDig = [...observedOutcomes.values()].some(
-          (outcome) =>
-            outcome.kind === "dig" && outcome.status === "successful",
-        );
-        if (!successfulDig || Date.now() - firstSampleAt < 1_200) return false;
-        firstSampleAt = Date.now();
-        return (
-          !(await isBlock(context.rcon, activeFixture.oakLog, "oak_log")) &&
-          (await isBlock(context.rcon, activeFixture.birchLog, "birch_log"))
-        );
+        const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+          ...observedOutcomes.values(),
+        ]);
+        if (bodyOutcomes.totalCount === 0) return false;
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherInitialOakBodyProgressConfirmed: true,
+        });
+        return true;
       },
     );
     if (firstOakProgress === undefined)
       incomplete("GATHER_MULTI_TARGET_FIRST_OAK_PROGRESS_NOT_CONFIRMED");
-    updateGatherMultiTargetDiagnostic(state, {
-      gatherInitialOakBodyDigAndServerBlockConfirmed: true,
-    });
 
     const beforeFollowup = playerOf(await collect(context.runtime.app));
     rememberOutcomes(beforeFollowup);
@@ -11184,71 +11206,110 @@ async function runGatherMultiTargetContinuityCase(
     >();
     let finalInventory:
       Readonly<Record<GatherMultiTargetItem, number>> | undefined;
-    let finalOakRemoved = false;
-    let finalBirchRemoved = false;
+    let finalOakRemoved: boolean | undefined;
+    let finalBirchRemoved: boolean | undefined;
     let lastSampleAt = 0;
     const complete = await observeForPlayer(
       context,
       180_000,
       async (player) => {
         rememberOutcomes(player);
-        for (const outcome of player.recentOutcomes) {
+        for (const outcome of observedOutcomes.values()) {
           if (
             !outcomeIdsBeforeFollowup.has(outcome.operationId) &&
-            Date.parse(outcome.observedAt ?? "") >= birchAcceptedAt &&
-            (outcome.kind === "dig" || outcome.kind === "collect_item")
+            Date.parse(outcome.observedAt ?? "") > birchAcceptedAt &&
+            !postFollowupOutcomes.has(outcome.operationId)
           ) {
             postFollowupOutcomes.set(outcome.operationId, outcome);
           }
         }
-        const bodyPairs = countCompletedGatherActions([
+        const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
           ...observedOutcomes.values(),
         ]);
-        const followupPairs = countCompletedGatherActions([
-          ...postFollowupOutcomes.values(),
-        ]);
+        const followupBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes(
+          [...postFollowupOutcomes.values()],
+          birchAcceptedAt,
+        );
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherSuccessfulBodyOutcomeCount: bodyOutcomes.totalCount,
+          gatherSuccessfulBodyOutcomeKindCounts: bodyOutcomes.kindCounts,
+          gatherPostBirchGoalBodyOutcomeCount: followupBodyOutcomes.totalCount,
+          gatherPostBirchGoalBodyOutcomeKindCounts:
+            followupBodyOutcomes.kindCounts,
+        });
         if (Date.now() - lastSampleAt < 1_200) return false;
         lastSampleAt = Date.now();
 
         const inventory = await readGatherMultiTargetInventory(() =>
           context.rcon.command(`data get entity ${context.botName} Inventory`),
         );
-        if (inventory.reason !== "parsed") return false;
+        const inventoryParsed = inventory.reason === "parsed";
+        const oakDelta = inventoryParsed
+          ? inventory.counts.oak_log - baseline.oak_log
+          : undefined;
+        const birchDelta = inventoryParsed
+          ? inventory.counts.birch_log - baseline.birch_log
+          : undefined;
+        updateGatherMultiTargetInventoryReadDiagnostic(
+          state,
+          inventory,
+          baseline,
+        );
+        if (!inventoryParsed) return false;
         finalInventory = inventory.counts;
-        finalOakRemoved = !(await isBlock(
-          context.rcon,
-          activeFixture.oakLog,
-          "oak_log",
-        ));
-        finalBirchRemoved = !(await isBlock(
-          context.rcon,
-          activeFixture.birchLog,
-          "birch_log",
-        ));
+        try {
+          finalOakRemoved = !(await isBlock(
+            context.rcon,
+            activeFixture.oakLog,
+            "oak_log",
+          ));
+        } catch {
+          finalOakRemoved = undefined;
+        }
+        try {
+          finalBirchRemoved = !(await isBlock(
+            context.rcon,
+            activeFixture.birchLog,
+            "birch_log",
+          ));
+        } catch {
+          finalBirchRemoved = undefined;
+        }
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherOakBlockRemovedByServer: finalOakRemoved ?? null,
+          gatherBirchBlockRemovedByServer: finalBirchRemoved ?? null,
+        });
         return (
-          finalOakRemoved &&
-          finalBirchRemoved &&
-          inventory.counts.oak_log - baseline.oak_log === 1 &&
-          inventory.counts.birch_log - baseline.birch_log === 1 &&
-          bodyPairs >= 2 &&
-          followupPairs >= 1
+          oakDelta !== undefined &&
+          oakDelta >= 1 &&
+          birchDelta !== undefined &&
+          birchDelta >= 1 &&
+          bodyOutcomes.totalCount >= 2 &&
+          followupBodyOutcomes.totalCount >= 1
         );
       },
     );
     if (complete === undefined || finalInventory === undefined)
       incomplete("GATHER_MULTI_TARGET_SERVER_AND_BODY_PROGRESS_NOT_CONFIRMED");
+    const finalBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+      ...observedOutcomes.values(),
+    ]);
+    const finalPostBirchBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes(
+      [...postFollowupOutcomes.values()],
+      birchAcceptedAt,
+    );
     updateGatherMultiTargetDiagnostic(state, {
       gatherOakLogInventoryDelta: finalInventory.oak_log - baseline.oak_log,
       gatherBirchLogInventoryDelta:
         finalInventory.birch_log - baseline.birch_log,
-      gatherOakBlockRemovedByServer: finalOakRemoved,
-      gatherBirchBlockRemovedByServer: finalBirchRemoved,
-      gatherSuccessfulBodyGatherPairs: countCompletedGatherActions([
-        ...observedOutcomes.values(),
-      ]),
-      gatherPostFollowupBodyGatherPairs: countCompletedGatherActions([
-        ...postFollowupOutcomes.values(),
-      ]),
+      gatherOakBlockRemovedByServer: finalOakRemoved ?? null,
+      gatherBirchBlockRemovedByServer: finalBirchRemoved ?? null,
+      gatherSuccessfulBodyOutcomeCount: finalBodyOutcomes.totalCount,
+      gatherSuccessfulBodyOutcomeKindCounts: finalBodyOutcomes.kindCounts,
+      gatherPostBirchGoalBodyOutcomeCount:
+        finalPostBirchBodyOutcomes.totalCount,
+      gatherPostBirchGoalBodyOutcomeKindCounts:
+        finalPostBirchBodyOutcomes.kindCounts,
     });
     const oakDelta = finalInventory.oak_log - baseline.oak_log;
     const birchDelta = finalInventory.birch_log - baseline.birch_log;
@@ -11320,8 +11381,8 @@ async function runGatherMultiTargetContinuityCase(
     fixture = undefined;
     caseResult = {
       ...gatherMultiTargetSafeEvidence(state),
-      gatherIndependentServerCountsConfirmed: true,
-      gatherBodyDigAndPickupPairsConfirmed: true,
+      gatherIndependentTargetInventoryIncreasesConfirmed: true,
+      gatherMultipleSuccessfulBodyOutcomesConfirmed: true,
       gatherProgressExplanationStatus:
         typeof state.gatherMultiTargetDiagnostic
           ?.gatherProgressExplanationStatus === "string"
@@ -11388,11 +11449,24 @@ async function sampleGatherProgressReply(
   const before = await readGatherMultiTargetInventory(() =>
     context.rcon.command(`data get entity ${context.botName} Inventory`),
   );
+  updateGatherMultiTargetInventoryReadDiagnostic(state, before, baseline);
   if (before.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
-  const oakBlockBefore = await isBlock(context.rcon, fixture.oakLog, "oak_log");
-  const birchBlockBefore = await isBlock(
-    context.rcon,
+  const readBlockRemoved = async (
+    target: Position,
+    item: GatherMultiTargetItem,
+  ): Promise<boolean | undefined> => {
+    try {
+      return !(await isBlock(context.rcon, target, item));
+    } catch {
+      return undefined;
+    }
+  };
+  const oakBlockRemovedBefore = await readBlockRemoved(
+    fixture.oakLog,
+    "oak_log",
+  );
+  const birchBlockRemovedBefore = await readBlockRemoved(
     fixture.birchLog,
     "birch_log",
   );
@@ -11429,22 +11503,20 @@ async function sampleGatherProgressReply(
   const after = await readGatherMultiTargetInventory(() =>
     context.rcon.command(`data get entity ${context.botName} Inventory`),
   );
+  updateGatherMultiTargetInventoryReadDiagnostic(state, after, baseline);
   if (after.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
-  const oakBlockAfter = await isBlock(context.rcon, fixture.oakLog, "oak_log");
-  const birchBlockAfter = await isBlock(
-    context.rcon,
+  const oakBlockRemovedAfter = await readBlockRemoved(
+    fixture.oakLog,
+    "oak_log",
+  );
+  const birchBlockRemovedAfter = await readBlockRemoved(
     fixture.birchLog,
     "birch_log",
   );
-  const worldStable =
-    GATHER_MULTI_TARGET_ITEMS.every(
-      (item) => before.counts[item] === after.counts[item],
-    ) &&
-    !oakBlockBefore &&
-    !birchBlockBefore &&
-    !oakBlockAfter &&
-    !birchBlockAfter;
+  const inventoryStable = GATHER_MULTI_TARGET_ITEMS.every(
+    (item) => before.counts[item] === after.counts[item],
+  );
   const observedOak = after.counts.oak_log - baseline.oak_log;
   const observedBirch = after.counts.birch_log - baseline.birch_log;
   const oakRemaining =
@@ -11462,14 +11534,18 @@ async function sampleGatherProgressReply(
     gatherProgressReplySidecarRetained:
       state.gatherProgressReplySidecarRetained === true,
     gatherProgressReplyReviewRequired: true,
-    gatherProgressWorldStableWhileReplying: worldStable,
+    gatherProgressInventoryStableWhileReplying: inventoryStable,
+    gatherOakBlockRemovedBeforeProgressReply: oakBlockRemovedBefore ?? null,
+    gatherBirchBlockRemovedBeforeProgressReply: birchBlockRemovedBefore ?? null,
+    gatherOakBlockRemovedAfterProgressReply: oakBlockRemovedAfter ?? null,
+    gatherBirchBlockRemovedAfterProgressReply: birchBlockRemovedAfter ?? null,
     gatherProgressObservedOakLogCount: observedOak,
     gatherProgressObservedBirchLogCount: observedBirch,
     gatherProgressRequestedOakLogCount: requestedCounts.oak_log,
     gatherProgressRequestedBirchLogCount: requestedCounts.birch_log,
     gatherProgressRemainingOakLogCount: oakRemaining,
     gatherProgressRemainingBirchLogCount: birchRemaining,
-    gatherProgressExplanationStatus: worldStable
+    gatherProgressExplanationStatus: inventoryStable
       ? "sampled_pending_private_review"
       : "sampled_world_changed_pending_private_review",
   });

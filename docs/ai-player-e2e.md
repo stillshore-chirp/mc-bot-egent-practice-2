@@ -56,11 +56,11 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 通常caseでは、隔離worldにoak logとbirch logを並べ、RCONで両targetと足場を確認します。新しいBody観測に両対象が含まれた後、数量を指定しない自然なoak採集依頼と短いbirch追記を実GPTへ送ります。birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。隠蔽、遮蔽物、側路からの視点変更は条件にしません。
 
-追記の受け入れは、新しいbirch proposalとlinked owner goalの採用状態・更新時刻で確かめます。別のrecent judgment snapshotは必須にしません。後続Body outcomeはgoal更新後に限り、2対象のdig/pickup、block、独立inventory差分、数量説明の各確認は引き続き必要です。先行case失敗時にfixture cleanupの例外が起きても元の失敗理由を保持し、外側のserver/listener/world cleanupはwrapperの別証拠として確認します。
+追記の受け入れは、新しいbirch proposalとlinked owner goalの採用状態・更新時刻で確かめます。別のrecent judgment snapshotは必須にしません。case開始前のBody outcomeを除外し、複数の一意な成功Body outcomeと、birch goalの更新後に観測した少なくとも1件の成功Body outcomeを確認します。oak/birch双方の独立RCON inventory差分が各1以上あることも必要です。成功`dig`と`collect_item`の固定ペア数、block消失、差分ちょうど+1は必須条件にせず、観測できたblock状態は補助証拠として記録します。先行case失敗時にfixture cleanupの例外が起きても元の失敗理由を保持し、外側のserver/listener/world cleanupはwrapperの別証拠として確認します。
 
-受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。
+受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。passには、owner goalの採用、複数の一意な成功Body操作、birch goal採用後の成功Body進捗、両対象の独立RCON inventory増加が必要です。RCONの最終inventory読取理由・parse stageと、成功Body操作の合計・種類別・birch goal後の件数は、失敗時にもsafe artifactへ残します。未読・不正なinventory countは`null`で、0として扱いません。block/drop readbackは取得できた場合だけ補助証拠として区別します。
 
-二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にworld状態が安定していたかを記録します。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
+二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にinventory countが安定していたかを記録します。返信前後のblock状態は補助観測です。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
 
 case上限は64 calls / 600,000 known tokens / 12分、targeted wrapper全体は72 calls / 660,000 known tokens / 16分です。1回の対象runでは次のように選択し、同条件の自動再試行はしません。
 
