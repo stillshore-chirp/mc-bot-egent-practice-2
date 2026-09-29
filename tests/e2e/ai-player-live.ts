@@ -1409,25 +1409,29 @@ interface DeathRecoveryBodySample {
   readonly onFire: boolean | null;
 }
 
-function deathRecoveryObservationMatches(
+function deathRecoveryObservationMismatch(
   sample: DeathRecoveryBodySample,
   persisted: Record<string, unknown>,
-): boolean {
+): string | undefined {
   const position = persisted.position;
+  if (persisted.dimension !== sample.dimension) return "dimension_mismatch";
+  if (!isRecord(position)) return "position_missing_or_invalid";
+  if (position.dimension !== sample.dimension)
+    return "position_dimension_mismatch";
   if (
-    persisted.dimension !== sample.dimension ||
-    !isRecord(position) ||
-    position.dimension !== sample.dimension ||
     typeof position.x !== "number" ||
     typeof position.y !== "number" ||
-    typeof position.z !== "number" ||
+    typeof position.z !== "number"
+  )
+    return "position_missing_or_invalid";
+  if (
     Math.hypot(
       position.x - sample.position.x,
       position.y - sample.position.y,
       position.z - sample.position.z,
     ) > 0.75
   )
-    return false;
+    return "position_outside_tolerance";
   for (const field of [
     "day",
     "timeOfDay",
@@ -1439,9 +1443,11 @@ function deathRecoveryObservationMatches(
     "inLava",
     "onFire",
   ] as const) {
-    if (sample[field] === null && persisted[field] !== null) return false;
+    if (sample[field] === null && persisted[field] !== null)
+      return `nullable_${field}_not_preserved`;
   }
-  if (!Array.isArray(persisted.inventoryItems)) return false;
+  if (!Array.isArray(persisted.inventoryItems))
+    return "inventory_items_missing";
   const blueWoolCount = persisted.inventoryItems
     .filter(
       (item): item is Record<string, unknown> =>
@@ -1452,7 +1458,9 @@ function deathRecoveryObservationMatches(
         total + (typeof item.count === "number" ? item.count : 0),
       0,
     );
-  return blueWoolCount === sample.blueWoolCount;
+  return blueWoolCount === sample.blueWoolCount
+    ? undefined
+    : "blue_wool_count_mismatch";
 }
 
 type Evidence = Awaited<
@@ -11429,6 +11437,7 @@ async function runDeathRecoveryTargetCase(
   let respawnBodyObservationFresh = false;
   let deathRecordReopenedUnchanged = false;
   let unknownFieldsRemainAbsent = false;
+  let databaseObservationMismatch: string | undefined;
   let purposeStageReferencesDeathRecord = false;
   let ownerContextReferencesDeathRecord = false;
   let firstChatAfterRequestObserved = false;
@@ -11704,15 +11713,33 @@ async function runDeathRecoveryTargetCase(
       state.deathRecoveryTargetObservations?.get(beforeTimestamp);
     const persistedAfterObservation =
       state.deathRecoveryTargetObservations?.get(afterTimestamp);
-    if (
-      persistedBeforeObservation === undefined ||
-      persistedAfterObservation === undefined ||
-      !deathRecoveryObservationMatches(
-        persistedBeforeObservation,
-        beforeRecord,
-      ) ||
-      !deathRecoveryObservationMatches(persistedAfterObservation, afterRecord)
-    )
+    const beforeObservationMismatch =
+      persistedBeforeObservation === undefined
+        ? "body_sample_missing"
+        : deathRecoveryObservationMismatch(
+            persistedBeforeObservation,
+            beforeRecord,
+          );
+    const afterObservationMismatch =
+      persistedAfterObservation === undefined
+        ? "body_sample_missing"
+        : deathRecoveryObservationMismatch(
+            persistedAfterObservation,
+            afterRecord,
+          );
+    databaseObservationMismatch =
+      beforeObservationMismatch === undefined
+        ? afterObservationMismatch === undefined
+          ? undefined
+          : `after_${afterObservationMismatch}`
+        : `before_${beforeObservationMismatch}`;
+    if (databaseObservationMismatch !== undefined)
+      incomplete("DEATH_RECOVERY_DB_FIELDS_NOT_TIED_TO_FRESH_BODY_OBSERVATION");
+    const matchedPersistedBeforeObservation =
+      persistedBeforeObservation ??
+      incomplete("DEATH_RECOVERY_DB_FIELDS_NOT_TIED_TO_FRESH_BODY_OBSERVATION");
+    const matchedPersistedAfterObservation =
+      persistedAfterObservation ??
       incomplete("DEATH_RECOVERY_DB_FIELDS_NOT_TIED_TO_FRESH_BODY_OBSERVATION");
     const respawnBodyObservedAt =
       respawnBodyObservation === undefined
@@ -11745,16 +11772,16 @@ async function runDeathRecoveryTargetCase(
       return (
         isRecord(snapshotBefore) &&
         snapshotBefore.observedAt === beforeTimestamp &&
-        deathRecoveryObservationMatches(
-          persistedBeforeObservation,
+        deathRecoveryObservationMismatch(
+          matchedPersistedBeforeObservation,
           snapshotBefore,
-        ) &&
+        ) === undefined &&
         isRecord(snapshotAfter) &&
         snapshotAfter.observedAt === afterTimestamp &&
-        deathRecoveryObservationMatches(
-          persistedAfterObservation,
+        deathRecoveryObservationMismatch(
+          matchedPersistedAfterObservation,
           snapshotAfter,
-        )
+        ) === undefined
       );
     };
 
@@ -12026,6 +12053,9 @@ async function runDeathRecoveryTargetCase(
       ownerReplySha256:
         state.deathRecoveryTargetOwnerReplyHash ?? "unavailable",
       ownerRequestReplyCorrelation: "unverified",
+      ...(databaseObservationMismatch === undefined
+        ? {}
+        : { databaseObservationMismatch }),
       purposeMarkerScope: "death_record_reference_not_request_start",
       ownerGoalContinuity: ownerGoalContinuityOutcome,
       privateOwnerReportReview: ownerReportPrivateRetained
