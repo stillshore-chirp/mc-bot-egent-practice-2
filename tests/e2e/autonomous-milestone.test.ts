@@ -3,8 +3,112 @@ import { describe, expect, it } from "vitest";
 import {
   hasCancellationOutcomeForOperation,
   hasJudgmentAfterSuccessfulOutcome,
+  hasNewActiveOwnerProposalGoal,
+  hasOwnerApproachWithStartedBodyOperation,
   isStoppedHandoffBoundaryConfirmed,
+  ownerApproachReductionBucket,
 } from "./autonomous-milestone.js";
+
+describe("ownerApproachReductionBucket", () => {
+  it("rejects missing, zero, and negative reductions", () => {
+    expect(ownerApproachReductionBucket(undefined, 9)).toBe("none");
+    expect(ownerApproachReductionBucket(9, 9)).toBe("none");
+    expect(ownerApproachReductionBucket(9, 9.1)).toBe("none");
+  });
+
+  it("distinguishes a small movement from the minimum approach", () => {
+    expect(ownerApproachReductionBucket(10, 9.751)).toBe("under_minimum");
+    expect(ownerApproachReductionBucket(10, 9.75)).toBe("minimum_met");
+  });
+});
+
+describe("hasOwnerApproachWithStartedBodyOperation", () => {
+  const activeOperation = {
+    operationId: "operation-a",
+    bodyStartedAt: "2026-09-29T10:00:00.000Z",
+  };
+
+  it("requires the movement threshold and a started Body operation together", () => {
+    expect(
+      hasOwnerApproachWithStartedBodyOperation(10, 9.75, activeOperation),
+    ).toBe(true);
+    expect(hasOwnerApproachWithStartedBodyOperation(10, 9.75, undefined)).toBe(
+      false,
+    );
+    expect(
+      hasOwnerApproachWithStartedBodyOperation(10, 9.75, {
+        ...activeOperation,
+        operationId: "",
+      }),
+    ).toBe(false);
+    expect(
+      hasOwnerApproachWithStartedBodyOperation(10, 9.75, {
+        ...activeOperation,
+        bodyStartedAt: "invalid",
+      }),
+    ).toBe(false);
+    expect(
+      hasOwnerApproachWithStartedBodyOperation(10, 9.751, activeOperation),
+    ).toBe(false);
+  });
+});
+
+describe("hasNewActiveOwnerProposalGoal", () => {
+  it("requires a new adopted owner proposal linked to an active owner goal", () => {
+    expect(
+      hasNewActiveOwnerProposalGoal(
+        ["old-proposal"],
+        [{ id: "new-proposal", status: "adopted" }],
+        [
+          {
+            ownerProposalId: "new-proposal",
+            source: "owner",
+            status: "active",
+          },
+        ],
+      ),
+    ).toBe(true);
+    expect(
+      hasNewActiveOwnerProposalGoal(
+        ["old-proposal"],
+        [{ id: "old-proposal", status: "adopted" }],
+        [
+          {
+            ownerProposalId: "old-proposal",
+            source: "owner",
+            status: "active",
+          },
+        ],
+      ),
+    ).toBe(false);
+    expect(
+      hasNewActiveOwnerProposalGoal(
+        ["old-proposal"],
+        [{ id: "new-proposal", status: "adopted" }],
+        [
+          {
+            ownerProposalId: "new-proposal",
+            source: "guest",
+            status: "active",
+          },
+        ],
+      ),
+    ).toBe(false);
+    expect(
+      hasNewActiveOwnerProposalGoal(
+        ["old-proposal"],
+        [{ id: "new-proposal", status: "adopted" }],
+        [
+          {
+            ownerProposalId: "new-proposal",
+            source: "owner",
+            status: "paused",
+          },
+        ],
+      ),
+    ).toBe(false);
+  });
+});
 
 describe("hasJudgmentAfterSuccessfulOutcome", () => {
   it("requires a judgment strictly after a successful outcome", () => {

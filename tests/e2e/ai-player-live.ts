@@ -119,8 +119,11 @@ import {
 import {
   hasCancellationOutcomeForOperation,
   hasJudgmentAfterSuccessfulOutcome,
+  hasNewActiveOwnerProposalGoal,
+  hasOwnerApproachWithStartedBodyOperation,
   hasTerminalOutcomeForOperation,
   isStoppedHandoffBoundaryConfirmed,
+  ownerApproachReductionBucket,
 } from "./autonomous-milestone.js";
 import { classifyObservationReply } from "./observation-reply-classifier.js";
 import {
@@ -7711,9 +7714,12 @@ async function main(): Promise<void> {
           parallelOwnerOperationReacquired: false,
           parallelOwnerPreferenceSent: false,
           parallelOwnerRequestResolved: false,
+          parallelOwnerGoalLinkedToRequest: false,
           parallelActionChangedAfterOwnerPreference: false,
           parallelOwnerApproachCheckCount: 0,
+          parallelOwnerApproachReductionBucket: "none",
           parallelOwnerApproachWorldObserved: false,
+          parallelOwnerApproachOperationMatchesStop: false,
           parallelStopRequested: false,
           parallelStopActiveBodyOperationObserved: false,
           parallelStopLatchConfirmed: false,
@@ -7817,19 +7823,25 @@ async function main(): Promise<void> {
           ownerOperation,
           changed,
         );
+        const ownerGoalLinkedToRequest = hasNewActiveOwnerProposalGoal(
+          ownerOperation.proposals.map((proposal) => proposal.id),
+          changed.proposals,
+          changed.goals,
+        );
         if (!ownerOpinionReceived || !ownerRequestChangedGoal)
           incomplete("OWNER_DIALOGUE_NOT_HANDLED_DURING_ACTION");
         updateParallelDiagnostic(state, {
           parallelOwnerOpinionReceived: ownerOpinionReceived,
           parallelOwnerRequestResolved: ownerRequestChangedGoal,
+          parallelOwnerGoalLinkedToRequest: ownerGoalLinkedToRequest,
         });
         let lastOwnerApproachCheckAt = 0;
-        let ownerApproachWorldObserved = false;
         let ownerApproachCheckCount = 0;
         let bestApproachBucket = "none";
-        const ownerApproach = await waitForPlayer(
+        let ownerApproachOperationId: string | undefined;
+        const ownerApproach = await observeForPlayer(
           context,
-          75_000,
+          5_000,
           async (player) => {
             const actionChanged =
               player.actionRevision > ownerOperation.actionRevision &&
@@ -7849,26 +7861,42 @@ async function main(): Promise<void> {
               botPosition.y - ownerPosition.y,
               botPosition.z - ownerPosition.z,
             );
-            const reduction = ownerDistanceBeforeRequest - remainingDistance;
             ownerApproachCheckCount += 1;
-            if (reduction >= 1.5) bestApproachBucket = "at_least_1_5";
-            else if (reduction > 0 && bestApproachBucket === "none")
-              bestApproachBucket = "under_1_5";
-            ownerApproachWorldObserved ||= reduction >= 1.5;
+            const reductionBucket = ownerApproachReductionBucket(
+              ownerDistanceBeforeRequest,
+              remainingDistance,
+            );
+            if (reductionBucket === "minimum_met")
+              bestApproachBucket = "minimum_met";
+            else if (
+              reductionBucket === "under_minimum" &&
+              bestApproachBucket === "none"
+            ) {
+              bestApproachBucket = "under_minimum";
+            }
+            const approachWithActiveOperation =
+              hasOwnerApproachWithStartedBodyOperation(
+                ownerDistanceBeforeRequest,
+                remainingDistance,
+                player.activeOperation,
+              );
+            if (approachWithActiveOperation)
+              ownerApproachOperationId = player.activeOperation?.operationId;
             updateParallelDiagnostic(state, {
               parallelOwnerApproachCheckCount: ownerApproachCheckCount,
               parallelOwnerApproachReductionBucket: bestApproachBucket,
-              parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
+              parallelOwnerApproachWorldObserved: approachWithActiveOperation,
               parallelActionChangedAfterOwnerPreference: actionChanged,
             });
             lastOwnerApproachCheckAt = Date.now();
-            return ownerApproachWorldObserved;
+            return approachWithActiveOperation;
           },
         );
         const activeBeforeStop = playerOf(await collect(context.runtime.app));
         const capturedOperation = activeBeforeStop.activeOperation;
+        const stopGenerationBefore = liveBeforeOwnerChat.stopGeneration;
         if (
-          activeBeforeStop.stopGeneration !== ownerApproach.stopGeneration ||
+          activeBeforeStop.stopGeneration !== stopGenerationBefore ||
           !isOperationActive(activeBeforeStop) ||
           capturedOperation === undefined ||
           capturedOperation.operationId.length === 0 ||
@@ -7880,7 +7908,16 @@ async function main(): Promise<void> {
         updateParallelDiagnostic(state, {
           parallelStopActiveBodyOperationObserved: true,
         });
-        const stopGenerationBefore = activeBeforeStop.stopGeneration;
+        const ownerApproachOperationMatchesStop =
+          ownerApproach !== undefined &&
+          ownerApproachOperationId !== undefined &&
+          capturedOperation.operationId === ownerApproachOperationId;
+        const ownerApproachWorldObserved = ownerApproach !== undefined;
+        updateParallelDiagnostic(state, {
+          parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
+          parallelOwnerApproachOperationMatchesStop:
+            ownerApproachOperationMatchesStop,
+        });
         let capturedOperationReceiptStatus:
           PlayerOutcomeStatus | "missing" | "other" = "missing";
         sendChat(context.owner, "今の行動を停止してください。");
@@ -7966,6 +8003,10 @@ async function main(): Promise<void> {
           parallelStopRuntimeQuietConfirmed: true,
           parallelStopRconQuietConfirmed: true,
         });
+        if (!ownerGoalLinkedToRequest)
+          incomplete("PARALLEL_OWNER_GOAL_NOT_LINKED_TO_REQUEST");
+        if (!ownerApproachWorldObserved)
+          incomplete("PARALLEL_OWNER_APPROACH_NOT_CONFIRMED");
         return {
           actionWasInFlight: true,
           ownerChatReceivedDuringLiveOperation:
@@ -7976,7 +8017,9 @@ async function main(): Promise<void> {
           unauthorizedChatDidNotMutateState: true,
           ownerOpinionProcessedDuringAction: true,
           ownerRequestChangedOrResolvedGoal: ownerRequestChangedGoal,
+          ownerGoalLinkedToRequest,
           ownerRequestWorldProgressObserved: ownerApproachWorldObserved,
+          ownerApproachOperationMatchesStop,
           stopActiveBodyOperationObserved: true,
           stopOperationReceiptConfirmed: true,
           stopOperationReceiptStatus: capturedOperationReceiptStatus,
