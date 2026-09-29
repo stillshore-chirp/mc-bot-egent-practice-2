@@ -2810,12 +2810,15 @@ function runBudgetFromEnvironment(): RunBudget {
 }
 
 export function runBudgetCoversCase(
-  runBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  runBudget: Pick<RunBudget, "durationMs" | "llmCalls" | "totalTokens">,
   caseBudget: Pick<RunBudget, "llmCalls" | "totalTokens">,
+  caseDeadlineMs: number,
+  elapsedSetupMs = 0,
 ): boolean {
   return (
     runBudget.llmCalls >= caseBudget.llmCalls &&
-    runBudget.totalTokens >= caseBudget.totalTokens
+    runBudget.totalTokens >= caseBudget.totalTokens &&
+    runBudget.durationMs - elapsedSetupMs >= caseDeadlineMs
   );
 }
 
@@ -8549,6 +8552,7 @@ async function main(): Promise<void> {
 }
 
 async function prepareRun(): Promise<RunState> {
+  const setupStartedClock = Date.now();
   if (process.env.AI_PLAYER_E2E_CONFIRMED !== "YES")
     incomplete("E2E_CONFIRMATION_REQUIRED");
   const selectedDiagnosticProbeCount = [
@@ -8621,9 +8625,22 @@ async function prepareRun(): Promise<RunState> {
     targetCase === undefined ? undefined : CASE_BUDGETS[targetCase];
   if (
     targetCaseBudget !== undefined &&
-    !runBudgetCoversCase(runBudget, targetCaseBudget)
+    (runBudget.llmCalls < targetCaseBudget.llmCalls ||
+      runBudget.totalTokens < targetCaseBudget.totalTokens)
   ) {
     incomplete("RUN_BUDGET_BELOW_TARGET_CASE_BUDGET");
+  }
+  if (
+    targetCase !== undefined &&
+    targetCaseBudget !== undefined &&
+    !runBudgetCoversCase(
+      runBudget,
+      targetCaseBudget,
+      CASE_DEADLINES[targetCase],
+      Date.now() - setupStartedClock,
+    )
+  ) {
+    incomplete("RUN_BUDGET_BELOW_TARGET_CASE_DURATION");
   }
   const cacheDirectoryValue =
     process.env.AI_PLAYER_E2E_SERVER_CACHE_DIR?.trim();
@@ -8662,7 +8679,7 @@ async function prepareRun(): Promise<RunState> {
   const suffix = randomBytes(2).toString("hex").toUpperCase();
   const runSeed = WORLD_SEED;
   const worldFixture = "flat-platform-dry-wall-container-oak-v1";
-  const startedClock = Date.now();
+  const startedClock = setupStartedClock;
   const state: RunState = {
     id: runId,
     ...(targetCase === undefined ? {} : { targetCase }),
@@ -14687,6 +14704,19 @@ async function runCase(
   let initialCaptured = false;
   let caseExecuted = false;
   try {
+    if (
+      state.targetCase === id &&
+      !runBudgetCoversCase(
+        {
+          ...state.runBudget,
+          durationMs: state.runDeadlineAt - started,
+        },
+        { llmCalls: maxCalls, totalTokens: maxTokens },
+        deadlineMs,
+      )
+    ) {
+      incomplete("RUN_BUDGET_CASE_TIME_RESERVATION_UNAVAILABLE");
+    }
     if (!shouldCollectAfterRun(state))
       incomplete(state.failureCode ?? "RUN_STOPPED_AFTER_BUDGET_OR_DEADLINE");
     const dependencyFailure = unknownHandoffCaseBlockCode(

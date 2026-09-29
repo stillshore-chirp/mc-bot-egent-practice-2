@@ -61,17 +61,20 @@ describe("no-food replan targeted E2E case", () => {
     );
     expect(
       runBudgetCoversCase(
-        { llmCalls: 160, totalTokens: 800_000 },
+        { durationMs: 10 * 60_000, llmCalls: 160, totalTokens: 800_000 },
         NO_FOOD_REPLAN_CASE_BUDGET,
+        NO_FOOD_REPLAN_CASE_DEADLINE_MS,
       ),
     ).toBe(true);
     expect(
       runBudgetCoversCase(
         {
+          durationMs: 10 * 60_000,
           llmCalls: NO_FOOD_REPLAN_CASE_BUDGET.llmCalls - 1,
           totalTokens: NO_FOOD_REPLAN_CASE_BUDGET.totalTokens,
         },
         NO_FOOD_REPLAN_CASE_BUDGET,
+        NO_FOOD_REPLAN_CASE_DEADLINE_MS,
       ),
     ).toBe(false);
   });
