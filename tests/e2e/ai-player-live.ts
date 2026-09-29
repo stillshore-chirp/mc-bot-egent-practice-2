@@ -10849,6 +10849,12 @@ async function runGatherMultiTargetContinuityCase(
   context: CaseContext,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   let fixture: GatherMultiTargetFixture | undefined;
+  let caseResult:
+    Readonly<Record<string, boolean | number | string>> | undefined;
+  let primaryError: unknown;
+  let cleanupError: unknown;
+  let primaryFailed = false;
+  let cleanupFailed = false;
   try {
     const quiet = await observeForPlayer(
       context,
@@ -11045,16 +11051,16 @@ async function runGatherMultiTargetContinuityCase(
       ) {
         return false;
       }
-      const accepted = player.recentJudgments.findLast(
-        ({ proposalId, proposalDisposition, decidedAt }) =>
-          birchProposalIds.includes(proposalId ?? "") &&
-          (proposalDisposition === "adopted" ||
-            proposalDisposition === "compromised") &&
-          Date.parse(decidedAt ?? "") >= followupSentAt,
+      const acceptedGoal = player.goals.find(
+        ({ ownerProposalId, source, status }) =>
+          birchProposalIds.includes(ownerProposalId ?? "") &&
+          source === "owner" &&
+          (status === "active" || status === "completed"),
       );
-      if (accepted === undefined) return false;
-      birchAcceptedAt = Date.parse(accepted.decidedAt ?? "");
-      return Number.isFinite(birchAcceptedAt);
+      birchAcceptedAt = Date.parse(acceptedGoal?.updatedAt ?? "");
+      return (
+        Number.isFinite(birchAcceptedAt) && birchAcceptedAt >= followupSentAt
+      );
     });
     if (birchIntent === undefined)
       incomplete("GATHER_MULTI_TARGET_BIRCH_FOLLOWUP_NOT_ACCEPTED");
@@ -11071,7 +11077,6 @@ async function runGatherMultiTargetContinuityCase(
     };
     updateGatherMultiTargetDiagnostic(state, {
       gatherBirchFollowupOwnerGoalAccepted: true,
-      gatherFollowupAcceptedJudgmentObserved: true,
       gatherRequestedBirchLogCount: birchGoalCount ?? "unknown",
     });
 
@@ -11215,7 +11220,7 @@ async function runGatherMultiTargetContinuityCase(
       activeFixture,
     );
     fixture = undefined;
-    return {
+    caseResult = {
       ...gatherMultiTargetSafeEvidence(state),
       gatherIndependentServerCountsConfirmed: true,
       gatherBodyDigAndPickupPairsConfirmed: true,
@@ -11230,16 +11235,29 @@ async function runGatherMultiTargetContinuityCase(
           ? "target_counts_reached"
           : "target_counts_remaining",
     };
+  } catch (error) {
+    primaryError = error;
+    primaryFailed = true;
   } finally {
     if (fixture !== undefined) {
-      await cleanupGatherMultiTargetFixture(
-        state,
-        context.rcon,
-        context.botName,
-        fixture,
-      );
+      try {
+        await cleanupGatherMultiTargetFixture(
+          state,
+          context.rcon,
+          context.botName,
+          fixture,
+        );
+      } catch (error) {
+        cleanupError = error;
+        cleanupFailed = true;
+      }
     }
   }
+  if (primaryFailed) throw primaryError;
+  if (cleanupFailed) throw cleanupError;
+  if (caseResult === undefined)
+    throw new Error("Gather case returned no result");
+  return caseResult;
 }
 
 async function sampleGatherProgressReply(
