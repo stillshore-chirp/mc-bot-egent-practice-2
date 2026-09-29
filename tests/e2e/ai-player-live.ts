@@ -488,6 +488,12 @@ type UnknownObstacleReadinessStatus =
   | "other_entities_not_clear"
   | "oracle_unavailable";
 type UnknownMoveOperationKind = "move_to" | "move_relative";
+type UnknownPreTaskObservationCaptureClass =
+  | "available"
+  | "body_missing"
+  | "observe_threw"
+  | "stale"
+  | "missing_visibility";
 
 interface UnknownCompositeDiagnostic {
   readonly unknownTargetInitiallyPresent?: boolean;
@@ -530,6 +536,7 @@ interface UnknownCompositeDiagnostic {
   readonly unknownFixtureFacingReadbackAvailable?: boolean;
   readonly unknownFixtureFacingConfirmed?: boolean;
   readonly unknownPreTaskObservationStatus?: "available" | "unknown";
+  readonly unknownPreTaskObservationCaptureClass?: UnknownPreTaskObservationCaptureClass;
   readonly unknownPreTaskTargetBlockVisible?: boolean;
   readonly unknownPreTaskWallMaterialVisible?: boolean;
   readonly unknownTaskOwnerGoalAccepted?: boolean;
@@ -7049,20 +7056,73 @@ async function main(): Promise<void> {
           incomplete("UNKNOWN_FIXTURE_FACING_NOT_CONFIRMED");
         const facingConfirmedAt = Date.now();
         let preTaskObservation: PlayerEvidence["lastObservation"];
+        let preTaskObservationCaptureClass:
+          UnknownPreTaskObservationCaptureClass | undefined;
         if (issue77TargetedRun) {
-          try {
-            const observation = await activeApplicationPlayerBody?.observe();
-            preTaskObservation =
-              observation === undefined
-                ? undefined
-                : {
-                    observedAt: observation.observedAt,
-                    visibleBlockNames: observation.perception.blocks.map(
-                      ({ name }) => name,
-                    ),
-                  };
-          } catch {
-            preTaskObservation = undefined;
+          const body = activeApplicationPlayerBody;
+          if (body === undefined) {
+            preTaskObservationCaptureClass = "body_missing";
+          } else {
+            const observationDeadline = Math.min(
+              facingConfirmedAt + 5_000,
+              context.caseDeadlineAt,
+            );
+            while (
+              Date.now() < observationDeadline &&
+              preTaskObservationCaptureClass !== "available" &&
+              preTaskObservationCaptureClass !== "observe_threw"
+            ) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              let observation:
+                Awaited<ReturnType<typeof body.observe>> | undefined;
+              try {
+                const remainingMs = observationDeadline - Date.now();
+                observation = await Promise.race([
+                  body.observe(),
+                  new Promise<undefined>((resolve) => {
+                    timer = setTimeout(() => resolve(undefined), remainingMs);
+                  }),
+                ]);
+              } catch {
+                preTaskObservationCaptureClass = "observe_threw";
+                break;
+              } finally {
+                if (timer !== undefined) clearTimeout(timer);
+              }
+              if (observation === undefined) {
+                preTaskObservationCaptureClass = "stale";
+                break;
+              }
+              const visibleBlocks = (
+                observation.perception as {
+                  blocks?: readonly { readonly name: string }[];
+                }
+              ).blocks;
+              const observedAt = Date.parse(observation.observedAt);
+              if (
+                !Number.isFinite(observedAt) ||
+                observedAt <= facingConfirmedAt
+              ) {
+                preTaskObservationCaptureClass = "stale";
+              } else if (
+                visibleBlocks === undefined ||
+                visibleBlocks.length === 0
+              ) {
+                preTaskObservationCaptureClass = "missing_visibility";
+              } else {
+                preTaskObservation = {
+                  observedAt: observation.observedAt,
+                  visibleBlockNames: visibleBlocks.map(({ name }) => name),
+                };
+                preTaskObservationCaptureClass = "available";
+              }
+              if (
+                preTaskObservationCaptureClass === "stale" ||
+                preTaskObservationCaptureClass === "missing_visibility"
+              ) {
+                await waitMs(Math.min(125, observationDeadline - Date.now()));
+              }
+            }
           }
         } else {
           preTaskObservation = playerOf(
@@ -7081,6 +7141,12 @@ async function main(): Promise<void> {
           : { status: "unknown" as const };
         updateUnknownCompositeDiagnostic(state, {
           unknownPreTaskObservationStatus: preTaskVisibility.status,
+          ...(preTaskObservationCaptureClass === undefined
+            ? {}
+            : {
+                unknownPreTaskObservationCaptureClass:
+                  preTaskObservationCaptureClass,
+              }),
           ...(preTaskVisibility.targetBlockVisible === undefined
             ? {}
             : {
