@@ -71,7 +71,16 @@ npm exec -- tsx tests/e2e/ai-player-live.ts
 
 この説明はcaseの実装契約です。実GPTを使った対象runがpassするまでは、Issue #83の実ゲーム受入証拠として数えません。
 
-`owner_return_through_door`は、既定runtimeへ自然なowner帰還依頼を一度送り、階段と閉じた木製ドアを含む隔離fixtureを通過する挙動を測ります。RCONはfixtureの設置と位置・door状態の独立readbackだけに使い、移動は既定PlayerBodyを通るGPT判断に任せます。成功には今回の依頼後に生じた一件のproposalがadoptedまたはcompromisedとなり、その同じproposalへowner goalが結び付いていること、依頼後のmove_to判断、BodyとRCON双方のowner側到達、ownerから1.75ブロック以内、両観測の位置一致、door openを要求します。declined、pending、unknown、proposalに結び付かないowner goalは成功条件を満たしません。`ownerProposalAdoptedForRequest`はadoptedのみを表し、adoptedまたはcompromisedでgoalがリンク済みかは`ownerProposalProgressableForRequest`に記録します。
+`owner_return_through_door`は、既定runtimeへ自然なowner帰還依頼を一度送り、階段と閉じた木製ドアを含む隔離fixtureを通過する挙動を測ります。RCONはfixtureの設置と位置・door状態の独立readbackだけに使い、移動は既定PlayerBodyを通るGPT判断に任せます。成功には次の条件をすべて要求します。
+
+- 今回の依頼後に生じた一件のproposalがadoptedまたはcompromisedとなり、その同じproposalへowner goalが結び付いている。
+- 依頼後にmove_to判断がある。
+- BodyとRCON双方がownerから1.75ブロック以内を示し、両観測の位置が一致する。
+- doorがopenである。
+
+side分類（`owner_side`、`doorway`など）は公開診断に残しますが、固定境界の分類自体は到着predicateに使いません。`declined`、`pending`、`unknown`、proposalに結び付かないowner goalは成功条件を満たしません。`ownerProposalAdoptedForRequest`はadoptedのみを表し、adoptedまたはcompromisedでgoalがリンク済みかは`ownerProposalProgressableForRequest`に記録します。
+
+履歴上の実測case statusは`incomplete`のまま保持します。そのrunでは旧side境界条件が到着を否定しましたが、保存済みの位置・距離・door証跡を現行ACで判定すると、Body/RCON双方が1.75ブロック以内で位置が一致し、doorがopenのため到着predicateを満たします。この再判定は保存済みstatusを書き換えず、proposal・goal・move条件を含むcase全体の証拠とも区別します。
 
 単独target runでは、実applicationが生成するPlayerBodyを捕捉するprobeをapplication生成前に設置します。Bodyを取得できない場合はcaseを未完了にし、proposal・移動・到着の成功根拠にしません。
 

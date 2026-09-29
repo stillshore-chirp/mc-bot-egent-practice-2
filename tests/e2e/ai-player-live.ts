@@ -10413,8 +10413,6 @@ export function ownerReturnArrivalConfirmed(
   >,
 ): boolean {
   return (
-    sample.bodySide === "owner_side" &&
-    sample.rconSide === "owner_side" &&
     sample.bodyDistance === "within_1_75" &&
     sample.rconDistance === "within_1_75" &&
     sample.bodyRconAligned &&

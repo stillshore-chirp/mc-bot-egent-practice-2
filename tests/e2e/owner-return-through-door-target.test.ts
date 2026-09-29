@@ -352,7 +352,7 @@ describe("owner return through door targeted E2E case", () => {
     expect(ownerReturnProposalDisposition(undefined)).toBe("unknown");
   });
 
-  it("requires matching owner-side arrival, distance, and an open door", () => {
+  it("requires close aligned observations and an open door, with side as diagnostics", () => {
     const confirmed = {
       bodySide: "owner_side",
       rconSide: "owner_side",
@@ -364,11 +364,15 @@ describe("owner return through door targeted E2E case", () => {
     expect(ownerReturnArrivalConfirmed(confirmed)).toBe(true);
 
     expect(
-      ownerReturnArrivalConfirmed({ ...confirmed, bodySide: "doorway" }),
-    ).toBe(false);
+      ownerReturnArrivalConfirmed({
+        ...confirmed,
+        bodySide: "doorway",
+        rconSide: "doorway",
+      }),
+    ).toBe(true);
     expect(
-      ownerReturnArrivalConfirmed({ ...confirmed, rconSide: "return_side" }),
-    ).toBe(false);
+      ownerReturnArrivalConfirmed({ ...confirmed, bodySide: "doorway" }),
+    ).toBe(true);
     expect(
       ownerReturnArrivalConfirmed({
         ...confirmed,
@@ -386,6 +390,9 @@ describe("owner return through door targeted E2E case", () => {
     ).toBe(false);
     expect(
       ownerReturnArrivalConfirmed({ ...confirmed, doorState: "closed" }),
+    ).toBe(false);
+    expect(
+      ownerReturnArrivalConfirmed({ ...confirmed, doorState: "unknown" }),
     ).toBe(false);
   });
 
