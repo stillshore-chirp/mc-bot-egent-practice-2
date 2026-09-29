@@ -117,9 +117,12 @@ import {
   withRestorableObstacle,
 } from "./unknown-recovery-obstacle.js";
 import {
+  hasCancellationOutcomeForOperation,
   hasJudgmentAfterSuccessfulOutcome,
+  hasNewActiveOwnerProposalGoal,
   hasTerminalOutcomeForOperation,
   isStoppedHandoffBoundaryConfirmed,
+  ownerApproachReductionBucket,
 } from "./autonomous-milestone.js";
 import { classifyObservationReply } from "./observation-reply-classifier.js";
 import {
@@ -247,10 +250,10 @@ export const NO_FOOD_REPLAN_CASE_BUDGET = {
 } as const;
 export const NO_FOOD_REPLAN_CASE_DEADLINE_MS = 4 * 60_000;
 export const PARALLEL_DIALOGUE_STOP_CASE_BUDGET = {
-  llmCalls: 48,
-  totalTokens: 240_000,
+  llmCalls: 64,
+  totalTokens: 480_000,
 } as const;
-export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 14 * 60_000;
+export const PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS = 20 * 60_000;
 export const OWNER_STOP_LATCH_CASE_BUDGET = {
   llmCalls: 48,
   totalTokens: 240_000,
@@ -7710,10 +7713,21 @@ async function main(): Promise<void> {
           parallelOwnerOperationReacquired: false,
           parallelOwnerPreferenceSent: false,
           parallelOwnerRequestResolved: false,
+          parallelOwnerGoalLinkedToRequest: false,
           parallelActionChangedAfterOwnerPreference: false,
           parallelOwnerApproachCheckCount: 0,
+          parallelOwnerApproachReductionBucket: "none",
           parallelOwnerApproachWorldObserved: false,
+          parallelOwnerApproachOperationMatchesStop: false,
           parallelStopRequested: false,
+          parallelStopActiveBodyOperationObserved: false,
+          parallelStopLatchConfirmed: false,
+          parallelStopOperationGone: false,
+          parallelStopGenerationAdvanced: false,
+          parallelStopOperationReceiptConfirmed: false,
+          parallelStopOperationReceiptStatus: "missing",
+          parallelStopRuntimeQuietConfirmed: false,
+          parallelStopRconQuietConfirmed: false,
         });
         sendChat(
           context.owner,
@@ -7808,19 +7822,25 @@ async function main(): Promise<void> {
           ownerOperation,
           changed,
         );
+        const ownerGoalLinkedToRequest = hasNewActiveOwnerProposalGoal(
+          ownerOperation.proposals.map((proposal) => proposal.id),
+          changed.proposals,
+          changed.goals,
+        );
         if (!ownerOpinionReceived || !ownerRequestChangedGoal)
           incomplete("OWNER_DIALOGUE_NOT_HANDLED_DURING_ACTION");
         updateParallelDiagnostic(state, {
           parallelOwnerOpinionReceived: ownerOpinionReceived,
           parallelOwnerRequestResolved: ownerRequestChangedGoal,
+          parallelOwnerGoalLinkedToRequest: ownerGoalLinkedToRequest,
         });
         let lastOwnerApproachCheckAt = 0;
-        let ownerApproachWorldObserved = false;
         let ownerApproachCheckCount = 0;
         let bestApproachBucket = "none";
-        const ownerApproach = await waitForPlayer(
+        let ownerApproachOperationId: string | undefined;
+        const ownerApproach = await observeForPlayer(
           context,
-          75_000,
+          5_000,
           async (player) => {
             const actionChanged =
               player.actionRevision > ownerOperation.actionRevision &&
@@ -7840,38 +7860,122 @@ async function main(): Promise<void> {
               botPosition.y - ownerPosition.y,
               botPosition.z - ownerPosition.z,
             );
-            const reduction = ownerDistanceBeforeRequest - remainingDistance;
             ownerApproachCheckCount += 1;
-            if (reduction >= 1.5) bestApproachBucket = "at_least_1_5";
-            else if (reduction > 0 && bestApproachBucket === "none")
-              bestApproachBucket = "under_1_5";
-            ownerApproachWorldObserved ||= reduction >= 1.5;
+            const reductionBucket = ownerApproachReductionBucket(
+              ownerDistanceBeforeRequest,
+              remainingDistance,
+            );
+            if (reductionBucket === "minimum_met")
+              bestApproachBucket = "minimum_met";
+            else if (
+              reductionBucket === "under_minimum" &&
+              bestApproachBucket === "none"
+            ) {
+              bestApproachBucket = "under_minimum";
+            }
+            const approachThresholdMet = reductionBucket === "minimum_met";
+            if (player.activeOperation?.operationId.trim())
+              ownerApproachOperationId = player.activeOperation.operationId;
             updateParallelDiagnostic(state, {
               parallelOwnerApproachCheckCount: ownerApproachCheckCount,
               parallelOwnerApproachReductionBucket: bestApproachBucket,
-              parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
+              parallelOwnerApproachWorldObserved: approachThresholdMet,
               parallelActionChangedAfterOwnerPreference: actionChanged,
             });
             lastOwnerApproachCheckAt = Date.now();
-            return ownerApproachWorldObserved;
+            return approachThresholdMet;
           },
         );
+        const activeBeforeStop = playerOf(await collect(context.runtime.app));
+        const capturedOperation = activeBeforeStop.activeOperation;
+        const stopGenerationBefore = activeBeforeStop.stopGeneration;
+        const stopGenerationUnchangedBeforeRequest =
+          stopGenerationBefore === liveBeforeOwnerChat.stopGeneration;
+        const stopActiveBodyOperationObserved =
+          typeof capturedOperation?.bodyStartedAt === "string" &&
+          Number.isFinite(Date.parse(capturedOperation.bodyStartedAt));
+        const capturedOperationId =
+          capturedOperation?.operationId.trim().length === 0
+            ? undefined
+            : capturedOperation?.operationId;
+        const capturedOperationWasActive = capturedOperation !== undefined;
+        updateParallelDiagnostic(state, {
+          parallelStopActiveBodyOperationObserved:
+            stopActiveBodyOperationObserved,
+        });
+        const ownerApproachOperationMatchesStop =
+          ownerApproach !== undefined &&
+          ownerApproachOperationId !== undefined &&
+          capturedOperation?.operationId === ownerApproachOperationId;
+        const ownerApproachWorldObserved = ownerApproach !== undefined;
+        updateParallelDiagnostic(state, {
+          parallelOwnerApproachWorldObserved: ownerApproachWorldObserved,
+          parallelOwnerApproachOperationMatchesStop:
+            ownerApproachOperationMatchesStop,
+        });
+        let capturedOperationReceiptStatus:
+          PlayerOutcomeStatus | "missing" | "other" = "missing";
+        let capturedOperationCancellationConfirmed = false;
         sendChat(context.owner, "今の行動を停止してください。");
         updateParallelDiagnostic(state, { parallelStopRequested: true });
-        const stopped = await waitForPlayer(
-          context,
-          45_000,
-          (player) =>
+        const stopped = await waitForPlayer(context, 45_000, (player) => {
+          const capturedOutcome =
+            capturedOperationId === undefined
+              ? undefined
+              : player.recentOutcomes.find(
+                  (outcome) => outcome.operationId === capturedOperationId,
+                );
+          const safeCapturedStatus = safeOutcomeStatus(capturedOutcome?.status);
+          capturedOperationReceiptStatus =
+            safeCapturedStatus ??
+            (capturedOutcome === undefined ? "missing" : "other");
+          const cancellationConfirmed =
+            capturedOperationId !== undefined &&
+            hasCancellationOutcomeForOperation(
+              capturedOperationId,
+              player.recentOutcomes,
+            );
+          capturedOperationCancellationConfirmed = cancellationConfirmed;
+          if (
+            capturedOperationReceiptStatus !== "missing" &&
+            capturedOperationReceiptStatus !== "other" &&
+            !cancellationConfirmed
+          ) {
+            fail("PARALLEL_STOP_CAPTURED_OPERATION_NOT_INTERRUPTED");
+          }
+          const activeCleared = !isOperationActive(player);
+          const generationAdvanced =
+            player.stopGeneration > stopGenerationBefore;
+          updateParallelDiagnostic(state, {
+            parallelStopLatchConfirmed: player.stopped,
+            parallelStopOperationGone: activeCleared,
+            parallelStopGenerationAdvanced: generationAdvanced,
+            parallelStopOperationReceiptConfirmed: cancellationConfirmed,
+            parallelStopOperationReceiptStatus: capturedOperationReceiptStatus,
+          });
+          return (
             player.stopped &&
-            !isOperationActive(player) &&
-            player.stopGeneration > ownerApproach.stopGeneration,
-        );
+            activeCleared &&
+            generationAdvanced &&
+            (!capturedOperationWasActive || cancellationConfirmed)
+          );
+        });
         const stopGeneration = stopped.stopGeneration;
         updateParallelDiagnostic(state, { parallelStopLatchConfirmed: true });
         const revisionAtStop = stopped.actionRevision;
-        const quietUntil = Math.min(Date.now() + 8_000, context.runDeadlineAt);
+        const rconPositionAtStop = parsePosition(
+          await rcon.command(`data get entity ${state.botName} Pos`),
+        );
+        const quietStartedAt = Date.now();
+        const quietUntil = Math.min(
+          quietStartedAt + 8_000,
+          context.caseDeadlineAt,
+          context.runDeadlineAt,
+        );
+        if (quietUntil - quietStartedAt < 8_000)
+          incomplete("PARALLEL_STOP_QUIET_WINDOW_UNAVAILABLE");
         while (Date.now() < quietUntil) {
-          await waitMs(1_000);
+          await waitMs(Math.min(1_000, quietUntil - Date.now()));
           const sample = playerOf(await collect(context.runtime.app));
           if (
             !sample.stopped ||
@@ -7881,7 +7985,32 @@ async function main(): Promise<void> {
           ) {
             fail("STOPPED_RUNTIME_RESUMED_WITHOUT_OWNER_REQUEST");
           }
+          const currentPosition = parsePosition(
+            await rcon.command(`data get entity ${state.botName} Pos`),
+          );
+          if (
+            Math.hypot(
+              currentPosition.x - rconPositionAtStop.x,
+              currentPosition.y - rconPositionAtStop.y,
+              currentPosition.z - rconPositionAtStop.z,
+            ) > 0.75
+          ) {
+            fail("PARALLEL_STOP_RCON_MOVED_AFTER_LATCH");
+          }
         }
+        const quietWindowMs = Date.now() - quietStartedAt;
+        if (quietWindowMs < 8_000)
+          incomplete("PARALLEL_STOP_QUIET_WINDOW_INCOMPLETE");
+        updateParallelDiagnostic(state, {
+          parallelStopRuntimeQuietConfirmed: true,
+          parallelStopRconQuietConfirmed: true,
+        });
+        if (!stopGenerationUnchangedBeforeRequest)
+          incomplete("PARALLEL_STOP_GENERATION_CHANGED_BEFORE_REQUEST");
+        if (!ownerGoalLinkedToRequest)
+          incomplete("PARALLEL_OWNER_GOAL_NOT_LINKED_TO_REQUEST");
+        if (!ownerApproachWorldObserved)
+          incomplete("PARALLEL_OWNER_APPROACH_NOT_CONFIRMED");
         return {
           actionWasInFlight: true,
           ownerChatReceivedDuringLiveOperation:
@@ -7892,9 +8021,18 @@ async function main(): Promise<void> {
           unauthorizedChatDidNotMutateState: true,
           ownerOpinionProcessedDuringAction: true,
           ownerRequestChangedOrResolvedGoal: ownerRequestChangedGoal,
+          ownerGoalLinkedToRequest,
           ownerRequestWorldProgressObserved: ownerApproachWorldObserved,
+          ownerApproachOperationMatchesStop,
+          stopActiveBodyOperationObserved,
+          stopOperationReceiptConfirmed: capturedOperationCancellationConfirmed,
+          stopOperationReceiptStatus: capturedOperationReceiptStatus,
+          stopGenerationAdvanced: stopGeneration > stopGenerationBefore,
+          stopOperationGone: !isOperationActive(stopped),
           immediateStopObserved: true,
           noRestartAfterStop: true,
+          runtimeAndRconQuietAfterStop: true,
+          quietWindowMs,
           ownerReplyObserved: context.responseQueue.length > beforeResponses,
           llmCallsDuringCase: stopped.counters.llmCalls - beforeLlm,
         };
@@ -7909,80 +8047,34 @@ async function main(): Promise<void> {
         requireLiveContext(),
         async (context) => {
           updateOwnerStopLatchDiagnostic(state, {
-            ownerStopTaskSent: false,
             ownerStopActiveBodyOperationObserved: false,
-            ownerStopRconMovementObserved: false,
             ownerStopRequested: false,
             ownerStopLatchConfirmed: false,
+            ownerStopOperationGone: false,
+            ownerStopGenerationAdvanced: false,
             ownerStopOperationReceiptConfirmed: false,
             ownerStopOperationReceiptStatus: "missing",
             ownerStopQuietWindowConfirmed: false,
             ownerStopRconQuietConfirmed: false,
           });
           const before = playerOf(await collect(context.runtime.app));
-          const startPosition = parsePosition(
-            await rcon.command(`data get entity ${state.botName} Pos`),
-          );
-          const taskSentAt = Date.now();
-          sendChat(
-            context.owner,
-            "南へ5ブロック移動してください。途中で止まらず、目標まで歩き続けてください。",
-          );
-          updateOwnerStopLatchDiagnostic(state, { ownerStopTaskSent: true });
-
-          let lastRconCheckAt = 0;
-          let operationAtProgress: PlayerEvidence | undefined;
-          await waitForPlayer(context, 90_000, async (player) => {
-            const operation = player.activeOperation;
-            if (
-              (operation?.kind !== "move_to" &&
-                operation?.kind !== "move_relative") ||
-              typeof operation.bodyStartedAt !== "string" ||
-              !Number.isFinite(Date.parse(operation.bodyStartedAt)) ||
-              Date.parse(operation.bodyStartedAt) < taskSentAt ||
-              operation.operationId === before.activeOperation?.operationId ||
-              player.actionRevision <= before.actionRevision
-            ) {
-              return false;
-            }
-            updateOwnerStopLatchDiagnostic(state, {
-              ownerStopActiveBodyOperationObserved: true,
-            });
-            if (Date.now() - lastRconCheckAt < 1_000) return false;
-            lastRconCheckAt = Date.now();
-            const position = parsePosition(
-              await rcon.command(`data get entity ${state.botName} Pos`),
-            );
-            if (
-              Math.hypot(
-                position.x - startPosition.x,
-                position.z - startPosition.z,
-              ) < 1.5
-            ) {
-              return false;
-            }
-            const latest = playerOf(await collect(context.runtime.app));
-            const latestOperation = latest.activeOperation;
-            if (
-              latestOperation?.operationId !== operation.operationId ||
-              latestOperation.kind !== operation.kind ||
-              typeof latestOperation.bodyStartedAt !== "string"
-            ) {
-              return false;
-            }
-            operationAtProgress = latest;
-            updateOwnerStopLatchDiagnostic(state, {
-              ownerStopRconMovementObserved: true,
-            });
-            return true;
+          const capturedOperation = before.activeOperation;
+          const capturedOperationWasActive = capturedOperation !== undefined;
+          const capturedOperationId =
+            capturedOperation !== undefined &&
+            capturedOperation.operationId.trim().length > 0
+              ? capturedOperation.operationId
+              : undefined;
+          const activeBodyOperationObserved =
+            typeof capturedOperation?.bodyStartedAt === "string" &&
+            Number.isFinite(Date.parse(capturedOperation.bodyStartedAt));
+          const stopGenerationBefore = before.stopGeneration;
+          updateOwnerStopLatchDiagnostic(state, {
+            ownerStopActiveBodyOperationObserved: activeBodyOperationObserved,
           });
-          const activeBeforeStop = operationAtProgress;
-          if (activeBeforeStop?.activeOperation === undefined) {
-            incomplete("OWNER_STOP_ACTIVE_OPERATION_NOT_CONFIRMED");
-          }
-          const capturedOperation = activeBeforeStop.activeOperation;
           let capturedOperationReceiptStatus:
             PlayerOutcomeStatus | "missing" | "other" = "missing";
+          let capturedOperationCancellationConfirmed = false;
 
           sendChat(context.owner, "今の行動を停止してください。");
           updateOwnerStopLatchDiagnostic(state, {
@@ -7992,14 +8084,16 @@ async function main(): Promise<void> {
             if (
               !player.stopped ||
               isOperationActive(player) ||
-              player.stopGeneration <= activeBeforeStop.stopGeneration
+              player.stopGeneration <= stopGenerationBefore
             ) {
               return false;
             }
-            const capturedOutcome = player.recentOutcomes.find(
-              (outcome) =>
-                outcome.operationId === capturedOperation.operationId,
-            );
+            const capturedOutcome =
+              capturedOperationId === undefined
+                ? undefined
+                : player.recentOutcomes.find(
+                    (outcome) => outcome.operationId === capturedOperationId,
+                  );
             const outcomeStatus = capturedOutcome?.status;
             capturedOperationReceiptStatus =
               outcomeStatus === "successful" ||
@@ -8012,12 +8106,17 @@ async function main(): Promise<void> {
                   ? "missing"
                   : "other";
             const cancellationConfirmed =
-              capturedOperationReceiptStatus === "interrupted" ||
-              capturedOperationReceiptStatus === "cancelled";
+              capturedOperationId !== undefined &&
+              hasCancellationOutcomeForOperation(
+                capturedOperationId,
+                player.recentOutcomes,
+              );
+            capturedOperationCancellationConfirmed = cancellationConfirmed;
             updateOwnerStopLatchDiagnostic(state, {
-              ownerStopLatchConfirmed: true,
-              ownerStopOperationGone: true,
-              ownerStopGenerationAdvanced: true,
+              ownerStopLatchConfirmed: player.stopped,
+              ownerStopOperationGone: !isOperationActive(player),
+              ownerStopGenerationAdvanced:
+                player.stopGeneration > stopGenerationBefore,
               ownerStopOperationReceiptConfirmed: cancellationConfirmed,
               ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
             });
@@ -8028,16 +8127,16 @@ async function main(): Promise<void> {
             ) {
               fail("OWNER_STOP_CAPTURED_OPERATION_NOT_INTERRUPTED");
             }
-            return cancellationConfirmed;
+            return !capturedOperationWasActive || cancellationConfirmed;
           });
           const stopGeneration = stopped.stopGeneration;
           const actionRevisionAtStop = stopped.actionRevision;
           updateOwnerStopLatchDiagnostic(state, {
-            ownerStopLatchConfirmed: true,
+            ownerStopLatchConfirmed: stopped.stopped,
             ownerStopOperationGone: !isOperationActive(stopped),
-            ownerStopGenerationAdvanced:
-              stopGeneration > activeBeforeStop.stopGeneration,
-            ownerStopOperationReceiptConfirmed: true,
+            ownerStopGenerationAdvanced: stopGeneration > stopGenerationBefore,
+            ownerStopOperationReceiptConfirmed:
+              capturedOperationCancellationConfirmed,
             ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
           });
 
@@ -8084,14 +8183,13 @@ async function main(): Promise<void> {
             ownerStopRconQuietConfirmed: true,
           });
           return {
-            ownerStopTaskSent: true,
-            ownerStopActiveBodyOperationObserved: true,
-            ownerStopRconMovementObserved: true,
             ownerStopRequested: true,
-            ownerStopLatchConfirmed: true,
-            ownerStopOperationGone: true,
-            ownerStopGenerationAdvanced: true,
-            ownerStopOperationReceiptConfirmed: true,
+            ownerStopActiveBodyOperationObserved: activeBodyOperationObserved,
+            ownerStopLatchConfirmed: stopped.stopped,
+            ownerStopOperationGone: !isOperationActive(stopped),
+            ownerStopGenerationAdvanced: stopGeneration > stopGenerationBefore,
+            ownerStopOperationReceiptConfirmed:
+              capturedOperationCancellationConfirmed,
             ownerStopOperationReceiptStatus: capturedOperationReceiptStatus,
             ownerStopQuietWindowConfirmed: true,
             ownerStopRconQuietConfirmed: true,
