@@ -2938,13 +2938,28 @@ export class LocalRcon {
       const commandId = nextId++;
       const terminatorId = nextId++;
       socket.write(encodeRconPacket(commandId, 2, command));
-      socket.write(
-        encodeRconPacket(terminatorId, 2, LOCAL_RCON_RESPONSE_TERMINATOR),
-      );
-
       const responseBodies: string[] = [];
       let responseBytes = 0;
       let responsePackets = 0;
+      const appendCommandResponse = (response: LocalRconPacket): void => {
+        if (response.id !== commandId)
+          incomplete("RCON_UNEXPECTED_RESPONSE_PACKET");
+        if (response.type !== 0 && response.type !== 2)
+          incomplete("RCON_COMMAND_FAILED");
+        responsePackets += 1;
+        responseBytes += response.bodyBytes;
+        if (
+          responsePackets > LOCAL_RCON_MAX_RESPONSE_PACKETS ||
+          responseBytes > LOCAL_RCON_MAX_RESPONSE_BYTES
+        ) {
+          incomplete("RCON_RESPONSE_LIMIT_EXCEEDED");
+        }
+        responseBodies.push(response.body);
+      };
+      appendCommandResponse(await readPacket());
+      socket.write(
+        encodeRconPacket(terminatorId, 2, LOCAL_RCON_RESPONSE_TERMINATOR),
+      );
       let terminated = false;
       while (!terminated) {
         const response = await readPacket();
@@ -2955,21 +2970,7 @@ export class LocalRcon {
           terminated = true;
           continue;
         }
-        if (response.id !== commandId) {
-          incomplete("RCON_UNEXPECTED_RESPONSE_PACKET");
-        }
-        if (response.type !== 0 && response.type !== 2) {
-          incomplete("RCON_COMMAND_FAILED");
-        }
-        responsePackets += 1;
-        responseBytes += response.bodyBytes;
-        if (
-          responsePackets > LOCAL_RCON_MAX_RESPONSE_PACKETS ||
-          responseBytes > LOCAL_RCON_MAX_RESPONSE_BYTES
-        ) {
-          incomplete("RCON_RESPONSE_LIMIT_EXCEEDED");
-        }
-        responseBodies.push(response.body);
+        appendCommandResponse(response);
       }
       return responseBodies.join("");
     } catch (error) {

@@ -10,7 +10,12 @@ interface RequestPacket {
   readonly body: string;
 }
 
-type MockMode = "single" | "split" | "missing-terminator" | "peer-close";
+type MockMode =
+  | "single"
+  | "split"
+  | "missing-terminator"
+  | "peer-close"
+  | "terminator-before-response";
 
 function encodePacket(id: number, type: number, body: string): Buffer {
   const content = Buffer.from(body, "utf8");
@@ -27,10 +32,13 @@ function encodePacket(id: number, type: number, body: string): Buffer {
 async function startRconMock(mode: MockMode): Promise<{
   readonly port: number;
   readonly requests: RequestPacket[];
+  readonly terminatorBeforeResponseObserved: () => boolean;
   readonly close: () => Promise<void>;
 }> {
   const sockets = new Set<Socket>();
   const requests: RequestPacket[] = [];
+  let commandResponseSent = false;
+  let terminatorBeforeResponseObserved = false;
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -49,23 +57,39 @@ async function startRconMock(mode: MockMode): Promise<{
           continue;
         }
         requests.push({ id, type, body });
-        if (requests.length !== 2) continue;
-        const [command, terminator] = requests;
-        if (command === undefined || terminator === undefined) continue;
-        if (mode === "single") {
-          socket.write(encodePacket(command.id, 0, "single-response"));
-        } else if (mode === "split") {
-          socket.write(encodePacket(command.id, 0, "part-one"));
-          socket.write(encodePacket(command.id, 0, "part-two"));
-        } else if (mode === "peer-close") {
-          socket.write(encodePacket(command.id, 0, "partial"));
-          socket.end();
-          continue;
-        } else {
-          socket.write(encodePacket(command.id, 0, "partial"));
+        if (mode === "terminator-before-response") {
+          if (body === "time query gametime") {
+            if (!commandResponseSent) {
+              terminatorBeforeResponseObserved = true;
+              socket.destroy();
+            } else {
+              socket.write(encodePacket(id, 0, "terminal-response"));
+            }
+            continue;
+          }
+          setTimeout(() => {
+            if (socket.destroyed) return;
+            commandResponseSent = true;
+            socket.write(encodePacket(id, 0, "first-response"));
+          }, 25);
           continue;
         }
-        socket.write(encodePacket(terminator.id, 0, "terminal-response"));
+        if (body === "time query gametime") {
+          if (mode !== "missing-terminator" && mode !== "peer-close")
+            socket.write(encodePacket(id, 0, "terminal-response"));
+          continue;
+        }
+        if (mode === "single") {
+          socket.write(encodePacket(id, 0, "single-response"));
+        } else if (mode === "split") {
+          socket.write(encodePacket(id, 0, "part-one"));
+          socket.write(encodePacket(id, 0, "part-two"));
+        } else if (mode === "peer-close") {
+          socket.write(encodePacket(id, 0, "partial"));
+          socket.end();
+        } else {
+          socket.write(encodePacket(id, 0, "partial"));
+        }
       }
     });
   });
@@ -79,6 +103,7 @@ async function startRconMock(mode: MockMode): Promise<{
   return {
     port: address.port,
     requests,
+    terminatorBeforeResponseObserved: () => terminatorBeforeResponseObserved,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve, reject) =>
@@ -114,6 +139,22 @@ describe("LocalRcon response completion", () => {
         "list",
         "time query gametime",
       ]);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("waits for the first reply before sending the terminator command", async () => {
+    const mock = await startRconMock("terminator-before-response");
+    try {
+      await expect(
+        new LocalRcon(mock.port, "synthetic-password").command("list"),
+      ).resolves.toBe("first-response");
+      expect(mock.requests.map(({ body }) => body)).toEqual([
+        "list",
+        "time query gametime",
+      ]);
+      expect(mock.terminatorBeforeResponseObserved()).toBe(false);
     } finally {
       await mock.close();
     }
