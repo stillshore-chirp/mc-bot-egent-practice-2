@@ -4181,8 +4181,7 @@ async function runArmorCapabilityCase(
     Date.now() - bodyObservedAt > 10_000 ||
     bodyBefore.self.inventory.length !== 0 ||
     !bodyEquipmentEmpty ||
-    rconBefore.carriedHelmetCount !== 0 ||
-    rconBefore.headSlot !== "empty"
+    rconBefore.carriedHelmetCount !== 0
   ) {
     updateArmorCapabilityDiagnostic(state, {
       armorCapabilityBaselineBodyObserved: Number.isFinite(bodyObservedAt),
@@ -4200,7 +4199,7 @@ async function runArmorCapabilityCase(
     armorCapabilityBaselineBodyInventoryCount: 0,
     armorCapabilityBaselineBodyEquipmentEmpty: true,
     armorCapabilityBaselineServerCarriedCount: 0,
-    armorCapabilityBaselineServerHeadSlot: "empty",
+    armorCapabilityBaselineServerHeadSlot: rconBefore.headSlot,
   });
 
   const fixtureStartedAt = Date.now();
