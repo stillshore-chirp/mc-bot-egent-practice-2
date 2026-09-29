@@ -240,8 +240,8 @@ export function damageResponseObservationTimeoutMs(
   return Math.max(1, caseDeadlineAt - now);
 }
 export const OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET = {
-  llmCalls: 24,
-  totalTokens: 160_000,
+  llmCalls: 48,
+  totalTokens: 320_000,
 } as const;
 export const OWNER_RETURN_THROUGH_DOOR_CASE_DEADLINE_MS = 8 * 60_000;
 export const NO_FOOD_REPLAN_CASE_BUDGET = {
