@@ -3333,6 +3333,10 @@ export function createOwnerReturnApplicationWithBodyCapture(
   config: Parameters<ApplicationFactory>[0],
   beforeCall?: Parameters<ApplicationFactory>[1],
   onPlayerBodyCreated?: (body: MineflayerPlayerBody) => void,
+  onObservation?: (
+    body: MineflayerPlayerBody,
+    observation: PlayerBodyObservation,
+  ) => void,
 ): Readonly<{
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
@@ -3343,8 +3347,10 @@ export function createOwnerReturnApplicationWithBodyCapture(
   )
     return { application: createApplication(config, beforeCall) };
 
-  const restoreProbe =
-    installGameActionPlacementObservationProbe(onPlayerBodyCreated);
+  const restoreProbe = installGameActionPlacementObservationProbe(
+    onPlayerBodyCreated,
+    onObservation,
+  );
   try {
     return {
       application: createApplication(config, beforeCall),
@@ -4334,11 +4340,59 @@ async function main(): Promise<void> {
       DASHBOARD_ENABLED: "false",
     });
     const { createApplication } = await import("../../src/app/application.js");
+    if (state.targetCase === "death_recovery") {
+      state.deathRecoveryTargetObservations = new Map();
+      state.deathRecoveryTargetEntityIds = new Set();
+    }
+    const deathRecoveryObservationCapture =
+      state.targetCase === "death_recovery"
+        ? (_body: MineflayerPlayerBody, observation: PlayerBodyObservation) => {
+            state.deathRecoveryTargetObservations?.set(observation.observedAt, {
+              dimension: observation.dimension,
+              position: observation.self.position,
+              blueWoolCount: observation.self.inventory
+                .filter(({ name }) => name === "blue_wool")
+                .reduce((total, item) => total + item.count, 0),
+              day: observation.time.day,
+              timeOfDay: observation.time.timeOfDay,
+              isDay: observation.time.isDay,
+              health: observation.self.health,
+              food: observation.self.food,
+              oxygen: observation.self.oxygen,
+              inWater: observation.self.inWater,
+              inLava: observation.self.inLava,
+              onFire: observation.self.onFire,
+            });
+            const deathAt = state.deathRecoveryTargetDeathAt;
+            const target = state.deathRecoveryTargetPickupPosition;
+            if (
+              deathAt === undefined ||
+              target === undefined ||
+              Date.parse(observation.observedAt) <= Date.parse(deathAt)
+            )
+              return;
+            const candidates = observation.perception.entities.filter(
+              (entity) =>
+                !entity.isPlayer &&
+                entity.name === "item" &&
+                Math.hypot(
+                  entity.position.x - target.x,
+                  entity.position.y - target.y,
+                  entity.position.z - target.z,
+                ) <= 1.5,
+            );
+            const targetDrop = candidates[0];
+            if (candidates.length === 1 && targetDrop !== undefined)
+              state.deathRecoveryTargetEntityIds?.add(targetDrop.id);
+          }
+        : undefined;
     const createdApplication = createOwnerReturnApplicationWithBodyCapture(
       state.targetCase,
       createApplication,
       config,
       state.llmAdmission?.beforeCall,
+      undefined,
+      deathRecoveryObservationCapture,
     );
     const activeApp = createdApplication.application;
     if (createdApplication.restoreProbe !== undefined)
@@ -4381,51 +4435,6 @@ async function main(): Promise<void> {
     const autonomousRegion = state.autonomousRegion;
     const autonomousSmokeBaseline = state.autonomousSmokeBaseline;
     if (state.targetCase === "death_recovery") {
-      state.deathRecoveryTargetObservations = new Map();
-      state.deathRecoveryTargetEntityIds = new Set();
-      restoreGameActionPlacementObservationProbe ??=
-        installGameActionPlacementObservationProbe(
-          undefined,
-          (_body, observation) => {
-            state.deathRecoveryTargetObservations?.set(observation.observedAt, {
-              dimension: observation.dimension,
-              position: observation.self.position,
-              blueWoolCount: observation.self.inventory
-                .filter(({ name }) => name === "blue_wool")
-                .reduce((total, item) => total + item.count, 0),
-              day: observation.time.day,
-              timeOfDay: observation.time.timeOfDay,
-              isDay: observation.time.isDay,
-              health: observation.self.health,
-              food: observation.self.food,
-              oxygen: observation.self.oxygen,
-              inWater: observation.self.inWater,
-              inLava: observation.self.inLava,
-              onFire: observation.self.onFire,
-            });
-            const deathAt = state.deathRecoveryTargetDeathAt;
-            const target = state.deathRecoveryTargetPickupPosition;
-            if (
-              deathAt === undefined ||
-              target === undefined ||
-              Date.parse(observation.observedAt) <= Date.parse(deathAt)
-            )
-              return;
-            const candidates = observation.perception.entities.filter(
-              (entity) =>
-                !entity.isPlayer &&
-                entity.name === "item" &&
-                Math.hypot(
-                  entity.position.x - target.x,
-                  entity.position.y - target.y,
-                  entity.position.z - target.z,
-                ) <= 1.5,
-            );
-            const targetDrop = candidates[0];
-            if (candidates.length === 1 && targetDrop !== undefined)
-              state.deathRecoveryTargetEntityIds?.add(targetDrop.id);
-          },
-        );
       await connectApplication(activeApp, state);
       const restoreExecuteProbe = installDeathRecoveryTargetExecuteProbe(state);
       try {
