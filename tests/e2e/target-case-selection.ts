@@ -3,6 +3,7 @@ export const TARGETABLE_CASES = [
   "game_action_discretion",
   "food_intent_continuity",
   "gather_multi_target_continuity",
+  "underwater_item_recovery",
   "damage_response",
   "no_food_replan",
   "learning_reuse",
@@ -38,6 +39,12 @@ export function isOwnerStopLatchTargeted(
   targetCase: TargetableCase | undefined,
 ): boolean {
   return targetCase === "owner_stop_latch";
+}
+
+export function isUnderwaterItemRecoveryTargeted(
+  targetCase: TargetableCase | undefined,
+): boolean {
+  return targetCase === "underwater_item_recovery";
 }
 
 export function isGatherMultiTargetCaseSelected(
