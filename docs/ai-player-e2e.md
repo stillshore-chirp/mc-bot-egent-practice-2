@@ -52,6 +52,8 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
 
+LocalRconはコマンド応答を同じrequest IDの複数packetから集め、後置する別IDの`time query gametime`応答を終端としてから本文を返します。上限はRCON length field 65,536 bytes、1応答64 packets・65,526 body bytes、既定5秒です。終端欠落、途中close、上限超過は未完了として扱います。TCP mockは単一packet、分割packet、終端欠落、途中closeを検証しますが、Paper実物での終端コマンド挙動は未確認で、このmockをゲーム受け入れ証拠には数えません。
+
 2026-09-29の隔離Paper測定2回は、どちらも対象caseが`GATHER_MULTI_TARGET_FIXTURE_SITE_UNAVAILABLE`で未完了でした。初回はrun 42,558 ms / case 180 ms、2回目はledger elapsed 49,706 ms / case 449 msです。両回ともapplication起動とgather依頼は記録されず、採集・所持品変化・数量説明は未測定です。2回目の共通Body smokeはpassでしたが、対象採集の証拠にはなりません。これはfixture準備段階で停止した測定であり、製品が採集に失敗した証拠として扱いません。2回目のrun-level `LLM_USAGE_PARTIAL_OR_UNKNOWN`は集約fallbackで、case理由を置き換えません。usageの数値0表示も実使用量確定とは扱いません。
 
 通常caseでは、隔離worldにoak logとbirch logを並べ、RCONで両targetと足場を確認します。新しいBody観測に両対象が含まれた後、数量を指定しない自然なoak採集依頼と短いbirch追記を実GPTへ送ります。birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。隠蔽、遮蔽物、側路からの視点変更は条件にしません。

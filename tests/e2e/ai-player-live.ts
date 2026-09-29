@@ -2836,7 +2836,19 @@ function encodeRconPacket(
   return packet;
 }
 
-class LocalRcon {
+const LOCAL_RCON_MAX_PACKET_BYTES = 65_536;
+const LOCAL_RCON_MAX_RESPONSE_BYTES = LOCAL_RCON_MAX_PACKET_BYTES - 10;
+const LOCAL_RCON_MAX_RESPONSE_PACKETS = 64;
+const LOCAL_RCON_RESPONSE_TERMINATOR = "time query gametime";
+
+interface LocalRconPacket {
+  readonly id: number;
+  readonly type: number;
+  readonly body: string;
+  readonly bodyBytes: number;
+}
+
+export class LocalRcon {
   public constructor(
     private readonly port: number,
     private readonly password: string,
@@ -2846,69 +2858,73 @@ class LocalRcon {
     const socket = createConnection({ host: "127.0.0.1", port: this.port });
     socket.setNoDelay(true);
     let buffered = Buffer.alloc(0);
-    const packets = new Map<
-      number,
-      { readonly type: number; readonly body: string }[]
-    >();
-    const waiters = new Map<
-      number,
-      {
-        resolve: (packet: {
-          readonly type: number;
-          readonly body: string;
-        }) => void;
-        reject: (error: Error) => void;
-      }
-    >();
+    const packets: LocalRconPacket[] = [];
+    const waiters: {
+      readonly resolve: (packet: LocalRconPacket) => void;
+      readonly reject: (error: Error) => void;
+    }[] = [];
     let nextId = 1;
+    let receivedPacketCount = 0;
+    let terminalError: Error | undefined;
     const timer = setTimeout(
       () => socket.destroy(new Error("RCON_TIMEOUT")),
       timeoutMs,
     );
 
-    const packet = (id: number, type: number, body: string) => {
-      const queue = packets.get(id) ?? [];
-      queue.push({ type, body });
-      packets.set(id, queue);
-      const waiter = waiters.get(id);
-      const value = queue.shift();
-      if (waiter && value !== undefined) {
-        waiters.delete(id);
+    const packet = (value: LocalRconPacket) => {
+      const waiter = waiters.shift();
+      if (waiter !== undefined) {
         waiter.resolve(value);
+        return;
       }
+      packets.push(value);
     };
-    const readPacket = (id: number) =>
-      new Promise<{ readonly type: number; readonly body: string }>(
-        (resolvePacket, reject) => {
-          const existing = packets.get(id)?.shift();
-          if (existing !== undefined) {
-            resolvePacket(existing);
-            return;
-          }
-          waiters.set(id, { resolve: resolvePacket, reject });
-        },
-      );
+    const readPacket = () =>
+      new Promise<LocalRconPacket>((resolvePacket, reject) => {
+        const existing = packets.shift();
+        if (existing !== undefined) {
+          resolvePacket(existing);
+          return;
+        }
+        if (terminalError !== undefined) {
+          reject(terminalError);
+          return;
+        }
+        waiters.push({ resolve: resolvePacket, reject });
+      });
     const rejectAll = (error: Error) => {
-      for (const waiter of waiters.values()) waiter.reject(error);
-      waiters.clear();
+      terminalError ??= error;
+      for (const waiter of waiters) waiter.reject(terminalError);
+      waiters.length = 0;
     };
     socket.on("data", (chunk) => {
       buffered = Buffer.concat([buffered, chunk]);
       while (buffered.length >= 4) {
         const length = buffered.readInt32LE(0);
-        if (length < 10 || length > 65_536) {
+        if (length < 10 || length > LOCAL_RCON_MAX_PACKET_BYTES) {
           socket.destroy(new Error("RCON_INVALID_PACKET"));
           return;
         }
         if (buffered.length < length + 4) return;
+        receivedPacketCount += 1;
+        if (receivedPacketCount > LOCAL_RCON_MAX_RESPONSE_PACKETS + 2) {
+          socket.destroy(new Error("RCON_RESPONSE_LIMIT_EXCEEDED"));
+          return;
+        }
         const id = buffered.readInt32LE(4);
         const type = buffered.readInt32LE(8);
-        const body = buffered.subarray(12, 4 + length - 2).toString("utf8");
+        const bodyBuffer = buffered.subarray(12, 4 + length - 2);
         buffered = buffered.subarray(4 + length);
-        packet(id, type, body);
+        packet({
+          id,
+          type,
+          body: bodyBuffer.toString("utf8"),
+          bodyBytes: bodyBuffer.byteLength,
+        });
       }
     });
     socket.on("error", (error) => rejectAll(error));
+    socket.on("close", () => rejectAll(new Error("RCON_CONNECTION_CLOSED")));
     try {
       await new Promise<void>((resolveConnect, reject) => {
         socket.once("connect", () => resolveConnect());
@@ -2916,20 +2932,57 @@ class LocalRcon {
       });
       const authId = nextId++;
       socket.write(encodeRconPacket(authId, 3, this.password));
-      const authResponse = await readPacket(authId);
-      if (authResponse.type !== 2) incomplete("RCON_AUTH_FAILED");
+      const authResponse = await readPacket();
+      if (authResponse.id !== authId || authResponse.type !== 2)
+        incomplete("RCON_AUTH_FAILED");
       const commandId = nextId++;
+      const terminatorId = nextId++;
       socket.write(encodeRconPacket(commandId, 2, command));
-      const response = await readPacket(commandId);
-      if (response.type !== 0 && response.type !== 2) {
-        incomplete("RCON_COMMAND_FAILED");
+      socket.write(
+        encodeRconPacket(terminatorId, 2, LOCAL_RCON_RESPONSE_TERMINATOR),
+      );
+
+      const responseBodies: string[] = [];
+      let responseBytes = 0;
+      let responsePackets = 0;
+      let terminated = false;
+      while (!terminated) {
+        const response = await readPacket();
+        if (response.id === terminatorId) {
+          if (response.type !== 0 && response.type !== 2)
+            incomplete("RCON_TERMINATOR_FAILED");
+          if (responsePackets === 0) incomplete("RCON_EMPTY_RESPONSE");
+          terminated = true;
+          continue;
+        }
+        if (response.id !== commandId) {
+          incomplete("RCON_UNEXPECTED_RESPONSE_PACKET");
+        }
+        if (response.type !== 0 && response.type !== 2) {
+          incomplete("RCON_COMMAND_FAILED");
+        }
+        responsePackets += 1;
+        responseBytes += response.bodyBytes;
+        if (
+          responsePackets > LOCAL_RCON_MAX_RESPONSE_PACKETS ||
+          responseBytes > LOCAL_RCON_MAX_RESPONSE_BYTES
+        ) {
+          incomplete("RCON_RESPONSE_LIMIT_EXCEEDED");
+        }
+        responseBodies.push(response.body);
       }
-      return response.body;
+      return responseBodies.join("");
     } catch (error) {
       if (error instanceof HarnessError) throw error;
       incomplete(
-        error instanceof Error && error.message === "RCON_TIMEOUT"
-          ? "RCON_TIMEOUT"
+        error instanceof Error &&
+          [
+            "RCON_TIMEOUT",
+            "RCON_INVALID_PACKET",
+            "RCON_RESPONSE_LIMIT_EXCEEDED",
+            "RCON_CONNECTION_CLOSED",
+          ].includes(error.message)
+          ? error.message
           : "RCON_UNAVAILABLE",
       );
     } finally {
