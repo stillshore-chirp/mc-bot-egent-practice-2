@@ -417,14 +417,14 @@ Issue #72全体の受け入れは未達です。必要なケースの残件と�
 
 pickupが確認できない場合は、同じ死亡記録に結び付く依頼後の成功したfresh `sweep`と、その依頼後のPurpose判断に結び付くBody outcomeで有限探索を確認したうえで、Botへ実際に観測したことの報告を求めます。依頼送信から最大60秒（case/run期限まで）response windowを開き、依頼後のchat候補をprivate sidecar（mode `0600`）へ保存します。候補が最終報告か、内容が実際のDB・Body・RCON証拠に正直かは自動判定せず、手動レビュー待ちです。候補の保存だけでは「未発見・未確認を正直に報告した」成功になりません。pickupと報告候補のどちらも、主担当レビューまでcaseは`DEATH_RECOVERY_PRIVATE_REVIEW_PENDING`で未完了です。`ownerReportMatchesServerResult`は自動でtrueにしません。探索が記録されない、行動上限に達する、依頼後の返信候補がない場合も未完了です。
 
-owner contextに同じ死亡時刻が含まれた事実と、依頼後に届いた最初のchatは別証拠です。最初のchatを最終報告と同一視しません。Purpose markerは同じ死亡記録への参照を示しますが、owner依頼後に始まった証拠にはしません。単独実行は64 calls / 600,000 known tokens / 12分を上限とし、共通runの既定budgetは変更しません。
+owner contextに同じ死亡時刻が含まれた事実と、依頼後に届いた最初のchatは別証拠です。最初のchatを最終報告と同一視しません。Purpose markerは同じ死亡記録への参照を示しますが、owner依頼後に始まった証拠にはしません。death_recovery caseは64 calls / 600,000 known tokens / 12分を上限とし、起動・fixture準備を含む単独run全体は72 calls / 660,000 known tokens / 16分を上限とします。共通runの既定budgetは変更しません。
 
 ```sh
 AI_PLAYER_E2E_CONFIRMED=YES \
 AI_PLAYER_E2E_TARGET_CASE=death_recovery \
-AI_PLAYER_E2E_MAX_LLM_CALLS=64 \
-AI_PLAYER_E2E_MAX_TOTAL_TOKENS=600000 \
-AI_PLAYER_E2E_MAX_DURATION_MINUTES=12 \
+AI_PLAYER_E2E_MAX_LLM_CALLS=72 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=660000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=16 \
 npm exec -- tsx tests/e2e/ai-player-live.ts
 ```
 
