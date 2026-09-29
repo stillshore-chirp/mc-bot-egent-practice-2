@@ -12120,12 +12120,9 @@ async function runDeathRecoveryTargetCase(
         break;
       const latest = playerOf(await collect(context.runtime.app));
       const usage = subtractCounters(latest.counters, context.usageAtStart);
-      if (
-        usage.llmCalls > 64 ||
-        totalTokens(usage) > 600_000 ||
-        usage.usageUnknownCalls > 0
-      )
-        incomplete("DEATH_RECOVERY_CASE_BUDGET_OR_USAGE_UNCERTAIN");
+      if (usage.usageUnknownCalls > 0) state.usageUncertain = true;
+      if (usage.llmCalls > 64 || totalTokens(usage) > 600_000)
+        incomplete("DEATH_RECOVERY_CASE_BUDGET_EXCEEDED");
       await waitMs(800);
     }
     if (Date.now() >= recoverDeadline)
