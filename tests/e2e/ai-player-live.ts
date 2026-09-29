@@ -4396,7 +4396,58 @@ async function runArmorCapabilityCase(
   const beforeAction = playerOf(await collect(context.runtime.app));
   if (isOperationActive(beforeAction))
     incomplete("ARMOR_CAPABILITY_PREEXISTING_OPERATION_ACTIVE");
+  const [{ PlayerConversationAgent }, { sanitizeMinecraftChatText }] =
+    await Promise.all([
+      import("../../src/player/agents.js"),
+      import("../../src/app/player-application.js"),
+    ]);
+  const conversationPrototype = PlayerConversationAgent.prototype;
+  const originalConversationHandleOwnerMessageDescriptor =
+    Object.getOwnPropertyDescriptor(
+      conversationPrototype,
+      "handleOwnerMessage",
+    );
+  if (
+    typeof originalConversationHandleOwnerMessageDescriptor?.value !==
+    "function"
+  )
+    incomplete("ARMOR_CAPABILITY_CONVERSATION_PROBE_UNAVAILABLE");
+  const originalConversationHandleOwnerMessage =
+    originalConversationHandleOwnerMessageDescriptor.value as typeof conversationPrototype.handleOwnerMessage;
+  const wearRequestText = "手持ちの防具を着てください。";
+  const wearReplyCapture: {
+    hash: string | undefined;
+    turnSettled: boolean;
+  } = { hash: undefined, turnSettled: false };
+  const instrumentedConversationHandleOwnerMessage = async function (
+    this: InstanceType<typeof PlayerConversationAgent>,
+    input: Parameters<typeof originalConversationHandleOwnerMessage>[0],
+  ): Promise<void> {
+    if (input.message !== wearRequestText)
+      return originalConversationHandleOwnerMessage.call(this, input);
+    const conversationOptions = (
+      this as unknown as {
+        options: { say: (text: string) => Promise<void> };
+      }
+    ).options;
+    const originalSay = conversationOptions.say;
+    const capturedSay = async (text: string): Promise<void> => {
+      wearReplyCapture.hash = createHash("sha256")
+        .update(sanitizeMinecraftChatText(text))
+        .digest("hex");
+      await originalSay(text);
+    };
+    conversationOptions.say = capturedSay;
+    try {
+      await originalConversationHandleOwnerMessage.call(this, input);
+    } finally {
+      if (conversationOptions.say === capturedSay)
+        conversationOptions.say = originalSay;
+      wearReplyCapture.turnSettled = true;
+    }
+  };
   let requestSentAt = 0;
+  const wearResponseStart = context.responseQueue.length;
   const priorJudgmentKeys = new Set(
     beforeAction.recentJudgments.map(
       (judgment) => `${judgment.revision ?? ""}:${judgment.decidedAt ?? ""}`,
@@ -4470,10 +4521,12 @@ async function runArmorCapabilityCase(
       helperCapture.callSettled = true;
     }
   };
+  conversationPrototype.handleOwnerMessage =
+    instrumentedConversationHandleOwnerMessage;
   MineflayerClient.prototype.equipAvailableArmor = capturedEquipAvailableArmor;
   try {
     requestSentAt = Date.now();
-    sendChat(context.owner, "手持ちの防具を着てください。");
+    sendChat(context.owner, wearRequestText);
     updateArmorCapabilityDiagnostic(state, {
       armorCapabilityWearRequestSent: true,
     });
@@ -4570,7 +4623,43 @@ async function runArmorCapabilityCase(
       armorCapabilityServerCarriedCountAfter: 0,
       armorCapabilityServerHeadSlotAfter: "expected_item",
     });
+    const wearReplyTimeoutMs = Math.max(
+      1,
+      Math.min(
+        45_000,
+        context.caseDeadlineAt - Date.now(),
+        context.runDeadlineAt - Date.now(),
+      ),
+    );
+    const wearReplyObserved = await observeForPlayer(
+      context,
+      wearReplyTimeoutMs,
+      () => {
+        const expectedHash = wearReplyCapture.hash;
+        return (
+          wearReplyCapture.turnSettled &&
+          expectedHash !== undefined &&
+          context.responseQueue
+            .slice(wearResponseStart)
+            .some(
+              (response) =>
+                response.at >= requestSentAt &&
+                createHash("sha256").update(response.text).digest("hex") ===
+                  expectedHash,
+            )
+        );
+      },
+    );
+    if (wearReplyObserved === undefined)
+      incomplete("ARMOR_CAPABILITY_WEAR_REPLY_NOT_CORRELATED");
   } finally {
+    if (
+      conversationPrototype.handleOwnerMessage ===
+      instrumentedConversationHandleOwnerMessage
+    ) {
+      conversationPrototype.handleOwnerMessage =
+        originalConversationHandleOwnerMessage;
+    }
     if (
       MineflayerClient.prototype.equipAvailableArmor ===
       capturedEquipAvailableArmor
