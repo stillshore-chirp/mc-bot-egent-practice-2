@@ -44,7 +44,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。`damage_response`のcase evidenceには`usageUnknownRequestErrorCalls`と`usageUnknownResponseUsageMissingCalls`の集計件数を記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
-後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`、`owner_stop_latch`、`armor_capability`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`、`skill_exchange`は前提caseなしで対象caseだけを実行します。`owner_stop_latch`はownerの永続停止が後続caseへ影響しないよう、明示target時だけ実行し、既定の全case matrixには含めません。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。単独の`skill_exchange`ではrepository seedの`mc-skill-gathering`を使い、receipt由来の学習成果とは扱いません。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`death_recovery`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`、`owner_stop_latch`、`armor_capability`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`、`skill_exchange`は前提caseなしで対象caseだけを実行します。`owner_stop_latch`はownerの永続停止が後続caseへ影響しないよう、明示target時だけ実行し、既定の全case matrixには含めません。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。単独の`skill_exchange`ではrepository seedの`mc-skill-gathering`を使い、receipt由来の学習成果とは扱いません。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
 
 `skill_exchange`では、Markdownの`sourceVersion`を新しいexport activityの同じSkill ID/versionへ結び付け、編集前にDB readbackで対応revisionの存在を確認します。版が不明または一致しなければ未完了として記録します。再利用は、相談前の活動snapshot以後に`purpose` roleで新しい`search_skills` tool callがあり、同じ取り込み済みSkill ID/versionの新しい検索activityが記録され、その時刻が同revisionのsuccessful dig outcome以前であることを確認します。検索activityは直接一致と基礎カテゴリ候補のfallbackを受け入れ、`read_skill`のactivityは検索の証拠に数えません。続けて新規outcomeのSkill ID/versionとRCONの`air`読戻しを確認し、fixtureを`air`へ戻して読戻します。公開artifactには判定用booleanだけを残します。
 
@@ -408,6 +408,25 @@ Targeted `unknown_composite` artifact `3422ee20…` はcase passです。caseは
 全case run artifact `d357682f…` は`body_operation_smoke`、`runtime_contract`、`autonomous_life`、`observation_boundary`、`persistent_memory_restart`がpassし、`learning_reuse`は31 callsの予算で未完了停止しました。run全体は既知378,075 tokens、usageは`partial_or_unknown`、cleanupは3/3です。
 
 Issue #72全体の受け入れは未達です。必要なケースの残件と共通runtime・DBを引き継ぐ統合証拠を閉じる必要があります。単一の長時間全case連続runは #76、遮蔽された目標探索は #77 の範囲です。既知usageは部分計測として扱い、不明分を補完しません。
+
+`death_recovery`は、非OP Body smokeで青い羊毛を1個持った死亡地点を設定し、実application接続後に死亡させます。kill前に自然なowner依頼から新しいadopted proposalとlinked active goalを確認し、respawn後に同goal IDの維持、または理由を伴う状態変更を確認します。維持はactive stateの観測事実として記録し、理由付き判断の受け入れはowner返信の手動レビューまで未確認です。goal不採用・消失・不明、またはkill前にfixture位置を保てない場合は未完了として死亡させません。実DBの死亡記録とfresh復帰観測は、applicationを動かしたまま別のreadonly SQLite handleでclose/reopenして照合します。
+
+死亡dropの周辺countは最大5秒、150ms間隔で確認します。正数、0、readback不明を区別して記録しますが、0・不明でも自然なowner依頼を送り、死亡記録の確度、見張り目標の扱いと理由、見える範囲の回収、実際にできたことの報告を続けます。dropを人工生成したり、server操作でBotに拾わせたりしません。最初のrespawn時のBody/RCON在庫、依頼前後の既知在庫、死亡地点のdrop countも独立に記録します。
+
+回収の機械的確認には、依頼後に開始した`collect_item`、事前のfresh Body観測で識別した同じentity IDと成功effect、nullでないBody前後所持数の増加、既知のRCON在庫増加、死亡地点drop countの減少をすべて要求します。既存在庫や未観測のitemを回収成功に数えず、未知のcountを0に補いません。どれかが欠ければpickup成功にはしません。
+
+pickupが確認できない場合は、同じ死亡記録に結び付く依頼後の成功したfresh `sweep`と、その依頼後のPurpose判断に結び付くBody outcomeで有限探索を確認したうえで、Botへ実際に観測したことの報告を求めます。依頼送信から最大60秒（case/run期限まで）response windowを開き、依頼後のchat候補をprivate sidecar（mode `0600`）へ保存します。候補が最終報告か、内容が実際のDB・Body・RCON証拠に正直かは自動判定せず、手動レビュー待ちです。候補の保存だけでは「未発見・未確認を正直に報告した」成功になりません。pickupと報告候補のどちらも、主担当レビューまでcaseは`DEATH_RECOVERY_PRIVATE_REVIEW_PENDING`で未完了です。`ownerReportMatchesServerResult`は自動でtrueにしません。探索が記録されない、行動上限に達する、依頼後の返信候補がない場合も未完了です。
+
+owner contextに同じ死亡時刻が含まれた事実と、依頼後に届いた最初のchatは別証拠です。最初のchatを最終報告と同一視しません。Purpose markerは同じ死亡記録への参照を示しますが、owner依頼後に始まった証拠にはしません。death_recovery caseは64 calls / 600,000 known tokens / 12分を上限とし、起動・fixture準備を含む単独run全体は72 calls / 660,000 known tokens / 16分を上限とします。共通runの既定budgetは変更しません。
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=death_recovery \
+AI_PLAYER_E2E_MAX_LLM_CALLS=72 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=660000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=16 \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
 
 ## 防具装着と能力説明のtarget
 
