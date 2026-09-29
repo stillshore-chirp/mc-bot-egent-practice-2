@@ -87,7 +87,9 @@ export function unknownTargetDiscoveredAfterBodyAction(input: {
         readonly visibleBlockNames?: readonly string[];
       }
     | undefined;
+  readonly preTaskActiveOperationIds: readonly string[];
   readonly outcomes: readonly {
+    readonly operationId: string;
     readonly kind?: string;
     readonly status?: string;
     readonly observedAt?: string;
@@ -129,9 +131,11 @@ export function unknownTargetDiscoveredAfterBodyAction(input: {
     "move_to",
     "move_relative",
   ];
+  const preTaskActiveOperationIds = new Set(input.preTaskActiveOperationIds);
   const action = input.outcomes.find((outcome) => {
     const outcomeAt = Date.parse(outcome.observedAt ?? "");
     return (
+      !preTaskActiveOperationIds.has(outcome.operationId) &&
       actionKinds.includes(outcome.kind as UnknownTargetDiscoveryActionKind) &&
       outcome.status === "successful" &&
       Number.isFinite(outcomeAt) &&

@@ -112,8 +112,10 @@ describe("hidden target discovery and pickup evidence", () => {
       unknownTargetDiscoveredAfterBodyAction({
         taskSentAt,
         preTaskObservation,
+        preTaskActiveOperationIds: [],
         outcomes: [
           {
+            operationId: "task-look",
             kind: "look",
             status: "successful",
             observedAt: "2026-09-29T00:00:03.000Z",
@@ -130,8 +132,10 @@ describe("hidden target discovery and pickup evidence", () => {
   it("keeps missing, initially visible, or actionless discovery unconfirmed", () => {
     const common = {
       taskSentAt,
+      preTaskActiveOperationIds: [],
       outcomes: [
         {
+          operationId: "task-move",
           kind: "move_to",
           status: "successful",
           observedAt: "2026-09-29T00:00:03.000Z",
@@ -170,6 +174,7 @@ describe("hidden target discovery and pickup evidence", () => {
         preTaskObservation,
         outcomes: [
           {
+            operationId: "task-look",
             kind: "look",
             status: "successful",
             observedAt: "2026-09-29T00:00:05.000Z",
@@ -177,6 +182,51 @@ describe("hidden target discovery and pickup evidence", () => {
         ],
       }),
     ).toBeUndefined();
+  });
+
+  it("does not attribute a pre-task active operation to task discovery", () => {
+    const preTaskActiveOperationIds = ["active-before-task"];
+    const common = {
+      taskSentAt,
+      preTaskObservation,
+      preTaskActiveOperationIds,
+      observation: {
+        observedAt: "2026-09-29T00:00:04.000Z",
+        visibleBlockNames: ["blue_wool"],
+      },
+    } as const;
+    expect(
+      unknownTargetDiscoveredAfterBodyAction({
+        ...common,
+        outcomes: [
+          {
+            operationId: "active-before-task",
+            kind: "move_to",
+            status: "successful",
+            observedAt: "2026-09-29T00:00:03.000Z",
+          },
+        ],
+      }),
+    ).toBeUndefined();
+    expect(
+      unknownTargetDiscoveredAfterBodyAction({
+        ...common,
+        outcomes: [
+          {
+            operationId: "active-before-task",
+            kind: "move_to",
+            status: "successful",
+            observedAt: "2026-09-29T00:00:03.000Z",
+          },
+          {
+            operationId: "started-after-task",
+            kind: "look",
+            status: "successful",
+            observedAt: "2026-09-29T00:00:03.500Z",
+          },
+        ],
+      }),
+    ).toBe("look");
   });
 
   it("requires target removal, matching target pickup event, and positive known inventory delta", () => {

@@ -543,9 +543,12 @@ interface UnknownCompositeDiagnostic {
   readonly unknownPreTaskObservationCaptureClass?: UnknownPreTaskObservationCaptureClass;
   readonly unknownPreTaskTargetBlockVisible?: boolean;
   readonly unknownPreTaskWallMaterialVisible?: boolean;
+  readonly unknownTaskStartActiveOperationPresent?: boolean;
+  readonly unknownTaskBaselineOperationIdsHash?: string;
   readonly unknownTaskOwnerGoalAccepted?: boolean;
   readonly unknownTargetDiscoveryAfterBodyAction?: boolean;
   readonly unknownTargetDiscoveryBodyActionKind?: UnknownTargetDiscoveryActionKind;
+  readonly unknownTargetDiscoveryOperationFreshAgainstTaskBaseline?: boolean;
   readonly unknownTargetInventoryReadStatus?: "parsed" | "unknown";
   readonly unknownTargetInventoryBaselineCount?: number;
   readonly unknownTargetInventoryLatestCount?: number;
@@ -7921,6 +7924,25 @@ async function main(): Promise<void> {
           beforePlayer.stopGeneration <= stopGeneration
         )
           incomplete("UNKNOWN_AUTONOMY_RESUME_NOT_CONFIRMED");
+        const preTaskActiveOperationIds =
+          beforePlayer.activeOperation === undefined
+            ? []
+            : [beforePlayer.activeOperation.operationId];
+        const taskBaselineOperationIds = [
+          ...new Set([
+            ...beforePlayer.recentOutcomes.map(
+              (outcome) => outcome.operationId,
+            ),
+            ...preTaskActiveOperationIds,
+          ]),
+        ].sort();
+        updateUnknownCompositeDiagnostic(state, {
+          unknownTaskStartActiveOperationPresent:
+            preTaskActiveOperationIds.length > 0,
+          unknownTaskBaselineOperationIdsHash: createHash("sha256")
+            .update(taskBaselineOperationIds.join("\n"))
+            .digest("hex"),
+        });
         state.unknownHandoffDependency = "resumed";
         updateUnknownCompositeDiagnostic(state, {
           unknownHandoffDependencyBlocked: false,
@@ -7992,6 +8014,7 @@ async function main(): Promise<void> {
             const discoveryActionKind = unknownTargetDiscoveredAfterBodyAction({
               taskSentAt,
               preTaskObservation,
+              preTaskActiveOperationIds,
               outcomes: currentOutcomes,
               observation: currentPlayer.lastObservation,
             });
@@ -7999,6 +8022,7 @@ async function main(): Promise<void> {
               updateUnknownCompositeDiagnostic(state, {
                 unknownTargetDiscoveryAfterBodyAction: true,
                 unknownTargetDiscoveryBodyActionKind: discoveryActionKind,
+                unknownTargetDiscoveryOperationFreshAgainstTaskBaseline: true,
               });
             }
             unknownTaskOwnerGoalAccepted ||=
