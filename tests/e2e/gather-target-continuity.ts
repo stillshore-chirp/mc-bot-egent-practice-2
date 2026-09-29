@@ -30,6 +30,54 @@ export interface GatherTargetOutcome {
   readonly observedAt?: string;
 }
 
+export interface SuccessfulGatherBodyOutcomeSummary {
+  readonly totalCount: number;
+  /** Sorted, identifier-free `operation=count` pairs for safe diagnostics. */
+  readonly kindCounts: string;
+}
+
+export interface GatherTargetDiscoveryObservation {
+  readonly observedAt?: string;
+  readonly visibleBlockNames?: readonly string[];
+}
+
+/** Require a new successful Body view/move before a fresh observation reveals the target. */
+export function gatherTargetVisibleAfterBodyAction(input: {
+  readonly item: GatherMultiTargetItem;
+  readonly previousOperationIds: ReadonlySet<string>;
+  readonly acceptedAt: number;
+  readonly outcomes: readonly GatherTargetOutcome[];
+  readonly observation: GatherTargetDiscoveryObservation | undefined;
+}): boolean {
+  const observationAt = Date.parse(input.observation?.observedAt ?? "");
+  if (
+    !Number.isFinite(input.acceptedAt) ||
+    !Number.isFinite(observationAt) ||
+    observationAt <= input.acceptedAt
+  ) {
+    return false;
+  }
+  const visibleTarget = input.observation?.visibleBlockNames?.some(
+    (name) => name.toLowerCase().replace(/^minecraft:/u, "") === input.item,
+  );
+  if (!visibleTarget) return false;
+
+  return input.outcomes.some((outcome) => {
+    const outcomeAt = Date.parse(outcome.observedAt ?? "");
+    return (
+      !input.previousOperationIds.has(outcome.operationId) &&
+      (outcome.kind === "look" ||
+        outcome.kind === "look_sweep" ||
+        outcome.kind === "move_to" ||
+        outcome.kind === "move_relative") &&
+      outcome.status === "successful" &&
+      Number.isFinite(outcomeAt) &&
+      outcomeAt >= input.acceptedAt &&
+      outcomeAt < observationAt
+    );
+  });
+}
+
 function targetTitleMatches(
   title: string | undefined,
   item: GatherMultiTargetItem,
@@ -139,34 +187,35 @@ export function gatherTargetAcceptedGoalCount(input: {
   return Number.isSafeInteger(count) && count > 0 ? count : undefined;
 }
 
-/** Count distinct successful dig→pickup pairs in observation order. */
-export function countCompletedGatherActions(
+/** Count distinct successful Body outcomes, optionally only after goal adoption. */
+export function summarizeSuccessfulGatherBodyOutcomes(
   outcomes: readonly GatherTargetOutcome[],
-): number {
-  const ordered = outcomes
-    .filter(
-      ({ operationId, kind, status, observedAt }) =>
-        operationId.length > 0 &&
-        (kind === "dig" || kind === "collect_item") &&
-        status === "successful" &&
-        Number.isFinite(Date.parse(observedAt ?? "")),
-    )
-    .toSorted(
-      (left, right) =>
-        Date.parse(left.observedAt ?? "") - Date.parse(right.observedAt ?? ""),
-    );
+  afterObservedAt?: number,
+): SuccessfulGatherBodyOutcomeSummary {
   const operationIds = new Set<string>();
-  let pendingDigs = 0;
-  let completed = 0;
-  for (const outcome of ordered) {
-    if (operationIds.has(outcome.operationId)) continue;
-    operationIds.add(outcome.operationId);
-    if (outcome.kind === "dig") {
-      pendingDigs += 1;
-    } else if (pendingDigs > 0) {
-      pendingDigs -= 1;
-      completed += 1;
+  const kindCounts = new Map<string, number>();
+  for (const outcome of outcomes) {
+    const observedAt = Date.parse(outcome.observedAt ?? "");
+    if (
+      outcome.operationId.trim().length === 0 ||
+      operationIds.has(outcome.operationId) ||
+      outcome.kind === undefined ||
+      outcome.status !== "successful" ||
+      !Number.isFinite(observedAt) ||
+      (afterObservedAt !== undefined &&
+        (!Number.isFinite(afterObservedAt) || observedAt <= afterObservedAt))
+    ) {
+      continue;
     }
+    operationIds.add(outcome.operationId);
+    kindCounts.set(outcome.kind, (kindCounts.get(outcome.kind) ?? 0) + 1);
   }
-  return completed;
+  return {
+    totalCount: operationIds.size,
+    kindCounts:
+      [...kindCounts]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([kind, count]) => `${kind}=${count}`)
+        .join(",") || "none",
+  };
 }

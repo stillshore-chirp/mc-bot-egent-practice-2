@@ -53,11 +53,13 @@ import { hasPersistedOwnerFact } from "./persistent-fact-oracle.js";
 import {
   GATHER_MULTI_TARGET_ITEMS,
   gatherMultiTargetBodySmokeSafeFailureEvidence,
-  gatherMultiTargetInventorySafeEvidence,
-  gatherMultiTargetOracleProbeBaselineFailureFields,
-  gatherMultiTargetOracleProbeResultFailureFields,
-  readGatherMultiTargetInventory,
+  gatherMultiTargetItemCountSafeEvidence,
+  gatherMultiTargetOracleProbeBaselineCountFailureFields,
+  gatherMultiTargetOracleProbeResultCountFailureFields,
+  readGatherMultiTargetItemCounts,
+  shouldRunGatherMultiTargetOracleProbe,
   type GatherMultiTargetItem,
+  type GatherMultiTargetItemCountReadResult,
 } from "./gather-multi-target-acceptance.js";
 import {
   classifyGatherDropReadbackFailure,
@@ -66,10 +68,10 @@ import {
   type GatherDropReadbackClass,
 } from "./gather-drop-readback.js";
 import {
-  countCompletedGatherActions,
   gatherTargetAcceptedGoalCount,
   hasResolvedGatherTargetOwnerGoal,
   newGatherTargetProposalIds,
+  summarizeSuccessfulGatherBodyOutcomes,
 } from "./gather-target-continuity.js";
 import {
   explainsFullHunger,
@@ -880,6 +882,7 @@ function isNoGptDiagnosticProbeOnly(): boolean {
     process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES" ||
+    process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" ||
     isDeathRecoveryFixtureProbeOnly()
   );
 }
@@ -2459,6 +2462,35 @@ function updateGatherMultiTargetDiagnostic(
   };
 }
 
+function updateGatherMultiTargetItemCountReadDiagnostic(
+  state: RunState,
+  result: GatherMultiTargetItemCountReadResult,
+  phase: "Baseline" | "Latest",
+  baseline?: Readonly<Record<GatherMultiTargetItem, number>>,
+): void {
+  const oakCount = result.counts.oak_log;
+  const birchCount = result.counts.birch_log;
+  const prefix = phase === "Baseline" ? "gatherBaseline" : "gatherLatest";
+  updateGatherMultiTargetDiagnostic(state, {
+    [`${prefix}InventoryReadReason`]: result.reason,
+    [`${prefix}InventoryParseStage`]: result.parseStage,
+    [`${prefix}OakLogInventoryCount`]: oakCount,
+    [`${prefix}BirchLogInventoryCount`]: birchCount,
+    ...(phase === "Latest"
+      ? {
+          gatherOakLogInventoryDelta:
+            oakCount === null || baseline === undefined
+              ? null
+              : oakCount - baseline.oak_log,
+          gatherBirchLogInventoryDelta:
+            birchCount === null || baseline === undefined
+              ? null
+              : birchCount - baseline.birch_log,
+        }
+      : {}),
+  });
+}
+
 function safeGameActionFailureEvidence(
   state: RunState,
   evidence: Evidence | undefined,
@@ -2878,7 +2910,19 @@ function encodeRconPacket(
   return packet;
 }
 
-class LocalRcon {
+const LOCAL_RCON_MAX_PACKET_BYTES = 65_536;
+const LOCAL_RCON_MAX_RESPONSE_BYTES = LOCAL_RCON_MAX_PACKET_BYTES - 10;
+const LOCAL_RCON_MAX_RESPONSE_PACKETS = 64;
+const LOCAL_RCON_RESPONSE_TERMINATOR = "time query gametime";
+
+interface LocalRconPacket {
+  readonly id: number;
+  readonly type: number;
+  readonly body: string;
+  readonly bodyBytes: number;
+}
+
+export class LocalRcon {
   public constructor(
     private readonly port: number,
     private readonly password: string,
@@ -2888,69 +2932,73 @@ class LocalRcon {
     const socket = createConnection({ host: "127.0.0.1", port: this.port });
     socket.setNoDelay(true);
     let buffered = Buffer.alloc(0);
-    const packets = new Map<
-      number,
-      { readonly type: number; readonly body: string }[]
-    >();
-    const waiters = new Map<
-      number,
-      {
-        resolve: (packet: {
-          readonly type: number;
-          readonly body: string;
-        }) => void;
-        reject: (error: Error) => void;
-      }
-    >();
+    const packets: LocalRconPacket[] = [];
+    const waiters: {
+      readonly resolve: (packet: LocalRconPacket) => void;
+      readonly reject: (error: Error) => void;
+    }[] = [];
     let nextId = 1;
+    let receivedPacketCount = 0;
+    let terminalError: Error | undefined;
     const timer = setTimeout(
       () => socket.destroy(new Error("RCON_TIMEOUT")),
       timeoutMs,
     );
 
-    const packet = (id: number, type: number, body: string) => {
-      const queue = packets.get(id) ?? [];
-      queue.push({ type, body });
-      packets.set(id, queue);
-      const waiter = waiters.get(id);
-      const value = queue.shift();
-      if (waiter && value !== undefined) {
-        waiters.delete(id);
+    const packet = (value: LocalRconPacket) => {
+      const waiter = waiters.shift();
+      if (waiter !== undefined) {
         waiter.resolve(value);
+        return;
       }
+      packets.push(value);
     };
-    const readPacket = (id: number) =>
-      new Promise<{ readonly type: number; readonly body: string }>(
-        (resolvePacket, reject) => {
-          const existing = packets.get(id)?.shift();
-          if (existing !== undefined) {
-            resolvePacket(existing);
-            return;
-          }
-          waiters.set(id, { resolve: resolvePacket, reject });
-        },
-      );
+    const readPacket = () =>
+      new Promise<LocalRconPacket>((resolvePacket, reject) => {
+        const existing = packets.shift();
+        if (existing !== undefined) {
+          resolvePacket(existing);
+          return;
+        }
+        if (terminalError !== undefined) {
+          reject(terminalError);
+          return;
+        }
+        waiters.push({ resolve: resolvePacket, reject });
+      });
     const rejectAll = (error: Error) => {
-      for (const waiter of waiters.values()) waiter.reject(error);
-      waiters.clear();
+      terminalError ??= error;
+      for (const waiter of waiters) waiter.reject(terminalError);
+      waiters.length = 0;
     };
     socket.on("data", (chunk) => {
       buffered = Buffer.concat([buffered, chunk]);
       while (buffered.length >= 4) {
         const length = buffered.readInt32LE(0);
-        if (length < 10 || length > 65_536) {
+        if (length < 10 || length > LOCAL_RCON_MAX_PACKET_BYTES) {
           socket.destroy(new Error("RCON_INVALID_PACKET"));
           return;
         }
         if (buffered.length < length + 4) return;
+        receivedPacketCount += 1;
+        if (receivedPacketCount > LOCAL_RCON_MAX_RESPONSE_PACKETS + 2) {
+          socket.destroy(new Error("RCON_RESPONSE_LIMIT_EXCEEDED"));
+          return;
+        }
         const id = buffered.readInt32LE(4);
         const type = buffered.readInt32LE(8);
-        const body = buffered.subarray(12, 4 + length - 2).toString("utf8");
+        const bodyBuffer = buffered.subarray(12, 4 + length - 2);
         buffered = buffered.subarray(4 + length);
-        packet(id, type, body);
+        packet({
+          id,
+          type,
+          body: bodyBuffer.toString("utf8"),
+          bodyBytes: bodyBuffer.byteLength,
+        });
       }
     });
     socket.on("error", (error) => rejectAll(error));
+    socket.on("close", () => rejectAll(new Error("RCON_CONNECTION_CLOSED")));
     try {
       await new Promise<void>((resolveConnect, reject) => {
         socket.once("connect", () => resolveConnect());
@@ -2958,20 +3006,58 @@ class LocalRcon {
       });
       const authId = nextId++;
       socket.write(encodeRconPacket(authId, 3, this.password));
-      const authResponse = await readPacket(authId);
-      if (authResponse.type !== 2) incomplete("RCON_AUTH_FAILED");
+      const authResponse = await readPacket();
+      if (authResponse.id !== authId || authResponse.type !== 2)
+        incomplete("RCON_AUTH_FAILED");
       const commandId = nextId++;
+      const terminatorId = nextId++;
       socket.write(encodeRconPacket(commandId, 2, command));
-      const response = await readPacket(commandId);
-      if (response.type !== 0 && response.type !== 2) {
-        incomplete("RCON_COMMAND_FAILED");
+      const responseBodies: string[] = [];
+      let responseBytes = 0;
+      let responsePackets = 0;
+      const appendCommandResponse = (response: LocalRconPacket): void => {
+        if (response.id !== commandId)
+          incomplete("RCON_UNEXPECTED_RESPONSE_PACKET");
+        if (response.type !== 0 && response.type !== 2)
+          incomplete("RCON_COMMAND_FAILED");
+        responsePackets += 1;
+        responseBytes += response.bodyBytes;
+        if (
+          responsePackets > LOCAL_RCON_MAX_RESPONSE_PACKETS ||
+          responseBytes > LOCAL_RCON_MAX_RESPONSE_BYTES
+        ) {
+          incomplete("RCON_RESPONSE_LIMIT_EXCEEDED");
+        }
+        responseBodies.push(response.body);
+      };
+      appendCommandResponse(await readPacket());
+      socket.write(
+        encodeRconPacket(terminatorId, 2, LOCAL_RCON_RESPONSE_TERMINATOR),
+      );
+      let terminated = false;
+      while (!terminated) {
+        const response = await readPacket();
+        if (response.id === terminatorId) {
+          if (response.type !== 0 && response.type !== 2)
+            incomplete("RCON_TERMINATOR_FAILED");
+          if (responsePackets === 0) incomplete("RCON_EMPTY_RESPONSE");
+          terminated = true;
+          continue;
+        }
+        appendCommandResponse(response);
       }
-      return response.body;
+      return responseBodies.join("");
     } catch (error) {
       if (error instanceof HarnessError) throw error;
       incomplete(
-        error instanceof Error && error.message === "RCON_TIMEOUT"
-          ? "RCON_TIMEOUT"
+        error instanceof Error &&
+          [
+            "RCON_TIMEOUT",
+            "RCON_INVALID_PACKET",
+            "RCON_RESPONSE_LIMIT_EXCEEDED",
+            "RCON_CONNECTION_CLOSED",
+          ].includes(error.message)
+          ? error.message
           : "RCON_UNAVAILABLE",
       );
     } finally {
@@ -8492,6 +8578,7 @@ async function prepareRun(): Promise<RunState> {
     "AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY",
+    "AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY",
     "AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY",
   ].filter((name) => process.env[name] === "YES").length;
   if (
@@ -8504,6 +8591,12 @@ async function prepareRun(): Promise<RunState> {
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
   const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
+  if (
+    process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" &&
+    requestedTargetCase !== "gather_multi_target_continuity"
+  ) {
+    incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_TARGET_REQUIRED");
+  }
   if (
     requestedTargetCase !== undefined &&
     requestedTargetCase.length > 0 &&
@@ -9274,8 +9367,18 @@ async function runOperationSmoke(
         }
         if (!positionMatchesSmokeSpawn(visibleBefore.self.position))
           incomplete("BODY_SMOKE_CLIENT_POSITION_NOT_CONFIRMED");
-        if (state.targetCase === "gather_multi_target_continuity") {
-          await runGatherStackOracleProbe(state, rcon, state.botName, body);
+        if (
+          shouldRunGatherMultiTargetOracleProbe(
+            state.targetCase,
+            process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY,
+          )
+        ) {
+          await runGatherTargetCountOracleProbe(
+            state,
+            rcon,
+            state.botName,
+            body,
+          );
         }
         const hiddenItemOmitted = !JSON.stringify(visibleBefore)
           .toLowerCase()
@@ -10741,9 +10844,11 @@ async function readGatherMultiTargetInventoryCounts(
   rcon: LocalRcon,
   botName: string,
 ): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
-  const result = await readGatherMultiTargetInventory(() =>
-    rcon.command(`data get entity ${botName} Inventory`),
+  const result = await readGatherMultiTargetItemCounts(
+    (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+    botName,
   );
+  updateGatherMultiTargetItemCountReadDiagnostic(state, result, "Baseline");
   if (result.reason !== "parsed") {
     updateGatherMultiTargetDiagnostic(state, {
       gatherInventoryReadAvailable: false,
@@ -10795,7 +10900,7 @@ async function rconGatherLogDropPositionNear(
   incomplete("GATHER_MULTI_TARGET_DROP_ORACLE_UNAVAILABLE");
 }
 
-async function runGatherStackOracleProbe(
+async function runGatherTargetCountOracleProbe(
   state: RunState,
   rcon: LocalRcon,
   botName: string,
@@ -10811,8 +10916,8 @@ async function runGatherStackOracleProbe(
     gatherOracleProbeProviderRequestsRecorded: 0,
     gatherOracleProbeBlockedProviderRequests: "not_applicable_prestart",
     gatherOracleProbeCleanupConfirmed: false,
-    ...gatherMultiTargetInventorySafeEvidence("Baseline", undefined),
-    ...gatherMultiTargetInventorySafeEvidence("Final", undefined),
+    ...gatherMultiTargetItemCountSafeEvidence("Baseline", undefined),
+    ...gatherMultiTargetItemCountSafeEvidence("Final", undefined),
     gatherOracleProbeBaselineDropCount: null,
     gatherOracleProbeDropCountBeforeCollection: null,
     gatherOracleProbeDropCountAfterCollection: null,
@@ -10845,20 +10950,21 @@ async function runGatherStackOracleProbe(
     await rcon.command(
       `item replace entity ${botName} hotbar.0 with minecraft:oak_log 64`,
     );
-    const baseline = await readGatherMultiTargetInventory(() =>
-      rcon.command(`data get entity ${botName} Inventory`),
+    const baseline = await readGatherMultiTargetItemCounts(
+      (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+      botName,
     );
     updateGatherMultiTargetDiagnostic(state, {
-      ...gatherMultiTargetInventorySafeEvidence("Baseline", baseline),
+      ...gatherMultiTargetItemCountSafeEvidence("Baseline", baseline),
     });
     const baselineFailureFields =
-      gatherMultiTargetOracleProbeBaselineFailureFields(baseline);
+      gatherMultiTargetOracleProbeBaselineCountFailureFields(baseline);
     if (baselineFailureFields.length > 0) {
       updateGatherMultiTargetDiagnostic(state, {
         gatherOracleProbeBaselineMismatchFields:
           baselineFailureFields.join(","),
       });
-      incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_STACK_BASELINE_UNCONFIRMED");
+      incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_COUNT_BASELINE_UNCONFIRMED");
     }
     const dropBaseline = await rconGatherLogDropCountNear(
       rcon,
@@ -10999,11 +11105,12 @@ async function runGatherStackOracleProbe(
     });
     if (!collectionConfirmed)
       incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_COLLECTION_UNCONFIRMED");
-    const inventoryAfter = await readGatherMultiTargetInventory(() =>
-      rcon.command(`data get entity ${botName} Inventory`),
+    const inventoryAfter = await readGatherMultiTargetItemCounts(
+      (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+      botName,
     );
     updateGatherMultiTargetDiagnostic(state, {
-      ...gatherMultiTargetInventorySafeEvidence("Final", inventoryAfter),
+      ...gatherMultiTargetItemCountSafeEvidence("Final", inventoryAfter),
       gatherOracleProbeDropCountAfterCollection: null,
     });
     const dropCountAfter = await rconGatherLogDropCountNear(
@@ -11014,10 +11121,11 @@ async function runGatherStackOracleProbe(
     updateGatherMultiTargetDiagnostic(state, {
       gatherOracleProbeDropCountAfterCollection: dropCountAfter,
     });
-    const resultFailureFields = gatherMultiTargetOracleProbeResultFailureFields(
-      inventoryAfter,
-      dropCountAfter,
-    );
+    const resultFailureFields =
+      gatherMultiTargetOracleProbeResultCountFailureFields(
+        inventoryAfter,
+        dropCountAfter,
+      );
     if (resultFailureFields.length > 0) {
       updateGatherMultiTargetDiagnostic(state, {
         gatherOracleProbeResultMismatchFields: resultFailureFields.join(","),
@@ -11155,8 +11263,9 @@ async function cleanupGatherMultiTargetFixture(
   for (const item of GATHER_MULTI_TARGET_ITEMS) {
     await rcon.command(`clear ${botName} minecraft:${item}`);
   }
-  const inventory = await readGatherMultiTargetInventory(() =>
-    rcon.command(`data get entity ${botName} Inventory`),
+  const inventory = await readGatherMultiTargetItemCounts(
+    (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+    botName,
   );
   const fixtureInventoryEmpty =
     inventory.reason === "parsed" &&
@@ -11806,6 +11915,12 @@ async function runGatherMultiTargetContinuityCase(
   context: CaseContext,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   let fixture: GatherMultiTargetFixture | undefined;
+  let caseResult:
+    Readonly<Record<string, boolean | number | string>> | undefined;
+  let primaryError: unknown;
+  let cleanupError: unknown;
+  let primaryFailed = false;
+  let cleanupFailed = false;
   try {
     const quiet = await observeForPlayer(
       context,
@@ -11895,13 +12010,17 @@ async function runGatherMultiTargetContinuityCase(
     >();
     const rememberOutcomes = (player: PlayerEvidence): void => {
       for (const outcome of player.recentOutcomes) {
-        if (
-          !priorOutcomeIds.has(outcome.operationId) &&
-          (outcome.kind === "dig" || outcome.kind === "collect_item")
-        ) {
+        if (!priorOutcomeIds.has(outcome.operationId)) {
           observedOutcomes.set(outcome.operationId, outcome);
         }
       }
+      const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+        ...observedOutcomes.values(),
+      ]);
+      updateGatherMultiTargetDiagnostic(state, {
+        gatherSuccessfulBodyOutcomeCount: bodyOutcomes.totalCount,
+        gatherSuccessfulBodyOutcomeKindCounts: bodyOutcomes.kindCounts,
+      });
     };
 
     sendChat(context.owner, "近くのオークの原木を集めてきて。進め方は任せる。");
@@ -11948,29 +12067,23 @@ async function runGatherMultiTargetContinuityCase(
       gatherRequestedBirchLogCount: "unknown",
     });
 
-    let firstSampleAt = 0;
     const firstOakProgress = await observeForPlayer(
       context,
       120_000,
       async (player) => {
         rememberOutcomes(player);
-        const successfulDig = [...observedOutcomes.values()].some(
-          (outcome) =>
-            outcome.kind === "dig" && outcome.status === "successful",
-        );
-        if (!successfulDig || Date.now() - firstSampleAt < 1_200) return false;
-        firstSampleAt = Date.now();
-        return (
-          !(await isBlock(context.rcon, activeFixture.oakLog, "oak_log")) &&
-          (await isBlock(context.rcon, activeFixture.birchLog, "birch_log"))
-        );
+        const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+          ...observedOutcomes.values(),
+        ]);
+        if (bodyOutcomes.totalCount === 0) return false;
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherInitialOakBodyProgressConfirmed: true,
+        });
+        return true;
       },
     );
     if (firstOakProgress === undefined)
       incomplete("GATHER_MULTI_TARGET_FIRST_OAK_PROGRESS_NOT_CONFIRMED");
-    updateGatherMultiTargetDiagnostic(state, {
-      gatherInitialOakBodyDigAndServerBlockConfirmed: true,
-    });
 
     const beforeFollowup = playerOf(await collect(context.runtime.app));
     rememberOutcomes(beforeFollowup);
@@ -12002,16 +12115,16 @@ async function runGatherMultiTargetContinuityCase(
       ) {
         return false;
       }
-      const accepted = player.recentJudgments.findLast(
-        ({ proposalId, proposalDisposition, decidedAt }) =>
-          birchProposalIds.includes(proposalId ?? "") &&
-          (proposalDisposition === "adopted" ||
-            proposalDisposition === "compromised") &&
-          Date.parse(decidedAt ?? "") >= followupSentAt,
+      const acceptedGoal = player.goals.find(
+        ({ ownerProposalId, source, status }) =>
+          birchProposalIds.includes(ownerProposalId ?? "") &&
+          source === "owner" &&
+          (status === "active" || status === "completed"),
       );
-      if (accepted === undefined) return false;
-      birchAcceptedAt = Date.parse(accepted.decidedAt ?? "");
-      return Number.isFinite(birchAcceptedAt);
+      birchAcceptedAt = Date.parse(acceptedGoal?.updatedAt ?? "");
+      return (
+        Number.isFinite(birchAcceptedAt) && birchAcceptedAt >= followupSentAt
+      );
     });
     if (birchIntent === undefined)
       incomplete("GATHER_MULTI_TARGET_BIRCH_FOLLOWUP_NOT_ACCEPTED");
@@ -12028,7 +12141,6 @@ async function runGatherMultiTargetContinuityCase(
     };
     updateGatherMultiTargetDiagnostic(state, {
       gatherBirchFollowupOwnerGoalAccepted: true,
-      gatherFollowupAcceptedJudgmentObserved: true,
       gatherRequestedBirchLogCount: birchGoalCount ?? "unknown",
     });
 
@@ -12038,71 +12150,115 @@ async function runGatherMultiTargetContinuityCase(
     >();
     let finalInventory:
       Readonly<Record<GatherMultiTargetItem, number>> | undefined;
-    let finalOakRemoved = false;
-    let finalBirchRemoved = false;
+    let finalOakRemoved: boolean | undefined;
+    let finalBirchRemoved: boolean | undefined;
     let lastSampleAt = 0;
     const complete = await observeForPlayer(
       context,
       180_000,
       async (player) => {
         rememberOutcomes(player);
-        for (const outcome of player.recentOutcomes) {
+        for (const outcome of observedOutcomes.values()) {
           if (
             !outcomeIdsBeforeFollowup.has(outcome.operationId) &&
-            Date.parse(outcome.observedAt ?? "") >= birchAcceptedAt &&
-            (outcome.kind === "dig" || outcome.kind === "collect_item")
+            Date.parse(outcome.observedAt ?? "") > birchAcceptedAt &&
+            !postFollowupOutcomes.has(outcome.operationId)
           ) {
             postFollowupOutcomes.set(outcome.operationId, outcome);
           }
         }
-        const bodyPairs = countCompletedGatherActions([
+        const bodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
           ...observedOutcomes.values(),
         ]);
-        const followupPairs = countCompletedGatherActions([
-          ...postFollowupOutcomes.values(),
-        ]);
+        const followupBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes(
+          [...postFollowupOutcomes.values()],
+          birchAcceptedAt,
+        );
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherSuccessfulBodyOutcomeCount: bodyOutcomes.totalCount,
+          gatherSuccessfulBodyOutcomeKindCounts: bodyOutcomes.kindCounts,
+          gatherPostBirchGoalBodyOutcomeCount: followupBodyOutcomes.totalCount,
+          gatherPostBirchGoalBodyOutcomeKindCounts:
+            followupBodyOutcomes.kindCounts,
+        });
         if (Date.now() - lastSampleAt < 1_200) return false;
         lastSampleAt = Date.now();
 
-        const inventory = await readGatherMultiTargetInventory(() =>
-          context.rcon.command(`data get entity ${context.botName} Inventory`),
+        const inventory = await readGatherMultiTargetItemCounts(
+          (item) =>
+            context.rcon.command(
+              `clear ${context.botName} minecraft:${item} 0`,
+            ),
+          context.botName,
         );
-        if (inventory.reason !== "parsed") return false;
+        const inventoryParsed = inventory.reason === "parsed";
+        const oakDelta = inventoryParsed
+          ? inventory.counts.oak_log - baseline.oak_log
+          : undefined;
+        const birchDelta = inventoryParsed
+          ? inventory.counts.birch_log - baseline.birch_log
+          : undefined;
+        updateGatherMultiTargetItemCountReadDiagnostic(
+          state,
+          inventory,
+          "Latest",
+          baseline,
+        );
+        if (!inventoryParsed) return false;
         finalInventory = inventory.counts;
-        finalOakRemoved = !(await isBlock(
-          context.rcon,
-          activeFixture.oakLog,
-          "oak_log",
-        ));
-        finalBirchRemoved = !(await isBlock(
-          context.rcon,
-          activeFixture.birchLog,
-          "birch_log",
-        ));
+        try {
+          finalOakRemoved = !(await isBlock(
+            context.rcon,
+            activeFixture.oakLog,
+            "oak_log",
+          ));
+        } catch {
+          finalOakRemoved = undefined;
+        }
+        try {
+          finalBirchRemoved = !(await isBlock(
+            context.rcon,
+            activeFixture.birchLog,
+            "birch_log",
+          ));
+        } catch {
+          finalBirchRemoved = undefined;
+        }
+        updateGatherMultiTargetDiagnostic(state, {
+          gatherOakBlockRemovedByServer: finalOakRemoved ?? null,
+          gatherBirchBlockRemovedByServer: finalBirchRemoved ?? null,
+        });
         return (
-          finalOakRemoved &&
-          finalBirchRemoved &&
-          inventory.counts.oak_log - baseline.oak_log === 1 &&
-          inventory.counts.birch_log - baseline.birch_log === 1 &&
-          bodyPairs >= 2 &&
-          followupPairs >= 1
+          oakDelta !== undefined &&
+          oakDelta >= 1 &&
+          birchDelta !== undefined &&
+          birchDelta >= 1 &&
+          bodyOutcomes.totalCount >= 2 &&
+          followupBodyOutcomes.totalCount >= 1
         );
       },
     );
     if (complete === undefined || finalInventory === undefined)
       incomplete("GATHER_MULTI_TARGET_SERVER_AND_BODY_PROGRESS_NOT_CONFIRMED");
+    const finalBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes([
+      ...observedOutcomes.values(),
+    ]);
+    const finalPostBirchBodyOutcomes = summarizeSuccessfulGatherBodyOutcomes(
+      [...postFollowupOutcomes.values()],
+      birchAcceptedAt,
+    );
     updateGatherMultiTargetDiagnostic(state, {
       gatherOakLogInventoryDelta: finalInventory.oak_log - baseline.oak_log,
       gatherBirchLogInventoryDelta:
         finalInventory.birch_log - baseline.birch_log,
-      gatherOakBlockRemovedByServer: finalOakRemoved,
-      gatherBirchBlockRemovedByServer: finalBirchRemoved,
-      gatherSuccessfulBodyGatherPairs: countCompletedGatherActions([
-        ...observedOutcomes.values(),
-      ]),
-      gatherPostFollowupBodyGatherPairs: countCompletedGatherActions([
-        ...postFollowupOutcomes.values(),
-      ]),
+      gatherOakBlockRemovedByServer: finalOakRemoved ?? null,
+      gatherBirchBlockRemovedByServer: finalBirchRemoved ?? null,
+      gatherSuccessfulBodyOutcomeCount: finalBodyOutcomes.totalCount,
+      gatherSuccessfulBodyOutcomeKindCounts: finalBodyOutcomes.kindCounts,
+      gatherPostBirchGoalBodyOutcomeCount:
+        finalPostBirchBodyOutcomes.totalCount,
+      gatherPostBirchGoalBodyOutcomeKindCounts:
+        finalPostBirchBodyOutcomes.kindCounts,
     });
     const oakDelta = finalInventory.oak_log - baseline.oak_log;
     const birchDelta = finalInventory.birch_log - baseline.birch_log;
@@ -12172,10 +12328,10 @@ async function runGatherMultiTargetContinuityCase(
       activeFixture,
     );
     fixture = undefined;
-    return {
+    caseResult = {
       ...gatherMultiTargetSafeEvidence(state),
-      gatherIndependentServerCountsConfirmed: true,
-      gatherBodyDigAndPickupPairsConfirmed: true,
+      gatherIndependentTargetInventoryIncreasesConfirmed: true,
+      gatherMultipleSuccessfulBodyOutcomesConfirmed: true,
       gatherProgressExplanationStatus:
         typeof state.gatherMultiTargetDiagnostic
           ?.gatherProgressExplanationStatus === "string"
@@ -12187,16 +12343,29 @@ async function runGatherMultiTargetContinuityCase(
           ? "target_counts_reached"
           : "target_counts_remaining",
     };
+  } catch (error) {
+    primaryError = error;
+    primaryFailed = true;
   } finally {
     if (fixture !== undefined) {
-      await cleanupGatherMultiTargetFixture(
-        state,
-        context.rcon,
-        context.botName,
-        fixture,
-      );
+      try {
+        await cleanupGatherMultiTargetFixture(
+          state,
+          context.rcon,
+          context.botName,
+          fixture,
+        );
+      } catch (error) {
+        cleanupError = error;
+        cleanupFailed = true;
+      }
     }
   }
+  if (primaryFailed) throw primaryError;
+  if (cleanupFailed) throw cleanupError;
+  if (caseResult === undefined)
+    throw new Error("Gather case returned no result");
+  return caseResult;
 }
 
 async function sampleGatherProgressReply(
@@ -12226,14 +12395,34 @@ async function sampleGatherProgressReply(
   );
   if (priorReplySettled === undefined)
     incomplete("GATHER_MULTI_TARGET_PRIOR_REPLY_NOT_SETTLED");
-  const before = await readGatherMultiTargetInventory(() =>
-    context.rcon.command(`data get entity ${context.botName} Inventory`),
+  const before = await readGatherMultiTargetItemCounts(
+    (item) =>
+      context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+    context.botName,
+  );
+  updateGatherMultiTargetItemCountReadDiagnostic(
+    state,
+    before,
+    "Latest",
+    baseline,
   );
   if (before.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
-  const oakBlockBefore = await isBlock(context.rcon, fixture.oakLog, "oak_log");
-  const birchBlockBefore = await isBlock(
-    context.rcon,
+  const readBlockRemoved = async (
+    target: Position,
+    item: GatherMultiTargetItem,
+  ): Promise<boolean | undefined> => {
+    try {
+      return !(await isBlock(context.rcon, target, item));
+    } catch {
+      return undefined;
+    }
+  };
+  const oakBlockRemovedBefore = await readBlockRemoved(
+    fixture.oakLog,
+    "oak_log",
+  );
+  const birchBlockRemovedBefore = await readBlockRemoved(
     fixture.birchLog,
     "birch_log",
   );
@@ -12267,25 +12456,30 @@ async function sampleGatherProgressReply(
     incomplete("GATHER_MULTI_TARGET_PROGRESS_REPLY_NOT_SAMPLED");
   }
   const hash = await retainGatherProgressReply(state, reply.text);
-  const after = await readGatherMultiTargetInventory(() =>
-    context.rcon.command(`data get entity ${context.botName} Inventory`),
+  const after = await readGatherMultiTargetItemCounts(
+    (item) =>
+      context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+    context.botName,
+  );
+  updateGatherMultiTargetItemCountReadDiagnostic(
+    state,
+    after,
+    "Latest",
+    baseline,
   );
   if (after.reason !== "parsed")
     incomplete("GATHER_MULTI_TARGET_PROGRESS_ORACLE_UNAVAILABLE");
-  const oakBlockAfter = await isBlock(context.rcon, fixture.oakLog, "oak_log");
-  const birchBlockAfter = await isBlock(
-    context.rcon,
+  const oakBlockRemovedAfter = await readBlockRemoved(
+    fixture.oakLog,
+    "oak_log",
+  );
+  const birchBlockRemovedAfter = await readBlockRemoved(
     fixture.birchLog,
     "birch_log",
   );
-  const worldStable =
-    GATHER_MULTI_TARGET_ITEMS.every(
-      (item) => before.counts[item] === after.counts[item],
-    ) &&
-    !oakBlockBefore &&
-    !birchBlockBefore &&
-    !oakBlockAfter &&
-    !birchBlockAfter;
+  const inventoryStable = GATHER_MULTI_TARGET_ITEMS.every(
+    (item) => before.counts[item] === after.counts[item],
+  );
   const observedOak = after.counts.oak_log - baseline.oak_log;
   const observedBirch = after.counts.birch_log - baseline.birch_log;
   const oakRemaining =
@@ -12303,14 +12497,18 @@ async function sampleGatherProgressReply(
     gatherProgressReplySidecarRetained:
       state.gatherProgressReplySidecarRetained === true,
     gatherProgressReplyReviewRequired: true,
-    gatherProgressWorldStableWhileReplying: worldStable,
+    gatherProgressInventoryStableWhileReplying: inventoryStable,
+    gatherOakBlockRemovedBeforeProgressReply: oakBlockRemovedBefore ?? null,
+    gatherBirchBlockRemovedBeforeProgressReply: birchBlockRemovedBefore ?? null,
+    gatherOakBlockRemovedAfterProgressReply: oakBlockRemovedAfter ?? null,
+    gatherBirchBlockRemovedAfterProgressReply: birchBlockRemovedAfter ?? null,
     gatherProgressObservedOakLogCount: observedOak,
     gatherProgressObservedBirchLogCount: observedBirch,
     gatherProgressRequestedOakLogCount: requestedCounts.oak_log,
     gatherProgressRequestedBirchLogCount: requestedCounts.birch_log,
     gatherProgressRemainingOakLogCount: oakRemaining,
     gatherProgressRemainingBirchLogCount: birchRemaining,
-    gatherProgressExplanationStatus: worldStable
+    gatherProgressExplanationStatus: inventoryStable
       ? "sampled_pending_private_review"
       : "sampled_world_changed_pending_private_review",
   });
