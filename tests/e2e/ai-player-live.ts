@@ -7808,6 +7808,7 @@ async function main(): Promise<void> {
         )
           incomplete("OWNER_PARALLEL_OPERATION_ENDED_BEFORE_CHAT");
         const ownerReplyStart = context.responseQueue.length;
+        const ownerPreferenceSentAt = Date.now();
         sendChat(
           context.owner,
           "強くお願いします。レッドストーンは後回しにして、いったん私のところへ戻ってください。あなたの意見も伝え、今の目的と折り合いをつけてください。",
@@ -7835,6 +7836,24 @@ async function main(): Promise<void> {
           parallelOwnerRequestResolved: ownerRequestChangedGoal,
           parallelOwnerGoalLinkedToRequest: ownerGoalLinkedToRequest,
         });
+        if (
+          (await observeForPlayer(context, 90_000, (player) => {
+            const operation = player.activeOperation;
+            const bodyStartedAt = operation?.bodyStartedAt;
+            return (
+              player.actionRevision > ownerOperation.actionRevision &&
+              operation !== undefined &&
+              operation.operationId !== ownerOperationId &&
+              bodyStartedAt !== undefined &&
+              Number.isFinite(Date.parse(bodyStartedAt)) &&
+              Date.parse(bodyStartedAt) >= ownerPreferenceSentAt
+            );
+          })) === undefined
+        ) {
+          if (Date.now() >= context.runDeadlineAt)
+            incomplete("RUN_DEADLINE_EXCEEDED");
+          incomplete("PARALLEL_STOP_ACTIVE_BODY_OPERATION_NOT_CONFIRMED");
+        }
         let lastOwnerApproachCheckAt = 0;
         let ownerApproachCheckCount = 0;
         let bestApproachBucket = "none";
