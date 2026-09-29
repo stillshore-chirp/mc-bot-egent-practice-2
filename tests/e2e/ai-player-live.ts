@@ -10946,6 +10946,11 @@ async function runUnderwaterItemRecoveryCase(
     movementRecoveryRequiredCount: 0,
     movementSignalObservedCount: 0,
     movementSignalAbortedCount: 0,
+    movementAbortReasonActionRevisionChangedCount: 0,
+    movementAbortReasonBodyOperationReplacedCount: 0,
+    movementAbortReasonOwnerStopCount: 0,
+    movementAbortReasonAutonomyStoppedCount: 0,
+    movementAbortReasonUnknownCount: 0,
     movementPathNoPathCount: 0,
     movementPathTimeoutCount: 0,
     movementPathSuccessCount: 0,
@@ -11069,7 +11074,6 @@ async function runUnderwaterItemRecoveryCase(
     const priorOutcomes = new Set(
       beforeRequest.recentOutcomes.map(({ operationId }) => operationId),
     );
-    const priorOwnerGoalIds = new Set(beforeRequest.goals.map(({ id }) => id));
     const targetItemEntityId = visibleItemEntityId;
     const originalExecuteDescriptor = Object.getOwnPropertyDescriptor(
       body,
@@ -11106,8 +11110,27 @@ async function runUnderwaterItemRecoveryCase(
       } finally {
         if (isMovement && signal !== undefined)
           incrementMovementDiagnostic("movementSignalObservedCount");
-        if (isMovement && signal?.aborted === true)
+        if (isMovement && signal?.aborted === true) {
           incrementMovementDiagnostic("movementSignalAbortedCount");
+          const reason: unknown = signal.reason;
+          const reasonMessage =
+            reason instanceof Error
+              ? reason.message
+              : typeof reason === "string"
+                ? reason
+                : undefined;
+          const reasonCountKey =
+            reasonMessage === "action_revision_changed"
+              ? "movementAbortReasonActionRevisionChangedCount"
+              : reasonMessage === "body_operation_replaced"
+                ? "movementAbortReasonBodyOperationReplacedCount"
+                : reasonMessage === "owner_stop"
+                  ? "movementAbortReasonOwnerStopCount"
+                  : reasonMessage === "autonomy_stopped"
+                    ? "movementAbortReasonAutonomyStoppedCount"
+                    : "movementAbortReasonUnknownCount";
+          incrementMovementDiagnostic(reasonCountKey);
+        }
       }
       if (isMovement) {
         const statusKey = {
@@ -11211,30 +11234,6 @@ async function runUnderwaterItemRecoveryCase(
           Date.parse(outcome.observedAt ?? "") >= requestAt &&
           matchingPickupObserved,
       );
-      const completedNewOwnerGoal = player.goals.some(
-        (goal) =>
-          !priorOwnerGoalIds.has(goal.id) &&
-          goal.source === "owner" &&
-          goal.status === "completed",
-      );
-      if (
-        !ownerDryReturnFollowupSent &&
-        collectSucceeded &&
-        completedNewOwnerGoal &&
-        fresh &&
-        gameFresh &&
-        observation.self.inWater === true &&
-        evidence.game?.inWater === true
-      ) {
-        sendChat(
-          context.owner,
-          "原木の拾得は確認できました。まだ水中なので、原木を持ったまま乾いた岸へ移動してください。",
-        );
-        ownerDryReturnFollowupSent = true;
-        updateUnderwaterItemRecoveryDiagnostic(state, {
-          dryReturnFollowupSent: true,
-        });
-      }
       if (Date.now() - lastOracleAt >= 1_500) {
         lastOracleAt = Date.now();
         latestInventory = await readUnderwaterRecoveryInventory(
@@ -11250,6 +11249,26 @@ async function runUnderwaterItemRecoveryCase(
           collectItemOutcomeSuccessful: collectSucceeded,
           inventoryDelta: latestInventory.oak_log - baseline.oak_log,
           matchingDropCountAfter: latestDropCount,
+        });
+      }
+      if (
+        !ownerDryReturnFollowupSent &&
+        enteredWater &&
+        collectSucceeded &&
+        latestInventory?.oak_log === baseline.oak_log + 1 &&
+        latestDropCount === 0 &&
+        fresh &&
+        gameFresh &&
+        observation.self.inWater === true &&
+        evidence.game?.inWater === true
+      ) {
+        sendChat(
+          context.owner,
+          "原木の拾得は確認できました。まだ水中なので、原木を持ったまま乾いた岸へ移動してください。",
+        );
+        ownerDryReturnFollowupSent = true;
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          dryReturnFollowupSent: true,
         });
       }
       if (
