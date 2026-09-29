@@ -185,6 +185,7 @@ import {
   isCaseSelectedForTarget,
   isArmorCapabilityTargeted,
   isGatherMultiTargetCaseSelected,
+  isUnderwaterItemRecoveryTargeted,
   isOwnerStopLatchTargeted,
   TARGETABLE_CASES,
   type TargetableCase,
@@ -277,6 +278,11 @@ export const OWNER_STOP_LATCH_CASE_BUDGET = {
   totalTokens: 240_000,
 } as const;
 export const OWNER_STOP_LATCH_CASE_DEADLINE_MS = 14 * 60_000;
+export const UNDERWATER_ITEM_RECOVERY_CASE_BUDGET = {
+  llmCalls: 64,
+  totalTokens: 600_000,
+} as const;
+export const UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS = 12 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
@@ -294,6 +300,7 @@ const CASE_BUDGETS = {
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
+  underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
   damage_response: DAMAGE_RESPONSE_CASE_BUDGET,
   no_food_replan: NO_FOOD_REPLAN_CASE_BUDGET,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_BUDGET,
@@ -319,6 +326,7 @@ const CASE_DEADLINES = {
   food_intent_continuity: 8 * 60_000,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
+  underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
   damage_response: 8 * 60_000,
   no_food_replan: NO_FOOD_REPLAN_CASE_DEADLINE_MS,
   parallel_dialogue_stop: PARALLEL_DIALOGUE_STOP_CASE_DEADLINE_MS,
@@ -2348,6 +2356,9 @@ function safeFailureEvidence(state: RunState, caseId: string): SafeEvidence {
     ...(caseId === "owner_stop_latch"
       ? (state.ownerStopLatchDiagnostic ?? {})
       : {}),
+    ...(caseId === "underwater_item_recovery"
+      ? (state.underwaterItemRecoveryDiagnostic ?? {})
+      : {}),
     ...(caseId === "armor_capability"
       ? (state.armorCapabilityDiagnostic ?? {})
       : {}),
@@ -2729,6 +2740,16 @@ function updateOwnerStopLatchDiagnostic(
 ): void {
   state.ownerStopLatchDiagnostic = {
     ...(state.ownerStopLatchDiagnostic ?? {}),
+    ...diagnostic,
+  };
+}
+
+function updateUnderwaterItemRecoveryDiagnostic(
+  state: RunState,
+  diagnostic: SafeEvidence,
+): void {
+  state.underwaterItemRecoveryDiagnostic = {
+    ...(state.underwaterItemRecoveryDiagnostic ?? {}),
     ...diagnostic,
   };
 }
@@ -3254,6 +3275,7 @@ interface RunState {
   unknownCompositeDiagnostic?: SafeEvidence;
   parallelDiagnostic?: SafeEvidence;
   ownerStopLatchDiagnostic?: SafeEvidence;
+  underwaterItemRecoveryDiagnostic?: SafeEvidence;
   armorCapabilityDiagnostic?: SafeEvidence;
   armorCapabilityReplyHash?: string;
   armorCapabilityReplySidecarRetained?: boolean;
@@ -3448,6 +3470,7 @@ export function createOwnerReturnApplicationWithBodyCapture(
   if (
     targetCase !== "death_recovery" &&
     !ownerReturnRequestGateEnabled(targetCase) &&
+    !isUnderwaterItemRecoveryTargeted(targetCase) &&
     !isArmorCapabilityTargeted(targetCase) &&
     !captureBodyForTargetedUnknownCase
   )
@@ -9281,6 +9304,16 @@ async function main(): Promise<void> {
       },
     );
 
+    if (isUnderwaterItemRecoveryTargeted(state.targetCase)) {
+      await recordCase(
+        state,
+        "underwater_item_recovery",
+        CASE_DEADLINES.underwater_item_recovery,
+        requireLiveContext(),
+        async (context) => runUnderwaterItemRecoveryCase(state, context),
+      );
+    }
+
     if (isOwnerStopLatchTargeted(state.targetCase)) {
       await recordCase(
         state,
@@ -11933,6 +11966,520 @@ async function rconGatherLogDropPositionNear(
   if (classification === "position") return parsePosition(reply);
   if (classification === "known_negative") return undefined;
   incomplete("GATHER_MULTI_TARGET_DROP_ORACLE_UNAVAILABLE");
+}
+
+interface UnderwaterItemRecoveryFixture {
+  readonly waterCells: readonly BlockPosition[];
+  readonly supportCells: readonly BlockPosition[];
+  readonly boundaryCells: readonly BlockPosition[];
+  readonly boundaryHeadroomCells: readonly BlockPosition[];
+  readonly itemCenter: Position;
+}
+
+export function underwaterRecoveryPickupMatchesTarget(
+  expectedEntityId: number,
+  evidence: {
+    readonly operationKind: string;
+    readonly operationEntityId: number | undefined;
+    readonly status: string;
+    readonly itemCollectionOutcome: string | undefined;
+    readonly effectType: string | undefined;
+    readonly effectEntityId: number | undefined;
+    readonly beforeOakLogs: number | undefined;
+    readonly afterOakLogs: number | undefined;
+  },
+): boolean {
+  return (
+    evidence.operationKind === "collect_item" &&
+    evidence.operationEntityId === expectedEntityId &&
+    evidence.status === "successful" &&
+    evidence.itemCollectionOutcome === "collected" &&
+    evidence.effectType === "item_collected" &&
+    evidence.effectEntityId === expectedEntityId &&
+    evidence.beforeOakLogs !== undefined &&
+    evidence.afterOakLogs !== undefined &&
+    evidence.afterOakLogs > evidence.beforeOakLogs
+  );
+}
+
+function findUnderwaterItemRecoveryFixture(
+  origin: Position,
+): UnderwaterItemRecoveryFixture {
+  const poolY = Math.floor(origin.y) - 1;
+  const waterCells = [0, 1, 2].map((distance) =>
+    fixturePoint(origin, 0, 3 + distance, poolY),
+  );
+  const first = fixturePoint(origin, 0, 3, poolY);
+  const last = fixturePoint(origin, 0, 5, poolY);
+  return {
+    waterCells,
+    supportCells: waterCells.map((cell) => ({ ...cell, y: poolY - 1 })),
+    boundaryCells: [
+      ...waterCells.flatMap((cell) => [
+        { x: cell.x - 1, y: poolY, z: cell.z },
+        { x: cell.x + 1, y: poolY, z: cell.z },
+      ]),
+      { x: first.x, y: poolY, z: first.z - 1 },
+      { x: last.x, y: poolY, z: last.z + 1 },
+    ],
+    boundaryHeadroomCells: [1, 2].flatMap((height) => [
+      ...waterCells.flatMap((cell) => [
+        { x: cell.x - 1, y: poolY + height, z: cell.z },
+        { x: cell.x + 1, y: poolY + height, z: cell.z },
+      ]),
+      { x: first.x, y: poolY + height, z: first.z - 1 },
+      { x: last.x, y: poolY + height, z: last.z + 1 },
+    ]),
+    itemCenter: { x: last.x + 0.5, y: last.y + 0.25, z: last.z + 0.5 },
+  };
+}
+
+async function readUnderwaterRecoveryInventory(
+  rcon: LocalRcon,
+  botName: string,
+): Promise<Readonly<Record<GatherMultiTargetItem, number>>> {
+  const result = await readGatherMultiTargetItemCounts(
+    (item) => rcon.command(`clear ${botName} minecraft:${item} 0`),
+    botName,
+  );
+  if (result.reason !== "parsed")
+    incomplete("UNDERWATER_RECOVERY_INVENTORY_ORACLE_UNAVAILABLE");
+  return result.counts;
+}
+
+async function runUnderwaterItemRecoveryCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  updateUnderwaterItemRecoveryDiagnostic(state, {
+    fixtureConfigured: false,
+    freshBodyItemVisible: false,
+    bodyEnteredWater: false,
+    collectItemOutcomeSuccessful: false,
+    inventoryDelta: null,
+    matchingDropCountAfter: null,
+    returnedToDryLand: false,
+    movementSuccessfulCount: 0,
+    movementFailedCount: 0,
+    movementInterruptedCount: 0,
+    movementUnverifiedCount: 0,
+    movementRecoveryRequiredCount: 0,
+    movementSignalObservedCount: 0,
+    movementSignalAbortedCount: 0,
+    movementAbortReasonActionRevisionChangedCount: 0,
+    movementAbortReasonBodyOperationReplacedCount: 0,
+    movementAbortReasonOwnerStopCount: 0,
+    movementAbortReasonAutonomyStoppedCount: 0,
+    movementAbortReasonUnknownCount: 0,
+    movementPathNoPathCount: 0,
+    movementPathTimeoutCount: 0,
+    movementPathSuccessCount: 0,
+    movementPathPartialCount: 0,
+    dryReturnFollowupSent: false,
+    fixtureCleanupConfirmed: false,
+  });
+  const body = activeApplicationPlayerBody;
+  if (body === undefined) incomplete("UNDERWATER_RECOVERY_BODY_UNAVAILABLE");
+  const quiet = await observeForPlayer(
+    context,
+    30_000,
+    (player) => !player.stopped && !isOperationActive(player),
+  );
+  if (quiet === undefined)
+    incomplete("UNDERWATER_RECOVERY_PRECONDITION_NOT_QUIET");
+  await removeAutonomousResourceFixture(context.rcon);
+  const origin = parsePosition(
+    await context.rcon.command(`data get entity ${context.botName} Pos`),
+  );
+  const fixture = findUnderwaterItemRecoveryFixture(origin);
+  const ownedFixtureCells = [
+    ...fixture.waterCells,
+    ...fixture.supportCells,
+    ...fixture.boundaryCells,
+    ...fixture.boundaryHeadroomCells,
+    ...fixture.waterCells.map((cell) => ({ ...cell, y: cell.y + 1 })),
+  ];
+  const baseline = await readUnderwaterRecoveryInventory(
+    context.rcon,
+    context.botName,
+  );
+  const dropBaseline = await rconGatherLogDropCountNear(
+    context.rcon,
+    fixture.itemCenter,
+    "oak_log",
+  );
+  if (dropBaseline !== 0)
+    incomplete("UNDERWATER_RECOVERY_DROP_BASELINE_NOT_EMPTY");
+
+  let fixtureTouched = false;
+  let requestSent = false;
+  let cleanupConfirmed = false;
+  let result: Readonly<Record<string, boolean | number | string>> | undefined;
+  let primaryError: unknown;
+  let primaryFailed = false;
+  let restoreCollectionCapture: (() => void) | undefined;
+  let restoreMovementEventCapture: (() => void) | undefined;
+  let ownerDryReturnFollowupSent = false;
+  try {
+    fixtureTouched = true;
+    for (const cell of [...fixture.supportCells, ...fixture.boundaryCells]) {
+      await context.rcon.command(
+        `setblock ${cell.x} ${cell.y} ${cell.z} stone`,
+      );
+      if (!(await isBlock(context.rcon, cell, "stone")))
+        incomplete("UNDERWATER_RECOVERY_FIXTURE_SUPPORT_NOT_CONFIRMED");
+    }
+    for (const cell of fixture.boundaryHeadroomCells) {
+      await context.rcon.command(`setblock ${cell.x} ${cell.y} ${cell.z} air`);
+      if (!(await isBlock(context.rcon, cell, "air")))
+        incomplete("UNDERWATER_RECOVERY_EXIT_HEADROOM_NOT_CONFIRMED");
+    }
+    for (const cell of fixture.waterCells) {
+      await context.rcon.command(
+        `setblock ${cell.x} ${cell.y + 1} ${cell.z} air`,
+      );
+      if (!(await isBlock(context.rcon, { ...cell, y: cell.y + 1 }, "air")))
+        incomplete("UNDERWATER_RECOVERY_FIXTURE_HEADROOM_NOT_CONFIRMED");
+      await context.rcon.command(
+        `setblock ${cell.x} ${cell.y} ${cell.z} water`,
+      );
+      if (!(await isBlock(context.rcon, cell, "water")))
+        incomplete("UNDERWATER_RECOVERY_WATER_FIXTURE_NOT_CONFIRMED");
+    }
+    await context.rcon.command(
+      `summon minecraft:item ${fixture.itemCenter.x} ${fixture.itemCenter.y} ${fixture.itemCenter.z} {Item:{id:"minecraft:oak_log",count:1},Age:-32768s}`,
+    );
+    if (
+      (await rconGatherLogDropCountNear(
+        context.rcon,
+        fixture.itemCenter,
+        "oak_log",
+      )) !== 1
+    ) {
+      incomplete("UNDERWATER_RECOVERY_ITEM_FIXTURE_NOT_UNIQUE");
+    }
+    const fixtureAt = Date.now();
+    updateUnderwaterItemRecoveryDiagnostic(state, { fixtureConfigured: true });
+    await context.rcon.command(
+      `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} 0 0`,
+    );
+    let visible = false;
+    let visibleItemEntityId: number | undefined;
+    while (Date.now() < Math.min(fixtureAt + 12_000, context.caseDeadlineAt)) {
+      const observation = await body.observe();
+      const visibleItem =
+        Date.parse(observation.observedAt) >= fixtureAt
+          ? observation.perception.entities.find(
+              (entity) =>
+                !entity.isPlayer &&
+                entity.name === "item" &&
+                Math.hypot(
+                  entity.position.x - fixture.itemCenter.x,
+                  entity.position.y - fixture.itemCenter.y,
+                  entity.position.z - fixture.itemCenter.z,
+                ) <= 2.5,
+            )
+          : undefined;
+      visible = visibleItem !== undefined;
+      visibleItemEntityId = visibleItem?.id;
+      if (visible) break;
+      await waitMs(200);
+    }
+    if (!visible || visibleItemEntityId === undefined)
+      incomplete("UNDERWATER_RECOVERY_FRESH_ITEM_NOT_VISIBLE");
+    updateUnderwaterItemRecoveryDiagnostic(state, {
+      freshBodyItemVisible: true,
+    });
+    const beforeRequest = playerOf(await collect(context.runtime.app));
+    const priorOutcomes = new Set(
+      beforeRequest.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    const targetItemEntityId = visibleItemEntityId;
+    const originalExecuteDescriptor = Object.getOwnPropertyDescriptor(
+      body,
+      "execute",
+    );
+    const originalExecute = body.execute.bind(body);
+    let matchingPickupObserved = false;
+    const incrementMovementDiagnostic = (key: string): void => {
+      const existing = state.underwaterItemRecoveryDiagnostic?.[key];
+      updateUnderwaterItemRecoveryDiagnostic(state, {
+        [key]: Math.min(99, typeof existing === "number" ? existing + 1 : 1),
+      });
+    };
+    const unsubscribeMovementEvents = body.onEvent((event) => {
+      if (event.type !== "operation_path_updated") return;
+      const countKey = {
+        noPath: "movementPathNoPathCount",
+        timeout: "movementPathTimeoutCount",
+        success: "movementPathSuccessCount",
+        partial: "movementPathPartialCount",
+      }[event.status];
+      incrementMovementDiagnostic(countKey);
+    });
+    restoreMovementEventCapture = unsubscribeMovementEvents;
+    const instrumentedExecute: typeof body.execute = async (
+      operation,
+      signal,
+    ) => {
+      const isMovement =
+        operation.kind === "move_to" || operation.kind === "move_relative";
+      let operationResult: Awaited<ReturnType<typeof body.execute>>;
+      try {
+        operationResult = await originalExecute.call(body, operation, signal);
+      } finally {
+        if (isMovement && signal !== undefined)
+          incrementMovementDiagnostic("movementSignalObservedCount");
+        if (isMovement && signal?.aborted === true) {
+          incrementMovementDiagnostic("movementSignalAbortedCount");
+          const reason: unknown = signal.reason;
+          const reasonMessage =
+            reason instanceof Error
+              ? reason.message
+              : typeof reason === "string"
+                ? reason
+                : undefined;
+          const reasonCountKey =
+            reasonMessage === "action_revision_changed"
+              ? "movementAbortReasonActionRevisionChangedCount"
+              : reasonMessage === "body_operation_replaced"
+                ? "movementAbortReasonBodyOperationReplacedCount"
+                : reasonMessage === "owner_stop"
+                  ? "movementAbortReasonOwnerStopCount"
+                  : reasonMessage === "autonomy_stopped"
+                    ? "movementAbortReasonAutonomyStoppedCount"
+                    : "movementAbortReasonUnknownCount";
+          incrementMovementDiagnostic(reasonCountKey);
+        }
+      }
+      if (isMovement) {
+        const statusKey = {
+          successful: "movementSuccessfulCount",
+          failed: "movementFailedCount",
+          interrupted: "movementInterruptedCount",
+          unverified: "movementUnverifiedCount",
+        }[operationResult.status];
+        incrementMovementDiagnostic(statusKey);
+        if (operationResult.recoveryRequired)
+          incrementMovementDiagnostic("movementRecoveryRequiredCount");
+      }
+      const beforeOakLogs = operationResult.before?.self.inventory
+        .filter((item) => item.name === "oak_log")
+        .reduce((count, item) => count + item.count, 0);
+      const afterOakLogs = operationResult.after?.self.inventory
+        .filter((item) => item.name === "oak_log")
+        .reduce((count, item) => count + item.count, 0);
+      if (
+        underwaterRecoveryPickupMatchesTarget(targetItemEntityId, {
+          operationKind: operation.kind,
+          operationEntityId:
+            operation.kind === "collect_item" ? operation.entityId : undefined,
+          status: operationResult.status,
+          itemCollectionOutcome: operationResult.itemCollectionOutcome,
+          effectType: operationResult.observedEffect?.type,
+          effectEntityId: operationResult.observedEffect?.entityId,
+          beforeOakLogs,
+          afterOakLogs,
+        })
+      ) {
+        matchingPickupObserved = true;
+      }
+      return operationResult;
+    };
+    body.execute = instrumentedExecute;
+    restoreCollectionCapture = () => {
+      if (body.execute !== instrumentedExecute) return;
+      if (originalExecuteDescriptor === undefined)
+        Reflect.deleteProperty(body, "execute");
+      else Object.defineProperty(body, "execute", originalExecuteDescriptor);
+    };
+    const requestAt = Date.now();
+    requestSent = true;
+    sendChat(
+      context.owner,
+      "近くの浅い水場に落ちた原木を拾い、乾いた岸まで戻ってきてください。危険なら無理をせず、確認できた状況を伝えてください。",
+    );
+
+    let enteredWater = false;
+    let collectSucceeded = false;
+    let latestInventory:
+      Readonly<Record<GatherMultiTargetItem, number>> | undefined;
+    let latestDropCount: number | undefined;
+    let lastOracleAt = 0;
+    while (
+      Date.now() < Math.min(context.caseDeadlineAt, context.runDeadlineAt)
+    ) {
+      const evidence = await collect(context.runtime.app);
+      const player = playerOf(evidence);
+      const observation = await body.observe();
+      const fresh = Date.parse(observation.observedAt) >= fixtureAt;
+      const gameFresh =
+        Date.parse(evidence.game?.observedAt ?? "") >= fixtureAt;
+      if (
+        fresh &&
+        gameFresh &&
+        observation.self.inWater === true &&
+        evidence.game?.inWater === true
+      ) {
+        enteredWater = true;
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          bodyEnteredWater: true,
+        });
+        const oxygenConfirmedLow =
+          observation.self.oxygen !== null && observation.self.oxygen <= 5;
+        const oxygenState = evidence.game.oxygenState;
+        const oxygenConfirmedUnsafe =
+          oxygenConfirmedLow || oxygenState === "low";
+        const oxygenUnknown =
+          observation.self.oxygen === null ||
+          oxygenState === "unknown" ||
+          oxygenState === "not_applicable";
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          oxygenEvidence: oxygenConfirmedUnsafe
+            ? "low"
+            : oxygenUnknown
+              ? "unknown"
+              : "normal",
+        });
+        if (oxygenConfirmedUnsafe) {
+          sendChat(context.owner, "今の行動を停止してください。");
+          incomplete("UNDERWATER_RECOVERY_OXYGEN_CONFIRMED_LOW");
+        }
+      }
+      collectSucceeded ||= player.recentOutcomes.some(
+        (outcome) =>
+          !priorOutcomes.has(outcome.operationId) &&
+          outcome.kind === "collect_item" &&
+          outcome.status === "successful" &&
+          Date.parse(outcome.observedAt ?? "") >= requestAt &&
+          matchingPickupObserved,
+      );
+      if (Date.now() - lastOracleAt >= 1_500) {
+        lastOracleAt = Date.now();
+        latestInventory = await readUnderwaterRecoveryInventory(
+          context.rcon,
+          context.botName,
+        );
+        latestDropCount = await rconGatherLogDropCountNear(
+          context.rcon,
+          fixture.itemCenter,
+          "oak_log",
+        );
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          collectItemOutcomeSuccessful: collectSucceeded,
+          inventoryDelta: latestInventory.oak_log - baseline.oak_log,
+          matchingDropCountAfter: latestDropCount,
+        });
+      }
+      if (
+        !ownerDryReturnFollowupSent &&
+        enteredWater &&
+        collectSucceeded &&
+        latestInventory?.oak_log === baseline.oak_log + 1 &&
+        latestDropCount === 0 &&
+        fresh &&
+        gameFresh &&
+        observation.self.inWater === true &&
+        evidence.game?.inWater === true
+      ) {
+        sendChat(
+          context.owner,
+          "原木の拾得は確認できました。まだ水中なので、原木を持ったまま乾いた岸へ移動してください。",
+        );
+        ownerDryReturnFollowupSent = true;
+        updateUnderwaterItemRecoveryDiagnostic(state, {
+          dryReturnFollowupSent: true,
+        });
+      }
+      if (
+        enteredWater &&
+        collectSucceeded &&
+        latestInventory?.oak_log === baseline.oak_log + 1 &&
+        latestDropCount === 0 &&
+        fresh &&
+        gameFresh &&
+        observation.self.inWater === false &&
+        evidence.game?.inWater === false
+      ) {
+        const serverPosition = parsePosition(
+          await context.rcon.command(`data get entity ${context.botName} Pos`),
+        );
+        const feet = {
+          x: Math.floor(serverPosition.x),
+          y: Math.floor(serverPosition.y),
+          z: Math.floor(serverPosition.z),
+        };
+        const head = { ...feet, y: feet.y + 1 };
+        const support = { ...feet, y: feet.y - 1 };
+        if (
+          (await isBlock(context.rcon, feet, "air")) &&
+          (await isBlock(context.rcon, head, "air")) &&
+          !(await isBlock(context.rcon, support, "air")) &&
+          !(await isBlock(context.rcon, support, "water"))
+        ) {
+          updateUnderwaterItemRecoveryDiagnostic(state, {
+            returnedToDryLand: true,
+          });
+          result = {
+            freshBodyItemVisible: true,
+            bodyEnteredWater: true,
+            collectItemOutcomeSuccessful: true,
+            inventoryDelta: 1,
+            matchingDropAbsent: true,
+            returnedToDryLand: true,
+          };
+          break;
+        }
+      }
+      await waitMs(800);
+    }
+    if (result === undefined)
+      incomplete("UNDERWATER_RECOVERY_PICKUP_OR_DRY_RETURN_UNCONFIRMED");
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
+  } finally {
+    restoreMovementEventCapture?.();
+    restoreCollectionCapture?.();
+  }
+
+  if (fixtureTouched) {
+    try {
+      if (primaryFailed && requestSent) {
+        sendChat(context.owner, "今の行動を停止してください。");
+        await context.rcon.command(
+          `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} 0 0`,
+        );
+      }
+      for (const cell of ownedFixtureCells)
+        await context.rcon.command(
+          `setblock ${cell.x} ${cell.y} ${cell.z} air`,
+        );
+      await context.rcon.command(
+        `execute positioned ${fixture.itemCenter.x} ${fixture.itemCenter.y} ${fixture.itemCenter.z} run kill @e[type=minecraft:item,distance=..4,nbt={Item:{id:"minecraft:oak_log"}}]`,
+      );
+      const restored = await Promise.all([
+        ...ownedFixtureCells.map((cell) => isBlock(context.rcon, cell, "air")),
+      ]);
+      cleanupConfirmed =
+        restored.every(Boolean) &&
+        (await rconGatherLogDropCountNear(
+          context.rcon,
+          fixture.itemCenter,
+          "oak_log",
+        )) === 0;
+    } catch {
+      cleanupConfirmed = false;
+    }
+    updateUnderwaterItemRecoveryDiagnostic(state, {
+      fixtureCleanupConfirmed: cleanupConfirmed,
+    });
+  }
+  if (primaryFailed) throw primaryError;
+  if (!cleanupConfirmed)
+    incomplete("UNDERWATER_RECOVERY_FIXTURE_CLEANUP_UNCONFIRMED");
+  if (result === undefined) incomplete("UNDERWATER_RECOVERY_RESULT_MISSING");
+  return result;
 }
 
 async function runGatherTargetCountOracleProbe(
@@ -18846,6 +19393,7 @@ async function writeArtifact(state: RunState): Promise<void> {
         : null,
       foodIntentContinuity: state.foodIntentContinuityDiagnostic ?? null,
       ownerReturnThroughDoor: state.ownerReturnDiagnostic ?? null,
+      underwaterItemRecovery: state.underwaterItemRecoveryDiagnostic ?? null,
       armorCapability: state.armorCapabilityDiagnostic ?? null,
     },
     budgets: {
