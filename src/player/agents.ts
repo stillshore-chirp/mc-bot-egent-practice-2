@@ -994,6 +994,7 @@ export interface PurposeAgentOptions {
   readonly onCommitted: (
     snapshot: PlayerRuntimeSnapshot,
     decision: PlayerThoughtDecision,
+    retainedActiveOperation?: boolean,
   ) => void;
   readonly onLearningUpdate?: () => void;
 }
@@ -1512,8 +1513,21 @@ export class PlayerPurposeAgent {
                 : {}),
             };
           }
-          committedDecision = decision;
-          this.options.onCommitted(saved.snapshot, decision);
+          const committed =
+            saved.retainedActiveOperation &&
+            decision.kind === "act" &&
+            saved.snapshot.activeOperation !== undefined
+              ? {
+                  ...decision,
+                  operationId: saved.snapshot.activeOperation.operationId,
+                }
+              : decision;
+          committedDecision = committed;
+          this.options.onCommitted(
+            saved.snapshot,
+            committed,
+            saved.retainedActiveOperation === true,
+          );
           let goalMemoryPersisted: boolean | undefined;
           if (goal !== undefined || proposalResolution !== undefined) {
             try {

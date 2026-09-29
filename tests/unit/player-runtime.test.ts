@@ -51,6 +51,201 @@ afterEach(() => {
 });
 
 describe("integrated player runtime", () => {
+  it("replaces a retained move_to when an observed safety fact changes", () => {
+    const directory = temporaryDirectory();
+    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    const move = (operationId: string) => ({
+      ...action(operationId, {
+        kind: "move_to" as const,
+        position: { x: 4, y: 64, z: 4 },
+        range: 1,
+      }),
+      purpose: "Reach the clearing",
+      expectedOutcome: "Move to the current destination.",
+    });
+
+    try {
+      const evidence = toObservationEvidence(observation());
+      mind.recordObservation(evidence);
+      const first = mind.commitThought({
+        expectedRevision: mind.snapshot().revision,
+        decision: move("safety-first"),
+      });
+      if (!first.accepted) throw new Error("INITIAL_MOVE_COMMIT_REJECTED");
+      const active = first.snapshot.activeOperation;
+      if (active === undefined) throw new Error("ACTIVE_MOVE_MISSING");
+      mind.markOperationStarted(active.operationId);
+
+      mind.recordObservation({
+        ...evidence,
+        observedAt: new Date(Date.now() + 1_000).toISOString(),
+        health: 19,
+      });
+      const reassessed = mind.commitThought({
+        expectedRevision: mind.snapshot().revision,
+        decision: move("safety-reassessed"),
+      });
+      if (!reassessed.accepted)
+        throw new Error("SAFETY_REASSESSMENT_COMMIT_REJECTED");
+      expect(reassessed.retainedActiveOperation).toBeUndefined();
+      expect(reassessed.snapshot.activeOperation?.operationId).toBe(
+        "safety-reassessed",
+      );
+      expect(reassessed.snapshot.actionRevision).toBe(
+        first.snapshot.actionRevision + 1,
+      );
+    } finally {
+      mind.close();
+    }
+  });
+
+  it("retains only an unchanged active move_to while preserving owner stop", async () => {
+    const fixture = createRuntimeFixture({
+      think: async () => ({ accepted: false }),
+    });
+    const goal = {
+      id: "move-goal",
+      title: "Reach the clearing",
+      status: "active" as const,
+      priority: 3,
+      changeReason: "The clearing is the current destination.",
+      source: "self" as const,
+    };
+    const move = (operationId: string, x: number) => ({
+      ...action(operationId, {
+        kind: "move_to" as const,
+        position: { x, y: 64, z: 4 },
+        range: 1,
+      }),
+      purpose: "Reach the clearing",
+      expectedOutcome: "Move to the current destination.",
+    });
+
+    try {
+      await fixture.runtime.start();
+      const firstDecision = move("move-first", 4);
+      const first = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: firstDecision,
+        goal,
+      });
+      if (!first.accepted) throw new Error("INITIAL_MOVE_COMMIT_REJECTED");
+      fixture.runtime.handleCommittedDecision(first.snapshot, firstDecision);
+      await waitFor(() => fixture.body.started.length === 1);
+      const firstOperation = first.snapshot.activeOperation;
+      if (firstOperation === undefined)
+        throw new Error("INITIAL_MOVE_OPERATION_MISSING");
+
+      const evidence = toObservationEvidence(observation());
+      fixture.mind.recordObservation({
+        ...evidence,
+        observedAt: new Date(Date.now() + 1_000).toISOString(),
+        timeOfDay: 7_000,
+        position: {
+          x: 12,
+          y: 64,
+          z: -4,
+          dimension: "overworld",
+        },
+        inventoryItems: [{ name: "stone", count: 3 }],
+        inventoryTotal: 3,
+        inventoryNames: ["stone"],
+      });
+      const repeatedDecision = move("move-repeated", 4);
+      const repeated = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: repeatedDecision,
+        goal,
+      });
+      if (!repeated.accepted) throw new Error("REPEATED_MOVE_COMMIT_REJECTED");
+      expect(repeated.retainedActiveOperation).toBe(true);
+      expect(repeated.snapshot.activeOperation).toMatchObject({
+        operationId: firstOperation.operationId,
+        actionRevision: firstOperation.actionRevision,
+      });
+      expect(repeated.snapshot.activeOperation).not.toHaveProperty(
+        "moveToContinuity",
+      );
+      fixture.runtime.handleCommittedDecision(
+        repeated.snapshot,
+        { ...repeatedDecision, operationId: firstOperation.operationId },
+        repeated.retainedActiveOperation,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(fixture.body.started).toEqual(["move_to"]);
+      expect(fixture.body.stopCalls).toBe(0);
+      expect(fixture.body.results).toHaveLength(0);
+
+      fixture.mind.addProposal({
+        title: "Change the current destination",
+        reason: "The owner has a new request.",
+      });
+      const ownerProposalDecision = move("move-after-owner-proposal", 4);
+      const ownerProposalCommit = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: ownerProposalDecision,
+      });
+      if (!ownerProposalCommit.accepted)
+        throw new Error("OWNER_PROPOSAL_MOVE_COMMIT_REJECTED");
+      expect(ownerProposalCommit.retainedActiveOperation).toBeUndefined();
+      fixture.runtime.handleCommittedDecision(
+        ownerProposalCommit.snapshot,
+        ownerProposalDecision,
+      );
+      await waitFor(() => fixture.body.started.length === 2);
+
+      const changedDestination = move("move-different-destination", 8);
+      const destinationCommit = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: changedDestination,
+      });
+      if (!destinationCommit.accepted)
+        throw new Error("CHANGED_DESTINATION_COMMIT_REJECTED");
+      expect(destinationCommit.retainedActiveOperation).toBeUndefined();
+      fixture.runtime.handleCommittedDecision(
+        destinationCommit.snapshot,
+        changedDestination,
+      );
+      await waitFor(() => fixture.body.started.length === 3);
+
+      const changedGoal = move("move-different-goal", 8);
+      const goalCommit = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: changedGoal,
+        goal: {
+          ...goal,
+          changeReason: "A different destination is now useful.",
+        },
+      });
+      if (!goalCommit.accepted) throw new Error("CHANGED_GOAL_COMMIT_REJECTED");
+      expect(goalCommit.retainedActiveOperation).toBeUndefined();
+      fixture.runtime.handleCommittedDecision(goalCommit.snapshot, changedGoal);
+      await waitFor(() => fixture.body.started.length === 4);
+
+      fixture.runtime.receiveChat("owner", "止まれ");
+      await waitFor(() => fixture.runtime.snapshot.stopped);
+      expect(
+        fixture.mind.commitThought({
+          expectedRevision: fixture.mind.snapshot().revision,
+          decision: move("move-after-stop", 8),
+        }),
+      ).toMatchObject({
+        accepted: false,
+        rejectionCode: "STOPPED",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(fixture.body.started).toEqual([
+        "move_to",
+        "move_to",
+        "move_to",
+        "move_to",
+      ]);
+      expect(fixture.runtime.snapshot.stopped).toBe(true);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("keeps ordinary breathing and water transitions from invalidating a thought", () => {
     const base = observation();
     const signature = (changes: Partial<PlayerBodyObservation["self"]>) =>

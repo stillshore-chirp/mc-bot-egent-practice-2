@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -282,6 +282,15 @@ const deathMemorySchema = z
 const deathRecoveryStageMarker =
   /^\[death-recovery:([^\]]+):(approach|sweep|collect)\]/u;
 
+const moveToContinuitySchema = z
+  .object({
+    operationFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    goalProvenanceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    safetyFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    stopGeneration: z.number().int().nonnegative(),
+  })
+  .strict();
+
 const stateSchema = z
   .object({
     revision: z.number().int().nonnegative(),
@@ -313,6 +322,7 @@ const stateSchema = z
         expectedOutcome: z.string().min(1).max(400).optional(),
         skillId: z.string().min(1).max(80).optional(),
         skillVersion: z.number().int().positive().optional(),
+        moveToContinuity: moveToContinuitySchema.optional(),
       })
       .strict()
       .optional(),
@@ -370,9 +380,142 @@ const stateSchema = z
   .strict();
 
 type StoredState = z.infer<typeof stateSchema>;
+type MoveToContinuity = z.infer<typeof moveToContinuitySchema>;
+
+function continuityFingerprint(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  return createHash("sha256").update(serialized).digest("hex");
+}
+
+function moveToOperationFingerprint(
+  decision: Extract<PlayerThoughtDecision, { kind: "act" }>,
+): string | undefined {
+  const operation = decision.operation;
+  if (operation.kind !== "move_to") return undefined;
+  return continuityFingerprint({
+    kind: operation.kind,
+    position: {
+      x: operation.position.x,
+      y: operation.position.y,
+      z: operation.position.z,
+    },
+    range: operation.range,
+    expectedOutcome: bounded(decision.expectedOutcome, 400, "expected outcome"),
+    skillId: decision.skillId ?? null,
+    skillVersion: decision.skillVersion ?? null,
+  });
+}
+
+function moveToGoalProvenanceFingerprint(input: {
+  readonly purpose: string;
+  readonly goals: readonly PlayerGoal[];
+  readonly proposals: readonly OwnerProposal[];
+}): string {
+  return continuityFingerprint({
+    purpose: input.purpose,
+    goals: [...input.goals]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map(
+        ({
+          id,
+          ownerProposalId,
+          title,
+          status,
+          priority,
+          changeReason,
+          source,
+        }) => ({
+          id,
+          ownerProposalId,
+          title,
+          status,
+          priority,
+          changeReason,
+          source,
+        }),
+      ),
+    proposals: [...input.proposals]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map(({ id, title, reason, priorityPreference, status, resolution }) => ({
+        id,
+        title,
+        reason,
+        priorityPreference,
+        status,
+        resolution,
+      })),
+  });
+}
+
+function moveToSafetyFingerprint(input: {
+  readonly stateFacts: StoredState["stateFacts"];
+  readonly uncertainties: StoredState["uncertainties"];
+  readonly lastObservation: PlayerObservationEvidence | undefined;
+  readonly latestDeath: StoredState["latestDeath"];
+}): string {
+  const observation = input.lastObservation;
+  const ownerNotes = (notes: StoredState["stateFacts"]) =>
+    notes
+      .filter(({ source }) => source === "owner")
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map(({ id, kind, summary }) => ({ id, kind, summary }));
+  return continuityFingerprint({
+    ownerFacts: ownerNotes(input.stateFacts),
+    ownerUncertainties: ownerNotes(input.uncertainties),
+    latestDeath:
+      input.latestDeath === undefined
+        ? null
+        : {
+            observedAt: input.latestDeath.observedAt,
+            recoveryStagesUsed: input.latestDeath.recoveryStagesUsed ?? [],
+          },
+    observation:
+      observation === undefined
+        ? null
+        : {
+            dimension: observation.dimension,
+            isDay: observation.isDay,
+            health: observation.health,
+            food: observation.food,
+            oxygen: observation.oxygen,
+            inWater: observation.inWater,
+            inLava: observation.inLava,
+            onFire: observation.onFire,
+            visibleBlockNames: [...observation.visibleBlockNames].sort(),
+            visibleEntityKinds: [...observation.visibleEntityKinds].sort(),
+            candidateSearchMayBeTruncated:
+              observation.candidateSearchMayBeTruncated,
+          },
+  });
+}
+
+function makeMoveToContinuity(input: {
+  readonly decision: Extract<PlayerThoughtDecision, { kind: "act" }>;
+  readonly purpose: string;
+  readonly goals: readonly PlayerGoal[];
+  readonly proposals: readonly OwnerProposal[];
+  readonly stateFacts: StoredState["stateFacts"];
+  readonly uncertainties: StoredState["uncertainties"];
+  readonly lastObservation: PlayerObservationEvidence | undefined;
+  readonly latestDeath: StoredState["latestDeath"];
+  readonly stopGeneration: number;
+}): MoveToContinuity | undefined {
+  const operationFingerprint = moveToOperationFingerprint(input.decision);
+  if (operationFingerprint === undefined) return undefined;
+  return {
+    operationFingerprint,
+    goalProvenanceFingerprint: moveToGoalProvenanceFingerprint(input),
+    safetyFingerprint: moveToSafetyFingerprint(input),
+    stopGeneration: input.stopGeneration,
+  };
+}
 
 type CommitThoughtResult =
-  | { readonly accepted: true; readonly snapshot: PlayerRuntimeSnapshot }
+  | {
+      readonly accepted: true;
+      readonly snapshot: PlayerRuntimeSnapshot;
+      readonly retainedActiveOperation?: true;
+    }
   | {
       readonly accepted: false;
       readonly snapshot: PlayerRuntimeSnapshot;
@@ -504,6 +647,11 @@ export class PlayerMindStore {
 
   public snapshot(): PlayerRuntimeSnapshot {
     const state = this.readStored();
+    const activeOperation =
+      state.activeOperation === undefined
+        ? undefined
+        : (({ moveToContinuity: _moveToContinuity, ...publicOperation }) =>
+            publicOperation)(state.activeOperation);
     const pendingKinds = this.database
       .prepare<[], { readonly kind: string }>(
         "SELECT DISTINCT kind FROM player_runtime_events WHERE consumed_at IS NULL ORDER BY kind",
@@ -518,6 +666,7 @@ export class PlayerMindStore {
     } = state;
     return {
       ...publicState,
+      ...(activeOperation === undefined ? {} : { activeOperation }),
       pendingEventKinds: pendingKinds,
     };
   }
@@ -868,6 +1017,52 @@ export class PlayerMindStore {
         input.understanding ?? { facts: [], uncertainties: [] },
         now,
       );
+      let latestDeath = current.latestDeath;
+      if (input.decision.kind === "act" && latestDeath !== undefined) {
+        const marker = deathRecoveryStageMarker.exec(
+          input.decision.expectedOutcome,
+        );
+        if (marker?.[1] === latestDeath.observedAt) {
+          const stage = marker[2] as PlayerDeathRecoveryStage;
+          const recoveryStagesUsed = latestDeath.recoveryStagesUsed ?? [];
+          if (!recoveryStagesUsed.includes(stage))
+            latestDeath = {
+              ...latestDeath,
+              recoveryStagesUsed: [...recoveryStagesUsed, stage],
+            };
+        }
+      }
+      const candidateMoveToContinuity =
+        input.decision.kind === "act"
+          ? makeMoveToContinuity({
+              decision: input.decision,
+              purpose: bounded(input.decision.purpose, 400, "purpose"),
+              goals,
+              proposals,
+              stateFacts: understanding.stateFacts,
+              uncertainties: understanding.uncertainties,
+              lastObservation: current.lastObservation,
+              latestDeath,
+              stopGeneration: current.stopGeneration,
+            })
+          : undefined;
+      const previousOperation = current.activeOperation;
+      const retainedActiveOperation =
+        input.decision.kind === "act" &&
+        input.decision.operation.kind === "move_to" &&
+        current.wait === undefined &&
+        previousOperation?.kind === "move_to" &&
+        previousOperation.actionRevision === current.actionRevision &&
+        previousOperation.bodyStartedAt !== undefined &&
+        previousOperation.moveToContinuity !== undefined &&
+        previousOperation.moveToContinuity.operationFingerprint ===
+          candidateMoveToContinuity?.operationFingerprint &&
+        previousOperation.moveToContinuity.goalProvenanceFingerprint ===
+          candidateMoveToContinuity.goalProvenanceFingerprint &&
+        previousOperation.moveToContinuity.safetyFingerprint ===
+          candidateMoveToContinuity.safetyFingerprint &&
+        previousOperation.moveToContinuity.stopGeneration ===
+          current.stopGeneration;
       let purpose = current.purpose;
       let activeOperation = current.activeOperation;
       let wait = current.wait;
@@ -875,29 +1070,36 @@ export class PlayerMindStore {
       switch (input.decision.kind) {
         case "act":
           purpose = bounded(input.decision.purpose, 400, "purpose");
-          activeOperation = {
-            operationId: bounded(
-              input.decision.operationId,
-              80,
-              "operation id",
-            ),
-            kind: input.decision.operation.kind,
-            actionRevision: current.actionRevision + 1,
-            startedAt: now,
-            expectedOutcome: bounded(
-              input.decision.expectedOutcome,
-              400,
-              "expected outcome",
-            ),
-            ...(input.decision.skillId === undefined
-              ? {}
-              : { skillId: bounded(input.decision.skillId, 80, "skill id") }),
-            ...(input.decision.skillVersion === undefined
-              ? {}
-              : { skillVersion: input.decision.skillVersion }),
-          };
+          if (retainedActiveOperation) {
+            activeOperation = previousOperation;
+          } else {
+            activeOperation = {
+              operationId: bounded(
+                input.decision.operationId,
+                80,
+                "operation id",
+              ),
+              kind: input.decision.operation.kind,
+              actionRevision: current.actionRevision + 1,
+              startedAt: now,
+              expectedOutcome: bounded(
+                input.decision.expectedOutcome,
+                400,
+                "expected outcome",
+              ),
+              ...(input.decision.skillId === undefined
+                ? {}
+                : { skillId: bounded(input.decision.skillId, 80, "skill id") }),
+              ...(input.decision.skillVersion === undefined
+                ? {}
+                : { skillVersion: input.decision.skillVersion }),
+              ...(candidateMoveToContinuity === undefined
+                ? {}
+                : { moveToContinuity: candidateMoveToContinuity }),
+            };
+            actionChanged = true;
+          }
           wait = undefined;
-          actionChanged = true;
           break;
         case "wait":
           purpose = bounded(input.decision.purpose, 400, "purpose");
@@ -931,7 +1133,9 @@ export class PlayerMindStore {
       }
       const purposeProgressRevision =
         current.purposeProgressRevision +
-        (input.decision.kind === "act" || goalProgress || proposalProgress
+        ((input.decision.kind === "act" && !retainedActiveOperation) ||
+        goalProgress ||
+        proposalProgress
           ? 1
           : 0);
       const shouldWakeAfterCompletion =
@@ -945,22 +1149,8 @@ export class PlayerMindStore {
       const stateChanged =
         resolutionChanged || input.goal !== undefined || understanding.changed;
       const nextRevision =
-        current.revision + (stateChanged || actionChanged ? 1 : 0);
-      let latestDeath = current.latestDeath;
-      if (input.decision.kind === "act" && latestDeath !== undefined) {
-        const marker = deathRecoveryStageMarker.exec(
-          input.decision.expectedOutcome,
-        );
-        if (marker?.[1] === latestDeath.observedAt) {
-          const stage = marker[2] as PlayerDeathRecoveryStage;
-          const recoveryStagesUsed = latestDeath.recoveryStagesUsed ?? [];
-          if (!recoveryStagesUsed.includes(stage))
-            latestDeath = {
-              ...latestDeath,
-              recoveryStagesUsed: [...recoveryStagesUsed, stage],
-            };
-        }
-      }
+        current.revision +
+        (stateChanged || actionChanged || retainedActiveOperation ? 1 : 0);
       const judgment = {
         revision: nextRevision,
         decidedAt: now,
@@ -1017,7 +1207,11 @@ export class PlayerMindStore {
           )
           .run(randomUUID(), purposeCompletionWakeSummary, now);
       }
-      return { accepted: true, snapshot: this.snapshot() };
+      return {
+        accepted: true,
+        snapshot: this.snapshot(),
+        ...(retainedActiveOperation ? { retainedActiveOperation: true } : {}),
+      };
     });
     return transaction.immediate();
   }

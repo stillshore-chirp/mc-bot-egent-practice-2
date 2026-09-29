@@ -439,8 +439,12 @@ export function createPlayerApplication(
         );
       }
     },
-    onCommitted: (snapshot, decision) =>
-      runtimeRef.current?.handleCommittedDecision(snapshot, decision),
+    onCommitted: (snapshot, decision, retainedActiveOperation) =>
+      runtimeRef.current?.handleCommittedDecision(
+        snapshot,
+        decision,
+        retainedActiveOperation,
+      ),
   });
   const runtime = new PlayerRuntime({
     ownerUsername: config.ownerUsername,
