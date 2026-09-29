@@ -50,15 +50,23 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 ## Issue #83の代表的な複数対象採集case
 
-`gather_multi_target_continuity`は既定application起動前に、既存`body_operation_smoke`の非OP Body clientとRCONでoak log 64個から65個への所持差分を測ります。この区間はruntimeが未起動なのでGPT受付やruntime actionと競合しません。1 stackから2 stacksへの変化、対象block消失、RCONが数えたitem drop 1個の生成、Bodyの`collect_item`後のdrop消失を独立に照合します。終了後はinventory・block・dropの空状態をRCONで確認し、その後に視認できる合成oak/birch原木を各1個だけ用意して所持数のRCON baselineを0と確認します。このfixtureの各1個はworld確認用で、依頼数量を意味しません。
+通常の`gather_multi_target_continuity` runでは、共通`body_operation_smoke`後に既定applicationを起動し、natural gather case内の独立したBody/RCON確認へ進みます。drop個数を事前probeで厳密照合することは通常runの必須gateではありません。pre-app oracle probeは診断専用で、`AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY=YES`と`AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity`を明示した場合だけ実行します。このno-GPT診断は既定application起動前に終了し、対象itemのcount-only query、block/drop readback、Body操作とcleanupを確認します。診断passはnatural gather受け入れの証拠には数えません。実行例: `AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=gather_multi_target_continuity AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY=YES npm exec -- tsx tests/e2e/ai-player-live.ts`。
 
 失敗時もbaseline/finalの読取理由と既知のcount・stack・drop値をsafe artifactへ保持し、未読・不正な値は`null`のまま扱って0へ置換せず、確定した不一致fieldだけを記録します。
 
-fixtureの水平視線判定はMinecraft Java yawの向き（0度は+Z、-90度は+X、+90度は-X、180度は-Z）に合わせ、観測者から対象への方向で角度を算出します。候補位置が空気・上部空気・石の足場を満たし、視線経路が開いていることをRCONで確認してから採用します。
+LocalRconはコマンド応答を同じrequest IDの複数packetから集め、最初の応答後に送る別IDの`time query gametime`応答を終端としてから本文を返します。上限はRCON length field 65,536 bytes、1応答64 packets・65,526 body bytes、既定5秒です。終端欠落、途中close、上限超過は未完了として扱います。TCP mockは単一packet、分割packet、終端欠落、途中closeを検証します。2026-09-29の隔離Paper診断ではbaseline inventory readを解析できましたが、final inventoryは`structure_invalid / response_truncated_possible`となり、全応答が常に解析可能とは確認できていません。
 
-続いて実GPTへ数量を指定しない自然なoak採集依頼と、短いbirch追記を送り、birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。pass条件は、Bodyの成功`dig`と後続`collect_item`の組が2組以上あり、少なくとも1組が追記後に完了すること、serverの両対象blockが消えること、独立したRCON inventory count差分が各+1であることです。
+2026-09-29の隔離Paper測定2回は、どちらも対象caseが`GATHER_MULTI_TARGET_FIXTURE_SITE_UNAVAILABLE`で未完了でした。初回はrun 42,558 ms / case 180 ms、2回目はledger elapsed 49,706 ms / case 449 msです。両回ともapplication起動とgather依頼は記録されず、採集・所持品変化・数量説明は未測定です。2回目の共通Body smokeはpassでしたが、対象採集の証拠にはなりません。これはfixture準備段階で停止した測定であり、製品が採集に失敗した証拠として扱いません。2回目のrun-level `LLM_USAGE_PARTIAL_OR_UNKNOWN`は集約fallbackで、case理由を置き換えません。usageの数値0表示も実使用量確定とは扱いません。
 
-二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にworld状態が安定していたかを記録します。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
+通常caseでは、隔離worldにoak logとbirch logを並べ、RCONで両targetと足場を確認します。新しいBody観測に両対象が含まれた後、数量を指定しない自然なoak採集依頼と短いbirch追記を実GPTへ送ります。birchの新規owner proposalと、それに結び付く採用済みまたは折衷済みowner goalを確認します。隠蔽、遮蔽物、側路からの視点変更は条件にしません。
+
+通常caseと診断probeの対象数は各itemの`clear <player> minecraft:<item> 0` count-only queryで読みます。ローカルPaper 1.21.11実装では`maxCount=0`がcount-only分岐を通り、matching stackを減らさず数量を返します。成功数と明示的な空結果だけを数値として受け入れ、予期しない返信や読取失敗は`unknown`のままです。player名やRCON返信本文はartifactへ保存しません。旧inventory SNBT parserとその単体testは保持しますが、採集caseの数量証拠には使いません。count-only queryのRCON返信はこの変更では実Paper未測定です。
+
+追記の受け入れは、新しいbirch proposalとlinked owner goalの採用状態・更新時刻で確かめます。別のrecent judgment snapshotは必須にしません。case開始前のBody outcomeを除外し、複数の一意な成功Body outcomeと、birch goalの更新後に観測した少なくとも1件の成功Body outcomeを確認します。oak/birch双方の独立RCON inventory差分が各1以上あることも必要です。成功`dig`と`collect_item`の固定ペア数、block消失、差分ちょうど+1は必須条件にせず、観測できたblock状態は補助証拠として記録します。先行case失敗時にfixture cleanupの例外が起きても元の失敗理由を保持し、外側のserver/listener/world cleanupはwrapperの別証拠として確認します。
+
+受け入れ済みowner goalの題名に一意の数量が明記されている場合だけ要求数として記録し、そこから残量を算出します。数量が確認できなければ要求数と残量は`unknown`です。passには、owner goalの採用、複数の一意な成功Body操作、birch goal採用後の成功Body進捗、両対象の独立RCON inventory増加が必要です。RCONの最終inventory読取理由・parse stageと、成功Body操作の合計・種類別・birch goal後の件数は、失敗時にもsafe artifactへ残します。未読・不正なinventory countは`null`で、0として扱いません。block/drop readbackは取得できた場合だけ補助証拠として区別します。
+
+二対象の結果をRCONで採取した後、Botへ両対象の進捗と残量を質問し、返信をmode `0600`のprivate sidecarへ1件だけ保存します。公開artifactには返信本文を含めず、採取boolean、SHA-256、RCON実数、要求数・残量の数値または`unknown`、返信中にinventory countが安定していたかを記録します。返信前後のblock状態は補助観測です。`gatherProgressExplanationStatus=sampled_pending_private_review`は返信を採取した状態であり、数量説明の正しさは示しません。primaryはprivate返信とRCON実数・要求数状態を照合してAC3を受け入れます。返信未採取、private保存失敗、RCON不明は未完了です。固定regexだけで自由文の正確性を自動判定しません。Body outcome、block readback、inventory readbackは別々の観測として記録します。inventory読取が欠落・不正・不明なら0件として扱いません。
 
 case上限は64 calls / 600,000 known tokens / 12分、targeted wrapper全体は72 calls / 660,000 known tokens / 16分です。1回の対象runでは次のように選択し、同条件の自動再試行はしません。
 

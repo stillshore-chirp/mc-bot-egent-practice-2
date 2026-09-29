@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  gatherMultiTargetItemCountSafeEvidence,
+  gatherMultiTargetOracleProbeBaselineCountFailureFields,
+  gatherMultiTargetOracleProbeResultCountFailureFields,
   parseGatherMultiTargetInventoryReply,
   parseGatherMultiTargetInventoryReplyDetailed,
+  readGatherMultiTargetItemCounts,
   readGatherMultiTargetInventory,
 } from "../e2e/gather-multi-target-acceptance.js";
 
@@ -21,6 +25,72 @@ describe("multi-target gather inventory oracle", () => {
         'entity data: [{id:"minecraft:oak_log",Count:2b,Slot:0b},{Slot:1b,count:3,id:"minecraft:oak_log"},{id:"minecraft:birch_log",count:1}]',
       ),
     ).toEqual({ oak_log: 5, birch_log: 1 });
+  });
+
+  it("reads exact non-mutating clear-count feedback for both target items", async () => {
+    const result = await readGatherMultiTargetItemCounts(
+      async (item) =>
+        item === "oak_log"
+          ? "Found 7 matching item(s) on player test_bot"
+          : "No items were found on player test_bot",
+      "test_bot",
+    );
+
+    expect(result).toEqual({
+      reason: "parsed",
+      parseStage: "parsed",
+      counts: { oak_log: 7, birch_log: 0 },
+    });
+  });
+
+  it("keeps an unrecognized target count unknown without discarding a known count", async () => {
+    const result = await readGatherMultiTargetItemCounts(
+      async (item) =>
+        item === "oak_log"
+          ? "Found 7 matching item(s) on player test_bot"
+          : "No items were found on player another_bot",
+      "test_bot",
+    );
+
+    expect(result).toEqual({
+      reason: "response_unrecognized",
+      parseStage: "response_unrecognized",
+      counts: { oak_log: 7, birch_log: null },
+    });
+    expect(JSON.stringify(result)).not.toContain("another_bot");
+  });
+
+  it("keeps the scalar probe unknown when either item read is unrecognized", async () => {
+    const baseline = await readGatherMultiTargetItemCounts(
+      async (item) =>
+        item === "oak_log"
+          ? "Found 64 matching item(s) on player test_bot"
+          : "No items were found on player test_bot",
+      "test_bot",
+    );
+    const final = await readGatherMultiTargetItemCounts(
+      async (item) =>
+        item === "oak_log"
+          ? "Found 65 matching item(s) on player test_bot"
+          : "unexpected response",
+      "test_bot",
+    );
+
+    expect(
+      gatherMultiTargetOracleProbeBaselineCountFailureFields(baseline),
+    ).toEqual([]);
+    expect(
+      gatherMultiTargetOracleProbeResultCountFailureFields(final, 0),
+    ).toEqual(["inventory_read"]);
+    expect(
+      gatherMultiTargetItemCountSafeEvidence("Final", final),
+    ).toMatchObject({
+      gatherOracleProbeFinalInventoryReadReason: "response_unrecognized",
+      gatherOracleProbeFinalOakCount: 65,
+      gatherOracleProbeFinalBirchCount: null,
+      gatherOracleProbeFinalOakStackCount: null,
+      gatherOracleProbeFinalBirchStackCount: null,
+    });
   });
 
   it("does not count target names inside nested component text", () => {
