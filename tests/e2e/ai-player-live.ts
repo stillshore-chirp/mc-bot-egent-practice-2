@@ -12044,6 +12044,11 @@ async function runDeathRecoveryTargetCase(
   let rconDropCountAfterRecoveryRequest: number | undefined;
   let ownerGoalContinuityObserved = false;
   let ownerGoalContinuityOutcome = "unconfirmed";
+  let ownerGoalReasonPresentAfterRespawn = false;
+  let recoverySearchCompleted = false;
+  let pickupConfirmed = false;
+  let ownerReportCandidatesCaptured = false;
+  let ownerReportCandidateCount = 0;
   const ownerReportMatchesServerResult = false;
   let ownerReportPrivateRetained = false;
   let restoreDeathRecoveryContextProbe: (() => void) | undefined;
@@ -12061,11 +12066,13 @@ async function runDeathRecoveryTargetCase(
     ownerRequestReplyCorrelationVerified: false,
     ownerRecordStableAfterRequest: false,
     ownerGoalContinuityObserved: false,
+    recoverySearchCompleted: false,
     boundedRecoveryFinished: false,
     targetPickupEventMatched: false,
     bodyInventoryIncreaseConfirmed: false,
     serverInventoryIncreaseConfirmed: false,
     serverDropRemovalConfirmed: false,
+    ownerReportCandidatesCaptured: false,
     ownerReportMatchesServerResult: false,
   };
   try {
@@ -12423,6 +12430,8 @@ async function runDeathRecoveryTargetCase(
       ) &&
       (goalAfterRespawn.changeReason?.trim().length ?? 0) > 0 &&
       Date.parse(goalAfterRespawn.updatedAt ?? "") > Date.parse(deathAt);
+    ownerGoalReasonPresentAfterRespawn =
+      (goalAfterRespawn.changeReason?.trim().length ?? 0) > 0;
     ownerGoalContinuityObserved =
       goalAfterRespawn.status === "active" || goalChangedWithReason;
     ownerGoalContinuityOutcome =
@@ -12449,18 +12458,16 @@ async function runDeathRecoveryTargetCase(
       if (dropCountBefore !== undefined && dropCountBefore > 0) break;
       await waitMs(150);
     }
-    if (dropCountBefore === undefined)
-      incomplete("DEATH_RECOVERY_TARGET_DROP_COUNT_UNAVAILABLE");
-    if (dropCountBefore === 0)
-      incomplete("DEATH_RECOVERY_TARGET_DROP_NOT_OBSERVED");
-    const dropPosition = await rconBlueWoolDropPositionWithinRadius(
-      context.rcon,
-      deathSiteBlock,
-      4,
-    );
-    if (dropPosition === undefined)
-      incomplete("DEATH_RECOVERY_TARGET_DROP_POSITION_NOT_READABLE");
-    state.deathRecoveryTargetPickupPosition = dropPosition;
+    const dropPosition =
+      dropCountBefore !== undefined && dropCountBefore > 0
+        ? await rconBlueWoolDropPositionWithinRadius(
+            context.rcon,
+            deathSiteBlock,
+            4,
+          ).catch(() => undefined)
+        : undefined;
+    if (dropPosition !== undefined)
+      state.deathRecoveryTargetPickupPosition = dropPosition;
     const recoveryRequest =
       "さっきの死亡記録で持ち物に何が起きたか、確度も含めて教えてください。先ほどの見張りの依頼を今どう扱っているか、その理由も教えてください。そのうえで死亡地点付近の青い羊毛を、見える範囲で探して回収し、最後に実際にできたことを報告してください。見つからない場合は未確認と教えてください。";
     rconInventoryCountBeforeRecoveryRequest = await rconInventoryItemCount(
@@ -12468,8 +12475,6 @@ async function runDeathRecoveryTargetCase(
       context.botName,
       "blue_wool",
     ).catch(() => undefined);
-    if (rconInventoryCountBeforeRecoveryRequest === undefined)
-      incomplete("DEATH_RECOVERY_RECOVERY_REQUEST_INVENTORY_UNAVAILABLE");
     const contextPrototype = CompanionContextFactory.prototype;
     const contextDescriptor = Object.getOwnPropertyDescriptor(
       contextPrototype,
@@ -12544,13 +12549,13 @@ async function runDeathRecoveryTargetCase(
       const judgments = Array.isArray(current.state.recentJudgments)
         ? current.state.recentJudgments.filter(isRecord)
         : [];
-      const active = isRecord(current.state.activeOperation)
-        ? current.state.activeOperation
-        : undefined;
       const outcomes = Array.isArray(current.state.recentOutcomes)
         ? current.state.recentOutcomes.filter(isRecord)
         : [];
       const marker = `[death-recovery:${deathAt}:`;
+      const active = isRecord(current.state.activeOperation)
+        ? current.state.activeOperation
+        : undefined;
       const hasRecordedStage =
         Array.isArray(stages) &&
         stages.some((stage) =>
@@ -12573,10 +12578,41 @@ async function runDeathRecoveryTargetCase(
               judgment.operationKind === outcome.kind,
           ),
       );
-      const stageLinkedAction =
-        hasRecordedStage && (activeMarkerCommitted || completedMarkerCommitted);
       purposeTraceConfirmed ||=
-        currentDeath?.observedAt === deathAt && stageLinkedAction;
+        currentDeath?.observedAt === deathAt &&
+        hasRecordedStage &&
+        (activeMarkerCommitted || completedMarkerCommitted);
+      recoverySearchCompleted ||=
+        currentDeath?.observedAt === deathAt &&
+        Array.isArray(stages) &&
+        stages.includes("sweep") &&
+        outcomes.some((outcome) => {
+          const observedAt =
+            typeof outcome.observedAt === "string"
+              ? Date.parse(outcome.observedAt)
+              : Number.NaN;
+          return (
+            typeof outcome.expectedOutcome === "string" &&
+            outcome.expectedOutcome.startsWith(`${marker}sweep]`) &&
+            outcome.kind === "look_sweep" &&
+            outcome.status === "successful" &&
+            Number.isFinite(observedAt) &&
+            observedAt >= conversationSentAt &&
+            judgments.some((judgment) => {
+              const decidedAt =
+                typeof judgment.decidedAt === "string"
+                  ? Date.parse(judgment.decidedAt)
+                  : Number.NaN;
+              return (
+                judgment.kind === "act" &&
+                judgment.operationKind === "look_sweep" &&
+                Number.isFinite(decidedAt) &&
+                decidedAt >= conversationSentAt &&
+                decidedAt <= observedAt
+              );
+            })
+          );
+        });
       state.deathRecoveryTargetPickupEventMatched ??= false;
       state.deathRecoveryTargetBodyInventoryIncreased ??= false;
       rconInventoryCountAfter = await rconInventoryItemCount(
@@ -12592,15 +12628,51 @@ async function runDeathRecoveryTargetCase(
       ).catch(() => undefined);
       rconDropCountAfterRecoveryRequest = rconDropCountAfter;
       if (
+        state.deathRecoveryTargetPickupPosition === undefined &&
+        rconDropCountAfter !== undefined &&
+        rconDropCountAfter > 0
+      ) {
+        const observedDropPosition = await rconBlueWoolDropPositionWithinRadius(
+          context.rcon,
+          deathSiteBlock,
+          4,
+        ).catch(() => undefined);
+        if (observedDropPosition !== undefined)
+          state.deathRecoveryTargetPickupPosition = observedDropPosition;
+      }
+      serverInventoryIncreaseConfirmed =
+        rconInventoryCountBeforeRecoveryRequest !== undefined &&
+        rconInventoryCountAfter !== undefined &&
+        rconInventoryCountAfter > rconInventoryCountBeforeRecoveryRequest;
+      serverDropRemovalConfirmed =
+        dropCountBefore !== undefined &&
+        dropCountBefore > 0 &&
+        rconDropCountAfter !== undefined &&
+        rconDropCountAfter < dropCountBefore;
+      const pickupConfirmed =
         purposeTraceConfirmed &&
         state.deathRecoveryTargetPickupEventMatched &&
         state.deathRecoveryTargetBodyInventoryIncreased &&
-        rconInventoryCountAfter !== undefined &&
-        rconInventoryCountAfter > rconInventoryCountBeforeRecoveryRequest &&
-        rconDropCountAfter !== undefined &&
-        rconDropCountAfter < dropCountBefore
-      )
+        serverInventoryIncreaseConfirmed &&
+        serverDropRemovalConfirmed;
+      const noTargetObservedAfterSweep =
+        recoverySearchCompleted &&
+        (dropCountBefore === undefined || dropCountBefore === 0) &&
+        (rconDropCountAfter === undefined || rconDropCountAfter === 0) &&
+        (state.deathRecoveryTargetEntityIds?.size ?? 0) === 0 &&
+        !state.deathRecoveryTargetPickupEventMatched;
+      if (pickupConfirmed) {
+        boundedRecoveryFinished =
+          (state.deathRecoveryTargetBodyActionCount ?? 0) > 0 &&
+          (state.deathRecoveryTargetBodyActionCount ?? 0) <= 24;
         break;
+      }
+      if (noTargetObservedAfterSweep) {
+        boundedRecoveryFinished =
+          (state.deathRecoveryTargetBodyActionCount ?? 0) > 0 &&
+          (state.deathRecoveryTargetBodyActionCount ?? 0) <= 24;
+        break;
+      }
       const latest = playerOf(await collect(context.runtime.app));
       const usage = subtractCounters(latest.counters, context.usageAtStart);
       if (usage.usageUnknownCalls > 0) state.usageUncertain = true;
@@ -12608,53 +12680,79 @@ async function runDeathRecoveryTargetCase(
         incomplete("DEATH_RECOVERY_CASE_BUDGET_EXCEEDED");
       await waitMs(800);
     }
-    if (Date.now() >= recoverDeadline)
-      incomplete("DEATH_RECOVERY_BOUNDED_PICKUP_NOT_CONFIRMED");
+    if (
+      !boundedRecoveryFinished &&
+      recoverySearchCompleted &&
+      state.deathRecoveryTargetActionLimitReached !== true &&
+      (state.deathRecoveryTargetBodyActionCount ?? 0) > 0 &&
+      (state.deathRecoveryTargetBodyActionCount ?? 0) <= 24
+    )
+      boundedRecoveryFinished = true;
     purposeStageReferencesDeathRecord = purposeTraceConfirmed;
-    if (!purposeStageReferencesDeathRecord)
-      incomplete("DEATH_RECOVERY_PURPOSE_TRACE_NOT_LINKED_TO_DEATH_RECORD");
     const targetPickupEventMatched =
       state.deathRecoveryTargetPickupEventMatched === true;
     const bodyInventoryIncreaseConfirmed =
       state.deathRecoveryTargetBodyInventoryIncreased === true;
     serverInventoryIncreaseConfirmed =
+      rconInventoryCountBeforeRecoveryRequest !== undefined &&
       rconInventoryCountAfter !== undefined &&
       rconInventoryCountAfter > rconInventoryCountBeforeRecoveryRequest;
     serverDropRemovalConfirmed =
-      rconDropCountAfter !== undefined && rconDropCountAfter < dropCountBefore;
-    if (
-      !targetPickupEventMatched ||
-      !bodyInventoryIncreaseConfirmed ||
-      !serverInventoryIncreaseConfirmed ||
-      !serverDropRemovalConfirmed
-    )
-      incomplete("DEATH_RECOVERY_PICKUP_OR_SERVER_ORACLE_MISMATCH");
-    const afterPickup = readDeathRecoveryDatabase(context.runtime.databasePath);
-    const stagesAfterPickup = afterPickup.latestDeath?.recoveryStagesUsed;
-    boundedRecoveryFinished =
-      state.deathRecoveryTargetActionLimitReached !== true &&
-      (state.deathRecoveryTargetBodyActionCount ?? 0) <= 24 &&
-      Array.isArray(stagesAfterPickup) &&
-      stagesAfterPickup.includes("collect");
-    if (!boundedRecoveryFinished)
-      incomplete("DEATH_RECOVERY_COLLECTION_STAGE_NOT_FINITE_OR_LINKED");
+      dropCountBefore !== undefined &&
+      dropCountBefore > 0 &&
+      rconDropCountAfter !== undefined &&
+      rconDropCountAfter < dropCountBefore;
+    pickupConfirmed =
+      purposeStageReferencesDeathRecord &&
+      targetPickupEventMatched &&
+      bodyInventoryIncreaseConfirmed &&
+      serverInventoryIncreaseConfirmed &&
+      serverDropRemovalConfirmed;
+    const anyPickupEvidence =
+      targetPickupEventMatched ||
+      bodyInventoryIncreaseConfirmed ||
+      serverInventoryIncreaseConfirmed ||
+      serverDropRemovalConfirmed ||
+      (state.deathRecoveryTargetEntityIds?.size ?? 0) > 0;
 
+    const reportRequest =
+      "死亡記録の確度と見張りの依頼の扱い・理由を説明し、青い羊毛を回収できたか、見つけられず未確認なのかを、実際に観測した範囲で報告してください。";
     const reportStart = state.responses.length;
     const reportSentAt = Date.now();
-    sendChat(
-      context.owner,
-      "青い羊毛を実際に回収できたか、未確認のことがあればそのまま教えてください。",
+    sendChat(context.owner, reportRequest);
+    const reportWindowMs = Math.max(
+      0,
+      Math.min(
+        60_000,
+        context.caseDeadlineAt - Date.now(),
+        context.runDeadlineAt - Date.now(),
+      ),
     );
-    await waitForPlayer(context, 60_000, () =>
-      state.responses.slice(reportStart).some(({ at }) => at >= reportSentAt),
-    );
-    const report = state.responses
+    // Agent activity is per provider response round, not correlated to an owner
+    // message. Keep the existing bounded reply window open for late replies.
+    await waitMs(reportWindowMs);
+    const reportCandidates = state.responses
       .slice(reportStart)
-      .find(({ at }) => at >= reportSentAt);
-    if (report === undefined)
+      .filter(({ at }) => at >= reportSentAt);
+    if (reportCandidates.length === 0)
       incomplete("DEATH_RECOVERY_OWNER_REPLY_NOT_OBSERVED");
-    await retainDeathRecoveryOwnerReply(state, "recovery_report", report.text);
+    for (const candidate of reportCandidates)
+      await retainDeathRecoveryOwnerReply(
+        state,
+        "recovery_report",
+        candidate.text,
+      );
     ownerReportPrivateRetained = true;
+    ownerReportCandidatesCaptured = true;
+    ownerReportCandidateCount = reportCandidates.length;
+    if (!purposeStageReferencesDeathRecord)
+      incomplete("DEATH_RECOVERY_PURPOSE_TRACE_NOT_LINKED_TO_DEATH_RECORD");
+    if (!boundedRecoveryFinished)
+      incomplete("DEATH_RECOVERY_BOUNDED_SEARCH_NOT_CONFIRMED");
+    if (!pickupConfirmed && anyPickupEvidence)
+      incomplete("DEATH_RECOVERY_PICKUP_OR_SERVER_ORACLE_MISMATCH");
+    if (!pickupConfirmed && !recoverySearchCompleted)
+      incomplete("DEATH_RECOVERY_BOUNDED_SEARCH_NOT_CONFIRMED");
     incomplete("DEATH_RECOVERY_PRIVATE_REVIEW_PENDING");
   } catch (error) {
     throw error instanceof Error
@@ -12673,6 +12771,7 @@ async function runDeathRecoveryTargetCase(
     proof.ownerRequestReplyCorrelationVerified = false;
     proof.ownerRecordStableAfterRequest = ownerRecordStableAfterRequest;
     proof.ownerGoalContinuityObserved = ownerGoalContinuityObserved;
+    proof.recoverySearchCompleted = recoverySearchCompleted;
     proof.boundedRecoveryFinished = boundedRecoveryFinished;
     proof.targetPickupEventMatched =
       state.deathRecoveryTargetPickupEventMatched === true;
@@ -12680,6 +12779,7 @@ async function runDeathRecoveryTargetCase(
       state.deathRecoveryTargetBodyInventoryIncreased === true;
     proof.serverInventoryIncreaseConfirmed = serverInventoryIncreaseConfirmed;
     proof.serverDropRemovalConfirmed = serverDropRemovalConfirmed;
+    proof.ownerReportCandidatesCaptured = ownerReportCandidatesCaptured;
     proof.ownerReportMatchesServerResult = ownerReportMatchesServerResult;
     state.deathRecoveryTargetDiagnostic = {
       ...(state.deathRecoveryTargetDiagnostic ?? {}),
@@ -12696,6 +12796,15 @@ async function runDeathRecoveryTargetCase(
       bodyActionCount: state.deathRecoveryTargetBodyActionCount ?? 0,
       ownerReplyRetained: state.deathRecoveryTargetOwnerReplyRetained ?? false,
       ownerReportPrivateRetained,
+      ownerReportCandidateCount,
+      recoveryOutcomeReview:
+        ownerReportCandidatesCaptured && pickupConfirmed
+          ? "pickup_pending_private_review"
+          : ownerReportCandidatesCaptured && recoverySearchCompleted
+            ? "search_report_candidates_pending_private_review"
+            : ownerReportCandidatesCaptured
+              ? "bounded_search_not_confirmed"
+              : "final_report_unavailable",
       ownerReplySha256:
         state.deathRecoveryTargetOwnerReplyHash ?? "unavailable",
       ownerRequestReplyCorrelation: "unverified",
@@ -12704,6 +12813,7 @@ async function runDeathRecoveryTargetCase(
         : { databaseObservationMismatch }),
       purposeMarkerScope: "death_record_reference_not_request_start",
       ownerGoalContinuity: ownerGoalContinuityOutcome,
+      ownerGoalReasonPresentAfterRespawn,
       privateOwnerReportReview: ownerReportPrivateRetained
         ? "pending"
         : "unavailable",
