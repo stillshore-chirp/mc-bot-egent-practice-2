@@ -11,6 +11,7 @@ Minecraft Java Editionの世界に一人のプレイヤーとして暮らし、�
 | 全体がどうつながるか、どのコードを読むか           | [アーキテクチャ](docs/architecture.md)                         |
 | 発話から目的・行動へどう進むか、停止・競合・再接続 | [自律プレイヤー](docs/autonomous-player.md)                    |
 | 人格や関係が入力へどう入り、何が再起動後も残るか   | [人格と記憶](docs/memory.md)                                   |
+| 既存worldとAI記憶を保ってMinecraft 26.3を評価する  | [26.3移行手順](docs/minecraft-26-3.md)                         |
 | 見える世界、使える操作、成功/未確認の判定          | [PlayerBody](docs/player-body.md)                              |
 | 経験が技能仮説になり、次回の判断へ戻る仕組み       | [MC Bot Skills](docs/mc-bot-skills.md)                         |
 | 何を証拠に評価し、どこから原因を調べるか           | [テスト・評価と原因調査](docs/testing.md)                      |
@@ -70,7 +71,7 @@ npm run dev
 | `PERSONA_PATH`                                             | `config/persona.example.json`            |
 | `DASHBOARD_ENABLED` / `DASHBOARD_PORT`                     | `true` / `4310`                          |
 
-Botの接続版と、利用者が使うMinecraftクライアント版は同一とは限りません。[26.1クライアントとの接続手順](docs/minecraft-26-1.md)を参照してください。起動前には[ゲームモード・難易度・権限](docs/operations.md#起動前の確認)を確認します。
+Botの接続版と、利用者が使うMinecraftクライアント版は同一とは限りません。既存worldを引き継いで26.3を評価する場合は[移行手順](docs/minecraft-26-3.md)、26.1で過去に行った接続検証は[歴史的記録](docs/minecraft-26-1.md)を参照してください。起動前には[ゲームモード・難易度・権限](docs/operations.md#起動前の確認)を確認します。
 
 ## 会話と停止
 
