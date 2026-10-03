@@ -27,7 +27,7 @@ Paper build 143は、まず複製worldの評価に使います。PaperがBETAで
 
 1. 「先週使ったworld」などの説明だけで選ばず、読み取り専用の一覧から対象server instanceとそのworldを一意に特定します。対象ID、現行版、設定、永続データの保存先は手元の非公開作業記録だけに置きます。特定できるまでは停止・コピー・起動を行いません。
 2. 対象worldを停止する権限、停止時間、複製検証で影響するファイルとBot状態を確認します。対象と影響範囲に対する明示許可がそろうまで停止しません。
-3. 既存のOpenAI API keyを複製Botでも再利用します。承認済みの秘密管理経路からプロセスへ渡し、値を文書、コマンド出力、ログ、Issue、PRへ出しません。公開記録には実APIを使ったかと成功・失敗だけを書きます。既存keyを使えない場合は別keyを無断で作りません。
+3. ownerによる再利用の明示許可が確認済みの場合に、既存のOpenAI API keyを複製Botでも再利用します。承認済みの秘密管理経路からプロセスへ渡し、値を文書、コマンド出力、ログ、Issue、PRへ出しません。公開記録には実APIを使ったかと成功・失敗だけを書きます。既存keyを使えない場合は別keyを無断で作りません。
 4. 複製環境は元serverと別のディレクトリ、別のloopback port、別のdatabaseにします。元serverと複製でworld、SQLite、pluginの書込み先を共有しません。
 
 ## 旧環境を保全して復元を確かめる
@@ -44,7 +44,7 @@ Paper build 143は、まず複製worldの評価に使います。PaperがBETAで
 2. ViaVersionとViaBackwards 5.12.0を導入します。元serverのpluginと設定を複製へ引き継ぎ、TreeGuardを含む各pluginの起動・権限・world保護が26.3上で機能するか確認します。非互換やデータ移行エラーがあれば、設定変更を広げずその検証を中断します。
 3. 26.3クライアントとBotを同じ複製worldへ接続します。Bot設定はMineflayer 4.37.1、`MINECRAFT_VERSION=1.21.11`を保ち、ViaBackwards経由で接続します。オンライン認証ではownerとBotに別々のMinecraft identityを使い、同じidentityの二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
 4. server logや接続受付だけで成功判定せず、ゲーム画面と複製Botの観測で確認します。既存landmarkと複数dimension、playerdata、map、chest・entityが移行前と対応し、読み書きできることを確認します。26.3の新要素を旧版Botが扱えるかは、個別に観測できた範囲だけ記録します。
-5. 複製databaseでSQLite整合性・schema読込を確認し、既存の会話文脈、人格・関係、MindStoreの目的・停止状態、MemoryStoreの既知記憶、McSkillRepositoryのskillとreceiptが参照できることを確認します。実記憶や会話を公開せず、項目別の成否だけを残します。
+5. 複製databaseでSQLite整合性・schema読込を確認し、永続化済みの人格設定・関係、MindStoreの目的・停止状態、MemoryStoreの記憶、McSkillRepositoryのskillとreceiptが参照できることを確認します。直近の会話履歴はプロセス内の`PlayerConversationAgent.#history`にあり、再起動時にリセットされます。これは移行対象の永続データに含めず、引継ぎ受け入れ条件にしません。実記憶や会話を公開せず、項目別の成否だけを残します。
 6. 同じ複製環境で日本語会話、短いゲーム内動作、その実動作中の即時停止、Bot切断・再接続、再起動後の停止状態と記憶の維持を確かめます。操作依頼やLLMの返答だけで成功とせず、ゲーム内変化を観測します。
 
 ## 適用と失敗時の戻し方
