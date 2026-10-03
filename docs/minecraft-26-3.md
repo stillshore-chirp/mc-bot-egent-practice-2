@@ -1,6 +1,6 @@
 # Minecraft Java 26.3 へ既存 world と AI 記憶を引き継ぐ手順
 
-この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順です。空の world を作って置き換える手順ではありません。移行作業そのものはまだ実施していません。
+この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順と、確認済み範囲の結果をまとめます。空の world を作って置き換える手順ではありません。旧環境を継続し、比較後の 26.3 検証 copy は停止済みです。実 world への切替と全受け入れ条件は未完了です。
 
 ## 対象と版
 
@@ -40,12 +40,23 @@ Paper build 143 は、まず複製 world の評価に使います。Paper が BE
 
 ## 複製 world を 26.3 で確認する
 
+26.3 の停止済み copy では、設定された world root の下に `dimensions/minecraft/{overworld,the_nether,the_end}/region/` と `players/` がある構造を観測しました。実際の root とファイル一覧は公開しません。copy や切替では root 全体と相対階層を保ち、旧版の dimension 配置を前提に一部 directory だけを移動しません。seed や settings の新 schema との比較は未確認です。
+
 1. 復元済み backup からさらに検証用 copy を作り、Paper 26.3 BETA build 143 と Java 25 を使います。起動前に PaperMC Fill API の manifest で build ID・channel・SHA-256 を照合し、選んだ artifact と一致しなければ停止します。`server.properties`の port や bind 先は複製専用にし、公開ネットワークへ接続できない状態にします。
 2. ViaVersion と ViaBackwards 5.12.0 を導入します。元 server の plugin と設定を複製へ引き継ぎ、TreeGuard を含む各 plugin の起動・権限・world 保護が 26.3 上で機能するか確認します。非互換やデータ移行エラーがあれば、設定変更を広げずその検証を中断します。
 3. 26.3 クライアントと Bot を同じ複製 world へ接続します。Bot 設定は Mineflayer 4.37.1、`MINECRAFT_VERSION=1.21.11`を保ち、ViaBackwards 経由で接続します。オンライン認証では owner と Bot に別々の Minecraft identity を使い、同じ identity の二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
 4. server log や接続受付だけで成功判定せず、ゲーム画面と複製 Bot の観測で確認します。既存 landmark と複数 dimension、playerdata、map、chest・entity が移行前と対応し、読み書きできることを確認します。26.3 の新要素を旧版 Bot が扱えるかは、個別に観測できた範囲だけ記録します。
 5. 複製 database で SQLite 整合性・schema 読込を確認し、永続化済みの人格設定・関係、MindStore の目的・停止状態、MemoryStore の記憶、McSkillRepository の skill と receipt が参照できることを確認します。直近の会話履歴はプロセス内の`PlayerConversationAgent.#history`にあり、再起動時にリセットされます。これは移行対象の永続データに含めず、引継ぎ受け入れ条件にしません。実記憶や会話を公開せず、項目別の成否だけを残します。
 6. 同じ複製環境で日本語会話、短いゲーム内動作、その実動作中の即時停止、Bot 切断・再接続、再起動後の停止状態と記憶の維持を確かめます。操作依頼や LLM の返答だけで成功とせず、ゲーム内変化を観測します。
+
+### 今回の観測結果
+
+- offline backup とその復元 copy の全 254 file で、対応する各 file の SHA-256 とサイズが一致しました。backup 総量は 1.418 GB です。旧 Paper/Bot 環境は再起動し、dashboard HTTP 200、Bot 接続、memory 利用可能を確認しました。
+- Paper 26.3 BETA build 143・Java 25・ViaVersion/ViaBackwards 5.12.0・TreeGuard の複製構成はロードしました。正常停止後の比較では 3 dimension すべてで region/chunk/POI/entity-region 件数が一致し、既存 6 人分の Identity・Inventory・EnderItems も一致しました。代表 3 chunk の blockstate と収納 3 件も一致しましたが、これは全 world の意味的内容やゲーム機能の保証ではありません。
+- 両 SQLite database の`quick_check`は`ok`、9 table の既存 primary key は維持されました。episodes は 14570 から 14571 へ増えましたが、内容不変は照合していません。
+- 26.3 コピー環境の probe4 当該セッションでは、独立した Paper/DB 観測により owner 入力、日本語の Bot 返信、`say`完了を確認しました。receipt の`JAPANESE_CHAT_NOT_OBSERVED`は probe 側の受信取りこぼしとして調査中で、日本語述語の観測とは分けて扱います。複合受け入れは別の未達述語があるため pass ではありません。
+- リスナーの最小修正と strict typepass 後の probe5 は 8.778 秒で`RCON_COMMAND_FAILED`となりました。失敗は RCON transport/auth ではなく、owner 生成前の Bot 位置応答に対する座標解析です。同時期に Paper の`invalid-move`拒否を 1 件観測しましたが、翻訳と physics のどちらが原因かは未確定です。owner 生成・日本語 listener 段階に届かず、listener 修正の効果も未確認です。API 1 件・RCON 5 件で後続検査に到達せず、movement、owner stop、再起動後の永続性、reconnect は`not_run`です。追加 probe は行いません。実 API の累計は 7 件、provider usage は`partial_or_unknown`です。
+- probe5 後、copy の fresh PID を確認して通常の SIGINT 停止を行い、3 dimension の ChunkHolder save・RegionFile I/O 完了、port 解放、process 終了を確認しました。元 runtime は active・connected・memory available を維持しています。native 26.3 client の同時接続と GUI は未実証で、実 world 切替は未実施、Issue #126 の受け入れは未完了です。
 
 ## 適用と失敗時の戻し方
 
@@ -59,4 +70,4 @@ Paper build 143 は、まず複製 world の評価に使います。Paper が BE
 
 ## 証跡と現在の状態
 
-この手順書は移行作業の記録ではありません。実際の world、database、接続先、username、seed、会話、API key、ログ原文、private path を公開しません。検証を行った場合は、非公開の artifact に snapshot、選択 build と channel、検査条件、pass/fail、失敗分類を残し、公開記録には必要な成否と未実施項目だけをまとめます。
+実際の world・database path、接続先、username、seed、会話内容、API key、ログ原文、player ID は公開しません。検査の snapshot、hash 一覧、詳細 log は非公開 artifact に保管し、公開記録には上記の集約結果、未確認範囲、未実施項目だけを記載します。PR #127 は部分参照の`Refs #126`のままです。
