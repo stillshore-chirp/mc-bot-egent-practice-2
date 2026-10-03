@@ -6,29 +6,34 @@ dashboard は bot runtime の観測層です。runtime の成功判定、Minecra
 
 ## データフロー
 
-```text
-ChatCoordinator / Application / Reflexes
-        │  TraceSession, ActiveTraceSpan
-        ▼
-  TraceService ── persistEvent ──► TraceStore (SQLite)
-        │                              │
-        │ subscribe                    ├─ trace_runs / spans / events
-        ▼                              ├─ links / results
-  DashboardHttpServer ◄── queries ─────└─ redaction manifests
-        │
-        ├─ JSON API: health, list, detail, events, demo-safe, export/import
-        ├─ SSE: /api/stream, Last-Event-ID backfill
-        └─ static dashboard/dist
-                    ▼
-             React + Vite UI
-          reducer / Replay / Three.js
+```mermaid
+flowchart TD
+    Player["既定: PlayerRuntime / runPlayerAgent"] --> Service["TraceService"]
+    Legacy["旧: ChatCoordinator / ToolExecutor / TaskRuntime"] --> Service
+    Service -->|"persistEvent"| Store["TraceStore / SQLite"]
+    Service -->|"保存成功eventをpublish"| HTTP["DashboardHttpServer"]
+    Store -->|"照会・backfill"| HTTP
+    HTTP -->|"JSON / SSE / static"| UI["React / Replay / Three.js"]
 ```
 
-アプリケーション起動時には TraceStore と TraceService を構成し、dashboard server の起動を試みてから Minecraft 接続へ進みます。dashboard の構成・bind・start に失敗した場合は observability の error を記録し、bot 起動そのものを dashboard の成功に依存させません。終了時は dashboard、memory、trace store を順に停止します。
+既定Playerとlegacyでは計測点が異なります。schemaにあるすべてのstageが両経路で生成されるわけではありません。
+
+アプリケーション起動時には TraceStore と TraceService を構成し、dashboard server の起動を試みてから Minecraft 接続へ進みます。dashboard の構成・bind・start に失敗した場合は observability の error を記録し、bot 起動そのものを dashboard の成功に依存させません。既定Playerの終了ではRuntimeと接続を止めてからdashboardと各storeを閉じます。詳細な順序は `PlayerCompanionApplication.shutdown()` を正本とします。
 
 TraceStore と既存の memory store は同じ SQLite database path を使いますが、trace は専用の `trace_*` tables と schema migration に分離されています。trace の API は memory record を直接公開しません。
 
-## 計測点
+## 既定AIプレイヤーの計測点
+
+| 実装箇所                                                          | 記録                                                    | 限界                                                |
+| ----------------------------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------- |
+| [PlayerRuntime](../../src/player/runtime.ts)                      | owner会話turn / 目的thoughtのtrace                      | thoughtが返ると閉じる。Bodyやgoalの達成保証ではない |
+| [runPlayerAgent](../../src/player/responses.ts)                   | Responsesのdeliberation span、latency/token             | tool結果の安全な詳細は別のround activity            |
+| [ConnectionManager](../../src/minecraft/connection-manager.ts)    | 接続retryのrecovery span（有効なtrace sessionがある時） | sessionがない時は生成しない。ゲーム行動の成功とは別 |
+| [PlayerCompanionApplication](../../src/app/player-application.ts) | read-only health callback                               | 完全なMindStoreやworldをHTTPへそのまま公開しない    |
+
+Body結果はMindStoreとSkill receiptに保存されます。既定経路ではBody操作・結果検証・学習改訂を、判断traceへ一続きに結ぶ計測が不足しています（[Issue #123](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/123)）。現状の調査手順は[テスト・評価](../testing.md)に記載します。
+
+## 旧tool/runtimeの計測点
 
 | 実装箇所                      | 記録する stage / 状態                                                               |
 | ----------------------------- | ----------------------------------------------------------------------------------- |

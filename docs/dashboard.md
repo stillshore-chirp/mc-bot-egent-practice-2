@@ -4,6 +4,8 @@
 
 bot、Minecraft、memory、task を操作する API はありません。Presenter 用 metadata の demo-safe 化、export、import は dashboard の記録を扱う操作ですが、bot の実行状態や Minecraft の世界を変更しません。
 
+既定Playerとlegacyでは生成するtraceの範囲が違います。**画面のtrace成功は、既定PlayerのBody操作成功やowner goal達成を保証しません。** 対応する計測点は[ダッシュボードアーキテクチャ](dashboard/architecture.md#既定aiプレイヤーの計測点)、結果との照合手順は[評価と原因調査](testing.md)を参照してください。
+
 ## ローカル起動
 
 ```bash
