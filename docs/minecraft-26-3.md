@@ -1,6 +1,6 @@
 # Minecraft Java 26.3 へ既存 world と AI 記憶を引き継ぐ手順
 
-この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順と、確認済み範囲の結果をまとめます。空の world を作って置き換える手順ではありません。旧環境を継続し、比較後の 26.3 検証 copy は停止済みです。実 world への切替と全受け入れ条件は未完了です。
+この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順と、確認済み範囲の結果をまとめます。空の world を作って置き換える手順ではありません。旧環境を継続し、比較後の Paper 26.3 検証 copy は停止済みです。別途確認した 26.3 client と旧版 Paper の接続経路は、Paper 26.3 server の受け入れを示しません。実 world への切替と server の全受け入れ条件は未完了です。
 
 ## 対象と版
 
@@ -56,7 +56,10 @@ Paper build 143 は、まず複製 world の評価に使います。Paper が BE
 - 両 SQLite database の`quick_check`は`ok`、9 table の既存 primary key は維持されました。episodes は 14570 から 14571 へ増えましたが、内容不変は照合していません。
 - 26.3 コピー環境の probe4 当該セッションでは、独立した Paper/DB 観測により owner 入力、日本語の Bot 返信、`say`完了を確認しました。receipt の`JAPANESE_CHAT_NOT_OBSERVED`は probe 側の受信取りこぼしとして調査中で、日本語述語の観測とは分けて扱います。複合受け入れは別の未達述語があるため pass ではありません。
 - リスナーの最小修正と strict typepass 後の probe5 は 8.778 秒で`RCON_COMMAND_FAILED`となりました。失敗は RCON transport/auth ではなく、owner 生成前の Bot 位置応答に対する座標解析です。同時期に Paper の`invalid-move`拒否を 1 件観測しましたが、翻訳と physics のどちらが原因かは未確定です。owner 生成・日本語 listener 段階に届かず、listener 修正の効果も未確認です。API 1 件・RCON 5 件で後続検査に到達せず、movement、owner stop、再起動後の永続性、reconnect は`not_run`です。追加 probe は行いません。実 API の累計は 7 件、provider usage は`partial_or_unknown`です。
-- probe5 後、copy の fresh PID を確認して通常の SIGINT 停止を行い、3 dimension の ChunkHolder save・RegionFile I/O 完了、port 解放、process 終了を確認しました。元 runtime は active・connected・memory available を維持しています。native 26.3 client の同時接続と GUI は未実証で、実 world 切替は未実施、Issue #126 の受け入れは未完了です。
+- probe5 後、copy の fresh PID を確認して通常の SIGINT 停止を行い、3 dimension の ChunkHolder save・RegionFile I/O 完了、port 解放、process 終了を確認しました。元 runtime は active・connected・memory available を維持しています。Paper 26.3 server での client 同時接続と GUI は未実証で、実 world 切替は未実施、Issue #126 の受け入れは未完了です。
+- 公式 Minecraft 26.3 client JAR の SHA-1 は[Mojang version manifest](https://piston-meta.mojang.com/mc/game/version_manifest_v2.json)と一致しました。公式 QuickPlay CLI で immutable backup 由来の Paper 1.21.11 build 132・ViaVersion 5.12.0 の検証 copy に接続し、独立した fresh Paper log で owner の参加後、退出前に既定 `createApplication` Bot が参加したこと、Bot の spawn・body・connected を確認しました。これは旧版 Paper copy 上の client 接続経路と owner/Bot 同時接続の確認です。Paper 26.3 server への接続や 26.3 server 側の新機能は確認していません。
+- 別の observer run 1 は 7.680 秒で`RCON_PROTOCOL_ERROR`となり、API 1 件・RCON 1 件を使用しました。位置・会話・移動・停止・再接続の検査には到達していません。この失敗は先の Paper log による同時接続確認とは別に扱います。実 API の累計は 8 件、provider usage は`partial_or_unknown`です。
+- 1.21.11 検証 copy は SIGINT で正常停止し、保存処理・port 解放・process 終了を確認しました。QuickPlay client は既に終了しており、原 client・server・既定 Bot は変更していません。Paper 26.3 server 上の同時接続と GUI、実 world 切替は未実施で、Issue #126 の受け入れは未完了です。
 
 ## 適用と失敗時の戻し方
 
