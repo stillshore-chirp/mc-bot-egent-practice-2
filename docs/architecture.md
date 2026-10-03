@@ -56,18 +56,18 @@ flowchart TB
 
 ## 責務と実コード
 
-| 領域 | 主な責務 | 入口・正本 |
-| --- | --- | --- |
-| 組立・終了 | 設定、DB、APIクライアント、接続、購読、終了順序 | [player-application.ts](../src/app/player-application.ts) |
-| 会話 | 所有者の発話、短期会話文脈、目的提案、停止/再開、記憶依頼 | [agents.ts / PlayerConversationAgent](../src/player/agents.ts) |
-| 目的判断 | 観測・目的・記憶・技能を踏まえた行動/待機/継続/完了の選択 | [agents.ts / PlayerPurposeAgent](../src/player/agents.ts) |
-| モデル呼出し | strict schema、tool loop、使用量、打切り、context圧縮 | [responses.ts](../src/player/responses.ts) |
-| 実行調整 | 意味のある変化で起動、一つのBody操作、割込み、再接続 | [runtime.ts](../src/player/runtime.ts) |
-| 意思決定状態 | revision比較、提案とgoalの関連、結果・停止の永続化 | [mind-store.ts](../src/player/mind-store.ts) |
-| 身体 | 可視観測、操作schema、Mineflayer操作、結果確認 | [player-body.ts](../src/minecraft/player-body.ts)、[詳細](player-body.md) |
-| 人格・長期記憶 | 人格設定、関係、生活状態、既往episodeの保存と検索 | [persona.ts](../src/persona/persona.ts)、[store.ts](../src/memory/store.ts)、[詳細](memory.md) |
-| 技能知識 | 検索、版管理、観測証跡による仮説作成・改訂 | [repository.ts](../src/mc-skills/repository.ts)、[詳細](mc-bot-skills.md) |
-| 観測性 | 内容を絞ったtrace、集計、読み取り専用画面 | [trace/service.ts](../src/trace/service.ts)、[dashboard](dashboard.md) |
+| 領域           | 主な責務                                                  | 入口・正本                                                                                     |
+| -------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 組立・終了     | 設定、DB、APIクライアント、接続、購読、終了順序           | [player-application.ts](../src/app/player-application.ts)                                      |
+| 会話           | 所有者の発話、短期会話文脈、目的提案、停止/再開、記憶依頼 | [agents.ts / PlayerConversationAgent](../src/player/agents.ts)                                 |
+| 目的判断       | 観測・目的・記憶・技能を踏まえた行動/待機/継続/完了の選択 | [agents.ts / PlayerPurposeAgent](../src/player/agents.ts)                                      |
+| モデル呼出し   | strict schema、tool loop、使用量、打切り、context圧縮     | [responses.ts](../src/player/responses.ts)                                                     |
+| 実行調整       | 意味のある変化で起動、一つのBody操作、割込み、再接続      | [runtime.ts](../src/player/runtime.ts)                                                         |
+| 意思決定状態   | revision比較、提案とgoalの関連、結果・停止の永続化        | [mind-store.ts](../src/player/mind-store.ts)                                                   |
+| 身体           | 可視観測、操作schema、Mineflayer操作、結果確認            | [player-body.ts](../src/minecraft/player-body.ts)、[詳細](player-body.md)                      |
+| 人格・長期記憶 | 人格設定、関係、生活状態、既往episodeの保存と検索         | [persona.ts](../src/persona/persona.ts)、[store.ts](../src/memory/store.ts)、[詳細](memory.md) |
+| 技能知識       | 検索、版管理、観測証跡による仮説作成・改訂                | [repository.ts](../src/mc-skills/repository.ts)、[詳細](mc-bot-skills.md)                      |
+| 観測性         | 内容を絞ったtrace、集計、読み取り専用画面                 | [trace/service.ts](../src/trace/service.ts)、[dashboard](dashboard.md)                         |
 
 ## なぜ会話と行動を分けるのか
 
@@ -77,14 +77,14 @@ flowchart TB
 
 ## 設計上の判断と強制される境界
 
-| 対象 | 誰が決めるか | 注意点 |
-| --- | --- | --- |
-| 何をしたいか、所有者の提案をどう扱うか | 目的エージェントが人格・目的・観測を材料に判断 | 採用・妥協・辞退の理由とowner goalを保持 |
-| 危険、死亡、建築変更への対応 | 目的エージェントが状況から判断 | 旧reflexの固定退避・旧建築認可を既定経路へ持ち込まない |
-| 入力の形・同時操作・停止状態 | schema、MindStore、Runtime、Body | 型検証やCASは、目的の妥当性まで保証するものではない |
-| ゲーム内の操作可否 | 通常のMinecraft/Bukkit権限と保護plugin | client側の操作受付だけで成功にしない |
-| credential、shell、任意コード、server管理 | モデルへ操作手段を公開しない | 既存サーバー設定の変更は別の運用作業 |
-| 何を達成したか | 操作後のゲーム観測と、その後の目的判断 | `successful`な一操作とowner goal完了は別 |
+| 対象                                      | 誰が決めるか                                   | 注意点                                                 |
+| ----------------------------------------- | ---------------------------------------------- | ------------------------------------------------------ |
+| 何をしたいか、所有者の提案をどう扱うか    | 目的エージェントが人格・目的・観測を材料に判断 | 採用・妥協・辞退の理由とowner goalを保持               |
+| 危険、死亡、建築変更への対応              | 目的エージェントが状況から判断                 | 旧reflexの固定退避・旧建築認可を既定経路へ持ち込まない |
+| 入力の形・同時操作・停止状態              | schema、MindStore、Runtime、Body               | 型検証やCASは、目的の妥当性まで保証するものではない    |
+| ゲーム内の操作可否                        | 通常のMinecraft/Bukkit権限と保護plugin         | client側の操作受付だけで成功にしない                   |
+| credential、shell、任意コード、server管理 | モデルへ操作手段を公開しない                   | 既存サーバー設定の変更は別の運用作業                   |
+| 何を達成したか                            | 操作後のゲーム観測と、その後の目的判断         | `successful`な一操作とowner goal完了は別               |
 
 ## データの流れ
 

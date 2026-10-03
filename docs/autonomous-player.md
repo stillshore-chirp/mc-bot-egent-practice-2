@@ -14,37 +14,47 @@
 
 ## 2. 具体例: 探索中に採集を頼まれたら
 
+まず、所有者の発話を目的判断へ渡します。
+
 ```mermaid
 sequenceDiagram
-    actor O as 所有者
-    participant R as PlayerRuntime
-    participant C as Conversation
+    participant R as Runtime
+    participant C as 会話
     participant M as MindStore
     participant P as Purpose
-    participant B as PlayerBody
-    participant S as Skill repository
-    O->>R: 「近くの木を集めよう」
     R->>R: owner identity・発話長を確認
-    R->>C: 今回の発話とturn
-    C->>M: propose_goal_change / addProposal
+    R->>C: 「近くの木を集めよう」
+    C->>M: 目的提案を保存
     M-->>C: pending proposal
     C->>R: onOwnerProposal
-    C-->>O: 会話の返答
-    R->>P: 最新snapshotとpending eventsで判断
-    P->>B: observe（視野内の現在状態）
-    P->>S: 必要ならsearch_skills / read_skill
-    P->>M: commit_action_decision + stateUpdates
-    alt revision一致・停止していない
-        M-->>P: 提案解決・goal・判断を同時確定
+    C->>C: sayで所有者へ返答
+    R->>P: 最新snapshotとevent
+    Note over R,P: 既存の身体操作はまだ継続できる
+```
+
+次に、目的を判断・確定し、操作結果から次の判断へ進みます。
+
+```mermaid
+sequenceDiagram
+    participant P as Purpose
+    participant M as MindStore
+    participant R as Runtime
+    participant B as Body
+    participant S as Skill repository
+    P->>B: 現在の可視観測
+    P->>S: 必要な技能を検索・参照
+    P->>M: 判断と状態更新をCASで確定
+    alt revision一致・未停止
+        M-->>P: proposal・goal・判断を確定
         P->>R: onCommitted
-        R->>B: 旧操作をcancel・settleしてexecute
-        B-->>R: before/afterと操作結果
-        R->>S: 観測由来のreceiptとoutcome
-        R->>M: recordOutcome / body_outcome event
-        R->>P: 結果を踏まえた次の判断
+        R->>B: 旧操作を終了確認後に実行
+        B-->>R: 前後観測と操作結果
+        R->>S: receiptとoutcome
+        R->>M: 結果とbody_outcome event
+        R->>P: 最新結果で次の判断
     else 古いrevisionまたは停止
         M-->>P: CAS_STALE / STOPPED
-        Note over P,R: 古い判断では操作を開始しない
+        Note over P,R: この判断では操作を始めない
     end
 ```
 
@@ -195,6 +205,12 @@ flowchart TD
 - 再接続後は古い回収操作を `continue` せず、fresh観測で再計画する。
 
 死亡eventをまたぐ累積retry上限はなく、無進捗の連続wakeを常に防げることは未実証です。過去の限定測定は[AIプレイヤーE2E](ai-player-e2e.md)の死亡回収節を参照してください。
+
+### 経路が詰まった時の判断材料
+
+現在のPurpose instructionsには、activeなowner goalのため所有者へ移動中にstallした場合の、閉じた手動ドアの回復手順があります。fresh観測でドアを確認し、必要なら一度見回し、向きと閉状態を再確認して一度使用します。`open=true` と新しいowner位置が確認できた時だけ移動を一度再試行し、根拠がなければ別経路または未達の理由を選びます。
+
+これはモデルへの手順指示です。回復回数を独立した永続カウンターで強制しているという意味ではありません。履歴から再試行済みか分からない場合にも、同じ手順を繰り返さないよう指示しています。関連する `recentActionPattern` と可視観測を合わせて評価します。実装箇所は [PlayerPurposeAgent.think](../src/player/agents.ts)、操作条件は [PlayerBody](player-body.md) です。
 
 ## 9. 読み終えた後に確認するもの
 

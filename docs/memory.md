@@ -121,7 +121,7 @@ MemoryStoreのschema versionは5です。関係、事実、場所、約束、epi
 
 通常shutdownはRuntimeと接続を止めてから各storeを閉じます。旧 `TaskRuntime` の `suspended` checkpointと、新RuntimeのactiveOperation復旧は別の契約です。異常終了時に、receiptだけ保存され後続状態がまだ保存されていない場合もあり、復旧は各証拠を照合します。
 
-バックアップは停止後の整合したDB、またはSQLite backup APIを使います。WAL（Write-Ahead Logging、先行書込みログ）利用中のDB本体だけをコピーしないでください。[運用手順](operations.md#sqliteのバックアップと復元確認)を参照してください。
+バックアップは停止後の整合したDB、またはSQLite backup APIを使います。WAL（Write-Ahead Logging、先行書込みログ）利用中のDB本体だけをコピーしないでください。[運用手順](operations.md#sqlite-のバックアップと復元確認)を参照してください。
 
 ## 7. モデルのcontext圧縮と永続記憶は別
 

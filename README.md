@@ -6,18 +6,18 @@ Minecraft Java Editionの世界に一人のプレイヤーとして暮らし、�
 
 ## 技術文書の読み方
 
-| 知りたいこと | 読む文書 |
-| --- | --- |
-| 全体がどうつながるか、どのコードを読むか | [アーキテクチャ](docs/architecture.md) |
-| 発話から目的・行動へどう進むか、停止・競合・再接続 | [自律プレイヤー](docs/autonomous-player.md) |
-| 人格や関係が入力へどう入り、何が再起動後も残るか | [人格と記憶](docs/memory.md) |
-| 見える世界、使える操作、成功/未確認の判定 | [PlayerBody](docs/player-body.md) |
-| 経験が技能仮説になり、次回の判断へ戻る仕組み | [MC Bot Skills](docs/mc-bot-skills.md) |
-| 何を証拠に評価し、どこから原因を調べるか | [テスト・評価と原因調査](docs/testing.md) |
-| 起動、停止、バックアップ、障害対応 | [運用](docs/operations.md) |
-| 画面・traceの見方 | [観測ダッシュボード](docs/dashboard.md) |
-| 現行AIプレイヤーの実ゲーム評価条件・過去結果 | [AIプレイヤーE2E](docs/ai-player-e2e.md) |
-| 旧方式の仕様を保守する | [legacy runtime](docs/architecture.md#旧toolruntime経路の詳細) |
+| 知りたいこと                                       | 読む文書                                                       |
+| -------------------------------------------------- | -------------------------------------------------------------- |
+| 全体がどうつながるか、どのコードを読むか           | [アーキテクチャ](docs/architecture.md)                         |
+| 発話から目的・行動へどう進むか、停止・競合・再接続 | [自律プレイヤー](docs/autonomous-player.md)                    |
+| 人格や関係が入力へどう入り、何が再起動後も残るか   | [人格と記憶](docs/memory.md)                                   |
+| 見える世界、使える操作、成功/未確認の判定          | [PlayerBody](docs/player-body.md)                              |
+| 経験が技能仮説になり、次回の判断へ戻る仕組み       | [MC Bot Skills](docs/mc-bot-skills.md)                         |
+| 何を証拠に評価し、どこから原因を調べるか           | [テスト・評価と原因調査](docs/testing.md)                      |
+| 起動、停止、バックアップ、障害対応                 | [運用](docs/operations.md)                                     |
+| 画面・traceの見方                                  | [観測ダッシュボード](docs/dashboard.md)                        |
+| 現行AIプレイヤーの実ゲーム評価条件・過去結果       | [AIプレイヤーE2E](docs/ai-player-e2e.md)                       |
+| 旧方式の仕様を保守する                             | [legacy runtime](docs/architecture.md#旧toolruntime経路の詳細) |
 
 文書体系と配置判断は[文書構成](docs/documentation-structure.md)、開発作業のルールは[AGENTS.md](AGENTS.md)を参照してください。
 
@@ -61,14 +61,14 @@ npm run dev
 
 [設定例](.env.example)と[設定schema](src/config/schema.ts)が設定名・必須性・既定値の正本です。API keyや接続情報の不足・不正は、接続前の設定エラーとして扱います。実値、会話、実記憶、world情報をGitHubへ掲載しないでください。
 
-| 設定 | 用途・既定値 |
-| --- | --- |
+| 設定                                                       | 用途・既定値                             |
+| ---------------------------------------------------------- | ---------------------------------------- |
 | `MINECRAFT_HOST` / `MINECRAFT_USERNAME` / `OWNER_USERNAME` | 必須。botとownerは別のMinecraft identity |
-| `MINECRAFT_PORT` / `MINECRAFT_AUTH` / `MINECRAFT_VERSION` | `25565` / `microsoft` / `1.21.11` |
-| `OPENAI_API_KEY` / `OPENAI_MODEL` | key必須 / model既定 `gpt-6-luna` |
-| `DATABASE_PATH` | `data/companion.sqlite` |
-| `PERSONA_PATH` | `config/persona.example.json` |
-| `DASHBOARD_ENABLED` / `DASHBOARD_PORT` | `true` / `4310` |
+| `MINECRAFT_PORT` / `MINECRAFT_AUTH` / `MINECRAFT_VERSION`  | `25565` / `microsoft` / `1.21.11`        |
+| `OPENAI_API_KEY` / `OPENAI_MODEL`                          | key必須 / model既定 `gpt-6-luna`         |
+| `DATABASE_PATH`                                            | `data/companion.sqlite`                  |
+| `PERSONA_PATH`                                             | `config/persona.example.json`            |
+| `DASHBOARD_ENABLED` / `DASHBOARD_PORT`                     | `true` / `4310`                          |
 
 Botの接続版と、利用者が使うMinecraftクライアント版は同一とは限りません。[26.1クライアントとの接続手順](docs/minecraft-26-1.md)を参照してください。起動前には[ゲームモード・難易度・権限](docs/operations.md#起動前の確認)を確認します。
 
