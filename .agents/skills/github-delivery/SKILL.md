@@ -1,6 +1,6 @@
 ---
 name: github-delivery
-description: "ソースコード変更とIssue、branch、commit、push、PR、CI、review準備をIssueからマージ可能な状態まで配送するときに使う。latest headとmergeabilityを確認し、merge/closeは別の明示指示が必要。"
+description: "ソースコード変更とIssue、branch、commit、push、PR、CI、review準備をIssueからマージ可能な状態まで配送するときに使う。latest headとmergeabilityを確認し、依頼に含まれる配送範囲でmerge/closeまで進める。"
 ---
 
 # GitHub配送 Skill
@@ -24,7 +24,7 @@ description: "ソースコード変更とIssue、branch、commit、push、PR、C
 - ソースコードを含まない文書やメタデータだけの軽微な変更でIssueを省略する場合は、PR本文へ短い理由を書く。
 - [`docs/ai-governance/14-issue-quality-gate.md`](../../../docs/ai-governance/14-issue-quality-gate.md)に従い、理由、根拠、現在と目標、範囲、非対象、受け入れ条件、検証、リスクを書く。
 - Issue本文の各受け入れ条件は、対応するテスト、画面、ログ、文書、手動確認などの証拠と照合し、確認できた条件だけを `[x]` に更新する。未確認または未達の条件は `[ ]` のまま残し、理由、影響、次に確認する方法をIssueへ記録する。本文を変更できない事情がある場合は、その事情を示して同じ内容をIssueコメントへ記録する。
-- 受け入れ条件のチェック更新は証拠の記録であり、merge / closeの権限または判断を拡張しない。merge / closeは「6. 権限境界と終了」に従い、対象と権限が明示された場合だけ行う。
+- 受け入れ条件のチェック更新は証拠の記録であり、依頼範囲を拡張しない。依頼に対象と影響を含むmerge / closeは「6. 権限境界と終了」に従って実行し、工程ごとの再確認を求めない。
 - Issueのタイトルと本文は日本語を原則とし、タイトルは対象と変更または問題が判別できる具体的な日本語にする。固有名詞、製品名・ライブラリ名、code identifier、version/path、GitHub構文は正本の例外に従って維持できる。
 - レビュー結果を主因として別Issue化する場合は、正本の `[レビュー指摘]` title、`レビュー指摘` label、由来・severity・観測事実・影響・別追跡理由・UX・scope・acceptance・verification・公開安全性を満たす。根拠不足のレビュー起因分類や、同一PRの主Issueからの分離はしない。
 
@@ -82,7 +82,7 @@ description: "ソースコード変更とIssue、branch、commit、push、PR、C
 <!-- agent-harness:delivery-exit:start -->
 
 - merge直前は再確認済みの単一snapshotへlatest HEAD、base（親merge含む）、CI、review履歴の対象HEADと最新HEADの差分・指摘対応、未解決thread、mergeabilityを記録する。snapshot後にHEAD・base・CI・review状態が変わった場合は、該当証拠を失効して更新する。HEADが進んだだけでは新たなreview依頼を必須としない。最終delivery judgmentはprimaryがacceptance、CI、review、thread、mergeabilityを照合して行う。
-- merge、Issue / PRのclose、release、production deploy、破壊的変更は、対象を特定した別の明示指示がある場合だけ行う。
+- merge、Issue / PRのclose、release、production deploy、破壊的変更は、現在の依頼が対象と影響を含む場合にその範囲で実行する。通常配送だけの依頼はmerge / closeまで含むとは解釈しない。実行環境やtoolが拒否した操作は迂回せず、拒否理由を記録してbackoffし、安全な独立作業を続ける。
 - blocker報告には、失敗しているcheckまたは操作、証跡、試した対応、未完了範囲、次の最短アクションを含める。
 - 最終報告には、Issue、branch、commit、PR、local verification、CI、review、remaining risksのうち今回に関係するものを示す。
 <!-- agent-harness:delivery-exit:end -->

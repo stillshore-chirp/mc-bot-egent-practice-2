@@ -53,7 +53,11 @@ checkpointを逃した時だけ同じownerへ一度partial resultを求め、進
 
 ## task-stateとruntime境界
 
-cross-sessionのfield sourceは[task-state/v1 template](ai-governance/templates/task-state.json)だけです。resume時は現在のsnapshotとclosureを照合し、条件一致のcompleted evidenceをartifact referenceで再利用します。completeはacceptanceと必要gateを満たし、remaining work、invalidated gate、blockerがない場合だけです。blockedは権限・外部状態など真の停止理由がある場合だけです。
+cross-sessionのfield sourceは[task-state/v1 template](ai-governance/templates/task-state.json)だけです。resume時は現在のsnapshotとclosureを照合し、条件一致のcompleted evidenceをartifact referenceで再利用します。completeはacceptanceと必要gateを満たし、remaining work、invalidated gate、blockerがない場合だけです。blockedは権限・外部状態など真の停止理由がある場合だけで、利用者の不在や返答待ちだけではblockerにしません。
+
+- 現在の依頼が対象と影響を定めている作業は、必要な開発・実環境の停止、backup、再起動、copy試験、適用、rollbackを同じ権限範囲で続け、工程ごとの再確認を求めません。依頼にIssue / PRのmerge・closeまで含まれる場合も同様です。
+- 追加確認なしで進める依頼では、利用者が1か月以上不在でも、依頼・既存資料・実環境の照合から対象と工程を自律的に確定し、確認質問への回答を再開条件にしません。危険な項目を確定できない場合は安全な代替または保留を選び、その工程だけを止めて独立作業を続けます。不在は権限やsecret境界を広げません。
+- 失敗や不確実性が出たら対象と現状を照合し、原本・backupを保全して復旧可能性を確かめ、危険な工程だけを止めます。toolやplatformの拒否、実行環境停止、認証切れ、依存先の不通は迂回せず記録し、backoff中に安全な独立作業を続けます。同じAPI照会を反復したり、busy loopで待ったりしません。
 
 Minecraft runtimeを使うlaneはowner、PID、process group、port、readiness、cleanupを起動前に固定し、成功・停止・失敗・割込みの全経路でprocess groupとport解放を確認します。runtimeを使わない場合はその旨を記録します。validatorのstatic PASSはtool発見、Hook注入、runtime routing、権限、実環境成功を保証しません。
 
@@ -65,7 +69,9 @@ root AGENTS.mdは180行・16KiB、nested AGENTS.mdは100行・8KiB、adapterは3
 
 各runの冒頭に、state、headRefOid、updatedAt、reviewDecision、mergeStateStatusだけからなる軽量keyを取得します。MERGEDまたはCLOSEDならstateを最優先し、そのrunでscheduled taskを削除して監視を終了し、review・thread・CI・mergeabilityの詳細を取得しません。UNKNOWNや空のsecondary fieldはterminal stateを覆しません。
 
-OPENで外部待ちが必要な時、keyが変わらない間は詳細照会をせず、eventまたはbackoffで待機します。logical checkpointまたはdeadlineで継続要否を再評価し、不要と判断した時だけ停止理由と未確認範囲を通知します。timeout回数を完了条件にしません。
+OPENで外部待ちが必要な時、keyが変わらない間は詳細照会や定時通知をせず、eventまたはbackoffで待機します。利用者から返答がないことだけで依頼済み作業を止めません。
+
+logical checkpointまたはdeadlineで継続価値と実行可能性を再評価し、目的が完了したら待機を終了します。timeout回数を完了条件にしません。schedulerの継続はhost/runtimeが稼働している間に限られ、この文書だけでは保証できません。
 
 ## 保守境界
 
