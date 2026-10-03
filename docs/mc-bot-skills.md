@@ -2,6 +2,60 @@
 
 MC Bot Skill は、Minecraftで繰り返し使える行動の要点を、目的・適用条件・本文・操作名・期待結果・confidenceと一緒に保存する構造化記録です。SQLiteが正本で、Markdownは交換用のコピーです。検索では要約だけを返し、必要な時に `get(skillId)` で本文を読みます。初期データにはサバイバル、探索、戦闘、採集、クラフト、建築、移動の7分類を入れます。
 
+## 目的判断に戻る学習ループ
+
+実装の正本は [repository.ts](../src/mc-skills/repository.ts)、学習提案を受ける窓口は [PlayerPurposeAgent.recordLearning](../src/player/agents.ts)、ゲーム結果の書込み元は [PlayerRuntimeのexecuteBody](../src/player/runtime.ts) です。
+
+ここでの学習は、モデルの重みを再学習する処理ではありません。観測された試行から、次に読み直せる技能文書と版・根拠を作る仕組みです。
+
+```mermaid
+sequenceDiagram
+    participant P as Purpose
+    participant S as McSkillRepository
+    participant R as Runtime
+    participant B as PlayerBody
+    participant L as 学習評価のResponses呼出し
+    P->>S: search / getで技能仮説を参照
+    P->>R: 操作と使用skillId/versionを確定
+    R->>B: execute
+    B-->>R: 実観測に基づく結果
+    R->>S: recordTrustedEvidence
+    opt 使用Skillあり
+        R->>S: recordOutcome
+    end
+    R->>P: body_outcomeで次の判断
+    P->>S: 結果に一致するreceiptと使用版を取得
+    opt 未評価の成功receipt
+        P->>L: 再利用可能な方法かを評価
+        L->>P: propose_skill_learning または保存不要
+        P->>S: receipt照合の上でcreate / revise
+    end
+    S-->>P: 次回検索で新版の技能を参照可能
+```
+
+### 誰が何を信用するか
+
+| 要素                  | 作成者                                   | 意味                                             |
+| --------------------- | ---------------------------------------- | ------------------------------------------------ |
+| Skill本文・confidence | モデル等の提案をrepositoryが検証して保存 | 再利用候補の仮説。成功保証ではない               |
+| trusted receipt       | RuntimeのBody結果記録経路                | 観測された操作と結果。モデルにwriterを公開しない |
+| native outcome        | receiptを照合するrepository              | 実使用Skillの試行結果を一度だけ統計へ反映        |
+| immutable revision    | repository transaction                   | どの版を何の根拠で変えたかを保持                 |
+| imported statistics   | Markdown交換からの外部情報               | 自分のnative experienceと混ぜない                |
+
+### 自動評価の条件と限界
+
+`PlayerPurposeAgent.think()` は、`body_outcome` eventと直近結果が一致し、成功receiptのoperation・使用Skill/版・期待結果も一致した場合に、独立した学習評価用Responses呼出しを行います。この「独立」は製品内の役割分離であり、別OSプロセスではありません。
+
+- 再利用できる方法なら一回の成功から仮説を作れる。反復成功を作成の必須条件にはしない。
+- 同等Skill、単発でしか使えない結果なら、評価しても保存しない場合がある。
+- 使用Skillありの自動評価では使用版の改訂を、使用Skillなしでは作成を提案する。
+- 通常のPurpose toolからも `propose_skill_learning` を使える。作成には成功receipt、改訂には成功/失敗receiptと使用版の一致が必要。
+- Skillの保存、MindStoreのlearning参照、後の実使用は別の事象。保存件数だけで能力向上を評価しない。
+- 学習評価を試したrunの直近24件の集合はプロセス内にあり、保存済みlearning参照とは別。再起動後まで「評価したが保存しなかった」履歴を無制限に保持する仕組みではない。
+
+学習の評価は「receipt → revision → 後続の使用版 → 新しい結果」を辿ります。具体的な確認先は[評価と原因調査](testing.md)を参照してください。
+
 ## 保存と公開API
 
 `McSkillRepository.open({ databasePath, exchangeDirectory, allowedOperationNames })` で開きます。リポジトリは独自の `mc_bot_skill_*` テーブルだけを `CREATE TABLE IF NOT EXISTS` で作るため、既存SQLite DBと同じファイルを使っても既存の記憶schemaを変更しません。通常の検索、取得、編集は `search`、`get`、`getHistory`、`createSkill`、`revise`、`reviseFromEvidence`、`listOutcomes`、`getEvidence` を使います。
