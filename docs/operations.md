@@ -4,7 +4,7 @@
 
 ## 起動前の確認
 
-1. Node.js 24 を推奨します。Node.js 22 以上が必要です。
+1. Node.js 24 を推奨します。Node.js 22.13.0 以上が必要です。
 2. `npm ci` を実行し、`npm run format:check`、`npm run lint`、`npm run typecheck`、`npm test`、`npm run build` を確認します。
 3. `.env.example` を `.env.local` へコピーし、実値は `.env.local` だけに保存します。
 4. `MINECRAFT_HOST`、`MINECRAFT_USERNAME`、`OWNER_USERNAME`、`OPENAI_API_KEY`、必要な connection / limit 設定を確認します。値を terminal、log、Issue、PR に表示しません。
@@ -41,13 +41,21 @@ npm run build
 npm start
 ```
 
-停止はprocessに通常のinterruptを送ります。graceful shutdownが、進行中taskの`suspended`遷移とcheckpoint、SQLiteの確定、接続の安全な切断を終えてから終了することを確認します。強制終了した場合も、次回起動時に`running`を`suspended`へ変更し、taskをcompletedと扱わず、保存されたcheckpointとMinecraftの観測状態からread-onlyで再評価します。再開にはownerの新しい明示指示が必要です。
+### ゲーム内の停止とプロセス終了
+
+ゲーム内のowner停止は、既定PlayerRuntimeの停止ラッチを先にSQLiteへ保存し、思考とBodyを止めます。この停止は再接続やプロセス再起動でも残り、ownerの明示再開で解除します。
+
+プロセスを終了する場合は通常のinterruptを使います。既定applicationはRuntimeと接続を止め、dashboard・trace・skills・mind・memoryの順に終了処理を行います。異常終了後は、保存済みactiveOperationをreceiptと照合し、一致する結果がなければ `unverified` として次の判断へ渡します。停止ラッチがない場合は自律判断を再開するので、再起動だけを永続停止の代わりにしないでください。
+
+旧 `TaskRuntime` の `running → suspended` とcheckpointによる復元は、明示的に起動した[legacy経路](architecture.md#旧toolruntime経路の詳細)の契約です。
 
 ## ログ確認
 
-各依頼には相関IDを付け、接続、観測、path、resource、inventory、authorization / permission、timeout、cancelled、LLM、persistence、safety、validation、internalのfailure categoryを確認します。相関IDはOpenAI呼出し、同じasync実行範囲のtool / skill / Minecraftログ、SQLiteのtask inputとterminal Episodeへ引き継ぎます。
+既定経路では、`category=llm` / `purpose=player_agent` のround・使用量・時間と、`player_runtime`、`player_memory`等の固定codeを確認します。会話/目的thoughtのtrace、Body結果、MindStoreのeventとSkill receiptは別の観測先です。traceの成功だけでMinecraft操作成功と判断しません。
 
-ログは構造化し、API key、Minecraft host、bot / owner username、会話全文、memory 本文を redact します。障害を共有するときは、相関 ID、環境区分、時刻範囲、failure category、確認済み状態、再試行結果だけを安全に要約します。
+具体的な「症状 → 観測項目 → コード → テスト」の対応は[評価と原因調査](testing.md#3-返事はしたが依頼を達成しないを辿る)を参照してください。旧tool/skillの相関ID・failure categoryはlegacy用の観測として区別します。
+
+障害を共有するときは、対象commit、環境区分、時刻範囲、固定code、結果分類、確認済み状態、未確認事項だけを安全に要約します。API key、接続先、player名、会話全文、記憶本文、追跡可能な実ID、原logをIssue/PRへ載せません。redaction済み出力でも、任意の自由文が公開可能とは限りません。
 
 ## SQLite のバックアップと復元確認
 
@@ -57,7 +65,7 @@ npm start
 sqlite3 data/companion.sqlite ".backup 'backups/companion-YYYYMMDD.sqlite'"
 ```
 
-復元確認は本番 database を上書きしない一時領域で行います。migration、人格設定、利用者情報、場所、約束、直近の task result が再起動後に読めることを確認し、未完了 task が success 扱いにならないことを確認します。
+復元確認は本番 database を上書きしない一時領域で行います。persona設定とDBの組合せ、MindStoreのgoal・提案・停止・直近結果、MemoryStoreのepisode、Skillの版・receiptを確認します。旧経路を使う場合は場所・約束・task checkpointも確認します。未完了操作を未観測の成功にしないことを確かめます。
 
 ## 障害切り分け
 
@@ -66,16 +74,16 @@ sqlite3 data/companion.sqlite ".backup 'backups/companion-YYYYMMDD.sqlite'"
 | 起動直後の設定エラー | 必須環境変数、数値上限、persona path                     | 値を表示せず field 名だけで修正する                             |
 | Minecraft 接続失敗   | server の稼働、version、auth、接続許可                   | 設定上限後はconnection stateを`failed`にし、安全なlogで報告する |
 | OpenAI failure       | API 利用権限、network、model、failure category           | credential を log に出さず、自然文の推測実行をしない            |
-| 操作が拒否される     | `OWNER_USERNAME`、権限、不可逆操作の明示依頼             | 会話参加と操作権限を混同しない                                  |
+| 操作が拒否される     | owner照合、停止状態、入力schema、server権限              | 会話参加と操作権限を混同しない                                  |
 | 移動・採取が失敗する | snapshot、path、resource、inventory、timeout、retry 回数 | 観測した state と次に可能な行動を報告する                       |
 | 記憶が復元しない     | database path、migration、shutdown、backup の整合性      | 実 record を外部へ転載せず、persistence failure として扱う      |
 
 server 再起動、world の変更、bot 操作、memory の修正、rollback、credential の変更は、対象と影響を示した明示的な運用判断の後にだけ実施します。
 
-接続が復旧した場合は、再取得したsnapshotをruntime再評価へ渡してMinecraft chatへ結果を返します。再接続上限へ到達した場合はchat transport自体が利用できないため、`RECONNECT_RETRY_EXHAUSTED`と`connectionState=failed`をローカルの構造化logまたはlive E2E evidenceで確認します。未送信のchat報告を送信済みとして扱いません。
+既定Playerは接続復旧eventと新しい観測から目的を再評価します。旧helperには再接続結果をchatで報告する経路もありますが、既定Playerの全再接続で同じ定型報告が出るとは限りません。再接続上限へ到達した場合はchat transport自体が利用できないため、`RECONNECT_RETRY_EXHAUSTED`と`connectionState=failed`をローカルの構造化logまたはlive E2E evidenceで確認します。未送信のchat報告を送信済みとして扱いません。
 
 ## 実環境受け入れ
 
-実 Minecraft と実 OpenAI API の E2E 手順・事前条件・証跡境界は [testing.md](testing.md#実環境-e2e) を正本とします。直近の公開可能な結果は [2026-08-25 実施結果](testing.md#2026-08-25-実施結果) にあります。資格情報または server 操作の許可がないときは、実 E2E を未実施として記録し、模擬環境の結果を置き換えません。
+実 Minecraft と実 OpenAI API の E2E 手順・事前条件・証跡境界は [testing.md](testing.md#実環境-e2e) を正本とします。現行Playerのcase別記録は[AIプレイヤーE2E](ai-player-e2e.md)、旧経路の歴史的記録は [2026-08-25実施結果](testing.md#2026-08-25-実施結果) にあります。資格情報または server 操作の許可がないときは、実 E2E を未実施として記録し、模擬環境の結果を置き換えません。
 
 26.1クライアントと1.21.11サーバーを併用する場合は、[26.1検証手順](minecraft-26-1.md)でサーバー側ViaVersionとBot側の接続版を分けて確認します。既存サーバーへ適用する際は、サーバーを停止し、worldと設定・plugin一式の復元可能なバックアップを作成してから、保守時間内にpluginを適用して再起動します。接続・chat・停止・切断の確認で問題が出たら停止し、バックアップからpluginと設定を戻して旧構成で起動・接続確認します。このリポジトリから実利用サーバーへの適用は行っていません。

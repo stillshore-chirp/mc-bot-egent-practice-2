@@ -6,25 +6,63 @@
 
 このアダプターは、従来の Bot 専用の木材採集制限、行動許可、建築ポリシー確認を適用しません。プレイヤーが実行できることは、Minecraft の物理挙動と接続先サーバーの通常の権限によって決まります。チャットコマンドや任意コマンドの実行、管理者操作、認証情報の操作、権限迂回は公開しません。`stop` とランタイムの永続停止ラッチは維持されます。
 
+## 呼出しから結果まで
+
+責務は [PlayerBody](../src/minecraft/player-body.ts)、[入力schema](../src/minecraft/player-body-schema.ts)、[観測型](../src/minecraft/player-body-observation.ts)、[registry知識](../src/minecraft/player-body-knowledge.ts) に分かれます。呼出し側の制御は[自律プレイヤー](autonomous-player.md)を参照してください。
+
+```mermaid
+flowchart TD
+    Decision["確定済みの操作"] --> Validate["schema・接続・操作所有権を確認"]
+    Validate --> Before["実行前観測"]
+    Before --> Execute["Mineflayer操作
+期限・AbortSignal"]
+    Execute --> After["実行後観測・server event照合"]
+    After --> Verified{"操作固有の効果を確認できたか"}
+    Verified -->|"確認"| Success["successful"]
+    Verified -->|"観測不足"| Unknown["unverified"]
+    Execute -->|"失敗"| Failed["failed"]
+    Execute -->|"中断"| Interrupted["interrupted / recoveryRequired"]
+    Success --> Runtime["Runtimeが結果を保存して再判断"]
+    Unknown --> Runtime
+    Failed --> Runtime
+    Interrupted --> Runtime
+```
+
+この図は結果分類の概略です。各操作の例外や検証条件は下記の成功確認を参照してください。Bodyの成功は操作単体の効果を表し、owner goal全体の達成はPurposeが最新観測と合わせて判断します。
+
 ## 操作一覧
 
 実行可能な操作名の正本は`playerOperationNames`です。31 操作はすべて`playerOperationSchema`・PlayerBody dispatch・PurposeAgent の GPT 向け操作 catalog に接続されています（実装上の接続を示し、GPT が各操作を実ゲームで選んだ証拠ではありません）。表の「ゲーム上」は通常の Java 版プレイヤー操作として可能か、「library」は依存 library に必要な API または構成要素があるかを示します。API があることだけでは、その環境での成功を保証しません。
 
 Mineflayer は`package.json`と`package-lock.json`で`4.37.1`、`mineflayer-pathfinder`は`2.4.5`に固定されています。library 欄は実装コードと[Mineflayer 4.37.1 API](https://github.com/PrismarineJS/mineflayer/blob/4.37.1/docs/api.md)、[同版の変更履歴](https://github.com/PrismarineJS/mineflayer/blob/4.37.1/docs/history.md)を照合しました。変更履歴では 4.35.0 に Minecraft 1.21.11 対応が追加されています。pathfinder の到達性や server ごとの結果は、別途ゲーム内で確認します。
 
-| 操作群・31 操作の内訳                                                            | ゲーム上                              | library・4.37.1                                                                       | 既存実装・GPT 公開             | 主な阻害要素・未対応理由                                                                      | 隔離 Paper での実ゲーム確認                                                                                                                                                                                                                |
-| -------------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 移動・視線・入力：`move_to`, `move_relative`, `look`, `look_sweep`, `control`    | 可能                                  | `look`, `lookAt`, control 入力。経路探索は`mineflayer-pathfinder`                     | あり（31 操作 schema/catalog） | 読込済み地形、経路、通常の到達距離、時間上限                                                  | 初回代表：`look`・移動を#75で受入。`look_sweep`、`control`など他操作は未測定                                                                                                                                                               |
-| 装備・使用・攻撃：`equip`, `use`, `attack`                                       | 可能（対象・所持条件あり）            | `equip`, `activateItem`, `useOn`, `attack`                                            | あり（31 操作 schema/catalog） | 対象 item、通常の到達距離、server 応答。攻撃元を特定できない protocol では hit を確認できない | 初回代表：`equip`はfresh Body headと独立server readbackで確認。`use`・`attack`は未測定                                                                                                                                                     |
-| 採掘・設置・制作：`dig`, `place`, `craft`                                        | 可能（server 権限・材料等の条件あり） | `dig`, `placeBlock`, `craft`                                                          | あり（31 操作 schema/catalog） | 対象の可視性、道具・材料・設置面・recipe・server 側更新                                       | 初回代表：#83で独立serverのoak/birch所持増加と達成後の`dig`・`collect_item`を確認。#72の`place`は別Issueの代表証拠。`craft`は未測定                                                                                                        |
-| 画面・設備：`open_window`, `window_click`, `window_transfer`, `window_close`     | 可能（接続先が提供する画面）          | container API、`clickWindow`, `transfer`, `closeWindow`                               | あり（31 操作 schema/catalog） | 可視・到達可能な対象、対応 window/protocol、正確な slot readback。modded 画面は未保証         | 一部：run9/10 の open・close は Body 結果と画面状態、transfer-in は Body 結果・slot 差分と RCON の炉入力内容変化を確認。transfer-out は Body の所持品/slot 差分まで（RCON による返却先所持品 readback は未確認）。他設備の群別受入は未確認 |
-| 所持品：`consume`, `toss`, `transfer`                                            | 可能（item・slot 条件あり）           | `consume`, `toss`, `transfer`                                                         | あり（31 操作 schema/catalog） | 所持数・空き slot・食料状態。効果を観測できない場合は未確認                                   | 初回代表：`consume`でbread 1→0とfood増加を確認。後続のfull-food段階は未完了。`toss`は未測定。`transfer`は下記の既存確認範囲を維持                                                                                                          |
-| 拾得：`collect_item`                                                             | 可能（拾得可能な drop への接近時）    | item 拾得専用操作ではなく、通常の移動・可視 entity 追跡・`playerCollect` event を使用 | あり（31 操作 schema/catalog） | 開始時から可視の対象 ID が必要。遮蔽・視界喪失・経路失敗時は停止                              | 初回代表：#83の自然な採集依頼と独立readbackで確認。#72の乾地 pickup は別Issueの代表証拠として維持                                                                                                                                          |
-| 釣り：`fish`                                                                     | 可能（釣竿・水面等の条件あり）        | `fish`                                                                                | あり（31 操作 schema/catalog） | 釣竿、環境、浮き・釣果 event と拾得確認                                                       | 未確認                                                                                                                                                                                                                                     |
-| 睡眠・乗り物：`sleep`, `wake`, `mount`, `dismount`, `move_vehicle`, `elytra_fly` | 可能（対象・装備・ゲーム条件あり）    | `sleep`, `wake`, `mount`, `dismount`, `moveVehicle`, `elytraFly`                      | あり（31 操作 schema/catalog） | 有効な bed/entity/vehicle、sleep 条件、飛行装備・状態、protocol                               | 未確認                                                                                                                                                                                                                                     |
-| 専門画面：`trade`, `enchant`, `anvil`, `write_book`, `update_sign`               | 可能（対象・材料・画面条件あり）      | `trade`, enchantment table / anvil API, `writeBook`, `updateSign`                     | あり（31 操作 schema/catalog） | offer・素材・経験値・画面種類。NBT/古い protocol で内容を読めない場合は未確認                 | 未確認                                                                                                                                                                                                                                     |
+各操作は通常のJava版の所持品・到達距離・server権限等に従います。schema/catalog/dispatchへの接続、libraryのAPI、実ゲームでの確認を分けて読みます。
 
-実ゲーム欄は、現行[#75の初回代表受入](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を31操作全体の網羅と混同しないための証拠状態です。初回範囲は`look`・移動・`dig`・`collect_item`・`equip`・`consume`と停止の代表場面です。装備readbackは[#63の公開進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/63#issuecomment-5850402144)、採集・達成後の操作は[Issue #83](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/83)、consumeの代表結果は上記[#75進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を参照します。既存の[#69公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/69)と[#78公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/78)も、それぞれの元の範囲で再利用します。行内の「未測定」は初回代表に含まれない操作の測定状態を示し、未実装やゲーム上不可能という意味ではありません。31 操作の schema/catalog 接続は実装状態を示すもので、各操作の実ゲーム受入証拠ではありません。
+| 操作群                                                                           | library / 構成要素                                                                    | 主な条件・阻害要素                                                                            |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| 移動・視線・入力：`move_to`, `move_relative`, `look`, `look_sweep`, `control`    | `look`, `lookAt`, control 入力。経路探索は`mineflayer-pathfinder`                     | 読込済み地形、経路、通常の到達距離、時間上限                                                  |
+| 装備・使用・攻撃：`equip`, `use`, `attack`                                       | `equip`, `activateItem`, `useOn`, `attack`                                            | 対象 item、通常の到達距離、server 応答。攻撃元を特定できない protocol では hit を確認できない |
+| 採掘・設置・制作：`dig`, `place`, `craft`                                        | `dig`, `placeBlock`, `craft`                                                          | 対象の可視性、道具・材料・設置面・recipe・server 側更新                                       |
+| 画面・設備：`open_window`, `window_click`, `window_transfer`, `window_close`     | container API、`clickWindow`, `transfer`, `closeWindow`                               | 可視・到達可能な対象、対応 window/protocol、正確な slot readback。modded 画面は未保証         |
+| 所持品：`consume`, `toss`, `transfer`                                            | `consume`, `toss`, `transfer`                                                         | 所持数・空き slot・食料状態。効果を観測できない場合は未確認                                   |
+| 拾得：`collect_item`                                                             | item 拾得専用操作ではなく、通常の移動・可視 entity 追跡・`playerCollect` event を使用 | 開始時から可視の対象 ID が必要。遮蔽・視界喪失・経路失敗時は停止                              |
+| 釣り：`fish`                                                                     | `fish`                                                                                | 釣竿、環境、浮き・釣果 event と拾得確認                                                       |
+| 睡眠・乗り物：`sleep`, `wake`, `mount`, `dismount`, `move_vehicle`, `elytra_fly` | `sleep`, `wake`, `mount`, `dismount`, `moveVehicle`, `elytraFly`                      | 有効な bed/entity/vehicle、sleep 条件、飛行装備・状態、protocol                               |
+| 専門画面：`trade`, `enchant`, `anvil`, `write_book`, `update_sign`               | `trade`, enchantment table / anvil API, `writeBook`, `updateSign`                     | offer・素材・経験値・画面種類。NBT/古い protocol で内容を読めない場合は未確認                 |
+
+### 過去の実ゲーム確認（操作群別）
+
+- **移動・視線・入力**: 初回代表：`look`・移動を#75で受入。`look_sweep`、`control`など他操作は未測定
+- **装備・使用・攻撃**: 初回代表：`equip`はfresh Body headと独立server readbackで確認。`use`・`attack`は未測定
+- **採掘・設置・制作**: 初回代表：#83で独立serverのoak/birch所持増加と達成後の`dig`・`collect_item`を確認。#72の`place`は別Issueの代表証拠。`craft`は未測定
+- **画面・設備**: 一部：run9/10 の open・close は Body 結果と画面状態、transfer-in は Body 結果・slot 差分と RCON の炉入力内容変化を確認。transfer-out は Body の所持品/slot 差分まで（RCON による返却先所持品 readback は未確認）。他設備の群別受入は未確認
+- **所持品**: 初回代表：`consume`でbread 1→0とfood増加を確認。後続のfull-food段階は未完了。`toss`は未測定。`transfer`は下記の既存確認範囲を維持
+- **拾得**: 初回代表：#83の自然な採集依頼と独立readbackで確認。#72の乾地 pickup は別Issueの代表証拠として維持
+- **釣り**: 未確認
+- **睡眠・乗り物**: 未確認
+- **専門画面**: 未確認
+
+上の実ゲーム記録は、現行[#75の初回代表受入](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を31操作全体の網羅と混同しないための証拠状態です。初回範囲は`look`・移動・`dig`・`collect_item`・`equip`・`consume`と停止の代表場面です。装備readbackは[#63の公開進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/63#issuecomment-5850402144)、採集・達成後の操作は[Issue #83](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/83)、consumeの代表結果は上記[#75進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を参照します。既存の[#69公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/69)と[#78公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/78)も、それぞれの元の範囲で再利用します。記録内の「未測定」は初回代表に含まれない操作の測定状態を示し、未実装やゲーム上不可能という意味ではありません。31 操作の schema/catalog 接続は実装状態を示すもので、各操作の実ゲーム受入証拠ではありません。
 
 ### 操作固有の成功確認
 

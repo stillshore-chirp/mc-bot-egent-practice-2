@@ -1,6 +1,115 @@
-# テスト
+# テスト・評価と原因調査
 
 このプロジェクトでは、test double による設計検証と、実 Minecraft・実 OpenAI API による受け入れ試験を分けます。前者の成功は後者の代替ではありません。
+
+## 1. 評価する対象を先に分ける
+
+| 問い                 | 根拠                                          | それだけでは言えないこと                                 |
+| -------------------- | --------------------------------------------- | -------------------------------------------------------- |
+| 入力を受け取ったか   | owner照合、会話turn、proposal                 | 採用・実行されたとは限らない                             |
+| 判断を確定できたか   | judgment、revision、tool結果code              | Bodyが開始・成功したとは限らない                         |
+| 操作が始まったか     | activeOperationの `bodyStartedAt`             | commit時刻 `startedAt` だけでは実開始の証拠にならない    |
+| 操作単体が成功したか | Bodyのbefore/after、対応event、receipt        | owner goal全体の達成とは限らない                         |
+| 目的を達成したか     | owner-linked goal、期待した最終状態、最新観測 | 発話やgoal更新だけで未観測の成功を補わない               |
+| 学習したか           | receiptとSkill版の関連、後続の使用と結果      | 作成/改訂件数だけで汎化・能力向上は証明しない            |
+| 人格・関係が伝わるか | 同じpersona/場面条件での発話と選択理由の評価  | DBにpersona/relationshipがあるだけでは自然さを保証しない |
+| 費用を比較できるか   | case範囲、call/token/latency、usageUnknown    | unknownを0と扱わない。異条件のrunを改善率にしない        |
+
+文書刷新（#121）はdotによる静的調査です。以下のテストは**既存の検証手段の説明**であり、今回新たに実行して合格した一覧ではありません。
+
+## 2. どこを観測するか
+
+| 観測先                         | 見えるもの                                                          | 見えない/注意するもの                                            |
+| ------------------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| 構造化log                      | 分類、固定code、API round・使用量・時間、接続失敗                   | 生の会話・promptを公開用logへ足さない                            |
+| `collectLiveEvidence().player` | purpose、goal/proposal、停止、直近判断/結果、観測、学習参照、集計   | 全履歴ではない。除去済みの一部位置以外にも機微な自由文が残り得る |
+| `recentAgentActivity`          | role、round、tool名、resultClass/code、CAS変更箇所、入力文字数等    | モデル内部の思考全文や入力全文ではない                           |
+| Skill repository               | 使用版、trusted receipt、native outcome、改訂/仮説の関連            | import統計は自分の観測実績ではない                               |
+| dashboard trace                | 会話/目的thought、Responsesのdeliberation、session内の接続retry計測 | 既定経路の全tool/Body/学習がDAGでつながるわけではない            |
+| 実ゲーム評価のartifact         | case条件、達成・未完了、独立したserver観測、予算                    | fixture準備失敗は製品の行動失敗ではない                          |
+| private sidecar                | 人が判断する必要のある限定された発話・snapshot                      | privateな補助ファイル。Issue/PRへ転載しない                      |
+
+実装: [application evidence](../src/app/player-application.ts)、[runtime evidence](../src/player/runtime.ts)、[round activity](../src/player/responses.ts)、[safe projection](../src/player/observation-evidence.ts)、[private sidecar](../tests/e2e/player-snapshot-sidecar.ts)。
+
+### traceの成功をゲームの成功と混同しない
+
+`PlayerRuntime.#traceCall()` は会話turn/目的thoughtが返った時点でtraceを閉じます。Bodyの実行は `handleCommittedDecision → #executeBody` の別のpromise系列で進みます。そのためtraceの `succeeded` は、思考処理が返ったことを示し、Body成功やgoal達成の証明ではありません。CASで判断が受理されず戻った場合も、この違いが重要です。
+
+現状は `minecraft_action / verification` 等のschemaがあるだけで、既定PlayerRuntimeの全Body結果がそのspanとして生成されるわけではありません。必要な結果はMindStoreとSkill receiptを照合します。この計測の関連付け不足は [Issue #123](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/123) で別に追跡します。文書の図で未実装のtraceを存在するように補いません。
+
+## 3. 「返事はしたが、依頼を達成しない」を辿る
+
+```mermaid
+flowchart TD
+    Start["症状と時刻範囲を絞る"] --> Proposal{"proposalは保存されたか"}
+    Proposal -->|"いいえ"| Chat["owner照合・turn・会話tool結果"]
+    Proposal -->|"はい"| Resolve{"採用・妥協・辞退とgoalがあるか"}
+    Resolve -->|"いいえ"| Think["Purpose起動・停止・待機・CAS拒否"]
+    Resolve -->|"はい"| Begin{"Body開始を観測したか"}
+    Begin -->|"いいえ"| Dispatch["actionRevision・旧操作settle・接続回復"]
+    Begin -->|"はい"| Result{"結果のstatusと根拠は何か"}
+    Result --> Failure["failed / interrupted / unverified
+観測・期限・server応答を照合"]
+    Result --> Success["successful
+操作の効果と最終goalを別に照合"]
+    Failure --> Next["次のevent・判断・目的状態を確認"]
+    Success --> Next
+    Next --> Learning["必要ならreceipt・Skill版・再利用まで追う"]
+```
+
+1. **症状を固定する**: 何を期待し、何を実際に観測したか、どの版・場面かを分ける。まず既存の証跡を読む。
+2. **入力を追う**: `proposals` がなければ [receiveChat / handleOwnerMessage](../src/player/agents.ts) とtool結果を調べる。会話の了承だけを提案保存の代わりにしない。
+3. **判断を追う**: pendingのままなら、停止・wait・pendingEventKinds・直近roundを確認する。`CAS_STALE` の場合は `changedComponents` を使い、古い状態へcommitを通す修正をしない。
+4. **実行を追う**: `activeOperation` はdispatch前に永続化される。実開始は `bodyStartedAt`、操作結果は `recentOutcomes` で確認する。復旧待ちなら接続状態も読む。
+5. **効果を追う**: `dig` はblock更新、`collect_item` は対象一致の拾得eventと所持数増加、`consume` は所持数減少とfood増加を確かめる。個別条件は [PlayerBody](player-body.md)。
+6. **次の判断を追う**: 操作成功でもgoalが残るなら、最新観測・expectedOutcome・次のdecisionを照合する。無進捗での見回し反復等は操作成功数だけで評価しない。
+7. **学習を追う**: 使用Skill/版とreceipt、learning参照、保存された改訂を照合する。保存不要と評価された場合もある。
+
+### よく使う切り分け表
+
+| 状況                           | 最初の手掛かり                            | 調査する境界                                                                                                      |
+| ------------------------------ | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `STALE_REVISION` / `CAS_STALE` | stop/action/outcome/proposal等の変更箇所  | [MindStore.commitThought](../src/player/mind-store.ts) と [Responsesの古い結果打切り](../src/player/responses.ts) |
+| `NO_ACTIVE_OPERATION`          | continue時のsnapshot                      | 行動終了後の古い判断か、モデルの選択か                                                                            |
+| `PROPOSAL_NOT_PENDING`         | proposal状態とowner goalのリンク          | 提案解決済み、または位置例外の条件外か                                                                            |
+| `INVALID_PLAYER_OPERATION`     | kindと返された現行schema                  | schema未参照、引数不足、型不正か                                                                                  |
+| `operation_stalled` / path失敗 | Body結果、fresh観測、直近行動パターン     | 見えている通路/扉と経路条件。目的選択と身体制御を分ける                                                           |
+| `BODY_RECOVERY_REQUIRED`       | cleanup状態・接続event                    | 未完了native操作の所有権を保持しているか                                                                          |
+| `PLAYER_SKILL_EVIDENCE_FAILED` | receiptの有無、Skill/版/operation         | Body結果保存と学習証拠が一致しているか                                                                            |
+| `GOAL_MIRROR_PERSIST_FAILED`   | MindStoreのgoalとLifeState                | 主commitと後続mirrorを混同していないか                                                                            |
+| 学習更新がない                 | receipt status、版、重複、tool resultCode | 適用条件外か、保存不要か、保存失敗か                                                                              |
+| tokenが少なく見える            | `usageUnknownCalls` と理由別counter       | provider未返却分を含まない下限値か                                                                                |
+| 記憶が次回入力にない           | storeの種類と保持/入力上限                | 消失か、短期会話か、検索/件数制限か                                                                               |
+
+## 4. 既存テストとの対応
+
+| 確認したい契約                             | 代表的なテストソース                                                                                                                                                                                |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 既定applicationとlegacyの組立              | [player-application.test.ts](../tests/unit/player-application.test.ts)                                                                                                                              |
+| 停止、event、CAS、再起動、Body所有権       | [player-runtime.test.ts](../tests/unit/player-runtime.test.ts)                                                                                                                                      |
+| 会話の文脈、能力説明、owner intent、割込み | [player-agent-owner-intent.test.ts](../tests/unit/player-agent-owner-intent.test.ts)                                                                                                                |
+| owner proposalとgoalの継続・競合           | [player-owner-goals.test.ts](../tests/unit/player-owner-goals.test.ts)                                                                                                                              |
+| 操作catalogとschema                        | [player-operation-discovery.test.ts](../tests/unit/player-operation-discovery.test.ts)                                                                                                              |
+| 身体操作の結果・観測境界                   | [player-body.test.ts](../tests/unit/player-body.test.ts)                                                                                                                                            |
+| API round、usage、打切り                   | [player-agent-rounds.test.ts](../tests/unit/player-agent-rounds.test.ts)                                                                                                                            |
+| context圧縮とcall/outputの対応             | [player-response-compaction.test.ts](../tests/unit/player-response-compaction.test.ts)                                                                                                              |
+| 死亡回収の根拠条件                         | [player-death-recovery-policy.test.ts](../tests/unit/player-death-recovery-policy.test.ts)                                                                                                          |
+| 技能の版・receipt・学習                    | [mc-skills.test.ts](../tests/unit/mc-skills.test.ts)、[player-learning.test.ts](../tests/integration/player-learning.test.ts)                                                                       |
+| 保存・検索・再起動                         | [memory.test.ts](../tests/unit/memory.test.ts)、[memory-restart.test.ts](../tests/integration/memory-restart.test.ts)                                                                               |
+| trace schema・redaction・保存              | [trace-contracts.test.ts](../tests/unit/trace-contracts.test.ts)、[trace-redaction.test.ts](../tests/unit/trace-redaction.test.ts)、[trace-store.test.ts](../tests/integration/trace-store.test.ts) |
+
+テストファイルの存在は、今回のHEADでの合格を意味しません。実行結果を使う場合は対象commitと実行条件を添えます。旧skill/reflexのテストを、既定Purposeの実ゲーム能力の証拠として使いません。
+
+## 5. 実ゲーム評価を読む
+
+現行の広いAIプレイヤー評価は [ai-player-live.ts](../tests/e2e/ai-player-live.ts) と [AIプレイヤーE2E手順](ai-player-e2e.md) が入口です。隔離serverのfixture、Body操作、独立したserver側読取り、実LLMの判断を分けて記録します。
+
+- `pass`: そのcaseの受け入れ条件をそのrunで満たした。
+- `fail`: そのcaseで確認できた不一致。どの境界で失敗したかを読む。
+- `incomplete`: fixture、証拠、使用量、期限等が不足。0件成功や製品失敗へ一律変換しない。
+- operatorの発話評価を残すcaseでは、機械的な件数/regexの合格だけで自然文の正しさを確定しない。
+
+既存の初回代表受入は31操作の網羅ではありません。死亡回収の成功や浅水からの自律帰岸など、未確認の範囲は [Bodyの実ゲーム記録](player-body.md#過去の実ゲーム確認操作群別) と各caseの原記録を確認します。取り止めた網羅試験を、本書の説明だけで新しい必須作業に戻しません。
 
 ## ローカル品質確認
 
@@ -24,7 +133,7 @@ GitHub Actions は通常PRで一つの `CI` workflowだけを起動します。�
 
 workflowはpath filterで起動自体を消しません。削除・renameの両側を分類するため、PRでは `git diff --name-only --no-renames -z base...head` を使います。同一のHEAD・base・入力閉包・実行条件で成功した証跡は再利用し、交差する入力が変わったgateだけを再実行します。
 
-`audit:high`はhigh / critical advisoryを品質gateにし、既知のmoderate認証依存はIssue #4で追跡します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
+`audit:high`はhigh / critical advisoryを品質gateにし、moderate認証依存の過去の調査は [Issue #4](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/4)、今回のhigh解消と残存項目は [Issue #124](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/124) を参照します。現在の件数は対象lockfileへの監査結果で判断します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
 
 ## Unit test
 
@@ -51,6 +160,8 @@ Integration test は実装された依存境界の契約を確認します。Min
 - 長時間 skill の cancellation と再開判断
 
 ## 実環境 E2E
+
+以下は初期12項目の対話式runnerの手順です。現在の `tests/e2e/live.ts` は `createApplication()` を呼ぶため既定Player経路で起動しますが、12項目の受入項目と2026-08-25の記録は旧実装に由来します。現行Player全体の受け入れには上のAIプレイヤー評価を参照し、旧task/reflexの出力説明をそのまま適用しないでください。
 
 Minecraft 26.1系のMacクライアントと本Botを同一サーバーへ接続する検証は、[専用手順](minecraft-26-1.md)を使います。この手順は接続・日本語会話・即時停止・切断の受け入れに絞り、以下の12項目runnerの全件成功とは区別します。
 
@@ -106,6 +217,8 @@ runnerのJSONを保存する場合は、repository外またはgit ignore済み�
 
 ## 2026-08-25 実施結果
 
+この節は旧tool/runtime実装の先行HEADにおける歴史的な測定記録です。現行既定Playerや今回の文書差分の動作検証ではありません。
+
 許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使い、上記12項目を追跡可能な一連のrunで確認しました。最終対話式runnerは12件pass、0件fail、0件skipで終了code 0でした。
 
 | 対象                         | 公開可能な観測結果                                                                                                       |
@@ -117,4 +230,4 @@ runnerのJSONを保存する場合は、repository外またはgit ignore済み�
 | failure                      | resource / inventory、path、短時間上限によるtimeout、即時cancelを実runで発生させ、成功扱いせず日本語で報告することを確認 |
 | 切断                         | server切断後、設定した再接続上限で`connectionState=failed`と明示的なretry exhausted状態を確認                            |
 
-接続先、player名、座標、会話、記憶本文、相関ID、実log原文、runner JSON、SQLite実dataはrepositoryへ保存していません。確認範囲は単一のローカル環境であり、remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。既知のmoderate dependency advisoryはIssue #4で追跡します。
+接続先、player名、座標、会話、記憶本文、相関ID、実log原文、runner JSON、SQLite実dataはrepositoryへ保存していません。確認範囲は単一のローカル環境であり、remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。当時のmoderate dependency advisoryの調査記録は [Issue #4](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/4) にあります。

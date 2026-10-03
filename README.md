@@ -1,140 +1,100 @@
 # mc-bot-egent-practice-2
 
-Minecraft Java Edition の世界に一人のプレイヤーとして接続し、指定利用者と日本語で会話しながら、観測したゲーム状態と関係に応じて自律的に判断し行動する AI コンパニオンです。成功・失敗は Minecraft で確認した状態を根拠にします。
+Minecraft Java Editionの世界に一人のプレイヤーとして暮らし、指定利用者（owner）と日本語で会話しながら、自分の目的と観測した状況から行動するAIコンパニオンです。
 
-## プロジェクトの目的
+目指すのは、人格・関係・共有経験・記憶が継続する存在です。現在の実装は、人格設定、構造化記憶、会話エージェント、目的エージェント、ゲーム操作を担うPlayerBodyを組み合わせています。人間らしさや長期自律性の達成を一括して保証するものではありません。
 
-単なる操作Botや命令実行インターフェースではなく、Minecraft世界に一人の存在として継続し、人格・関係・共有経験・記憶・自律的判断の連続性を保つことを上位の製品原則とします。ゲーム内の危険、死亡、建築変更もプレイヤーが判断でき、強いowner要求に応じて選択を変えられます。操作は通常のBukkit・サーバー権限とownerの永続停止に従います。credential、shell、任意コード、server admin accessはモデルへ公開しません。
+## 技術文書の読み方
 
-## 目指す理想
+| 知りたいこと                                       | 読む文書                                                       |
+| -------------------------------------------------- | -------------------------------------------------------------- |
+| 全体がどうつながるか、どのコードを読むか           | [アーキテクチャ](docs/architecture.md)                         |
+| 発話から目的・行動へどう進むか、停止・競合・再接続 | [自律プレイヤー](docs/autonomous-player.md)                    |
+| 人格や関係が入力へどう入り、何が再起動後も残るか   | [人格と記憶](docs/memory.md)                                   |
+| 見える世界、使える操作、成功/未確認の判定          | [PlayerBody](docs/player-body.md)                              |
+| 経験が技能仮説になり、次回の判断へ戻る仕組み       | [MC Bot Skills](docs/mc-bot-skills.md)                         |
+| 何を証拠に評価し、どこから原因を調べるか           | [テスト・評価と原因調査](docs/testing.md)                      |
+| 起動、停止、バックアップ、障害対応                 | [運用](docs/operations.md)                                     |
+| 画面・traceの見方                                  | [観測ダッシュボード](docs/dashboard.md)                        |
+| 現行AIプレイヤーの実ゲーム評価条件・過去結果       | [AIプレイヤーE2E](docs/ai-player-e2e.md)                       |
+| 旧方式の仕様を保守する                             | [legacy runtime](docs/architecture.md#旧toolruntime経路の詳細) |
 
-- 安定した名前、人格、価値観、話し方を持つ。
-- 利用者との関係、共有体験、約束、世界内の場所や経験を継続的に記憶する。
-- 再起動や session をまたいでも、同じ存在として振る舞う。
-- ownerが停止した行動はすぐに止まり、失敗や再起動から復帰できる。
-- ゲーム内の危険や損失を含む判断はプレイヤーが行い、即時停止とサーバー権限は決定論的な境界で守る。
+文書体系と配置判断は[文書構成](docs/documentation-structure.md)、開発作業のルールは[AGENTS.md](AGENTS.md)を参照してください。
 
-## 既定のプレイヤー経路
+## 既定の動作と境界
 
-既定のAIプレイヤー／行動系GPTは `src/player` と `src/app/player-application.ts` を通じて行動を判断し、PlayerBodyがゲーム操作を実行します。判断知識を担うMC Bot Skillsは `src/mc-skills` に置きます。旧 `src/skills`、`src/decision`、`src/reflexes`、tool executionはlegacy helperとして残します。詳細は[自律プレイヤー](docs/autonomous-player.md)と[PlayerBody](docs/player-body.md)、旧Paper補助の範囲は[原木収集の建築保護](docs/building-protection.md)を参照してください。
+```mermaid
+flowchart LR
+    Chat["所有者の発話"] --> Conversation["会話
+返答と目的提案"]
+    Conversation --> State["永続状態
+人格・目的・記憶"]
+    State --> Purpose["目的判断"]
+    Observation["可視観測"] --> Purpose
+    Purpose --> Runtime["判断確定・実行調整"]
+    Runtime --> Body["PlayerBody
+ゲーム操作と結果確認"]
+    Body --> Observation
+    Body --> Experience["結果・経験・技能仮説"]
+    Experience --> State
+```
 
-## 旧tool/runtime経路の初期目標
+- 既定起動は `createApplication() → createPlayerApplication()`。チャットがなくても、起動・結果・意味のある変化・待機期限などで目的を再判断します。
+- 会話は身体を直接操作せず、目的提案を保存します。実行中でも会話でき、行動変更は別の判断で確定します。
+- 所有者の停止は永続化し、再開するまで維持します。危険や建築変更は状況に応じた判断対象ですが、停止、サーバー権限、外部アクセス境界を越えません。
+- 操作受付やモデルの発言だけではゲーム内成功にしません。観測が不足すれば `unverified` として扱います。
+- shell、任意コード、server管理用操作をモデルに公開しません。旧方式の固定reflexや作業skillは[legacy経路](docs/architecture.md#旧toolruntime経路の詳細)で区別します。
 
-- Minecraft への接続と指定利用者との日本語会話
-- 利用者への追従と即時停止
-- 空腹、危険、被ダメージ、経路詰まり、切断への即時対応
-- 利用者情報、場所、約束、共有体験の永続記憶
-- 複数工程を含む原木収集依頼の実行と観測状態による結果検証
+## 必要環境と起動
 
-## 旧tool/runtime経路の実装状態
-
-初期完成版の製品コード、unit / integration test、設定例、運用文書を実装しています。2026-08-25には、許可済みのローカルLAN test world、Minecraft Java Edition 1.21.11、実OpenAI Responses APIを使った[実環境E2Eの12項目](docs/testing.md#2026-08-25-実施結果)を、初期コンパニオン実装の先行HEADで確認しました。最終対話式runnerは12件pass、fail / skipなし、終了code 0でした。
-
-確認範囲は単一のローカル環境です。remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。依存経路の既知のmoderate advisoryはIssue #4で追跡し、high / criticalを品質gateにしています。ダッシュボードとトレース計測を含む現行HEADでの実Minecraft・実OpenAIのlatest-head E2Eは未実行です。先行HEADの12件passは、今回の完了証跡として扱いません。
-
-旧tool/runtime経路は次の体験を実装しています。これらのhelper固有の安全候補や採取・建築制限は、既定AIプレイヤー／行動系GPTの判断方針ではありません。
-
-- 指定利用者の日本語チャットを受け取り、型付き tool を通じて行動する。
-- 追従、即時停止、空腹、危険、被ダメージ、経路詰まり、切断を決定論的な実行層で扱う。
-- 人格、利用者との関係、明示された事実、場所、約束、共有体験、作業結果を SQLite へ構造化して保存する。
-- 指定種類・指定数の原木を集め、依頼者へ戻り、inventory の観測値から完了または失敗を報告する。
-
-製品経路には固定応答の会話実装、fake Minecraft、fake LLM、書込みを省略するmemory fallbackを含めません。外部境界のtest doubleは`tests/`内だけに置き、製品buildから除外します。
-
-## 非目標
-
-旧リポジトリとの互換レイヤ、複数 bot、複数 LLM provider、MCP、LangGraph、VPT、MineDojo、汎用Paper plugin基盤、音声会話、クラウド常駐、汎用 plugin 基盤、Minecraft サーバー管理機能は初期完成版の範囲外です。LLM に shell、任意コード、任意ファイル操作、サーバー管理コマンドは公開しません。
-
-## 観測ダッシュボード
-
-AIコンパニオンの依頼から応答までに発生した、型付きトレースを読み取り専用で確認できます。Three.jsの3D DAG、処理ノード一覧、結果・検証・エラーの詳細、SSEによるLive表示、保存済みtraceのReplay、Presenter Modeを提供します。ダッシュボードからbot、Minecraft、memory、taskを操作する機能はありません。
-
-ローカルでは `npm run build` の後に `npm run dev` を実行し、既定の [http://127.0.0.1:4310](http://127.0.0.1:4310) を開きます。loopback外へbindする場合は32文字以上のtokenとHTTPS / network制御を使い、browserはBasic challengeから同一originのAPI / SSEへ認証を引き継ぎます。詳細は [観測ダッシュボード索引](docs/dashboard.md) と、そこから参照する実装別文書にまとめています。ダッシュボードの停止、保存失敗、描画失敗はbot本体のtask failureへ変換せず、画面に観測性劣化として表示します。
-
-## 必要環境
-
-- Node.js 24 を推奨します。Node.js 22 以上を CI で検証します。
-- npm と、ローカルへ書込み可能な SQLite の保存先。
-- 実 E2E 時のみ、Mineflayer が直接対応する Minecraft Java Edition サーバー、許可された bot 接続情報、指定利用者、実 OpenAI API の利用資格とネットワーク到達性。
-
-Mac 版 Minecraft 26.1 クライアントを使う場合は、[26.1 接続・日本語会話の検証手順](docs/minecraft-26-1.md)を参照してください。`MINECRAFT_VERSION` は Bot 側が接続するサーバー版であり、クライアント版を指定する欄ではありません。
-
-Minecraft の接続先、player 名、API key、token、world seed、私的座標、会話、実記憶データを repository、Issue、PR、log 要約へ保存しません。
-
-## 最短のローカル起動手順
+- Node.js 24を推奨。packageの最低要求は22.13.0です。
+- npm、書込み可能なSQLite保存先。
+- 通常プレイには対応するMinecraft Java Editionサーバー、許可されたbot/ownerの識別情報、OpenAI APIの利用資格・到達性が必要です。
 
 ```bash
 npm ci
 cp .env.example .env.local
-```
-
-`.env.local` の必須値を、その環境で許可された実値に設定します。`OPENAI_API_KEY`、Minecraft 接続情報、`OWNER_USERNAME` が不足または不正な場合、アプリケーションは接続や tool 実行の前に設定エラーとして停止する必要があります。
-
-ローカルで遊ぶ前に、[ゲームモード・難易度・個人権限の起動前チェック](docs/operations.md#起動前の確認)を実施します。サーバー既定と本人の保存済み状態は別に確認し、接続後の現在値もゲーム内で確かめます。
-
-```bash
+# .env.local に、その環境で許可された設定値を入力
+npm run build
 npm run dev
 ```
 
-実 OpenAI API と実 Minecraft server を操作する前に、対象 server、world、bot account、許可された操作範囲を確認してください。実環境の詳細手順は [docs/testing.md](docs/testing.md#実環境-e2e) と [docs/operations.md](docs/operations.md) にあります。
+[設定例](.env.example)と[設定schema](src/config/schema.ts)が設定名・必須性・既定値の正本です。API keyや接続情報の不足・不正は、接続前の設定エラーとして扱います。実値、会話、実記憶、world情報をGitHubへ掲載しないでください。
 
-指定利用者はMinecraft chatから、例えば次のように依頼します。文面を後段の正規表現でcommandへ変換せず、OpenAI Responses APIが公開済みのstrict tool schemaから操作を選びます。
+| 設定                                                       | 用途・既定値                             |
+| ---------------------------------------------------------- | ---------------------------------------- |
+| `MINECRAFT_HOST` / `MINECRAFT_USERNAME` / `OWNER_USERNAME` | 必須。botとownerは別のMinecraft identity |
+| `MINECRAFT_PORT` / `MINECRAFT_AUTH` / `MINECRAFT_VERSION`  | `25565` / `microsoft` / `1.21.11`        |
+| `OPENAI_API_KEY` / `OPENAI_MODEL`                          | key必須 / model既定 `gpt-6-luna`         |
+| `DATABASE_PATH`                                            | `data/companion.sqlite`                  |
+| `PERSONA_PATH`                                             | `config/persona.example.json`            |
+| `DASHBOARD_ENABLED` / `DASHBOARD_PORT`                     | `true` / `4310`                          |
+
+Botの接続版と、利用者が使うMinecraftクライアント版は同一とは限りません。[26.1クライアントとの接続手順](docs/minecraft-26-1.md)を参照してください。起動前には[ゲームモード・難易度・権限](docs/operations.md#起動前の確認)を確認します。
+
+## 会話と停止
+
+所有者はゲーム内チャットで依頼・相談します。一般の発話はモデルが文脈から判断し、行動依頼なら目的提案へ進みます。複数工程の依頼が必ず達成されるという意味ではありません。
 
 ```text
-ついてきて。距離は3ブロック、1分まで。
-oak_logを4個集めて、ここへ戻ってきて。
+近くの木を集めたい。一緒に進めよう。
+いま何をしようとしている？
+次回も覚えておいて。探索の前に持ち物を確認したい。
 停止
-この場所を「川沿いの拠点」、用途を「帰還場所」として覚えて。
 ```
 
-`停止`、`停止して`、`止まって`、`止めて`、`ストップ`、`やめて`、`中止`、`中断`はLLM待ちを経ず、ownerの完全一致chatとして即時処理します。
+`停止`、`停止して`、`止まって`、`止めて`、`ストップ`、`やめて`、`中止`、`中断`の完全一致はLLMを待たず処理します。停止後の再開は所有者の新しい明確な指示を会話エージェントが判断します。保存される記憶の種類と限界は[人格と記憶](docs/memory.md)にあります。
 
-既定PlayerBodyはTreeGuard補助なしで動作し、通常のBukkit・サーバー権限と他pluginの保護に従います。旧Bot helperで従来のTreeGuardイベント制限を使う場合は、Paper pluginの設定で `bot-names` と `legacy-bot-action-guard.enabled: true` を明示してください。新しい設定項目を持たない既存configでは制限は無効です。旧helper向けの `natural-resource-regions` などの詳細は[建築保護文書](docs/building-protection.md)にあります。既存の稼働環境へのJAR配置・設定反映・再起動は別の適用作業です。
+## ダッシュボード
 
-## 設定
+起動後は既定の [http://127.0.0.1:4310](http://127.0.0.1:4310) で、読み取り専用のtrace・Live・Replay画面を確認できます。画面からbotや記憶を操作しません。非loopback公開は認証とネットワーク保護を伴う別の運用判断です。[画面の構成](docs/dashboard.md)と[原因調査](docs/testing.md)を参照してください。
 
-[.env.example](.env.example) は設定名、必須性、既定値だけを示します。実値は無視対象の `.env.local` にだけ保存します。
+## 検証と現在の限界
 
-| 区分      | 必須設定                                                 | 既定設定                                                                         |
-| --------- | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Minecraft | `MINECRAFT_HOST`、`MINECRAFT_USERNAME`、`OWNER_USERNAME` | port `25565`、auth `microsoft`、version `1.21.11`                                |
-| OpenAI    | `OPENAI_API_KEY`                                         | model `gpt-6-luna`                                                               |
-| 永続化    | なし                                                     | `DATABASE_PATH=data/companion.sqlite`                                            |
-| 安全上限  | なし                                                     | 移動距離、採取数、timeout、retry、追従距離、空腹しきい値は `.env.example` を参照 |
-| live E2E  | なし                                                     | `LIVE_E2E_CONFIRMED=false`。許可済みtest worldでだけ`true`にする                 |
+型・単体・結合テスト、画面テスト、実Minecraft/APIによる評価は別の証拠です。過去の限定された場面での成功を、最新HEAD・別world・長期連続プレイの保証に広げません。文書刷新では動作テストを追加実施していません。
 
-人格の安定した設定は [config/persona.example.json](config/persona.example.json) にあります。利用中に変化する関係・記憶・約束は SQLite に保存します。
+- 通常の品質確認と変更pathごとのCI: [testing.md](docs/testing.md)
+- 実ゲーム評価の選択・予算・未完了判定: [ai-player-e2e.md](docs/ai-player-e2e.md)
+- 初期コンパニオンの2026-08-25評価は旧経路の歴史的記録: [実施結果](docs/testing.md#2026-08-25-実施結果)
 
-## 開発・検証
-
-```bash
-npm run format:check
-npm run lint
-npm run typecheck
-npm test
-npm run build
-npm run test:browser
-npm run audit:high
-```
-
-GitHub Actions はNode.js 22 / 24でserver・dashboardのformat、lint、typecheck、test、build、auditを実行し、Node.js 24の独立jobでPlaywright Chromium browser E2Eも実行します。browser E2Eは架空の最小fixtureだけを使い、API key、Minecraft接続情報、実worldへ接続しません。live E2EはAPI keyやMinecraft接続情報をCIに渡さないため自動実行しません。
-
-```bash
-npm run test:e2e
-npm run test:e2e:dashboard
-```
-
-これらの command は実環境用です。`test:e2e` は初期コンパニオン12項目、`test:e2e:dashboard` は今回のdashboard固有10シナリオを扱います。必須設定・利用権限・安全な test world が揃わない場合は接続や API 呼出しを行わず、明確な設定エラーとして終了させます。手順と受け入れ項目は [docs/testing.md](docs/testing.md#実環境-e2e) と [dashboardのテスト](docs/dashboard/testing.md#実環境-e2e) を参照してください。
-対話式runnerは`.env.local`の`LIVE_E2E_CONFIRMED=true`を追加の安全gateとし、12項目すべてに実worldの観測に基づく`pass`が入力された場合だけ成功終了します。項目ごとに接続、health / food / oxygen、task state、原木収集数、ローカル追跡用の相関IDをJSONとして出力し、記憶復元項目の前にはapplicationを実際に再生成・再接続します。runnerの原文は実環境情報を含み得るため、repository、Issue、PRへ保存しません。
-
-## 文書
-
-- [アーキテクチャ](docs/architecture.md)
-- [自律プレイヤー](docs/autonomous-player.md)
-- [PlayerBody](docs/player-body.md)
-- [人格と記憶](docs/memory.md)
-- [テストと実環境 E2E](docs/testing.md)
-- [Minecraft 26.1 接続・日本語会話の検証](docs/minecraft-26-1.md)
-- [運用](docs/operations.md)
-- [観測ダッシュボード索引](docs/dashboard.md)
-- [エージェント作業契約](AGENTS.md)
+複数bot、複数LLM provider、音声会話、クラウド常駐の運用保証、Minecraftサーバー管理は現在の提供範囲に含めません。

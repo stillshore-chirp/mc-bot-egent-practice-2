@@ -1,78 +1,222 @@
-# 自律プレイヤー
+# 自律プレイヤー: 会話から判断・行動へ
 
-既定の `createApplication()` は `createPlayerApplication()` を作成します。接続後に `PlayerRuntime` が起動し、チャットがなくても可視観測、persona、保存済みの関心・目標、記憶、技能候補から目的を選んで判断します。旧アプリケーションは `createLegacyApplication()` から明示的に作成できます。
+[全体構成](architecture.md)を踏まえ、既定の `createPlayerApplication()` が組み立てる制御を説明します。主な実装は [agents.ts](../src/player/agents.ts)、[runtime.ts](../src/player/runtime.ts)、[mind-store.ts](../src/player/mind-store.ts)、型の正本は [contracts.ts](../src/player/contracts.ts) です。以下の場面はコードの流れを説明する架空例で、今回の実ゲーム試験結果ではありません。
 
-## 既存機能の扱い
+## 1. 一人のプレイヤーを三つの責務で構成する
 
-| 機能                                                                       | 既定アプリでの扱い     | 経路                                                                                                                                          |
-| -------------------------------------------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Minecraft接続と再接続                                                      | 再利用                 | `MineflayerClient` と `ConnectionManager`。接続設定、認証、retry policyを共有します。中断時の復旧も既存の再接続経路へ依頼します。             |
-| 関係・生活状態・長期記憶                                                   | 再利用                 | `MemoryStore`。personaや関心、ownerとの関係、既往episodeをエージェントの文脈へ渡し、観測結果と目標を保存します。                              |
-| Traceとdashboard                                                           | 再利用                 | `TraceService`、`TraceStore`、`DashboardHttpServer`。判断・toolのtraceとredactedな接続・health・runtime evidenceを提供します。                |
-| Mineflayer身体                                                             | 新しい境界を使用       | `PlayerBody` が通常プレイヤーとして実行できる操作と可視観測を定義し、入力schemaと実際のゲーム内結果を検証します。                             |
-| `ChatCoordinator`、既定Agent、`CompanionContextFactory`、旧 `ToolExecutor` | 既定経路では起動しない | これらを組み立てるのは明示的な `createLegacyApplication()` です。新しい会話・目的エージェントと同時には動きません。                           |
-| `ReflexCoordinator` と決定的なゲームreflex                                 | 既定経路では起動しない | 新runtimeに並行した移動・採掘・危険回避を開始しません。必要な操作判断は一つのpurpose agentへ集約します。                                      |
-| `src/runtime/` の共通処理                                                  | 用途ごとに区別         | retryやtimeoutの小さな共通処理は接続管理から利用できます。旧 `TaskRuntime` や `ActionArbiter` は新PlayerRuntimeの意思決定主体ではありません。 |
-| 旧決定的skills・操作authorization wrappers                                 | 既定経路では実行しない | 旧アプリケーションの明示的なlegacy helperとして残ります。新runtimeでは許可済み操作schemaとMinecraft serverの実際のpermissionを境界にします。  |
+| 責務                           | 入力                                           | 出力・できること                                         | 直接しないこと           |
+| ------------------------------ | ---------------------------------------------- | -------------------------------------------------------- | ------------------------ |
+| 会話 `PlayerConversationAgent` | ownerの今回の発話、直近会話、persona、保存状態 | 返答、目的提案、明示的な記憶、停止/再開                  | Body操作                 |
+| 目的 `PlayerPurposeAgent`      | 現在観測、目的・提案、記憶、技能、event        | 理由付きの `act / wait / continue / complete` と状態更新 | 確定前のBody dispatch    |
+| 実行 `PlayerRuntime`           | 確定判断、Body event、owner chat               | 一つのBody操作の所有、停止、中断、結果保存、次の判断起動 | 独立したゲーム目的の生成 |
 
-## 会話、判断、身体の境界
+会話と目的は同じ設定modelを使う別のResponses呼出しです。別OSプロセスではありません。各目的判断内では `parallel_tool_calls: false`、Runtimeも目的判断を一つずつ進めます。一方、会話turnは長い身体操作の終了を待たずに受け付けられます。
 
-所有者のMinecraft chatは独立した会話エージェントへ送られます。会話エージェントは返答、目的提案、明示的な停止・再開を扱います。目的提案はMindStoreへ先に保存され、行動中のbodyを直接変更しません。目的エージェントは現在の目的・proposal・観測・記憶を照らし、採用、妥協、辞退、別の自律目的を理由付きで選びます。owner以外のchatは受け付けません。提案への判断理由は、consumeを他のowner goalの準備行動として選んだ場合もownerへ通知し、consumeの結果はPlayerBodyの事後観測に基づいて別途伝えます。会話エージェントは、送信に成功したassistant返答だけを後続turnの会話文脈へ記録します。
+## 2. 具体例: 探索中に採集を頼まれたら
 
-会話エージェントは公開操作catalogを使い、操作kindが存在することと、今回の観測状態で実行できること・実行結果を区別して能力を説明します。返答が240文字を超えた場合は、元のpersona・会話規則を引き継ぎ、tool実行後の最新runtime・memory状態を使って、操作toolなしで一度だけ短く再生成します。失敗時や再生成結果も上限を超えた時は、再依頼や未確認の成功・完了を促さない短い案内を返します。再生成要求もResponses APIの`beforeCall`予算admissionを通し、停止・古いturnを尊重します。
+まず、所有者の発話を目的判断へ渡します。
 
-equipの結果は、PlayerBodyの操作statusと実行後に観測した対象slotの装備を照合してownerへ伝えます。statusが成功でも対象itemをslotで確認できなければ、装備できたとは断定しません。実行後観測がない場合も、装備結果を未確認として伝えます。
+```mermaid
+sequenceDiagram
+    participant R as Runtime
+    participant C as 会話
+    participant M as MindStore
+    participant P as Purpose
+    R->>R: owner identity・発話長を確認
+    R->>C: 「近くの木を集めよう」
+    C->>M: 目的提案を保存
+    M-->>C: pending proposal
+    C->>R: onOwnerProposal
+    C->>C: sayで所有者へ返答
+    R->>P: 最新snapshotとevent
+    Note over R,P: 既存の身体操作はまだ継続できる
+```
 
-`bot_death` は未処理runtime eventと `MindStore.latestDeath` を同じtransactionで保存します。イベント時刻以前に実際に記録された最後の観測があれば、観測時刻・dimension・本人位置・所持品名と個数を死亡前の値として結び付けます。死亡後の最初の観測は別欄に保存し、観測がない値や旧保存データで欠けている値は補いません。会話と目的の入力には同じ死亡記録を渡します。LiveEvidenceでは位置とアイテム別個数を除き、画面・診断artifactへ出しません。
+次に、目的を判断・確定し、操作結果から次の判断へ進みます。
 
-死亡後の目的判断には、`latestDeath`の死亡時刻・死亡前の最終観測と今回のfresh Body観測を照合した`deathRecovery`要約を渡します。死亡前位置は観測済み範囲の目安であり、死亡地点やdrop位置そのものではありません。death-recovery marker付きの位置依存操作では、死亡前の位置・観測時刻・dimensionと死亡時刻、死亡後の現在Body観測が利用可能で整合することを検証します。欠損・不一致・現在観測不能は、この死亡記録を使う回収操作の検証を止めますが、一般的な再観測や準備操作は妨げません。`current_hazard_observed`は今回観測した危険を示すPurpose判断材料で、固定拒否条件ではありません。危険の程度、経路、追加観測や待機の見込みを新しい観測と結果に照らして判断します。ownerの永続停止と通常のサーバー権限は常に守ります。死亡時刻との経過は実観測から評価し、設定やchunk状態が不明な時にdropの残存・消失やdespawn期限を推測しません。
+```mermaid
+sequenceDiagram
+    participant P as Purpose
+    participant M as MindStore
+    participant R as Runtime
+    participant B as Body
+    participant S as Skill repository
+    P->>B: 現在の可視観測
+    P->>S: 必要な技能を検索・参照
+    P->>M: 判断と状態更新をCASで確定
+    alt revision一致・未停止
+        M-->>P: proposal・goal・判断を確定
+        P->>R: onCommitted
+        R->>B: 旧操作を終了確認後に実行
+        B-->>R: 前後観測と操作結果
+        R->>S: receiptとoutcome
+        R->>M: 結果とbody_outcome event
+        R->>P: 最新結果で次の判断
+    else 古いrevisionまたは停止
+        M-->>P: CAS_STALE / STOPPED
+        Note over P,R: この判断では操作を始めない
+    end
+```
 
-`approach`、`sweep`、`collect`のmarkerと使用済み状態は、死亡記録に対する過去の試行履歴です。使用済みstageだけを理由に同じ方法を固定拒否せず、各wakeでfresh Body観測と対応するbody outcomeを見直し、根拠があれば同じstageを含む次の手段をPurposeで選び直します。同じ条件で無進捗の操作を機械的に反復せず、観測・準備・別行動・待機も選択肢にします。再接続時は現在の観測とowner intentから再判断し、切断前のdeath-recovery操作をcontinueしません。各Purpose実行は既存のresponse round上限（既定6 round）内、Body操作は既存の操作別期限内で終えます。死亡eventをまたぐ累積retry上限はなく、連続wakeでの無限反復を防げることは未実証です。回収成功として扱うには、拾得eventと対応inventory数の増加を確認します。増加が不明なら`unverified`です。拾得証拠は対応itemの所持増加を示しますが、死亡drop由来や全持ち物を回収した証明にはなりません。可視範囲はsubsetなので、dropが見えないことも不在の証明にはなりません。未確認・危険・無進捗を回収成功へ読み替えません。
+図は採用される場合を例にしています。目的エージェントは目的との釣り合いを見て、採用・妥協・辞退を選べます。辞退からowner goalは自動生成しません。採用/妥協では元のproposalとowner goalを関連付け、理由を残します。
 
-採用・妥協したproposalは元のtitleと意図を持つowner goalに結び付き、解決理由と一緒に以後の判断文脈へ残ります。activeとpausedのリンクgoalは直近goalの件数制限を越えて文脈に保持しますが、paused goalは自動再開しません。self由来の中間goalを完了しても、リンクされたowner intentは完了しません。owner intentの完了や放棄は明示的なgoal更新で判断し、提案を辞退した場合はgoalを自動生成しません。`locate_owner`はpending proposal、またはadopted/compromisedかつリンクgoalがactiveな時だけ所有者位置を観測します。proposal解決とgoal linkageは同じCAS transactionに入り、goal mirrorへも保存します。
+ここで重要なのは、会話の了承、判断のcommit、Body操作開始、操作成功、依頼全体の達成が**別の出来事**であることです。たとえば `dig` の成功は対象blockの破壊確認であり、原木の拾得や依頼全体の完了を意味しません。
 
-目的エージェントには29種類のoperation kindと短い説明を提示します。`look`、`move_to`、`move_relative`、`dig`には現行schemaから生成した短い入力署名も添え、参照済みの現行schemaは直近4種・合計4,096文字以内で再提示します。未提示または引数が不明なschemaは必要時に `describe_operation` で取得します。最終的な `operationJson` はcommit時にも `playerOperationSchema` で検証し、既知kindの入力不正ならそのschemaを返して同じ判断内で修正できるようにします。`move_relative` は現在位置を起点とする有界な相対移動で、方角は分かるが目標座標が未観測の探索に使えます。指定offsetが到達許容range以下なら移動せずに到達済みと判定されうるため入力を拒否し、成功は実際のBody前後観測で到達と移動の両方を確認します。
+## 3. 会話の入力と出力
 
-経路追従はMineflayer pathfinderへ委ねます。`NavigationMovements`は平地の斜め移動で両脇の足元と頭上に通行空間を要求し、壁の角を抜ける実行不能な経路を避けます。Bodyは`path_update`の状態と経路長を座標なしの内部eventとして通知できます。このeventだけで到着や操作成功とは判定せず、Bodyの前後観測とサーバー側の確認を用います。
+`handleOwnerMessage()` はowner identityと最新turnを確認します。非ownerのchatはRuntime入口でも除外します。
 
-行動判断時のgoal変更、owner proposal解決、fact/uncertainty更新は、必要なものを`commit_action_decision.stateUpdates`へ含めると同じrevision CAS transactionで確定します。更新なしは`null`で表し、`commit_goal_state`と`update_understanding`も判断途中の単独更新用に残しています。`continue`と状態更新を同時に確定しても、進行中body操作の`actionRevision`は変わりません。goal mirrorの外部記憶保存に失敗した場合もMindStoreのcommitとaction dispatchは維持し、tool結果の`goalMemoryPersisted: false`で区別します。run13までの統合試験では自律生活の完了に至っておらず、各修正によるAPI呼び出し・token削減効果も比較条件を揃えて検証していません。
+| tool                                | 効果                                                   |
+| ----------------------------------- | ------------------------------------------------------ |
+| `propose_goal_change`               | proposalを永続化し、目的判断へ通知                     |
+| `remember_owner_fact`               | ownerが明示的に記憶を求めた事実の要約をMindStoreへ保存 |
+| `stop_autonomy` / `resume_autonomy` | 停止世代を照合して永続停止/再開                        |
+| `inspect_player_status`             | 保存済みruntime状態を読む                              |
+| `search_memory`                     | MemoryStoreの関連記憶を検索                            |
 
-目的エージェントは `commit_action_decision` の永続commitが成功した時点で判断を完了し、余分な最終LLM roundを要求しません。CAS不一致はtool code `STALE_REVISION` と理由 `CAS_STALE`、停止は `STOPPED` で同じthought内の再試行を終え、次回の判断へ渡します。進行中操作がない`continue`とpendingでないproposalはそれぞれ `NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` として返し、同じthought内で修正できます。未commitのthoughtでは受領eventを消費せず、commit後にだけ消費します。会話エージェントは返答文を必要とするため、tool後の最終応答を引き続き取得します。
+モデルには、雑談・能力相談だけで行動提案を作らないこと、今回の発話と直近4件までの会話を合わせて指示語を解釈することを指示します。これは意味判断の指示であり、あらゆる発話を正しく分類する保証ではありません。
 
-Body outcomeはrevisionを進め、未commit thoughtの古い判断commitをCASで拒否します。進行中のResponses要求は応答を受け取りusageを記録した後、保留中Body outcomeを確認し、古いtoolや次roundへ進む前にthoughtを終えます。最新Body結果と保留wakeで再判断します。
+返答は送信成功後にだけ短期会話文脈へ記録します。240文字を超える返答は最新状態を使い、toolなしで一度だけ短く再生成します。失敗または再超過時は短い案内へ置き換えます。最終Minecraft chat送信でも改行を平坦化し、slash command化を防ぎます（[sanitizeMinecraftChatText](../src/app/player-application.ts)）。
 
-永続化されたowner proposalは優先wakeとして保留します。進行中Responses HTTPだけは最大30秒応答を待ち、応答usageを一度記録した後に古いtool・次roundを止め、最新snapshotで再判断します。30秒以内にsettleしない時はrequestをabortし、usage unknownとowner proposal起因を記録して再判断へ進みます。HTTP外の初回Body observation、`observe_body`、`locate_owner`の読み取り待ちはproposal受付時にthoughtを即時中断し、遅れて返った観測から旧thoughtを続けません。proposalが続けて届いてもHTTP待機期限は延長しません。vitals、永続stop、shutdownは即時hard abortし、stop latchはproposal wakeで解除しません。
+即時停止語の完全一致は会話LLMを通りません。それ以外の停止/再開は、今回のowner発話の意味をモデルが判断してtoolを呼びます。古いturnが新しい状態を上書きしないよう、turnと `stopGeneration` を照合します。
 
-通常の周囲観測の変化は、思考中ならCAS revisionを進めずにイベントとして永続保存し、現在の判断が確定・終了してから次の判断へ渡します。これにより移動中の視界変化などで毎回進行中の思考を取り消さず、後続判断でも観測を失いません。commit済みの判断は通常イベントによる中断の対象にせず、行動の所有権と結果記録を維持します。run67では未知状況case中に`CAS_STALE`を12件、先行中断後のrun68・69では`request_error`をそれぞれ13・19件観測しました。通常観測を後続判断へ送る変更を含むrun70では、未知状況で制御障害後の回復を観測し、`request_error`は11件でした。run69との行動・world条件が異なるため、使用量・達成率の改善は未確定です。中断や通信失敗でproviderのusageが返らないrequestは`usageUnknownCalls`へ計上し、token合計を下限として扱います。E2Eでは該当caseの使用量を未確定と判定します。
+## 4. 目的判断に何を渡すか
 
-長いResponses tool loopではserver-side compactionを有効にし、各requestのrendered inputが16,000 tokenの閾値を超える時にcontextを圧縮します。この閾値は一requestのcontext用で、run全体の累積usage budgetとは別です。`store:false` を保ち、返されたopaque compaction itemは次requestへ引き継ぎます。tool処理済み境界で最新compactionより前をpruneし、call/outputが境界をまたぐ時は対になるcallまで保持します。system instructionsとtoolsは各requestに維持します。MindStoreの目的・停止・CAS stateは永続runtimeで管理し、圧縮結果で上書きしません。
+`think()` はBodyの初回観測を取り、snapshotのrevisionがまだ一致し、停止されていないことを確認してResponsesへ進みます。
 
-目的判断はイベントごとに新しいResponses会話を始めるため、上記のserver-side compactionだけでは次の判断へ渡す初期入力の増加を抑えられません。初期入力では直近の判断・結果を各4件に絞り、MindStoreが保持する直近履歴から省いた件数を示します。古い移動結果は直近8件に限り、操作種別・成否・観測時に保存した相対変位へ縮約し、迂回を考える材料として残します。変位は結果文を読み直して作らず、Bodyの前後観測から直接保存します。旧保存データに変位がなければ補いません。直近の保存済み結果に含まれる移動変位は`recentMovement`へ正味の概数としてまとめ、activeなowner goalがあれば対応proposal受付後の結果だけを数えます。この値は保持中の結果履歴に限られ、対象への距離や経路の成否を示しません。MindStoreの履歴自体は削除しません。最新の結果、進行中操作、継続中のowner goalと対応proposal、現在のfact・uncertaintyは別フィールドで保持します。pending proposalはruntime内の一箇所だけに載せます。可視ブロックは全件と座標、距離、状態プロパティ、看板文字を維持し、各ブロックで繰り返すdimension（観測全体のdimensionと同一）と内部数値stateIdだけを初期入力から省きます。元のBody観測は記録経路へ渡し、Body toolの観測結果も変更しません。この削減がAPI使用量や目的達成率を改善するかは同条件の実ゲーム比較では未確認です。
+| 入力             | 内容                                                  | 注意点                                   |
+| ---------------- | ----------------------------------------------------- | ---------------------------------------- |
+| instructions     | PersonaCore、関心・goal、判断原則、操作catalog        | personaは行動選択の材料。権限を作らない  |
+| `runtime`        | 目的、提案、facts/uncertainties、停止、操作、直近結果 | `compactSnapshot()`で件数を絞る          |
+| `memory`         | 関係、LifeState、MemoryStore検索結果                  | 読み込める構造と、自動更新される構造は別 |
+| `observation`    | 自身、所持品、可視block/entity、画面、向き            | 見えない対象の現在位置は補わない         |
+| `events`         | 判断を起こした出来事と時刻                            | commit後にだけ対象eventをconsume         |
+| `spatialHistory` | 以前に実際に見た可視block範囲                         | 過去の範囲が今も通行可能とは限らない     |
+| `deathRecovery`  | 死亡記録と今回観測の整合性                            | 死亡前位置をdropの確定位置にしない       |
 
-会話turnは長いbody操作の完了を待たずに並行できます。行動を変更するかは別の目的判断が決めます。判断の一般的な `revision` は状態更新を、`actionRevision` は行動計画の有効性を管理するCAS値です。結果が古い判断はcommitされません。新しい行動を始める前に現在の操作をcancelし、身体側のdispatchがsettleしたことを確認します。同時にbodyを操作する実行ownerは一つです。
+人格・記憶の保持先と入力件数は[人格と記憶](memory.md)にまとめています。世界の看板、本、表示名、画面タイトル等は `untrustedWorldAuthoredText` として出所を分け、世界内の情報として読みます。system指示やowner認可、停止を上書きする命令にはしません。
 
-`activeOperation.startedAt` は行動判断のcommit時刻で、`bodyStartedAt` はPlayerBodyから実operation開始eventを受けた時だけ記録します。E2E診断は両者を区別して開始後の介入を判定できます。既存の `startedAt` は互換性のためbody開始時にも更新され、旧保存データでは `bodyStartedAt` を省略できます。
+### 必要な情報を追加で得るtool
 
-停止はSQLiteへ永続化され、再起動や観測イベントがあっても解除されません。即時stop commandはLLMを呼ばず停止latchを先に保存します。停止後はownerから認証された再開が行われた時だけ自律判断を再開します。古いconversation turnやaction decisionはstop generation/CASにより新しい状態を上書きできません。
+- `observe_body`: 初回観測が得られなかった場合の補完。初回観測がある判断ではtool一覧から外す。
+- `locate_owner`: pending proposal、または採用/妥協されactiveなowner-linked goalに限り位置の特例観測。
+- `ask_body_knowledge`: Minecraft registryのitem/block/entity等を英語IDで照会。レシピ等の推論は事実と分ける。
+- `describe_operation`: 現行schemaを取得。31操作の正本は [player-body-schema.ts](../src/minecraft/player-body-schema.ts)。
+- `search_skills` / `read_skill` / `read_skill_history`: 技能候補、本文、版履歴を読む。検索語句不一致時は基礎7分類の候補を返す。
+- `search_memory`: 既往の事実や結果を検索。
+- `export_skill_markdown` / `import_skill_markdown`: 専用交換領域だけで技能を交換。
+- `propose_skill_learning`: receiptに対応する技能仮説を作成/改訂。
 
-## 観測、待機、再接続
+`look`、`move_to`、`move_relative`、`dig`には短い入力署名を先に提示します。参照した操作schemaは直近4種・合計4,096文字以内で再提示します。引数が不正なら現行schemaを返して修正でき、未知の引数を推測実行しません。
 
-目的エージェントは `PlayerBody.observe()` から視野と遮蔽条件を通過した範囲だけを受け取ります。所有者の座標はpending proposal、またはadopted/compromisedかつactiveなowner-linked goalを進めるために `locate_owner` を選んだ時だけ特例で観測できます。辞退済みproposalや明示的に完了・放棄したowner goalはこの例外を許可しません。通常の接続evidenceとdashboard healthは従来のMinecraft statusをローカルに使い、隠れたworld stateをGPTへ渡しません。
+## 5. 判断の確定と競合
 
-目的判断用の観測にはMinecraft座標軸（東が`+x`、西が`-x`、南が`+z`、北が`-z`）と、可視判定と同じyawから導いた現在の方角を添えます。これは自身の向きと可視ブロックの絶対座標を解釈する補助で、遮蔽された対象の座標や経路の成否は追加しません。
+`commit_action_decision` は操作JSONを [playerOperationSchema](../src/minecraft/player-body-schema.ts) で検証し、必要なgoal更新・proposal解決・理解更新を `stateUpdates` に含めて `PlayerMindStore.commitThought()` へ渡します。
 
-目的判断で実際に見たブロックは、現在と過去6視点まで、ブロック名ごとの可視位置範囲・自分の立ち位置・向き・観測時刻へ縮約して別のSQLite表に保存します。同じ視点と可視範囲の反復は1件へまとめ、現在の全観測と重複する視点は判断入力から除きます。過去の範囲は可視部分だけを示し、同名ブロックが範囲内で連続していることや、今も通れる経路を保証しません。所有者位置の例外値、会話、未観測の地形は保存せず、公開用runtime snapshotにもこの位置履歴を含めません。
+| 判断       | 永続状態への効果                               | Runtimeの動き                                    |
+| ---------- | ---------------------------------------------- | ------------------------------------------------ |
+| `act`      | purpose、activeOperation、actionRevisionを更新 | 旧操作を中断・終了確認後に置換                   |
+| `continue` | 既存操作を維持。一般revisionは更新し得る       | activeOperationが必要。身体を再dispatchしない    |
+| `wait`     | 理由・wakeOn・任意wakeAtを保存し操作を解除     | 身体を止め、条件を満たすイベントを待つ           |
+| `complete` | 現在purposeを閉じ、待機条件と完了契機を保存    | 身体を止め、進捗に対応する次の自律判断を一度起動 |
 
-body eventを種類ごとにまとめ、意味のあるvitals、inventory、entity、block、time、position、windowの変化を判断契機にします。bounded samplerはpacketの取りこぼしを補います。状態が変わらないtickは新しいLLM判断になりません。通常wakeは一件へ集約します。Body outcomeはrevisionを進め、進行中HTTPのusageを記録した後、未実行toolや次roundへ進まず最新snapshotで再判断します。owner proposalを除く後続wakeは保留中のBody outcomeを置き換えません。vitalsやowner proposalなど、即時に判断を更新すべきイベントは未commit thoughtを中断します。通常の周囲観測は現在のthoughtを完了させてから次の判断に渡します。commit済みのthoughtは通常wakeでは中断しません。受理済みpending wakeは、その後にwait条件が変わっても一度処理されます。owner proposalは進行中thoughtをabortして優先し、旧thoughtのsettle後に処理します。stopとshutdownはpending wakeを破棄してthoughtをabortし、永続停止中は再接続を含むイベントで再開しません。行動完了・失敗・stall・死亡・再接続はeventとして保存されます。エージェントは次のwake条件と期限を保存して待てます。目的をcompleteしたcommitは、MindStoreに完了eventを同じtransactionで永続化し、single-flightへ次の自己目的判断を一度渡します。意味のあるgoal変更、新しい操作、実際の操作結果を経た次のcompleteは再び一度wakeします。同じgoalの説明だけを更新した場合や進捗のないcomplete再送では重複wakeしません。未処理の完了eventは再起動後に優先処理し、停止中は保持してownerの明示resumeまで実行しません。接続断やnative operationのcleanupが必要な中断は通常のConnectionManager再試行経路に渡し、再接続まで行動を待機させます。再接続設定が無効なら設定を迂回せず失敗状態を保ちます。
+`complete` とowner goalの `completed` 更新は別です。owner intentを完了/放棄するには明示的なgoal更新が必要です。自発的な中間goalを終えてもowner intentを消しません。active/pausedなowner-linked goalとproposalは入力の件数制限でも保持し、paused goalを自動再開しません。
 
-呼吸中に酸素値が1段階下がるたびに目的判断を中断しないよう、通常の入水状態と酸素の正常・不明状態は周囲変化として次の判断へ送ります。体力・食料の変化、低酸素への移行、火・溶岩・窒息は引き続き即時のvitals変化として扱います。
+### 三つの世代値
 
-## 技能と学習
+- `revision`: 判断開始時に読んだ状態が最新かを比較する。操作結果や提案等で進む。
+- `actionRevision`: 新しい操作・待機・停止等に切り替わったかを比較する。`continue`では進行中操作の版を変えない。
+- `stopGeneration`: 停止/再開の前後で古い会話toolが状態を戻さないために照合する。
 
-技能は一度の全件投入ではなく、現在の目的に合わせて `McSkillRepository.search()`、個別skill、履歴を必要時だけ検索します。検索結果には本文の先頭240文字・最大960 byteまでをプレビューとして含め、詳しい条件や全文が必要なら個別Skillを読みます。検索したSkillの本文も未検証の仮説として扱います。操作前のtrusted観測条件とbodyの実際の前後観測から結果receiptを作ります。モデル自身はtrusted receiptを作れません。未登録で他の場面にも使える方法を得た成功なら、一度の成功だけで仮説Skillを作成し、同じ仕事を無検討に続ける前に保存します。真に一度限りの操作や同等の既存Skillは除き、重複・日誌的な技能を避けます。作成した仮説Skillを後の操作で使った場合は、そのskill/versionに一致する次のtrusted receiptの成功・失敗を反映して改訂します。同じrunからの仮説作成は冪等です。後の実行はskill/versionをreceiptへ固定し、統計に一度だけ結び付けます。skills、receipts、outcomes、MindStoreは同じ設定済みSQLite databaseに保存されるため、再起動後も学習と参照が残ります。
+停止またはCAS不一致は同じthought内の再試行を終え、最新状態で再判断します。進行中操作のない `continue`、pendingでないproposal、不正な操作入力などは理由付きで返します。
 
-Markdown import/exportは専用の `mc-skills` exchange directoryを使います。importした本文は未信頼の知識で、system指示、認可、停止境界を変更しません。export結果はownerへローカルのファイル位置を返します。
+MindStoreのCAS成功時に `onCommitted` でRuntimeへ通知し、余分な最終LLM roundを待たずdispatchへ進みます。goalをMemoryStoreのLifeStateへ写す処理は後続であり、失敗しても確定判断は維持します。戻り値 `goalMemoryPersisted: false` と警告を調査します。
 
-`collectLiveEvidence()` は `LiveEvidence.player` に、revision、stop状態、目的、proposal resolution、active operation、wait、直近のjudgment/outcome/learning参照、可視範囲を縮約した最後の観測、LLM call/token/latency countersを返します。act judgmentの既存summaryには、toolが返した最大400文字の短い選択理由を保存し、次のpurpose inputにも渡します。reasonが空または旧形式のdecisionでは汎用summaryを維持します。この短いreasonは既存のMindStore judgment/snapshot内だけにあり、Responses activity projectionには別フィールドを加えません。Responsesの直近64 roundはrole、プロセス内の連番とround、token/latency、入力/schema/outputの文字数、allowlist済みtool名・固定結果分類とaction commitの固定拒否理由enumだけをMindStoreへ保存します。拒否理由は `CAS_STALE`、`STOPPED`、`NO_ACTIVE_OPERATION`、`PROPOSAL_NOT_PENDING` に限り、任意tool codeは記録しません。中断roundはモデルが要求したtool数と実際に結果を得たtoolだけを区別します。request_errorには、既知のwake種別、停止、その他の中断、通信・provider失敗の固定原因分類だけを任意で付け、例外本文は保存しません。E2E failure artifactには同じsafe activity projectionを使います。内部推論本文、prompt、tool引数/出力、tool call ID等の生成識別子、owner位置の例外座標は保存・公開しません。
+## 6. イベント・待機・割込み
 
-`move_to`と`control`の前後Body観測が両方ある場合は、操作結果の短い要約に自己位置の相対変位を含め、次の目的判断へ渡します。観測が欠ける場合やdimensionが変わった場合は変位を推定しません。これは進路を見直す材料であり、対象物の発見やowner goalの達成を示す判定ではありません。
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: 接続後に状態復元
+    Ready --> Thinking: startup / event / deadline
+    Thinking --> Acting: actを確定
+    Thinking --> Waiting: waitを確定
+    Thinking --> Ready: completeと次の目的契機
+    Acting --> Thinking: 結果 / stall / 提案 / 変化
+    Waiting --> Thinking: wake条件を満たす
+    Thinking --> Stopped: owner停止
+    Acting --> Stopped: owner停止
+    Waiting --> Stopped: owner停止
+    Stopped --> Ready: ownerの明示再開
+    Acting --> Recovery: cleanup未完了 / 接続断
+    Recovery --> Ready: 再接続して観測
+```
+
+図は概念上の状態です。`Thinking` と `Acting` は重なり得ます（操作を続けながら次の判断をする）。SQLiteの単一enumとして実装されている図ではありません。
+
+| 契機               | 進行中の目的判断への扱い                                                                      |
+| ------------------ | --------------------------------------------------------------------------------------------- |
+| owner proposal     | HTTP待ちなら最大30秒だけ応答・usage記録を待つ。HTTP外の観測待ちは中断。後続の古いtoolを止める |
+| Body outcome       | revisionを進め、HTTP応答とusage記録後に古いtool/次roundを止める                               |
+| 通常の周囲変化     | 思考中はrevisionを進めずeventを保存し、判断終了後に渡す                                       |
+| vitals等の重要変化 | 未commit thoughtを中断して新しい観測で再判断                                                  |
+| stop / shutdown    | thoughtを即時中断、保留wakeを破棄、Bodyを停止                                                 |
+
+owner proposalの連続到着で30秒期限は延長しません。期限内にHTTPが終了しなければabortし、使用量不明を記録します。通常の周囲変化でcommit済みの操作所有権を捨てません。
+
+イベント購読に加え15秒のsamplerが意味のある変化を補足します。vitalsは3秒、timeを含む変化は60秒、通常の意味変化は12秒の間隔で集約します。移動中の位置変化だけでは再判断しません。酸素の通常変化を一律に緊急扱いせず、低酸素等をvitalsとして扱います。
+
+`wait.wakeOn` と未来の `wakeAt` は通常wakeを絞ります。owner proposalなどの例外、受理済み保留wake、完了後の一度のwakeはRuntimeが区別します。判断失敗は5秒から最大60秒へbackoffします。個々のtool loopは既定6 roundですが、プレイ全体の費用上限とは別です。
+
+## 7. 身体操作・結果・再起動
+
+Runtimeは現在の操作をcancelし、そのpromiseがsettleした後、最新 `actionRevision`・operation ID・停止状態を再確認して次を始めます。`activeOperation.startedAt` はcommit時に設定され、Body開始eventでも互換更新されます。実際にBody開始を観測した時刻は `bodyStartedAt` を使います。
+
+結果保存の順序は、Bodyのafter観測 → McSkillRepositoryのtrusted receipt/outcome → MemoryStoreのepisode → MindStoreの結果とeventです。複数storeをまたぐ単一transactionではありません。receipt保存失敗は `PLAYER_SKILL_EVIDENCE_FAILED` として記録され、モデルの成功申告で補いません。
+
+通常のowner goalの終了判断は次のPurposeへ戻します。食事依頼の結果と装備結果にはRuntimeの専用通知もあり、食事は所持数減少とfood増加、装備は実slotのitemを照合して説明します。
+
+キャンセルしてもnative処理が残る場合、Bodyは `recoveryRequired` を返し、Runtimeは通常の再接続経路へ依頼します。再接続まで次の操作を開始せず、再接続設定が無効ならそれを迂回しません。
+
+再起動では保存済みactiveOperationをそのまま再実行しません。一致するtrusted receiptがあれば結果へ使い、なければ `unverified` として閉じて再判断します。停止ラッチは維持します。詳しい保存先は[人格と記憶](memory.md)を参照してください。
+
+## 8. 具体例: 死亡後の探索
+
+```mermaid
+flowchart TD
+    Death["bot_death"] --> Save["死亡eventと最新の死亡前観測を保存"]
+    Save --> Fresh["死亡後のfresh Body観測"]
+    Fresh --> Check{"時刻・dimension・位置の根拠が揃うか"}
+    Check -->|"不足"| Observe["再観測・準備・理由付き待機"]
+    Check -->|"整合"| Judge["Purposeが危険・目的・経路を判断"]
+    Judge --> Search["接近・見回し・可視itemの拾得"]
+    Search --> Receipt{"対象一致の拾得eventと所持数増加"}
+    Receipt -->|"確認"| Partial["そのitemの拾得証拠"]
+    Receipt -->|"不足"| Unknown["失敗・未確認を記録"]
+    Partial --> Fresh
+    Unknown --> Fresh
+```
+
+- 死亡前の最終観測位置は、死亡地点やdropの位置を保証しない。
+- 死亡後最初の観測を別欄へ保存し、欠けた値を推測しない。
+- `[death-recovery:…]` marker付き操作は、時刻・dimensionと現在観測の整合性を検証する。
+- `approach / sweep / collect` は試行履歴。過去に使ったという理由だけで固定拒否しない。
+- 危険の観測は判断材料。固定の一律禁止条件にはしない。
+- 拾得成功でも「死亡drop由来」「持ち物全回収」は別の証明が必要。
+- 再接続後は古い回収操作を `continue` せず、fresh観測で再計画する。
+
+死亡eventをまたぐ累積retry上限はなく、無進捗の連続wakeを常に防げることは未実証です。過去の限定測定は[AIプレイヤーE2E](ai-player-e2e.md)の死亡回収節を参照してください。
+
+### 経路が詰まった時の判断材料
+
+現在のPurpose instructionsには、activeなowner goalのため所有者へ移動中にstallした場合の、閉じた手動ドアの回復手順があります。fresh観測でドアを確認し、必要なら一度見回し、向きと閉状態を再確認して一度使用します。`open=true` と新しいowner位置が確認できた時だけ移動を一度再試行し、根拠がなければ別経路または未達の理由を選びます。
+
+これはモデルへの手順指示です。回復回数を独立した永続カウンターで強制しているという意味ではありません。履歴から再試行済みか分からない場合にも、同じ手順を繰り返さないよう指示しています。関連する `recentActionPattern` と可視観測を合わせて評価します。実装箇所は [PlayerPurposeAgent.think](../src/player/agents.ts)、操作条件は [PlayerBody](player-body.md) です。
+
+## 9. 読み終えた後に確認するもの
+
+- 人格・関係の読込みと実際の更新経路: [memory.md](memory.md)
+- 操作単体の観測範囲と結果条件: [player-body.md](player-body.md)
+- receiptから再利用可能な技能へ戻る流れ: [mc-bot-skills.md](mc-bot-skills.md)
+- 判断拒否、未達、使用量不明を調べる: [testing.md](testing.md)
+
+実ゲームrunごとの経緯は評価文書へ集約します。異なるworld・入力・予算のrun間の値を、そのまま改善率として比較しません。
