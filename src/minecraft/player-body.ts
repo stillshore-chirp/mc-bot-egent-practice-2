@@ -487,6 +487,18 @@ function waitTicks(ticks: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function closeWindowWithoutWaiting(bot: Bot, window: Window): boolean {
+  try {
+    // Stop and event callbacks must release local window ownership synchronously.
+    // Mineflayer performs that release before resolving this Promise; rejection is
+    // handled here because these callbacks cannot await without delaying stop.
+    void bot.closeWindow(window).catch(() => undefined);
+  } catch {
+    // A disconnected bot may throw before returning the close Promise.
+  }
+  return bot.currentWindow !== window;
+}
+
 function stableSignature(observation: PlayerBodyObservation): string {
   return JSON.stringify({
     dimension: observation.dimension,
@@ -1722,7 +1734,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       bot.stopDigging();
       bot.pathfinder.setGoal(null);
       bot.moveVehicle(0, 0);
-      if (bot.currentWindow !== null) bot.closeWindow(bot.currentWindow);
+      if (bot.currentWindow !== null)
+        closeWindowWithoutWaiting(bot, bot.currentWindow);
     } catch {
       // A disconnected bot has no active controls to release.
     }
@@ -1802,7 +1815,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         ].includes(operation.kind) &&
         bot.currentWindow !== null
       )
-        bot.closeWindow(bot.currentWindow);
+        closeWindowWithoutWaiting(bot, bot.currentWindow);
     } catch {
       // The connection can end while an action is being cancelled.
     }
@@ -2088,7 +2101,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       case "window_close": {
         const window = requireOpenWindow(bot);
-        bot.closeWindow(window);
+        await bot.closeWindow(window);
         await waitTicks(2, signal);
         return;
       }
@@ -3009,12 +3022,7 @@ function openWindowCancellable(
     const onOpen = (window: Window): void => {
       if (abortedAfterPacket) {
         if (bot.currentWindow === window) {
-          try {
-            bot.closeWindow(window);
-          } catch {
-            // A disconnect will settle this operation if closing is no longer possible.
-            return;
-          }
+          if (!closeWindowWithoutWaiting(bot, window)) return;
         }
         finish(abortError(signal));
         return;

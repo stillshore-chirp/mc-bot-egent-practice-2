@@ -330,7 +330,7 @@ function makeFakeBot(
     attack: vi.fn(),
     heldItem: null,
     swingArm: vi.fn(),
-    closeWindow: vi.fn((window: Window) => {
+    closeWindow: vi.fn(async (window: Window) => {
       if (bot.currentWindow === window) bot.currentWindow = null;
     }),
     dig: vi.fn(async () => undefined),
@@ -2599,6 +2599,32 @@ describe("player body", () => {
     expect(clicked.status).toBe("successful");
   });
 
+  it("awaits a rejected async close and releases the operation for a replacement", async () => {
+    const fake = makeFakeBot();
+    fake.setWindow(makeWindow());
+    fake.emitWindowOpen();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    vi.mocked(fake.bot.closeWindow).mockImplementationOnce(async () => {
+      throw new Error("close acknowledgement failed");
+    });
+
+    const closed = await body.execute({ kind: "window_close" });
+    expect(closed.status).toBe("failed");
+    expect(fake.bot.closeWindow).toHaveBeenCalledOnce();
+    expect(fake.bot.currentWindow).not.toBeNull();
+
+    const retried = await body.execute({ kind: "window_close" });
+    expect(retried.status).toBe("successful");
+    expect(fake.bot.currentWindow).toBeNull();
+
+    const replacement = await body.execute({
+      kind: "look",
+      target: { x: 0, y: 65, z: -2 },
+    });
+    expect(replacement.status).toBe("successful");
+    expect(replacement.recoveryRequired).toBe(false);
+  });
+
   it("removes the window waiter when cancellation happens before activation sends a packet", async () => {
     const fake = makeFakeBot();
     const target = new Vec3(0, 64, -2);
@@ -2646,6 +2672,82 @@ describe("player body", () => {
     });
     expect(replacement.status).toBe("successful");
     expect(fake.bot.closeWindow).not.toHaveBeenCalledWith(window);
+  });
+
+  it("keeps a late window quarantined after synchronous close throws until disconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot({ deferWindowOpen: true });
+      const target = new Vec3(0, 64, -2);
+      fake.blocks.set("0,64,-2", makeBlock("brewing_stand", 2, target));
+      fake.candidates.push(target);
+      const lateWindow = makeWindow();
+      fake.setWindow(lateWindow);
+      vi.mocked(fake.bot.swingArm).mockImplementationOnce(() => {
+        throw new Error("activation completion failed after packet dispatch");
+      });
+      const client = (
+        fake.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      const write = vi.spyOn(client, "write");
+      let currentBot = fake.bot;
+      const body = new MineflayerPlayerBody(() => currentBot);
+      const controller = new AbortController();
+      const pending = body.execute(
+        {
+          kind: "open_window",
+          target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+        },
+        controller.signal,
+      );
+      await vi.waitFor(() =>
+        expect(write).toHaveBeenCalledWith("block_place", expect.any(Object)),
+      );
+      const persistentWindowListeners =
+        fake.bot.listenerCount("windowOpen") - 1;
+      controller.abort(new Error("cancel after packet"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      const cancelled = await pending;
+      expect(cancelled.status).toBe("interrupted");
+      expect(cancelled.recoveryRequired).toBe(true);
+      await expect(body.execute({ kind: "window_close" })).rejects.toThrow(
+        /still settling/,
+      );
+
+      vi.mocked(fake.bot.closeWindow).mockImplementationOnce(() => {
+        throw new Error("late close threw before local release");
+      });
+      fake.emitWindowOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fake.bot.closeWindow).toHaveBeenCalledWith(lateWindow);
+      expect(fake.bot.currentWindow).toBe(lateWindow);
+      await expect(body.execute({ kind: "window_close" })).rejects.toThrow(
+        /still settling/,
+      );
+
+      fake.bot.emit("end", "test disconnect");
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fake.bot.listenerCount("windowOpen")).toBe(
+        persistentWindowListeners,
+      );
+
+      const next = makeFakeBot();
+      currentBot = next.bot;
+      body.attach(next.bot);
+      const replacement = await body.execute({
+        kind: "look",
+        target: { x: 0, y: 65, z: -2 },
+      });
+      expect(replacement.status).toBe("successful");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("quarantines a sent window activation until its late window is closed", async () => {

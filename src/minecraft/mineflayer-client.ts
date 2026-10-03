@@ -3248,7 +3248,13 @@ export class MineflayerClient implements MinecraftPort {
     bot.pathfinder.setGoal(null);
     bot.stopDigging();
     bot.clearControlStates();
-    if (bot.currentWindow) bot.closeWindow(bot.currentWindow);
+    if (bot.currentWindow) {
+      try {
+        await bot.closeWindow(bot.currentWindow);
+      } catch {
+        // The close packet is best-effort when a disconnected window rejects cleanup.
+      }
+    }
   }
 
   private requireBot(): Bot {
