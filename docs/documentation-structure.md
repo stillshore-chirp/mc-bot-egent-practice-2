@@ -18,7 +18,7 @@ READMEはプロジェクト入口、詳細な契約は対応する正本へ分�
 | [ai-player-e2e](ai-player-e2e.md) | 実ゲーム評価手順・過去結果・限界 | 最新コードの全体解説 |
 | [operations](operations.md) | 設定・起動停止・バックアップ・運用 | runtimeの内部状態遷移 |
 | [dashboard](dashboard.md) | 画面・traceの詳細文書への入口 | 成功判定の代替 |
-| [legacy-runtime](legacy-runtime.md) | 明示的な旧アプリケーションの契約 | 既定動作との混在 |
+| [legacy-runtime](architecture.md#旧toolruntime経路の詳細) | 明示的な旧アプリケーションの契約 | 既定動作との混在 |
 
 製品説明はコードの入口・型・保存/呼出し箇所と対応付けます。設計意図、実装、過去の実測、今回未実行の検証を分け、過去のrun番号を一般保証へ置き換えません。
 

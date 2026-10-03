@@ -17,7 +17,7 @@ Minecraft Java Editionの世界に一人のプレイヤーとして暮らし、�
 | 起動、停止、バックアップ、障害対応 | [運用](docs/operations.md) |
 | 画面・traceの見方 | [観測ダッシュボード](docs/dashboard.md) |
 | 現行AIプレイヤーの実ゲーム評価条件・過去結果 | [AIプレイヤーE2E](docs/ai-player-e2e.md) |
-| 旧方式の仕様を保守する | [legacy runtime](docs/legacy-runtime.md) |
+| 旧方式の仕様を保守する | [legacy runtime](docs/architecture.md#旧toolruntime経路の詳細) |
 
 文書体系と配置判断は[文書構成](docs/documentation-structure.md)、開発作業のルールは[AGENTS.md](AGENTS.md)を参照してください。
 
@@ -43,7 +43,7 @@ flowchart LR
 - 会話は身体を直接操作せず、目的提案を保存します。実行中でも会話でき、行動変更は別の判断で確定します。
 - 所有者の停止は永続化し、再開するまで維持します。危険や建築変更は状況に応じた判断対象ですが、停止、サーバー権限、外部アクセス境界を越えません。
 - 操作受付やモデルの発言だけではゲーム内成功にしません。観測が不足すれば `unverified` として扱います。
-- shell、任意コード、server管理用操作をモデルに公開しません。旧方式の固定reflexや作業skillは[legacy経路](docs/legacy-runtime.md)で区別します。
+- shell、任意コード、server管理用操作をモデルに公開しません。旧方式の固定reflexや作業skillは[legacy経路](docs/architecture.md#旧toolruntime経路の詳細)で区別します。
 
 ## 必要環境と起動
 
