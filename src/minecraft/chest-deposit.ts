@@ -73,15 +73,26 @@ export async function depositIntoChest(
   ensureIdentity(before, target);
   let window: Chest | undefined;
   let reason: DepositResult["reason"] = "completed";
-  const close = () => {
-    if (window && bot.currentWindow === window) window.close();
+  let closePromise: Promise<boolean> | undefined;
+  const close = (): Promise<boolean> => {
+    if (closePromise !== undefined) return closePromise;
+    const activeWindow = window;
+    if (!activeWindow || bot.currentWindow !== activeWindow)
+      return Promise.resolve(true);
+    closePromise = (async () => {
+      try {
+        await activeWindow.close();
+        return true;
+      } catch {
+        /* A disconnect may reject the close after local ownership is released. */
+        return false;
+      }
+    })();
+    return closePromise;
   };
   const abort = () => {
-    try {
-      close();
-    } catch {
-      /* Connection shutdown may already have closed it. */
-    }
+    // Abort listeners are synchronous; finally awaits this same rejection-safe close.
+    void close().catch(() => undefined);
   };
   signal.addEventListener("abort", abort, { once: true });
   try {
@@ -109,18 +120,17 @@ export async function depositIntoChest(
         () => timerSignal.removeEventListener("abort", stopped),
       );
     });
-    void open.then(
-      (opened) => {
+    void open
+      .then(async (opened) => {
         if (abandoned && bot.currentWindow === opened) {
           try {
-            opened.close();
+            await opened.close();
           } catch {
-            /* Connection already closed. */
+            /* Connection already closed; preserve the abandoned-open quarantine. */
           }
         }
-      },
-      () => undefined,
-    );
+      })
+      .catch(() => undefined);
     window = await Promise.race([open, guarded]);
     const active = window;
     const check = () => {
@@ -206,11 +216,7 @@ export async function depositIntoChest(
     reason = signal.aborted ? "cancelled" : "failed";
   } finally {
     signal.removeEventListener("abort", abort);
-    try {
-      close();
-    } catch {
-      reason = "failed";
-    }
+    if (!(await close())) reason = "failed";
   }
   try {
     // Read-only reconciliation remains allowed after stop; no further clicks are issued.

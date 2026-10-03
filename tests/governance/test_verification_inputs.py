@@ -56,6 +56,17 @@ def test_minecraft_version_guide_selects_product_gate() -> None:
     assert result["workflow_contract"] is False
 
 
+def test_minecraft_26_3_migration_guide_selects_only_product_gate() -> None:
+    result = MODULE.classify_paths(["docs/minecraft-26-3.md"])
+
+    assert result["classification_ok"] is True
+    assert result["product"] is True
+    assert result["unknown_paths"] == []
+    assert result["browser"] is False
+    assert result["governance"] is False
+    assert result["workflow_contract"] is False
+
+
 def test_behavior_memory_e2e_guide_selects_product_gate() -> None:
     result = MODULE.classify_paths(["docs/behavior-memory-e2e.md"])
 

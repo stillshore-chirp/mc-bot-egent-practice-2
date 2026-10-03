@@ -1,4 +1,5 @@
 import mineflayer, { type Bot, type BotOptions } from "mineflayer";
+import { states } from "minecraft-protocol";
 import pathfinderPackage, {
   Movements,
   pathfinder,
@@ -611,6 +612,9 @@ export class MineflayerClient implements MinecraftPort {
     const sendsPlayerLoadedPacket = bot.supportFeature(
       "sendsPlayerLoadedPacket",
     );
+    const sendsClientTickEndPacket = bot.supportFeature(
+      "sendsClientTickEndPacket",
+    );
     const usesNamedMetadata = bot.supportFeature("mcDataHasEntityMetadata");
     bot._client.on("entity_metadata", (packet) => {
       const botEntity = bot.entity;
@@ -642,9 +646,25 @@ export class MineflayerClient implements MinecraftPort {
       for (const listener of this.deathListeners) listener(observedAt);
     });
     let connectionOpen = true;
+    const onPhysicsTick = (): void => {
+      if (
+        !sendsClientTickEndPacket ||
+        this.botInstance !== bot ||
+        this.connectionEpoch !== connectionEpoch ||
+        !connectionOpen ||
+        this.intentionalDisconnect ||
+        bot._client.state !== states.PLAY
+      )
+        return;
+      // physicsTick fires before this frame's position packet. Send synchronously
+      // to close the previous tick before movement, including catch-up ticks.
+      bot._client.write("tick_end", {});
+    };
+    if (sendsClientTickEndPacket) bot.on("physicsTick", onPhysicsTick);
     let invalidatePendingSpawn: (() => void) | undefined;
     let rejectPendingConnect: ((reason: string) => void) | undefined;
     bot.on("end", (reason) => {
+      bot.off("physicsTick", onPhysicsTick);
       if (this.botInstance !== bot || this.connectionEpoch !== connectionEpoch)
         return;
       connectionOpen = false;
@@ -3248,7 +3268,13 @@ export class MineflayerClient implements MinecraftPort {
     bot.pathfinder.setGoal(null);
     bot.stopDigging();
     bot.clearControlStates();
-    if (bot.currentWindow) bot.closeWindow(bot.currentWindow);
+    if (bot.currentWindow) {
+      try {
+        await bot.closeWindow(bot.currentWindow);
+      } catch {
+        // The close packet is best-effort when a disconnected window rejects cleanup.
+      }
+    }
   }
 
   private requireBot(): Bot {

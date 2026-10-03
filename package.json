@@ -34,7 +34,7 @@
   "dependencies": {
     "better-sqlite3": "13.0.3",
     "dotenv": "17.4.2",
-    "mineflayer": "4.37.1",
+    "mineflayer": "4.39.0",
     "mineflayer-pathfinder": "2.4.5",
     "openai": "7.5.0",
     "pino": "10.3.1",

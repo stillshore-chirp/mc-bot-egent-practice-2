@@ -83,6 +83,7 @@ PRODUCT_PATTERNS = (
     "docs/behavior-memory-e2e.md",
     "docs/mc-bot-skills.md",
     "docs/memory.md",
+    "docs/minecraft-26-3.md",
     "docs/minecraft-26-1.md",
     "docs/player-body.md",
     "docs/autonomous-player.md",

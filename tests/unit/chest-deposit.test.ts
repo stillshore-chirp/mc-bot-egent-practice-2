@@ -46,7 +46,12 @@ const item = (name: string, count: number, slot: number): Item => ({
   nbt: null,
   components: [],
 });
-function simulation(full = false, abortAt = 0, externalChange = false) {
+function simulation(
+  full = false,
+  abortAt = 0,
+  externalChange = false,
+  rejectClose = false,
+) {
   const controller = new AbortController();
   let calls = 0;
   let revision = 0;
@@ -60,12 +65,13 @@ function simulation(full = false, abortAt = 0, externalChange = false) {
     inventoryStart: 27,
     inventoryEnd: 63,
     selectedItem: null as Item | null,
-    close: () => {
+    close: async () => {
       if (window.selectedItem) {
         window.slots[27] = window.selectedItem;
         window.selectedItem = null;
       }
       bot.currentWindow = null;
+      if (rejectClose) throw new Error("close acknowledgement failed");
     },
   };
   const bot = {
@@ -187,6 +193,23 @@ describe("observed deposit", () => {
       reason: "cancelled",
     });
     expect(s.bot.clickWindow).toHaveBeenCalledTimes(2);
+    expect(s.bot.currentWindow).toBeNull();
+  });
+  it("awaits abort cleanup and reconciles even if the close promise rejects", async () => {
+    const s = simulation(false, 2, false, true);
+    const result = await depositIntoChest(
+      s.bot,
+      target,
+      "oak_log",
+      2,
+      s.signal,
+      s.inspect,
+    );
+    expect(result).toMatchObject({
+      verified: true,
+      deposited: 1,
+      reason: "failed",
+    });
     expect(s.bot.currentWindow).toBeNull();
   });
   it("never claims verified completion when another operation changes the chest", async () => {

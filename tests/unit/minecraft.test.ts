@@ -14,21 +14,29 @@ import { FakeMinecraft } from "../support/fake-minecraft.js";
 function createSpawnableBot(
   supportsPlayerLoaded: boolean,
   waitForChunksToLoad = vi.fn().mockResolvedValue(undefined),
+  supportsClientTickEnd = false,
 ) {
   const bot = Object.assign(new EventEmitter(), {
-    _client: Object.assign(new EventEmitter(), { write: vi.fn() }),
+    _client: Object.assign(new EventEmitter(), {
+      state: "play",
+      write: vi.fn(),
+    }),
     username: "server_bot",
     version: "1.21.11",
     registry: minecraftData("1.21.11"),
     pathfinder: {
+      setGoal: vi.fn(),
       setMovements: vi.fn(),
       thinkTimeout: 0,
       tickTimeout: 0,
     },
     loadPlugin: vi.fn(),
+    stopDigging: vi.fn(),
+    clearControlStates: vi.fn(),
     supportFeature: vi.fn(
       (feature: string) =>
-        feature === "sendsPlayerLoadedPacket" && supportsPlayerLoaded,
+        (feature === "sendsPlayerLoadedPacket" && supportsPlayerLoaded) ||
+        (feature === "sendsClientTickEndPacket" && supportsClientTickEnd),
     ),
     waitForChunksToLoad,
     end: vi.fn(function (this: EventEmitter, reason: string) {
@@ -52,6 +60,99 @@ function createMineflayerClient(): MineflayerClient {
 }
 
 describe("Minecraft boundary", () => {
+  it("separates supported physics-tick movement packets synchronously", async () => {
+    const bot = createSpawnableBot(
+      false,
+      vi.fn().mockResolvedValue(undefined),
+      true,
+    );
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = createMineflayerClient();
+      const connection = client.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await connection;
+      bot._client.write.mockClear();
+
+      // Model two catch-up physics ticks and their movement writes in one JS task.
+      bot.emit("physicsTick");
+      bot._client.write("position", {});
+      bot.emit("physicsTick");
+      bot._client.write("position", {});
+      expect(
+        bot._client.write.mock.calls.map(([name]) => name as string),
+      ).toEqual(["tick_end", "position", "tick_end", "position"]);
+
+      bot._client.state = "configuration";
+      bot.emit("physicsTick");
+      expect(bot._client.write).toHaveBeenCalledTimes(4);
+      bot._client.state = "play";
+      const disconnecting = client.disconnect("fixture stop");
+      bot.emit("physicsTick");
+      expect(bot._client.write).toHaveBeenCalledTimes(4);
+      await disconnecting;
+      expect(bot.listenerCount("physicsTick")).toBe(0);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("guards tick_end against a superseded bot and removes its listener on late end", async () => {
+    const oldBot = createSpawnableBot(
+      false,
+      vi.fn().mockResolvedValue(undefined),
+      true,
+    );
+    oldBot.end = vi.fn();
+    const newBot = createSpawnableBot(
+      false,
+      vi.fn().mockResolvedValue(undefined),
+      true,
+    );
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValueOnce(
+        oldBot as unknown as ReturnType<typeof mineflayer.createBot>,
+      )
+      .mockReturnValueOnce(
+        newBot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = createMineflayerClient();
+      const controller = new AbortController();
+      const oldConnection = client.connect(controller.signal);
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(1));
+      const oldRejected = expect(oldConnection).rejects.toThrow("test abort");
+      controller.abort(new Error("test abort"));
+      await oldRejected;
+
+      const newConnection = client.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(2));
+      newBot.emit("spawn");
+      await newConnection;
+      newBot._client.write.mockClear();
+
+      oldBot.emit("physicsTick");
+      expect(oldBot._client.write).not.toHaveBeenCalledWith("tick_end", {});
+      oldBot.emit("end", "late old end");
+      expect(oldBot.listenerCount("physicsTick")).toBe(0);
+
+      newBot.emit("physicsTick");
+      expect(newBot._client.write).toHaveBeenCalledExactlyOnceWith(
+        "tick_end",
+        {},
+      );
+      newBot.emit("end", "test cleanup");
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
   it("waits for chunks before completing a supported player connection", async () => {
     let loadChunks!: () => void;
     const chunksLoaded = new Promise<void>((resolve) => {
@@ -330,6 +431,9 @@ describe("Minecraft boundary", () => {
       bot.emit("spawn");
       await connection;
       expect(bot.waitForChunksToLoad).not.toHaveBeenCalled();
+      bot._client.write.mockClear();
+      bot.emit("physicsTick");
+      expect(bot._client.write).not.toHaveBeenCalledWith("tick_end", {});
       expect(
         bot._client.write.mock.calls.filter(
           ([name]) => name === "player_loaded",
