@@ -133,7 +133,7 @@ GitHub Actions は通常PRで一つの `CI` workflowだけを起動します。�
 
 workflowはpath filterで起動自体を消しません。削除・renameの両側を分類するため、PRでは `git diff --name-only --no-renames -z base...head` を使います。同一のHEAD・base・入力閉包・実行条件で成功した証跡は再利用し、交差する入力が変わったgateだけを再実行します。
 
-`audit:high`はhigh / critical advisoryを品質gateにし、既知のmoderate認証依存はIssue #4で追跡します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
+`audit:high`はhigh / critical advisoryを品質gateにし、moderate認証依存の過去の調査は [Issue #4](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/4)、今回のhigh解消と残存項目は [Issue #124](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/124) を参照します。現在の件数は対象lockfileへの監査結果で判断します。CI は API key、Minecraft 接続情報、実 world を持たず、live E2E を起動しません。
 
 ## Unit test
 
@@ -230,4 +230,4 @@ runnerのJSONを保存する場合は、repository外またはgit ignore済み�
 | failure                      | resource / inventory、path、短時間上限によるtimeout、即時cancelを実runで発生させ、成功扱いせず日本語で報告することを確認 |
 | 切断                         | server切断後、設定した再接続上限で`connectionState=failed`と明示的なretry exhausted状態を確認                            |
 
-接続先、player名、座標、会話、記憶本文、相関ID、実log原文、runner JSON、SQLite実dataはrepositoryへ保存していません。確認範囲は単一のローカル環境であり、remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。既知のmoderate dependency advisoryはIssue #4で追跡します。
+接続先、player名、座標、会話、記憶本文、相関ID、実log原文、runner JSON、SQLite実dataはrepositoryへ保存していません。確認範囲は単一のローカル環境であり、remote / managed server、異なるworld条件、認証構成の網羅、複数hostile配置での修正後退避、長時間連続soak、他OSは未確認です。当時のmoderate dependency advisoryの調査記録は [Issue #4](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/4) にあります。
