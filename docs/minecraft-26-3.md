@@ -1,16 +1,16 @@
 # Minecraft Java 26.3 へ既存 world と AI 記憶を引き継ぐ手順
 
-この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順と、確認済み範囲の結果をまとめます。空の world を作って置き換える手順ではありません。旧環境を継続します。最新の Gate1 run2 では Paper 26.3 検証 copy 上で native 26.3 client と既定 application Bot の短時間同時接続、Bot の spawn・body を確認しましたが、その後`invalid-move`で切断され、15 秒安定条件は未達です。GUIと実 world 切替も未検証です。
+この文書は、現在使っている world と Bot の継続性を保ちながら、Minecraft Java Edition 26.3 のサーバー構成を複製上で評価する手順と、確認済み範囲の結果をまとめます。空の world を作って置き換える手順ではありません。Gate1 では Paper 26.3 copy に native 26.3 client と既定 application Bot が同時参加し、16.297 秒の観測中に 4 回の位置・spawn・body 確認が成立しました。これは Gate1 の限定成功で、Issue 全体の受け入れを意味しません。実 world は旧環境のままで、切替は未実施です。
 
 ## 対象と版
 
-| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                                                                                                 |
-| ---------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                                                                                                         |
-| Paper                  | 26.3 BETA build 143                     | 2026-10-03 時点の複製検証候補。BETA は安定版として扱いません。                                                                                                             |
-| Java                   | Java 25（既存 runtime は 25.0.1）       | 複製環境で起動時の版を確認します。個人環境のインストール先は記録しません。                                                                                                 |
-| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | Paper 26.3 上で旧版 Bot を受け入れる構成を試します。組み合わせの個別動作は未確認です。                                                                                     |
-| Bot                    | Mineflayer 4.39.0、候補接続版 26.1      | 既定 `MINECRAFT_VERSION=1.21.11`は維持。Gate1 run2 で26.1 candidateのspawn・body・短時間同時接続を確認しましたが、`invalid-move`で15秒安定未達。26.3直接対応は未確認です。 |
+| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                                                                        |
+| ---------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                                                                                |
+| Paper                  | 26.3 BETA build 143                     | 複製で評価中の版。Gate1 の同時接続を確認しました。BETA は安定版として扱わず、実行前に公式 API の channel と artifact hash を照合します。          |
+| Java                   | Java 25（26.3 copy 用）                 | 旧 runtime は Java 21 のままです。候補8は SerialGC で起動し world load error は未観測ですが、長時間安定性は未確認です。                           |
+| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | Paper 26.3 copy でロードし、旧版 Bot の限定接続を試しています。全機能の互換性は未確認です。                                                       |
+| Bot                    | Mineflayer 4.39.0（copy 候補）          | 現 runtime は 4.37.1 / 1.21.11 のままです。copy で 26.1 candidate の同時参加と 16.297 秒・4観測を確認しました。26.3直接対応や全機能は未確認です。 |
 
 版の根拠と実行前確認は次のとおりです。
 
@@ -19,9 +19,9 @@
 - [Paper 26.3 の告知](https://papermc.io/news/26-3/)は、26.3 へ保存した world を旧版へ戻せないと案内しています。
 - ViaBackwards の[5.12.0 release](https://github.com/ViaVersion/ViaBackwards/releases/tag/5.12.0)は 26.3 server support を記載しています。ViaBackwards は ViaVersion を必要とします（[ViaVersion 5.12.0](https://github.com/ViaVersion/ViaVersion/releases/tag/5.12.0)）。
 - Mineflayer は[公式 4.39.0 release](https://github.com/PrismarineJS/mineflayer/releases/tag/4.39.0)に固定します。公式[対応表](https://github.com/PrismarineJS/mineflayer#features)が示す候補は 26.1 までで、26.3 への直接対応を示していません。関連する[PR #4125](https://github.com/PrismarineJS/mineflayer/pull/4125)、[PR #4128](https://github.com/PrismarineJS/mineflayer/pull/4128)、[PR #4130](https://github.com/PrismarineJS/mineflayer/pull/4130)の内容はこの release に含まれるとみなしません。
-- protocol 775 では`tick_end`が必要です。Mineflayer 4.39.0 の`physicsTick`は位置 packet の送信前に発火し、catch-up 時は同じ JavaScript task 内で複数 tick が続きます。そのため対応版だけで listener 内から同期送信し、次の movement より前に前 tick を閉じます。microtask へ遅らせると catch-up movement の後ろへ marker がまとまり、tick 境界にならない場合があります。
+- protocol 775 では`tick_end`が必要です。Paper 26.3 copy と Mineflayer 4.39.0 / 26.1 protocol の API 不使用 component probe で、158 tick に 158 marker と 11 movement packet を観測しました。これは単独 idle component の結果で、既定 application の移動や受け入れを証明しません。
 - 既定の接続版は`MINECRAFT_VERSION=1.21.11`のままです。26.1 候補を検証する複製だけで`MINECRAFT_VERSION=26.1`を明示し、ViaBackwards 経由で別 profile として試します。公式[CI run 34038030872](https://github.com/PrismarineJS/mineflayer/actions/runs/34038030872)には 1.21.11 の chest close timeout があり、4.39.0 の既定版への後方互換も未実証です。
-- 26.3 で追加された block 等が Bot へどう変換・表示されるかは未検証です。接続や一部の観測が成功しても、新要素を完全に認識できたとは扱いません。
+- 26.3 で追加された block 等を複製上で利用できるかは一部だけ確認中です。item の利用可能性は GUI 表示、配置、生成 terrain、全新要素への対応を証明しません。
 
 Paper build 143 は、まず複製 world の評価に使います。Paper が BETA であることを risk として記録し、複製の受け入れと復旧可能性、対象 world と影響範囲を照合して、既存の移行依頼の範囲で実 world へ適用するか判断します。BETA であることだけを理由に一律禁止とはしません。
 
@@ -42,35 +42,33 @@ Paper build 143 は、まず複製 world の評価に使います。Paper が BE
 
 ## 複製 world を 26.3 で確認する
 
-26.3 の停止済み copy では、設定された world root の下に `dimensions/minecraft/{overworld,the_nether,the_end}/region/` と `players/` がある構造を観測しました。実際の root とファイル一覧は公開しません。copy や切替では root 全体と相対階層を保ち、旧版の dimension 配置を前提に一部 directory だけを移動しません。seed や settings の新 schema との比較は未確認です。
+26.3 copy の保存構造は `dimensions/minecraft/{overworld,the_nether,the_end}/region/` と `players/` です。root 全体と相対階層を保ち、旧版の dimension 配置を前提に一部 directory だけを移動しません。非公開の metadata 比較では 3 dimension の seed・generator・関連 flag が一致しました。これは保存 metadata の保持を示しますが、新 terrain の生成や長期プレイを確認した結果ではありません。
 
 1. 復元済み backup からさらに検証用 copy を作り、Paper 26.3 BETA build 143 と Java 25 を使います。起動前に PaperMC Fill API の manifest で build ID・channel・SHA-256 を照合し、選んだ artifact と一致しなければ停止します。`server.properties`の port や bind 先は複製専用にし、公開ネットワークへ接続できない状態にします。
 2. ViaVersion と ViaBackwards 5.12.0 を導入します。元 server の plugin と設定を複製へ引き継ぎ、TreeGuard を含む各 plugin の起動・権限・world 保護が 26.3 上で機能するか確認します。非互換やデータ移行エラーがあれば、設定変更を広げずその検証を中断します。
-3. 26.3 クライアントと Bot を同じ複製 world へ接続します。lockfile の Mineflayer 4.39.0 を使い、既定`MINECRAFT_VERSION=1.21.11`の fallback と、複製だけで`MINECRAFT_VERSION=26.1`を明示する candidate を別 profile として ViaBackwards 経由で試します。Gate1 run2 で明示 26.1 candidate の短時間 spawn・body・同時接続は観測しましたが、15 秒安定条件は満たさず、26.3 の直接対応や新要素対応も証明しません。オンライン認証では owner と Bot に別々の Minecraft identity を使い、同じ identity の二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
-4. server log や接続受付だけで成功判定せず、ゲーム画面と複製 Bot の観測で確認します。既存 landmark と複数 dimension、playerdata、map、chest・entity が移行前と対応し、読み書きできることを確認します。26.3 の新要素を旧版 Bot が扱えるかは、個別に観測できた範囲だけ記録します。
+3. 26.3 クライアントと Bot を同じ複製 world へ接続します。lockfile の Mineflayer 4.39.0 を使い、既定`MINECRAFT_VERSION=1.21.11`の fallback と、複製だけで`MINECRAFT_VERSION=26.1`を明示する candidate を別 profile として ViaBackwards 経由で試します。Gate1 では明示 26.1 candidate の同時参加と 16.297 秒・4 回の位置/spawn/body 観測が成立しましたが、26.3 の直接対応や全機能を証明しません。オンライン認証では owner と Bot に別々の Minecraft identity を使い、同じ identity の二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
+4. server log や接続受付だけで成功判定せず、独立したゲーム内または server 観測と複製 Bot の観測を組み合わせて確認します。GUI を確認できない場合は未確認と記録します。既存 landmark と複数 dimension、playerdata、map、chest・entity が移行前と対応し、読み書きできることを確認します。26.3 の新要素を旧版 Bot が扱えるかは、個別に観測できた範囲だけ記録します。
 5. 複製 database で SQLite 整合性・schema 読込を確認し、永続化済みの人格設定・関係、MindStore の目的・停止状態、MemoryStore の記憶、McSkillRepository の skill と receipt が参照できることを確認します。直近の会話履歴はプロセス内の`PlayerConversationAgent.#history`にあり、再起動時にリセットされます。これは移行対象の永続データに含めず、引継ぎ受け入れ条件にしません。実記憶や会話を公開せず、項目別の成否だけを残します。
 6. 同じ複製環境で日本語会話、短いゲーム内動作、その実動作中の即時停止、Bot 切断・再接続、再起動後の停止状態と記憶の維持を確かめます。操作依頼や LLM の返答だけで成功とせず、ゲーム内変化を観測します。
 
 ### 今回の観測結果
 
-- probe3–5 は Mineflayer 4.37.1・`MINECRAFT_VERSION=1.21.11`で実施しました。native QuickPlay による旧版 Paper copy への接続と owner/Bot 同時接続も、この旧 fallback の履歴です。固定更新後の Mineflayer 4.39.0 protocol-only idle 接続と、Gate1 run2 の 26.1 candidate spawn・body は後続 bullet のとおり確認しました。15 秒安定と継続的なゲーム内動作は未達です。
-- offline backup とその復元 copy の全 254 file で、対応する各 file の SHA-256 とサイズが一致しました。backup 総量は 1.418 GB です。旧 Paper/Bot 環境は再起動し、dashboard HTTP 200、Bot 接続、memory 利用可能を確認しました。
-- Paper 26.3 BETA build 143・Java 25・ViaVersion/ViaBackwards 5.12.0・TreeGuard の複製構成はロードしました。正常停止後の比較では 3 dimension すべてで region/chunk/POI/entity-region 件数が一致し、既存 6 人分の Identity・Inventory・EnderItems も一致しました。代表 3 chunk の blockstate と収納 3 件も一致しましたが、これは全 world の意味的内容やゲーム機能の保証ではありません。
-- 両 SQLite database の`quick_check`は`ok`、9 table の既存 primary key は維持されました。episodes は 14570 から 14571 へ増えましたが、内容不変は照合していません。
-- 26.3 コピー環境の probe4 当該セッションでは、独立した Paper/DB 観測により owner 入力、日本語の Bot 返信、`say`完了を確認しました。receipt の`JAPANESE_CHAT_NOT_OBSERVED`は probe 側の受信取りこぼしとして調査中で、日本語述語の観測とは分けて扱います。複合受け入れは別の未達述語があるため pass ではありません。
-- リスナーの最小修正と strict typepass 後の probe5 は 8.778 秒で`RCON_COMMAND_FAILED`となりました。失敗は RCON transport/auth ではなく、owner 生成前の Bot 位置応答に対する座標解析です。同時期に Paper の`invalid-move`拒否を 1 件観測しましたが、翻訳と physics のどちらが原因かは当時未確定でした。owner 生成・日本語 listener 段階に届かず、listener 修正の効果も確認できませんでした。API 1 件・RCON 5 件で後続検査に到達せず、movement、owner stop、再起動後の永続性、reconnect は当時`not_run`でした。この probe 時点の実 API 累計は 7 件、provider usage は`partial_or_unknown`です。
-- probe5 後、copy の fresh PID を確認して通常の SIGINT 停止を行い、3 dimension の ChunkHolder save・RegionFile I/O 完了、port 解放、process 終了を確認しました。元 runtime は active・connected・memory available を維持しています。この停止確認後に検証 copy を再起動して後続試験を行いました。
-- その後の実 API 不使用の protocol-only idle probe では、Mineflayer 4.39.0・26.1 protocol 775 の単独 Bot が各`physicsTick`後に`tick_end`を送り、Paper 26.3 copy へ spawn 後 7.993 秒接続しました。158 tick に 158 marker、11 movement packet を観測し、追加 log に`invalid-move`や`DecoderException`はありませんでした。Bot 自身が上限時間で通常 disconnect した試験です。これは idle 接続の証拠であり、アプリ統合、catch-up 時の同期順、移動、owner 同時接続の受け入れを示しません。
-- 公式 Minecraft 26.3 client JAR の SHA-1 は[Mojang version manifest](https://piston-meta.mojang.com/mc/game/version_manifest_v2.json)と一致しました。公式 QuickPlay CLI で immutable backup 由来の Paper 1.21.11 build 132・ViaVersion 5.12.0 の検証 copy に接続し、独立した fresh Paper log で owner の参加後、退出前に既定 `createApplication` Bot が参加したこと、Bot の spawn・body・connected を確認しました。これは旧版 Paper copy 上の client 接続経路と owner/Bot 同時接続の確認です。Paper 26.3 server への接続や 26.3 server 側の新機能は確認していません。
-- 別の observer run 1 は 7.680 秒で`RCON_PROTOCOL_ERROR`となり、API 1 件・RCON 1 件を使用しました。位置・会話・移動・停止・再接続の検査には到達していません。この失敗は先の Paper log による同時接続確認とは別に扱います。この run 時点の実 API 累計は 8 件、provider usage は`partial_or_unknown`です。
-- 1.21.11 検証 copy は SIGINT で正常停止し、保存処理・port 解放・process 終了を確認しました。QuickPlay client は既に終了しており、原 client・server・既定 Bot は変更していません。
-- 最新 Gate1 run2 では Paper 26.3 BETA build 143 copy に native 26.3 client と既定 application Bot（Mineflayer 4.39.0、`MINECRAFT_VERSION=26.1`）を接続し、短時間の同時参加と Bot の spawn・body を観測しました。その後 Bot は`invalid-move`で切断され、15 秒安定受入条件は未達です。これは接続開始までの証拠で、安定稼働・移動・全機能を示しません。GUI は未検証、実 world 切替も未実施です。controlled probe の実 API HTTP 呼び出しは累計 9 件です。provider/API usage は最新 run の使用量を含めて`partial_or_unknown`です。Issue #126 の受け入れは未完了です。
+- offline backup と復元 copy の全 254 file で、各 file の SHA-256 とサイズが一致しました（合計 1.418 GB）。旧 Paper/Bot 環境は再起動後も稼働し、dashboard HTTP 200、Bot 接続、memory 利用可能を確認しました。
+- Paper 26.3 BETA build 143・Java 25・ViaVersion/ViaBackwards 5.12.0・TreeGuard の copy はロードしました。3 dimension の region/chunk/POI/entity-region 件数、既存 6 人分の Identity・Inventory・EnderItems、代表 3 chunk の blockstate と収納 3 件が旧 backup と一致しました。初回のデータ照合時点では SQLite 両方の`quick_check`が`ok`で、9 table の既存 primary key を保っていました。episodes は 14570 から 14571 へ増加し、内容不変は未照合です。
+- 非公開 metadata 比較では 3 dimension の seed・generator・関連 flag が一致しました。これは保存値の保持であり、新 terrain の生成確認ではありません。copy の保存先は `dimensions/minecraft/{overworld,the_nether,the_end}/region/` と `players/`を含み、root 全体の階層を保ちます。
+- probe4 の 26.3 copy 当該セッションでは、独立した Paper/DB 観測で owner 入力、日本語の Bot 返信、`say`完了を確認しました。probe 側の受信 receipt は取りこぼしましたが、日本語入出力自体は実証済みです。複合受け入れは未達述語があるため pass ではありません。
+- `poplar_planks` は 26.3 copy 上で利用可能で、検証後の cleanup を確認しました（API 0・RCON 6）。native owner は接続中でしたが GUI は未確認です。配置、生成 terrain、他の新要素や Bot の意味理解は未検証です。
+- Gate1 は Paper 26.3 BETA build 143 copy、native 26.3 client、既定 application Bot（Mineflayer 4.39.0 / `MINECRAFT_VERSION=26.1`）で同時参加しました。16.297 秒に 4 回の位置・spawn・body 観測が成立し、API 2・RCON 9 でした。default application は終了を確認しましたが、これは Paper の正常停止を意味しません。複合受け入れは false で、移動・owner stop・Paper 正常停止後の保存・再起動後の永続性・reconnect は未達です。
+- Java 25 の candidate 8 は SerialGC で起動し、world load error は観測していません。過去の G1 candidate 7 の起動後 fatal は履歴上の失敗で、原因は未確定です。長時間安定性は未確認です。
+- Gate2 run 2 は 51.095 秒で`JAPANESE_CHAT_NOT_OBSERVED`を返しました（API 4・RCON 4）。接続、runtime closure、copy guard、server version は通過しています。同じ run の約 52 秒の独立 Paper 観測（API 0）では owner の日本語入力と Bot の日本語返信を各 1 件確認し、kick・disconnect・error はありませんでした。receipt 判定はこの player-chat を取りこぼしており、イベント形式の原因は未確定です。日本語入出力は実証済みですが、移動・owner stop・再起動・reconnect は未到達で、複合受け入れは未完了です。run 2 の`memory baselineCount=0`は未設定の receipt 値で、記憶消失の証拠ではありません。
+- 以前の probe3–5、protocol-only idle probe、旧 Paper 1.21.11 copy の native client 接続は歴史的な候補評価です。これらは現在の Gate1 結果へ加算せず、Bot 4.37.1 / fallback 1.21.11 の観測と 4.39.0 / 26.1 candidate の観測を区別します。実 API HTTP 呼び出し累計は 15 件、provider usage は`partial_or_unknown`です。
+- 元 runtime は旧環境で継続中です。実 world と本番 database は切り替えておらず、検証 copy の world/DB も昇格させません。Issue #126 は未完了です。
 
 ## 適用と失敗時の戻し方
 
-複製確認の完了だけで自動的に切り替えず、対象 server、停止・再開、更新するデータ、作業時間が既存の移行依頼と一致すること、複製の受け入れと復旧可能性を照合します。条件がそろえば依頼済みの適用範囲で切り替えます。対象や影響を安全に特定できない場合、または受入範囲外の不可逆なデータ損失が判明した場合は、その工程だけを保留して安全な独立作業を続けます。追加確認は再開条件にしません。Paper の BETA 状態は適用 risk として判断記録に残します。
+複製確認の完了だけで自動的に切り替えず、対象 server、停止・再開、更新するデータ、作業時間が既存の移行依頼と一致すること、複製の受け入れと復旧可能性を照合します。既存 world の 26.3 化と新要素利用は依頼の目的です。Paper の BETA 状態は risk として記録し、対象照合・復旧可能性・段階的適用を踏まえて依頼範囲内で判断します。危険な項目を安全に特定できない場合や、範囲外の不可逆損失が判明した場合はその工程を保留し、安全な独立作業を続けます。追加確認を再開条件にしません。
 
-実際に切り替える場合は、Bot を通常停止してから server を正常停止し、その時点で新しい offline backup を作成します。練習用 copy をそのまま昇格させず、最新の backup から切替用 copy を作り、同じ選定 build で更新します。
+切替前に read-only で対象、更新後の source・設定、人格・database・skill の保存先、新しい guarded launcher の内容と旧 launcher の退避先を照合します。旧 launcher は旧 source・作業 directory・人格設定を使うため、切替後の再起動に使わず backup に保全します。新 launcher は実 server の永続 working directory を使い、検証済み backup と同じ人格 file を server 内の絶対 path で参照する設定にします。旧 backup helper は stale PID を使うため再利用しません。Bot を通常停止してから server を正常停止し、書込み停止を確認して fresh offline backup を取り、別の復元 copy との照合を行います。その後に初めて新 launcher を配置・登録し、検証済み source と既存の人格・database・skill・owner-stop 状態を引き継ぎます。既に許可された API key は既存の秘密管理経路から process に渡し、値を表示・保存しません。検証 copy の world/DB は昇格させません。
 
 複製検証に失敗した場合は、複製 server と Bot だけを停止し、失敗した copy を隔離します。元 world は変更せず、複製検証用 backup で上書きしません。
 
