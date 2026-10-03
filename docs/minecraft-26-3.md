@@ -1,16 +1,16 @@
 # Minecraft Java 26.3 へ既存 world と AI 記憶を引き継ぐ手順
 
-この文書は、既存 world と Bot の継続性を保つための移行手順と確認記録です。Gate1 の copy 評価は記録時点の証拠であり、16.297 秒の観測で native 26.3 client と既定 application Bot の同時参加を確認した限定結果です。2026-10-04時点では、既存環境へ Paper 26.3 BETA build 143、Java 25 SerialGC、ViaVersion / ViaBackwards 5.12.0、Mineflayer 4.39.0（Bot protocol 26.1）を適用し、既定 application を稼働しています。既存 world・persona・記憶の保存先を維持して適用し、利用承認済みの既存 API 認証設定を再利用しました。ただし移行後の最終データ照合と配送受け入れは未完了です。進捗と最終判断は [Issue #126](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/126) と [PR #127](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/pull/127) を参照してください。
+この文書は、既存 world と Bot の継続性を保つための移行手順と確認記録です。Gate1 の copy 評価は記録時点の証拠であり、16.297 秒の観測で native 26.3 client と既定 application Bot の同時参加を確認した限定結果です。2026-10-04時点では、既存環境へ Paper 26.3 BETA build 143、Java 25 SerialGC、ViaVersion / ViaBackwards 5.12.0、Mineflayer 4.39.0（Bot protocol 26.1）を適用し、既定 application を稼働しています。既存 world・persona・記憶の保存先を維持して適用し、利用承認済みの既存 API 認証設定を再利用しました。既存データの構造・代表データ・永続記憶と通常保存後の再起動を確認しました。全world内容・全mob identity・長期安定性は未検証です。配送の最終判断は [Issue #126](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/126) と [PR #127](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/pull/127) を参照してください。
 
 ## 対象と版
 
-| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                                                                        |
-| ---------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                                                                                |
-| Paper                  | 26.3 BETA build 143                    | 既存環境へ適用済みです。BETA は安定版として扱わず、長期安定性と最終データ照合・配送受け入れは未確認です。                                                   |
-| Java                   | Java 25 SerialGC                      | 現適用 Paper 用の runtime です。切替前の構成は Java 21 でした。長時間安定性は未確認です。                                                                          |
-| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | 現適用 Paper でロードしています。旧 Bot の限定接続を確認しましたが、全機能の互換性は未確認です。                                                                   |
-| Bot                    | Mineflayer 4.39.0 / protocol 26.1     | 既定 application で稼働中です。切替前の構成は 4.37.1 / 1.21.11 でした。26.3 への直接対応や全機能、最終データ照合は未確認です。                                  |
+| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                                                          |
+| ---------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                                                                  |
+| Paper                  | 26.3 BETA build 143                     | 既存環境へ適用済みです。BETA は安定版として扱わず、長期安定性は未検証です。最終配送判断は Issue #126 / PR #127 を参照してください。 |
+| Java                   | Java 25 SerialGC                        | 現適用 Paper 用の runtime です。切替前の構成は Java 21 でした。長時間安定性は未確認です。                                           |
+| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | 現適用 Paper でロードしています。旧 Bot の限定接続を確認しましたが、全機能の互換性は未確認です。                                    |
+| Bot                    | Mineflayer 4.39.0 / protocol 26.1       | 既定 application で稼働中です。切替前の構成は 4.37.1 / 1.21.11 でした。26.3 への直接対応や全機能は未確認です。                      |
 
 版の根拠と実行前確認は次のとおりです。
 
