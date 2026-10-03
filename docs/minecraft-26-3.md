@@ -4,13 +4,13 @@
 
 ## 対象と版
 
-| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                |
-| ---------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                        |
-| Paper                  | 26.3 BETA build 143                     | 2026-10-03 時点の複製検証候補。BETA は安定版として扱いません。                            |
-| Java                   | Java 25（既存 runtime は 25.0.1）       | 複製環境で起動時の版を確認します。個人環境のインストール先は記録しません。                |
-| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | Paper 26.3 上で旧版 Bot を受け入れる構成を試します。組み合わせの個別動作は未確認です。    |
-| Bot                    | Mineflayer 4.37.1、接続版 1.21.11       | lockfile の固定を維持し、ViaBackwards 経由で試します。26.3 への直接接続対応は未確認です。 |
+| 項目                   | この手順で固定する内容                  | 確認と境界                                                                                                                                                       |
+| ---------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Minecraft Java Edition | 26.3 正式版                             | 2026-09-15 公開。クライアント版と Paper の状態は別々に確認します。                                                                                               |
+| Paper                  | 26.3 BETA build 143                     | 2026-10-03 時点の複製検証候補。BETA は安定版として扱いません。                                                                                                   |
+| Java                   | Java 25（既存 runtime は 25.0.1）       | 複製環境で起動時の版を確認します。個人環境のインストール先は記録しません。                                                                                       |
+| Via plugins            | ViaVersion 5.12.0 + ViaBackwards 5.12.0 | Paper 26.3 上で旧版 Bot を受け入れる構成を試します。組み合わせの個別動作は未確認です。                                                                           |
+| Bot                    | Mineflayer 4.39.0、候補接続版 26.1      | 固定 package は公式 4.39.0 release。既定 `MINECRAFT_VERSION=1.21.11`は維持し、26.1 候補は複製で明示設定します。26.3 への直接対応と候補の実環境動作は未確認です。 |
 
 版の根拠と実行前確認は次のとおりです。
 
@@ -18,8 +18,9 @@
 - Paper の[Java 要件](https://docs.papermc.io/paper/getting-started/)、[Downloads Service](https://docs.papermc.io/misc/downloads-service/)、[26.3 build 一覧 API](https://fill.papermc.io/v3/projects/paper/versions/26.3/builds)。実行直前に build 番号・`BETA` channel・配布 artifact の SHA-256 を照合し、一致しなければ起動しません。
 - [Paper 26.3 の告知](https://papermc.io/news/26-3/)は、26.3 へ保存した world を旧版へ戻せないと案内しています。
 - ViaBackwards の[5.12.0 release](https://github.com/ViaVersion/ViaBackwards/releases/tag/5.12.0)は 26.3 server support を記載しています。ViaBackwards は ViaVersion を必要とします（[ViaVersion 5.12.0](https://github.com/ViaVersion/ViaVersion/releases/tag/5.12.0)）。
-- Mineflayer の[4.37.1 release](https://github.com/PrismarineJS/mineflayer/releases/tag/4.37.1)を維持します。上流[4.39.0 README](https://github.com/PrismarineJS/mineflayer#features)の対応表は 26.1 までです。26.3 対応の[PR #4125](https://github.com/PrismarineJS/mineflayer/pull/4125)、[PR #4128](https://github.com/PrismarineJS/mineflayer/pull/4128)、[PR #4130](https://github.com/PrismarineJS/mineflayer/pull/4130)は 2026-10-03 時点で未マージでした。
-- 26.3 で追加された block 等が 1.21.11 Bot へどう変換・表示されるかは未検証です。接続や一部の観測が成功しても、新要素を完全に認識できたとは扱いません。
+- Mineflayer は[公式 4.39.0 release](https://github.com/PrismarineJS/mineflayer/releases/tag/4.39.0)に固定します。公式[対応表](https://github.com/PrismarineJS/mineflayer#features)が示す候補は 26.1 までで、26.3 への直接対応を示していません。関連する[PR #4125](https://github.com/PrismarineJS/mineflayer/pull/4125)、[PR #4128](https://github.com/PrismarineJS/mineflayer/pull/4128)、[PR #4130](https://github.com/PrismarineJS/mineflayer/pull/4130)の内容はこの release に含まれるとみなしません。
+- 既定の接続版は`MINECRAFT_VERSION=1.21.11`のままです。26.1 候補を検証する複製だけで`MINECRAFT_VERSION=26.1`を明示し、ViaBackwards 経由で別 profile として試します。公式[CI run 34038030872](https://github.com/PrismarineJS/mineflayer/actions/runs/34038030872)には 1.21.11 の chest close timeout があり、4.39.0 の既定版への後方互換も未実証です。
+- 26.3 で追加された block 等が Bot へどう変換・表示されるかは未検証です。接続や一部の観測が成功しても、新要素を完全に認識できたとは扱いません。
 
 Paper build 143 は、まず複製 world の評価に使います。Paper が BETA であることを risk として記録し、複製の受け入れと復旧可能性、対象 world と影響範囲を照合して、既存の移行依頼の範囲で実 world へ適用するか判断します。BETA であることだけを理由に一律禁止とはしません。
 
@@ -44,13 +45,14 @@ Paper build 143 は、まず複製 world の評価に使います。Paper が BE
 
 1. 復元済み backup からさらに検証用 copy を作り、Paper 26.3 BETA build 143 と Java 25 を使います。起動前に PaperMC Fill API の manifest で build ID・channel・SHA-256 を照合し、選んだ artifact と一致しなければ停止します。`server.properties`の port や bind 先は複製専用にし、公開ネットワークへ接続できない状態にします。
 2. ViaVersion と ViaBackwards 5.12.0 を導入します。元 server の plugin と設定を複製へ引き継ぎ、TreeGuard を含む各 plugin の起動・権限・world 保護が 26.3 上で機能するか確認します。非互換やデータ移行エラーがあれば、設定変更を広げずその検証を中断します。
-3. 26.3 クライアントと Bot を同じ複製 world へ接続します。Bot 設定は Mineflayer 4.37.1、`MINECRAFT_VERSION=1.21.11`を保ち、ViaBackwards 経由で接続します。オンライン認証では owner と Bot に別々の Minecraft identity を使い、同じ identity の二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
+3. 26.3 クライアントと Bot を同じ複製 world へ接続します。lockfile の Mineflayer 4.39.0 を使い、既定`MINECRAFT_VERSION=1.21.11`の fallback と、複製だけで`MINECRAFT_VERSION=26.1`を明示する candidate を別 profile として ViaBackwards 経由で試します。4.39.0 candidate は未検証で、26.1 接続も 26.3 への直接対応や新要素対応を証明しません。オンライン認証では owner と Bot に別々の Minecraft identity を使い、同じ identity の二重接続で片方を切断させません。認証設定を変更して接続成功とみなすことはしません。
 4. server log や接続受付だけで成功判定せず、ゲーム画面と複製 Bot の観測で確認します。既存 landmark と複数 dimension、playerdata、map、chest・entity が移行前と対応し、読み書きできることを確認します。26.3 の新要素を旧版 Bot が扱えるかは、個別に観測できた範囲だけ記録します。
 5. 複製 database で SQLite 整合性・schema 読込を確認し、永続化済みの人格設定・関係、MindStore の目的・停止状態、MemoryStore の記憶、McSkillRepository の skill と receipt が参照できることを確認します。直近の会話履歴はプロセス内の`PlayerConversationAgent.#history`にあり、再起動時にリセットされます。これは移行対象の永続データに含めず、引継ぎ受け入れ条件にしません。実記憶や会話を公開せず、項目別の成否だけを残します。
 6. 同じ複製環境で日本語会話、短いゲーム内動作、その実動作中の即時停止、Bot 切断・再接続、再起動後の停止状態と記憶の維持を確かめます。操作依頼や LLM の返答だけで成功とせず、ゲーム内変化を観測します。
 
 ### 今回の観測結果
 
+- probe3–5 は Mineflayer 4.37.1・`MINECRAFT_VERSION=1.21.11`で実施しました。native QuickPlay による旧版 Paper copy への接続と owner/Bot 同時接続も、この旧 fallback の履歴です。固定更新後の Mineflayer 4.39.0、および明示的な 26.1 candidate は実環境で未検証です。
 - offline backup とその復元 copy の全 254 file で、対応する各 file の SHA-256 とサイズが一致しました。backup 総量は 1.418 GB です。旧 Paper/Bot 環境は再起動し、dashboard HTTP 200、Bot 接続、memory 利用可能を確認しました。
 - Paper 26.3 BETA build 143・Java 25・ViaVersion/ViaBackwards 5.12.0・TreeGuard の複製構成はロードしました。正常停止後の比較では 3 dimension すべてで region/chunk/POI/entity-region 件数が一致し、既存 6 人分の Identity・Inventory・EnderItems も一致しました。代表 3 chunk の blockstate と収納 3 件も一致しましたが、これは全 world の意味的内容やゲーム機能の保証ではありません。
 - 両 SQLite database の`quick_check`は`ok`、9 table の既存 primary key は維持されました。episodes は 14570 から 14571 へ増えましたが、内容不変は照合していません。
