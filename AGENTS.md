@@ -6,7 +6,7 @@
 
 - ユーザーの依頼と制約を最優先し、rootから変更対象までのAGENTS.mdと発動Skillを読みます。
 - 製品の上位原則は、Minecraft世界に継続する一人のAIコンパニオンとして、人格・関係・共有経験・記憶・自律的判断の連続性を保つことです。ゲーム内の危険、死亡、建築変更はAIプレイヤーの判断に含み、強いowner要求に応じて選択を変えられます。通常のBukkit・サーバー権限とownerの永続停止を守り、credential、shell、任意コード、server admin accessは公開しません。既定経路とlegacy helperの配置は[自律プレイヤー](docs/autonomous-player.md)と[PlayerBody](docs/player-body.md)を参照します。
-- 目的、受け入れ条件、非対象、依存、検証方法、権限境界を確認してから作業します。
+- 目的、受け入れ条件、非対象、依存、検証方法、権限境界を確認し、依頼内の対象・影響に沿って作業します。既に依頼範囲へ含まれる工程ごとに再確認を求めず、詳しい運用は[docs/agent-harness.md](docs/agent-harness.md)に従います。
 - 現在のcode、config、test、文書、履歴を読み、既存挙動を保つ最小十分な差分を作ります。
 - 実施した検証、未実行検証、残るriskを分けて記録します。
 - .claude/と.cursor/はtool発見用の薄いadapterで、正本やhard gateを複製しません。
@@ -35,7 +35,7 @@
 - commitは独立してreview・revertできる一つの責務または受け入れ条件の単位にし、関連test・文書・schema・生成物を同じcommitへ含めます。
 - 一つの責務の実装・test・文書・検証が完了したら、次の独立責務を編集する前に、対象pathを明示したstage確認とcommitを行います。複数責務を最後に後付け分解しません。
 - shared worktreeの他担当差分を上書き・削除・commitせず、担当範囲を確認してから統合します。
-- merge、Issue / PR close、release、deploy、force-push、公開履歴の書換え、破壊的操作は対象と権限の別明示が必要です。
+- merge、Issue / PR close、release、deploy、force-push、公開履歴の書換え、破壊的操作は、依頼が対象と影響を含む場合にその範囲で実行し、工程ごとの再確認は求めません。受入範囲にない不可逆なデータ損失が分かった場合は原本を保全してその工程だけを保留し、安全な独立作業を続けます。toolやplatformが拒否した権限は迂回しません。
 
 ## ガバナンス変更
 
