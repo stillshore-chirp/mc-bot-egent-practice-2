@@ -1306,13 +1306,16 @@ export class PlayerPurposeAgent {
             ...(proposalResolution === undefined ? {} : { proposalResolution }),
           });
           if (!saved.accepted) {
-            const rejectionCode = saved.rejectionCode;
+            const rejectionCode =
+              saved.rejectionCode ??
+              (saved.snapshot.stopped
+                ? "STOPPED"
+                : saved.snapshot.revision !== expectedRevision
+                  ? "CAS_STALE"
+                  : undefined);
             return {
               ok: false,
-              code:
-                rejectionCode === "GOAL_CAPACITY"
-                  ? "GOAL_CAPACITY"
-                  : "STALE_REVISION",
+              code: rejectionCode ?? "NO_STATE_CHANGE",
               ...(rejectionCode === undefined ? {} : { rejectionCode }),
             };
           }
@@ -1357,8 +1360,18 @@ export class PlayerPurposeAgent {
             facts,
             uncertainties,
           });
-          if (!saved.accepted)
-            return { ok: false, code: "STALE_REVISION_OR_EMPTY" };
+          if (!saved.accepted) {
+            const rejectionCode = saved.snapshot.stopped
+              ? "STOPPED"
+              : saved.snapshot.revision !== expectedRevision
+                ? "CAS_STALE"
+                : undefined;
+            return {
+              ok: false,
+              code: rejectionCode ?? "NO_STATE_CHANGE",
+              ...(rejectionCode === undefined ? {} : { rejectionCode }),
+            };
+          }
           expectedRevision = saved.snapshot.revision;
           expectedSnapshot = saved.snapshot;
           return {
@@ -1791,12 +1804,14 @@ export class PlayerPurposeAgent {
           : { onResponsesRequestState: input.onResponsesRequestState }),
         shouldFinishAfterTool: (toolName, result) => {
           const outcome = asRecord(result);
-          if (toolName !== "commit_action_decision") return false;
           if (
             outcome?.ok === false &&
-            (outcome.code === "STALE_REVISION" || outcome.code === "STOPPED")
+            (outcome.code === "CAS_STALE" ||
+              outcome.code === "STALE_REVISION" ||
+              outcome.code === "STOPPED")
           )
             return true;
+          if (toolName !== "commit_action_decision") return false;
           return (
             committedDecision !== undefined &&
             outcome?.ok === true &&

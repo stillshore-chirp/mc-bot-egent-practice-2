@@ -1931,6 +1931,61 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each([
+    {
+      toolName: "commit_goal_state",
+      argumentsValue: {
+        ...emptyGoalStateArguments(),
+        goalTitle: "Reassess the nearby threat",
+        goalStatus: "active",
+        goalSource: "self",
+      },
+    },
+    {
+      toolName: "update_understanding",
+      argumentsValue: {
+        facts: [{ summary: "A fresh state fact", source: "observed" }],
+        uncertainties: [],
+      },
+    },
+  ])(
+    "ends the Purpose run after a stale $toolName write",
+    async ({ toolName, argumentsValue }) => {
+      const mindRef: { current?: PlayerMindStore } = {};
+      const fixture = openPurposeFixture([
+        (_request, index) => {
+          const mind = mindRef.current;
+          if (index !== 0 || mind === undefined)
+            throw new Error("TEST_REVISION_FIXTURE_MISSING");
+          mind.enqueueEvent("state_changed", "A newer event arrived.");
+          return functionCallResponse(
+            "stale-state-write",
+            toolName,
+            argumentsValue,
+          );
+        },
+        terminalResponse("The stale state was somehow accepted."),
+      ]);
+      mindRef.current = fixture.mind;
+
+      try {
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+
+        expect(result.accepted).toBe(false);
+        expect(fixture.requests).toHaveLength(1);
+        expect(
+          fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
+        ).toMatchObject({ resultCode: "CAS_STALE", resultClass: "rejected" });
+        expect(fixture.mind.pendingEvents()).toHaveLength(1);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("reports unknown when a stale revision has no observable component delta", async () => {
     const mindRef: { current?: PlayerMindStore } = {};
     const fixture = openPurposeFixture([
