@@ -3348,6 +3348,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     let settledTargetSince: number | undefined;
     let pathFailurePromise: Promise<never> | undefined;
     let rejectPathFailure: ((error: ItemCollectionError) => void) | undefined;
+    let lastVisibleTarget: Entity | undefined;
+    let lastVisibleAimPoint: Vec3 | undefined;
     const onPathUpdate = (results: {
       readonly status: string;
       readonly path?: readonly unknown[];
@@ -3383,6 +3385,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     const observeVisibleTarget = async (
       firstObservation: PlayerBodyObservation | null,
       deadline = Date.now() + itemCollectionVisibilityGraceMs,
+      attemptedViewRecovery = false,
     ): Promise<
       | {
           readonly observation: PlayerBodyObservation;
@@ -3403,16 +3406,46 @@ export class MineflayerPlayerBody implements PlayerBody {
               "invalid_target",
               "The requested visible entity is not an item entity.",
             );
+          const currentTarget = bot.entities[entityId];
+          if (currentTarget === undefined)
+            throw new ItemCollectionError(
+              "entity_removed",
+              "The requested item entity left the client entity table.",
+            );
+          if (
+            lastVisibleTarget !== undefined &&
+            currentTarget !== lastVisibleTarget
+          )
+            throw new ItemCollectionError(
+              "entity_removed",
+              "The requested item entity changed while it was being collected.",
+            );
+          lastVisibleTarget = currentTarget;
+          if (Number.isFinite(currentTarget.height) && currentTarget.height > 0)
+            lastVisibleAimPoint = new Vec3(
+              target.position.x,
+              target.position.y + Math.max(0.1, currentTarget.height * 0.55),
+              target.position.z,
+            );
           return { observation: firstObservation, target };
         }
       }
 
       if (pathPromise !== undefined) await stopPath();
       if (pickupObserved()) return undefined;
-      if (bot.entities[entityId] === undefined)
+      const currentTarget = bot.entities[entityId];
+      if (
+        currentTarget === undefined ||
+        (lastVisibleTarget !== undefined && currentTarget !== lastVisibleTarget)
+      )
         throw new ItemCollectionError(
           "entity_removed",
           "The requested item entity has left the current client entity table.",
+        );
+      if (currentTarget.name !== "item")
+        throw new ItemCollectionError(
+          "invalid_target",
+          "The requested visible entity is not an item entity.",
         );
       if (Date.now() >= deadline)
         throw new ItemCollectionError(
@@ -3420,9 +3453,53 @@ export class MineflayerPlayerBody implements PlayerBody {
           "The requested item did not return to the current visible view.",
         );
 
+      if (!attemptedViewRecovery && lastVisibleAimPoint !== undefined) {
+        const recoveryEntity = bot.entity;
+        const recoveryLifeGeneration = this.lifeGeneration;
+        attemptedViewRecovery = true;
+        const isCurrentLife = (): boolean => {
+          if (
+            this.boundBot !== bot ||
+            this.boundBotEnded ||
+            this.disconnectedSinceBind ||
+            this.lifeGeneration !== recoveryLifeGeneration ||
+            bot.entity !== recoveryEntity ||
+            bot.entities[entityId] !== lastVisibleTarget
+          )
+            return false;
+          try {
+            return this.getBot() === bot;
+          } catch {
+            return false;
+          }
+        };
+        try {
+          throwIfAborted(signal);
+          if (!isCurrentLife()) return undefined;
+          await waitForAction(bot.lookAt(lastVisibleAimPoint, true), signal);
+          if (pickupObserved()) return undefined;
+          if (!isCurrentLife()) return undefined;
+          await waitForPhysicsTick(bot, signal);
+          if (pickupObserved()) return undefined;
+          if (!isCurrentLife()) return undefined;
+          return await observeVisibleTarget(
+            this.safeObserve(bot),
+            deadline,
+            true,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          // Keep the existing visibility deadline if the bounded view turn fails.
+        }
+      }
+
       await waitForItemCollectionPoll(signal);
       if (pickupObserved()) return undefined;
-      return observeVisibleTarget(this.safeObserve(bot), deadline);
+      return observeVisibleTarget(
+        this.safeObserve(bot),
+        deadline,
+        attemptedViewRecovery,
+      );
     };
 
     try {

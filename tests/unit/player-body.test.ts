@@ -1279,40 +1279,144 @@ describe("player body", () => {
     }
   });
 
-  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+  it("re-aims once at the last visible item point and confirms the later pickup", async () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
       const item = addItemEntity(fake.bot);
       const body = new MineflayerPlayerBody(() => fake.bot);
-      let cancelPath: (() => void) | undefined;
-      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
-        () =>
-          new Promise<void>((_resolve, reject) => {
-            cancelPath = () => reject(new Error("Path stopped"));
-            fake.bot.entity.yaw = Math.PI / 2;
-            item.position = new Vec3(0, 64, -12);
-          }),
-      );
-      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
-        if (goal === null) cancelPath?.();
+      let cancelFirstPath: (() => void) | undefined;
+      let physicsTickSent = false;
+      fake.bot.on("physicsTick", () => {
+        physicsTickSent = true;
       });
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              cancelFirstPath = () => reject(new Error("Path stopped"));
+              fake.bot.entity.yaw = Math.PI / 2;
+            }),
+        )
+        .mockImplementationOnce(async () => {
+          expect(physicsTickSent).toBe(true);
+          fake.bot.entity.position = new Vec3(0, 64, -4.5);
+          emitItemPickup(fake, item);
+          removeItemEntity(fake.bot, item.id);
+        });
+      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+        if (goal === null) cancelFirstPath?.();
+      });
+      const lookAt = vi.spyOn(fake.bot, "lookAt");
 
       const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
-      await vi.advanceTimersByTimeAsync(1_250);
+      await vi.advanceTimersByTimeAsync(1_000);
       const result = await resultPromise;
 
-      expect(result.status).toBe("failed");
-      expect(result.itemCollectionOutcome).toBe("target_unobservable");
-      expect(result.after?.perception.entities).not.toContain(
-        expect.objectContaining({ id: 2 }),
-      );
-      expect(result.detail).toContain(
-        "did not return to the current visible view",
+      expect(result.status).toBe("successful");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(result.observedEffect).toEqual({
+        type: "item_collected",
+        entityId: 2,
+      });
+      expect(goto).toHaveBeenCalledTimes(2);
+      expect(lookAt).toHaveBeenCalledTimes(1);
+      expect(lookAt).toHaveBeenCalledWith(
+        new Vec3(0, 64 + item.height * 0.55, -5),
+        true,
       );
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    let cancelPath: (() => void) | undefined;
+    let obstructed = false;
+    const originalRaycast = fake.bot.world.raycast.bind(fake.bot.world);
+    vi.spyOn(fake.bot.world, "raycast").mockImplementation(
+      (origin, direction, range, matching) => {
+        if (obstructed && matching !== undefined)
+          return makeBlock(
+            "stone",
+            1,
+            new Vec3(0, 64, -3),
+          ) as unknown as ReturnType<typeof fake.bot.world.raycast>;
+        return originalRaycast(origin, direction, range, matching);
+      },
+    );
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+          fake.bot.entity.yaw = Math.PI / 2;
+          item.position = new Vec3(1, 64, -5);
+          obstructed = true;
+        }),
+    );
+    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+    const lookAt = vi.spyOn(fake.bot, "lookAt");
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("failed");
+    expect(result.itemCollectionOutcome).toBe("target_unobservable");
+    expect(result.after?.perception.entities).not.toContain(
+      expect.objectContaining({ id: 2 }),
+    );
+    expect(result.detail).toContain(
+      "did not return to the current visible view",
+    );
+    expect(result.observedEffect).toBeUndefined();
+    expect(lookAt).toHaveBeenCalledTimes(1);
+    expect(lookAt).toHaveBeenCalledWith(
+      new Vec3(0, 64 + item.height * 0.55, -5),
+      true,
+    );
+  });
+
+  it("does not resume collection after owner stop during the recovery physics tick", async () => {
+    const fake = makeFakeBot();
+    addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    let cancelPath: (() => void) | undefined;
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+          fake.bot.entity.yaw = Math.PI / 2;
+        }),
+    );
+    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+    const lookAt = vi
+      .spyOn(fake.bot, "lookAt")
+      .mockImplementation(async () => undefined);
+    const resultPromise = body.execute(
+      { kind: "collect_item", entityId: 2 },
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(fake.bot.listenerCount("physicsTick")).toBe(1),
+    );
+    controller.abort(new Error("Owner stopped collection"));
+    const result = await resultPromise;
+
+    expect(result.status).toBe("interrupted");
+    expect(result.observedEffect).toBeUndefined();
+    expect(goto).toHaveBeenCalledTimes(1);
+    expect(fake.bot.listenerCount("physicsTick")).toBe(0);
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
   it("aborts the visibility grace wait without starting an item path", async () => {
@@ -1365,6 +1469,7 @@ describe("player body", () => {
 
     expect(removedResult.status).toBe("failed");
     expect(removedResult.itemCollectionOutcome).toBe("entity_removed");
+    expect(disappeared.bot.lookAt).not.toHaveBeenCalled();
 
     const noPath = makeFakeBot();
     addItemEntity(noPath.bot);
