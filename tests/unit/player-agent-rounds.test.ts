@@ -29,8 +29,13 @@ import {
 } from "../../src/player/agents.js";
 import { PlayerMindStore } from "../../src/player/mind-store.js";
 import { toObservationEvidence } from "../../src/player/observation-evidence.js";
-import type { PlayerResponsesClient } from "../../src/player/responses.js";
+import {
+  createPlayerTool,
+  runPlayerAgent,
+  type PlayerResponsesClient,
+} from "../../src/player/responses.js";
 import { toSpatialView } from "../../src/player/spatial-view.js";
+import type { TraceService } from "../../src/trace/service.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -40,6 +45,289 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
+  it("records fixed tool names and result classes without tool payloads", async () => {
+    const traceResults: {
+      readonly stage: string;
+      readonly name: string;
+      readonly kind: string;
+      readonly summary: string | undefined;
+    }[] = [];
+    const eventOrder: string[] = [];
+    const trace = {
+      withSpan: async (
+        stage: string,
+        name: string,
+        options: {
+          readonly resultKind?: string;
+          readonly summarizeResult?:
+            ((result: unknown) => string | undefined) | undefined;
+        },
+        operation: () => Promise<unknown>,
+      ) => {
+        if (options.resultKind === "tool_result")
+          eventOrder.push(`audit-start:${name}`);
+        const result = await operation();
+        if (options.resultKind !== undefined)
+          traceResults.push({
+            stage,
+            name,
+            kind: options.resultKind,
+            summary: options.summarizeResult?.(result),
+          });
+        if (options.resultKind === "tool_result")
+          eventOrder.push(`audit-end:${name}`);
+        return result;
+      },
+    } as unknown as TraceService;
+    const privateMarker = "PRIVATE_TOOL_PAYLOAD_130";
+    let successfulToolExecutions = 0;
+    let rejectedToolExecutions = 0;
+    let failedToolExecutions = 0;
+    const schema = z.object({ value: z.string() }).strict();
+    const tools = [
+      createPlayerTool({
+        name: "inspect_runtime",
+        description: "test runtime inspection",
+        schema,
+        execute: () => {
+          eventOrder.push("execute:inspect_runtime");
+          successfulToolExecutions += 1;
+          return { ok: true, privateValue: privateMarker };
+        },
+      }),
+      createPlayerTool({
+        name: "describe_operation",
+        description: "test operation description",
+        schema,
+        execute: () => {
+          eventOrder.push("execute:describe_operation");
+          rejectedToolExecutions += 1;
+          return { ok: false, code: "TEST_REJECTED" };
+        },
+      }),
+      createPlayerTool({
+        name: "observe_body",
+        description: "test body observation",
+        schema,
+        execute: () => {
+          eventOrder.push("execute:observe_body");
+          failedToolExecutions += 1;
+          throw new Error(privateMarker);
+        },
+      }),
+    ];
+    const requests: unknown[] = [];
+    const responses = [
+      functionCallResponse("trace-ok", "inspect_runtime", {
+        value: privateMarker,
+      }),
+      functionCallResponse("trace-rejected", "describe_operation", {
+        value: privateMarker,
+      }),
+      functionCallResponse("trace-error", "observe_body", {
+        value: privateMarker,
+      }),
+      functionCallResponse("trace-unknown", "unregistered_private_name", {
+        value: privateMarker,
+      }),
+      terminalResponse("完了しました。"),
+    ];
+
+    const result = await runPlayerAgent({
+      client: scriptedClient(responses, requests),
+      model: "test-model",
+      instructions: "test only",
+      input: "test question",
+      tools,
+      logger: pino({ level: "silent" }),
+      trace,
+    });
+
+    expect(result.toolCalls).toBe(4);
+    expect(successfulToolExecutions).toBe(1);
+    expect(rejectedToolExecutions).toBe(1);
+    expect(failedToolExecutions).toBe(1);
+    expect(traceResults).toEqual([
+      {
+        stage: "tool",
+        name: "Player agent tool inspect_runtime",
+        kind: "tool_result",
+        summary: "tool=inspect_runtime;result=ok",
+      },
+      {
+        stage: "tool",
+        name: "Player agent tool describe_operation",
+        kind: "tool_result",
+        summary: "tool=describe_operation;result=rejected",
+      },
+      {
+        stage: "tool",
+        name: "Player agent tool observe_body",
+        kind: "tool_result",
+        summary: "tool=observe_body;result=error",
+      },
+      {
+        stage: "tool",
+        name: "Player agent tool unknown",
+        kind: "tool_result",
+        summary: "tool=unknown;result=unknown",
+      },
+    ]);
+    expect(eventOrder).toEqual([
+      "execute:inspect_runtime",
+      "audit-start:Player agent tool inspect_runtime",
+      "audit-end:Player agent tool inspect_runtime",
+      "execute:describe_operation",
+      "audit-start:Player agent tool describe_operation",
+      "audit-end:Player agent tool describe_operation",
+      "execute:observe_body",
+      "audit-start:Player agent tool observe_body",
+      "audit-end:Player agent tool observe_body",
+      "audit-start:Player agent tool unknown",
+      "audit-end:Player agent tool unknown",
+    ]);
+    expect(JSON.stringify(traceResults)).not.toContain(privateMarker);
+    expect(JSON.stringify(traceResults)).not.toContain(
+      "unregistered_private_name",
+    );
+  });
+
+  it("sends the final reply once when trace recording fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-trace-failure-"));
+    temporaryDirectories.push(directory);
+    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    const requests: unknown[] = [];
+    let toolExecutions = 0;
+    let sayCalls = 0;
+    const trace = {
+      withSpan: async (
+        _stage: string,
+        _name: string,
+        options: { readonly resultKind?: string | undefined },
+        operation: () => Promise<unknown>,
+      ) => {
+        const result = await operation();
+        if (options.resultKind !== undefined)
+          throw new Error("TRACE_STORE_UNAVAILABLE");
+        return result;
+      },
+    } as unknown as TraceService;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(
+        [
+          functionCallResponse("trace-failure-tool", "inspect_runtime", {}),
+          terminalResponse("確認しました。"),
+        ],
+        requests,
+      ),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      trace,
+      inspectRuntime: () => {
+        toolExecutions += 1;
+        return undefined;
+      },
+      say: async () => {
+        sayCalls += 1;
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+
+    try {
+      const turn = conversation.nextTurn();
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "エージェントは死んでいる？",
+        turn,
+      });
+      expect(toolExecutions).toBe(1);
+      expect(sayCalls).toBe(1);
+    } finally {
+      mind.close();
+    }
+  });
+
+  it("records final reply callback completion without reply text", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "player-final-trace-"));
+    temporaryDirectories.push(directory);
+    const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
+    const requests: unknown[] = [];
+    const traceResults: {
+      readonly kind: string;
+      readonly summary: string | undefined;
+    }[] = [];
+    const eventOrder: string[] = [];
+    const trace = {
+      withSpan: async (
+        _stage: string,
+        _name: string,
+        options: {
+          readonly resultKind?: string;
+          readonly summarizeResult?:
+            ((result: unknown) => string | undefined) | undefined;
+        },
+        operation: () => Promise<unknown>,
+      ) => {
+        if (options.resultKind === "final_response")
+          eventOrder.push("audit-start");
+        const result = await operation();
+        if (options.resultKind !== undefined)
+          traceResults.push({
+            kind: options.resultKind,
+            summary: options.summarizeResult?.(result),
+          });
+        if (options.resultKind === "final_response")
+          eventOrder.push("audit-end");
+        return result;
+      },
+    } as unknown as TraceService;
+    const privateReply = "PRIVATE_FINAL_REPLY_130";
+    let sayCalls = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient([terminalResponse(privateReply)], requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      trace,
+      say: async () => {
+        eventOrder.push("say");
+        sayCalls += 1;
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+
+    try {
+      const turn = conversation.nextTurn();
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "状態を確認して",
+        turn,
+      });
+      expect(sayCalls).toBe(1);
+      expect(traceResults).toEqual([
+        {
+          kind: "final_response",
+          summary: "say_callback_completed",
+        },
+      ]);
+      expect(eventOrder).toEqual(["say", "audit-start", "audit-end"]);
+      expect(JSON.stringify(traceResults)).not.toContain(privateReply);
+    } finally {
+      mind.close();
+    }
+  });
+
   it("inherits operation references in the dedicated review from the used Skill version", async () => {
     const runId = "learning-revise-dedicated";
     const skillId = "learning-used-skill";

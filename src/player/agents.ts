@@ -1004,7 +1004,7 @@ export class PlayerConversationAgent {
     if (ownerFactSave.failed) {
       const reply =
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。";
-      await this.options.say(reply);
+      await sayConversationReply(this.options.trace, this.options.say, reply);
       currentConversationTurn.assistantReply = reply;
       return;
     }
@@ -1072,8 +1072,38 @@ export class PlayerConversationAgent {
         reply = assistantConversationReplyFallback;
     }
     if (input.turn !== this.#latestTurn) return;
-    await this.options.say(reply);
+    await sayConversationReply(this.options.trace, this.options.say, reply);
     currentConversationTurn.assistantReply = reply;
+  }
+}
+
+async function sayConversationReply(
+  trace: TraceService | undefined,
+  say: (reply: string) => void | Promise<void>,
+  reply: string,
+): Promise<void> {
+  await say(reply);
+  if (trace === undefined) return;
+  try {
+    await trace.withSpan(
+      "response",
+      "Conversation final reply",
+      {
+        summary:
+          "Post-send audit only; duration covers this audit span, not say callback execution.",
+        sensitivity: "internal",
+        attributes: {
+          durationScope: "audit_only",
+          completionScope: "say_callback_returned",
+          serverReceipt: "unconfirmed",
+        },
+        resultKind: "final_response",
+        summarizeResult: () => "say_callback_completed",
+      },
+      async () => "say_callback_completed",
+    );
+  } catch {
+    // The reply already completed; audit failure must not replay or suppress it.
   }
 }
 
