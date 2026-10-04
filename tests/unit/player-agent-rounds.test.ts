@@ -152,11 +152,19 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "観測が無い場合のobserve_bodyは最大1回",
+        "最初の観測がない場合だけobserve_bodyを一度使えます",
       );
       expect(request.instructions).toContain(
-        "利用可能な操作から今できる一つを直ちにcommit_action_decision",
+        "今できる一手を選び、commit_action_decisionで確定",
       );
+      expect(request).toMatchObject({
+        model: "gpt-6-luna",
+        reasoning: { effort: "none" },
+      });
+      expect(fixture.requestOptions[0]).toMatchObject({
+        maxRetries: 0,
+        timeout: 10_000,
+      });
       expect(request.instructions).toContain("look:");
       expect(request.instructions).not.toContain(
         "死亡回収のexpectedOutcome先頭には",
@@ -164,8 +172,129 @@ describe("player agent response rounds", () => {
       const payload = requestUserPayload(request);
       expect(payload.observation).toMatchObject({ self: { health: 3 } });
       expect(JSON.stringify(payload.observation)).toContain("zombie");
+      expect(payload.runtime).not.toHaveProperty("skillActivity");
+      expect(payload.runtime).not.toHaveProperty("learningReferences");
       expect(requestUserPayload(request).events).toContainEqual(
         expect.objectContaining({ kind: "bot_damaged" }),
+      );
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      expect(tools.map(({ name }) => name)).toEqual([
+        "describe_operation",
+        "commit_action_decision",
+      ]);
+      expect(tools.map(({ name }) => name)).not.toContain("search_skills");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses the instant first-action path for a newly received strong owner proposal", async () => {
+    const fixture = openPurposeFixture([
+      terminalResponse("The current owner request has a first step."),
+    ]);
+    try {
+      const proposal = fixture.mind.addProposal({
+        title: "Gather birch logs",
+        reason: "The owner asked for nearby wood.",
+        priority: 5,
+      });
+      const event = fixture.mind
+        .pendingEvents()
+        .findLast(({ kind }) => kind === "owner_proposal");
+      expect(event).toBeDefined();
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: event === undefined ? [] : [event],
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request).toMatchObject({
+        model: "gpt-6-luna",
+        reasoning: { effort: "none" },
+      });
+      expect(fixture.requestOptions[0]).toMatchObject({
+        maxRetries: 0,
+        timeout: 10_000,
+      });
+      expect(request.instructions).toContain("危険は創作せず");
+      expect(request.instructions).toContain("proposalDisposition");
+      expect(request.instructions).not.toContain("直近の被害・死亡");
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      const commitTool = tools.find(
+        ({ name }) => name === "commit_action_decision",
+      );
+      expect(JSON.stringify(commitTool?.parameters)).toContain(
+        "proposalDisposition",
+      );
+      expect(JSON.stringify(commitTool?.parameters)).toContain("proposalId");
+      expect(requestUserPayload(request).runtime).toMatchObject({
+        proposals: [
+          expect.objectContaining({ id: proposal.id, priorityPreference: 5 }),
+        ],
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps old proposal and startup death events on the normal Purpose path", async () => {
+    const fixture = openPurposeFixture([
+      terminalResponse("Continue the current purpose normally."),
+    ]);
+    try {
+      const adopted = fixture.mind.addProposal({
+        title: "Already resolved request",
+        reason: "Resolved before startup.",
+        priority: 5,
+      });
+      const resolved = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        proposalResolution: {
+          proposalId: adopted.id,
+          disposition: "adopted",
+          resolution: "Already incorporated into the active goal.",
+        },
+      });
+      expect(resolved.accepted).toBe(true);
+      fixture.mind.addProposal({
+        title: "Old high-priority proposal still pending",
+        reason: "Its startup wake must not be mistaken for a new request.",
+        priority: 5,
+      });
+      fixture.mind.recordDeathEvent(
+        "2026-09-25T00:00:00.000Z",
+        "Historical death event.",
+      );
+      const staleOwnerWakeAt = new Date(Date.now() - 120_000).toISOString();
+      const pending = fixture.mind
+        .pendingEvents()
+        .map((event) =>
+          event.kind === "owner_proposal"
+            ? { ...event, createdAt: staleOwnerWakeAt }
+            : event,
+        );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: pending,
+        urgentPerceptionWake: false,
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request).toMatchObject({ model: "test-model" });
+      expect(request).not.toHaveProperty("reasoning");
+      expect(fixture.requestOptions[0]).toEqual({});
+      expect(request.instructions).toContain(
+        "新しい目的や活動に初めて着手する時",
       );
     } finally {
       fixture.close();
@@ -3168,6 +3297,7 @@ interface PurposeFixture {
   readonly skills: McSkillRepository;
   readonly observationCalls: number;
   readonly requests: unknown[];
+  readonly requestOptions: unknown[];
   close(): void;
 }
 
@@ -3191,6 +3321,7 @@ function openPurposeFixture(
     allowedOperationNames: playerOperationNames,
   });
   const requests: unknown[] = [];
+  const requestOptions: unknown[] = [];
   let observationCalls = 0;
   const body = {
     observe: async () => {
@@ -3200,7 +3331,7 @@ function openPurposeFixture(
       return observeBody();
     },
   } as unknown as PlayerBody;
-  const client = scriptedClient(responses, requests);
+  const client = scriptedClient(responses, requests, requestOptions);
   const agent = new PlayerPurposeAgent({
     client,
     apiKey: "test-only",
@@ -3224,6 +3355,7 @@ function openPurposeFixture(
       return observationCalls;
     },
     requests,
+    requestOptions,
     close: () => {
       skills.close();
       mind.close();
@@ -3358,11 +3490,13 @@ function openConversationFixture(): ConversationFixture {
 function scriptedClient(
   responses: ScriptedResponse[],
   requests: unknown[],
+  requestOptions?: unknown[],
 ): PlayerResponsesClient {
   return {
     responses: {
-      create: async (request: unknown) => {
+      create: async (request: unknown, options?: unknown) => {
         const index = requests.push(request) - 1;
+        requestOptions?.push(options ?? {});
         const response = responses.shift();
         if (response === undefined)
           throw new Error("TEST_RESPONSE_QUEUE_EMPTY");
