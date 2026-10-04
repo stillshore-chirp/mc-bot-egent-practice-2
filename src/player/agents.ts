@@ -402,6 +402,66 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function damageReflexInputMetadata(serializedInput: string):
+  | {
+      readonly reflexResultCount: number;
+      readonly confirmedSameLifeCount: number;
+      readonly latestResultObservedAt: string;
+    }
+  | undefined {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(serializedInput) as unknown;
+  } catch {
+    return undefined;
+  }
+  const runtime = asRecord(asRecord(payload)?.runtime);
+  const recentOutcomes = Array.isArray(runtime?.recentOutcomes)
+    ? runtime.recentOutcomes
+    : [];
+  const reflexResults = recentOutcomes.flatMap((value) => {
+    const outcome = asRecord(value);
+    const summary = outcome?.summary;
+    const observedAt = outcome?.observedAt;
+    if (
+      outcome === undefined ||
+      typeof summary !== "string" ||
+      !summary.startsWith("damage-reflex ") ||
+      typeof observedAt !== "string" ||
+      !Number.isFinite(Date.parse(observedAt))
+    )
+      return [];
+    const serverConfirmedAt = /(?:^|; )serverConfirmedAt=([^;]+)/u.exec(
+      summary,
+    )?.[1];
+    return [
+      {
+        status: outcome.status,
+        summary,
+        observedAt,
+        observedAtMs: Date.parse(observedAt),
+        confirmedSameLife:
+          outcome.status === "successful" &&
+          summary.endsWith("; sameLife=true") &&
+          serverConfirmedAt !== undefined &&
+          serverConfirmedAt !== "unknown" &&
+          Number.isFinite(Date.parse(serverConfirmedAt)),
+      },
+    ];
+  });
+  if (reflexResults.length === 0) return undefined;
+  const latest = reflexResults.reduce((current, result) =>
+    result.observedAtMs > current.observedAtMs ? result : current,
+  );
+  return {
+    reflexResultCount: reflexResults.length,
+    confirmedSameLifeCount: reflexResults.filter(
+      ({ confirmedSameLife }) => confirmedSameLife,
+    ).length,
+    latestResultObservedAt: latest.observedAt,
+  };
+}
+
 function serializedStateChanged(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) !== JSON.stringify(right);
 }
@@ -2023,6 +2083,8 @@ export class PlayerPurposeAgent {
                   dimension === bodyObservation.dimension),
             ),
     });
+    const reflexInputMetadata = damageReflexInputMetadata(inputText);
+    let reflexInputMarkerLogged = false;
     try {
       await runPlayerAgent({
         client: this.#client,
@@ -2045,9 +2107,20 @@ export class PlayerPurposeAgent {
         ...(input.shouldStopAfterResponse === undefined
           ? {}
           : { shouldStopAfterResponse: input.shouldStopAfterResponse }),
-        ...(input.onResponsesRequestState === undefined
-          ? {}
-          : { onResponsesRequestState: input.onResponsesRequestState }),
+        onResponsesRequestState: (active) => {
+          if (
+            active &&
+            !reflexInputMarkerLogged &&
+            reflexInputMetadata !== undefined
+          ) {
+            this.options.logger.info(
+              reflexInputMetadata,
+              "serialized Purpose input includes damage reflex outcomes",
+            );
+            reflexInputMarkerLogged = true;
+          }
+          input.onResponsesRequestState?.(active);
+        },
         shouldFinishAfterTool: (toolName, result) => {
           const outcome = asRecord(result);
           if (

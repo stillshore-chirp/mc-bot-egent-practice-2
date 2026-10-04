@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import pino, { type Logger } from "pino";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 
@@ -200,6 +200,110 @@ describe("player agent response rounds", () => {
       fixture.close();
     }
   });
+
+  it.each(["normal", "urgent", "absent"] as const)(
+    "logs anonymous reflex-input metadata only when the %s serialized runtime contains it",
+    async (mode) => {
+      const logger = pino({ level: "silent" });
+      const info = vi.spyOn(logger, "info");
+      const observedAt = "2026-10-04T07:14:59.000Z";
+      const startedAt = "2026-10-04T07:14:57.000Z";
+      const serverConfirmedAt = "2026-10-04T07:14:58.000Z";
+      const resultSummary = `damage-reflex hit_confirmed; operation=attack; status=successful; startedAt=${startedAt}; serverConfirmedAt=${serverConfirmedAt}; sameLife=true`;
+      const eventSummary = `damage-reflex events=1; hit_confirmed; operation=attack; status=successful; startedAt=${startedAt}; serverConfirmedAt=${serverConfirmedAt}; sameLife=true`;
+      const fixture = openPurposeFixture(
+        [terminalResponse("I will use the confirmed attack result.")],
+        undefined,
+        createMemoryPort(),
+        async () => bodyObservationFixture(),
+        undefined,
+        logger,
+      );
+      const operationId = `damage-reflex:${startedAt}:0`;
+      if (mode !== "absent")
+        fixture.mind.recordOutcome({
+          evidence: {
+            operationId,
+            kind: "attack",
+            status: "successful",
+            summary: resultSummary,
+            observedAt,
+          },
+        });
+      const events =
+        mode === "normal"
+          ? [
+              {
+                id: `body_outcome:${operationId}`,
+                kind: "body_outcome" as const,
+                summary: eventSummary,
+                createdAt: observedAt,
+              },
+            ]
+          : mode === "urgent"
+            ? [
+                {
+                  id: "synthetic-damage-wake",
+                  kind: "bot_damaged" as const,
+                  summary: "Synthetic damage wake.",
+                  createdAt: observedAt,
+                },
+              ]
+            : [];
+
+      try {
+        await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events,
+        });
+
+        expect(fixture.requests).toHaveLength(1);
+        const payload = requestUserPayload(fixture.requests[0]);
+        const runtime = z
+          .record(z.string(), z.unknown())
+          .parse(payload.runtime);
+        const outcomes = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.recentOutcomes);
+        const markerCalls = info.mock.calls.filter(
+          ([, message]) =>
+            message ===
+            "serialized Purpose input includes damage reflex outcomes",
+        );
+        if (mode === "absent") {
+          expect(
+            outcomes.some(
+              ({ summary }) =>
+                typeof summary === "string" &&
+                summary.startsWith("damage-reflex "),
+            ),
+          ).toBe(false);
+          expect(markerCalls).toHaveLength(0);
+          return;
+        }
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            kind: "attack",
+            status: "successful",
+            summary: resultSummary,
+            observedAt,
+          }),
+        );
+        expect(markerCalls).toHaveLength(1);
+        const [fields, message] = markerCalls[0] ?? [];
+        expect(fields).toEqual({
+          reflexResultCount: 1,
+          confirmedSameLifeCount: 1,
+          latestResultObservedAt: observedAt,
+        });
+        expect(message).toBe(
+          "serialized Purpose input includes damage reflex outcomes",
+        );
+      } finally {
+        fixture.close();
+      }
+    },
+  );
 
   it("distinguishes the last pre-death position from the current observation", async () => {
     const beforeAt = "2026-10-04T07:14:55.000Z";
@@ -3605,6 +3709,7 @@ function openPurposeFixture(
   memory: PlayerMemoryPort = createMemoryPort(),
   observeBody?: () => Promise<PlayerBodyObservation>,
   onObservation?: (observation: PlayerBodyObservation) => void,
+  logger: Logger = pino({ level: "silent" }),
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-agent-rounds-"));
   temporaryDirectories.push(directory);
@@ -3636,7 +3741,7 @@ function openPurposeFixture(
     mind,
     memory,
     ownerPlayerId: "owner-player",
-    logger: pino({ level: "silent" }),
+    logger,
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     ...(onObservation === undefined ? {} : { onObservation }),
     onCommitted,
