@@ -98,6 +98,74 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("prioritizes a fresh damage judgment before historical skill review", async () => {
+    const fixture = openPurposeFixture(
+      [terminalResponse("The current threat needs an immediate decision.")],
+      () => undefined,
+      createMemoryPort(),
+      async () => {
+        const current = bodyObservationFixture();
+        return {
+          ...current,
+          self: { ...current.self, health: 3 },
+          perception: {
+            ...current.perception,
+            entities: [
+              {
+                id: 12,
+                name: "zombie",
+                kind: "mob",
+                category: "Hostile mobs",
+                position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+                distance: 1,
+                health: null,
+                isPlayer: false,
+              },
+            ],
+          },
+        };
+      },
+    );
+
+    try {
+      const runId = "urgent-damage-skip-learning-review";
+      recordSuccessfulSkillUse(fixture, runId, "urgent-damage-skill");
+      const events = [
+        ...fixture.mind.pendingEvents(),
+        {
+          id: "urgent-damage-event",
+          kind: "bot_damaged" as const,
+          summary:
+            "Bot自身への被害を観測。cause=mob:zombie; confidence=observed",
+          createdAt: new Date().toISOString(),
+        },
+      ];
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.observationCalls).toBe(1);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain("urgent wakeではSkill検索");
+      expect(request.instructions).toContain(
+        "一つの情報取得・退避・防御・反撃操作",
+      );
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toMatchObject({ self: { health: 3 } });
+      expect(JSON.stringify(payload.observation)).toContain("zombie");
+      expect(requestUserPayload(request).events).toContainEqual(
+        expect.objectContaining({ kind: "bot_damaged" }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("inherits operation references in the normal tool path without model input", async () => {
     const runId = "learning-revise-normal";
     const skillId = "learning-used-skill";

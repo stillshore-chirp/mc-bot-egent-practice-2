@@ -1,5 +1,6 @@
 import type {
   PlayerBodyEvent,
+  PlayerBodyDeathCause,
   PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerKnowledge,
@@ -18,7 +19,9 @@ export type PlayerWakeKind =
   | "body_outcome"
   | "state_changed"
   | "operation_stalled"
+  | "bot_damaged"
   | "bot_death"
+  | "bot_death_cause_updated"
   | "reconnected"
   | "deadline"
   | "manual";
@@ -214,6 +217,7 @@ export interface PlayerObservationEvidence {
 
 export interface PlayerDeathMemory {
   readonly observedAt: string;
+  readonly cause?: PlayerBodyDeathCause | undefined;
   readonly beforeObservation?: PlayerObservationEvidence | undefined;
   readonly firstPostDeathObservation?: PlayerObservationEvidence | undefined;
   readonly recoveryStagesUsed?: readonly PlayerDeathRecoveryStage[] | undefined;

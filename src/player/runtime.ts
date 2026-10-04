@@ -10,6 +10,8 @@ import type {
 } from "../mc-skills/index.js";
 import type {
   PlayerBody,
+  PlayerBodyDamageSource,
+  PlayerBodyDeathCause,
   PlayerBodyEvent,
   PlayerOperation,
   PlayerOperationResult,
@@ -34,6 +36,15 @@ import {
 // Keep owner changes responsive while giving an accepted HTTP one
 // bounded drain window.
 const ownerProposalSettlementTimeoutMs = 30_000;
+const damageObservationCoalesceMs = 3_000;
+
+function isUrgentPerceptionWake(kind: PlayerWakeKind): boolean {
+  return (
+    kind === "bot_damaged" ||
+    kind === "bot_death" ||
+    kind === "bot_death_cause_updated"
+  );
+}
 
 interface ActiveBodyRun {
   readonly operationId: string;
@@ -102,6 +113,7 @@ export class PlayerRuntime {
   #pendingThoughtWake: PendingThoughtWake | undefined;
   #replacementTail: Promise<void> = Promise.resolve();
   #retryTimer: NodeJS.Timeout | undefined;
+  #revisionRetryUsed = false;
   #deadlineTimer: NodeJS.Timeout | undefined;
   #sampleTimer: NodeJS.Timeout | undefined;
   #vitalsWakeTimer: NodeJS.Timeout | undefined;
@@ -112,6 +124,7 @@ export class PlayerRuntime {
   #ownerProposalsAwaitingResolution = new Set<string>();
   #ownerConsumeOperations = new Set<string>();
   #bodyConnected = true;
+  #lastDamageEventAtMs = Number.NEGATIVE_INFINITY;
   #started = false;
   #shuttingDown = false;
   #handledPurposeCompletionWakeSequence = 0;
@@ -294,6 +307,9 @@ export class PlayerRuntime {
         : {
             latestDeath: {
               observedAt: snapshot.latestDeath.observedAt,
+              ...(snapshot.latestDeath.cause === undefined
+                ? {}
+                : { cause: snapshot.latestDeath.cause }),
               ...(snapshot.latestDeath.beforeObservation === undefined
                 ? {}
                 : {
@@ -319,6 +335,7 @@ export class PlayerRuntime {
   ): void {
     if (this.#activeThought !== undefined) this.#activeThoughtCommitted = true;
     this.#retryDelayMs = 5_000;
+    this.#revisionRetryUsed = false;
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     this.#retryTimer = undefined;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
@@ -421,6 +438,32 @@ export class PlayerRuntime {
       typeof bodyEvent.at === "string"
         ? bodyEvent.at
         : new Date().toISOString();
+    if (event.type === "bot_damaged") {
+      const damageAt = Date.parse(event.at);
+      this.#lastDamageEventAtMs = Number.isFinite(damageAt)
+        ? damageAt
+        : Date.now();
+      this.enqueueAndWake(
+        "bot_damaged",
+        damageEventSummary(event.source, event.confidence),
+        event.at,
+        "bot_damaged",
+        damageObservationCoalesceMs,
+        { invalidateDecision: false },
+      );
+      return;
+    }
+    if (event.type === "bot_death_cause_updated") {
+      const updated = this.options.mind.recordDeathCauseUpdate(
+        event.deathAt,
+        event.cause,
+        deathCauseUpdateSummary(event.cause),
+        event.at,
+      );
+      if (updated !== undefined)
+        this.#requestThought(updated.kind, updated.summary);
+      return;
+    }
     if (type === "operation_started") {
       const active = this.#activeBody;
       if (
@@ -453,6 +496,7 @@ export class PlayerRuntime {
       return;
     }
     if (type === "bot_death") {
+      if (event.type !== "bot_death") return;
       this.options.memory.recordEpisode({
         summary: "Bot自身がMinecraft内で死亡したことを観測",
         status: "observed",
@@ -460,8 +504,11 @@ export class PlayerRuntime {
       });
       this.enqueueAndWake(
         "bot_death",
-        "Bot自身の死亡を観測し、復帰後の目的を再評価",
+        deathEventSummary(event.cause),
         at,
+        "bot_death",
+        3_000,
+        event.cause === undefined ? {} : { deathCause: event.cause },
       );
       return;
     }
@@ -513,6 +560,10 @@ export class PlayerRuntime {
     at: string,
     key: string = kind,
     minimumGapMs = 3_000,
+    options: {
+      readonly invalidateDecision?: boolean;
+      readonly deathCause?: PlayerBodyDeathCause;
+    } = {},
   ): void {
     const now = Date.parse(at);
     const previous = this.#eventTimes.get(key) ?? 0;
@@ -528,14 +579,11 @@ export class PlayerRuntime {
       kind === "state_changed" &&
       !summary.includes("vitals") &&
       this.#activeThought !== undefined;
+    const invalidateDecision = options.invalidateDecision ?? !deferObservation;
     const event =
       kind === "bot_death"
-        ? this.options.mind.recordDeathEvent(at, summary)
-        : this.options.mind.enqueueEvent(
-            kind,
-            summary,
-            deferObservation ? { invalidateDecision: false } : undefined,
-          );
+        ? this.options.mind.recordDeathEvent(at, summary, options.deathCause)
+        : this.options.mind.enqueueEvent(kind, summary, { invalidateDecision });
     this.#requestThought(kind, event.summary);
   }
 
@@ -545,13 +593,18 @@ export class PlayerRuntime {
     acceptedPendingWake = false,
   ): void {
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
+    if (isUrgentPerceptionWake(kind) && this.#retryTimer !== undefined) {
+      this.#queueThoughtWake(kind, reason);
+      return;
+    }
     const current = this.options.mind.snapshot();
     if (
       !acceptedPendingWake &&
       current.wait !== undefined &&
       !current.wait.wakeOn.includes(kind) &&
       kind !== "deadline" &&
-      kind !== "owner_proposal"
+      kind !== "owner_proposal" &&
+      !isUrgentPerceptionWake(kind)
     )
       return;
     if (
@@ -559,7 +612,8 @@ export class PlayerRuntime {
       current.wait?.wakeAt !== undefined &&
       Date.parse(current.wait.wakeAt) > Date.now() &&
       kind !== "owner_proposal" &&
-      kind !== "manual"
+      kind !== "manual" &&
+      !isUrgentPerceptionWake(kind)
     )
       return;
     const activeThought = this.#activeThought;
@@ -575,6 +629,7 @@ export class PlayerRuntime {
       } else if (
         !this.#activeThoughtCommitted &&
         kind !== "body_outcome" &&
+        !isUrgentPerceptionWake(kind) &&
         (kind !== "state_changed" || reason.includes("vitals"))
       ) {
         // Body outcomes advance CAS but let the in-flight request settle; its
@@ -589,6 +644,7 @@ export class PlayerRuntime {
     this.#activeResponsesRequest = false;
     const events = this.options.mind.pendingEvents(32);
     let retry = false;
+    let immediateRevisionRetry = false;
     void this.#traceCall("autonomous purpose thought", async () => {
       try {
         const result = await this.options.purpose.think({
@@ -617,8 +673,16 @@ export class PlayerRuntime {
           !result.accepted &&
           !controller.signal.aborted &&
           !this.options.mind.snapshot().stopped
-        )
+        ) {
           retry = true;
+          if (
+            this.options.mind.snapshot().revision !== current.revision &&
+            !this.#revisionRetryUsed
+          ) {
+            this.#revisionRetryUsed = true;
+            immediateRevisionRetry = true;
+          }
+        }
       } catch (error) {
         if (
           !controller.signal.aborted &&
@@ -635,23 +699,33 @@ export class PlayerRuntime {
         retry =
           !controller.signal.aborted && !this.options.mind.snapshot().stopped;
       })
-      .finally(() => this.#finishThought(controller, retry));
+      .finally(() =>
+        this.#finishThought(controller, retry, immediateRevisionRetry),
+      );
   }
 
   #queueThoughtWake(kind: PlayerWakeKind, reason: string): void {
     const pending = this.#pendingThoughtWake;
-    if (pending?.kind === "owner_proposal" && kind !== "owner_proposal") return;
-    if (kind === "owner_proposal" || pending === undefined) {
-      this.#pendingThoughtWake = { kind, reason };
+    const priority = (wake: PlayerWakeKind): number =>
+      wake === "owner_proposal"
+        ? 5
+        : wake === "body_outcome"
+          ? 4
+          : isUrgentPerceptionWake(wake)
+            ? 3
+            : wake === "operation_stalled"
+              ? 2
+              : 1;
+    if (pending !== undefined && priority(pending.kind) > priority(kind))
       return;
-    }
-    // Keep a durable body result as the next wake; owner proposals preempt above.
-    if (pending.kind === "body_outcome" && kind !== "body_outcome") return;
-    if (kind !== "state_changed" || pending.kind === "state_changed")
-      this.#pendingThoughtWake = { kind, reason };
+    this.#pendingThoughtWake = { kind, reason };
   }
 
-  #finishThought(controller: AbortController, retry: boolean): void {
+  #finishThought(
+    controller: AbortController,
+    retry: boolean,
+    immediateRevisionRetry = false,
+  ): void {
     if (this.#activeThought !== controller) return;
     this.#clearOwnerProposalSettlement(controller);
     this.#activeThought = undefined;
@@ -669,7 +743,7 @@ export class PlayerRuntime {
       return;
     }
     if (retry) {
-      this.#retryThought();
+      this.#retryThought(immediateRevisionRetry);
       return;
     }
     this.#dispatchPendingThought();
@@ -965,18 +1039,23 @@ export class PlayerRuntime {
           );
           if (meaningful.length > 0) {
             const criticalVitals = meaningful.includes("vitals");
+            const damageAlreadyReported =
+              criticalVitals &&
+              Date.now() - this.#lastDamageEventAtMs <
+                damageObservationCoalesceMs;
             const gap = criticalVitals
               ? 3_000
               : meaningful.includes("time")
                 ? 60_000
                 : 12_000;
-            this.enqueueAndWake(
-              "state_changed",
-              `観測上の意味のある変化: ${meaningful.join(", ")}`,
-              observation.observedAt,
-              `semantic:${meaningful.sort().join(",")}`,
-              gap,
-            );
+            if (!damageAlreadyReported)
+              this.enqueueAndWake(
+                "state_changed",
+                `観測上の意味のある変化: ${meaningful.join(", ")}`,
+                observation.observedAt,
+                `semantic:${meaningful.sort().join(",")}`,
+                gap,
+              );
           }
         }
       } catch (error) {
@@ -1031,17 +1110,19 @@ export class PlayerRuntime {
     this.#vitalsWakeTimer.unref();
   }
 
-  #retryThought(): void {
+  #retryThought(immediateRevisionRetry = false): void {
     if (
       this.#retryTimer !== undefined ||
       this.#shuttingDown ||
       this.options.mind.snapshot().stopped
     )
       return;
-    const delay = this.#retryDelayMs;
-    this.#retryDelayMs = Math.min(60_000, Math.round(this.#retryDelayMs * 2));
+    const delay = immediateRevisionRetry ? 0 : this.#retryDelayMs;
+    if (!immediateRevisionRetry)
+      this.#retryDelayMs = Math.min(60_000, Math.round(this.#retryDelayMs * 2));
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
+      if (!immediateRevisionRetry) this.#revisionRetryUsed = false;
       if (this.#pendingThoughtWake !== undefined) {
         this.#dispatchPendingThought();
         return;
@@ -1342,6 +1423,57 @@ function sanitizeDetail(value: string): string {
     if (sanitized.length >= 180) break;
   }
   return sanitized.replace(/\s+/gu, " ").trim().slice(0, 180);
+}
+
+function safeDamageToken(value: string, maximumLength: number): string {
+  return /^[a-z0-9_.:-]+$/iu.test(value) && value.length <= maximumLength
+    ? value
+    : "unknown";
+}
+
+function damageEventSummary(
+  source: PlayerBodyDamageSource | null,
+  confidence: "observed" | "unknown",
+): string {
+  if (source === null || confidence !== "observed")
+    return "Bot自身への被害を観測。原因はunknown。新しいBody観測でhealthと可視脅威を確認。";
+  const kind = safeDamageToken(source.kind, 48);
+  const name = safeDamageToken(source.name, 80);
+  const category =
+    source.category !== null &&
+    source.category.length <= 80 &&
+    /^[\p{L}\p{N} _.-]+$/u.test(source.category)
+      ? source.category
+      : "unknown";
+  return `Bot自身への被害を観測。攻撃元source=${kind}:${name}; category=${category}; confidence=observed。新しいBody観測でhealthと可視脅威を確認。`;
+}
+
+function causeSourceSummary(cause: PlayerBodyDeathCause): string {
+  if (cause.confidence !== "observed" || cause.source === null)
+    return "unknown";
+  const kind = safeDamageToken(cause.source.kind, 48);
+  const name = safeDamageToken(cause.source.name, 80);
+  return `${kind}:${name}`;
+}
+
+function deathEventSummary(cause: PlayerBodyDeathCause | undefined): string {
+  if (cause === undefined)
+    return "Bot自身の死亡を観測。観測された死因はunknown。復帰後に現状を再評価。";
+  const causeKey =
+    cause.causeKey !== undefined &&
+    /^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(cause.causeKey)
+      ? `; causeKey=${cause.causeKey}`
+      : "";
+  return `Bot自身の死亡を観測。cause=${causeSourceSummary(cause)}; confidence=${cause.confidence}; provenance=${cause.provenance}${causeKey}。復帰後に現状を再評価。`;
+}
+
+function deathCauseUpdateSummary(cause: PlayerBodyDeathCause): string {
+  const causeKey =
+    cause.causeKey !== undefined &&
+    /^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(cause.causeKey)
+      ? `; causeKey=${cause.causeKey}`
+      : "";
+  return `既存のBot死亡記録へcause=${causeSourceSummary(cause)}; confidence=${cause.confidence}; provenance=${cause.provenance}${causeKey}を追加。死亡件数は増やさない。`;
 }
 
 export function semanticSignatures(
