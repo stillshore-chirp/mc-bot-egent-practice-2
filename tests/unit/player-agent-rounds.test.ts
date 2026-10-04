@@ -253,6 +253,205 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("reserves the last conversation round for a reply and retains tool results", async () => {
+    const fixture = openConversationFixture();
+    fixture.responses.push(
+      ...Array.from({ length: 5 }, (_, index) =>
+        functionCallResponse(`runtime-${index}`, "inspect_runtime", {}),
+      ),
+      terminalResponse("状態を確認しました。"),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "状態を調べてください。",
+        turn,
+      });
+
+      expect(fixture.requests).toHaveLength(6);
+      expect(fixture.messages).toEqual(["状態を確認しました。"]);
+      const requests = fixture.requests.map((request) =>
+        z.record(z.string(), z.unknown()).parse(request),
+      );
+      expect(requests.map(({ tool_choice }) => tool_choice)).toEqual([
+        "auto",
+        "auto",
+        "auto",
+        "auto",
+        "auto",
+        "none",
+      ]);
+      const finalInput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(requests[5]?.input);
+      expect(
+        finalInput.filter(({ type }) => type === "function_call_output"),
+      ).toHaveLength(5);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("honors cancellation before executing a pending conversation tool", async () => {
+    const fixture = openConversationFixture();
+    const controller = new AbortController();
+    fixture.responses.push(() => {
+      controller.abort();
+      return functionCallResponse("stop-before-abort", "stop_autonomy", {});
+    });
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await expect(
+        fixture.conversation.handleOwnerMessage({
+          username: "owner",
+          message: "自律行動を停止してください。",
+          turn,
+          signal: controller.signal,
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().stopped).toBe(false);
+      expect(fixture.messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("delivers a long final reply in chunks within the existing call budget", async () => {
+    let admittedCalls = 0;
+    const fixture = openConversationFixture(() => {
+      admittedCalls += 1;
+      if (admittedCalls > 6) throw new Error("CALL_BUDGET_EXHAUSTED");
+    });
+    const longReply = "長い回答です。".repeat(40);
+    fixture.responses.push(
+      ...Array.from({ length: 5 }, (_, index) =>
+        functionCallResponse(`runtime-long-${index}`, "inspect_runtime", {}),
+      ),
+      terminalResponse(longReply),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "説明してください。",
+        turn,
+      });
+
+      expect(admittedCalls).toBe(6);
+      expect(fixture.requests).toHaveLength(6);
+      expect(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[5])
+          .tool_choice,
+      ).toBe("none");
+      expect(fixture.messages).toHaveLength(2);
+      expect(fixture.messages.join("")).toBe(longReply);
+      expect(fixture.messages.every((message) => message.length <= 240)).toBe(
+        true,
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("flattens chat newlines, preserves Unicode boundaries, and marks truncation", async () => {
+    const fixture = openConversationFixture();
+    const longReply = `${"a".repeat(180)}\n${"😀".repeat(100)}`;
+    fixture.responses.push(terminalResponse(longReply));
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "説明してください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+      const delivered = fixture.messages.join("");
+      expect(delivered).toBe(longReply.replace("\n", " "));
+      expect(
+        fixture.messages.every((message) => !/[\r\n]/u.test(message)),
+      ).toBe(true);
+      expect(fixture.messages.join("")).not.toContain("省略");
+    } finally {
+      fixture.close();
+    }
+
+    const oversizedFixture = openConversationFixture();
+    const oversizedReply = "😀".repeat(1_000);
+    oversizedFixture.responses.push(terminalResponse(oversizedReply));
+    try {
+      await oversizedFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "詳しく説明してください。",
+        turn: oversizedFixture.conversation.nextTurn(),
+      });
+      const delivered = oversizedFixture.messages.join("");
+      expect(oversizedFixture.messages).toHaveLength(8);
+      expect(
+        oversizedFixture.messages.every((message) => message.length <= 240),
+      ).toBe(true);
+      expect(delivered).toBe(`${"😀".repeat(957)}…（省略）`);
+      for (const chunk of oversizedFixture.messages) {
+        const first = chunk.charCodeAt(0);
+        const last = chunk.charCodeAt(chunk.length - 1);
+        expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+        expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+      }
+    } finally {
+      oversizedFixture.close();
+    }
+  });
+
+  it("stops chunked delivery before a new owner-stop generation and skips final audit", async () => {
+    const traceResults: string[] = [];
+    const trace = {
+      withSpan: async (
+        _stage: string,
+        _name: string,
+        options: { readonly resultKind?: string },
+        operation: () => Promise<unknown>,
+      ) => {
+        if (options.resultKind !== undefined)
+          traceResults.push(options.resultKind);
+        return operation();
+      },
+    } as unknown as TraceService;
+    const fixtureHolder: { current: ConversationFixture | undefined } = {
+      current: undefined,
+    };
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      async () => {
+        const activeFixture = fixtureHolder.current;
+        if (activeFixture === undefined) return;
+        const state = activeFixture.mind.snapshot();
+        activeFixture.mind.stop(state.stopGeneration);
+      },
+      trace,
+    );
+    fixtureHolder.current = fixture;
+    const reply = "x".repeat(500);
+    fixture.responses.push(terminalResponse(reply));
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "答えてください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+      expect(fixture.messages).toEqual(["x".repeat(240)]);
+      expect(fixture.messages.join("")).not.toBe(reply);
+      expect(traceResults).toEqual([]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("records final reply callback completion without reply text", async () => {
     const directory = mkdtempSync(join(tmpdir(), "player-final-trace-"));
     temporaryDirectories.push(directory);
@@ -287,7 +486,7 @@ describe("player agent response rounds", () => {
         return result;
       },
     } as unknown as TraceService;
-    const privateReply = "PRIVATE_FINAL_REPLY_130";
+    const privateReply = "PRIVATE_FINAL_REPLY_130".repeat(20);
     let sayCalls = 0;
     const conversation = new PlayerConversationAgent({
       client: scriptedClient([terminalResponse(privateReply)], requests),
@@ -314,14 +513,14 @@ describe("player agent response rounds", () => {
         message: "状態を確認して",
         turn,
       });
-      expect(sayCalls).toBe(1);
+      expect(sayCalls).toBe(2);
       expect(traceResults).toEqual([
         {
           kind: "final_response",
           summary: "say_callback_completed",
         },
       ]);
-      expect(eventOrder).toEqual(["say", "audit-start", "audit-end"]);
+      expect(eventOrder).toEqual(["say", "say", "audit-start", "audit-end"]);
       expect(JSON.stringify(traceResults)).not.toContain(privateReply);
     } finally {
       mind.close();
@@ -2098,6 +2297,12 @@ describe("player agent response rounds", () => {
       expect(result.accepted).toBe(true);
       expect(fixture.observationCalls).toBe(2);
       expect(fixture.requests).toHaveLength(2);
+      expect(
+        fixture.requests.map(
+          (request) =>
+            z.record(z.string(), z.unknown()).parse(request).tool_choice,
+        ),
+      ).toEqual(["auto", "auto"]);
       const secondRequest = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[1]);
@@ -3074,6 +3279,12 @@ describe("player agent response rounds", () => {
       expect(result.accepted).toBe(true);
       expect(result.decision?.kind).toBe("act");
       expect(fixture.requests).toHaveLength(6);
+      expect(
+        fixture.requests.map(
+          (request) =>
+            z.record(z.string(), z.unknown()).parse(request).tool_choice,
+        ),
+      ).toEqual(Array.from({ length: 6 }, () => "auto"));
       expect(committed).toHaveLength(1);
     } finally {
       fixture.close();
@@ -3518,6 +3729,235 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("exposes bounded current inventory and vitals through observe_body", async () => {
+    const base = bodyObservationFixture();
+    const sword = {
+      slot: 0,
+      itemId: 267,
+      name: "iron_sword",
+      count: 1,
+      metadata: 0,
+      durability: 100,
+      maxDurability: 100,
+      customName: null,
+      enchantments: [],
+    };
+    const book = {
+      slot: 2,
+      itemId: 387,
+      name: "written_book",
+      count: 1,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: "private custom item label",
+      bookPages: ["private book body"],
+      enchantments: [],
+    };
+    const zombie = {
+      id: 14,
+      name: "zombie",
+      kind: "zombie",
+      category: "Hostile mobs",
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      health: 18,
+      isPlayer: false,
+      equipment: { mainHand: "iron_sword" },
+    };
+    const skeleton = {
+      ...zombie,
+      id: 15,
+      name: "skeleton",
+      kind: "skeleton",
+      position: { x: -1, y: 64, z: 3, dimension: "overworld" },
+      distance: 3.2,
+      equipment: { mainHand: "bow" },
+    };
+    const observation: PlayerBodyObservation = {
+      ...base,
+      self: {
+        ...base.self,
+        health: 7,
+        food: 10,
+        inventory: [
+          sword,
+          { ...sword, slot: 1, name: "golden_apple", count: 4 },
+          book,
+          ...Array.from({ length: 64 }, (_, index) => ({
+            ...sword,
+            slot: index + 3,
+            name: `test_item_${index}`,
+          })),
+        ],
+        equipment: { hand: sword, "off-hand": null },
+      },
+      perception: {
+        ...base.perception,
+        entities: [zombie],
+        nearbyHostiles: {
+          source: "client_received_unoccluded_nearby_hostiles",
+          observedAt: base.observedAt,
+          maxDistance: 16,
+          entityOutputLimit: 16,
+          omittedEntityCandidates: 0,
+          candidateSearchMayBeTruncated: false,
+          entities: [zombie, skeleton],
+        },
+      },
+    };
+    const fixture = openConversationFixture(undefined, async () => observation);
+    fixture.responses.push(
+      functionCallResponse("observe-current-self", "observe_body", {}),
+      terminalResponse("現在観測を確認しました。"),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "体力と持ち物、周辺も調べてください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const followupInput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input);
+      const bodyOutput = followupInput.find(
+        ({ type }) => type === "function_call_output",
+      );
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(bodyOutput?.output)));
+      const self = z.record(z.string(), z.unknown()).parse(summary.self);
+      expect(self).toMatchObject({ health: 7, food: 10 });
+      expect(self.inventory).toMatchObject({
+        available: true,
+        source: "client_received_current_player_inventory",
+        omittedItemStackCount: 3,
+      });
+      const inventory = z.record(z.string(), z.unknown()).parse(self.inventory);
+      const items = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(inventory.items);
+      expect(items).toHaveLength(64);
+      expect(items.slice(0, 3)).toEqual([
+        { name: "iron_sword", count: 1 },
+        { name: "golden_apple", count: 4 },
+        { name: "written_book", count: 1 },
+      ]);
+      const equipment = z.record(z.string(), z.unknown()).parse(self.equipment);
+      expect(equipment).toMatchObject({
+        mainHand: "iron_sword",
+        offHand: null,
+        head: "unknown",
+      });
+      expect(JSON.stringify(summary)).not.toContain(
+        "private custom item label",
+      );
+      expect(JSON.stringify(summary)).not.toContain("private book body");
+
+      const visibleEntities = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(summary.visibleEntities);
+      expect(visibleEntities[0]).toMatchObject({
+        name: "zombie",
+        equipment: { mainHand: "iron_sword" },
+      });
+      const nearby = z
+        .record(z.string(), z.unknown())
+        .parse(summary.nearbyHostiles);
+      expect(nearby).toMatchObject({
+        observedHostileCountLowerBound: 2,
+        frontViewOverlapEntityCount: 1,
+      });
+      const nearbyEntities = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(nearby.entities);
+      expect(nearbyEntities[0]).toMatchObject({ name: "skeleton" });
+      const nearbyEquipment = z
+        .record(z.string(), z.unknown())
+        .parse(nearbyEntities[0]?.equipment);
+      expect(nearbyEquipment).toMatchObject({ mainHand: "bow" });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("distinguishes observed empty inventory from unavailable observation", async () => {
+    const base = bodyObservationFixture();
+    const observedFixture = openConversationFixture(undefined, async () => ({
+      ...base,
+      self: {
+        ...base.self,
+        inventory: [],
+        equipment: { "off-hand": null },
+      },
+    }));
+    observedFixture.responses.push(
+      functionCallResponse("observe-empty-inventory", "observe_body", {}),
+      terminalResponse("確認しました。"),
+    );
+
+    try {
+      await observedFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "持ち物を見てください。",
+        turn: observedFixture.conversation.nextTurn(),
+      });
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(observedFixture.requests[1]);
+      const toolOutput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input)
+        .find(({ type }) => type === "function_call_output");
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(toolOutput?.output)));
+      const self = z.record(z.string(), z.unknown()).parse(summary.self);
+      expect(self.inventory).toMatchObject({ available: true, items: [] });
+      expect(self.equipment).toMatchObject({
+        mainHand: "unknown",
+        offHand: null,
+      });
+    } finally {
+      observedFixture.close();
+    }
+
+    const unavailableFixture = openConversationFixture();
+    unavailableFixture.responses.push(
+      functionCallResponse("observe-unavailable-inventory", "observe_body", {}),
+      terminalResponse("確認できませんでした。"),
+    );
+    try {
+      await unavailableFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "持ち物を見てください。",
+        turn: unavailableFixture.conversation.nextTurn(),
+      });
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(unavailableFixture.requests[1]);
+      const toolOutput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input)
+        .find(({ type }) => type === "function_call_output");
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(toolOutput?.output)));
+      expect(summary).toEqual({
+        available: false,
+        reason: "observation_unavailable",
+      });
+      expect(summary).not.toHaveProperty("self");
+    } finally {
+      unavailableFixture.close();
+    }
+  });
+
   it("persists concise owner facts once and retains them after reopening the same database", async () => {
     const fixture = openConversationFixture();
     const fact = "合言葉は maple-47";
@@ -3700,9 +4140,13 @@ describe("player agent response rounds", () => {
           turn,
         });
         expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
-        expect(fixture.messages).toEqual([
-          "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
-        ]);
+        expect(fixture.messages).toEqual(
+          failure === "stopped"
+            ? []
+            : [
+                "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+              ],
+        );
         expect(fixture.messages.join(" ")).not.toContain("保存しました");
       } finally {
         fixture.close();
@@ -4386,7 +4830,12 @@ interface ConversationFixture {
   close(): void;
 }
 
-function openConversationFixture(): ConversationFixture {
+function openConversationFixture(
+  beforeCall?: () => void,
+  observeBody?: () => Promise<PlayerBodyObservation>,
+  onSay?: (text: string) => void | Promise<void>,
+  trace?: TraceService,
+): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
   const databasePath = join(directory, "player.sqlite");
@@ -4402,8 +4851,12 @@ function openConversationFixture(): ConversationFixture {
     mind,
     memory: createMemoryPort(),
     logger: pino({ level: "silent" }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
+    ...(observeBody === undefined ? {} : { observeBody }),
+    ...(trace === undefined ? {} : { trace }),
     say: async (text) => {
       messages.push(text);
+      await onSay?.(text);
     },
     onProposal: () => undefined,
     onStop: async () => undefined,

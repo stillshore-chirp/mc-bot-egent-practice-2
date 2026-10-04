@@ -527,7 +527,7 @@ describe("player owner intent context", () => {
     }
   });
 
-  it("regenerates an overlong reply once without tools and keeps call admission", async () => {
+  it("delivers an overlong reply without spending another provider call", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const messages: string[] = [];
     let admittedCalls = 0;
@@ -550,10 +550,7 @@ describe("player owner intent context", () => {
       onResume: () => undefined,
     });
     const draft = "長い回答".repeat(61);
-    fixture.responses.push(
-      terminalResponse(draft),
-      terminalResponse("digとequipを利用できます。"),
-    );
+    fixture.responses.push(terminalResponse(draft));
 
     try {
       await conversation.handleOwnerMessage({
@@ -563,13 +560,12 @@ describe("player owner intent context", () => {
       });
 
       const initialRequest = record(fixture.requests[0]);
-      const compactRequest = record(fixture.requests[1]);
       expect(initialRequest.tool_choice).toBe("auto");
-      expect(compactRequest.tool_choice).toBe("none");
-      expect(compactRequest.tools).toEqual([]);
-      expect(JSON.stringify(compactRequest.input)).toContain(draft);
-      expect(admittedCalls).toBe(2);
-      expect(messages).toEqual(["digとequipを利用できます。"]);
+      expect(fixture.requests).toHaveLength(1);
+      expect(admittedCalls).toBe(1);
+      expect(messages.join("")).toBe(draft);
+      expect(messages).toHaveLength(2);
+      expect(messages.every((message) => message.length <= 240)).toBe(true);
     } finally {
       fixture.close();
     }
@@ -584,7 +580,7 @@ describe("player owner intent context", () => {
         reason: "The owner asked me to gather wood.",
         priority: 3,
       }),
-      currentStateMarker: "Gather nearby wood",
+      replyAllowed: true,
     },
     {
       name: "a saved owner fact",
@@ -592,7 +588,7 @@ describe("player owner intent context", () => {
       response: functionCallResponse("save-owner-fact", "remember_owner_fact", {
         summary: "The owner prefers concise replies",
       }),
-      currentStateMarker: "The owner prefers concise replies",
+      replyAllowed: true,
     },
     {
       name: "a committed stop request",
@@ -600,17 +596,13 @@ describe("player owner intent context", () => {
       response: functionCallResponse("stop-autonomy", "stop_autonomy", {
         reason: "The owner requested a pause.",
       }),
-      currentStateMarker: '"stopped":true',
+      replyAllowed: false,
     },
   ])(
-    "keeps original conversation rules and post-tool state while shortening $name",
-    async ({ ownerMessage, response, currentStateMarker }) => {
+    "delivers existing tool results without another call and respects $name stop boundary",
+    async ({ ownerMessage, response, replyAllowed }) => {
       const fixture = openPurposeFixture(createMemoryPort());
       const messages: string[] = [];
-      fixture.mind.recordDeathEvent(
-        new Date().toISOString(),
-        "Synthetic death event",
-      );
       const conversation = new PlayerConversationAgent({
         client: scriptedClient(fixture.responses, fixture.requests),
         apiKey: "test-only",
@@ -626,11 +618,8 @@ describe("player owner intent context", () => {
         onStop: async () => undefined,
         onResume: () => undefined,
       });
-      fixture.responses.push(
-        response,
-        terminalResponse("長い回答".repeat(61)),
-        terminalResponse("現状を確認しました。"),
-      );
+      const draft = "長い回答".repeat(61);
+      fixture.responses.push(response, terminalResponse(draft));
 
       try {
         await conversation.handleOwnerMessage({
@@ -639,162 +628,28 @@ describe("player owner intent context", () => {
           turn: conversation.nextTurn(),
         });
 
-        const regenerationRequest = record(fixture.requests[2]);
-        const regenerationMessage = record(
-          (regenerationRequest.input as unknown[])[0],
-        );
-        const regenerationPayload = record(
-          JSON.parse(String(regenerationMessage.content)),
-        );
-        const regenerationState = JSON.parse(
-          String(regenerationPayload.currentState),
-        ) as unknown;
-        const serializedRegenerationState = JSON.stringify(regenerationState);
-        const regenerationInstructions = String(
-          regenerationRequest.instructions,
-        );
-        expect(regenerationRequest.tool_choice).toBe("none");
-        expect(regenerationRequest.tools).toEqual([]);
-        expect(serializedRegenerationState).toContain(currentStateMarker);
-        expect(serializedRegenerationState).toContain('"latestDeath"');
-        expect(regenerationInstructions).toContain(
-          "runtime.latestDeathは過去の記録として扱い",
-        );
-        expect(regenerationInstructions).toContain(
-          "remember_owner_factを必ず呼び",
-        );
-        expect(regenerationInstructions).toContain(
-          "stop_autonomyやresume_autonomy",
-        );
-        expect(regenerationInstructions).toContain("propose_goal_change");
-        expect(regenerationInstructions).toContain("直近4件までのowner会話");
-        expect(messages).toEqual(["現状を確認しました。"]);
+        expect(fixture.requests).toHaveLength(2);
+        const followup = record(fixture.requests[1]);
+        const followupInput = Array.isArray(followup.input)
+          ? followup.input
+          : [];
+        const toolOutputs = followupInput
+          .map((item) => record(item))
+          .filter(({ type }) => type === "function_call_output");
+        expect(toolOutputs).toHaveLength(1);
+        if (replyAllowed) {
+          expect(messages.join("")).toBe(draft);
+          expect(messages.length).toBeGreaterThan(1);
+          expect(messages.every((message) => message.length <= 240)).toBe(true);
+        } else {
+          expect(fixture.mind.snapshot().stopped).toBe(true);
+          expect(messages).toEqual([]);
+        }
       } finally {
         fixture.close();
       }
     },
   );
-
-  it("does not invite a duplicate proposal when shortening fails after proposal commit", async () => {
-    const fixture = openPurposeFixture(createMemoryPort());
-    const messages: string[] = [];
-    const conversation = new PlayerConversationAgent({
-      client: scriptedClient(fixture.responses, fixture.requests),
-      apiKey: "test-only",
-      model: "test-model",
-      ownerUsername: "owner",
-      mind: fixture.mind,
-      memory: createMemoryPort(),
-      logger: pino({ level: "silent" }),
-      say: async (message) => {
-        messages.push(message);
-      },
-      onProposal: () => undefined,
-      onStop: async () => undefined,
-      onResume: () => undefined,
-    });
-    fixture.responses.push(
-      functionCallResponse("gather-proposal", "propose_goal_change", {
-        title: "Gather nearby wood",
-        reason: "The owner asked me to gather wood.",
-        priority: 3,
-      }),
-      terminalResponse("長い回答".repeat(61)),
-      () => {
-        throw new Error("TEST_REGENERATION_FAILED");
-      },
-    );
-
-    try {
-      await conversation.handleOwnerMessage({
-        username: "owner",
-        message: "近くの木を集めてください。",
-        turn: conversation.nextTurn(),
-      });
-      expect(fixture.mind.snapshot().proposals).toHaveLength(1);
-      expect(messages).toEqual(["うまく短く整理できず、説明が不十分です。"]);
-      expect(messages[0]).not.toMatch(/もう一度|再度|頼んで/u);
-      expect(fixture.requests).toHaveLength(3);
-    } finally {
-      fixture.close();
-    }
-  });
-
-  it("uses a generic fallback when reply regeneration fails", async () => {
-    const fixture = openPurposeFixture(createMemoryPort());
-    const messages: string[] = [];
-    const conversation = new PlayerConversationAgent({
-      client: scriptedClient(fixture.responses, fixture.requests),
-      apiKey: "test-only",
-      model: "test-model",
-      ownerUsername: "owner",
-      mind: fixture.mind,
-      memory: createMemoryPort(),
-      logger: pino({ level: "silent" }),
-      say: async (message) => {
-        messages.push(message);
-      },
-      onProposal: () => undefined,
-      onStop: async () => undefined,
-      onResume: () => undefined,
-    });
-    fixture.responses.push(terminalResponse("長い回答".repeat(61)), () => {
-      throw new Error("TEST_REGENERATION_FAILED");
-    });
-
-    try {
-      await conversation.handleOwnerMessage({
-        username: "owner",
-        message: "この操作の使い方を教えてください。",
-        turn: conversation.nextTurn(),
-      });
-      expect(messages).toEqual(["うまく短く整理できず、説明が不十分です。"]);
-      expect(messages[0]).not.toMatch(/操作は|完了|覚えました/u);
-    } finally {
-      fixture.close();
-    }
-  });
-
-  it("does not swallow call-admission rejection during reply regeneration", async () => {
-    const fixture = openPurposeFixture(createMemoryPort());
-    const messages: string[] = [];
-    let admittedCalls = 0;
-    const conversation = new PlayerConversationAgent({
-      client: scriptedClient(fixture.responses, fixture.requests),
-      apiKey: "test-only",
-      model: "test-model",
-      ownerUsername: "owner",
-      mind: fixture.mind,
-      memory: createMemoryPort(),
-      logger: pino({ level: "silent" }),
-      beforeCall: () => {
-        admittedCalls += 1;
-        if (admittedCalls > 1) throw new Error("TEST_BUDGET_EXHAUSTED");
-      },
-      say: async (message) => {
-        messages.push(message);
-      },
-      onProposal: () => undefined,
-      onStop: async () => undefined,
-      onResume: () => undefined,
-    });
-    fixture.responses.push(terminalResponse("長い回答".repeat(61)));
-
-    try {
-      await expect(
-        conversation.handleOwnerMessage({
-          username: "owner",
-          message: "どんな操作ができますか？",
-          turn: conversation.nextTurn(),
-        }),
-      ).rejects.toThrow("TEST_BUDGET_EXHAUSTED");
-      expect(admittedCalls).toBe(2);
-      expect(fixture.requests).toHaveLength(1);
-      expect(messages).toHaveLength(0);
-    } finally {
-      fixture.close();
-    }
-  });
 
   it("carries bounded owner chat context into a short follow-up proposal", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
