@@ -8,7 +8,7 @@
 
 ## 呼出しから結果まで
 
-責務は [PlayerBody](../src/minecraft/player-body.ts)、[入力schema](../src/minecraft/player-body-schema.ts)、[観測型](../src/minecraft/player-body-observation.ts)、[registry知識](../src/minecraft/player-body-knowledge.ts) に分かれます。呼出し側の制御は[自律プレイヤー](autonomous-player.md)を参照してください。
+責務は [PlayerBody](../src/minecraft/player-body.ts)、[入力schema](../src/minecraft/player-body-schema.ts)、[観測型](../src/minecraft/player-body-observation.ts)、[registry知識](../src/minecraft/player-body-knowledge.ts)、[操作判断manual](../src/minecraft/player-body-manual.ts) に分かれます。呼出し側の制御は[自律プレイヤー](autonomous-player.md)を参照してください。
 
 ```mermaid
 flowchart TD
@@ -34,7 +34,7 @@ flowchart TD
 
 実行可能な操作名の正本は`playerOperationNames`です。31 操作はすべて`playerOperationSchema`・PlayerBody dispatch・PurposeAgent の GPT 向け操作 catalog に接続されています（実装上の接続を示し、GPT が各操作を実ゲームで選んだ証拠ではありません）。表の「ゲーム上」は通常の Java 版プレイヤー操作として可能か、「library」は依存 library に必要な API または構成要素があるかを示します。API があることだけでは、その環境での成功を保証しません。
 
-Mineflayer は`package.json`と`package-lock.json`で`4.37.1`、`mineflayer-pathfinder`は`2.4.5`に固定されています。library 欄は実装コードと[Mineflayer 4.37.1 API](https://github.com/PrismarineJS/mineflayer/blob/4.37.1/docs/api.md)、[同版の変更履歴](https://github.com/PrismarineJS/mineflayer/blob/4.37.1/docs/history.md)を照合しました。変更履歴では 4.35.0 に Minecraft 1.21.11 対応が追加されています。pathfinder の到達性や server ごとの結果は、別途ゲーム内で確認します。
+Mineflayer は`package.json`と`package-lock.json`で`4.39.0`、`mineflayer-pathfinder`は`2.4.5`に固定されています。library 欄は実装コードと[Mineflayer 4.39.0 API](https://github.com/PrismarineJS/mineflayer/blob/4.39.0/docs/api.md)、[同版の変更履歴](https://github.com/PrismarineJS/mineflayer/blob/4.39.0/docs/history.md)を照合しました。変更履歴では4.35.0にMinecraft 1.21.11対応が追加されています。pathfinderの到達性やserverごとの結果は、別途ゲーム内で確認します。
 
 各操作は通常のJava版の所持品・到達距離・server権限等に従います。schema/catalog/dispatchへの接続、libraryのAPI、実ゲームでの確認を分けて読みます。
 
@@ -50,7 +50,17 @@ Mineflayer は`package.json`と`package-lock.json`で`4.37.1`、`mineflayer-path
 | 睡眠・乗り物：`sleep`, `wake`, `mount`, `dismount`, `move_vehicle`, `elytra_fly` | `sleep`, `wake`, `mount`, `dismount`, `moveVehicle`, `elytraFly`                      | 有効な bed/entity/vehicle、sleep 条件、飛行装備・状態、protocol                               |
 | 専門画面：`trade`, `enchant`, `anvil`, `write_book`, `update_sign`               | `trade`, enchantment table / anvil API, `writeBook`, `updateSign`                     | offer・素材・経験値・画面種類。NBT/古い protocol で内容を読めない場合は未確認                 |
 
-### 過去の実ゲーム確認（操作群別）
+### 現在の条件から操作を判断する
+
+`describe_operation` は操作ごとの`manual`も返します。`implementation: "body_operation_provided"`はschema・catalog・Body dispatcherに操作があることを示し、現在の接続で実行できるという意味ではありません。`currentAvailability`は毎回のfresh観測と実行前提の照合を求めます。null・欠落・古い観測は「利用不可」ではなく「不明」として扱い、前提を確かめてから試してください。`unavailable`にはPlayerBodyから公開しない操作境界を示します。
+
+`preconditions`とschemaで対象・所持品・到達性・通常権限を確認し、`successEvidence`とBodyの実行結果で効果を判定します。`historicalTrial`は過去の限定された実ゲーム試験の範囲であり、現在の接続・環境の動作保証ではありません。`unverified`は確認不足です。ownerの依頼全体が達成されたかは、操作単体の`successful`とは別に確認します。
+
+`move_to`は現在位置と到達範囲、freshな経路・地形の条件を見て選びます。`look_sweep`は8方向の可視範囲を返しますが、候補の省略や検索上限があり、対象が返らないことは不在の証明になりません。`attack`はfresh観測に見える通常到達距離内の対象が必要です。命中は自身を攻撃元とする`entityHurt`で、対象の死亡は別の効果として確認します。
+
+被害時の`bot_damaged`は`at`、`source`（`kind`・`name`・`category`、または`null`）、`confidence`（`observed`・`unknown`）を持ちます。`bot_death`の`cause`は任意です。死亡後1秒以内に対応する構造化通知を受けると、`bot_death_cause_updated`を一度だけ追加し、`deathAt`で元の死亡へ結び付けます。これは新たな死亡ではありません。更新されるcauseには`causeKey`、source、confidence、provenance（`damage_event`・`death_notification`）が含まれます。正規レジストリのMobならsource名はcanonicalなentity名になり、識別できない相手やplayer名の本文はgenericな`death_cause`とtranslation keyで表します。これらのeventは数値のentity ID・座標・usernameを含みません。sourceやcauseがない場合は攻撃者・死因を特定できません。vitals変化後に取り直す`self.health`も`null`になり得ます。これらは見えている手掛かりであり、完全なダメージ記録ではありません。移動・見渡し・攻撃を選んだ後も、それぞれの実行結果を別に確認します。
+
+### 過去の代表的な実ゲーム確認（操作群別）
 
 - **移動・視線・入力**: 初回代表：`look`・移動を#75で受入。`look_sweep`、`control`など他操作は未測定
 - **装備・使用・攻撃**: 初回代表：`equip`はfresh Body headと独立server readbackで確認。`use`・`attack`は未測定
@@ -62,7 +72,7 @@ Mineflayer は`package.json`と`package-lock.json`で`4.37.1`、`mineflayer-path
 - **睡眠・乗り物**: 未確認
 - **専門画面**: 未確認
 
-上の実ゲーム記録は、現行[#75の初回代表受入](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を31操作全体の網羅と混同しないための証拠状態です。初回範囲は`look`・移動・`dig`・`collect_item`・`equip`・`consume`と停止の代表場面です。装備readbackは[#63の公開進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/63#issuecomment-5850402144)、採集・達成後の操作は[Issue #83](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/83)、consumeの代表結果は上記[#75進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を参照します。既存の[#69公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/69)と[#78公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/78)も、それぞれの元の範囲で再利用します。記録内の「未測定」は初回代表に含まれない操作の測定状態を示し、未実装やゲーム上不可能という意味ではありません。31 操作の schema/catalog 接続は実装状態を示すもので、各操作の実ゲーム受入証拠ではありません。
+上の実ゲーム記録は、過去の[#75に記録された代表試験](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を31操作全体の網羅と混同しないための証拠状態です。初回範囲は`look`・移動・`dig`・`collect_item`・`equip`・`consume`と停止の代表場面です。装備readbackは[#63の公開進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/63#issuecomment-5850402144)、採集・達成後の操作は[Issue #83](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/83)、consumeの代表結果は上記[#75進捗](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/75#issuecomment-5863730780)を参照します。既存の[#69公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/69)と[#78公開receipt](https://github.com/stillshore-chirp/mc-bot-egent-practice-2/issues/78)も、それぞれの元の範囲で再利用します。ここに記す実ゲーム結果は実施時点・個別scopeの証拠であり、現在の接続状態や現在の運用成功を証明しません。記録内の「未測定」は初回代表に含まれない操作の測定状態を示し、未実装やゲーム上不可能という意味ではありません。31 操作の schema/catalog 接続は実装状態を示すもので、各操作の実ゲーム受入証拠ではありません。
 
 ### 操作固有の成功確認
 
