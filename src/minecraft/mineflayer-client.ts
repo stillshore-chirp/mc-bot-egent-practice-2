@@ -673,7 +673,13 @@ export class MineflayerClient implements MinecraftPort {
     }
     this.intentionalDisconnect = false;
     const connectionEpoch = ++this.connectionEpoch;
-    const bot = mineflayer.createBot(this.options.bot);
+    const botOptions: BotOptions & {
+      readonly respawnPositionDelayMs?: number;
+    } =
+      this.options.bot.version === "26.1"
+        ? { ...this.options.bot, respawnPositionDelayMs: 0 }
+        : this.options.bot;
+    const bot = mineflayer.createBot(botOptions);
     guardMovementPacketWrites(bot, this.logger, () => this.spawned);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;

@@ -14,6 +14,7 @@
     "dev": "tsx src/index.ts",
     "dev:dashboard": "vite --config vite.config.ts",
     "start": "node dist/index.js",
+    "postinstall": "tsx scripts/patch-mineflayer-respawn-position-delay.ts",
     "preflight:local": "tsx scripts/local-play-preflight.ts",
     "typecheck": "npm run typecheck:server && npm run typecheck:dashboard",
     "typecheck:server": "tsc --noEmit",
