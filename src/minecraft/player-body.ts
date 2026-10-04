@@ -289,7 +289,7 @@ function damageSource(
 
 function isKnownHostileEntity(bot: Bot, entity: Entity): boolean {
   if (
-    entity.type !== "mob" ||
+    entity.type === "player" ||
     entity.username !== undefined ||
     typeof entity.name !== "string"
   )
@@ -4041,7 +4041,6 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (
         target?.id !== visible.id ||
         visible.isPlayer ||
-        visible.kind !== "mob" ||
         this.hostileApproachTargets.has(target) ||
         !isKnownHostileEntity(bot, target)
       )

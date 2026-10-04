@@ -985,7 +985,7 @@ export function observePlayerBody(
     .filter(({ distance }) => distance <= maxVisibleDistance)
     .sort((left, right) => left.distance - right.distance);
   const nearbyHostileCandidates = entityCandidates.filter(({ entity }) => {
-    if (entity.type !== "mob" || entity.username !== undefined) return false;
+    if (entity.type === "player" || entity.username !== undefined) return false;
     const name = entityName(entity);
     return bot.registry.entitiesByName[name]?.category === "Hostile mobs";
   });

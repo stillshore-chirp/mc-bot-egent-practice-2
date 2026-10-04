@@ -1,5 +1,6 @@
 import { Vec3 } from "vec3";
 import type { Bot } from "mineflayer";
+import minecraftData from "minecraft-data";
 import { describe, expect, it } from "vitest";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
 
@@ -91,6 +92,49 @@ function mob(
 }
 
 describe("nearby hostile observation", () => {
+  it("uses the 26.1 registry category for native hostile entity types", () => {
+    const registry = minecraftData("26.1");
+    const fromRegistry = (
+      id: number,
+      name: string,
+      position: Vec3,
+    ): FixtureEntity => {
+      const entry = registry.entitiesByName[name];
+      if (entry === undefined)
+        throw new Error(`Missing 26.1 entity registry entry for ${name}`);
+      return mob(id, name, position, { type: entry.type });
+    };
+    const bot = makeObservationBot(
+      [
+        fromRegistry(2, "zombie", new Vec3(0, 64, -4)),
+        fromRegistry(3, "skeleton", new Vec3(0, 64, 4)),
+        fromRegistry(4, "creeper", new Vec3(8, 64, 4)),
+        fromRegistry(5, "drowned", new Vec3(0, 64, 9)),
+        fromRegistry(6, "player", new Vec3(0, 64, 6)),
+      ],
+      false,
+    );
+    Object.assign(bot.registry.entitiesByName, registry.entitiesByName);
+    Object.assign(bot, { version: "26.1" });
+
+    for (const name of ["zombie", "skeleton", "creeper", "drowned"])
+      expect(registry.entitiesByName[name]?.type).toBe("hostile");
+    expect(registry.entitiesByName.player?.type).toBe("player");
+
+    const observation = observePlayerBody(bot, undefined);
+    expect(
+      observation.perception.nearbyHostiles?.entities
+        .map(({ name }) => name)
+        .sort(),
+    ).toEqual(["creeper", "drowned", "skeleton", "zombie"]);
+    expect(observation.perception.entities.map(({ name }) => name)).toContain(
+      "zombie",
+    );
+    expect(
+      observation.perception.entities.map(({ name }) => name),
+    ).not.toContain("skeleton");
+  });
+
   it("adds unoccluded client-received hostiles outside FOV with current evidence", () => {
     const observation = observePlayerBody(
       makeObservationBot([
