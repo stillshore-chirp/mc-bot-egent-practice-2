@@ -79,7 +79,7 @@ Runtimeが`setDamageReflexEnabled(true)`にした間、Bodyはenable・spawn・�
 ### 操作固有の成功確認
 
 - `dig`は読込済みで通常到達距離内の対象へ操作内で向き直り、視認性・遮蔽・同じ接続を再確認してから採掘します。対象がその視点から見えないままなら採掘しません。`attack`は Bot 自身を攻撃元と特定できる`entityHurt`だけで命中を確認し、命中と死亡は別の結果にします。`dig`・`place`は対象位置のサーバー起点更新を照合し、採掘後の空気または要求した設置 block を確認します。クライアント内の楽観更新だけでは成功にしません。`craft`は要求アイテム数の増加を確認します。
-- window 移送は対象 item と slot ごとの正確な増減を確認します。`consume`は item 数の減少と満腹度の増加の両方を必要とします。
+- window 移送は対象 item と slot ごとの正確な増減を確認します。`consume`は item 数の減少に加え、満腹度の増加か自身の食事完了通知を必要とします。食事完了は消費の根拠であり、体力回復は後続の health 観測で別に確認します。
 - `collect_item`は開始時に可視の entity ID だけを受け付け、250ms ごとに可視性と位置を再観測します。視界を失えば停止し、45 秒期限・`AbortSignal`・`stop()`に従います。成功には対象 ID に一致する`playerCollect` eventと、その event から得た item 名の所持数増加を最大 1 秒の再観測内で両方確認する必要があります。増加が不明なら`unverified`とし、entity 消失・視界喪失・不正対象・経路失敗・timeout を別の`itemCollectionOutcome`として扱います。
 - `fish`は浮き・食いつきの粒子を観測し、引き上げ後の回収 item とインベントリ増加を照合します。sleep/wake・乗降・乗り物操作は要求状態や位置・status を確認し、乗り物入力 tick を制限します。
 - `trade`は選択した取引の入出力 item 数、`enchant`は対象へ新しく付いた効果、`anvil`は要求名を確認します。本や看板の内容は接続 protocol が提供する範囲だけを確認します。

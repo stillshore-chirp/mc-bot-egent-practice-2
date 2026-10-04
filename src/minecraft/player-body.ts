@@ -525,6 +525,9 @@ interface ActiveOperation {
   runFinished: boolean;
   botDisconnected: boolean;
   effectItemName?: string;
+  consumeStatusObserved?: boolean;
+  consumeStatusLifeGeneration?: number;
+  consumeStatusCleanup?: () => void;
   lookSweep?: PlayerBodyLookSweep;
   expectedTrade?: {
     readonly input1Name: string;
@@ -552,6 +555,18 @@ interface PacketClient {
   on(event: string, listener: (packet: unknown) => void): void;
   removeListener(event: string, listener: (packet: unknown) => void): void;
   write(event: string, packet: unknown): void;
+}
+
+function isOwnEatingCompletionPacket(
+  packet: unknown,
+  entityId: number,
+): boolean {
+  if (typeof packet !== "object" || packet === null) return false;
+  const status = packet as {
+    readonly entityId?: unknown;
+    readonly entityStatus?: unknown;
+  };
+  return status.entityId === entityId && status.entityStatus === 9;
 }
 
 class ActionTimeoutError extends Error {
@@ -1205,13 +1220,15 @@ function operationEvidence(
     case "window_close":
       return before.window !== null && after.window === null;
     case "consume":
+      if (active.effectItemName === undefined) return false;
       return (
-        active.effectItemName !== undefined &&
-        after.self.food !== null &&
-        before.self.food !== null &&
-        after.self.food > before.self.food &&
         countNamedItem(after, active.effectItemName) <
-          countNamedItem(before, active.effectItemName)
+          countNamedItem(before, active.effectItemName) &&
+        ((after.self.food !== null &&
+          before.self.food !== null &&
+          after.self.food > before.self.food) ||
+          (active.consumeStatusObserved === true &&
+            active.consumeStatusLifeGeneration !== undefined))
       );
     case "toss":
       return (
@@ -2460,6 +2477,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       blockEvidence?.dispose();
       attackEvidence?.();
       itemCollectionEvidence?.();
+      active.consumeStatusCleanup?.();
+      delete active.consumeStatusCleanup;
       this.stopStallMonitor(active);
       this.cleanupAction(
         active,
@@ -2515,7 +2534,9 @@ export class MineflayerPlayerBody implements PlayerBody {
             : "Mineflayer observed this player damage the target; target death was not observed."
           : operation.kind === "collect_item"
             ? "Mineflayer observed this player collect the requested item entity and the matching inventory count increased."
-            : "Observed post-action state confirms the requested effect.";
+            : operation.kind === "consume"
+              ? "The requested item count decreased and food increase or this player's eating-completion status was observed; health recovery was not inferred."
+              : "Observed post-action state confirms the requested effect.";
     } else if (active.timedOut) {
       status = "unverified";
       detail =
@@ -2609,6 +2630,35 @@ export class MineflayerPlayerBody implements PlayerBody {
     } catch {
       return null;
     }
+  }
+
+  private captureConsumeStatus(bot: Bot, active: ActiveOperation): () => void {
+    const client = bot._client as unknown as PacketClient;
+    const entity = bot.entity;
+    const lifeGeneration = this.lifeGeneration;
+    const onEntityStatus = (packet: unknown): void => {
+      if (
+        !isOwnEatingCompletionPacket(packet, entity.id) ||
+        this.boundBot !== bot ||
+        this.boundBotEnded ||
+        this.disconnectedSinceBind ||
+        this.botLifeDead ||
+        this.lifeGeneration !== lifeGeneration ||
+        bot.entity !== entity ||
+        !Number.isFinite(bot.health) ||
+        bot.health <= 0
+      )
+        return;
+      try {
+        if (this.getBot() !== bot) return;
+      } catch {
+        return;
+      }
+      active.consumeStatusObserved = true;
+      active.consumeStatusLifeGeneration = lifeGeneration;
+    };
+    client.on("entity_status", onEntityStatus);
+    return () => client.removeListener("entity_status", onEntityStatus);
   }
 
   private async waitForConsumeEffectConfirmation(
@@ -3124,6 +3174,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         active.effectItemName = food.name;
         await bot.equip(food, "hand");
         if (signal.aborted) throw abortError(signal);
+        active.consumeStatusCleanup = this.captureConsumeStatus(bot, active);
         await bot.consume();
         return;
       }

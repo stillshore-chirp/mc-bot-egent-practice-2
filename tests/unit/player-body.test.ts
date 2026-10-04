@@ -581,10 +581,11 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
 function prepareConsumeFixture(
   fake: ReturnType<typeof makeFakeBot>,
   food = 19,
+  itemName = "bread",
 ): Record<string, unknown> {
   const bread = {
     type: 5,
-    name: "bread",
+    name: itemName,
     count: 1,
     metadata: 0,
     durabilityUsed: null,
@@ -601,13 +602,24 @@ function prepareConsumeFixture(
   const registry = fake.bot.registry as unknown as {
     foodsByName: Record<string, { effectiveQuality: number }>;
   };
-  registry.foodsByName.bread = { effectiveQuality: 2 };
+  registry.foodsByName[itemName] = { effectiveQuality: 2 };
   Object.assign(fake.bot, {
     equip: vi.fn(async (item: unknown) => {
       Object.assign(fake.bot, { heldItem: item });
     }),
   });
   return bread;
+}
+
+function emitEatingCompletion(
+  fake: ReturnType<typeof makeFakeBot>,
+  entityId = fake.bot.entity.id,
+): void {
+  const client = fake.bot._client as unknown as EventEmitter;
+  client.emit("entity_status", {
+    entityId,
+    entityStatus: 9,
+  });
 }
 
 describe("player body", () => {
@@ -744,6 +756,135 @@ describe("player body", () => {
     }
   });
 
+  it("confirms full-food golden-apple consumption from own eating status and item decrease", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          emitEatingCompletion(fake);
+          setTimeout(() => {
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, apple, null);
+          }, 200);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.food).toBe(20);
+      expect(result.after?.self.food).toBe(20);
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "golden_apple" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat an inventory decrease without own eating status as confirmed", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          setTimeout(() => {
+            emitEatingCompletion(fake, fake.bot.entity.id + 1);
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, apple, null);
+          }, 100);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "golden_apple" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not confirm own eating status without an item decrease", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      prepareConsumeFixture(fake, 20, "golden_apple");
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => emitEatingCompletion(fake)),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "golden_apple", count: 1 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores eating status after the consume operation changes life", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          fake.bot.emit("spawn");
+          emitEatingCompletion(fake);
+          inventory.slots[36] = null;
+          fake.inventory.emit("updateSlot", 36, apple, null);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps a consume without observed state changes unverified", async () => {
     vi.useFakeTimers();
     try {
@@ -765,6 +906,11 @@ describe("player body", () => {
       expect(result.after?.self.inventory).toContainEqual(
         expect.objectContaining({ name: "bread", count: 1 }),
       );
+      expect(
+        (fake.bot._client as unknown as EventEmitter).listenerCount(
+          "entity_status",
+        ),
+      ).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -791,6 +937,11 @@ describe("player body", () => {
       expect(result.after?.self.inventory).toContainEqual(
         expect.objectContaining({ name: "bread", count: 1 }),
       );
+      expect(
+        (fake.bot._client as unknown as EventEmitter).listenerCount(
+          "entity_status",
+        ),
+      ).toBe(0);
     } finally {
       vi.useRealTimers();
     }
