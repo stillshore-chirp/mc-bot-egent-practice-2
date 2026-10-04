@@ -7,6 +7,7 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { AppError } from "../domain/errors.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 import {
   playerOperationSchema,
@@ -80,6 +81,8 @@ const maximumItemCollectionTimeoutMs = 45_000;
 const consumeEffectObservationGraceMs = 1_000;
 const consumeEffectObservationPollTicks = 1;
 const deathEvidenceCorrelationMs = 1_000;
+const spawnAdmissionWaitMs = 3_000;
+const spawnAdmissionPollMs = 50;
 
 export interface PlayerBodyDamageSource {
   readonly kind: string;
@@ -580,6 +583,49 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new Error("Player operation interrupted");
+}
+
+function waitForSpawnAdmissionPoll(
+  delayMs: number,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const finish = (callback: () => void): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => reject(abortError(signal)));
+    const timer = setTimeout(() => finish(resolve), delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isMinecraftNotConnected(error: unknown): error is AppError {
+  return (
+    error instanceof AppError && error.detail.code === "MINECRAFT_NOT_CONNECTED"
+  );
+}
+
+function interruptedBeforeSpawnAdmission(
+  operation: PlayerOperation,
+  startedAt: string,
+): PlayerOperationResult {
+  return {
+    operationId: randomUUID(),
+    operation,
+    status: "interrupted",
+    startedAt,
+    completedAt: new Date().toISOString(),
+    before: null,
+    after: null,
+    recoveryRequired: false,
+    detail: "Operation was cancelled before Minecraft spawn admission.",
+  };
 }
 
 function waitForItemCollectionPoll(signal: AbortSignal): Promise<void> {
@@ -1375,8 +1421,10 @@ function captureServerBlockUpdates(
 export class MineflayerPlayerBody implements PlayerBody {
   private active: ActiveOperation | undefined;
   private admission: Promise<void> = Promise.resolve();
+  private readonly pendingOperationAdmissions = new Set<AbortController>();
   private readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   private boundBot: Bot | undefined;
+  private boundBotEnded = false;
   private readonly botHandlers: (() => void)[] = [];
   private readonly inventoryHandlers: (() => void)[] = [];
   private inventoryBoundBot: Bot | undefined;
@@ -1455,6 +1503,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     signal?: AbortSignal,
   ): Promise<PlayerOperationResult> {
     const operation = playerOperationSchema.parse(rawOperation);
+    const requestedAt = new Date().toISOString();
     const previousAdmission = this.admission;
     let resolveAdmission!: () => void;
     const nextAdmission = new Promise<void>((resolve) => {
@@ -1464,11 +1513,38 @@ export class MineflayerPlayerBody implements PlayerBody {
       () => nextAdmission,
       () => nextAdmission,
     );
+    const admissionController = new AbortController();
+    const isAdmissionAborted = (): boolean =>
+      admissionController.signal.aborted;
+    const abortAdmission = (): void =>
+      admissionController.abort(signal?.reason);
+    if (signal?.aborted) abortAdmission();
+    else signal?.addEventListener("abort", abortAdmission, { once: true });
+    this.pendingOperationAdmissions.add(admissionController);
 
     let active: ActiveOperation | undefined;
     try {
       await previousAdmission;
-      const bot = this.getBot();
+      if (isAdmissionAborted())
+        return interruptedBeforeSpawnAdmission(operation, requestedAt);
+      let bot: Bot;
+      try {
+        bot = this.getBot();
+      } catch (error) {
+        if (!isMinecraftNotConnected(error)) throw error;
+        try {
+          bot = await this.waitForSpawnAdmission(
+            error,
+            admissionController.signal,
+          );
+        } catch (waitError) {
+          if (isAdmissionAborted())
+            return interruptedBeforeSpawnAdmission(operation, requestedAt);
+          throw waitError;
+        }
+      }
+      if (isAdmissionAborted())
+        return interruptedBeforeSpawnAdmission(operation, requestedAt);
       this.bindBot(bot);
       const previous = this.active;
       if (previous !== undefined) {
@@ -1476,6 +1552,8 @@ export class MineflayerPlayerBody implements PlayerBody {
           new Error("Replaced by a newer player operation"),
         );
         await previous.done;
+        if (isAdmissionAborted())
+          return interruptedBeforeSpawnAdmission(operation, requestedAt);
         if (
           !previous.actionSettled &&
           !(previous.botDisconnected && previous.bot !== bot)
@@ -1495,6 +1573,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       active ??= this.makeActive(operation, bot, controller);
       this.active = active;
+      this.pendingOperationAdmissions.delete(admissionController);
       this.emit({
         type: "operation_started",
         at: active.startedAt,
@@ -1504,6 +1583,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       active.done = this.runActive(active);
     } finally {
       resolveAdmission();
+      this.pendingOperationAdmissions.delete(admissionController);
+      signal?.removeEventListener("abort", abortAdmission);
     }
 
     const result = await active.done;
@@ -1512,7 +1593,44 @@ export class MineflayerPlayerBody implements PlayerBody {
     return result;
   }
 
+  private async waitForSpawnAdmission(
+    initialError: AppError,
+    signal: AbortSignal,
+  ): Promise<Bot> {
+    const waitingBot = this.boundBot;
+    const isBoundBotEnded = (): boolean => this.boundBotEnded;
+    if (waitingBot === undefined || isBoundBotEnded()) throw initialError;
+    const deadline = Date.now() + spawnAdmissionWaitMs;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      if (this.boundBot !== waitingBot || isBoundBotEnded()) throw initialError;
+      await waitForSpawnAdmissionPoll(
+        Math.min(spawnAdmissionPollMs, deadline - Date.now()),
+        signal,
+      );
+      throwIfAborted(signal);
+      if (
+        Date.now() >= deadline ||
+        this.boundBot !== waitingBot ||
+        isBoundBotEnded()
+      )
+        throw initialError;
+      let admittedBot: Bot;
+      try {
+        admittedBot = this.getBot();
+      } catch (error) {
+        if (isMinecraftNotConnected(error)) continue;
+        throw error;
+      }
+      if (admittedBot !== waitingBot) throw initialError;
+      return admittedBot;
+    }
+    throw initialError;
+  }
+
   public async stop(): Promise<void> {
+    for (const pending of this.pendingOperationAdmissions)
+      pending.abort(new Error("Player body stopped"));
     const active = this.active;
     if (active !== undefined) {
       active.controller.abort(new Error("Player body stopped"));
@@ -2721,6 +2839,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       clearTimeout(this.pendingBotDeath.timer);
     this.pendingBotDeath = undefined;
     this.boundBot = bot;
+    this.boundBotEnded = false;
     this.lastStateSignatures.clear();
     this.lastBotDamage = undefined;
     this.pendingDeathNotice = undefined;
@@ -2871,6 +2990,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("end", (reason: unknown) => {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
+      this.boundBotEnded = true;
       if (this.pendingBotDeath?.bot === bot) {
         clearTimeout(this.pendingBotDeath.timer);
         this.pendingBotDeath = undefined;

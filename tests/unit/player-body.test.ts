@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Window } from "prismarine-windows";
+import { AppError } from "../../src/domain/errors.js";
 import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
   MineflayerPlayerBody,
@@ -2481,6 +2482,164 @@ describe("player body", () => {
 
     expect(result.status).toBe("successful");
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("waits for spawn admission before executing a selected relative move", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const notConnected = new AppError({
+        category: "connection",
+        code: "MINECRAFT_NOT_CONNECTED",
+        message: "not connected",
+        retryable: true,
+      });
+      let admitted = false;
+      const body = new MineflayerPlayerBody(() => {
+        if (!admitted) throw notConnected;
+        return fake.bot;
+      });
+      body.attach(fake.bot);
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementationOnce(async () => {
+          fake.bot.entity.position.x = 13;
+        });
+
+      const pending = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(goto).not.toHaveBeenCalled();
+
+      (fake.bot as unknown as EventEmitter).emit("spawn");
+      await vi.advanceTimersByTimeAsync(100);
+      expect(goto).not.toHaveBeenCalled();
+
+      fake.bot.entity.position.x = 10;
+      admitted = true;
+      await vi.advanceTimersByTimeAsync(50);
+      const result = await pending;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.position.x).toBe(10);
+      expect(goto).toHaveBeenCalledOnce();
+      expect(goto.mock.calls[0]?.[0]).toMatchObject({ x: 13, y: 64, z: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a pending spawn admission through signal or body stop", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const cancellation of ["signal", "stop"] as const) {
+        const fake = makeFakeBot();
+        const notConnected = new AppError({
+          category: "connection",
+          code: "MINECRAFT_NOT_CONNECTED",
+          message: "not connected",
+          retryable: true,
+        });
+        const body = new MineflayerPlayerBody(() => {
+          throw notConnected;
+        });
+        body.attach(fake.bot);
+        const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+        const controller = new AbortController();
+        const pending = body.execute(
+          {
+            kind: "move_relative",
+            offset: { x: 3, y: 0, z: 0 },
+            range: 1,
+          },
+          cancellation === "signal" ? controller.signal : undefined,
+        );
+        await vi.advanceTimersByTimeAsync(50);
+
+        if (cancellation === "signal") controller.abort();
+        else await body.stop();
+        const result = await pending;
+
+        expect(result.status).toBe("interrupted");
+        expect(result.before).toBeNull();
+        expect(goto).not.toHaveBeenCalled();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves spawn admission errors on timeout and bot replacement", async () => {
+    vi.useFakeTimers();
+    try {
+      const notConnected = new AppError({
+        category: "connection",
+        code: "MINECRAFT_NOT_CONNECTED",
+        message: "not connected",
+        retryable: true,
+      });
+      const denied = new AppError({
+        category: "permission",
+        code: "MINECRAFT_ACTION_DENIED",
+        message: "action denied",
+        retryable: false,
+      });
+      const deniedFixture = makeFakeBot();
+      const deniedBody = new MineflayerPlayerBody(() => {
+        throw denied;
+      });
+      deniedBody.attach(deniedFixture.bot);
+      await expect(
+        deniedBody.execute({
+          kind: "move_relative",
+          offset: { x: 3, y: 0, z: 0 },
+          range: 1,
+        }),
+      ).rejects.toBe(denied);
+
+      const timeoutFixture = makeFakeBot();
+      const timeoutBody = new MineflayerPlayerBody(() => {
+        throw notConnected;
+      });
+      timeoutBody.attach(timeoutFixture.bot);
+      const timedOut = timeoutBody.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      const timeoutExpectation = expect(timedOut).rejects.toBe(notConnected);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await timeoutExpectation;
+
+      const oldBot = makeFakeBot();
+      const replacementBot = makeFakeBot();
+      let currentBot = oldBot.bot;
+      const replacementBody = new MineflayerPlayerBody(() => {
+        if (currentBot === oldBot.bot) throw notConnected;
+        return currentBot;
+      });
+      replacementBody.attach(oldBot.bot);
+      const replacementGoto = vi.spyOn(replacementBot.bot.pathfinder, "goto");
+      const replaced = replacementBody.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      const replacementExpectation =
+        expect(replaced).rejects.toBe(notConnected);
+      await Promise.resolve();
+      (oldBot.bot as unknown as EventEmitter).emit("end", "replaced");
+      currentBot = replacementBot.bot;
+      replacementBody.attach(replacementBot.bot);
+      await vi.advanceTimersByTimeAsync(50);
+      await replacementExpectation;
+      expect(replacementGoto).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("resolves a relative move from the observed start and verifies arrival", async () => {
