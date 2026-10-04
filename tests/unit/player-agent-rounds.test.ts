@@ -3161,6 +3161,7 @@ describe("player agent response rounds", () => {
         body: {
           connectionState: "connected",
           activeOperation: null,
+          latestOperationPhase: null,
           latestObservation: {
             observedAt: "2026-10-04T00:00:00.000Z",
             ageMs: 0,

@@ -448,7 +448,18 @@ export type PlayerBodyEvent =
     }
   | { readonly type: "reconnected"; readonly at: string }
   | {
+      readonly type: "operation_admission_waiting";
+      readonly at: string;
+      readonly operation: PlayerOperationName;
+    }
+  | {
       readonly type: "operation_started";
+      readonly at: string;
+      readonly operationId: string;
+      readonly operation: PlayerOperationName;
+    }
+  | {
+      readonly type: "operation_dispatched";
       readonly at: string;
       readonly operationId: string;
       readonly operation: PlayerOperationName;
@@ -2209,6 +2220,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           bot = await this.waitForSpawnAdmission(
             error,
             admissionController.signal,
+            operation.kind,
           );
         } catch (waitError) {
           if (isAdmissionAborted())
@@ -2269,10 +2281,16 @@ export class MineflayerPlayerBody implements PlayerBody {
   private async waitForSpawnAdmission(
     initialError: AppError,
     signal: AbortSignal,
+    operation: PlayerOperationName,
   ): Promise<Bot> {
     const waitingBot = this.boundBot;
     const isBoundBotEnded = (): boolean => this.boundBotEnded;
     if (waitingBot === undefined || isBoundBotEnded()) throw initialError;
+    this.emit({
+      type: "operation_admission_waiting",
+      at: new Date().toISOString(),
+      operation,
+    });
     const deadline = Date.now() + spawnAdmissionWaitMs;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
@@ -2878,6 +2896,12 @@ export class MineflayerPlayerBody implements PlayerBody {
     signal: AbortSignal,
     active: ActiveOperation,
   ): Promise<void> {
+    this.emit({
+      type: "operation_dispatched",
+      at: new Date().toISOString(),
+      operationId: active.id,
+      operation: operation.kind,
+    });
     switch (operation.kind) {
       case "move_to":
       case "move_relative": {

@@ -3667,6 +3667,8 @@ describe("player body", () => {
         return fake.bot;
       });
       body.attach(fake.bot);
+      const bodyEvents: PlayerBodyEvent[] = [];
+      body.onEvent((event) => bodyEvents.push(event));
       const goto = vi
         .spyOn(fake.bot.pathfinder, "goto")
         .mockImplementationOnce(async () => {
@@ -3694,6 +3696,20 @@ describe("player body", () => {
       expect(result.before?.self.position.x).toBe(10);
       expect(goto).toHaveBeenCalledOnce();
       expect(goto.mock.calls[0]?.[0]).toMatchObject({ x: 13, y: 64, z: 0 });
+      expect(
+        bodyEvents
+          .filter(
+            ({ type }) =>
+              type === "operation_admission_waiting" ||
+              type === "operation_started" ||
+              type === "operation_dispatched",
+          )
+          .map(({ type }) => type),
+      ).toEqual([
+        "operation_admission_waiting",
+        "operation_started",
+        "operation_dispatched",
+      ]);
     } finally {
       vi.useRealTimers();
     }
