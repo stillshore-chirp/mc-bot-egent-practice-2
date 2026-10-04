@@ -1008,7 +1008,7 @@ export class PlayerRuntime {
         });
       }
       this.options.memory.recordEpisode({
-        summary: `被害時の身体反射: ${evidenceSummary}`,
+        summary: `身体反射の結果: ${evidenceSummary}`,
         status: event.status,
         operationKind: event.operationKind ?? "damage_reflex",
       });
@@ -1557,7 +1557,11 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
 function damageReflexEvidenceSummary(
   event: DamageReflexCompletedEvent,
 ): string {
-  return `${event.summary}; operation=${event.operationKind ?? "none"}; status=${event.status}; startedAt=${event.startedAt}; serverConfirmedAt=${event.serverConfirmedAt ?? "unknown"}; sameLife=${event.sameLife ?? "unknown"}`;
+  const trigger =
+    "trigger" in event && event.trigger === "hostile_approach"
+      ? "hostile_approach"
+      : "damage";
+  return `${event.summary}; operation=${event.operationKind ?? "none"}; status=${event.status}; startedAt=${event.startedAt}; serverConfirmedAt=${event.serverConfirmedAt ?? "unknown"}; trigger=${trigger}; sameLife=${event.sameLife ?? "unknown"}`;
 }
 
 function ownerConsumeOutcomeMessage(

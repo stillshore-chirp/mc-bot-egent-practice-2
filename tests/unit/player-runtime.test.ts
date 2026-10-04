@@ -1170,14 +1170,77 @@ describe("integrated player runtime", () => {
         ({ kind }) => kind === "body_outcome",
       )?.summary;
       expect(wakeSummary).toContain("serverConfirmedAt=");
+      expect(wakeSummary).toContain("trigger=damage; sameLife=true");
       expect(wakeSummary).toContain("sameLife=true");
       expect(wakeSummary).toContain("action_unverified");
       expect(memoryEpisodes).toHaveLength(2);
+      expect(memoryEpisodes[0]?.summary).toContain("身体反射の結果:");
+      expect(memoryEpisodes[0]?.summary).not.toContain("被害時");
       expect(JSON.stringify(memoryEpisodes)).not.toContain("entityId");
     } finally {
       await runtime.shutdown();
       skills.close();
       mind.close();
+    }
+  });
+
+  it("passes a hostile-approach reflex to Purpose without recording damage", async () => {
+    const purposeInputs: { kind: string; summary: string }[][] = [];
+    const episodeSummaries: string[] = [];
+    const memory = {
+      ...createMemoryPort(),
+      recordEpisode: ({ summary }: { readonly summary: string }) =>
+        episodeSummaries.push(summary),
+    };
+    const fixture = createRuntimeFixture(
+      {
+        think: async ({ events }) => {
+          purposeInputs.push(
+            events.map(({ kind, summary }) => ({ kind, summary })),
+          );
+          return { accepted: true };
+        },
+      },
+      memory,
+    );
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => purposeInputs.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const completedAt = new Date().toISOString();
+      const approachCompletion = {
+        type: "damage_reflex_completed",
+        at: completedAt,
+        operationKind: "attack",
+        status: "successful",
+        startedAt: completedAt,
+        serverConfirmedAt: completedAt,
+        sameLife: true,
+        summary: "hit_confirmed",
+        trigger: "hostile_approach",
+      } as unknown as PlayerBodyEvent;
+      fixture.body.emit(approachCompletion);
+
+      await waitFor(() => purposeInputs.length >= 2);
+      const resultInput = purposeInputs.find((events) =>
+        events.some(({ kind }) => kind === "body_outcome"),
+      );
+      const result = resultInput?.find(({ kind }) => kind === "body_outcome");
+      expect(result?.summary).toContain(
+        "trigger=hostile_approach; sameLife=true",
+      );
+      expect(resultInput?.some(({ kind }) => kind === "bot_damaged")).toBe(
+        false,
+      );
+      expect(fixture.mind.snapshot().recentOutcomes[0]?.summary).toContain(
+        "trigger=hostile_approach",
+      );
+      expect(episodeSummaries[0]).toContain("身体反射の結果:");
+      expect(episodeSummaries[0]).not.toContain("被害時");
+    } finally {
+      await fixture.close();
     }
   });
 
@@ -3751,7 +3814,10 @@ function createMemoryPort(): PlayerMemoryPort {
   };
 }
 
-function createRuntimeFixture(purpose?: PlayerPurposePort) {
+function createRuntimeFixture(
+  purpose?: PlayerPurposePort,
+  memory: PlayerMemoryPort = createMemoryPort(),
+) {
   const directory = temporaryDirectory();
   const databasePath = join(directory, "player.sqlite");
   const mind = PlayerMindStore.open(databasePath);
@@ -3763,7 +3829,7 @@ function createRuntimeFixture(purpose?: PlayerPurposePort) {
     playerId: "owner-player",
     body,
     mind,
-    memory: createMemoryPort(),
+    memory,
     skills,
     conversation: {
       nextTurn: () => 1,
