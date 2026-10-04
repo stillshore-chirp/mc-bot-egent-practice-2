@@ -463,7 +463,7 @@ describe("player owner intent context", () => {
         expect(serializedRegenerationState).toContain(currentStateMarker);
         expect(serializedRegenerationState).toContain('"latestDeath"');
         expect(regenerationInstructions).toContain(
-          "runtime.latestDeathがある場合",
+          "runtime.latestDeathは過去の記録として扱い",
         );
         expect(regenerationInstructions).toContain(
           "remember_owner_factを必ず呼び",
@@ -826,10 +826,10 @@ describe("player owner intent context", () => {
         inventory: [],
       });
       expect(String(request.instructions)).toContain(
-        "self.foodSaturation、self.inventory",
+        "現在わかるfood・inventoryを使って候補を選びます",
       );
       expect(String(request.instructions)).toContain(
-        "満腹や食料なしと断定せず",
+        "可食性や回復量の確認をconsumeの前提にしません",
       );
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({

@@ -284,10 +284,11 @@ describe("player agent response rounds", () => {
         }),
       );
       expect(request.instructions).toContain(
-        "観測待ちへ目的をすり替えず脱出経路を変える一手",
+        "同じ場所へ戻る循環があれば別の実行可能な操作",
       );
-      expect(request.instructions).toContain("自分の復帰Bed");
-      expect(request.instructions).toContain("見えていない出口形状は断定せず");
+      expect(request.instructions).toContain(
+        "所有やspawn設定が不明でも試行を妨げず",
+      );
     } finally {
       fixture.close();
     }
@@ -585,7 +586,7 @@ describe("player agent response rounds", () => {
       expect(request).not.toHaveProperty("reasoning");
       expect(fixture.requestOptions[0]).toEqual({});
       expect(request.instructions).toContain(
-        "新しい目的や活動に初めて着手する時",
+        "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
       );
     } finally {
       fixture.close();
@@ -949,7 +950,9 @@ describe("player agent response rounds", () => {
       const knowledgeTool = tools.find(
         (tool) => tool.name === "ask_body_knowledge",
       );
-      expect(knowledgeTool?.description).toContain("初回観測");
+      expect(knowledgeTool?.description).toContain(
+        "操作を選ぶ前提として再観測しないでください",
+      );
       const inputItems = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.input);
@@ -2143,7 +2146,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "body操作がfailed、unverified、interrupted、cancelledになったら",
+        "Body操作がfailed、unverified、interrupted、cancelledならその結果を次判断に使います",
       );
       expect(JSON.stringify(request.input)).toContain(
         "Target position is occupied by oak_planks",
