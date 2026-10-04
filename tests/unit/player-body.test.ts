@@ -1768,6 +1768,192 @@ describe("player body", () => {
     expect(JSON.stringify(completion)).not.toContain('"id"');
   });
 
+  it("starts one reflex for a nearby hostile before damage and coalesces later damage", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const attack = vi.fn((target: Entity) =>
+      botEvents.emit("entityHurt", target, fake.bot.entity),
+    );
+    Object.assign(fake.bot, { attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    botEvents.emit("entityMoved", zombie);
+    botEvents.emit("entityMoved", zombie);
+
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_started"),
+      ).toBe(true),
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_started"),
+    ).toMatchObject({ trigger: "hostile_approach" });
+    expect(events.some((event) => event.type === "bot_damaged")).toBe(false);
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled(), {
+      timeout: 1_000,
+    });
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() =>
+      expect(events.some((event) => event.type === "bot_damaged")).toBe(true),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    botEvents.emit("entityMoved", zombie);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(
+      () =>
+        expect(
+          events.filter((event) => event.type === "damage_reflex_started"),
+        ).toHaveLength(2),
+      { timeout: 1_000 },
+    );
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started")[1],
+    ).toMatchObject({ trigger: "hostile_approach" });
+    await body.stop();
+  });
+
+  it("re-engages after a hostile leaves and returns to ordinary attack reach", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(1),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    zombie.position = new Vec3(0, 64, -5);
+    botEvents.emit("entityMoved", zombie);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+
+    zombie.position = new Vec3(0, 64, -2);
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(2),
+    );
+    await body.stop();
+  });
+
+  it("rejects passive, player, occluded, out-of-reach, and disabled hostile approaches", async () => {
+    const cases = [
+      "passive",
+      "player",
+      "occluded",
+      "out-of-reach",
+      "disabled",
+    ] as const;
+    for (const scenario of cases) {
+      const fake = makeFakeBot();
+      const target = addFakeZombieEntity(fake);
+      registerFakeZombie(fake);
+      if (scenario === "passive")
+        Object.assign(fake.bot.registry.entitiesByName, {
+          zombie: {
+            name: "zombie",
+            displayName: "Zombie",
+            type: "mob",
+            category: "Passive mobs",
+          },
+        });
+      if (scenario === "player")
+        Object.assign(target, { type: "player", username: "other" });
+      if (scenario === "occluded") {
+        const wall = makeBlock("stone", 1, new Vec3(0, 64, -1));
+        Object.assign(fake.bot.world, {
+          raycast: vi.fn(() => wall),
+        });
+      }
+      if (scenario === "out-of-reach") target.position = new Vec3(0, 64, -5);
+
+      const botEvents = fake.bot as unknown as EventEmitter;
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      if (scenario !== "disabled") body.setDamageReflexEnabled(true);
+      botEvents.emit("entityMoved", target);
+      await vi.waitFor(() =>
+        expect(
+          events.some(
+            (event) =>
+              event.type === "state_changed" && event.reason === "entities",
+          ),
+        ).toBe(true),
+      );
+      expect(
+        events.some((event) => event.type === "damage_reflex_started"),
+      ).toBe(false);
+      expect(fake.bot.attack).not.toHaveBeenCalled();
+      await body.stop();
+    }
+  });
+
+  it("rechecks a stationary hostile on spawn after replacing an old-life timer", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    botEvents.emit("entityMoved", zombie);
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(1),
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_started"),
+    ).toMatchObject({ trigger: "hostile_approach" });
+    await body.stop();
+  });
+
   it("equips only owned items into empty armor slots and recognizes a spear from server slot packets", async () => {
     const fake = makeFakeBot();
     const zombie = addFakeZombieEntity(fake);

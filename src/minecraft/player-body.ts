@@ -120,6 +120,7 @@ export interface PlayerBodyDeathCause {
 
 export type PlayerBodyDamageReflexOperationKind =
   "equip" | "attack" | "control";
+export type PlayerBodyDamageReflexTrigger = "damage" | "hostile_approach";
 
 export type PlayerBodyDamageReflexSummary =
   | "hit_confirmed"
@@ -133,6 +134,7 @@ export type PlayerBodyDamageReflexSummary =
 interface DamageReflexRun {
   readonly bot: Bot;
   readonly controller: AbortController;
+  trigger: PlayerBodyDamageReflexTrigger;
   readonly startedAt: string;
   readonly startedAtMs: number;
   readonly startLifeGeneration: number;
@@ -284,6 +286,21 @@ function damageSource(
       : null;
   return { kind, name, category };
 }
+
+function isKnownHostileEntity(bot: Bot, entity: Entity): boolean {
+  if (
+    entity.type !== "mob" ||
+    entity.username !== undefined ||
+    typeof entity.name !== "string"
+  )
+    return false;
+  const registryEntity = bot.registry.entitiesByName[entity.name];
+  return (
+    registryEntity?.name === entity.name &&
+    typeof registryEntity.category === "string" &&
+    /^hostile\s+mobs?$/iu.test(registryEntity.category)
+  );
+}
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -397,10 +414,15 @@ export type PlayerBodyEvent =
       readonly source: PlayerBodyDamageSource | null;
       readonly confidence: "observed" | "unknown";
     }
-  | { readonly type: "damage_reflex_started"; readonly at: string }
+  | {
+      readonly type: "damage_reflex_started";
+      readonly at: string;
+      readonly trigger?: PlayerBodyDamageReflexTrigger;
+    }
   | {
       readonly type: "damage_reflex_completed";
       readonly at: string;
+      readonly trigger?: PlayerBodyDamageReflexTrigger;
       readonly operationKind: PlayerBodyDamageReflexOperationKind | null;
       readonly status: PlayerOperationStatus;
       readonly startedAt: string;
@@ -1527,6 +1549,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   private passiveArmorEquipInFlight:
     { readonly bot: Bot; readonly promise: Promise<void> } | undefined;
   private passiveArmorPending = false;
+  private hostileApproachTargets = new Set<Entity>();
   private lifeGeneration = 0;
   private botLifeDead = false;
   private admission: Promise<void> = Promise.resolve();
@@ -1737,15 +1760,28 @@ export class MineflayerPlayerBody implements PlayerBody {
     await waitForAction(nativeEquip, signal);
   }
 
-  private startDamageReflex(bot: Bot, source: Entity | undefined): void {
+  private startDamageReflex(
+    bot: Bot,
+    source: Entity | undefined,
+    trigger: PlayerBodyDamageReflexTrigger = "damage",
+  ): void {
     if (
       !this.damageReflexEnabled ||
       this.boundBot !== bot ||
       this.boundBotEnded
     )
       return;
+    if (trigger === "damage" && source && isKnownHostileEntity(bot, source)) {
+      try {
+        requireReachableEntity(bot, source.id, attackRange);
+        this.hostileApproachTargets.add(source);
+      } catch {
+        // A distant damage source remains eligible for a later approach trigger.
+      }
+    }
     const current = this.damageReflex;
     if (current?.bot === bot) {
+      if (trigger === "damage") current.trigger = "damage";
       if (source !== undefined) current.latestSource = source;
       return;
     }
@@ -1753,6 +1789,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     const reflex: DamageReflexRun = {
       bot,
       controller: new AbortController(),
+      trigger,
       startedAt,
       startedAtMs: Date.now(),
       startLifeGeneration: this.lifeGeneration,
@@ -2003,13 +2040,22 @@ export class MineflayerPlayerBody implements PlayerBody {
       );
     };
     bot.on("entityHurt", onOutgoingHit);
-    this.emit({ type: "damage_reflex_started", at: reflex.startedAt });
+    this.emit({
+      type: "damage_reflex_started",
+      at: reflex.startedAt,
+      trigger: reflex.trigger,
+    });
     const equipment = this.equipDamageReflexItems(reflex).catch(() => {
       reflex.failed = true;
     });
     try {
       while (!signal.aborted) {
         if (!this.damageReflexIsCurrent(reflex)) break;
+        if (
+          reflex.trigger === "hostile_approach" &&
+          !this.damageReflexIsAlive(reflex)
+        )
+          break;
         if (!this.damageReflexIsAlive(reflex)) {
           if (!(await this.waitForDamageReflexSpawn(reflex, wallDeadline)))
             break;
@@ -2081,6 +2127,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.emit({
         type: "damage_reflex_completed",
         at: new Date().toISOString(),
+        trigger: reflex.trigger,
         operationKind: reflex.operationKind,
         status: reflex.status,
         startedAt: reflex.firstOperationStartedAt ?? reflex.startedAt,
@@ -2241,6 +2288,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       const bot = this.getBot();
       this.bindBot(bot);
       this.schedulePassiveArmor(bot);
+      this.scheduleStateEvent("entities");
     } catch {
       // Bind and inventory events will retry when this client becomes available.
     }
@@ -3489,6 +3537,7 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
+    this.hostileApproachTargets = new Set<Entity>();
     if (this.passiveArmorTask !== undefined)
       this.passiveArmorPending = this.damageReflexEnabled;
     this.passiveArmorController?.abort(new Error("Minecraft bot changed"));
@@ -3695,12 +3744,17 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.passiveArmorPending = this.damageReflexEnabled;
       this.passiveArmorController?.abort(new Error("Minecraft life changed"));
       this.lifeGeneration += 1;
+      this.hostileApproachTargets = new Set<Entity>();
       this.botLifeDead = false;
       if (this.disconnectedSinceBind) {
         this.disconnectedSinceBind = false;
         this.emit({ type: "reconnected", at: new Date().toISOString() });
       }
       this.scheduleStateEvent("position");
+      const staleEntityTimer = this.stateTimers.get("entities");
+      if (staleEntityTimer !== undefined) clearTimeout(staleEntityTimer);
+      this.stateTimers.delete("entities");
+      this.scheduleStateEvent("entities");
       this.schedulePassiveArmor(bot);
     });
     this.bindInventoryEventsWhenReady(bot);
@@ -3747,11 +3801,19 @@ export class MineflayerPlayerBody implements PlayerBody {
     reason: Extract<PlayerBodyEvent, { type: "state_changed" }>["reason"],
   ): void {
     if (this.stateTimers.has(reason)) return;
+    const scheduledBot = this.boundBot;
+    const scheduledLifeGeneration = this.lifeGeneration;
     const timer = setTimeout(
       () => {
         this.stateTimers.delete(reason);
         const bot = this.boundBot;
-        if (bot === undefined) return;
+        if (
+          bot === undefined ||
+          (reason === "entities" &&
+            (bot !== scheduledBot ||
+              this.lifeGeneration !== scheduledLifeGeneration))
+        )
+          return;
         try {
           if (this.getBot() !== bot) return;
         } catch {
@@ -3762,6 +3824,12 @@ export class MineflayerPlayerBody implements PlayerBody {
         }
         const observation = this.safeObserve(bot);
         if (observation === null) return;
+        if (reason === "entities")
+          this.startVisibleHostileApproach(
+            bot,
+            observation,
+            scheduledLifeGeneration,
+          );
         const signature = semanticSignature(observation, reason);
         if (this.lastStateSignatures.get(reason) === signature) return;
         this.lastStateSignatures.set(reason, signature);
@@ -3774,6 +3842,56 @@ export class MineflayerPlayerBody implements PlayerBody {
       reason === "entities" || reason === "blocks" ? 300 : 150,
     );
     this.stateTimers.set(reason, timer);
+  }
+
+  private startVisibleHostileApproach(
+    bot: Bot,
+    observation: PlayerBodyObservation,
+    lifeGeneration: number,
+  ): void {
+    if (
+      !this.damageReflexEnabled ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      this.lifeGeneration !== lifeGeneration ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return;
+    for (const previousTarget of this.hostileApproachTargets) {
+      if (
+        bot.entities[previousTarget.id] !== previousTarget ||
+        !isKnownHostileEntity(bot, previousTarget)
+      ) {
+        this.hostileApproachTargets.delete(previousTarget);
+        continue;
+      }
+      try {
+        requireReachableEntity(bot, previousTarget.id, attackRange);
+      } catch {
+        this.hostileApproachTargets.delete(previousTarget);
+      }
+    }
+    for (const visible of observation.perception.entities) {
+      const target = bot.entities[visible.id];
+      if (
+        target?.id !== visible.id ||
+        visible.isPlayer ||
+        visible.kind !== "mob" ||
+        this.hostileApproachTargets.has(target) ||
+        !isKnownHostileEntity(bot, target)
+      )
+        continue;
+      try {
+        requireVisibleEntity(bot, target.id, attackRange);
+      } catch {
+        continue;
+      }
+      this.hostileApproachTargets.add(target);
+      this.startDamageReflex(bot, target, "hostile_approach");
+      return;
+    }
   }
 
   private emit(event: PlayerBodyEvent): void {
