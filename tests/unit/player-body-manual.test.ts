@@ -32,16 +32,19 @@ describe("PlayerBody capability manual", () => {
       "Recommended action order, not a Body execution precondition or guard",
     );
     expect(manual.preconditions.join(" ")).toContain(
-      "each visible hostile at least 8 blocks away",
+      "each observed hostile at least 8 blocks away",
     );
     expect(manual.preconditions.join(" ")).toContain(
-      "when health is low or health loss is observed with visible hostiles",
+      "when health is low or health loss is observed with hostiles in the fresh FOV or `nearbyHostiles` subset",
     );
     expect(manual.preconditions.join(" ")).toContain(
       "move farther instead of waiting",
     );
     expect(manual.preconditions.join(" ")).toContain(
-      "does not prove unseen hostiles are absent or guarantee the distance will hold",
+      "unseen hostiles are not proven absent",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "distance is not guaranteed to hold",
     );
     expect(manual.successEvidence.join(" ")).toContain(
       "a higher observed `food` value or a matching same-Bot/life `entity_status` status 9",

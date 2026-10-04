@@ -50,7 +50,7 @@ const operationDetails: Partial<
 > = {
   consume: {
     preconditions: [
-      "`consume` only selects items recognized by the current registry as food. Recommended action order, not a Body execution precondition or guard: when health is low or health loss is observed with visible hostiles, move with `move_relative` until fresh observations place each visible hostile at least 8 blocks away; if any remain closer, move farther instead of waiting. Use the actual movement result and fresh distances before eating. This does not prove unseen hostiles are absent or guarantee the distance will hold.",
+      "`consume` only selects items recognized by the current registry as food. Recommended action order, not a Body execution precondition or guard: when health is low or health loss is observed with hostiles in the fresh FOV or `nearbyHostiles` subset, move with `move_relative` until fresh observations place each observed hostile at least 8 blocks away; if any remain closer, move farther instead of waiting. Use the actual movement result and fresh distances before eating. `nearbyHostiles` is an unoccluded client-received subset, not a world census; unseen hostiles are not proven absent and the distance is not guaranteed to hold.",
       "Do not promise direct health recovery from eating; check fresh vitals after the operation.",
     ],
     successEvidence: [

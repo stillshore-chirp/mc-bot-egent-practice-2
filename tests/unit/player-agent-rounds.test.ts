@@ -1180,7 +1180,50 @@ describe("player agent response rounds", () => {
               isPlayer: false,
               droppedItem: { name: "golden_apple", count: 1 },
             },
+            {
+              id: 91,
+              name: "zombie",
+              kind: "zombie",
+              category: "Hostile mobs",
+              position: { x: 2, y: 64, z: -1, dimension: "overworld" },
+              distance: 2.2,
+              health: 20,
+              isPlayer: false,
+              equipment: { mainHand: "iron_sword" },
+            },
           ],
+          nearbyHostiles: {
+            source: "client_received_unoccluded_nearby_hostiles",
+            observedAt: base.observedAt,
+            maxDistance: 16,
+            entityOutputLimit: 16,
+            omittedEntityCandidates: 2,
+            candidateSearchMayBeTruncated: true,
+            entities: [
+              {
+                id: 91,
+                name: "zombie",
+                kind: "zombie",
+                category: "Hostile mobs",
+                position: { x: 2, y: 64, z: -1, dimension: "overworld" },
+                distance: 2.2,
+                health: 20,
+                isPlayer: false,
+                equipment: { mainHand: "iron_sword" },
+              },
+              {
+                id: 93,
+                name: "skeleton",
+                kind: "skeleton",
+                category: "Hostile mobs",
+                position: { x: -1, y: 64, z: 4, dimension: "overworld" },
+                distance: 4.1,
+                health: 20,
+                isPlayer: false,
+                equipment: { mainHand: "bow" },
+              },
+            ],
+          },
         },
       };
       const fixture = openPurposeFixture(
@@ -1215,10 +1258,10 @@ describe("player agent response rounds", () => {
           "food値上昇または同じBot/lifeのentity_status status 9",
         );
         expect(request.instructions).toContain(
-          "各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+          "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
         );
         expect(request.instructions).toContain(
-          "8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます",
+          "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
         );
         const purposeInput = requestUserPayload(request);
         const serializedObservation = z
@@ -1238,6 +1281,40 @@ describe("player agent response rounds", () => {
           id: 78,
           droppedItem: { name: "golden_apple", count: 1 },
         });
+        expect(entities[2]).toMatchObject({
+          id: 91,
+          position: { x: 2, y: 64, z: -1 },
+          equipment: { mainHand: "iron_sword" },
+          untrustedWorldAuthoredText: {
+            displayName: { trust: "untrusted_world_text", value: "zombie" },
+          },
+        });
+        const nearbyHostiles = z
+          .record(z.string(), z.unknown())
+          .parse(perception.nearbyHostiles);
+        expect(nearbyHostiles).toMatchObject({
+          source: "client_received_unoccluded_nearby_hostiles",
+          observedAt: base.observedAt,
+          maxDistance: 16,
+          observedHostileCountLowerBound: 2,
+          frontViewOverlapEntityCount: 1,
+          omittedEntityCandidates: 2,
+          candidateSearchMayBeTruncated: true,
+        });
+        const nearbyEntities = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(nearbyHostiles.entities);
+        expect(nearbyEntities).toHaveLength(1);
+        expect(nearbyEntities[0]).toMatchObject({
+          id: 93,
+          position: { x: -1, y: 64, z: 4 },
+          distance: 4.1,
+          equipment: { mainHand: "bow" },
+          untrustedWorldAuthoredText: {
+            displayName: { trust: "untrusted_world_text", value: "skeleton" },
+          },
+        });
+        expect(nearbyEntities[0]).not.toHaveProperty("name");
       } finally {
         fixture.close();
       }
@@ -1833,10 +1910,10 @@ describe("player agent response rounds", () => {
         "その根拠をproposal resolutionに伝えてください",
       );
       expect(instructions).toContain(
-        "各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+        "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
       );
       expect(instructions).toContain(
-        "8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます",
+        "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
       );
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",

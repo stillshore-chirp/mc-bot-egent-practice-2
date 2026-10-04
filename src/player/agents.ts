@@ -538,6 +538,7 @@ export interface ConversationAgentOptions {
 }
 
 const conversationVisibleEntityLimit = 8;
+const conversationNearbyHostileLimit = 16;
 const conversationEquipmentSlots = [
   "mainHand",
   "offHand",
@@ -601,31 +602,36 @@ function summarizeConversationBodyObservation(
     (left, right) =>
       Number(left.name === "item") - Number(right.name === "item"),
   );
-  const visibleEntities = prioritizedEntities
-    .slice(0, conversationVisibleEntityLimit)
-    .map((entity) => ({
-      name: entity.name.slice(0, 80),
-      kind: entity.kind.slice(0, 80),
-      category: entity.category?.slice(0, 80) ?? null,
-      distance: Math.round(entity.distance * 10) / 10,
-      relativeDirection: relativeEntityDirection(
-        observation.self.yaw,
-        observation.self.position,
-        entity.position,
-      ),
-      health: entity.health,
-      equipment: Object.fromEntries(
-        conversationEquipmentSlots.map((slot) => [
-          slot,
-          entity.equipment?.[slot] === undefined
-            ? "unknown"
-            : (entity.equipment[slot]?.slice(0, 80) ?? null),
-        ]),
-      ),
-    }));
+  const summarizedFrontEntities = prioritizedEntities.slice(
+    0,
+    conversationVisibleEntityLimit,
+  );
+  const visibleEntities = summarizedFrontEntities.map((entity) =>
+    summarizeConversationEntity(entity, observation),
+  );
   const omittedVisibleCandidates =
     observation.perception.omittedEntityCandidates > 0 ||
     entities.length > conversationVisibleEntityLimit;
+  const nearbyHostiles = observation.perception.nearbyHostiles;
+  const frontVisibleIds = new Set(summarizedFrontEntities.map(({ id }) => id));
+  const uniqueNearbyEntities = new Map<
+    number,
+    PlayerBodyObservation["perception"]["entities"][number]
+  >();
+  for (const entity of nearbyHostiles?.entities ?? []) {
+    if (
+      !entity.isPlayer &&
+      entity.category === "Hostile mobs" &&
+      !uniqueNearbyEntities.has(entity.id)
+    )
+      uniqueNearbyEntities.set(entity.id, entity);
+  }
+  const nearbyOverlapCount = [...uniqueNearbyEntities.keys()].filter((id) =>
+    frontVisibleIds.has(id),
+  ).length;
+  const nearbyOnlyEntities = [...uniqueNearbyEntities.values()].filter(
+    ({ id }) => !frontVisibleIds.has(id),
+  );
 
   return {
     available: true,
@@ -638,6 +644,59 @@ function summarizeConversationBodyObservation(
       observation.perception.candidateSearchMayBeTruncated ||
       omittedVisibleCandidates,
     worldAbsenceEstablished: false,
+    nearbyHostiles:
+      nearbyHostiles === undefined
+        ? {
+            available: false,
+            observedAt: observation.observedAt,
+            worldAbsenceEstablished: false,
+          }
+        : {
+            available: true,
+            source: nearbyHostiles.source,
+            observedAt: nearbyHostiles.observedAt,
+            coverage: "client_received_unoccluded_hostile_subset",
+            maxDistance: nearbyHostiles.maxDistance,
+            entityOutputLimit: nearbyHostiles.entityOutputLimit,
+            observedHostileCountLowerBound: uniqueNearbyEntities.size,
+            frontViewOverlapEntityCount: nearbyOverlapCount,
+            entities: nearbyOnlyEntities
+              .slice(0, conversationNearbyHostileLimit)
+              .map((entity) =>
+                summarizeConversationEntity(entity, observation),
+              ),
+            omittedEntityCandidates: nearbyHostiles.omittedEntityCandidates,
+            candidateSearchMayBeTruncated:
+              nearbyHostiles.candidateSearchMayBeTruncated ||
+              nearbyOnlyEntities.length > conversationNearbyHostileLimit,
+            worldAbsenceEstablished: false,
+          },
+  };
+}
+
+function summarizeConversationEntity(
+  entity: PlayerBodyObservation["perception"]["entities"][number],
+  observation: PlayerBodyObservation,
+) {
+  return {
+    name: entity.name.slice(0, 80),
+    kind: entity.kind.slice(0, 80),
+    category: entity.category?.slice(0, 80) ?? null,
+    distance: Math.round(entity.distance * 10) / 10,
+    relativeDirection: relativeEntityDirection(
+      observation.self.yaw,
+      observation.self.position,
+      entity.position,
+    ),
+    health: entity.health,
+    equipment: Object.fromEntries(
+      conversationEquipmentSlots.map((slot) => [
+        slot,
+        entity.equipment?.[slot] === undefined
+          ? "unknown"
+          : (entity.equipment[slot]?.slice(0, 80) ?? null),
+      ]),
+    ),
   };
 }
 
@@ -853,7 +912,7 @@ export class PlayerConversationAgent {
       createPlayerTool({
         name: "observe_body",
         description:
-          "身体の現在観測から可視範囲内の非player entity subsetを読む。絶対位置やIDは返さず、装備slotのunknownと明示的なemptyを区別する。",
+          "身体の現在観測から正面視界と周辺hostile subsetを別々に読む。source・時刻・方向・装備・下限件数・候補欠落を示し、IDや絶対位置は返さず、装備slotのunknownと明示的なemptyを区別する。",
         schema: emptyInput,
         execute: async () => {
           if (input.signal?.aborted || !this.isCurrentTurn(input.turn))
@@ -888,7 +947,7 @@ export class PlayerConversationAgent {
     const instructions = [
       memoryContext.persona,
       "あなたはMinecraft内で暮らすAIプレイヤーの会話エージェントです。目的提案、会話、能力照会、状態照会、停止・再開を担当します。目的判断とPlayerRuntimeは操作を選択・実行します。会話turnにBody操作toolがないことだけで、コンパニオン全体に操作能力がないとは説明しません。",
-      "敵など現在の視界情報（種類・距離・方向・装備）を尋ねられたらobserve_bodyを使い、可視部分・候補欠落・探索打切りを明示して、見えない対象の不在や全方位を断定しない。",
+      "敵など現在の周辺情報（種類・距離・方角・装備）を尋ねられたらobserve_bodyを使い、正面FOVとclient_received_unoccluded_nearby_hostiles（受信済み・遮蔽なしの16ブロック以内の部分集合）を分けて、source・観測時刻・下限件数・候補欠落・探索打切りを示します。nearbyHostilesは正面FOV外の敵も含み、両方の一覧にある同じ敵は一度だけ数えます。未受信・壁越し・全世界の不在や全包囲を断定しません。",
       "所有者の提案はすぐ実行せず、提案として永続化してください。別の自律判断エージェントが目的や現行操作との釣り合いを判断します。雑談は目的改訂イベントにせず、会話だけで答えてください。",
       "所有者が採掘、移動、修理などゲーム内での具体的な行動と結果、または専用Skill交換機能での書き出し・取り込みを求めたら、既存目的に似ていても今回の依頼をpropose_goal_changeで目的提案として記録してください。方法を自分で選ぶよう任された依頼も対象です。状態確認や相談だけなら提案を作らず会話で答えてください。採用・妥協・辞退は自律判断エージェントに委ねてください。",
       "能力や実行条件の相談では必要に応じてdescribe_operationを呼び、公開catalog、現在のschema、operation manualを根拠に答えてください。操作kindとmanualはBody実装の存在・引数・前提条件を示しますが、今回の可視性・距離・所持状態による実行可否や成功は保証しません。freshな観測とBody結果を確認してください。会話toolにBody実行がないことだけから、コンパニオン全体の能力を否定しないでください。単独kindにない複合作業はcatalog内の構成操作と条件だけを説明し、総合的な実行可能性が未確認ならそう伝えてください。能力相談や質問だけで目的提案を作らず、未確認の実装・環境条件を推測して補わないでください。",
@@ -1929,7 +1988,7 @@ export class PlayerPurposeAgent {
       }
     }
     const actionFirstInstruction =
-      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。今回のBody観測に見えている落下物は自発的にcollect_itemを試し、武器・防具・道具を優先し、回復に使えると分かる食料も積極的に集めてください。回収成功は実際の拾得結果で判断します。体力低下はfresh bot_damaged eventまたは現在と直近観測のself.health差で判断します。self.healthが低いか低下が確認され、今回見えているhostileがいる時は、consume前に各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください。次の判断では実際の移動結果とfresh観測の距離を確認し、8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます。これは推奨する行動順序であり、Bodyのconsume実行preconditionや距離保証ではありません。見えていない敵の不在は断定しません。consumeは現在のregistryが食料と認識する所持品だけを使います。成功には対象食料の所持数減少に加え、food値上昇または同じBot/lifeのentity_status status 9が必要です。status 9や所持数減少だけでは成功とせず、fresh self.healthの上昇を観測した場合だけhealth回復を報告してください。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
+      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。今回のBody観測に見えている落下物は自発的にcollect_itemを試し、武器・防具・道具を優先し、回復に使えると分かる食料も積極的に集めてください。回収成功は実際の拾得結果で判断します。体力低下はfresh bot_damaged eventまたは現在と直近観測のself.health差で判断します。self.healthが低いか低下が確認された場合は、今回のFOV entitiesとperception.nearbyHostiles.entities（あれば）をIDで重複除外してhostileを数えます。観測できたhostileが1体以上いる時だけ、consume前に各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください。敵が1体も観測されない場合は退避moveを強制せず、freshな所持食料など現在の観測に基づく候補を選びます。追加の全周観測を待ちません。次の判断では実際の移動結果とfresh観測の距離を確認し、8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます。nearbyHostilesは受信済み・遮蔽なしの16ブロック以内の部分集合であり、全世界の不在は示しません。これは推奨する行動順序であり、Bodyのconsume実行preconditionや距離保証ではありません。見えていない敵の不在は断定しません。consumeは現在のregistryが食料と認識する所持品だけを使います。成功には対象食料の所持数減少に加え、food値上昇または同じBot/lifeのentity_status status 9が必要です。status 9や所持数減少だけでは成功とせず、fresh self.healthの上昇を観測した場合だけhealth回復を報告してください。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
     const normalInstructions = [
       memoryContext.persona,
       "あなたはAIプレイヤーの自律的な目的・行動エージェントです。起動時にもMinecraft観測、保存persona/interest/goal、記憶、既往結果から自分の目的を選び、必要なら実行可能な小さな行動を自律的に開始してください。チャット起点の偽イベントを待たないでください。",
@@ -1959,7 +2018,7 @@ export class PlayerPurposeAgent {
       "会話エージェントの所有者提案は入力です。現行目的や保存personaと合わせ、採用・妥協・辞退を理由付きで決められます。提案受付だけで実行中の操作は変わりません。身体操作を変える時はcommit_action_decisionで新しい操作を確定してください。",
       "未解決のowner提案が届いた判断では、その採用・妥協・辞退を先に確定してください。既存目標の整理や操作定義の取得だけを続けて新しい提案をpendingのまま放置しないでください。採否はあなたが状況から判断し、採用や操作開始を自動で強制されるものではありません。",
       "採用または妥協したowner proposalは、元の意図を示すactive owner goalと結び付き、妥協理由も文脈に残ります。途中のself goalを完了してもowner intentは完了しません。意図の達成・放棄は明示的なgoal更新で判断し、採用を強制された手順として扱わないでください。辞退はowner goalを作りません。",
-      "食事を目的とする時は現在観測したfood・inventoryを使い、目的に合う所持食料を選びます。",
+      "食事を目的とする時は現在観測したfood・inventoryを使い、目的に合う所持食料を選びます。consume対象は現在のregistryが食料と認識する所持品だけです。",
       "食事を求めるowner proposalは、その根拠をproposal resolutionに伝えてください。consume後はPlayerBodyの結果を確認し、食料の所持数減少とfood値上昇または同じBot/lifeのstatus 9が両方確認できた場合だけ食べたと報告し、health回復は実測時のみ報告します。",
       ...(urgentPerceptionWake
         ? []
@@ -2653,7 +2712,24 @@ export function compactDecisionObservation(
   observation: PlayerBodyObservation,
 ): unknown {
   const { inventory, equipment, ...self } = observation.self;
-  const { blocks, entities, ...perception } = observation.perception;
+  const { blocks, entities, nearbyHostiles, ...perception } =
+    observation.perception;
+  const frontEntityIds = new Set(entities.map(({ id }) => id));
+  const uniqueNearbyHostiles = new Map<
+    number,
+    PlayerBodyObservation["perception"]["entities"][number]
+  >();
+  for (const entity of nearbyHostiles?.entities ?? []) {
+    if (
+      !entity.isPlayer &&
+      entity.category === "Hostile mobs" &&
+      !uniqueNearbyHostiles.has(entity.id)
+    )
+      uniqueNearbyHostiles.set(entity.id, entity);
+  }
+  const nearbyHostileOverlaps = [...uniqueNearbyHostiles.keys()].filter((id) =>
+    frontEntityIds.has(id),
+  ).length;
   const compactWindow = observation.window
     ? compactDecisionWindow(observation.window)
     : null;
@@ -2678,6 +2754,18 @@ export function compactDecisionObservation(
     },
     perception: {
       ...perception,
+      ...(nearbyHostiles === undefined
+        ? {}
+        : {
+            nearbyHostiles: {
+              ...nearbyHostiles,
+              observedHostileCountLowerBound: uniqueNearbyHostiles.size,
+              frontViewOverlapEntityCount: nearbyHostileOverlaps,
+              entities: [...uniqueNearbyHostiles.values()]
+                .filter(({ id }) => !frontEntityIds.has(id))
+                .map(compactDecisionEntity),
+            },
+          }),
       blocks: blocks.map(
         ({ name, position, distance, properties, signText }) => ({
           name,
