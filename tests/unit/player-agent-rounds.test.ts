@@ -3633,6 +3633,235 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("exposes bounded current inventory and vitals through observe_body", async () => {
+    const base = bodyObservationFixture();
+    const sword = {
+      slot: 0,
+      itemId: 267,
+      name: "iron_sword",
+      count: 1,
+      metadata: 0,
+      durability: 100,
+      maxDurability: 100,
+      customName: null,
+      enchantments: [],
+    };
+    const book = {
+      slot: 2,
+      itemId: 387,
+      name: "written_book",
+      count: 1,
+      metadata: 0,
+      durability: null,
+      maxDurability: null,
+      customName: "private custom item label",
+      bookPages: ["private book body"],
+      enchantments: [],
+    };
+    const zombie = {
+      id: 14,
+      name: "zombie",
+      kind: "zombie",
+      category: "Hostile mobs",
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      health: 18,
+      isPlayer: false,
+      equipment: { mainHand: "iron_sword" },
+    };
+    const skeleton = {
+      ...zombie,
+      id: 15,
+      name: "skeleton",
+      kind: "skeleton",
+      position: { x: -1, y: 64, z: 3, dimension: "overworld" },
+      distance: 3.2,
+      equipment: { mainHand: "bow" },
+    };
+    const observation: PlayerBodyObservation = {
+      ...base,
+      self: {
+        ...base.self,
+        health: 7,
+        food: 10,
+        inventory: [
+          sword,
+          { ...sword, slot: 1, name: "golden_apple", count: 4 },
+          book,
+          ...Array.from({ length: 64 }, (_, index) => ({
+            ...sword,
+            slot: index + 3,
+            name: `test_item_${index}`,
+          })),
+        ],
+        equipment: { hand: sword, "off-hand": null },
+      },
+      perception: {
+        ...base.perception,
+        entities: [zombie],
+        nearbyHostiles: {
+          source: "client_received_unoccluded_nearby_hostiles",
+          observedAt: base.observedAt,
+          maxDistance: 16,
+          entityOutputLimit: 16,
+          omittedEntityCandidates: 0,
+          candidateSearchMayBeTruncated: false,
+          entities: [zombie, skeleton],
+        },
+      },
+    };
+    const fixture = openConversationFixture(undefined, async () => observation);
+    fixture.responses.push(
+      functionCallResponse("observe-current-self", "observe_body", {}),
+      terminalResponse("現在観測を確認しました。"),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "体力と持ち物、周辺も調べてください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const followupInput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input);
+      const bodyOutput = followupInput.find(
+        ({ type }) => type === "function_call_output",
+      );
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(bodyOutput?.output)));
+      const self = z.record(z.string(), z.unknown()).parse(summary.self);
+      expect(self).toMatchObject({ health: 7, food: 10 });
+      expect(self.inventory).toMatchObject({
+        available: true,
+        source: "client_received_current_player_inventory",
+        omittedItemStackCount: 3,
+      });
+      const inventory = z.record(z.string(), z.unknown()).parse(self.inventory);
+      const items = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(inventory.items);
+      expect(items).toHaveLength(64);
+      expect(items.slice(0, 3)).toEqual([
+        { name: "iron_sword", count: 1 },
+        { name: "golden_apple", count: 4 },
+        { name: "written_book", count: 1 },
+      ]);
+      const equipment = z.record(z.string(), z.unknown()).parse(self.equipment);
+      expect(equipment).toMatchObject({
+        mainHand: "iron_sword",
+        offHand: null,
+        head: "unknown",
+      });
+      expect(JSON.stringify(summary)).not.toContain(
+        "private custom item label",
+      );
+      expect(JSON.stringify(summary)).not.toContain("private book body");
+
+      const visibleEntities = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(summary.visibleEntities);
+      expect(visibleEntities[0]).toMatchObject({
+        name: "zombie",
+        equipment: { mainHand: "iron_sword" },
+      });
+      const nearby = z
+        .record(z.string(), z.unknown())
+        .parse(summary.nearbyHostiles);
+      expect(nearby).toMatchObject({
+        observedHostileCountLowerBound: 2,
+        frontViewOverlapEntityCount: 1,
+      });
+      const nearbyEntities = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(nearby.entities);
+      expect(nearbyEntities[0]).toMatchObject({ name: "skeleton" });
+      const nearbyEquipment = z
+        .record(z.string(), z.unknown())
+        .parse(nearbyEntities[0]?.equipment);
+      expect(nearbyEquipment).toMatchObject({ mainHand: "bow" });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("distinguishes observed empty inventory from unavailable observation", async () => {
+    const base = bodyObservationFixture();
+    const observedFixture = openConversationFixture(undefined, async () => ({
+      ...base,
+      self: {
+        ...base.self,
+        inventory: [],
+        equipment: { "off-hand": null },
+      },
+    }));
+    observedFixture.responses.push(
+      functionCallResponse("observe-empty-inventory", "observe_body", {}),
+      terminalResponse("確認しました。"),
+    );
+
+    try {
+      await observedFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "持ち物を見てください。",
+        turn: observedFixture.conversation.nextTurn(),
+      });
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(observedFixture.requests[1]);
+      const toolOutput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input)
+        .find(({ type }) => type === "function_call_output");
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(toolOutput?.output)));
+      const self = z.record(z.string(), z.unknown()).parse(summary.self);
+      expect(self.inventory).toMatchObject({ available: true, items: [] });
+      expect(self.equipment).toMatchObject({
+        mainHand: "unknown",
+        offHand: null,
+      });
+    } finally {
+      observedFixture.close();
+    }
+
+    const unavailableFixture = openConversationFixture();
+    unavailableFixture.responses.push(
+      functionCallResponse("observe-unavailable-inventory", "observe_body", {}),
+      terminalResponse("確認できませんでした。"),
+    );
+    try {
+      await unavailableFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "持ち物を見てください。",
+        turn: unavailableFixture.conversation.nextTurn(),
+      });
+      const followup = z
+        .record(z.string(), z.unknown())
+        .parse(unavailableFixture.requests[1]);
+      const toolOutput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input)
+        .find(({ type }) => type === "function_call_output");
+      const summary = z
+        .record(z.string(), z.unknown())
+        .parse(JSON.parse(String(toolOutput?.output)));
+      expect(summary).toEqual({
+        available: false,
+        reason: "observation_unavailable",
+      });
+      expect(summary).not.toHaveProperty("self");
+    } finally {
+      unavailableFixture.close();
+    }
+  });
+
   it("persists concise owner facts once and retains them after reopening the same database", async () => {
     const fixture = openConversationFixture();
     const fact = "合言葉は maple-47";
@@ -4501,7 +4730,10 @@ interface ConversationFixture {
   close(): void;
 }
 
-function openConversationFixture(beforeCall?: () => void): ConversationFixture {
+function openConversationFixture(
+  beforeCall?: () => void,
+  observeBody?: () => Promise<PlayerBodyObservation>,
+): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
   const databasePath = join(directory, "player.sqlite");
@@ -4518,6 +4750,7 @@ function openConversationFixture(beforeCall?: () => void): ConversationFixture {
     memory: createMemoryPort(),
     logger: pino({ level: "silent" }),
     ...(beforeCall === undefined ? {} : { beforeCall }),
+    ...(observeBody === undefined ? {} : { observeBody }),
     say: async (text) => {
       messages.push(text);
     },

@@ -539,6 +539,7 @@ export interface ConversationAgentOptions {
 
 const conversationVisibleEntityLimit = 8;
 const conversationNearbyHostileLimit = 16;
+const conversationInventoryStackLimit = 64;
 const conversationEquipmentSlots = [
   "mainHand",
   "offHand",
@@ -636,6 +637,12 @@ function summarizeConversationBodyObservation(
   return {
     available: true,
     observedAt: observation.observedAt,
+    self: {
+      health: observation.self.health,
+      food: observation.self.food,
+      inventory: summarizeConversationInventory(observation.self.inventory),
+      equipment: summarizeConversationEquipment(observation.self.equipment),
+    },
     coverage: "visible_non_player_subset",
     observedVisibleEntityCount: entities.length,
     visibleEntities,
@@ -672,6 +679,61 @@ function summarizeConversationBodyObservation(
             worldAbsenceEstablished: false,
           },
   };
+}
+
+function summarizeConversationInventory(
+  inventory: PlayerBodyObservation["self"]["inventory"] | undefined,
+) {
+  if (inventory === undefined) return { available: false };
+  const items: { readonly name: string; readonly count: number }[] = [];
+  let omittedItemStackCount = 0;
+  for (const item of inventory) {
+    const name = conversationRegistryItemName(item.name);
+    if (
+      name === undefined ||
+      !Number.isInteger(item.count) ||
+      item.count < 1 ||
+      item.count > 127 ||
+      items.length >= conversationInventoryStackLimit
+    ) {
+      omittedItemStackCount += 1;
+      continue;
+    }
+    items.push({ name, count: item.count });
+  }
+  return {
+    available: true,
+    source: "client_received_current_player_inventory",
+    items,
+    omittedItemStackCount,
+  };
+}
+
+function summarizeConversationEquipment(
+  equipment: PlayerBodyObservation["self"]["equipment"] | undefined,
+) {
+  const slots = [
+    ["mainHand", "hand"],
+    ["offHand", "off-hand"],
+    ["head", "head"],
+    ["torso", "torso"],
+    ["legs", "legs"],
+    ["feet", "feet"],
+  ] as const;
+  return Object.fromEntries(
+    slots.map(([outputSlot, sourceSlot]) => {
+      if (equipment === undefined || !Object.hasOwn(equipment, sourceSlot))
+        return [outputSlot, "unknown"];
+      const item = equipment[sourceSlot];
+      if (item === null) return [outputSlot, null];
+      if (item === undefined) return [outputSlot, "unknown"];
+      return [outputSlot, conversationRegistryItemName(item.name) ?? "unknown"];
+    }),
+  );
+}
+
+function conversationRegistryItemName(name: string): string | undefined {
+  return /^[a-z0-9_:-]{1,80}$/u.test(name) ? name : undefined;
 }
 
 function summarizeConversationEntity(
@@ -912,7 +974,7 @@ export class PlayerConversationAgent {
       createPlayerTool({
         name: "observe_body",
         description:
-          "身体の現在観測から正面視界と周辺hostile subsetを別々に読む。source・時刻・方向・装備・下限件数・候補欠落を示し、IDや絶対位置は返さず、装備slotのunknownと明示的なemptyを区別する。",
+          "身体の現在観測から自分の体力・食料・持ち物のregistry品名/個数・装備と、正面視界/周辺hostile subsetを読む。source・時刻・方向・装備・下限件数・候補欠落を示し、IDや絶対位置は返さず、inventory未取得と明示的な空、装備slotのunknownとemptyを区別する。",
         schema: emptyInput,
         execute: async () => {
           if (input.signal?.aborted || !this.isCurrentTurn(input.turn))
