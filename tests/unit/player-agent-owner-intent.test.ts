@@ -755,7 +755,7 @@ describe("player owner intent context", () => {
     }
   });
 
-  it("does not swallow call-admission rejection during reply regeneration", async () => {
+  it("sends the bounded fallback when reply regeneration admission is rejected", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const messages: string[] = [];
     let admittedCalls = 0;
@@ -781,16 +781,14 @@ describe("player owner intent context", () => {
     fixture.responses.push(terminalResponse("長い回答".repeat(61)));
 
     try {
-      await expect(
-        conversation.handleOwnerMessage({
-          username: "owner",
-          message: "どんな操作ができますか？",
-          turn: conversation.nextTurn(),
-        }),
-      ).rejects.toThrow("TEST_BUDGET_EXHAUSTED");
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "どんな操作ができますか？",
+        turn: conversation.nextTurn(),
+      });
       expect(admittedCalls).toBe(2);
       expect(fixture.requests).toHaveLength(1);
-      expect(messages).toHaveLength(0);
+      expect(messages).toEqual(["うまく短く整理できず、説明が不十分です。"]);
     } finally {
       fixture.close();
     }
