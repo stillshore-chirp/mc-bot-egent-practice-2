@@ -9,6 +9,7 @@ import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import { isHostileEntity } from "../decision/hostile-classification.js";
 import type { ArmorSlot } from "../domain/snapshot.js";
 import {
   selectArmorUpgrades,
@@ -289,7 +290,7 @@ function damageSource(
 
 function isKnownHostileEntity(bot: Bot, entity: Entity): boolean {
   if (
-    entity.type !== "mob" ||
+    entity.type === "player" ||
     entity.username !== undefined ||
     typeof entity.name !== "string"
   )
@@ -297,8 +298,7 @@ function isKnownHostileEntity(bot: Bot, entity: Entity): boolean {
   const registryEntity = bot.registry.entitiesByName[entity.name];
   return (
     registryEntity?.name === entity.name &&
-    typeof registryEntity.category === "string" &&
-    /^hostile\s+mobs?$/iu.test(registryEntity.category)
+    isHostileEntity(entity.name, entity.type, bot.registry)
   );
 }
 interface LoadedPrismarineItem {
@@ -4041,7 +4041,6 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (
         target?.id !== visible.id ||
         visible.isPlayer ||
-        visible.kind !== "mob" ||
         this.hostileApproachTargets.has(target) ||
         !isKnownHostileEntity(bot, target)
       )

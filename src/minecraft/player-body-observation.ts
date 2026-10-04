@@ -4,6 +4,7 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import { z } from "zod";
 import { Vec3 } from "vec3";
+import { isHostileEntity } from "../decision/hostile-classification.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 import { isHandOperableDoor } from "./navigation-movements.js";
 
@@ -985,9 +986,9 @@ export function observePlayerBody(
     .filter(({ distance }) => distance <= maxVisibleDistance)
     .sort((left, right) => left.distance - right.distance);
   const nearbyHostileCandidates = entityCandidates.filter(({ entity }) => {
-    if (entity.type !== "mob" || entity.username !== undefined) return false;
+    if (entity.type === "player" || entity.username !== undefined) return false;
     const name = entityName(entity);
-    return bot.registry.entitiesByName[name]?.category === "Hostile mobs";
+    return isHostileEntity(name, entity.type, bot.registry);
   });
   const visibleEntities: BodyVisibleEntity[] = [];
   for (const { entity, distance } of entityCandidates.slice(

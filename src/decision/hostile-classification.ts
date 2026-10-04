@@ -1,17 +1,23 @@
 interface EntityRegistry {
   readonly entitiesByName: Readonly<
-    Record<string, { readonly category?: string } | undefined>
+    Record<
+      string,
+      { readonly type?: string; readonly category?: string } | undefined
+    >
   >;
 }
 
-/** Versioned Minecraft data is primary; the protocol type covers new hostiles. */
+/** Registry type is authoritative; legacy mob adapters can fall back to category. */
 export function isHostileEntity(
   name: string,
   type: string,
   registry: EntityRegistry,
 ): boolean {
-  const category = registry.entitiesByName[name]?.category;
-  return category === undefined
-    ? type === "hostile"
-    : category === "Hostile mobs";
+  if (type === "player") return false;
+  const entity = registry.entitiesByName[name];
+  if (entity === undefined) return type === "hostile";
+  if (entity.type === "hostile") return true;
+  if (type !== "mob" && type !== "hostile") return false;
+  if (entity.type !== undefined && entity.type !== "mob") return false;
+  return entity.category === "Hostile mobs";
 }

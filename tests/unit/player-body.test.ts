@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { Vec3 } from "vec3";
 import { describe, expect, it, vi } from "vitest";
+import minecraftData from "minecraft-data";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
@@ -2087,6 +2088,63 @@ describe("player body", () => {
     expect(
       events.filter((event) => event.type === "damage_reflex_started")[1],
     ).toMatchObject({ trigger: "hostile_approach" });
+    await body.stop();
+  });
+
+  it("starts a nearby approach for the 26.1 registry hostile type", async () => {
+    const fake = makeFakeBot();
+    const registry = minecraftData("26.1");
+    const zombieDefinition = registry.entitiesByName.zombie;
+    if (zombieDefinition === undefined)
+      throw new Error("Missing 26.1 zombie registry entry");
+    const zombie = addFakeZombieEntity(fake);
+    Object.assign(zombie, { type: zombieDefinition.type });
+    zombie.position = new Vec3(0, 64, 2);
+    const decoys = ["end_crystal", "strider"].map((name, index) => {
+      const definition = registry.entitiesByName[name];
+      if (definition === undefined)
+        throw new Error(`Missing 26.1 ${name} registry entry`);
+      const decoy = {
+        id: index + 3,
+        name,
+        type: definition.type,
+        position: new Vec3(0, 64, -0.5 - index),
+        velocity: new Vec3(0, 0, 0),
+        yaw: 0,
+        pitch: 0,
+        height: 1.8,
+        metadata: [],
+      } as unknown as Entity;
+      (fake.bot.entities as Record<number, Entity>)[decoy.id] = decoy;
+      Object.assign(fake.bot.registry.entitiesByName, { [name]: definition });
+      return decoy;
+    });
+    Object.assign(fake.bot.registry.entitiesByName, {
+      zombie: zombieDefinition,
+    });
+    Object.assign(fake.bot, { version: "26.1" });
+
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) =>
+            event.type === "damage_reflex_started" &&
+            event.trigger === "hostile_approach",
+        ),
+      ).toBe(true),
+    );
+    await vi.waitFor(() =>
+      expect(fake.bot.lookAt).toHaveBeenCalledWith(expect.any(Vec3), true),
+    );
+    await vi.waitFor(() =>
+      expect(fake.bot.attack).toHaveBeenCalledWith(zombie),
+    );
+    for (const decoy of decoys)
+      expect(fake.bot.attack).not.toHaveBeenCalledWith(decoy);
     await body.stop();
   });
 
