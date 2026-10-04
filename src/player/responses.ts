@@ -489,7 +489,7 @@ export async function runPlayerAgent(
       toolCalls += 1;
       const tool = byName.get(call.name);
       let result: unknown;
-      let resultClass: PlayerAgentToolResultClass;
+      let resultClass: PlayerAgentToolResultClass = "unknown";
       let resultCode:
         | PlayerThoughtCommitRejectionCode
         | PlayerSkillLearningRejectionCode
@@ -497,10 +497,12 @@ export async function runPlayerAgent(
         | undefined;
       let staleChangedComponents:
         PlayerThoughtStaleChangeComponent[] | undefined;
-      if (tool === undefined) {
-        result = { ok: false, code: "UNKNOWN_TOOL" };
-        resultClass = "unknown";
-      } else {
+      const executeCall = async (): Promise<unknown> => {
+        if (tool === undefined) {
+          result = { ok: false, code: "UNKNOWN_TOOL" };
+          resultClass = "unknown";
+          return result;
+        }
         try {
           const parsed: unknown = JSON.parse(call.arguments);
           result = await tool.execute(parsed);
@@ -514,7 +516,10 @@ export async function runPlayerAgent(
           result = { ok: false, code: safeErrorCode(error) };
           resultClass = "error";
         }
-      }
+        return result;
+      };
+      result = await executeCall();
+      await recordPlayerToolAudit(input.trace, call.name, resultClass);
       if (activityToolCalls.length < 8) {
         activityToolCalls.push({
           name: safeToolName(call.name),
@@ -574,6 +579,32 @@ function safeResponseStatus(
   if (status === "completed" || status === "incomplete" || status === "failed")
     return status;
   return "unknown";
+}
+
+async function recordPlayerToolAudit(
+  trace: TraceService | undefined,
+  toolName: string,
+  resultClass: PlayerAgentToolResultClass,
+): Promise<void> {
+  if (trace === undefined) return;
+  try {
+    await trace.withSpan(
+      "tool",
+      `Player agent tool ${safeToolName(toolName)}`,
+      {
+        summary:
+          "Post-execution audit only; duration covers this audit span, not tool execution.",
+        sensitivity: "internal",
+        attributes: { durationScope: "audit_only" },
+        resultKind: "tool_result",
+        summarizeResult: () =>
+          `tool=${safeToolName(toolName)};result=${resultClass}`,
+      },
+      async () => resultClass,
+    );
+  } catch {
+    // Audit failure must not change an already completed tool result.
+  }
 }
 
 function containsCompactionItem(output: readonly unknown[]): boolean {

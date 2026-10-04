@@ -66,6 +66,12 @@ const bodyControls = [
   "sprint",
   "sneak",
 ] as const;
+const horizontalMovementControls = [
+  "forward",
+  "back",
+  "left",
+  "right",
+] as const;
 const interactRange = 4.5;
 const attackRange = 3.2;
 const stallCheckMs = 5_000;
@@ -448,7 +454,18 @@ export type PlayerBodyEvent =
     }
   | { readonly type: "reconnected"; readonly at: string }
   | {
+      readonly type: "operation_admission_waiting";
+      readonly at: string;
+      readonly operation: PlayerOperationName;
+    }
+  | {
       readonly type: "operation_started";
+      readonly at: string;
+      readonly operationId: string;
+      readonly operation: PlayerOperationName;
+    }
+  | {
+      readonly type: "operation_dispatched";
       readonly at: string;
       readonly operationId: string;
       readonly operation: PlayerOperationName;
@@ -512,7 +529,9 @@ interface ActiveOperation {
   readonly bot: Bot;
   readonly startedAt: string;
   readonly startedAtMs: number;
+  readonly startedLifeGeneration: number;
   resolvedMoveTarget?: Vec3;
+  moveRelativeLeadInputAttempted: boolean;
   done: Promise<PlayerOperationResult>;
   timedOut: boolean;
   lastProgressAt: number;
@@ -800,6 +819,39 @@ function waitTicks(ticks: number, signal: AbortSignal): Promise<void> {
     };
     signal.addEventListener("abort", abort, { once: true });
   });
+}
+
+function controlsTowardHorizontalTarget(
+  bot: Bot,
+  target: { readonly x: number; readonly y: number; readonly z: number },
+): (typeof horizontalMovementControls)[number][] {
+  const entity = bot.entity;
+  const position = entity.position;
+  if (
+    !Number.isFinite(position.x) ||
+    !Number.isFinite(position.y) ||
+    !Number.isFinite(position.z)
+  )
+    return [];
+  const dx = target.x - position.x;
+  const dz = target.z - position.z;
+  const distance = Math.hypot(dx, dz);
+  if (!Number.isFinite(distance) || distance < 0.01) return [];
+  const targetYaw = Math.atan2(-dx, -dz);
+  const yawDelta = Math.atan2(
+    Math.sin(targetYaw - entity.yaw),
+    Math.cos(targetYaw - entity.yaw),
+  );
+  if (!Number.isFinite(yawDelta)) return [];
+  const controls: (typeof horizontalMovementControls)[number][] = [];
+  const componentThreshold = Math.sin(Math.PI / 8);
+  const forwardAmount = Math.cos(yawDelta);
+  const lateralAmount = Math.sin(yawDelta);
+  if (forwardAmount > componentThreshold) controls.push("forward");
+  else if (forwardAmount < -componentThreshold) controls.push("back");
+  if (lateralAmount > componentThreshold) controls.push("left");
+  else if (lateralAmount < -componentThreshold) controls.push("right");
+  return controls;
 }
 
 function waitForPhysicsTick(bot: Bot, signal: AbortSignal): Promise<void> {
@@ -2209,6 +2261,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           bot = await this.waitForSpawnAdmission(
             error,
             admissionController.signal,
+            operation.kind,
           );
         } catch (waitError) {
           if (isAdmissionAborted())
@@ -2269,10 +2322,16 @@ export class MineflayerPlayerBody implements PlayerBody {
   private async waitForSpawnAdmission(
     initialError: AppError,
     signal: AbortSignal,
+    operation: PlayerOperationName,
   ): Promise<Bot> {
     const waitingBot = this.boundBot;
     const isBoundBotEnded = (): boolean => this.boundBotEnded;
     if (waitingBot === undefined || isBoundBotEnded()) throw initialError;
+    this.emit({
+      type: "operation_admission_waiting",
+      at: new Date().toISOString(),
+      operation,
+    });
     const deadline = Date.now() + spawnAdmissionWaitMs;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
@@ -2361,6 +2420,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       bot,
       startedAt,
       startedAtMs: Date.now(),
+      startedLifeGeneration: this.lifeGeneration,
+      moveRelativeLeadInputAttempted: false,
       done: Promise.resolve({
         operationId: "",
         operation,
@@ -2577,6 +2638,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       detail =
         "Mineflayer accepted the request, but the resulting world effect was not observable.";
     }
+    if (active.moveRelativeLeadInputAttempted)
+      detail +=
+        " Pathfinder開始前に、同じ水平目標方向へ短い通常移動入力を一度試しました。入力だけでは到達を成功扱いしません。";
 
     const completedAt = new Date().toISOString();
     const result: PlayerOperationResult = {
@@ -2872,12 +2936,116 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
   }
 
+  private isCurrentMoveRelativeInputCurrent(
+    bot: Bot,
+    signal: AbortSignal,
+    active: ActiveOperation,
+  ): boolean {
+    if (
+      signal.aborted ||
+      this.active !== active ||
+      active.bot !== bot ||
+      active.runFinished ||
+      active.botDisconnected ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.disconnectedSinceBind ||
+      this.botLifeDead ||
+      this.lifeGeneration !== active.startedLifeGeneration ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0 ||
+      !Number.isFinite(bot.entity.position.x) ||
+      !Number.isFinite(bot.entity.position.y) ||
+      !Number.isFinite(bot.entity.position.z)
+    )
+      return false;
+    try {
+      return this.getBot() === bot;
+    } catch {
+      return false;
+    }
+  }
+
+  private async tryMoveRelativeLeadInput(
+    bot: Bot,
+    target: { readonly x: number; readonly y: number; readonly z: number },
+    signal: AbortSignal,
+    active: ActiveOperation,
+  ): Promise<void> {
+    if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) return;
+    const controls = controlsTowardHorizontalTarget(bot, target);
+    if (controls.length === 0) return;
+    try {
+      bot.pathfinder.setGoal(null);
+    } catch {
+      return;
+    }
+    if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) return;
+
+    const waitController = new AbortController();
+    const abortWait = (): void => waitController.abort(signal.reason);
+    const abortForLifeChange = (): void =>
+      waitController.abort(new Error("Minecraft life changed during movement"));
+    const endWait = (): void =>
+      waitController.abort(new Error("Minecraft disconnected during movement"));
+    const onHealth = (): void => {
+      if (
+        bot.health <= 0 ||
+        this.lifeGeneration !== active.startedLifeGeneration
+      )
+        abortForLifeChange();
+    };
+    signal.addEventListener("abort", abortWait, { once: true });
+    bot.once("end", endWait);
+    bot.once("death", abortForLifeChange);
+    bot.once("spawn", abortForLifeChange);
+    bot.on("health", onHealth);
+    let attempted = false;
+    try {
+      for (const control of horizontalMovementControls)
+        bot.setControlState(control, false);
+      for (const control of controls) {
+        if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active))
+          return;
+        bot.setControlState(control, true);
+        attempted = true;
+        active.moveRelativeLeadInputAttempted = true;
+      }
+      if (!attempted) return;
+
+      if (signal.aborted) abortWait();
+      await waitTicks(5, waitController.signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // A disconnected client can reject control input; keep the existing operation result handling.
+    } finally {
+      signal.removeEventListener("abort", abortWait);
+      bot.removeListener("end", endWait);
+      bot.removeListener("death", abortForLifeChange);
+      bot.removeListener("spawn", abortForLifeChange);
+      bot.removeListener("health", onHealth);
+      for (const control of horizontalMovementControls) {
+        try {
+          bot.setControlState(control, false);
+        } catch {
+          // The client may already be disconnected; no further control is possible.
+        }
+      }
+    }
+  }
+
   private async dispatch(
     bot: Bot,
     operation: PlayerOperation,
     signal: AbortSignal,
     active: ActiveOperation,
   ): Promise<void> {
+    this.emit({
+      type: "operation_dispatched",
+      at: new Date().toISOString(),
+      operationId: active.id,
+      operation: operation.kind,
+    });
     switch (operation.kind) {
       case "move_to":
       case "move_relative": {
@@ -2893,6 +3061,15 @@ export class MineflayerPlayerBody implements PlayerBody {
           target.z,
           operation.range,
         );
+        if (operation.kind === "move_relative") {
+          await this.tryMoveRelativeLeadInput(bot, target, signal, active);
+          if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) {
+            if (signal.aborted) throw abortError(signal);
+            throw new Error(
+              "The Minecraft life or connection changed before relative pathfinding started.",
+            );
+          }
+        }
         let latestPathUpdateStatus: string | undefined;
         let observingPathUpdates = true;
         const capturePathUpdate = (results: {
@@ -2931,8 +3108,11 @@ export class MineflayerPlayerBody implements PlayerBody {
         try {
           if (signal.aborted) return;
           await bot.pathfinder.goto(goal);
-          if (latestPathUpdateStatus === "noPath")
-            throw new Error("No path to the goal!");
+          if (latestPathUpdateStatus === "noPath") {
+            const error = new Error("No path to the goal!");
+            if (operation.kind === "move_relative") error.name = "NoPath";
+            throw error;
+          }
         } finally {
           stopObservingPathUpdates();
         }

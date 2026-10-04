@@ -341,6 +341,7 @@ function makeFakeBot(
       setTimeout(() => bot.emit("physicsTick"), 0);
     }),
     clearControlStates: vi.fn(),
+    setControlState: vi.fn(),
     deactivateItem: vi.fn(),
     stopDigging: vi.fn(),
     moveVehicle: vi.fn(),
@@ -3667,6 +3668,8 @@ describe("player body", () => {
         return fake.bot;
       });
       body.attach(fake.bot);
+      const bodyEvents: PlayerBodyEvent[] = [];
+      body.onEvent((event) => bodyEvents.push(event));
       const goto = vi
         .spyOn(fake.bot.pathfinder, "goto")
         .mockImplementationOnce(async () => {
@@ -3688,12 +3691,27 @@ describe("player body", () => {
       fake.bot.entity.position.x = 10;
       admitted = true;
       await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(250);
       const result = await pending;
 
       expect(result.status).toBe("successful");
       expect(result.before?.self.position.x).toBe(10);
       expect(goto).toHaveBeenCalledOnce();
       expect(goto.mock.calls[0]?.[0]).toMatchObject({ x: 13, y: 64, z: 0 });
+      expect(
+        bodyEvents
+          .filter(
+            ({ type }) =>
+              type === "operation_admission_waiting" ||
+              type === "operation_started" ||
+              type === "operation_dispatched",
+          )
+          .map(({ type }) => type),
+      ).toEqual([
+        "operation_admission_waiting",
+        "operation_started",
+        "operation_dispatched",
+      ]);
     } finally {
       vi.useRealTimers();
     }
@@ -3813,6 +3831,8 @@ describe("player body", () => {
     const fake = makeFakeBot();
     fake.bot.entity.position.x = 4.2;
     fake.bot.entity.position.z = 2.4;
+    const setControlState = vi.fn();
+    Object.assign(fake.bot, { setControlState });
     const body = new MineflayerPlayerBody(() => fake.bot);
     let plannedGoal: unknown;
     const goto = vi
@@ -3832,8 +3852,189 @@ describe("player body", () => {
     expect(result.status).toBe("successful");
     expect(result.operation.kind).toBe("move_relative");
     expect(goto).toHaveBeenCalledOnce();
+    expect(setControlState).toHaveBeenCalledWith("right", true);
+    expect(setControlState).toHaveBeenLastCalledWith("right", false);
     expect(plannedGoal).toMatchObject({ x: 8, y: 64, z: 1 });
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("starts one same-direction input before pathfinding and keeps NoPath as failed", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const setControlState = vi.fn();
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      const result = await resultPromise;
+
+      expect(setControlState).toHaveBeenCalledWith("right", true);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+      expect(
+        setControlState.mock.calls.filter(([, enabled]) => enabled),
+      ).toHaveLength(1);
+      expect(result.status).toBe("failed");
+      expect(goto).toHaveBeenCalledOnce();
+      expect(result.detail).toContain("NoPath");
+      expect(result.detail).toContain("Pathfinder開始前に");
+      expect(result.detail).not.toContain("NoPathを返し");
+      expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not repeat its lead input when noPath status is followed by another error", async () => {
+    const fake = makeFakeBot();
+    const setControlState = vi.fn();
+    Object.assign(fake.bot, { setControlState });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const stopped = new Error("Path was stopped");
+    stopped.name = "PathStopped";
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.emit("path_update", {
+        status: "noPath",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+      throw stopped;
+    });
+
+    const result = await body.execute({
+      kind: "move_relative",
+      offset: { x: 3, y: 0, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(
+      setControlState.mock.calls.filter(([, enabled]) => enabled),
+    ).toHaveLength(1);
+    expect(setControlState).toHaveBeenLastCalledWith("right", false);
+  });
+
+  it("sends relative movement input before an unresolved pathfinder request", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const setControlState = vi.fn();
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      let finishGoto!: () => void;
+      const pendingGoto = new Promise<void>((resolve) => {
+        finishGoto = resolve;
+      });
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockReturnValueOnce(pendingGoto);
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(setControlState).toHaveBeenCalledWith("right", true);
+      expect(goto).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(goto).toHaveBeenCalledOnce();
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+      finishGoto();
+      expect((await resultPromise).status).toBe("unverified");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases the relative lead input immediately when the owner aborts", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const controller = new AbortController();
+      const setControlState = vi.fn((_control: string, enabled: boolean) => {
+        if (enabled) controller.abort(new Error("Owner stopped movement"));
+      });
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute(
+        {
+          kind: "move_relative",
+          offset: { x: 3, y: 0, z: 0 },
+          range: 1,
+        },
+        controller.signal,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(setControlState).toHaveBeenCalledWith("right", true);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+      expect(goto).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases the relative lead input when death and respawn change the bot life", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      let changedLife = false;
+      const setControlState = vi.fn((_control: string, enabled: boolean) => {
+        if (!enabled || changedLife) return;
+        changedLife = true;
+        fake.bot.health = 0;
+        fake.bot.emit("health");
+        fake.bot.emit("death");
+        fake.bot.health = 20;
+        fake.bot.emit("spawn");
+      });
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("failed");
+      expect(
+        setControlState.mock.calls.filter(([, enabled]) => enabled),
+      ).toHaveLength(1);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+      expect(goto).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not claim a relative move succeeded without observed arrival", async () => {
@@ -3866,6 +4067,8 @@ describe("player body", () => {
 
   it("removes the move_to path listener when goto rejects", async () => {
     const fake = makeFakeBot();
+    const setControlState = vi.fn();
+    Object.assign(fake.bot, { setControlState });
     const body = new MineflayerPlayerBody(() => fake.bot);
     vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(
       new Error("NoPath: No path to the goal!"),
@@ -3879,6 +4082,7 @@ describe("player body", () => {
 
     expect(result.status).toBe("failed");
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+    expect(setControlState).not.toHaveBeenCalledWith("right", true);
   });
 
   it("waits briefly after native dig completion for a delayed target server update", async () => {

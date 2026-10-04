@@ -331,6 +331,34 @@ export interface PlayerRuntimeInspection {
       readonly operation: PlayerOperation["kind"];
       readonly startedAt: string;
     } | null;
+    readonly latestOperationPhase: {
+      readonly operation: PlayerOperation["kind"];
+      readonly phase:
+        | "guard_rejected"
+        | "execute_requested"
+        | "admission_waiting"
+        | "admitted"
+        | "dispatch_entered"
+        | "path_progress"
+        | "result";
+      readonly at: string;
+      readonly ageMs: number;
+      readonly inFlight: boolean;
+      readonly admissionObserved: boolean;
+      readonly status: McSkillOutcomeStatus | null;
+      readonly reason:
+        | "runtime_shutting_down"
+        | "owner_stopped"
+        | "action_revision_changed"
+        | "operation_replaced"
+        | "body_recovery_required"
+        | "body_disconnected"
+        | "execution_returned_without_admission"
+        | null;
+      readonly firstPathStatus:
+        "noPath" | "timeout" | "success" | "partial" | null;
+      readonly controlEnabledCount: number | null;
+    } | null;
     readonly latestObservation: {
       readonly observedAt: string;
       readonly ageMs: number;

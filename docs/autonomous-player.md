@@ -82,6 +82,8 @@ sequenceDiagram
 
 `inspect_runtime`は認証済みowner会話から呼ぶ読み取り専用のbounded診断です。現在processのPurpose/Conversation実行状態とResponses待ち時間、Body接続とactive operation、保存済み最新観測の時刻/health、pending proposal件数、最後のBody結果、直近activity tail内の安全な拒否codeを返します。activity tailには日時がないため、拒否codeは現在の失敗と断定せず、内部ログや例外本文も返しません。Minecraft内の死亡記録は`inspect_player_status`で別に確認します。
 
+`latestOperationPhase`は現在process内だけの最新phaseで、execute要求、spawn admission待ち/完了、Body dispatcherへの進入、最初のpath更新、結果またはRuntime入口拒否を示します。古さとin-flight状態を併記し、operation ID・action revision・引数は会話診断へ出しません。`dispatch_entered`はBody dispatcherへ渡った記録であり、サーバー上の効果確認ではありません。
+
 モデルには、雑談・能力相談だけで行動提案を作らないこと、今回の発話と直近4件までの会話を合わせて指示語を解釈することを指示します。これは意味判断の指示であり、あらゆる発話を正しく分類する保証ではありません。
 
 返答は送信成功後にだけ短期会話文脈へ記録します。240文字を超える返答は最新状態を使い、toolなしで一度だけ短く再生成します。失敗または再超過時は短い案内へ置き換えます。最終Minecraft chat送信でも改行を平坦化し、slash command化を防ぎます（[sanitizeMinecraftChatText](../src/app/player-application.ts)）。

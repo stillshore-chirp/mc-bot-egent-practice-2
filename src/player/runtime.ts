@@ -39,6 +39,11 @@ import {
 const ownerProposalSettlementTimeoutMs = 30_000;
 const damageObservationCoalesceMs = 3_000;
 
+function enabledControlCount(operation: PlayerOperation): number | null {
+  if (operation.kind !== "control") return null;
+  return Object.values(operation.controls).filter((enabled) => enabled).length;
+}
+
 function isUrgentPerceptionWake(kind: PlayerWakeKind): boolean {
   return (
     kind === "bot_damaged" ||
@@ -49,11 +54,30 @@ function isUrgentPerceptionWake(kind: PlayerWakeKind): boolean {
 
 interface ActiveBodyRun {
   readonly operationId: string;
+  readonly actionRevision: number;
   readonly operation: PlayerOperation;
   readonly skillId?: string;
   readonly skillVersion?: number;
   readonly controller: AbortController;
   promise: Promise<void>;
+}
+
+type RuntimeBodyOperationPhase = NonNullable<
+  PlayerRuntimeInspection["body"]["latestOperationPhase"]
+>;
+
+interface LatestBodyOperationPhase {
+  readonly runtimeOperationId: string;
+  readonly actionRevision: number;
+  readonly bodyOperationId?: string;
+  readonly operation: PlayerOperation["kind"];
+  readonly phase: RuntimeBodyOperationPhase["phase"];
+  readonly at: string;
+  readonly admissionObserved: boolean;
+  readonly status?: McSkillOutcomeStatus;
+  readonly reason?: RuntimeBodyOperationPhase["reason"];
+  readonly firstPathStatus?: RuntimeBodyOperationPhase["firstPathStatus"];
+  readonly controlEnabledCount: number | null;
 }
 
 type DamageReflexCompletedEvent = Extract<
@@ -146,6 +170,7 @@ export class PlayerRuntime {
   #ownerProposalsAwaitingResolution = new Set<string>();
   #ownerConsumeOperations = new Set<string>();
   #pendingDamageReflexOutcome: PendingDamageReflexOutcome | undefined;
+  #latestBodyOperationPhase: LatestBodyOperationPhase | undefined;
   #bodyConnected = true;
   #lastDamageEventAtMs = Number.NEGATIVE_INFINITY;
   #started = false;
@@ -225,6 +250,31 @@ export class PlayerRuntime {
                 startedAt:
                   snapshot.activeOperation.bodyStartedAt ??
                   snapshot.activeOperation.startedAt,
+              },
+        latestOperationPhase:
+          this.#latestBodyOperationPhase === undefined
+            ? null
+            : {
+                operation: this.#latestBodyOperationPhase.operation,
+                phase: this.#latestBodyOperationPhase.phase,
+                at: this.#latestBodyOperationPhase.at,
+                ageMs: Math.max(
+                  0,
+                  now - Date.parse(this.#latestBodyOperationPhase.at),
+                ),
+                inFlight:
+                  this.#activeBody?.operationId ===
+                    this.#latestBodyOperationPhase.runtimeOperationId &&
+                  this.#latestBodyOperationPhase.phase !== "result" &&
+                  this.#latestBodyOperationPhase.phase !== "guard_rejected",
+                admissionObserved:
+                  this.#latestBodyOperationPhase.admissionObserved,
+                status: this.#latestBodyOperationPhase.status ?? null,
+                reason: this.#latestBodyOperationPhase.reason ?? null,
+                firstPathStatus:
+                  this.#latestBodyOperationPhase.firstPathStatus ?? null,
+                controlEnabledCount:
+                  this.#latestBodyOperationPhase.controlEnabledCount,
               },
         latestObservation:
           snapshot.lastObservation === undefined
@@ -600,9 +650,62 @@ export class PlayerRuntime {
         active !== undefined &&
         bodyEvent.operation === active.operation.kind
       ) {
+        const bodyOperationId =
+          typeof bodyEvent.operationId === "string"
+            ? bodyEvent.operationId
+            : undefined;
+        this.#advanceBodyOperationPhase(active, {
+          phase: "admitted",
+          at,
+          admissionObserved: true,
+          ...(bodyOperationId === undefined ? {} : { bodyOperationId }),
+        });
         // The adapter generates its own operationId; the runtime's durable ID is the action identity.
         this.options.mind.markOperationStarted(active.operationId, at);
       }
+      return;
+    }
+    if (type === "operation_admission_waiting") {
+      const active = this.#activeBody;
+      if (active !== undefined && bodyEvent.operation === active.operation.kind)
+        this.#advanceBodyOperationPhase(active, {
+          phase: "admission_waiting",
+          at,
+        });
+      return;
+    }
+    if (type === "operation_dispatched") {
+      const active = this.#activeBody;
+      if (
+        active !== undefined &&
+        bodyEvent.operation === active.operation.kind &&
+        bodyEvent.operationId ===
+          this.#latestBodyOperationPhase?.bodyOperationId
+      )
+        this.#advanceBodyOperationPhase(active, {
+          phase: "dispatch_entered",
+          at,
+        });
+      return;
+    }
+    if (type === "operation_path_updated") {
+      const active = this.#activeBody;
+      const latest = this.#latestBodyOperationPhase;
+      if (
+        active !== undefined &&
+        latest?.firstPathStatus === undefined &&
+        bodyEvent.operation === active.operation.kind &&
+        bodyEvent.operationId === latest?.bodyOperationId &&
+        (bodyEvent.status === "noPath" ||
+          bodyEvent.status === "timeout" ||
+          bodyEvent.status === "success" ||
+          bodyEvent.status === "partial")
+      )
+        this.#advanceBodyOperationPhase(active, {
+          phase: "path_progress",
+          at,
+          firstPathStatus: bodyEvent.status,
+        });
       return;
     }
     if (type === "operation_completed" || type === "operation_failed") {
@@ -1028,20 +1131,34 @@ export class PlayerRuntime {
     if (running !== undefined)
       await this.#settleBody(running, "body_operation_replaced");
     const latest = this.options.mind.snapshot();
-    if (
-      this.#shuttingDown ||
-      latest.stopped ||
-      latest.actionRevision !== snapshot.actionRevision ||
-      latest.activeOperation?.operationId !== decision.operationId
-    )
+    const guardReason = this.#bodyOperationGuardReason(
+      latest,
+      snapshot.actionRevision,
+      decision.operationId,
+    );
+    if (guardReason !== undefined) {
+      this.#recordBodyOperationGuardRejection(
+        decision,
+        snapshot.actionRevision,
+        guardReason,
+      );
       return;
+    }
     if (this.#bodyNeedsRecovery || !this.#bodyConnected) {
+      this.#recordBodyOperationGuardRejection(
+        decision,
+        snapshot.actionRevision,
+        this.#bodyNeedsRecovery
+          ? "body_recovery_required"
+          : "body_disconnected",
+      );
       this.options.mind.deferOperationUntilReconnect(decision.operationId);
       return;
     }
     const controller = new AbortController();
     const run: ActiveBodyRun = {
       operationId: decision.operationId,
+      actionRevision: snapshot.actionRevision,
       operation: decision.operation,
       ...(decision.skillId === undefined ? {} : { skillId: decision.skillId }),
       ...(decision.skillVersion === undefined
@@ -1050,6 +1167,15 @@ export class PlayerRuntime {
       controller,
       promise: Promise.resolve(),
     };
+    this.#recordBodyOperationPhase({
+      runtimeOperationId: run.operationId,
+      actionRevision: run.actionRevision,
+      operation: run.operation.kind,
+      phase: "execute_requested",
+      at: new Date().toISOString(),
+      admissionObserved: false,
+      controlEnabledCount: enabledControlCount(run.operation),
+    });
     this.#activeBody = run;
     run.promise = this.#executeBody(
       run,
@@ -1057,6 +1183,90 @@ export class PlayerRuntime {
       decision.expectedOutcome,
     );
     await run.promise;
+  }
+
+  #bodyOperationGuardReason(
+    latest: PlayerRuntimeSnapshot,
+    expectedActionRevision: number,
+    operationId: string,
+  ):
+    | Exclude<
+        RuntimeBodyOperationPhase["reason"],
+        null | "execution_returned_without_admission"
+      >
+    | undefined {
+    if (this.#shuttingDown) return "runtime_shutting_down";
+    if (latest.stopped) return "owner_stopped";
+    if (latest.actionRevision !== expectedActionRevision)
+      return "action_revision_changed";
+    if (latest.activeOperation?.operationId !== operationId)
+      return "operation_replaced";
+    return undefined;
+  }
+
+  #recordBodyOperationGuardRejection(
+    decision: Extract<PlayerThoughtDecision, { kind: "act" }>,
+    actionRevision: number,
+    reason: Exclude<
+      RuntimeBodyOperationPhase["reason"],
+      null | "execution_returned_without_admission"
+    >,
+  ): void {
+    this.#recordBodyOperationPhase({
+      runtimeOperationId: decision.operationId,
+      actionRevision,
+      operation: decision.operation.kind,
+      phase: "guard_rejected",
+      at: new Date().toISOString(),
+      admissionObserved: false,
+      reason,
+      firstPathStatus: null,
+      controlEnabledCount: enabledControlCount(decision.operation),
+    });
+  }
+
+  #recordBodyOperationPhase(phase: LatestBodyOperationPhase): void {
+    this.#latestBodyOperationPhase = phase;
+    this.options.logger.info(
+      {
+        category: "player_runtime",
+        code: "BODY_OPERATION_PHASE",
+        operationId: phase.runtimeOperationId,
+        actionRevision: phase.actionRevision,
+        operation: phase.operation,
+        phase: phase.phase,
+        at: phase.at,
+        admissionObserved: phase.admissionObserved,
+        status: phase.status ?? null,
+        reason: phase.reason ?? null,
+        firstPathStatus: phase.firstPathStatus ?? null,
+        controlEnabledCount: phase.controlEnabledCount,
+      },
+      "player body operation phase",
+    );
+  }
+
+  #advanceBodyOperationPhase(
+    run: ActiveBodyRun,
+    update: Pick<LatestBodyOperationPhase, "phase" | "at"> &
+      Partial<
+        Pick<
+          LatestBodyOperationPhase,
+          | "bodyOperationId"
+          | "admissionObserved"
+          | "status"
+          | "reason"
+          | "firstPathStatus"
+        >
+      >,
+  ): void {
+    const latest = this.#latestBodyOperationPhase;
+    if (
+      latest?.runtimeOperationId !== run.operationId ||
+      latest.actionRevision !== run.actionRevision
+    )
+      return;
+    this.#recordBodyOperationPhase({ ...latest, ...update });
   }
 
   async #executeBody(
@@ -1146,6 +1356,16 @@ export class PlayerRuntime {
         ...(skillVersion === undefined ? {} : { skillVersion }),
       },
       recoveryRequired,
+    });
+    this.#advanceBodyOperationPhase(run, {
+      phase: "result",
+      at: observedAt,
+      status: outcome,
+      reason:
+        this.#latestBodyOperationPhase?.runtimeOperationId ===
+          run.operationId && !this.#latestBodyOperationPhase.admissionObserved
+          ? "execution_returned_without_admission"
+          : null,
     });
     if (this.#activeBody === run) this.#activeBody = undefined;
     if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)

@@ -156,6 +156,7 @@ describe("integrated player runtime", () => {
         },
         body: {
           connectionState: "not_started",
+          latestOperationPhase: null,
           latestObservation: {
             health: observation().self.health,
           },
@@ -172,6 +173,131 @@ describe("integrated player runtime", () => {
       expect(JSON.stringify(diagnostics)).not.toContain("private proposal");
       expect(JSON.stringify(diagnostics)).not.toContain("owner-player");
       expect(JSON.stringify(diagnostics)).not.toContain("reason");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("exposes only bounded operation phases and distinguishes a rejected entry", async () => {
+    const fixture = createRuntimeFixture({
+      think: async () => ({ accepted: true }),
+    });
+    const loggerInfo = vi.spyOn(fixture.logger, "info");
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => !fixture.runtime.inspectRuntime().purpose.active);
+
+      const decision = action("private-operation-id", {
+        kind: "control",
+        controls: { forward: false },
+        ticks: 3,
+      });
+      const committed = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision,
+      });
+      expect(committed.accepted).toBe(true);
+      if (!committed.accepted) return;
+      fixture.runtime.handleCommittedDecision(committed.snapshot, decision);
+      await waitFor(
+        () =>
+          fixture.runtime.inspectRuntime().body.latestOperationPhase?.phase ===
+          "dispatch_entered",
+      );
+
+      const dispatched =
+        fixture.runtime.inspectRuntime().body.latestOperationPhase;
+      expect(dispatched).toMatchObject({
+        operation: "control",
+        phase: "dispatch_entered",
+        inFlight: true,
+        admissionObserved: true,
+        controlEnabledCount: 0,
+      });
+      expect(JSON.stringify(dispatched)).not.toContain("private-operation-id");
+      expect(JSON.stringify(dispatched)).not.toContain("actionRevision");
+      expect(JSON.stringify(dispatched)).not.toContain("forward");
+
+      fixture.body.completeActive("unverified");
+      await waitFor(
+        () =>
+          fixture.mind.snapshot().lastOutcome?.operationId ===
+          decision.operationId,
+      );
+      expect(
+        fixture.runtime.inspectRuntime().body.latestOperationPhase,
+      ).toMatchObject({
+        phase: "result",
+        status: "unverified",
+        inFlight: false,
+        admissionObserved: true,
+        controlEnabledCount: 0,
+      });
+
+      fixture.body.emit({
+        type: "disconnected",
+        at: new Date().toISOString(),
+        reason: "test disconnect",
+      });
+      const blockedDecision = action("private-blocked-operation", {
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      const blockedCommit = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision: blockedDecision,
+      });
+      expect(blockedCommit.accepted).toBe(true);
+      if (!blockedCommit.accepted) return;
+      fixture.runtime.handleCommittedDecision(
+        blockedCommit.snapshot,
+        blockedDecision,
+      );
+      await waitFor(
+        () =>
+          fixture.runtime.inspectRuntime().body.latestOperationPhase?.phase ===
+          "guard_rejected",
+      );
+      expect(
+        fixture.runtime.inspectRuntime().body.latestOperationPhase,
+      ).toMatchObject({
+        operation: "move_relative",
+        phase: "guard_rejected",
+        reason: "body_disconnected",
+        inFlight: false,
+        admissionObserved: false,
+        controlEnabledCount: null,
+      });
+      expect(fixture.body.started).toEqual(["control"]);
+      expect(
+        JSON.stringify(
+          fixture.runtime.inspectRuntime().body.latestOperationPhase,
+        ),
+      ).not.toContain("private-blocked-operation");
+      const phaseLogs = loggerInfo.mock.calls
+        .map(([fields]) => fields)
+        .filter(
+          (fields): fields is Record<string, unknown> =>
+            typeof fields === "object" &&
+            fields !== null &&
+            "code" in fields &&
+            fields.code === "BODY_OPERATION_PHASE",
+        );
+      expect(phaseLogs.map((fields) => fields.phase)).toEqual([
+        "execute_requested",
+        "admitted",
+        "dispatch_entered",
+        "result",
+        "guard_rejected",
+      ]);
+      expect(phaseLogs.at(-1)).toMatchObject({
+        operationId: "private-blocked-operation",
+        operation: "move_relative",
+        reason: "body_disconnected",
+      });
+      expect(JSON.stringify(phaseLogs)).not.toContain("offset");
+      expect(JSON.stringify(phaseLogs)).not.toContain("private operation args");
     } finally {
       await fixture.close();
     }
@@ -3591,6 +3717,12 @@ class DeferredBody implements PlayerBody {
       operationId,
       operation: operation.kind,
     });
+    this.emit({
+      type: "operation_dispatched",
+      at: new Date().toISOString(),
+      operationId,
+      operation: operation.kind,
+    });
     return new Promise((resolve) => {
       let settled = false;
       const finish = (status: PlayerOperationResult["status"]): void => {
@@ -3824,6 +3956,7 @@ function createRuntimeFixture(
   const skills = openSkills(databasePath, directory);
   const body = new DeferredBody();
   const messages: string[] = [];
+  const logger = pino({ level: "silent" });
   const runtime = new PlayerRuntime({
     ownerUsername: "owner",
     playerId: "owner-player",
@@ -3836,7 +3969,7 @@ function createRuntimeFixture(
       handleOwnerMessage: async () => undefined,
     },
     purpose: purpose ?? { think: async () => ({ accepted: false }) },
-    logger: pino({ level: "silent" }),
+    logger,
     say: async (message) => {
       messages.push(message);
     },
@@ -3846,6 +3979,7 @@ function createRuntimeFixture(
     mind,
     runtime,
     messages,
+    logger,
     close: async () => {
       await runtime.shutdown();
       skills.close();
