@@ -157,6 +157,9 @@ describe("player agent response rounds", () => {
       expect(request.instructions).toContain(
         "今できる一手を選び、commit_action_decisionで確定",
       );
+      expect(request.instructions).toContain(
+        "今回の視界に近接hostileが見えるなら",
+      );
       expect(request).toMatchObject({
         model: "gpt-6-luna",
         reasoning: { effort: "none" },
@@ -174,9 +177,17 @@ describe("player agent response rounds", () => {
       expect(JSON.stringify(payload.observation)).toContain("zombie");
       expect(payload.runtime).not.toHaveProperty("skillActivity");
       expect(payload.runtime).not.toHaveProperty("learningReferences");
-      expect(requestUserPayload(request).events).toContainEqual(
-        expect.objectContaining({ kind: "bot_damaged" }),
-      );
+      const urgentEvents = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(payload.events);
+      expect(
+        urgentEvents.some(
+          (event) =>
+            event.kind === "bot_damaged" &&
+            typeof event.summary === "string" &&
+            event.summary.includes("cause=mob:zombie"),
+        ),
+      ).toBe(true);
       const tools = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.tools);
@@ -191,27 +202,22 @@ describe("player agent response rounds", () => {
   });
 
   it("commits an urgent relative action with the no-Skill schema", async () => {
-    const fixture = openPurposeFixture(
-      [
-        functionCallResponse(
-          "urgent-relative-action-without-skill",
-          "commit_action_decision",
-          {
-            ...actionArguments(),
-            purpose:
-              "Take one short relative step using the current observation.",
-            operationJson: JSON.stringify({
-              kind: "move_relative",
-              offset: { x: 0, y: 0, z: 2 },
-              range: 1,
-            }),
-          },
-        ),
-      ],
-      () => undefined,
-      createMemoryPort(),
-      async () => bodyObservationFixture(),
-    );
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "urgent-relative-action-without-skill",
+        "commit_action_decision",
+        {
+          ...actionArguments(),
+          purpose:
+            "Take one short relative step using the current observation.",
+          operationJson: JSON.stringify({
+            kind: "move_relative",
+            offset: { x: 0, y: 0, z: 2 },
+            range: 1,
+          }),
+        },
+      ),
+    ]);
     try {
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
@@ -226,6 +232,7 @@ describe("player agent response rounds", () => {
       });
 
       expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(1);
       expect(result.decision).toMatchObject({
         kind: "act",
         operation: {
@@ -244,9 +251,26 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
+      expect(request.instructions).toContain("offset:{x:0,y:0,z:2},range:1");
+      expect(request.instructions).toContain(
+        "最初のBody観測を一度試して取得できなくても",
+      );
+      expect(request.instructions).toContain(
+        "Bodyに委ねて結果を次判断へ使ってください",
+      );
+      expect(requestUserPayload(request).observation).toBeUndefined();
       const tools = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.tools);
+      expect(tools.map(({ name }) => name)).toContain("observe_body");
+      expect(tools.map(({ name }) => name)).not.toContain("search_skills");
+      expect(fixture.requests).toHaveLength(1);
+      expect(
+        fixture.mind
+          .snapshot()
+          .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
+          .map(({ name }) => name),
+      ).not.toContain("describe_operation");
       const commitTool = tools.find(
         ({ name }) => name === "commit_action_decision",
       );
@@ -268,10 +292,46 @@ describe("player agent response rounds", () => {
   });
 
   it("uses the instant first-action path for a newly received strong owner proposal", async () => {
-    const fixture = openPurposeFixture([
-      terminalResponse("The current owner request has a first step."),
-    ]);
+    const memory = createMemoryPort();
+    const staleProposalId = "resolved-owner-proposal-hidden-from-urgent";
+    memory.context = () => ({
+      persona: JSON.stringify({
+        name: "HelperBot",
+        currentInterests: ["nearby forest"],
+        goals: [{ ownerProposalId: staleProposalId, title: "old goal" }],
+      }),
+      ownerUsername: "owner",
+      relationship: {},
+      lifeState: {},
+      recalled: [],
+    });
+    const fixture = openPurposeFixture(
+      [terminalResponse("The current owner request has a first step.")],
+      undefined,
+      memory,
+    );
     try {
+      const oldProposal = fixture.mind.addProposal({
+        title: "Already resolved owner goal",
+        reason: "Earlier request already adopted.",
+        priority: 4,
+      });
+      const oldGoal = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: {
+          title: "Continue earlier owner goal",
+          status: "active",
+          priority: 4,
+          changeReason: "Previously adopted.",
+          source: "owner",
+        },
+        proposalResolution: {
+          proposalId: oldProposal.id,
+          disposition: "adopted",
+          resolution: "Already accepted earlier.",
+        },
+      });
+      expect(oldGoal.accepted).toBe(true);
       const proposal = fixture.mind.addProposal({
         title: "Gather birch logs",
         reason: "The owner asked for nearby wood.",
@@ -300,6 +360,10 @@ describe("player agent response rounds", () => {
       });
       expect(request.instructions).toContain("危険は創作せず");
       expect(request.instructions).toContain("proposalDisposition");
+      expect(request.instructions).toContain(
+        "今回の入力runtime.proposalsにstatus=pendingとして載っているものだけ",
+      );
+      expect(request.instructions).not.toContain(staleProposalId);
       expect(request.instructions).not.toContain("直近の被害・死亡");
       const tools = z
         .array(z.record(z.string(), z.unknown()))
@@ -316,6 +380,19 @@ describe("player agent response rounds", () => {
           expect.objectContaining({ id: proposal.id, priorityPreference: 5 }),
         ],
       });
+      const payloadRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(requestUserPayload(request).runtime);
+      const goals = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(payloadRuntime.goals);
+      expect(goals).toHaveLength(1);
+      expect(goals[0]).not.toHaveProperty("ownerProposalId");
+      expect(JSON.stringify(payloadRuntime)).not.toContain(oldProposal.id);
+      expect(JSON.stringify(payloadRuntime)).not.toContain(staleProposalId);
+      expect(request.instructions).toContain("HelperBot");
+      expect(request.instructions).toContain("nearby forest");
+      expect(request.instructions).not.toContain('"goals"');
     } finally {
       fixture.close();
     }
