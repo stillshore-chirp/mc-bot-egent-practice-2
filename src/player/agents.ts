@@ -986,6 +986,11 @@ const actionDecisionInput = z
   })
   .strict();
 
+const urgentActionDecisionInput = actionDecisionInput.extend({
+  skillId: z.enum([""]),
+  skillVersion: z.number().int().min(0).max(0),
+});
+
 const observeInput = z.object({}).strict();
 const locateOwnerInput = z
   .object({
@@ -1486,7 +1491,9 @@ export class PlayerPurposeAgent {
         name: "commit_action_decision",
         description:
           "この判断の最後に一度使う。操作の開始、理由付き待機、実行中操作の継続、目的完了と任意のgoal/proposal/理解更新を一つのCASで確定する。",
-        schema: actionDecisionInput,
+        schema: urgentFirstAction
+          ? urgentActionDecisionInput
+          : actionDecisionInput,
         execute: async (value) => {
           if (input.signal?.aborted)
             return { ok: false, code: "THOUGHT_CANCELLED" };

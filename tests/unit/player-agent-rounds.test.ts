@@ -190,6 +190,83 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("commits an urgent relative action with the no-Skill schema", async () => {
+    const fixture = openPurposeFixture(
+      [
+        functionCallResponse(
+          "urgent-relative-action-without-skill",
+          "commit_action_decision",
+          {
+            ...actionArguments(),
+            purpose:
+              "Take one short relative step using the current observation.",
+            operationJson: JSON.stringify({
+              kind: "move_relative",
+              offset: { x: 0, y: 0, z: 2 },
+              range: 1,
+            }),
+          },
+        ),
+      ],
+      () => undefined,
+      createMemoryPort(),
+      async () => bodyObservationFixture(),
+    );
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-relative-action-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: {
+          kind: "move_relative",
+          offset: { x: 0, y: 0, z: 2 },
+        },
+      });
+      expect(fixture.mind.snapshot().activeOperation).toMatchObject({
+        kind: "move_relative",
+      });
+      expect(fixture.mind.snapshot().activeOperation?.skillId).toBeUndefined();
+      expect(
+        fixture.mind.snapshot().activeOperation?.skillVersion,
+      ).toBeUndefined();
+
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      const commitTool = tools.find(
+        ({ name }) => name === "commit_action_decision",
+      );
+      const parameters = z
+        .record(z.string(), z.unknown())
+        .parse(commitTool?.parameters);
+      const properties = z
+        .record(z.string(), z.unknown())
+        .parse(parameters.properties);
+      expect(properties.skillId).toMatchObject({ enum: [""] });
+      expect(properties.skillVersion).toMatchObject({
+        type: "integer",
+        minimum: 0,
+        maximum: 0,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("uses the instant first-action path for a newly received strong owner proposal", async () => {
     const fixture = openPurposeFixture([
       terminalResponse("The current owner request has a first step."),
