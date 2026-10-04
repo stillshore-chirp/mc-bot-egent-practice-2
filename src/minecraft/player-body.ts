@@ -2986,6 +2986,24 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
     if (!this.isCurrentMoveRelativeFallback(bot, signal, active)) return;
 
+    const waitController = new AbortController();
+    const abortWait = (): void => waitController.abort(signal.reason);
+    const abortForLifeChange = (): void =>
+      waitController.abort(new Error("Minecraft life changed during movement"));
+    const endWait = (): void =>
+      waitController.abort(new Error("Minecraft disconnected during movement"));
+    const onHealth = (): void => {
+      if (
+        bot.health <= 0 ||
+        this.lifeGeneration !== active.startedLifeGeneration
+      )
+        abortForLifeChange();
+    };
+    signal.addEventListener("abort", abortWait, { once: true });
+    bot.once("end", endWait);
+    bot.once("death", abortForLifeChange);
+    bot.once("spawn", abortForLifeChange);
+    bot.on("health", onHealth);
     let attempted = false;
     try {
       for (const control of horizontalMovementControls)
@@ -2998,25 +3016,17 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       if (!attempted) return;
 
-      const waitController = new AbortController();
-      const abortWait = (): void => waitController.abort(signal.reason);
-      const endWait = (): void =>
-        waitController.abort(
-          new Error("Minecraft disconnected during movement"),
-        );
-      signal.addEventListener("abort", abortWait, { once: true });
-      bot.once("end", endWait);
-      try {
-        if (signal.aborted) abortWait();
-        await waitTicks(5, waitController.signal);
-      } finally {
-        signal.removeEventListener("abort", abortWait);
-        bot.removeListener("end", endWait);
-      }
+      if (signal.aborted) abortWait();
+      await waitTicks(5, waitController.signal);
     } catch (error) {
       if (signal.aborted) throw error;
       // A disconnected client can reject control input; preserve the original NoPath result.
     } finally {
+      signal.removeEventListener("abort", abortWait);
+      bot.removeListener("end", endWait);
+      bot.removeListener("death", abortForLifeChange);
+      bot.removeListener("spawn", abortForLifeChange);
+      bot.removeListener("health", onHealth);
       for (const control of horizontalMovementControls) {
         try {
           bot.setControlState(control, false);

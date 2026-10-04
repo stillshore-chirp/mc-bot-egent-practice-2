@@ -3947,6 +3947,44 @@ describe("player body", () => {
     }
   });
 
+  it("releases the NoPath control when death and respawn change the bot life", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      let changedLife = false;
+      const setControlState = vi.fn((_control: string, enabled: boolean) => {
+        if (!enabled || changedLife) return;
+        changedLife = true;
+        fake.bot.health = 0;
+        fake.bot.emit("health");
+        fake.bot.emit("death");
+        fake.bot.health = 20;
+        fake.bot.emit("spawn");
+      });
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("failed");
+      expect(
+        setControlState.mock.calls.filter(([, enabled]) => enabled),
+      ).toHaveLength(1);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not claim a relative move succeeded without observed arrival", async () => {
     const fake = makeFakeBot();
     const body = new MineflayerPlayerBody(() => fake.bot);
