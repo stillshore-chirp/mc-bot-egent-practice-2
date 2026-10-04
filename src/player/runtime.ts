@@ -98,6 +98,7 @@ export interface PlayerRuntimeOptions {
 interface PendingThoughtWake {
   readonly kind: PlayerWakeKind;
   readonly reason: string;
+  readonly damageAware: boolean;
 }
 
 /** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
@@ -110,6 +111,8 @@ export class PlayerRuntime {
   #activeThought: AbortController | undefined;
   #activeThoughtStartedAtMs: number | undefined;
   #activeThoughtCommitted = false;
+  #activeThoughtDamageAware = false;
+  #activeThoughtDamageInvalidated = false;
   #activeResponsesRequest = false;
   #activeResponsesRequestStartedAtMs: number | undefined;
   #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
@@ -540,13 +543,19 @@ export class PlayerRuntime {
       this.#lastDamageEventAtMs = Number.isFinite(damageAt)
         ? damageAt
         : Date.now();
+      const invalidateDecision =
+        this.#activeThought !== undefined &&
+        !this.#activeThoughtCommitted &&
+        !this.#activeThoughtDamageAware &&
+        !this.#activeThoughtDamageInvalidated;
+      if (invalidateDecision) this.#activeThoughtDamageInvalidated = true;
       this.enqueueAndWake(
         "bot_damaged",
         damageEventSummary(event.source, event.confidence),
         event.at,
         "bot_damaged",
         damageObservationCoalesceMs,
-        { invalidateDecision: false },
+        { invalidateDecision, damageAware: true },
       );
       return;
     }
@@ -660,11 +669,18 @@ export class PlayerRuntime {
     options: {
       readonly invalidateDecision?: boolean;
       readonly deathCause?: PlayerBodyDeathCause;
+      readonly damageAware?: boolean;
     } = {},
   ): void {
     const now = Date.parse(at);
     const previous = this.#eventTimes.get(key) ?? 0;
     if (Number.isFinite(now) && now - previous < minimumGapMs) {
+      if (kind === "bot_damaged" && options.invalidateDecision === true) {
+        const event = this.options.mind.enqueueEvent(kind, summary, {
+          invalidateDecision: true,
+        });
+        this.#requestThought(kind, event.summary, false, true);
+      }
       if (kind === "state_changed" && summary.includes("vitals")) {
         this.options.mind.enqueueEvent(kind, summary);
         this.#scheduleVitalsWake(Math.max(1, minimumGapMs - (now - previous)));
@@ -681,17 +697,23 @@ export class PlayerRuntime {
       kind === "bot_death"
         ? this.options.mind.recordDeathEvent(at, summary, options.deathCause)
         : this.options.mind.enqueueEvent(kind, summary, { invalidateDecision });
-    this.#requestThought(kind, event.summary);
+    this.#requestThought(
+      kind,
+      event.summary,
+      false,
+      options.damageAware ?? false,
+    );
   }
 
   #requestThought(
     kind: PlayerWakeKind,
     reason: string,
     acceptedPendingWake = false,
+    damageAwareWake = false,
   ): void {
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
     if (isUrgentPerceptionWake(kind) && this.#retryTimer !== undefined) {
-      this.#queueThoughtWake(kind, reason);
+      this.#queueThoughtWake(kind, reason, damageAwareWake);
       return;
     }
     const current = this.options.mind.snapshot();
@@ -715,7 +737,7 @@ export class PlayerRuntime {
       return;
     const activeThought = this.#activeThought;
     if (activeThought !== undefined) {
-      this.#queueThoughtWake(kind, reason);
+      this.#queueThoughtWake(kind, reason, damageAwareWake);
       if (kind === "owner_proposal") {
         if (this.#activeResponsesRequest) {
           this.#boundOwnerProposalSettlement(activeThought);
@@ -739,6 +761,8 @@ export class PlayerRuntime {
     this.#activeThought = controller;
     this.#activeThoughtStartedAtMs = Date.now();
     this.#activeThoughtCommitted = false;
+    this.#activeThoughtDamageAware = kind === "bot_damaged" || damageAwareWake;
+    this.#activeThoughtDamageInvalidated = false;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     const events = this.options.mind.pendingEvents(32);
@@ -807,7 +831,11 @@ export class PlayerRuntime {
       );
   }
 
-  #queueThoughtWake(kind: PlayerWakeKind, reason: string): void {
+  #queueThoughtWake(
+    kind: PlayerWakeKind,
+    reason: string,
+    damageAware = false,
+  ): void {
     const pending = this.#pendingThoughtWake;
     const priority = (wake: PlayerWakeKind): number =>
       wake === "owner_proposal"
@@ -819,9 +847,16 @@ export class PlayerRuntime {
             : wake === "operation_stalled"
               ? 2
               : 1;
-    if (pending !== undefined && priority(pending.kind) > priority(kind))
+    if (pending !== undefined && priority(pending.kind) > priority(kind)) {
+      if (damageAware && !pending.damageAware)
+        this.#pendingThoughtWake = { ...pending, damageAware: true };
       return;
-    this.#pendingThoughtWake = { kind, reason };
+    }
+    this.#pendingThoughtWake = {
+      kind,
+      reason,
+      damageAware: damageAware || pending?.damageAware === true,
+    };
   }
 
   #finishThought(
@@ -834,6 +869,8 @@ export class PlayerRuntime {
     this.#activeThought = undefined;
     this.#activeThoughtStartedAtMs = undefined;
     this.#activeThoughtCommitted = false;
+    this.#activeThoughtDamageAware = false;
+    this.#activeThoughtDamageInvalidated = false;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
@@ -861,7 +898,12 @@ export class PlayerRuntime {
     // The event already passed its wait/deadline gate when queued. A newer
     // thought may have committed a different wait since then; honor this
     // accepted wake once against the latest snapshot without widening gates.
-    this.#requestThought(pending.kind, pending.reason, true);
+    this.#requestThought(
+      pending.kind,
+      pending.reason,
+      true,
+      pending.damageAware,
+    );
   }
 
   async #replaceBodyOperation(
@@ -1082,6 +1124,8 @@ export class PlayerRuntime {
     this.#activeResponsesRequestStartedAtMs = undefined;
     this.#pendingThoughtWake = undefined;
     this.#activeThoughtCommitted = false;
+    this.#activeThoughtDamageAware = false;
+    this.#activeThoughtDamageInvalidated = false;
     thought?.abort(new Error(reason));
   }
 

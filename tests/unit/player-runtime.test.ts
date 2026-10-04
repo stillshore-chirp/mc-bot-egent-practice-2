@@ -2351,6 +2351,170 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("rejects a startup judgment after the first fresh damage event before dispatch", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, signal }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) await firstThoughtGate;
+        const decision = action(`damage-freshness-${thoughtCount}`);
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        if (signal?.aborted) return { accepted: false };
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    fixture.mind.enqueueEvent("bot_death", "historical death wake");
+    runtimeRef.current = fixture.runtime;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const revisionBeforeDamage = fixture.mind.snapshot().revision;
+      const baseAt = Date.now();
+      fixture.body.emit({
+        type: "bot_damaged",
+        at: new Date(baseAt).toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      const revisionAfterFirstDamage = fixture.mind.snapshot().revision;
+      expect(revisionAfterFirstDamage).toBe(revisionBeforeDamage + 1);
+      for (const offset of [1_000, 2_000])
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + offset).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      expect(fixture.mind.snapshot().revision).toBe(revisionAfterFirstDamage);
+
+      releaseFirstThought?.();
+      await waitFor(
+        () => thoughtCount === 2 && fixture.body.started.length === 1,
+      );
+      expect(commits).toEqual([false, true]);
+      expect(fixture.body.started).toEqual(["look"]);
+      expect(fixture.mind.snapshot().pendingEventKinds).toContain(
+        "bot_damaged",
+      );
+    } finally {
+      releaseFirstThought?.();
+      await fixture.close();
+    }
+  });
+
+  it("keeps a damage-aware thought live when owner proposal wins the pending-wake priority", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseFreshThought: (() => void) | undefined;
+    const freshThoughtGate = new Promise<void>((resolve) => {
+      releaseFreshThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    let freshEvents: readonly string[] = [];
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, signal, events }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { accepted: false };
+        }
+        freshEvents = events.map(({ kind }) => kind);
+        await freshThoughtGate;
+        const decision = action("damage-aware-owner-proposal");
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    runtimeRef.current = fixture.runtime;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const baseAt = Date.now();
+      fixture.body.emit({
+        type: "bot_damaged",
+        at: new Date(baseAt).toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      fixture.mind.addProposal({
+        title: "Return to the owner",
+        reason: "Meet me.",
+      });
+      fixture.runtime.onOwnerProposal();
+      await waitFor(() => thoughtCount === 2);
+      expect(freshEvents).toContain("bot_damaged");
+      const revisionBeforeRepeat = fixture.mind.snapshot().revision;
+
+      for (const offset of [1_000, 2_000])
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + offset).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      expect(fixture.mind.snapshot().revision).toBe(revisionBeforeRepeat);
+      expect(commits).toEqual([]);
+
+      releaseFreshThought?.();
+      await waitFor(() => fixture.body.started.length === 1);
+      expect(commits).toEqual([true]);
+      expect(fixture.body.started).toEqual(["look"]);
+    } finally {
+      releaseFreshThought?.();
+      await fixture.close();
+    }
+  });
+
   it("coalesces a legacy death-wake backlog and delivers the latest request and death at startup", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
