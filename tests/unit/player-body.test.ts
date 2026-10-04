@@ -1676,6 +1676,72 @@ describe("player body", () => {
     expect(typeof completion.serverConfirmedAt).toBe("string");
   });
 
+  it("keeps an equipped melee weapon while still filling empty armor slots", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_spear", 1);
+    addItemToInventory(fake, "iron_sword", 1);
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "iron_chestplate", 1);
+    const inventory = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const swordSlot = inventory.slots.findIndex(
+      (item) => item?.name === "iron_sword",
+    );
+    const heldSword = inventory.slots[swordSlot];
+    inventory.slots[36] = heldSword ?? null;
+    inventory.slots[swordSlot] = null;
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const clientEvents = fake.bot._client as unknown as EventEmitter;
+    const equipCalls: { name: string; destination: string }[] = [];
+    const attack = vi.fn((_target: Entity) => {
+      botEvents.emit("entityHurt", zombie, fake.bot.entity);
+    });
+    Object.assign(fake.bot, {
+      heldItem: heldSword,
+      equip: vi.fn(async (item: Item, destination: string) => {
+        equipCalls.push({ name: item.name, destination });
+        const slot = fake.bot.getEquipmentDestSlot(destination);
+        const previous = inventory.slots[slot] ?? null;
+        inventory.slots[slot] = item as unknown as Record<string, unknown>;
+        fake.inventory.emit("updateSlot", slot, previous, item);
+        clientEvents.emit("set_slot", { windowId: 0, slot, item: {} });
+      }),
+      attack,
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(equipCalls).toHaveLength(2));
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled());
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+
+    expect(equipCalls).toEqual([
+      { name: "golden_helmet", destination: "head" },
+      { name: "iron_chestplate", destination: "torso" },
+    ]);
+    expect(fake.bot.heldItem?.name).toBe("iron_sword");
+    expect(inventory.slots.some((item) => item?.name === "golden_spear")).toBe(
+      true,
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_completed"),
+    ).toMatchObject({
+      status: "successful",
+      summary: "equipment_and_hit_confirmed",
+    });
+  });
+
   it("does not treat optimistic inventory updates as server-confirmed reflex equipment", async () => {
     const fake = makeFakeBot();
     const zombie = addFakeZombieEntity(fake);

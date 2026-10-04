@@ -1762,10 +1762,13 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       if (reflex.controller.signal.aborted || !this.damageReflexIsAlive(reflex))
         return;
+      const heldItem = bot.heldItem;
+      if (heldItem != null && /_(?:sword|axe|spear)$/u.test(heldItem.name))
+        return;
       const weapon = inventory
         .items()
         .find((item) => /_(?:sword|axe|spear)$/u.test(item.name));
-      if (weapon === undefined || bot.heldItem?.name === weapon.name) return;
+      if (weapon === undefined) return;
       const slot = bot.getEquipmentDestSlot("hand");
       reflex.expectedEquipSlot = slot;
       reflex.expectedEquipName = weapon.name;
