@@ -2234,6 +2234,110 @@ describe("player body", () => {
     }
   });
 
+  it("aims at a loaded, reachable block before rechecking view and digging", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    const targetKey = "0,64,2";
+    fake.blocks.set(targetKey, makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    Object.assign(fake.bot, { digTime: vi.fn(() => 1_000) });
+    expect(
+      observePlayerBody(fake.bot, "owner").perception.blocks.some(
+        (block) => block.position.z === target.z,
+      ),
+    ).toBe(false);
+    vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
+      expect(fake.bot.lookAt).toHaveBeenCalledWith(
+        target.offset(0.5, 0.5, 0.5),
+        true,
+      );
+      expect(
+        observePlayerBody(fake.bot, "owner").perception.blocks.some(
+          (block) => block.position.z === target.z,
+        ),
+      ).toBe(true);
+      fake.blocks.set(targetKey, makeBlock("air", 0, target));
+      (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+        location: target,
+        type: 0,
+      });
+    });
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+
+    expect(fake.bot.dig).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe("successful");
+  });
+
+  it("does not dig after aiming if the block stays occluded or the Bot changes", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    const targetKey = "0,64,2";
+    fake.blocks.set(targetKey, makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    Object.assign(fake.bot, { digTime: vi.fn(() => 1_000) });
+    fake.hiddenBlockKeys.add(targetKey);
+    let currentBot = fake.bot;
+    const body = new MineflayerPlayerBody(() => currentBot);
+
+    const occluded = await body.execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+    expect(fake.bot.lookAt).toHaveBeenCalledTimes(1);
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+    expect(occluded.status).toBe("failed");
+    expect(occluded.detail).toContain("Target block is occluded");
+
+    fake.hiddenBlockKeys.delete(targetKey);
+    const replacement = makeFakeBot();
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(async () => {
+      currentBot = replacement.bot;
+    });
+    const changedBot = await body.execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+    expect(changedBot.status).toBe("failed");
+    expect(changedBot.detail).toContain("Minecraft bot changed while aiming");
+  });
+
+  it("does not start digging when the operation is cancelled while aiming", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    fake.blocks.set("0,64,2", makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    const controller = new AbortController();
+    let markLookStarted!: () => void;
+    const lookStarted = new Promise<void>((resolve) => {
+      markLookStarted = resolve;
+    });
+    let resolveLook!: () => void;
+    const pendingLook = new Promise<void>((resolve) => {
+      resolveLook = resolve;
+    });
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(async () => {
+      markLookStarted();
+      await pendingLook;
+    });
+
+    const resultPromise = new MineflayerPlayerBody(() => fake.bot).execute(
+      { kind: "dig", position: { x: target.x, y: target.y, z: target.z } },
+      controller.signal,
+    );
+    await lookStarted;
+    controller.abort(new Error("Owner stopped the operation"));
+    const result = await resultPromise;
+    resolveLook();
+
+    expect(result.status).toBe("interrupted");
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+  });
+
   it("waits for the target's server block update after native placement resolves", async () => {
     vi.useFakeTimers();
     try {

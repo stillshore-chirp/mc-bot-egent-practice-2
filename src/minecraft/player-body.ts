@@ -1705,8 +1705,8 @@ export class MineflayerPlayerBody implements PlayerBody {
         : operation.kind === "use" && operation.target.kind === "block"
           ? blockPosition(operation.target.position)
           : undefined;
-    const blockEvidence =
-      blockTarget === undefined
+    let blockEvidence =
+      blockTarget === undefined || operation.kind === "dig"
         ? undefined
         : captureServerBlockUpdates(bot, blockTarget);
     const attackEvidence = captureAttackEvidence(bot, operation, active);
@@ -1722,6 +1722,17 @@ export class MineflayerPlayerBody implements PlayerBody {
       controller.abort(new ActionTimeoutError(timeoutMs));
     }, timeoutMs);
     try {
+      if (operation.kind === "dig" && blockTarget !== undefined) {
+        const target = requireReachableBlock(bot, operation.position, false);
+        await waitForAction(
+          bot.lookAt(target.position.offset(0.5, 0.5, 0.5), true),
+          controller.signal,
+        );
+        throwIfAborted(controller.signal);
+        if (this.getBot() !== bot)
+          throw new Error("Minecraft bot changed while aiming to dig");
+        blockEvidence = captureServerBlockUpdates(bot, blockTarget);
+      }
       if (!controller.signal.aborted) {
         const action = this.dispatch(bot, operation, controller.signal, active);
         active.actionPromise = action;
@@ -2246,6 +2257,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       case "dig": {
         const block = requireReachableBlock(bot, operation.position);
+        if (this.getBot() !== bot)
+          throw new Error("Minecraft bot changed before digging");
+        throwIfAborted(signal);
         await bot.dig(block);
         return;
       }
@@ -3124,6 +3138,7 @@ function chooseFood(bot: Bot, requested?: string): Item {
 function requireReachableBlock(
   bot: Bot,
   rawPosition: { readonly x: number; readonly y: number; readonly z: number },
+  checkVisibility = true,
 ): Block {
   const position = blockPosition(rawPosition);
   const block = bot.blockAt(position);
@@ -3133,6 +3148,7 @@ function requireReachableBlock(
   const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
   if (eye.distanceTo(target) > interactRange + 0.15)
     throw new Error("Target block is outside normal player reach");
+  if (!checkVisibility) return block;
   if (!bot.canSeeBlock(block)) throw new Error("Target block is occluded");
   const visible = observePlayerBody(bot, undefined).perception.blocks.some(
     (candidate) => blockKey(candidate.position) === blockKey(position),

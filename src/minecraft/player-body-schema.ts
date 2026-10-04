@@ -85,7 +85,7 @@ export const playerOperationDescriptions = {
   equip: "Equip an inventory item into a player equipment slot.",
   use: "Use a held item for 1-200 ticks (default 4), or interact with a currently visible block or entity.",
   attack: "Attack a currently visible entity within normal player reach.",
-  dig: "Mine a currently visible block within normal player reach.",
+  dig: "Mine a loaded block within normal player reach. The Body aims at it, then rechecks visibility and obstruction before digging.",
   place:
     "Place an inventory item at a reported empty-cell candidate; use its position and supporting face.",
   craft:

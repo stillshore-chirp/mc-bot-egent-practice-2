@@ -105,6 +105,11 @@ const operationDetails: Partial<
       "These events support a fresh decision about movement, looking, or attack; they do not establish that any response succeeded. Verify the selected operation result separately.",
     ],
   },
+  dig: {
+    preconditions: [
+      "The requested block must be loaded and within normal player reach. PlayerBody turns toward it, then rechecks current visibility and line of sight; it will not dig a block that remains hidden or obstructed.",
+    ],
+  },
 };
 
 /**
