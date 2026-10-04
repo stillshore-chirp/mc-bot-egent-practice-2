@@ -175,6 +175,8 @@ export interface RunPlayerAgentInput {
   readonly maxRounds?: number;
   /** Restrict a formatting-only request from invoking tools. */
   readonly toolChoice?: "auto" | "none";
+  /** Reserve the final bounded round for a response without tool calls. */
+  readonly finalRoundToolChoice?: "none";
   /** Synchronously admit or reject each provider request before it starts. */
   readonly beforeCall?: () => void;
   readonly role?: PlayerAgentRole;
@@ -296,7 +298,10 @@ export async function runPlayerAgent(
             instructions: input.instructions,
             input: messages,
             tools,
-            tool_choice: input.toolChoice ?? "auto",
+            tool_choice:
+              input.finalRoundToolChoice === "none" && round === maxRounds - 1
+                ? "none"
+                : (input.toolChoice ?? "auto"),
             parallel_tool_calls: false,
             store: false,
             include: ["reasoning.encrypted_content"],

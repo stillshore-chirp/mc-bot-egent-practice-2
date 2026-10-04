@@ -253,6 +253,109 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("reserves the last conversation round for a reply and retains tool results", async () => {
+    const fixture = openConversationFixture();
+    fixture.responses.push(
+      ...Array.from({ length: 5 }, (_, index) =>
+        functionCallResponse(`runtime-${index}`, "inspect_runtime", {}),
+      ),
+      terminalResponse("状態を確認しました。"),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "状態を調べてください。",
+        turn,
+      });
+
+      expect(fixture.requests).toHaveLength(6);
+      expect(fixture.messages).toEqual(["状態を確認しました。"]);
+      const requests = fixture.requests.map((request) =>
+        z.record(z.string(), z.unknown()).parse(request),
+      );
+      expect(requests.map(({ tool_choice }) => tool_choice)).toEqual([
+        "auto",
+        "auto",
+        "auto",
+        "auto",
+        "auto",
+        "none",
+      ]);
+      const finalInput = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(requests[5]?.input);
+      expect(
+        finalInput.filter(({ type }) => type === "function_call_output"),
+      ).toHaveLength(5);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("honors cancellation before executing a pending conversation tool", async () => {
+    const fixture = openConversationFixture();
+    const controller = new AbortController();
+    fixture.responses.push(() => {
+      controller.abort();
+      return functionCallResponse("stop-before-abort", "stop_autonomy", {});
+    });
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await expect(
+        fixture.conversation.handleOwnerMessage({
+          username: "owner",
+          message: "自律行動を停止してください。",
+          turn,
+          signal: controller.signal,
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().stopped).toBe(false);
+      expect(fixture.messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses the bounded fallback when long-reply compaction exceeds the call budget", async () => {
+    let admittedCalls = 0;
+    const fixture = openConversationFixture(() => {
+      admittedCalls += 1;
+      if (admittedCalls > 6) throw new Error("CALL_BUDGET_EXHAUSTED");
+    });
+    fixture.responses.push(
+      ...Array.from({ length: 5 }, (_, index) =>
+        functionCallResponse(`runtime-long-${index}`, "inspect_runtime", {}),
+      ),
+      terminalResponse("長い回答です。".repeat(40)),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "説明してください。",
+        turn,
+      });
+
+      expect(admittedCalls).toBe(7);
+      expect(fixture.requests).toHaveLength(6);
+      expect(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[5])
+          .tool_choice,
+      ).toBe("none");
+      expect(fixture.messages).toEqual([
+        "うまく短く整理できず、説明が不十分です。",
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("records final reply callback completion without reply text", async () => {
     const directory = mkdtempSync(join(tmpdir(), "player-final-trace-"));
     temporaryDirectories.push(directory);
@@ -2098,6 +2201,12 @@ describe("player agent response rounds", () => {
       expect(result.accepted).toBe(true);
       expect(fixture.observationCalls).toBe(2);
       expect(fixture.requests).toHaveLength(2);
+      expect(
+        fixture.requests.map(
+          (request) =>
+            z.record(z.string(), z.unknown()).parse(request).tool_choice,
+        ),
+      ).toEqual(["auto", "auto"]);
       const secondRequest = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[1]);
@@ -3074,6 +3183,12 @@ describe("player agent response rounds", () => {
       expect(result.accepted).toBe(true);
       expect(result.decision?.kind).toBe("act");
       expect(fixture.requests).toHaveLength(6);
+      expect(
+        fixture.requests.map(
+          (request) =>
+            z.record(z.string(), z.unknown()).parse(request).tool_choice,
+        ),
+      ).toEqual(Array.from({ length: 6 }, () => "auto"));
       expect(committed).toHaveLength(1);
     } finally {
       fixture.close();
@@ -4386,7 +4501,7 @@ interface ConversationFixture {
   close(): void;
 }
 
-function openConversationFixture(): ConversationFixture {
+function openConversationFixture(beforeCall?: () => void): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
   const databasePath = join(directory, "player.sqlite");
@@ -4402,6 +4517,7 @@ function openConversationFixture(): ConversationFixture {
     mind,
     memory: createMemoryPort(),
     logger: pino({ level: "silent" }),
+    ...(beforeCall === undefined ? {} : { beforeCall }),
     say: async (text) => {
       messages.push(text);
     },

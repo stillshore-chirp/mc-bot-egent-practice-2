@@ -973,6 +973,8 @@ export class PlayerConversationAgent {
       tools,
       logger: this.options.logger,
       role: "conversation",
+      maxRounds: 6,
+      finalRoundToolChoice: "none",
       onResponsesRequestState: (active) => {
         if (this.#activeTurn === input.turn)
           this.#activeRequestStartedAtMs = active ? Date.now() : undefined;
@@ -1018,9 +1020,9 @@ export class PlayerConversationAgent {
         runtime: compactSnapshot(regenerationSnapshot),
         memory: compactMemory(regenerationMemory),
       });
-      // Let exhausted call budgets escape instead of turning them into a chat reply.
-      this.options.beforeCall?.();
       try {
+        // A denied compaction call must still leave room for one bounded reply.
+        this.options.beforeCall?.();
         const compacted = await runPlayerAgent({
           client: this.#client,
           model: this.options.model,
