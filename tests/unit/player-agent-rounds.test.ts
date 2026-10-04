@@ -201,6 +201,98 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("distinguishes the last pre-death position from the current observation", async () => {
+    const beforeAt = "2026-10-04T07:14:55.000Z";
+    const deathAt = "2026-10-04T07:14:57.000Z";
+    const currentAt = "2026-10-04T07:14:59.000Z";
+    const base = bodyObservationFixture();
+    const previousLife = {
+      ...base,
+      observedAt: beforeAt,
+      self: {
+        ...base.self,
+        position: { ...base.self.position, x: 12, z: -4 },
+      },
+    };
+    const currentObservation = {
+      ...base,
+      observedAt: currentAt,
+      self: {
+        ...base.self,
+        position: { ...base.self.position, x: -3, z: 6 },
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        terminalResponse(
+          "I will choose the next escape step from these facts.",
+        ),
+      ],
+      undefined,
+      createMemoryPort(),
+      async () => currentObservation,
+    );
+    fixture.mind.recordObservation(toObservationEvidence(previousLife));
+    fixture.mind.recordOutcome({
+      evidence: {
+        operationId: "previous-short-movement",
+        kind: "move_relative",
+        status: "failed",
+        summary: "A short relative move made no progress.",
+        observedAt: "2026-10-04T07:14:56.000Z",
+        movementDelta: { x: 0.04, y: 0, z: 1.96 },
+      },
+    });
+    const deathEvent = fixture.mind.recordDeathEvent(
+      deathAt,
+      "Synthetic death event.",
+    );
+
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [deathEvent],
+      });
+
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const payload = requestUserPayload(request);
+      const runtime = z.record(z.string(), z.unknown()).parse(payload.runtime);
+      const latestDeath = z
+        .record(z.string(), z.unknown())
+        .parse(runtime.latestDeath);
+      expect(latestDeath).toMatchObject({
+        observedAt: deathAt,
+        previousLife: {
+          observedAt: beforeAt,
+          dimension: "overworld",
+          position: { x: 12, y: 64, z: -4 },
+        },
+      });
+      expect(payload.observation).toMatchObject({
+        observedAt: currentAt,
+        self: { position: { x: -3, y: 64, z: 6 } },
+      });
+      const recentOutcomes = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(runtime.recentOutcomes);
+      expect(recentOutcomes).toContainEqual(
+        expect.objectContaining({
+          kind: "move_relative",
+          movementDelta: { x: 0, y: 0, z: 2 },
+        }),
+      );
+      expect(request.instructions).toContain(
+        "観測待ちへ目的をすり替えず脱出経路を変える一手",
+      );
+      expect(request.instructions).toContain("自分の復帰Bed");
+      expect(request.instructions).toContain("見えていない出口形状は断定せず");
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("commits an urgent relative action with the no-Skill schema", async () => {
     const fixture = openPurposeFixture([
       functionCallResponse(

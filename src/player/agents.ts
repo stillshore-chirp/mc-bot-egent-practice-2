@@ -1907,6 +1907,7 @@ export class PlayerPurposeAgent {
           ...(urgentPerceptionWake
             ? [
                 "直近の被害・死亡と今回の視界を踏まえ、古い死亡位置を現在位置として扱わず、利用可能な操作から短い一手を今選んでください。危険の確度を保ち、結果や次の被害から続けて学びます。",
+                "runtime.latestDeath.previousLifeは死亡前の最終観測であり、死亡地点・復帰地点・現在位置ではありません。時刻とdimensionを保ったまま今回のobservationおよび直近movementDeltaと比較し、同じ狭い範囲へ戻る循環が見えたら、観測待ちへ目的をすり替えず脱出経路を変える一手を選んでください。観測できた出口・窓・障害物を開く/越える案、自分の復帰Bedと確認できるものを通常権限で壊し次の復帰先を変える案も比較できます。別spawn位置、Bed所有/設定、見えていない出口形状は断定せず、素手の正面戦闘や同じ方向への短距離反復だけを第一候補に固定しないでください。",
               ]
             : []),
           ...(urgentOwnerRequest
@@ -2363,6 +2364,30 @@ function compactFirstActionSnapshot(
         : {
             observedAt: snapshot.latestDeath.observedAt,
             cause: snapshot.latestDeath.cause ?? null,
+            previousLife:
+              snapshot.latestDeath.beforeObservation === undefined
+                ? null
+                : {
+                    observedAt:
+                      snapshot.latestDeath.beforeObservation.observedAt,
+                    dimension:
+                      snapshot.latestDeath.beforeObservation.dimension.slice(
+                        0,
+                        80,
+                      ),
+                    position:
+                      snapshot.latestDeath.beforeObservation.position ===
+                      undefined
+                        ? null
+                        : {
+                            x: snapshot.latestDeath.beforeObservation.position
+                              .x,
+                            y: snapshot.latestDeath.beforeObservation.position
+                              .y,
+                            z: snapshot.latestDeath.beforeObservation.position
+                              .z,
+                          },
+                  },
           },
     lastObservation:
       snapshot.lastObservation === undefined
@@ -2384,11 +2409,20 @@ function compactFirstActionSnapshot(
       })),
     recentOutcomes: snapshot.recentOutcomes
       .slice(-2)
-      .map(({ kind, status, summary, observedAt }) => ({
+      .map(({ kind, status, summary, observedAt, movementDelta }) => ({
         kind,
         status,
         summary: summary.slice(0, 240),
         observedAt,
+        ...(movementDelta === undefined
+          ? {}
+          : {
+              movementDelta: {
+                x: Math.round(movementDelta.x * 10) / 10,
+                y: Math.round(movementDelta.y * 10) / 10,
+                z: Math.round(movementDelta.z * 10) / 10,
+              },
+            }),
       })),
   };
 }
