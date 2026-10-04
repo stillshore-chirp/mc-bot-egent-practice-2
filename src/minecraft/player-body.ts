@@ -9,6 +9,11 @@ import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { AppError } from "../domain/errors.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import type { ArmorSlot } from "../domain/snapshot.js";
+import {
+  selectArmorUpgrades,
+  type EquippedArmorBySlot,
+} from "./player-armor-selection.js";
 import {
   playerOperationSchema,
   type PlayerOperation,
@@ -87,6 +92,12 @@ const damageReflexActiveWindowMs = 1_000;
 const damageReflexMaximumWallMs = 4_000;
 const damageReflexSpawnWaitMs = 3_000;
 const damageReflexAttackTicks = 6;
+const armorDestinations: readonly ArmorSlot[] = [
+  "head",
+  "torso",
+  "legs",
+  "feet",
+];
 const damageReflexArmorSlots = [
   { destination: "head", matches: /(?:^|_)helmet$/u },
   { destination: "torso", matches: /_chestplate$/u },
@@ -1511,6 +1522,11 @@ export class MineflayerPlayerBody implements PlayerBody {
   private active: ActiveOperation | undefined;
   private damageReflexEnabled = false;
   private damageReflex: DamageReflexRun | undefined;
+  private passiveArmorController: AbortController | undefined;
+  private passiveArmorTask: Promise<void> | undefined;
+  private passiveArmorEquipInFlight:
+    { readonly bot: Bot; readonly promise: Promise<void> } | undefined;
+  private passiveArmorPending = false;
   private lifeGeneration = 0;
   private botLifeDead = false;
   private admission: Promise<void> = Promise.resolve();
@@ -1591,6 +1607,136 @@ export class MineflayerPlayerBody implements PlayerBody {
     return () => this.listeners.delete(listener);
   }
 
+  private schedulePassiveArmor(bot = this.boundBot): void {
+    if (
+      !this.damageReflexEnabled ||
+      bot === undefined ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return;
+    if (this.passiveArmorEquipInFlight?.bot === bot) {
+      this.passiveArmorPending = true;
+      return;
+    }
+    if (this.damageReflex !== undefined) {
+      this.passiveArmorPending = true;
+      return;
+    }
+    if (this.passiveArmorTask !== undefined) {
+      this.passiveArmorPending = true;
+      return;
+    }
+
+    const controller = new AbortController();
+    const lifeGeneration = this.lifeGeneration;
+    this.passiveArmorPending = false;
+    this.passiveArmorController = controller;
+    const task = Promise.resolve()
+      .then(() =>
+        this.equipPassiveArmor(bot, lifeGeneration, controller.signal),
+      )
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.passiveArmorTask !== task) return;
+        this.passiveArmorTask = undefined;
+        this.passiveArmorController = undefined;
+        const retry = this.passiveArmorPending;
+        this.passiveArmorPending = false;
+        const currentBot = this.boundBot;
+        if (retry && currentBot !== undefined)
+          this.schedulePassiveArmor(currentBot);
+      });
+    this.passiveArmorTask = task;
+  }
+
+  private passiveArmorIsCurrent(
+    bot: Bot,
+    lifeGeneration: number,
+    signal: AbortSignal,
+  ): boolean {
+    if (
+      signal.aborted ||
+      !this.damageReflexEnabled ||
+      this.damageReflex !== undefined ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      this.lifeGeneration !== lifeGeneration ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return false;
+    try {
+      return this.getBot() === bot;
+    } catch {
+      return false;
+    }
+  }
+
+  private async equipPassiveArmor(
+    bot: Bot,
+    lifeGeneration: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const inventory = initializedInventory(bot);
+    if (
+      inventory === undefined ||
+      typeof inventory.items !== "function" ||
+      typeof bot.equip !== "function"
+    )
+      return;
+
+    const planned = selectArmorUpgrades(
+      inventory.items(),
+      readEquippedArmor(bot, inventory.slots),
+    );
+    for (const candidate of planned) {
+      if (!this.passiveArmorIsCurrent(bot, lifeGeneration, signal)) return;
+      const next = selectArmorUpgrades(
+        inventory.items(),
+        readEquippedArmor(bot, inventory.slots),
+      ).find((upgrade) => upgrade.destination === candidate.destination);
+      if (next === undefined) continue;
+      await this.performPassiveArmorEquip(
+        bot,
+        next.item,
+        next.destination,
+        signal,
+      );
+      if (!this.passiveArmorIsCurrent(bot, lifeGeneration, signal)) return;
+    }
+  }
+
+  private async performPassiveArmorEquip(
+    bot: Bot,
+    item: Item,
+    destination: ArmorSlot,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const nativeEquip = Promise.resolve(bot.equip(item, destination));
+    const inFlight = { bot, promise: nativeEquip };
+    this.passiveArmorEquipInFlight = inFlight;
+    const clearWhenSettled = (failed: boolean): void => {
+      if (this.passiveArmorEquipInFlight !== inFlight) return;
+      this.passiveArmorEquipInFlight = undefined;
+      if (failed) {
+        this.passiveArmorPending = false;
+        return;
+      }
+      if (this.passiveArmorTask === undefined && this.passiveArmorPending)
+        this.schedulePassiveArmor(bot);
+    };
+    void nativeEquip.then(
+      () => clearWhenSettled(false),
+      () => clearWhenSettled(true),
+    );
+    await waitForAction(nativeEquip, signal);
+  }
+
   private startDamageReflex(bot: Bot, source: Entity | undefined): void {
     if (
       !this.damageReflexEnabled ||
@@ -1627,6 +1773,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       done: Promise.resolve(),
     };
     this.damageReflex = reflex;
+    if (this.passiveArmorTask !== undefined) this.passiveArmorPending = true;
+    this.passiveArmorController?.abort(new Error("Damage reflex has priority"));
     reflex.done = this.runDamageReflex(reflex);
   }
 
@@ -1718,6 +1866,13 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private async equipDamageReflexItems(reflex: DamageReflexRun): Promise<void> {
     const { bot } = reflex;
+    const passiveArmorTask = this.passiveArmorTask;
+    if (passiveArmorTask !== undefined) await passiveArmorTask;
+    if (
+      !this.damageReflexIsAlive(reflex) ||
+      this.passiveArmorEquipInFlight?.bot === bot
+    )
+      return;
     const inventory = bot.inventory;
     if (
       typeof inventory.items !== "function" ||
@@ -1933,7 +2088,10 @@ export class MineflayerPlayerBody implements PlayerBody {
         sameLife: reflex.sameLife,
         summary,
       });
-      if (this.damageReflex === reflex) this.damageReflex = undefined;
+      if (this.damageReflex === reflex) {
+        this.damageReflex = undefined;
+        this.schedulePassiveArmor(bot);
+      }
     }
   }
 
@@ -2069,10 +2227,23 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   public setDamageReflexEnabled(enabled: boolean): void {
     this.damageReflexEnabled = enabled;
-    if (!enabled)
+    if (!enabled) {
+      this.passiveArmorPending = false;
+      this.passiveArmorController?.abort(
+        new Error("Player damage reflex disabled"),
+      );
       this.damageReflex?.controller.abort(
         new Error("Player damage reflex disabled"),
       );
+      return;
+    }
+    try {
+      const bot = this.getBot();
+      this.bindBot(bot);
+      this.schedulePassiveArmor(bot);
+    } catch {
+      // Bind and inventory events will retry when this client becomes available.
+    }
   }
 
   public async stopActiveOperation(): Promise<void> {
@@ -3318,6 +3489,9 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
+    if (this.passiveArmorTask !== undefined)
+      this.passiveArmorPending = this.damageReflexEnabled;
+    this.passiveArmorController?.abort(new Error("Minecraft bot changed"));
     if (this.damageReflex !== undefined && this.damageReflex.bot !== bot)
       this.damageReflex.controller.abort(new Error("Minecraft bot changed"));
     for (const detach of this.botHandlers.splice(0)) detach();
@@ -3490,6 +3664,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
       this.boundBotEnded = true;
+      this.passiveArmorPending = false;
+      this.passiveArmorController?.abort(
+        new Error("Minecraft connection ended"),
+      );
       this.damageReflex?.controller.abort(
         new Error("Minecraft connection ended"),
       );
@@ -3514,6 +3692,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("spawn", () => {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
+      this.passiveArmorPending = this.damageReflexEnabled;
+      this.passiveArmorController?.abort(new Error("Minecraft life changed"));
       this.lifeGeneration += 1;
       this.botLifeDead = false;
       if (this.disconnectedSinceBind) {
@@ -3521,13 +3701,17 @@ export class MineflayerPlayerBody implements PlayerBody {
         this.emit({ type: "reconnected", at: new Date().toISOString() });
       }
       this.scheduleStateEvent("position");
+      this.schedulePassiveArmor(bot);
     });
     this.bindInventoryEventsWhenReady(bot);
+    this.schedulePassiveArmor(bot);
   }
 
   private markBotLifeDead(bot: Bot): void {
     if (this.boundBot !== bot || this.botLifeDead) return;
     this.botLifeDead = true;
+    this.passiveArmorPending = this.damageReflexEnabled;
+    this.passiveArmorController?.abort(new Error("Minecraft life ended"));
     this.lifeGeneration += 1;
   }
 
@@ -3536,9 +3720,12 @@ export class MineflayerPlayerBody implements PlayerBody {
     const inventory = initializedInventory(bot);
     if (inventory !== undefined) {
       this.inventoryBoundBot = bot;
-      const onInventoryUpdate = (): void =>
+      const onInventoryUpdate = (): void => {
         this.scheduleStateEvent("inventory");
+        this.schedulePassiveArmor(bot);
+      };
       inventory.on("updateSlot", onInventoryUpdate);
+      this.schedulePassiveArmor(bot);
       this.inventoryHandlers.push(() =>
         inventory.removeListener("updateSlot", onInventoryUpdate),
       );
@@ -3598,6 +3785,23 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
     }
   }
+}
+
+function readEquippedArmor(
+  bot: Bot,
+  slots: readonly (Item | null)[],
+): EquippedArmorBySlot {
+  const equipped: Partial<Record<ArmorSlot, string | null>> = {};
+  for (const destination of armorDestinations) {
+    const index = bot.getEquipmentDestSlot(destination);
+    if (!Number.isInteger(index) || index < 0 || index >= slots.length)
+      continue;
+    const item = slots[index];
+    if (item === null) equipped[destination] = null;
+    else if (item !== undefined && typeof item.name === "string")
+      equipped[destination] = item.name;
+  }
+  return equipped;
 }
 
 function findInventoryItem(bot: Bot, name: string): Item {

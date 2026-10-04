@@ -106,6 +106,20 @@ function addItemToInventory(
   inventory.emit("updateSlot", slot, previous, next);
 }
 
+function installFakeArmorEquip(fake: ReturnType<typeof makeFakeBot>) {
+  const inventory = fake.inventory as EventEmitter & {
+    slots: (Record<string, unknown> | null)[];
+  };
+  const equip = vi.fn(async (item: Item, destination: string) => {
+    const slot = fake.bot.getEquipmentDestSlot(destination);
+    const previous = inventory.slots[slot] ?? null;
+    inventory.slots[slot] = item as unknown as Record<string, unknown>;
+    inventory.emit("updateSlot", slot, previous, item);
+  });
+  Object.assign(fake.bot, { equip });
+  return equip;
+}
+
 function emitItemPickup(
   fake: ReturnType<typeof makeFakeBot>,
   collected: Entity,
@@ -1536,6 +1550,159 @@ describe("player body", () => {
     });
   });
 
+  it("equips the best carried known armor while enabled without damage", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "leather_helmet", 1);
+    addItemToInventory(fake, "diamond_helmet", 1);
+    addItemToInventory(fake, "iron_chestplate", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(2));
+
+    expect(
+      equip.mock.calls.map(([item, destination]) => ({
+        item: item.name,
+        destination,
+      })),
+    ).toEqual([
+      { item: "diamond_helmet", destination: "head" },
+      { item: "iron_chestplate", destination: "torso" },
+    ]);
+    await body.stop();
+  });
+
+  it("reacts to inventory updates but keeps stronger and unknown equipped armor", async () => {
+    const fake = makeFakeBot();
+    const slots = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    slots.slots[5] = { name: "diamond_helmet", count: 1 };
+    slots.slots[6] = { name: "modded_chestplate", count: 1 };
+    slots.slots[7] = { name: "diamond_leggings", count: 1 };
+    slots.slots[8] = { name: "netherite_boots", count: 1 };
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "diamond_chestplate", 1);
+    addItemToInventory(fake, "golden_leggings", 1);
+    addItemToInventory(fake, "iron_boots", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).not.toHaveBeenCalled();
+
+    addItemToInventory(fake, "netherite_leggings", 1);
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    expect(equip.mock.calls[0]?.[0].name).toBe("netherite_leggings");
+    expect(equip.mock.calls[0]?.[1]).toBe("legs");
+    await body.stop();
+  });
+
+  it("does not use queued armor from a dead life and retries after spawn", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const equip = installFakeArmorEquip(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).not.toHaveBeenCalled();
+
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    expect(equip.mock.calls[0]?.[0].name).toBe("iron_helmet");
+    await body.stop();
+  });
+
+  it("cancels queued passive armor when the body is stopped", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await body.stop();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(equip).not.toHaveBeenCalled();
+  });
+
+  it("keeps reflex attack moving while a native passive equip is unsettled", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "iron_sword", 1);
+    const inventory = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const botEvents = fake.bot as unknown as EventEmitter;
+    let finishNativeEquip!: () => void;
+    const nativeEquip = new Promise<void>((resolve) => {
+      finishNativeEquip = resolve;
+    });
+    const equip = vi.fn((item: Item, destination: string) => {
+      if (destination === "head")
+        return nativeEquip.then(() => {
+          const slot = fake.bot.getEquipmentDestSlot(destination);
+          const previous = inventory.slots[slot] ?? null;
+          inventory.slots[slot] = item as unknown as Record<string, unknown>;
+          fake.inventory.emit("updateSlot", slot, previous, item);
+        });
+      return Promise.resolve();
+    });
+    const attack = vi.fn((target: Entity) =>
+      botEvents.emit("entityHurt", target, fake.bot.entity),
+    );
+    Object.assign(fake.bot, { equip, attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled());
+    expect(equip).toHaveBeenCalledTimes(1);
+    await body.stop();
+    expect(
+      events.some((event) => event.type === "damage_reflex_completed"),
+    ).toBe(true);
+
+    finishNativeEquip();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry passive armor in a loop after native equip rejects", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const inventory = fake.inventory;
+    const equip = vi.fn((_item: Item, _destination: string) => {
+      inventory.emit("updateSlot", 40, null, null);
+      return Promise.reject(new Error("native equip rejected"));
+    });
+    Object.assign(fake.bot, { equip });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(equip).toHaveBeenCalledTimes(1);
+    await body.stop();
+  });
+
   it("coalesces damage into a visible short retaliation without cancelling the active operation", async () => {
     const fake = makeFakeBot();
     const zombie = addFakeZombieEntity(fake);
@@ -1781,7 +1948,7 @@ describe("player body", () => {
       (event) => event.type === "damage_reflex_completed",
     );
     expect(completion).toMatchObject({
-      operationKind: "equip",
+      operationKind: "attack",
       status: "unverified",
       serverConfirmedAt: null,
       sameLife: null,
