@@ -37,6 +37,7 @@ import {
   playerThoughtStaleChangeComponents,
   type PlayerThoughtCommitRejectionCode,
 } from "./contracts.js";
+import type { PlayerBodyDeathCause } from "../minecraft/player-body.js";
 import { spatialViewSchema, type PlayerSpatialView } from "./spatial-view.js";
 
 const wakeKinds = [
@@ -45,7 +46,9 @@ const wakeKinds = [
   "body_outcome",
   "state_changed",
   "operation_stalled",
+  "bot_damaged",
   "bot_death",
+  "bot_death_cause_updated",
   "reconnected",
   "deadline",
   "manual",
@@ -267,9 +270,45 @@ const observationSchema = z
   })
   .strict();
 
+const damageSourceSchema = z
+  .object({
+    kind: z
+      .string()
+      .min(1)
+      .max(48)
+      .regex(/^[a-z0-9_.:-]+$/iu),
+    name: z
+      .string()
+      .min(1)
+      .max(80)
+      .regex(/^[a-z0-9_.:-]+$/iu),
+    category: z.string().max(80).nullable(),
+  })
+  .strict();
+
+const deathCauseSchema = z
+  .object({
+    source: damageSourceSchema.nullable(),
+    confidence: z.enum(["observed", "unknown"]),
+    provenance: z.enum(["damage_event", "death_notification"]),
+    causeKey: z
+      .string()
+      .max(108)
+      .regex(/^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u)
+      .optional(),
+  })
+  .strict()
+  .transform((cause): PlayerBodyDeathCause => ({
+    source: cause.source,
+    confidence: cause.confidence,
+    provenance: cause.provenance,
+    ...(cause.causeKey === undefined ? {} : { causeKey: cause.causeKey }),
+  }));
+
 const deathMemorySchema = z
   .object({
     observedAt: z.iso.datetime(),
+    cause: deathCauseSchema.optional(),
     beforeObservation: observationSchema.optional(),
     firstPostDeathObservation: observationSchema.optional(),
     recoveryStagesUsed: z
@@ -490,12 +529,37 @@ export class PlayerMindStore {
         )
         .run(JSON.stringify(initialState), new Date().toISOString());
       const store = new PlayerMindStore(database);
+      store.coalescePendingWakeBacklog();
       store.readStored();
       return store;
     } catch (error) {
       database.close();
       throw error;
     }
+  }
+
+  private coalescePendingWakeBacklog(): void {
+    const now = new Date().toISOString();
+    const transaction = this.database.transaction(() => {
+      for (const kind of [
+        "bot_death",
+        "bot_damaged",
+        "bot_death_cause_updated",
+      ] as const) {
+        this.database
+          .prepare(
+            `UPDATE player_runtime_events SET consumed_at = ?
+             WHERE kind = ? AND consumed_at IS NULL
+               AND id <> (
+                 SELECT id FROM player_runtime_events
+                 WHERE kind = ? AND consumed_at IS NULL
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1
+               )`,
+          )
+          .run(now, kind, kind);
+      }
+    });
+    transaction.immediate();
   }
 
   public close(): void {
@@ -552,7 +616,21 @@ export class PlayerMindStore {
     }
     return this.database
       .prepare<[number], EventRow>(
-        "SELECT id, kind, summary, created_at FROM player_runtime_events WHERE consumed_at IS NULL ORDER BY created_at, rowid LIMIT ?",
+        `SELECT id, kind, summary, created_at FROM player_runtime_events
+         WHERE consumed_at IS NULL
+         ORDER BY CASE kind
+           WHEN 'owner_proposal' THEN 0
+           WHEN 'bot_damaged' THEN 1
+           WHEN 'bot_death' THEN 2
+           WHEN 'bot_death_cause_updated' THEN 3
+           WHEN 'operation_stalled' THEN 4
+           WHEN 'body_outcome' THEN 5
+           WHEN 'state_changed' THEN 6
+           ELSE 7
+         END,
+         CASE WHEN kind IN ('owner_proposal', 'bot_damaged', 'bot_death', 'bot_death_cause_updated', 'operation_stalled') THEN created_at END DESC,
+         CASE WHEN kind NOT IN ('owner_proposal', 'bot_damaged', 'bot_death', 'bot_death_cause_updated', 'operation_stalled') THEN created_at END ASC,
+         rowid LIMIT ?`,
       )
       .all(limit)
       .map((row) => ({
@@ -589,22 +667,28 @@ export class PlayerMindStore {
     const now = new Date().toISOString();
     const id = randomUUID();
     const transaction = this.database.transaction(() => {
-      // Only ordinary observations may be queued behind an in-flight thought.
       if (
-        kind !== "state_changed" ||
-        safeSummary.includes("vitals") ||
+        (kind === "state_changed" && safeSummary.includes("vitals")) ||
         options.invalidateDecision !== false
       ) {
         const current = this.readStored();
         this.writeStored({ ...current, revision: current.revision + 1 }, now);
       }
+      if (kind === "bot_damaged") {
+        // Keep one recent hurt signal while a thought or action is settling.
+        this.database
+          .prepare(
+            "UPDATE player_runtime_events SET consumed_at = ? WHERE kind = 'bot_damaged' AND consumed_at IS NULL",
+          )
+          .run(now);
+      }
       if (kind === "state_changed" && safeSummary.includes("vitals")) {
         // Keep the latest urgent-damage signal while coalescing packet bursts.
         this.database
           .prepare(
-            "DELETE FROM player_runtime_events WHERE kind = 'state_changed' AND summary LIKE '%vitals%' AND consumed_at IS NULL",
+            "UPDATE player_runtime_events SET consumed_at = ? WHERE kind = 'state_changed' AND summary LIKE '%vitals%' AND consumed_at IS NULL",
           )
-          .run();
+          .run(now);
       }
       this.database
         .prepare(
@@ -618,7 +702,7 @@ export class PlayerMindStore {
         DELETE FROM player_runtime_events
         WHERE id IN (
           SELECT id FROM player_runtime_events
-          WHERE consumed_at IS NULL AND kind NOT IN ('bot_death','owner_proposal','operation_stalled')
+          WHERE consumed_at IS NULL AND kind NOT IN ('bot_death','bot_death_cause_updated','owner_proposal','operation_stalled')
             AND NOT (kind = 'manual' AND summary = '目的完了後の自律目的を再評価')
             AND NOT (kind = 'state_changed' AND summary LIKE '%vitals%')
           ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 48
@@ -634,6 +718,7 @@ export class PlayerMindStore {
   public recordDeathEvent(
     observedAt: string,
     summary: string,
+    cause?: PlayerBodyDeathCause,
   ): PlayerRuntimeEvent {
     const deathObservedAt = isoDate(observedAt);
     const safeSummary = bounded(summary, 400, "event summary");
@@ -649,6 +734,9 @@ export class PlayerMindStore {
           : undefined;
       const latestDeath = deathMemorySchema.parse({
         observedAt: deathObservedAt,
+        ...(cause === undefined
+          ? {}
+          : { cause: deathCauseSchema.parse(cause) }),
         ...(beforeObservation === undefined ? {} : { beforeObservation }),
       });
       this.writeStored(
@@ -661,6 +749,11 @@ export class PlayerMindStore {
       );
       this.database
         .prepare(
+          "UPDATE player_runtime_events SET consumed_at = ? WHERE kind IN ('bot_death', 'bot_death_cause_updated') AND consumed_at IS NULL",
+        )
+        .run(now);
+      this.database
+        .prepare(
           "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'bot_death', ?, ?, NULL)",
         )
         .run(id, safeSummary, now);
@@ -669,6 +762,51 @@ export class PlayerMindStore {
         kind: "bot_death" as const,
         summary: safeSummary,
         createdAt: now,
+      };
+    });
+    return transaction.immediate();
+  }
+
+  public recordDeathCauseUpdate(
+    deathObservedAt: string,
+    cause: PlayerBodyDeathCause,
+    summary: string,
+    at: string,
+  ): PlayerRuntimeEvent | undefined {
+    const targetDeathAt = isoDate(deathObservedAt);
+    const safeSummary = bounded(summary, 400, "event summary");
+    const validatedCause = deathCauseSchema.parse(cause);
+    const createdAt = isoDate(at);
+    const id = randomUUID();
+    const transaction = this.database.transaction(() => {
+      const current = this.readStored();
+      const death = current.latestDeath;
+      if (death?.observedAt !== targetDeathAt) return undefined;
+      if (JSON.stringify(death.cause) === JSON.stringify(validatedCause))
+        return undefined;
+
+      const latestDeath = deathMemorySchema.parse({
+        ...death,
+        cause: validatedCause,
+      });
+      // Attribution augments the same death and does not increment its count
+      // or invalidate a decision independently of the runtime wake.
+      this.writeStored({ ...current, latestDeath }, createdAt);
+      this.database
+        .prepare(
+          "UPDATE player_runtime_events SET consumed_at = ? WHERE kind = 'bot_death_cause_updated' AND consumed_at IS NULL",
+        )
+        .run(createdAt);
+      this.database
+        .prepare(
+          "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'bot_death_cause_updated', ?, ?, NULL)",
+        )
+        .run(id, safeSummary, createdAt);
+      return {
+        id,
+        kind: "bot_death_cause_updated" as const,
+        summary: safeSummary,
+        createdAt,
       };
     });
     return transaction.immediate();

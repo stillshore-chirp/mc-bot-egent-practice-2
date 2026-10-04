@@ -7,6 +7,7 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 import {
   playerOperationSchema,
   type PlayerOperation,
@@ -78,6 +79,152 @@ const maximumItemCollectionTimeoutMs = 45_000;
 // Mineflayer's consume acknowledgement can arrive just before its inventory and food packets.
 const consumeEffectObservationGraceMs = 1_000;
 const consumeEffectObservationPollTicks = 1;
+const deathEvidenceCorrelationMs = 1_000;
+
+export interface PlayerBodyDamageSource {
+  readonly kind: string;
+  readonly name: string;
+  readonly category: string | null;
+}
+
+export interface PlayerBodyDeathCause {
+  readonly source: PlayerBodyDamageSource | null;
+  readonly confidence: "observed" | "unknown";
+  readonly provenance: "damage_event" | "death_notification";
+  readonly causeKey?: string;
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function componentText(value: unknown, depth = 0): string {
+  if (depth > 8) return "";
+  if (typeof value === "string" || typeof value === "number")
+    return String(value);
+  if (Array.isArray(value))
+    return value.map((part) => componentText(part, depth + 1)).join("");
+  const component = recordOf(value);
+  if (component === undefined) return "";
+  const ownText =
+    typeof component.text === "string"
+      ? component.text
+      : typeof component[""] === "string"
+        ? component[""]
+        : "";
+  const extra = Array.isArray(component.extra)
+    ? component.extra.map((part) => componentText(part, depth + 1)).join("")
+    : "";
+  return `${ownText}${extra}`;
+}
+
+function registryMobSource(
+  bot: Bot,
+  component: unknown,
+  key: string,
+): PlayerBodyDamageSource | null {
+  if (key.startsWith("death.attack.player")) return null;
+  const candidate = recordOf(component);
+  const translated = candidate?.translate;
+  let registryName: string | undefined;
+  if (typeof translated === "string") {
+    const match = /^entity\.minecraft\.([a-z0-9_]+)$/u.exec(translated);
+    if (match !== null) registryName = match[1];
+  } else if (
+    typeof component === "string" ||
+    (typeof candidate?.text === "string" &&
+      candidate.extra === undefined &&
+      candidate.insertion === undefined)
+  ) {
+    const displayName =
+      typeof component === "string" ? component : candidate?.text;
+    const matches = Object.values(bot.registry.entitiesByName).filter(
+      (entry) =>
+        entry.displayName === displayName &&
+        typeof entry.category === "string" &&
+        /mobs?$/iu.test(entry.category),
+    );
+    if (matches.length === 1) registryName = matches[0]?.name;
+  }
+  if (registryName === undefined) return null;
+  const registryEntity = bot.registry.entitiesByName[registryName];
+  if (
+    registryEntity === undefined ||
+    typeof registryEntity.name !== "string" ||
+    typeof registryEntity.category !== "string" ||
+    !/mobs?$/iu.test(registryEntity.category)
+  )
+    return null;
+  return {
+    kind: "mob",
+    name: registryEntity.name,
+    category: registryEntity.category,
+  };
+}
+
+function deathNoticeCause(
+  bot: Bot,
+  value: unknown,
+  position: unknown,
+  sender: unknown,
+  username: string,
+): PlayerBodyDeathCause | undefined {
+  if (position !== "system" || sender !== null) return undefined;
+  const message = recordOf(value);
+  const json = recordOf(message?.json);
+  const key = json?.translate;
+  if (
+    typeof key !== "string" ||
+    !/^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(key)
+  )
+    return undefined;
+  const args = json?.with;
+  if (!Array.isArray(args)) return undefined;
+  const victim = componentText(args[0]).trim();
+  if (victim.length === 0 || !sameMinecraftIdentity(victim, username))
+    return undefined;
+  const source = registryMobSource(bot, args[1], key);
+  return {
+    source: source ?? { kind: "death_cause", name: key, category: null },
+    confidence: "observed",
+    provenance: "death_notification",
+    causeKey: key,
+  };
+}
+
+function damageSource(
+  bot: Bot,
+  entity: Entity | undefined,
+): PlayerBodyDamageSource | null {
+  if (entity === undefined) return null;
+  const rawKind = entity.type;
+  const kind =
+    typeof rawKind === "string" && /^[a-z0-9_.:-]{1,48}$/iu.test(rawKind)
+      ? rawKind.toLowerCase()
+      : "unknown";
+  const rawName = entity.name;
+  const registryName =
+    typeof rawName === "string" && /^[a-z0-9_.:-]{1,80}$/iu.test(rawName)
+      ? rawName.toLowerCase()
+      : undefined;
+  const registryEntity =
+    registryName === undefined
+      ? undefined
+      : bot.registry.entitiesByName[registryName];
+  if (registryEntity === undefined)
+    return { kind: "unknown", name: "unknown", category: null };
+  const name = registryEntity.name;
+  const rawCategory = registryEntity?.category;
+  const category =
+    typeof rawCategory === "string" &&
+    rawCategory.length <= 80 &&
+    rawCategory.toLowerCase() !== "unknown"
+      ? rawCategory
+      : null;
+  return { kind, name, category };
+}
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -185,7 +332,23 @@ export type PlayerBodyEvent =
         | "position"
         | "window";
     }
-  | { readonly type: "bot_death"; readonly at: string }
+  | {
+      readonly type: "bot_damaged";
+      readonly at: string;
+      readonly source: PlayerBodyDamageSource | null;
+      readonly confidence: "observed" | "unknown";
+    }
+  | {
+      readonly type: "bot_death";
+      readonly at: string;
+      readonly cause?: PlayerBodyDeathCause;
+    }
+  | {
+      readonly type: "bot_death_cause_updated";
+      readonly at: string;
+      readonly deathAt: string;
+      readonly cause: PlayerBodyDeathCause;
+    }
   | {
       readonly type: "disconnected";
       readonly at: string;
@@ -1226,6 +1389,30 @@ export class MineflayerPlayerBody implements PlayerBody {
     Extract<PlayerBodyEvent, { type: "state_changed" }>["reason"],
     string
   >();
+  private lastBotDamage:
+    | {
+        readonly bot: Bot;
+        readonly observedAtMs: number;
+        readonly source: PlayerBodyDamageSource | null;
+      }
+    | undefined;
+  private pendingDeathNotice:
+    | {
+        readonly bot: Bot;
+        readonly observedAtMs: number;
+        readonly cause: PlayerBodyDeathCause;
+      }
+    | undefined;
+  private pendingBotDeath:
+    | {
+        readonly bot: Bot;
+        readonly at: string;
+        readonly observedAtMs: number;
+        cause: PlayerBodyDeathCause | undefined;
+        causeUpdateEmitted: boolean;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    | undefined;
   private disconnectedSinceBind = false;
 
   public constructor(
@@ -2530,8 +2717,13 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.windowUpdateHandlers.clear();
     for (const timer of this.stateTimers.values()) clearTimeout(timer);
     this.stateTimers.clear();
+    if (this.pendingBotDeath !== undefined)
+      clearTimeout(this.pendingBotDeath.timer);
+    this.pendingBotDeath = undefined;
     this.boundBot = bot;
     this.lastStateSignatures.clear();
+    this.lastBotDamage = undefined;
+    this.pendingDeathNotice = undefined;
     const listen = (
       event: keyof BotEvents,
       handler: (...args: never[]) => void,
@@ -2576,10 +2768,113 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("entityGone", state("entities"));
     listen("entityMoved", state("entities"));
     listen("entityUpdate", state("entities"));
-    listen("death", () =>
-      this.emit({ type: "bot_death", at: new Date().toISOString() }),
+    listen("entityHurt", (target: Entity, source: Entity | undefined) => {
+      if (this.boundBot !== bot || target.id !== bot.entity.id) return;
+      const at = new Date().toISOString();
+      const observedSource = damageSource(bot, source);
+      this.lastBotDamage = {
+        bot,
+        observedAtMs: Date.now(),
+        source: observedSource,
+      };
+      this.emit({
+        type: "bot_damaged",
+        at,
+        source: observedSource,
+        confidence: observedSource === null ? "unknown" : "observed",
+      });
+    });
+    listen(
+      "message",
+      (message: unknown, position: unknown, sender: unknown) => {
+        if (this.boundBot !== bot) return;
+        const cause = deathNoticeCause(
+          bot,
+          message,
+          position,
+          sender,
+          bot.username,
+        );
+        if (cause === undefined) return;
+        const now = Date.now();
+        const pendingDeath = this.pendingBotDeath;
+        if (
+          pendingDeath?.bot === bot &&
+          now >= pendingDeath.observedAtMs &&
+          now - pendingDeath.observedAtMs <= deathEvidenceCorrelationMs
+        ) {
+          if (
+            pendingDeath.cause?.provenance === "death_notification" ||
+            pendingDeath.causeUpdateEmitted
+          )
+            return;
+          if (JSON.stringify(pendingDeath.cause) === JSON.stringify(cause))
+            return;
+          pendingDeath.cause = cause;
+          pendingDeath.causeUpdateEmitted = true;
+          this.emit({
+            type: "bot_death_cause_updated",
+            at: new Date(now).toISOString(),
+            deathAt: pendingDeath.at,
+            cause,
+          });
+          return;
+        }
+        this.pendingDeathNotice = { bot, observedAtMs: now, cause };
+      },
     );
+    listen("death", () => {
+      if (this.boundBot !== bot) return;
+      const now = Date.now();
+      const notice = this.pendingDeathNotice;
+      const damage = this.lastBotDamage;
+      const cause =
+        notice?.bot === bot &&
+        now >= notice.observedAtMs &&
+        now - notice.observedAtMs <= deathEvidenceCorrelationMs
+          ? notice.cause
+          : damage?.bot === bot &&
+              now >= damage.observedAtMs &&
+              now - damage.observedAtMs <= deathEvidenceCorrelationMs
+            ? {
+                source: damage.source,
+                confidence:
+                  damage.source === null
+                    ? ("unknown" as const)
+                    : ("observed" as const),
+                provenance: "damage_event" as const,
+              }
+            : undefined;
+      if (this.pendingBotDeath !== undefined)
+        clearTimeout(this.pendingBotDeath.timer);
+      const at = new Date(now).toISOString();
+      const pendingBotDeath = {
+        bot,
+        at,
+        observedAtMs: now,
+        cause,
+        causeUpdateEmitted: false,
+        timer: setTimeout(() => {
+          if (this.pendingBotDeath === pendingBotDeath)
+            this.pendingBotDeath = undefined;
+        }, deathEvidenceCorrelationMs),
+      };
+      this.pendingBotDeath = pendingBotDeath;
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
+      this.emit({
+        type: "bot_death",
+        at,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    });
     listen("end", (reason: unknown) => {
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
+      if (this.pendingBotDeath?.bot === bot) {
+        clearTimeout(this.pendingBotDeath.timer);
+        this.pendingBotDeath = undefined;
+      }
       this.disconnectedSinceBind = true;
       if (this.active?.bot === bot) {
         this.active.botDisconnected = true;
@@ -2595,6 +2890,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       });
     });
     listen("spawn", () => {
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
       if (this.disconnectedSinceBind) {
         this.disconnectedSinceBind = false;
         this.emit({ type: "reconnected", at: new Date().toISOString() });

@@ -12,6 +12,8 @@
 
 会話と目的は同じ設定modelを使う別のResponses呼出しです。別OSプロセスではありません。各目的判断内では `parallel_tool_calls: false`、Runtimeも目的判断を一つずつ進めます。一方、会話turnは長い身体操作の終了を待たずに受け付けられます。
 
+会話agentはBody操作を直接実行しませんが、目的判断とRuntimeは操作を選択・実行します。会話turnにBody toolが表示されないことだけから「コンパニオン全体に操作能力がない」とは判断しません。現在の能力はfresh観測、`describe_operation`のschemaとmanual、実際のBody結果を分けて説明します。
+
 ## 2. 具体例: 探索中に採集を頼まれたら
 
 まず、所有者の発話を目的判断へ渡します。
@@ -66,13 +68,17 @@ sequenceDiagram
 
 `handleOwnerMessage()` はowner identityと最新turnを確認します。非ownerのchatはRuntime入口でも除外します。
 
-| tool                                | 効果                                                   |
-| ----------------------------------- | ------------------------------------------------------ |
-| `propose_goal_change`               | proposalを永続化し、目的判断へ通知                     |
-| `remember_owner_fact`               | ownerが明示的に記憶を求めた事実の要約をMindStoreへ保存 |
-| `stop_autonomy` / `resume_autonomy` | 停止世代を照合して永続停止/再開                        |
-| `inspect_player_status`             | 保存済みruntime状態を読む                              |
-| `search_memory`                     | MemoryStoreの関連記憶を検索                            |
+| tool                                | 効果                                                                  |
+| ----------------------------------- | --------------------------------------------------------------------- |
+| `propose_goal_change`               | proposalを永続化し、目的判断へ通知                                    |
+| `remember_owner_fact`               | ownerが明示的に記憶を求めた事実の要約をMindStoreへ保存                |
+| `stop_autonomy` / `resume_autonomy` | 停止世代を照合して永続停止/再開                                       |
+| `inspect_player_status`             | 保存済みruntime状態を読む                                             |
+| `inspect_runtime`                   | 現在processのPurpose/Conversation/Body操作、接続、観測age、結果を読む |
+| `describe_operation`                | 指定操作の現行schemaと条件・成功証拠manualを読む                      |
+| `search_memory`                     | MemoryStoreの関連記憶を検索                                           |
+
+`inspect_runtime`は認証済みowner会話から呼ぶ読み取り専用のbounded診断です。現在processのPurpose/Conversation実行状態とResponses待ち時間、Body接続とactive operation、保存済み最新観測の時刻/health、pending proposal件数、最後のBody結果、直近activity tail内の安全な拒否codeを返します。activity tailには日時がないため、拒否codeは現在の失敗と断定せず、内部ログや例外本文も返しません。Minecraft内の死亡記録は`inspect_player_status`で別に確認します。
 
 モデルには、雑談・能力相談だけで行動提案を作らないこと、今回の発話と直近4件までの会話を合わせて指示語を解釈することを指示します。これは意味判断の指示であり、あらゆる発話を正しく分類する保証ではありません。
 
@@ -100,9 +106,9 @@ sequenceDiagram
 
 - `observe_body`: 初回観測が得られなかった場合の補完。初回観測がある判断ではtool一覧から外す。
 - `locate_owner`: pending proposal、または採用/妥協されactiveなowner-linked goalに限り位置の特例観測。
-- `ask_body_knowledge`: Minecraft registryのitem/block/entity等を英語IDで照会。レシピ等の推論は事実と分ける。
-- `describe_operation`: 現行schemaを取得。31操作の正本は [player-body-schema.ts](../src/minecraft/player-body-schema.ts)。
-- `search_skills` / `read_skill` / `read_skill_history`: 技能候補、本文、版履歴を読む。検索語句不一致時は基礎7分類の候補を返す。
+- `ask_body_knowledge`: Minecraft registryのitem/block/entity等を英語IDで照会。レシピ等の推論は事実と分け、registry情報だけから現在の操作可否を推定しない。
+- `describe_operation`: 現行schemaと操作固有の条件・成功証拠・代表試験scopeを取得。schema/catalogへの接続は現在の実行可能性や成功の証明ではない。31操作の正本は [player-body-schema.ts](../src/minecraft/player-body-schema.ts)、判断manualは [player-body-manual.ts](../src/minecraft/player-body-manual.ts)。
+- `search_skills` / `read_skill` / `read_skill_history`: 技能候補、本文、版履歴を読む。skillは再利用候補の仮説であり、現在の前提や成功の証拠ではない。fresh観測・現行schemaと照合してから使う。検索語句不一致時は基礎7分類の候補を返す。
 - `search_memory`: 既往の事実や結果を検索。
 - `export_skill_markdown` / `import_skill_markdown`: 専用交換領域だけで技能を交換。
 - `propose_skill_learning`: receiptに対応する技能仮説を作成/改訂。

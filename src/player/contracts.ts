@@ -1,5 +1,6 @@
 import type {
   PlayerBodyEvent,
+  PlayerBodyDeathCause,
   PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerKnowledge,
@@ -10,7 +11,11 @@ import type {
   McSkillOutcomeStatus,
   McSkillRecord,
 } from "../mc-skills/index.js";
-import type { PlayerAgentRoundActivity } from "./responses.js";
+import type {
+  PlayerAgentRequestErrorCause,
+  PlayerAgentRoundActivity,
+  PlayerAgentToolRoundActivity,
+} from "./responses.js";
 
 export type PlayerWakeKind =
   | "startup"
@@ -18,7 +23,9 @@ export type PlayerWakeKind =
   | "body_outcome"
   | "state_changed"
   | "operation_stalled"
+  | "bot_damaged"
   | "bot_death"
+  | "bot_death_cause_updated"
   | "reconnected"
   | "deadline"
   | "manual";
@@ -214,6 +221,7 @@ export interface PlayerObservationEvidence {
 
 export interface PlayerDeathMemory {
   readonly observedAt: string;
+  readonly cause?: PlayerBodyDeathCause | undefined;
   readonly beforeObservation?: PlayerObservationEvidence | undefined;
   readonly firstPostDeathObservation?: PlayerObservationEvidence | undefined;
   readonly recoveryStagesUsed?: readonly PlayerDeathRecoveryStage[] | undefined;
@@ -301,6 +309,49 @@ export interface PlayerRuntimeSnapshot {
     readonly thoughts: number;
     readonly learningUpdates: number;
   };
+}
+
+/** Bounded, content-free view of the current in-process player runtime. */
+export interface PlayerRuntimeInspection {
+  readonly sampledAt: string;
+  readonly process: {
+    readonly started: boolean;
+    readonly shuttingDown: boolean;
+  };
+  readonly purpose: {
+    readonly active: boolean;
+    readonly activeForMs: number | null;
+    readonly awaitingResponse: boolean;
+    readonly responseWaitForMs: number | null;
+    readonly retryScheduled: boolean;
+  };
+  readonly body: {
+    readonly connectionState: "not_started" | "connected" | "disconnected";
+    readonly activeOperation: {
+      readonly operation: PlayerOperation["kind"];
+      readonly startedAt: string;
+    } | null;
+    readonly latestObservation: {
+      readonly observedAt: string;
+      readonly ageMs: number;
+      readonly health: number | null;
+    } | null;
+    readonly lastResult: {
+      readonly operation: PlayerOperation["kind"];
+      readonly status: McSkillOutcomeStatus;
+      readonly observedAt: string;
+    } | null;
+  };
+  readonly pendingOwnerProposalCount: number;
+  readonly recentDecisionFailures: readonly {
+    readonly role: "purpose" | "conversation";
+    readonly responseStatus: PlayerAgentRoundActivity["responseStatus"];
+    readonly requestErrorCause?: PlayerAgentRequestErrorCause;
+    readonly rejectionCodes: readonly NonNullable<
+      PlayerAgentToolRoundActivity["resultCode"]
+    >[];
+    readonly ageKnown: false;
+  }[];
 }
 
 export interface PlayerBodyPort {

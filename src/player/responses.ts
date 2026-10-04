@@ -47,6 +47,7 @@ export const playerAgentToolNames = [
   "stop_autonomy",
   "resume_autonomy",
   "inspect_player_status",
+  "inspect_runtime",
   "search_memory",
   "observe_body",
   "locate_owner",
@@ -582,11 +583,14 @@ function safeCommitRejectionCode(
 ): PlayerThoughtCommitRejectionCode | undefined {
   if (!isRecord(value)) return undefined;
   if (value.ok !== false) return undefined;
-  if (toolName === "commit_goal_state")
-    return value.rejectionCode === "GOAL_CAPACITY" ||
-      value.code === "GOAL_CAPACITY"
-      ? "GOAL_CAPACITY"
+  if (toolName === "commit_goal_state" || toolName === "update_understanding") {
+    const code = value.rejectionCode ?? value.code;
+    return code === "CAS_STALE" ||
+      code === "STOPPED" ||
+      (toolName === "commit_goal_state" && code === "GOAL_CAPACITY")
+      ? code
       : undefined;
+  }
   if (toolName !== "commit_action_decision") return undefined;
   const code = value.rejectionCode;
   return code === "CAS_STALE" ||

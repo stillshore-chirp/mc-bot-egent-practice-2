@@ -126,6 +126,57 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("returns bounded process diagnostics without proposal text or internal ids", async () => {
+    const fixture = createRuntimeFixture();
+    try {
+      fixture.mind.addProposal({
+        title: "private proposal title",
+        reason: "private proposal reason",
+      });
+      fixture.mind.recordObservation(toObservationEvidence(observation()));
+      fixture.mind.recordAgentActivity({
+        ...agentActivity(1),
+        toolCalls: [
+          {
+            name: "commit_goal_state",
+            resultClass: "rejected",
+            resultCode: "CAS_STALE",
+            outputChars: 40,
+          },
+        ],
+      });
+
+      const diagnostics = fixture.runtime.inspectRuntime();
+      expect(diagnostics).toMatchObject({
+        process: { started: false, shuttingDown: false },
+        purpose: {
+          active: false,
+          awaitingResponse: false,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "not_started",
+          latestObservation: {
+            health: observation().self.health,
+          },
+        },
+        pendingOwnerProposalCount: 1,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      });
+      expect(JSON.stringify(diagnostics)).not.toContain("private proposal");
+      expect(JSON.stringify(diagnostics)).not.toContain("owner-player");
+      expect(JSON.stringify(diagnostics)).not.toContain("reason");
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("returns fixed reasons for each atomic thought rejection", () => {
     const directory = temporaryDirectory();
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
@@ -2187,6 +2238,14 @@ describe("integrated player runtime", () => {
       await runtime.start();
       await waitFor(() => thoughtCount === 1);
       body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(thoughtCount).toBe(1);
+      body.emit({
         type: "operation_stalled",
         operationId: "body-1",
         operation: "look",
@@ -2201,20 +2260,200 @@ describe("integrated player runtime", () => {
           purpose: "wait for the action result",
           reason: "only reevaluate on a body outcome",
           wakeOn: ["body_outcome"],
+          wakeAt: new Date(Date.now() + 60_000).toISOString(),
         },
       });
       expect(newWait.accepted).toBe(true);
 
       releaseFirstThought?.();
       await waitFor(() => thoughtCount === 2);
-      expect(followupWaitKinds).toEqual(["body_outcome"]);
+      expect(followupWaitKinds).toEqual(
+        expect.arrayContaining(["body_outcome", "deadline"]),
+      );
       expect(followupEventKinds).toContain("operation_stalled");
 
-      body.emit({ type: "bot_death", at: new Date().toISOString() });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(thoughtCount).toBe(2);
+      expect(followupEventKinds).toContain("bot_damaged");
+
+      const deathAt = new Date().toISOString();
+      body.emit({ type: "bot_death", at: deathAt });
+      await waitFor(() => thoughtCount === 3);
+      expect(followupEventKinds).toContain("bot_damaged");
+
+      body.emit({
+        type: "bot_death_cause_updated",
+        at: new Date(Date.parse(deathAt) + 100).toISOString(),
+        deathAt,
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          confidence: "observed",
+          provenance: "death_notification",
+          causeKey: "death.attack.mob",
+        },
+      });
+      await waitFor(() => thoughtCount === 4);
+      expect(followupEventKinds).toContain("bot_death");
+      expect(followupEventKinds).toContain("bot_death_cause_updated");
+      expect(mind.snapshot().latestDeath?.cause?.source?.name).toBe("zombie");
     } finally {
       releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("keeps urgent damage wakes pending through a Purpose retry backoff", async () => {
+    let thoughtCount = 0;
+    let latestEventKinds: readonly string[] = [];
+    let rejectFirstThought: ((error: Error) => void) | undefined;
+    const firstThoughtGate = new Promise<void>((_resolve, reject) => {
+      rejectFirstThought = reject;
+    });
+    const fixture = createRuntimeFixture({
+      think: async ({ events }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) await firstThoughtGate;
+        latestEventKinds = events.map(({ kind }) => kind);
+        return { accepted: true };
+      },
+    });
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      vi.useFakeTimers();
+      rejectFirstThought?.(new Error("simulated transient Purpose failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fixture.runtime.busy).toBe(false);
+
+      const baseAt = Date.now();
+      for (let index = 0; index < 3; index += 1) {
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + index * 1_000).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      }
+      expect(thoughtCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(thoughtCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(thoughtCount).toBe(2);
+      expect(latestEventKinds).toContain("bot_damaged");
+    } finally {
+      await fixture.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces a legacy death-wake backlog and delivers the latest request and death at startup", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const initialMind = PlayerMindStore.open(databasePath);
+    const initial = initialMind.snapshot();
+    const wait = initialMind.commitThought({
+      expectedRevision: initial.revision,
+      decision: {
+        kind: "wait",
+        purpose: "continue the saved owner task",
+        reason: "wait for startup or an owner request",
+        wakeOn: ["startup", "owner_proposal"],
+      },
+    });
+    expect(wait.accepted).toBe(true);
+    initialMind.enqueueEvent("owner_proposal", "最新の採集依頼を確認");
+    initialMind.close();
+
+    const legacyDb = new Database(databasePath);
+    const insertDeath = legacyDb.prepare(
+      "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'bot_death', ?, ?, NULL)",
+    );
+    for (let index = 0; index < 100; index += 1) {
+      insertDeath.run(
+        `legacy-death-${index}`,
+        "Bot自身の死亡を観測",
+        new Date(
+          Date.parse("2026-10-01T00:00:00.000Z") + index * 1_000,
+        ).toISOString(),
+      );
+    }
+    legacyDb.close();
+
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let purposeEvents: readonly { kind: string; summary: string }[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events }) => {
+          purposeEvents = events.map(({ kind, summary }) => ({
+            kind,
+            summary,
+          }));
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      const pendingDeaths = mind
+        .pendingEvents(64)
+        .filter(({ kind }) => kind === "bot_death");
+      expect(pendingDeaths).toHaveLength(1);
+      expect(pendingDeaths[0]?.id).toBe("legacy-death-99");
+      expect(
+        mind
+          .pendingEvents(32)
+          .some(
+            ({ kind, summary }) =>
+              kind === "owner_proposal" && summary.includes("最新の採集依頼"),
+          ),
+      ).toBe(true);
+      const retainedHistory = new Database(databasePath, { readonly: true });
+      try {
+        expect(
+          retainedHistory
+            .prepare(
+              "SELECT COUNT(*) AS count FROM player_runtime_events WHERE kind = 'bot_death'",
+            )
+            .get(),
+        ).toEqual({ count: 100 });
+      } finally {
+        retainedHistory.close();
+      }
+
+      await runtime.start();
+      await waitFor(() => purposeEvents.length > 0);
+      expect(purposeEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "owner_proposal",
+            summary: "最新の採集依頼を確認",
+          }),
+          expect.objectContaining({
+            kind: "bot_death",
+            summary: "Bot自身の死亡を観測",
+          }),
+        ]),
+      );
+    } finally {
       await runtime.shutdown();
       skills.close();
       mind.close();

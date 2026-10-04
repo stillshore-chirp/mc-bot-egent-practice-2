@@ -98,6 +98,74 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("prioritizes a fresh damage judgment before historical skill review", async () => {
+    const fixture = openPurposeFixture(
+      [terminalResponse("The current threat needs an immediate decision.")],
+      () => undefined,
+      createMemoryPort(),
+      async () => {
+        const current = bodyObservationFixture();
+        return {
+          ...current,
+          self: { ...current.self, health: 3 },
+          perception: {
+            ...current.perception,
+            entities: [
+              {
+                id: 12,
+                name: "zombie",
+                kind: "mob",
+                category: "Hostile mobs",
+                position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+                distance: 1,
+                health: null,
+                isPlayer: false,
+              },
+            ],
+          },
+        };
+      },
+    );
+
+    try {
+      const runId = "urgent-damage-skip-learning-review";
+      recordSuccessfulSkillUse(fixture, runId, "urgent-damage-skill");
+      const events = [
+        ...fixture.mind.pendingEvents(),
+        {
+          id: "urgent-damage-event",
+          kind: "bot_damaged" as const,
+          summary:
+            "Bot自身への被害を観測。cause=mob:zombie; confidence=observed",
+          createdAt: new Date().toISOString(),
+        },
+      ];
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.observationCalls).toBe(1);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain("urgent wakeではSkill検索");
+      expect(request.instructions).toContain(
+        "一つの情報取得・退避・防御・反撃操作",
+      );
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toMatchObject({ self: { health: 3 } });
+      expect(JSON.stringify(payload.observation)).toContain("zombie");
+      expect(requestUserPayload(request).events).toContainEqual(
+        expect.objectContaining({ kind: "bot_damaged" }),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("inherits operation references in the normal tool path without model input", async () => {
     const runId = "learning-revise-normal";
     const skillId = "learning-used-skill";
@@ -1931,6 +1999,61 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each([
+    {
+      toolName: "commit_goal_state",
+      argumentsValue: {
+        ...emptyGoalStateArguments(),
+        goalTitle: "Reassess the nearby threat",
+        goalStatus: "active",
+        goalSource: "self",
+      },
+    },
+    {
+      toolName: "update_understanding",
+      argumentsValue: {
+        facts: [{ summary: "A fresh state fact", source: "observed" }],
+        uncertainties: [],
+      },
+    },
+  ])(
+    "ends the Purpose run after a stale $toolName write",
+    async ({ toolName, argumentsValue }) => {
+      const mindRef: { current?: PlayerMindStore } = {};
+      const fixture = openPurposeFixture([
+        (_request, index) => {
+          const mind = mindRef.current;
+          if (index !== 0 || mind === undefined)
+            throw new Error("TEST_REVISION_FIXTURE_MISSING");
+          mind.enqueueEvent("state_changed", "A newer event arrived.");
+          return functionCallResponse(
+            "stale-state-write",
+            toolName,
+            argumentsValue,
+          );
+        },
+        terminalResponse("The stale state was somehow accepted."),
+      ]);
+      mindRef.current = fixture.mind;
+
+      try {
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+
+        expect(result.accepted).toBe(false);
+        expect(fixture.requests).toHaveLength(1);
+        expect(
+          fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
+        ).toMatchObject({ resultCode: "CAS_STALE", resultClass: "rejected" });
+        expect(fixture.mind.pendingEvents()).toHaveLength(1);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("reports unknown when a stale revision has no observable component delta", async () => {
     const mindRef: { current?: PlayerMindStore } = {};
     const fixture = openPurposeFixture([
@@ -2146,7 +2269,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("keeps requesting a user-facing final answer after conversation tools", async () => {
+  it("uses bounded runtime diagnostics for internal health questions", async () => {
     const directory = mkdtempSync(
       join(tmpdir(), "player-conversation-rounds-"),
     );
@@ -2154,10 +2277,8 @@ describe("player agent response rounds", () => {
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     const requests: unknown[] = [];
     const responses = [
-      functionCallResponse("status-check", "inspect_player_status", {}),
-      terminalResponse(
-        "I am exploring nearby and can help with the next step.",
-      ),
+      functionCallResponse("runtime-check", "inspect_runtime", {}),
+      terminalResponse("現在の処理状態を確認しました。"),
     ];
     const client = scriptedClient(responses, requests);
     const messages: string[] = [];
@@ -2169,6 +2290,36 @@ describe("player agent response rounds", () => {
       mind,
       memory: createMemoryPort(),
       logger: pino({ level: "silent" }),
+      inspectRuntime: () => ({
+        sampledAt: "2026-10-04T00:00:00.000Z",
+        process: { started: true, shuttingDown: false },
+        purpose: {
+          active: true,
+          activeForMs: 1_500,
+          awaitingResponse: false,
+          responseWaitForMs: null,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "connected",
+          activeOperation: null,
+          latestObservation: {
+            observedAt: "2026-10-04T00:00:00.000Z",
+            ageMs: 0,
+            health: 17,
+          },
+          lastResult: null,
+        },
+        pendingOwnerProposalCount: 2,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            responseStatus: "completed",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      }),
       say: async (text) => {
         messages.push(text);
       },
@@ -2181,14 +2332,40 @@ describe("player agent response rounds", () => {
       const turn = conversation.nextTurn();
       await conversation.handleOwnerMessage({
         username: "owner",
-        message: "What are you doing?",
+        message: "エージェントは死んでる？",
         turn,
       });
 
-      expect(messages).toEqual([
-        "I am exploring nearby and can help with the next step.",
-      ]);
+      expect(messages).toEqual(["現在の処理状態を確認しました。"]);
       expect(requests).toHaveLength(2);
+      const firstRequest = z.record(z.string(), z.unknown()).parse(requests[0]);
+      const instructions = z.string().parse(firstRequest.instructions);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(firstRequest.tools);
+      expect(instructions).toContain("必ずinspect_runtimeを呼び");
+      expect(instructions).toContain("Minecraft内でBotが死亡したことと");
+      expect(instructions).toContain("会話turnにBody操作toolがないことだけで");
+      expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
+      expect(tools.map((tool) => tool.name)).toContain("describe_operation");
+      const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input);
+      const toolOutput = input.find(
+        (item) => item.type === "function_call_output",
+      );
+      const diagnostics = JSON.parse(String(toolOutput?.output)) as {
+        runtime: {
+          purpose: { active: boolean };
+          recentDecisionFailures: unknown[];
+        };
+        conversation: { active: boolean };
+      };
+      expect(diagnostics.runtime.purpose.active).toBe(true);
+      expect(diagnostics.runtime.recentDecisionFailures).toHaveLength(1);
+      expect(diagnostics.conversation.active).toBe(true);
+      expect(JSON.stringify(diagnostics)).not.toContain("ownerUsername");
     } finally {
       mind.close();
     }

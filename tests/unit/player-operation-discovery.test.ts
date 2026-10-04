@@ -187,6 +187,11 @@ describe("on-demand player operation schemas", () => {
       expect(result.kind).toBe(kind);
       expect(result.schema).toEqual(expected);
       expect(result.description).toEqual(expect.any(String));
+      expect(result.manual).toMatchObject({
+        kind,
+        implementation: "body_operation_provided",
+        currentAvailability: "requires_fresh_precondition_check",
+      });
     }
 
     expect(playerOperationCatalog).toContain("collect_item:");

@@ -418,6 +418,17 @@ function addOffAxisStoneCandidates(
     throw new Error(`Only added ${added} of ${count} stone candidates`);
 }
 
+function registerFakeZombie(fake: ReturnType<typeof makeFakeBot>): void {
+  Object.assign(fake.bot.registry.entitiesByName, {
+    zombie: {
+      name: "zombie",
+      displayName: "Zombie",
+      type: "hostile",
+      category: "Hostile mobs",
+    },
+  });
+}
+
 function addWallWithOpening(fake: ReturnType<typeof makeFakeBot>): Vec3 {
   for (let x = -1; x <= 1; x += 1) {
     for (let y = 64; y <= 66; y += 1) {
@@ -1399,6 +1410,296 @@ describe("player body", () => {
     (second.bot as unknown as EventEmitter).emit("spawn");
     expect(events.some((event) => event.type === "reconnected")).toBe(true);
     expect(events.some((event) => event.type === "disconnected")).toBe(true);
+  });
+
+  it("emits self damage with Mineflayer's attributed source but no private identity or position", () => {
+    const fake = makeFakeBot();
+    const zombie = {
+      id: 2,
+      name: "zombie",
+      type: "mob",
+      position: new Vec3(0, 64, -2),
+      username: "private-player-name",
+    } as unknown as Entity;
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      fake.bot.entity,
+      zombie,
+    );
+
+    expect(events).toContainEqual({
+      type: "bot_damaged",
+      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+      source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+      confidence: "observed",
+    });
+    const damageEvent = events.find((event) => event.type === "bot_damaged");
+    expect(JSON.stringify(damageEvent)).not.toContain("private-player-name");
+    expect(JSON.stringify(damageEvent)).not.toContain('"position"');
+    expect(JSON.stringify(damageEvent)).not.toContain('"id"');
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      zombie,
+      fake.bot.entity,
+    );
+    expect(events.filter((event) => event.type === "bot_damaged")).toHaveLength(
+      1,
+    );
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      fake.bot.entity,
+      undefined,
+    );
+    expect(events.at(-1)).toMatchObject({
+      type: "bot_damaged",
+      source: null,
+      confidence: "unknown",
+    });
+  });
+
+  it("retains damage attribution through a positive health packet before death", () => {
+    const fake = makeFakeBot();
+    const zombie = {
+      id: 2,
+      name: "zombie",
+      type: "mob",
+      position: new Vec3(0, 64, -2),
+    } as unknown as Entity;
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    fake.bot.health = 2.33;
+    botEvents.emit("health");
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+
+    expect(events.find((event) => event.type === "bot_death")).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "damage_event",
+      },
+    });
+    expect(events.filter((event) => event.type === "bot_death")).toHaveLength(
+      1,
+    );
+    botEvents.emit("end", "test complete");
+  });
+
+  it("resolves a registry-backed attacker translation in a self death notice", () => {
+    const fake = makeFakeBot();
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+
+    botEvents.emit(
+      "message",
+      {
+        json: {
+          translate: "death.attack.mob",
+          with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+        },
+      },
+      "system",
+      null,
+    );
+    botEvents.emit("death");
+
+    expect(events.at(-1)).toEqual({
+      type: "bot_death",
+      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "death_notification",
+        causeKey: "death.attack.mob",
+      },
+    });
+    botEvents.emit("end", "test complete");
+  });
+
+  it("resolves only exact registry display names and preserves unknown or player attackers generically", () => {
+    const observeCause = (key: string, attacker: unknown) => {
+      const fake = makeFakeBot();
+      registerFakeZombie(fake);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const botEvents = fake.bot as unknown as EventEmitter;
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: key,
+            with: [{ text: "bot" }, attacker],
+          },
+        },
+        "system",
+        null,
+      );
+      botEvents.emit("death");
+      const death = events.find((event) => event.type === "bot_death");
+      botEvents.emit("end", "test complete");
+      return death;
+    };
+
+    expect(observeCause("death.attack.mob", { text: "Zombie" })).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        causeKey: "death.attack.mob",
+      },
+    });
+    expect(
+      observeCause("death.attack.mob", { text: "Custom Zombie" }),
+    ).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: {
+          kind: "death_cause",
+          name: "death.attack.mob",
+          category: null,
+        },
+        causeKey: "death.attack.mob",
+      },
+    });
+    expect(
+      observeCause("death.attack.player", { text: "Zombie" }),
+    ).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: {
+          kind: "death_cause",
+          name: "death.attack.player",
+          category: null,
+        },
+        causeKey: "death.attack.player",
+      },
+    });
+  });
+
+  it("attaches a late self death notice to the same death without another death event", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      registerFakeZombie(fake);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const botEvents = fake.bot as unknown as EventEmitter;
+      fake.bot.health = 0;
+      botEvents.emit("health");
+      botEvents.emit("death");
+      const death = events.find((event) => event.type === "bot_death");
+      expect(death).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(500);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.mob",
+            with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+          },
+        },
+        "system",
+        null,
+      );
+
+      expect(events.filter((event) => event.type === "bot_death")).toHaveLength(
+        1,
+      );
+      expect(events.at(-1)).toMatchObject({
+        type: "bot_death_cause_updated",
+        deathAt: death?.at,
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          causeKey: "death.attack.mob",
+          confidence: "observed",
+          provenance: "death_notification",
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.arrow",
+            with: [{ text: "bot" }, { text: "Arrow" }],
+          },
+        },
+        "system",
+        null,
+      );
+      expect(
+        events.filter((event) => event.type === "bot_death_cause_updated"),
+      ).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({
+        type: "bot_death_cause_updated",
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          causeKey: "death.attack.mob",
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(901);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.mob",
+            with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+          },
+        },
+        "system",
+        null,
+      );
+      expect(
+        events.filter((event) => event.type === "bot_death_cause_updated"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not turn player-authored or another player's death text into self-cause", () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const message = (victim: string) => ({
+      json: {
+        translate: "death.attack.mob",
+        with: [{ text: victim }, { text: "Zombie" }],
+      },
+    });
+
+    botEvents.emit("message", message("bot"), "chat", null);
+    botEvents.emit("message", message("another"), "system", null);
+    botEvents.emit("message", message("bot"), "system", "player-uuid");
+    botEvents.emit("death");
+
+    expect(events.at(-1)).toEqual({
+      type: "bot_death",
+      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+    });
   });
 
   it("limits block and entity perception to visible, unoccluded targets and labels unknowns", () => {
