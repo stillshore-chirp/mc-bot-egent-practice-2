@@ -315,7 +315,13 @@ describe("player owner intent context", () => {
 
       const request = record(fixture.requests[0]);
       expect(String(request.instructions)).toContain(
-        "能力や実行条件の相談には",
+        "能力や実行条件の相談では必要に応じてdescribe_operationを呼び",
+      );
+      expect(String(request.instructions)).toContain(
+        "operation manualを根拠に答えてください",
+      );
+      expect(JSON.stringify(request.tools)).toContain(
+        '"name":"describe_operation"',
       );
       expect(String(request.instructions)).toContain(playerOperationCatalog);
       expect(request.tool_choice).toBe("auto");
