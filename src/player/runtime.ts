@@ -22,6 +22,7 @@ import type {
   PlayerMemoryPort,
   PlayerObservationEvidence,
   PlayerObservedDisplacement,
+  PlayerRuntimeInspection,
   PlayerRuntimeEvent,
   PlayerRuntimeSnapshot,
   PlayerThoughtDecision,
@@ -63,6 +64,7 @@ export interface PlayerConversationPort {
     readonly turn: number;
     readonly signal?: AbortSignal;
   }): Promise<void>;
+  finishTurn?(turn: number): void;
 }
 
 export interface PlayerPurposePort {
@@ -106,8 +108,10 @@ export class PlayerRuntime {
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
   #activeThought: AbortController | undefined;
+  #activeThoughtStartedAtMs: number | undefined;
   #activeThoughtCommitted = false;
   #activeResponsesRequest = false;
+  #activeResponsesRequestStartedAtMs: number | undefined;
   #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
   #ownerProposalSettlementThought: AbortController | undefined;
   #pendingThoughtWake: PendingThoughtWake | undefined;
@@ -137,6 +141,97 @@ export class PlayerRuntime {
 
   public get busy(): boolean {
     return this.#activeThought !== undefined || this.#activeBody !== undefined;
+  }
+
+  /** Safe, bounded current-process diagnostics for an authenticated owner question. */
+  public inspectRuntime(): PlayerRuntimeInspection {
+    const now = Date.now();
+    const snapshot = this.options.mind.snapshot();
+    const recentDecisionFailures = snapshot.recentAgentActivity
+      .slice(-8)
+      .flatMap((activity) => {
+        const rejectionCodes = activity.toolCalls
+          .filter((call) => call.resultClass !== "ok")
+          .flatMap((call) =>
+            call.resultCode === undefined ? [] : [call.resultCode],
+          );
+        if (
+          rejectionCodes.length === 0 &&
+          activity.responseStatus !== "failed" &&
+          activity.responseStatus !== "request_error" &&
+          activity.responseStatus !== "incomplete"
+        )
+          return [];
+        return [
+          {
+            role: activity.role,
+            responseStatus: activity.responseStatus,
+            ...(activity.requestErrorCause === undefined
+              ? {}
+              : { requestErrorCause: activity.requestErrorCause }),
+            rejectionCodes,
+            ageKnown: false as const,
+          },
+        ];
+      })
+      .slice(-4);
+    return {
+      sampledAt: new Date(now).toISOString(),
+      process: { started: this.#started, shuttingDown: this.#shuttingDown },
+      purpose: {
+        active: this.#activeThought !== undefined,
+        activeForMs:
+          this.#activeThoughtStartedAtMs === undefined
+            ? null
+            : Math.max(0, now - this.#activeThoughtStartedAtMs),
+        awaitingResponse: this.#activeResponsesRequest,
+        responseWaitForMs:
+          !this.#activeResponsesRequest ||
+          this.#activeResponsesRequestStartedAtMs === undefined
+            ? null
+            : Math.max(0, now - this.#activeResponsesRequestStartedAtMs),
+        retryScheduled: this.#retryTimer !== undefined,
+      },
+      body: {
+        connectionState: !this.#started
+          ? "not_started"
+          : this.#bodyConnected
+            ? "connected"
+            : "disconnected",
+        activeOperation:
+          snapshot.activeOperation === undefined
+            ? null
+            : {
+                operation: snapshot.activeOperation.kind,
+                startedAt:
+                  snapshot.activeOperation.bodyStartedAt ??
+                  snapshot.activeOperation.startedAt,
+              },
+        latestObservation:
+          snapshot.lastObservation === undefined
+            ? null
+            : {
+                observedAt: snapshot.lastObservation.observedAt,
+                ageMs: Math.max(
+                  0,
+                  now - Date.parse(snapshot.lastObservation.observedAt),
+                ),
+                health: snapshot.lastObservation.health,
+              },
+        lastResult:
+          snapshot.lastOutcome === undefined
+            ? null
+            : {
+                operation: snapshot.lastOutcome.kind,
+                status: snapshot.lastOutcome.status,
+                observedAt: snapshot.lastOutcome.observedAt,
+              },
+      },
+      pendingOwnerProposalCount: snapshot.proposals.filter(
+        ({ status }) => status === "pending",
+      ).length,
+      recentDecisionFailures,
+    };
   }
 
   public async start(): Promise<void> {
@@ -236,9 +331,11 @@ export class PlayerRuntime {
         turn,
         signal: this.#lifetime.signal,
       }),
-    ).catch((error: unknown) =>
-      this.#logFailure("PLAYER_CONVERSATION_FAILED", error),
-    );
+    )
+      .catch((error: unknown) =>
+        this.#logFailure("PLAYER_CONVERSATION_FAILED", error),
+      )
+      .finally(() => this.options.conversation.finishTurn?.(turn));
   }
 
   /** Called after a durable owner proposal was recorded; this leaves the body running. */
@@ -640,8 +737,10 @@ export class PlayerRuntime {
     }
     const controller = new AbortController();
     this.#activeThought = controller;
+    this.#activeThoughtStartedAtMs = Date.now();
     this.#activeThoughtCommitted = false;
     this.#activeResponsesRequest = false;
+    this.#activeResponsesRequestStartedAtMs = undefined;
     const events = this.options.mind.pendingEvents(32);
     let retry = false;
     let immediateRevisionRetry = false;
@@ -665,8 +764,12 @@ export class PlayerRuntime {
             this.#pendingThoughtWake?.kind === "body_outcome" ||
             this.#pendingThoughtWake?.kind === "owner_proposal",
           onResponsesRequestState: (active) => {
-            if (this.#activeThought === controller)
+            if (this.#activeThought === controller) {
               this.#activeResponsesRequest = active;
+              this.#activeResponsesRequestStartedAtMs = active
+                ? Date.now()
+                : undefined;
+            }
           },
         });
         if (
@@ -729,8 +832,10 @@ export class PlayerRuntime {
     if (this.#activeThought !== controller) return;
     this.#clearOwnerProposalSettlement(controller);
     this.#activeThought = undefined;
+    this.#activeThoughtStartedAtMs = undefined;
     this.#activeThoughtCommitted = false;
     this.#activeResponsesRequest = false;
+    this.#activeResponsesRequestStartedAtMs = undefined;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
       return;
@@ -974,6 +1079,7 @@ export class PlayerRuntime {
     const thought = this.#activeThought;
     this.#clearOwnerProposalSettlement(thought);
     this.#activeResponsesRequest = false;
+    this.#activeResponsesRequestStartedAtMs = undefined;
     this.#pendingThoughtWake = undefined;
     this.#activeThoughtCommitted = false;
     thought?.abort(new Error(reason));

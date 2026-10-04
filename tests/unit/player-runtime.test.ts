@@ -126,6 +126,57 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("returns bounded process diagnostics without proposal text or internal ids", async () => {
+    const fixture = createRuntimeFixture();
+    try {
+      fixture.mind.addProposal({
+        title: "private proposal title",
+        reason: "private proposal reason",
+      });
+      fixture.mind.recordObservation(toObservationEvidence(observation()));
+      fixture.mind.recordAgentActivity({
+        ...agentActivity(1),
+        toolCalls: [
+          {
+            name: "commit_goal_state",
+            resultClass: "rejected",
+            resultCode: "CAS_STALE",
+            outputChars: 40,
+          },
+        ],
+      });
+
+      const diagnostics = fixture.runtime.inspectRuntime();
+      expect(diagnostics).toMatchObject({
+        process: { started: false, shuttingDown: false },
+        purpose: {
+          active: false,
+          awaitingResponse: false,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "not_started",
+          latestObservation: {
+            health: observation().self.health,
+          },
+        },
+        pendingOwnerProposalCount: 1,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      });
+      expect(JSON.stringify(diagnostics)).not.toContain("private proposal");
+      expect(JSON.stringify(diagnostics)).not.toContain("owner-player");
+      expect(JSON.stringify(diagnostics)).not.toContain("reason");
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("returns fixed reasons for each atomic thought rejection", () => {
     const directory = temporaryDirectory();
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));

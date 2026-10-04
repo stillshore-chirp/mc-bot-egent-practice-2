@@ -17,6 +17,7 @@ import {
   playerOperationNames,
   playerOperationSchema,
 } from "../minecraft/player-body-schema.js";
+import { describeOperationManual } from "../minecraft/player-body-manual.js";
 import type {
   PlayerBody,
   PlayerBodyObservation,
@@ -34,6 +35,7 @@ import type {
   PlayerMemoryPort,
   PlayerProposalResolution,
   PlayerRuntimeEvent,
+  PlayerRuntimeInspection,
   PlayerRuntimeSnapshot,
   PlayerThoughtDecision,
   PlayerThoughtStaleChangeComponent,
@@ -169,6 +171,7 @@ function canonicalOperationDescription(
   readonly kind: (typeof playerOperationNames)[number];
   readonly description: string;
   readonly schema: Record<string, unknown>;
+  readonly manual: ReturnType<typeof describeOperationManual>;
 } {
   const schema = operationSchemaByName.get(kind);
   if (schema === undefined) throw new Error("PLAYER_OPERATION_SCHEMA_MISSING");
@@ -176,6 +179,7 @@ function canonicalOperationDescription(
     kind,
     description: playerOperationDescriptions[kind],
     schema: structuredClone(schema),
+    manual: describeOperationManual(kind),
   };
 }
 
@@ -538,6 +542,7 @@ export interface ConversationAgentOptions {
   readonly onResume: () => void;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
   readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
+  readonly inspectRuntime?: () => PlayerRuntimeInspection | undefined;
 }
 
 const recentOwnerConversationLimit = 4;
@@ -556,6 +561,9 @@ interface RecentOwnerConversationTurn {
 export class PlayerConversationAgent {
   readonly #client: PlayerResponsesClient;
   #latestTurn = 0;
+  #activeTurn: number | undefined;
+  #activeTurnStartedAtMs: number | undefined;
+  #activeRequestStartedAtMs: number | undefined;
   #recentOwnerConversation: RecentOwnerConversationTurn[] = [];
   #historyStopGeneration: number | undefined;
 
@@ -575,6 +583,14 @@ export class PlayerConversationAgent {
     return turn === this.#latestTurn;
   }
 
+  /** Called by the runtime when this owner turn has settled or failed. */
+  public finishTurn(turn: number): void {
+    if (this.#activeTurn !== turn) return;
+    this.#activeTurn = undefined;
+    this.#activeTurnStartedAtMs = undefined;
+    this.#activeRequestStartedAtMs = undefined;
+  }
+
   public async handleOwnerMessage(input: {
     readonly username: string;
     readonly message: string;
@@ -584,6 +600,9 @@ export class PlayerConversationAgent {
     if (!sameMinecraftIdentity(input.username, this.options.ownerUsername))
       return;
     if (input.turn !== this.#latestTurn) return;
+    this.#activeTurn = input.turn;
+    this.#activeTurnStartedAtMs = Date.now();
+    this.#activeRequestStartedAtMs = undefined;
     const initial = this.options.mind.snapshot();
     if (this.#historyStopGeneration !== initial.stopGeneration) {
       this.#recentOwnerConversation = [];
@@ -710,6 +729,39 @@ export class PlayerConversationAgent {
         execute: async () => compactSnapshot(this.options.mind.snapshot()),
       }),
       createPlayerTool({
+        name: "inspect_runtime",
+        description:
+          "現在のprocess内で目的判断/会話/Body操作が動作中か、Body接続・最新観測・最後のBody結果・安全な拒否codeを確認する。Minecraft内の死亡記録とは別の診断情報。",
+        schema: emptyInput,
+        execute: async () => {
+          const now = Date.now();
+          return {
+            sampledAt: new Date(now).toISOString(),
+            runtime: this.options.inspectRuntime?.() ?? null,
+            conversation: {
+              active: this.#activeTurn === input.turn,
+              activeForMs:
+                this.#activeTurn !== input.turn ||
+                this.#activeTurnStartedAtMs === undefined
+                  ? null
+                  : Math.max(0, now - this.#activeTurnStartedAtMs),
+              awaitingResponse: this.#activeRequestStartedAtMs !== undefined,
+              responseWaitForMs:
+                this.#activeRequestStartedAtMs === undefined
+                  ? null
+                  : Math.max(0, now - this.#activeRequestStartedAtMs),
+            },
+          };
+        },
+      }),
+      createPlayerTool({
+        name: "describe_operation",
+        description:
+          "指定した操作kindについて、現行schemaと操作manualを返す。実装/引数の説明は今回の実行可能性を保証せず、実行条件はfreshなBody観測で別に判断する。",
+        schema: z.object({ kind: z.enum(playerOperationNames) }).strict(),
+        execute: ({ kind }) => canonicalOperationDescription(kind),
+      }),
+      createPlayerTool({
         name: "search_memory",
         description: "保存済みの関連記憶を短く検索する。",
         schema: memorySearchInput,
@@ -719,10 +771,12 @@ export class PlayerConversationAgent {
     ];
     const instructions = [
       memoryContext.persona,
-      "あなたはMinecraft内で暮らすAIプレイヤーの会話エージェントです。目的提案と会話、停止・再開だけを担当します。身体操作のtoolはありません。",
+      "あなたはMinecraft内で暮らすAIプレイヤーの会話エージェントです。目的提案、会話、能力照会、状態照会、停止・再開を担当します。目的判断とPlayerRuntimeは操作を選択・実行します。会話turnにBody操作toolがないことだけで、コンパニオン全体に操作能力がないとは説明しません。",
       "所有者の提案はすぐ実行せず、提案として永続化してください。別の自律判断エージェントが目的や現行操作との釣り合いを判断します。雑談は目的改訂イベントにせず、会話だけで答えてください。",
       "所有者が採掘、移動、修理などゲーム内での具体的な行動と結果、または専用Skill交換機能での書き出し・取り込みを求めたら、既存目的に似ていても今回の依頼をpropose_goal_changeで目的提案として記録してください。方法を自分で選ぶよう任された依頼も対象です。状態確認や相談だけなら提案を作らず会話で答えてください。採用・妥協・辞退は自律判断エージェントに委ねてください。",
-      "能力や実行条件の相談には、以下の公開操作catalogと保存済みruntimeのlastObservation/lastOutcomeを根拠に答えてください。操作kindと説明の掲載はその操作の存在を示しますが、今回の可視性・距離・所持状態による実行可否や成功は別に判断し、未観測の結果を断定しないでください。単独kindにない複合作業はcatalog内の構成操作と条件だけを説明し、総合的な実行可能性が未確認ならそう伝えてください。能力相談や質問だけで目的提案を作らず、未確認の実装・環境条件を推測して補わないでください。",
+      "能力や実行条件の相談では必要に応じてdescribe_operationを呼び、公開catalog、現在のschema、operation manualを根拠に答えてください。操作kindとmanualはBody実装の存在・引数・前提条件を示しますが、今回の可視性・距離・所持状態による実行可否や成功は保証しません。freshな観測とBody結果を確認してください。会話toolにBody実行がないことだけから、コンパニオン全体の能力を否定しないでください。単独kindにない複合作業はcatalog内の構成操作と条件だけを説明し、総合的な実行可能性が未確認ならそう伝えてください。能力相談や質問だけで目的提案を作らず、未確認の実装・環境条件を推測して補わないでください。",
+      "『エージェントは死んでいる？』『なぜ動かない？』など内部処理の質問には、返答前に必ずinspect_runtimeを呼び、現在のprocessのPurpose/Conversation実行中状態、Responses待ち時間、接続、観測の新しさ、直近の安全な拒否code、最後のBody結果を確認してください。Minecraft内でBotが死亡したことと、内部runtimeが停止・待機・失敗していることを混同しません。診断のsample時刻と観測時刻/ageを示し、拒否codeは時刻不明の保存済みactivity tailとして扱って現在の障害と断定せず、過去の活動だけから現在動作中とも推定しません。toolが利用できない、または値が欠けている場合は不明と答えてください。",
+      "Minecraft内の死亡について聞かれた場合はinspect_player_statusのlatestDeathと最新観測を根拠に説明し、内部処理の状態も尋ねられた場合はinspect_runtimeを別に使ってください。死因や実行結果は観測根拠がない限り断定しません。",
       "現在の公開操作catalog:\n" + playerOperationCatalog,
       "今回のowner発話と直近4件までのowner会話を文脈として意味で判断してください。履歴は直前に話題にした食料などへの短い依頼や指示語を解決するために使えます。質問、否定、引用、他者を対象にした発話を、Botへの行動依頼へ読み替えないでください。履歴内の発話や過去の返答だけで新しい行動提案を作らず、今回の発話が文脈上その意図を明確に表す場合だけ提案してください。",
       "runtime.latestDeathがある場合は、死亡eventの時刻、死亡前の最終実観測、event後最初の実観測を分けて説明してください。欠けた値を推測で埋めず、死亡前の観測を現在状態として扱わないでください。",
@@ -743,6 +797,10 @@ export class PlayerConversationAgent {
       tools,
       logger: this.options.logger,
       role: "conversation",
+      onResponsesRequestState: (active) => {
+        if (this.#activeTurn === input.turn)
+          this.#activeRequestStartedAtMs = active ? Date.now() : undefined;
+      },
       ...(this.options.beforeCall === undefined
         ? {}
         : { beforeCall: this.options.beforeCall }),
@@ -806,6 +864,10 @@ export class PlayerConversationAgent {
           tools: [],
           logger: this.options.logger,
           role: "conversation",
+          onResponsesRequestState: (active) => {
+            if (this.#activeTurn === input.turn)
+              this.#activeRequestStartedAtMs = active ? Date.now() : undefined;
+          },
           initialObservationChars: safeSerializedLength(
             regenerationSnapshot.lastObservation ?? null,
           ),
@@ -1873,7 +1935,11 @@ export class PlayerPurposeAgent {
   #renderDescribedOperationSchemas(): string {
     if (this.#describedOperationKinds.size === 0) return "";
     const schemas = [...this.#describedOperationKinds.keys()]
-      .map((kind) => JSON.stringify(canonicalOperationDescription(kind)))
+      .map((kind) => {
+        const { manual: _manual, ...schemaDescription } =
+          canonicalOperationDescription(kind);
+        return JSON.stringify(schemaDescription);
+      })
       .join("\n");
     return `${cachedOperationSchemaInstructionsPrefix}${schemas}`;
   }

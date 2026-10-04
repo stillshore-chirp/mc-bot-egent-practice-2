@@ -47,6 +47,7 @@ export const playerAgentToolNames = [
   "stop_autonomy",
   "resume_autonomy",
   "inspect_player_status",
+  "inspect_runtime",
   "search_memory",
   "observe_body",
   "locate_owner",

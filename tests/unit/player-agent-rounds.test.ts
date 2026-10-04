@@ -2269,7 +2269,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("keeps requesting a user-facing final answer after conversation tools", async () => {
+  it("uses bounded runtime diagnostics for internal health questions", async () => {
     const directory = mkdtempSync(
       join(tmpdir(), "player-conversation-rounds-"),
     );
@@ -2277,10 +2277,8 @@ describe("player agent response rounds", () => {
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     const requests: unknown[] = [];
     const responses = [
-      functionCallResponse("status-check", "inspect_player_status", {}),
-      terminalResponse(
-        "I am exploring nearby and can help with the next step.",
-      ),
+      functionCallResponse("runtime-check", "inspect_runtime", {}),
+      terminalResponse("現在の処理状態を確認しました。"),
     ];
     const client = scriptedClient(responses, requests);
     const messages: string[] = [];
@@ -2292,6 +2290,36 @@ describe("player agent response rounds", () => {
       mind,
       memory: createMemoryPort(),
       logger: pino({ level: "silent" }),
+      inspectRuntime: () => ({
+        sampledAt: "2026-10-04T00:00:00.000Z",
+        process: { started: true, shuttingDown: false },
+        purpose: {
+          active: true,
+          activeForMs: 1_500,
+          awaitingResponse: false,
+          responseWaitForMs: null,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "connected",
+          activeOperation: null,
+          latestObservation: {
+            observedAt: "2026-10-04T00:00:00.000Z",
+            ageMs: 0,
+            health: 17,
+          },
+          lastResult: null,
+        },
+        pendingOwnerProposalCount: 2,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            responseStatus: "completed",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      }),
       say: async (text) => {
         messages.push(text);
       },
@@ -2304,14 +2332,40 @@ describe("player agent response rounds", () => {
       const turn = conversation.nextTurn();
       await conversation.handleOwnerMessage({
         username: "owner",
-        message: "What are you doing?",
+        message: "エージェントは死んでる？",
         turn,
       });
 
-      expect(messages).toEqual([
-        "I am exploring nearby and can help with the next step.",
-      ]);
+      expect(messages).toEqual(["現在の処理状態を確認しました。"]);
       expect(requests).toHaveLength(2);
+      const firstRequest = z.record(z.string(), z.unknown()).parse(requests[0]);
+      const instructions = z.string().parse(firstRequest.instructions);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(firstRequest.tools);
+      expect(instructions).toContain("必ずinspect_runtimeを呼び");
+      expect(instructions).toContain("Minecraft内でBotが死亡したことと");
+      expect(instructions).toContain("会話turnにBody操作toolがないことだけで");
+      expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
+      expect(tools.map((tool) => tool.name)).toContain("describe_operation");
+      const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input);
+      const toolOutput = input.find(
+        (item) => item.type === "function_call_output",
+      );
+      const diagnostics = JSON.parse(String(toolOutput?.output)) as {
+        runtime: {
+          purpose: { active: boolean };
+          recentDecisionFailures: unknown[];
+        };
+        conversation: { active: boolean };
+      };
+      expect(diagnostics.runtime.purpose.active).toBe(true);
+      expect(diagnostics.runtime.recentDecisionFailures).toHaveLength(1);
+      expect(diagnostics.conversation.active).toBe(true);
+      expect(JSON.stringify(diagnostics)).not.toContain("ownerUsername");
     } finally {
       mind.close();
     }

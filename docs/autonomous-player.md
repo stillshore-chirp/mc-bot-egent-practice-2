@@ -68,13 +68,17 @@ sequenceDiagram
 
 `handleOwnerMessage()` はowner identityと最新turnを確認します。非ownerのchatはRuntime入口でも除外します。
 
-| tool                                | 効果                                                   |
-| ----------------------------------- | ------------------------------------------------------ |
-| `propose_goal_change`               | proposalを永続化し、目的判断へ通知                     |
-| `remember_owner_fact`               | ownerが明示的に記憶を求めた事実の要約をMindStoreへ保存 |
-| `stop_autonomy` / `resume_autonomy` | 停止世代を照合して永続停止/再開                        |
-| `inspect_player_status`             | 保存済みruntime状態を読む                              |
-| `search_memory`                     | MemoryStoreの関連記憶を検索                            |
+| tool                                | 効果                                                                  |
+| ----------------------------------- | --------------------------------------------------------------------- |
+| `propose_goal_change`               | proposalを永続化し、目的判断へ通知                                    |
+| `remember_owner_fact`               | ownerが明示的に記憶を求めた事実の要約をMindStoreへ保存                |
+| `stop_autonomy` / `resume_autonomy` | 停止世代を照合して永続停止/再開                                       |
+| `inspect_player_status`             | 保存済みruntime状態を読む                                             |
+| `inspect_runtime`                   | 現在processのPurpose/Conversation/Body操作、接続、観測age、結果を読む |
+| `describe_operation`                | 指定操作の現行schemaと条件・成功証拠manualを読む                      |
+| `search_memory`                     | MemoryStoreの関連記憶を検索                                           |
+
+`inspect_runtime`は認証済みowner会話から呼ぶ読み取り専用のbounded診断です。現在processのPurpose/Conversation実行状態とResponses待ち時間、Body接続とactive operation、保存済み最新観測の時刻/health、pending proposal件数、最後のBody結果、直近activity tail内の安全な拒否codeを返します。activity tailには日時がないため、拒否codeは現在の失敗と断定せず、内部ログや例外本文も返しません。Minecraft内の死亡記録は`inspect_player_status`で別に確認します。
 
 モデルには、雑談・能力相談だけで行動提案を作らないこと、今回の発話と直近4件までの会話を合わせて指示語を解釈することを指示します。これは意味判断の指示であり、あらゆる発話を正しく分類する保証ではありません。
 
