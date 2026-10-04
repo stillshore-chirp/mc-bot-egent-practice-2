@@ -385,6 +385,7 @@ export function createPlayerApplication(
     memory: playerMemory,
     logger,
     inspectRuntime: () => runtimeRef.current?.inspectRuntime(),
+    observeBody: () => body.observe(),
     ...(trace === undefined ? {} : { trace }),
     ...(beforeCall === undefined ? {} : { beforeCall }),
     onCall: (metrics) =>

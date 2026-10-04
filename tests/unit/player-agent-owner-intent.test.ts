@@ -332,6 +332,144 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("grounds nearby-enemy answers in a bounded current-view body observation", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const baseObservation = bodyObservationFixture();
+    const entities: PlayerBodyObservation["perception"]["entities"] = [
+      ...Array.from({ length: 9 }, (_, index) => ({
+        id: 300000 + index,
+        name: "item",
+        kind: "item",
+        category: null,
+        position: {
+          x: index,
+          y: 64,
+          z: -0.5,
+          dimension: "overworld",
+        },
+        distance: 0.5 + index,
+        health: null,
+        isPlayer: false,
+      })),
+      {
+        id: 314159,
+        name: "zombie",
+        kind: "zombie",
+        category: "Hostile mobs",
+        position: { x: 4, y: 64, z: -3, dimension: "overworld" },
+        distance: 5.02,
+        health: 13.4,
+        isPlayer: false,
+        equipment: { mainHand: "iron_sword", offHand: null, head: null },
+      },
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: 314160 + index,
+        name: index === 0 ? "skeleton" : `hostile_${index}`,
+        kind: index === 0 ? "skeleton" : `hostile_${index}`,
+        category: "Hostile mobs",
+        position: {
+          x: 20 + index,
+          y: 64,
+          z: -3,
+          dimension: "overworld",
+        },
+        distance: 10 + index,
+        health: null,
+        isPlayer: false,
+      })),
+      {
+        id: 314999,
+        name: "private-player-name",
+        kind: "player",
+        category: null,
+        position: { x: 1, y: 64, z: -1, dimension: "overworld" },
+        distance: 1.5,
+        health: 20,
+        isPlayer: true,
+        username: "private-player-name",
+      },
+    ];
+    const observation: PlayerBodyObservation = {
+      ...baseObservation,
+      perception: {
+        ...baseObservation.perception,
+        candidateSearchMayBeTruncated: true,
+        omittedEntityCandidates: 2,
+        entities,
+      },
+    };
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => observation,
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("observe-enemies", "observe_body", {}),
+      terminalResponse("視界内にゾンビがいます。"),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "近くの敵の種類や装備は？",
+        turn: conversation.nextTurn(),
+      });
+
+      const initialRequest = record(fixture.requests[0]);
+      expect(String(initialRequest.instructions)).toContain(
+        "敵など現在の視界情報（種類・距離・方向・装備）を尋ねられたらobserve_bodyを使い",
+      );
+      expect(JSON.stringify(initialRequest.tools)).toContain(
+        '"name":"observe_body"',
+      );
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      const output = JSON.parse(String(toolOutput?.output)) as unknown;
+      const serializedOutput = JSON.stringify(output);
+      expect(record(output).visibleEntities).toHaveLength(8);
+      expect(serializedOutput).toContain('"name":"zombie"');
+      expect(serializedOutput).toContain('"kind":"zombie"');
+      expect(serializedOutput).toContain('"distance":5');
+      expect(serializedOutput).toContain('"relativeDirection":"ahead_right"');
+      expect(serializedOutput).toContain('"health":13.4');
+      expect(serializedOutput).toContain('"mainHand":"iron_sword"');
+      expect(serializedOutput).toContain('"offHand":null');
+      expect(serializedOutput).toContain('"feet":"unknown"');
+      expect(serializedOutput).toContain(
+        '"coverage":"visible_non_player_subset"',
+      );
+      expect(serializedOutput).toContain('"omittedVisibleCandidates":true');
+      expect(serializedOutput).toContain(
+        '"candidateSearchMayBeTruncated":true',
+      );
+      expect(serializedOutput).toContain('"worldAbsenceEstablished":false');
+      expect(serializedOutput).toContain('"observedVisibleEntityCount":18');
+      expect(serializedOutput).not.toContain('"name":"item"');
+      expect(serializedOutput).not.toContain("private-player-name");
+      expect(serializedOutput).not.toContain('"position"');
+      expect(serializedOutput).not.toContain('"id"');
+      expect(messages).toEqual(["視界内にゾンビがいます。"]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("regenerates an overlong reply once without tools and keeps call admission", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const messages: string[] = [];

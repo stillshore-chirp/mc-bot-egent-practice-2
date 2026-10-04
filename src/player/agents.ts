@@ -474,6 +474,111 @@ export interface ConversationAgentOptions {
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
   readonly onRoundActivity?: (activity: PlayerAgentRoundActivity) => void;
   readonly inspectRuntime?: () => PlayerRuntimeInspection | undefined;
+  readonly observeBody?: () => Promise<PlayerBodyObservation>;
+}
+
+const conversationVisibleEntityLimit = 8;
+const conversationEquipmentSlots = [
+  "mainHand",
+  "offHand",
+  "head",
+  "torso",
+  "legs",
+  "feet",
+] as const;
+
+function relativeEntityDirection(
+  yaw: number,
+  origin: PlayerBodyObservation["self"]["position"],
+  target: PlayerBodyObservation["perception"]["entities"][number]["position"],
+):
+  | "ahead"
+  | "ahead_right"
+  | "right"
+  | "behind_right"
+  | "behind"
+  | "behind_left"
+  | "left"
+  | "ahead_left"
+  | "unknown" {
+  const dx = target.x - origin.x;
+  const dz = target.z - origin.z;
+  if (
+    !Number.isFinite(yaw) ||
+    ![dx, dz].every(Number.isFinite) ||
+    origin.dimension !== target.dimension ||
+    (dx === 0 && dz === 0)
+  )
+    return "unknown";
+
+  const forwardX = -Math.sin(yaw);
+  const forwardZ = -Math.cos(yaw);
+  const rightX = Math.cos(yaw);
+  const rightZ = -Math.sin(yaw);
+  const forward = dx * forwardX + dz * forwardZ;
+  const right = dx * rightX + dz * rightZ;
+  const sector =
+    (Math.round(Math.atan2(right, forward) / (Math.PI / 4)) + 8) % 8;
+  return [
+    "ahead",
+    "ahead_right",
+    "right",
+    "behind_right",
+    "behind",
+    "behind_left",
+    "left",
+    "ahead_left",
+  ][sector] as Exclude<ReturnType<typeof relativeEntityDirection>, "unknown">;
+}
+
+function summarizeConversationBodyObservation(
+  observation: PlayerBodyObservation,
+) {
+  const entities = observation.perception.entities.filter(
+    ({ isPlayer }) => !isPlayer,
+  );
+  const prioritizedEntities = [...entities].sort(
+    (left, right) =>
+      Number(left.name === "item") - Number(right.name === "item"),
+  );
+  const visibleEntities = prioritizedEntities
+    .slice(0, conversationVisibleEntityLimit)
+    .map((entity) => ({
+      name: entity.name.slice(0, 80),
+      kind: entity.kind.slice(0, 80),
+      category: entity.category?.slice(0, 80) ?? null,
+      distance: Math.round(entity.distance * 10) / 10,
+      relativeDirection: relativeEntityDirection(
+        observation.self.yaw,
+        observation.self.position,
+        entity.position,
+      ),
+      health: entity.health,
+      equipment: Object.fromEntries(
+        conversationEquipmentSlots.map((slot) => [
+          slot,
+          entity.equipment?.[slot] === undefined
+            ? "unknown"
+            : (entity.equipment[slot]?.slice(0, 80) ?? null),
+        ]),
+      ),
+    }));
+  const omittedVisibleCandidates =
+    observation.perception.omittedEntityCandidates > 0 ||
+    entities.length > conversationVisibleEntityLimit;
+
+  return {
+    available: true,
+    observedAt: observation.observedAt,
+    coverage: "visible_non_player_subset",
+    observedVisibleEntityCount: entities.length,
+    visibleEntities,
+    omittedVisibleCandidates,
+    candidateSearchMayBeTruncated:
+      observation.perception.candidateSearchMayBeTruncated ||
+      omittedVisibleCandidates,
+    worldAbsenceEstablished: false,
+  };
 }
 
 const recentOwnerConversationLimit = 4;
@@ -686,6 +791,26 @@ export class PlayerConversationAgent {
         },
       }),
       createPlayerTool({
+        name: "observe_body",
+        description:
+          "身体の現在観測から可視範囲内の非player entity subsetを読む。絶対位置やIDは返さず、装備slotのunknownと明示的なemptyを区別する。",
+        schema: emptyInput,
+        execute: async () => {
+          if (input.signal?.aborted || !this.isCurrentTurn(input.turn))
+            return { available: false, reason: "turn_cancelled_or_stale" };
+          if (this.options.observeBody === undefined)
+            return { available: false, reason: "observation_unavailable" };
+          try {
+            const observation = await this.options.observeBody();
+            if (input.signal?.aborted || !this.isCurrentTurn(input.turn))
+              return { available: false, reason: "turn_cancelled_or_stale" };
+            return summarizeConversationBodyObservation(observation);
+          } catch {
+            return { available: false, reason: "observation_failed" };
+          }
+        },
+      }),
+      createPlayerTool({
         name: "describe_operation",
         description:
           "指定した操作kindについて、現行schemaと操作manualを返す。実装/引数の説明は今回の実行結果を保証せず、可視性や距離などは通常のBody操作結果で確かめる。",
@@ -703,6 +828,7 @@ export class PlayerConversationAgent {
     const instructions = [
       memoryContext.persona,
       "あなたはMinecraft内で暮らすAIプレイヤーの会話エージェントです。目的提案、会話、能力照会、状態照会、停止・再開を担当します。目的判断とPlayerRuntimeは操作を選択・実行します。会話turnにBody操作toolがないことだけで、コンパニオン全体に操作能力がないとは説明しません。",
+      "敵など現在の視界情報（種類・距離・方向・装備）を尋ねられたらobserve_bodyを使い、可視部分・候補欠落・探索打切りを明示して、見えない対象の不在や全方位を断定しない。",
       "所有者の提案はすぐ実行せず、提案として永続化してください。別の自律判断エージェントが目的や現行操作との釣り合いを判断します。雑談は目的改訂イベントにせず、会話だけで答えてください。",
       "所有者が採掘、移動、修理などゲーム内での具体的な行動と結果、または専用Skill交換機能での書き出し・取り込みを求めたら、既存目的に似ていても今回の依頼をpropose_goal_changeで目的提案として記録してください。方法を自分で選ぶよう任された依頼も対象です。状態確認や相談だけなら提案を作らず会話で答えてください。採用・妥協・辞退は自律判断エージェントに委ねてください。",
       "能力や実行条件の相談では必要に応じてdescribe_operationを呼び、公開catalog、現在のschema、operation manualを根拠に答えてください。操作kindとmanualはBody実装の存在・引数・前提条件を示しますが、今回の可視性・距離・所持状態による実行可否や成功は保証しません。freshな観測とBody結果を確認してください。会話toolにBody実行がないことだけから、コンパニオン全体の能力を否定しないでください。単独kindにない複合作業はcatalog内の構成操作と条件だけを説明し、総合的な実行可能性が未確認ならそう伝えてください。能力相談や質問だけで目的提案を作らず、未確認の実装・環境条件を推測して補わないでください。",
