@@ -70,6 +70,7 @@ export interface BodyVisibleEntity {
   readonly username?: string;
   /** Omitted slots are unknown; null means explicitly empty. */
   readonly equipment?: BodyVisibleEntityEquipment;
+  readonly droppedItem?: BodyVisibleDroppedItem;
 }
 
 export interface BodyVisibleEntityEquipment {
@@ -79,6 +80,11 @@ export interface BodyVisibleEntityEquipment {
   readonly torso?: string | null;
   readonly legs?: string | null;
   readonly feet?: string | null;
+}
+
+export interface BodyVisibleDroppedItem {
+  readonly name: string;
+  readonly count: number;
 }
 
 export interface BodyWindowSnapshot {
@@ -198,6 +204,13 @@ const lookSweepEntitySchema = z
       })
       .strict()
       .optional(),
+    droppedItem: z
+      .object({
+        name: z.string().min(1).max(80),
+        count: z.number().int().min(1).max(127),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -286,14 +299,25 @@ export function summarizeLookSweepView(
       })),
     visibleEntities: entities
       .slice(0, playerBodyLookSweepEntityLimit)
-      .map(({ name, kind, category, position, distance, equipment }) => ({
-        name: name.slice(0, 80),
-        kind: kind.slice(0, 80),
-        category: category?.slice(0, 80) ?? null,
-        position: { x: position.x, y: position.y, z: position.z },
-        distance,
-        ...(equipment === undefined ? {} : { equipment }),
-      })),
+      .map(
+        ({
+          name,
+          kind,
+          category,
+          position,
+          distance,
+          equipment,
+          droppedItem,
+        }) => ({
+          name: name.slice(0, 80),
+          kind: kind.slice(0, 80),
+          category: category?.slice(0, 80) ?? null,
+          position: { x: position.x, y: position.y, z: position.z },
+          distance,
+          ...(equipment === undefined ? {} : { equipment }),
+          ...(droppedItem === undefined ? {} : { droppedItem }),
+        }),
+      ),
     omittedBlockCandidates,
     omittedEntityCandidates,
     candidateSearchMayBeTruncated:
@@ -504,6 +528,30 @@ function visibleEntityEquipment(
   });
 
   return Object.keys(equipment).length === 0 ? undefined : equipment;
+}
+
+function visibleDroppedItem(
+  bot: Bot,
+  entity: Entity,
+): BodyVisibleDroppedItem | undefined {
+  let item: Item | null;
+  try {
+    item = entity.getDroppedItem();
+  } catch {
+    return undefined;
+  }
+  if (
+    item === null ||
+    typeof item.name !== "string" ||
+    item.name.length === 0 ||
+    item.name.length > 80 ||
+    bot.registry.itemsByName[item.name] === undefined ||
+    !Number.isInteger(item.count) ||
+    item.count < 1 ||
+    item.count > 127
+  )
+    return undefined;
+  return { name: item.name, count: item.count };
 }
 
 function entityHealth(entity: Entity): number | null {
@@ -912,6 +960,7 @@ export function observePlayerBody(
     const name = entityName(entity);
     const category = bot.registry.entitiesByName[name]?.category ?? null;
     const equipment = visibleEntityEquipment(entity);
+    const droppedItem = visibleDroppedItem(bot, entity);
     visibleEntities.push({
       id: entity.id,
       name,
@@ -923,6 +972,7 @@ export function observePlayerBody(
       isPlayer: entity.username !== undefined,
       ...(entity.username === undefined ? {} : { username: entity.username }),
       ...(equipment === undefined ? {} : { equipment }),
+      ...(droppedItem === undefined ? {} : { droppedItem }),
     });
   }
 

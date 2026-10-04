@@ -7,7 +7,13 @@ import {
   summarizeLookSweepView,
 } from "../../src/minecraft/player-body-observation.js";
 
-function makeBot(equipment: readonly (string | null | undefined)[]): Bot {
+function makeBot(
+  equipment: readonly (string | null | undefined)[],
+  options: {
+    readonly entityName?: string;
+    readonly getDroppedItem?: () => unknown;
+  } = {},
+): Bot {
   const self = {
     id: 1,
     position: new Vec3(0, 64, 0),
@@ -19,7 +25,7 @@ function makeBot(equipment: readonly (string | null | undefined)[]): Bot {
   };
   const enemy = {
     id: 2,
-    name: "zombie",
+    name: options.entityName ?? "zombie",
     type: "hostile",
     position: new Vec3(0, 64, -4),
     velocity: new Vec3(0, 0, 0),
@@ -30,6 +36,9 @@ function makeBot(equipment: readonly (string | null | undefined)[]): Bot {
     equipment: equipment.map((name) =>
       name === undefined ? undefined : name === null ? null : { name },
     ),
+    ...(options.getDroppedItem === undefined
+      ? {}
+      : { getDroppedItem: options.getDroppedItem }),
   };
   return {
     username: "fixture_bot",
@@ -49,6 +58,7 @@ function makeBot(equipment: readonly (string | null | undefined)[]): Bot {
     getEquipmentDestSlot: () => 0,
     registry: {
       entitiesByName: { zombie: { category: "Hostile mobs" } },
+      itemsByName: { diamond_sword: {} },
       blocksByStateId: {},
     },
     world: { raycast: () => null },
@@ -122,4 +132,56 @@ describe("visible entity equipment observation", () => {
     expect(current.visibleEntities[0]).not.toHaveProperty("equipment");
     expect(parsed.success).toBe(true);
   });
+
+  it("observes a bounded registry dropped-item name and count in normal and sweep views", () => {
+    const { observation, current, parsed } = sweepFor(
+      makeBot([], {
+        entityName: "item",
+        getDroppedItem: () => ({
+          name: "diamond_sword",
+          count: 1,
+          customName: "untrusted display text",
+          nbt: { display: "untrusted display text" },
+        }),
+      }),
+    );
+
+    expect(observation.perception.entities[0]?.droppedItem).toEqual({
+      name: "diamond_sword",
+      count: 1,
+    });
+    expect(current.visibleEntities[0]?.droppedItem).toEqual({
+      name: "diamond_sword",
+      count: 1,
+    });
+    expect(JSON.stringify(current.visibleEntities[0])).not.toContain(
+      "untrusted display text",
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it.each([
+    ["missing", () => null],
+    [
+      "throws",
+      () => {
+        throw new Error("fixture failure");
+      },
+    ],
+    ["unregistered item", () => ({ name: "custom_item", count: 1 })],
+    ["out-of-bound count", () => ({ name: "diamond_sword", count: 128 })],
+  ])(
+    "omits a dropped item when native data is %s",
+    (_label, getDroppedItem) => {
+      const { observation, current, parsed } = sweepFor(
+        makeBot([], { entityName: "item", getDroppedItem }),
+      );
+
+      expect(observation.perception.entities[0]).not.toHaveProperty(
+        "droppedItem",
+      );
+      expect(current.visibleEntities[0]).not.toHaveProperty("droppedItem");
+      expect(parsed.success).toBe(true);
+    },
+  );
 });

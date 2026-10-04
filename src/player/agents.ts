@@ -1929,7 +1929,7 @@ export class PlayerPurposeAgent {
       }
     }
     const actionFirstInstruction =
-      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
+      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。今回のBody観測に見えている落下物は自発的にcollect_itemを試し、武器・防具・道具を優先してください。回収成功は実際の拾得結果で判断します。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
     const normalInstructions = [
       memoryContext.persona,
       "あなたはAIプレイヤーの自律的な目的・行動エージェントです。起動時にもMinecraft観測、保存persona/interest/goal、記憶、既往結果から自分の目的を選び、必要なら実行可能な小さな行動を自律的に開始してください。チャット起点の偽イベントを待たないでください。",

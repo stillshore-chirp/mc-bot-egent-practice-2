@@ -1149,6 +1149,71 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each(["ordinary", "urgent"] as const)(
+    "keeps visible dropped-item facts in the serialized %s Purpose input and prompts proactive collection",
+    async (wake) => {
+      const base = bodyObservationFixture();
+      const observation: PlayerBodyObservation = {
+        ...base,
+        perception: {
+          ...base.perception,
+          entities: [
+            {
+              id: 77,
+              name: "item",
+              kind: "object",
+              category: null,
+              position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+              distance: 1,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "diamond_sword", count: 1 },
+            },
+          ],
+        },
+      };
+      const fixture = openPurposeFixture(
+        [terminalResponse("Fixture response; no operation was executed.")],
+        undefined,
+        undefined,
+        async () => observation,
+      );
+
+      try {
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+          ...(wake === "urgent" ? { urgentPerceptionWake: true } : {}),
+        });
+
+        expect(result.accepted).toBe(false);
+        const request = z
+          .record(z.string(), z.unknown())
+          .parse(fixture.requests[0]);
+        expect(request.instructions).toContain(
+          "今回のBody観測に見えている落下物は自発的にcollect_itemを試し",
+        );
+        expect(request.instructions).toContain("武器・防具・道具を優先");
+        const purposeInput = requestUserPayload(request);
+        const serializedObservation = z
+          .record(z.string(), z.unknown())
+          .parse(purposeInput.observation);
+        const perception = z
+          .record(z.string(), z.unknown())
+          .parse(serializedObservation.perception);
+        const entities = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(perception.entities);
+        expect(entities[0]).toMatchObject({
+          id: 77,
+          droppedItem: { name: "diamond_sword", count: 1 },
+        });
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("summarizes only retained movement after the latest active owner proposal", () => {
     const fixture = openPurposeFixture([]);
     try {
