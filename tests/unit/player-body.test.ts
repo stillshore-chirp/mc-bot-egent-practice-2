@@ -1432,13 +1432,18 @@ describe("player body", () => {
       zombie,
     );
 
-    expect(events).toContainEqual({
+    const damageEvent = events.find((event) => event.type === "bot_damaged");
+    expect(damageEvent?.type).toBe("bot_damaged");
+    if (damageEvent?.type !== "bot_damaged") {
+      throw new Error("expected bot damage event");
+    }
+    expect(damageEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(damageEvent).toEqual({
       type: "bot_damaged",
-      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+      at: damageEvent.at,
       source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
       confidence: "observed",
     });
-    const damageEvent = events.find((event) => event.type === "bot_damaged");
     expect(JSON.stringify(damageEvent)).not.toContain("private-player-name");
     expect(JSON.stringify(damageEvent)).not.toContain('"position"');
     expect(JSON.stringify(damageEvent)).not.toContain('"id"');
@@ -1520,9 +1525,15 @@ describe("player body", () => {
     );
     botEvents.emit("death");
 
-    expect(events.at(-1)).toEqual({
+    const deathEvent = events.at(-1);
+    expect(deathEvent?.type).toBe("bot_death");
+    if (deathEvent?.type !== "bot_death") {
+      throw new Error("expected bot death event");
+    }
+    expect(deathEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(deathEvent).toEqual({
       type: "bot_death",
-      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+      at: deathEvent.at,
       cause: {
         source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
         confidence: "observed",
@@ -1696,10 +1707,13 @@ describe("player body", () => {
     botEvents.emit("message", message("bot"), "system", "player-uuid");
     botEvents.emit("death");
 
-    expect(events.at(-1)).toEqual({
-      type: "bot_death",
-      at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
-    });
+    const deathEvent = events.at(-1);
+    expect(deathEvent?.type).toBe("bot_death");
+    if (deathEvent?.type !== "bot_death") {
+      throw new Error("expected bot death event");
+    }
+    expect(deathEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(deathEvent).toEqual({ type: "bot_death", at: deathEvent.at });
   });
 
   it("limits block and entity perception to visible, unoccluded targets and labels unknowns", () => {

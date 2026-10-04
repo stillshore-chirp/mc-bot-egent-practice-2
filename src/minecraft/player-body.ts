@@ -216,7 +216,7 @@ function damageSource(
   if (registryEntity === undefined)
     return { kind: "unknown", name: "unknown", category: null };
   const name = registryEntity.name;
-  const rawCategory = registryEntity?.category;
+  const rawCategory = registryEntity.category;
   const category =
     typeof rawCategory === "string" &&
     rawCategory.length <= 80 &&
