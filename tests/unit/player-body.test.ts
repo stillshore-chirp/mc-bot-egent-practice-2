@@ -2090,6 +2090,72 @@ describe("player body", () => {
     await body.stop();
   });
 
+  it("starts a nearby hostile approach behind the current view and wakes when it moves", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    zombie.position = new Vec3(0, 64, 2);
+    registerFakeZombie(fake);
+    const observation = observePlayerBody(fake.bot, undefined);
+    expect(observation.perception.entities).toEqual([]);
+    expect(observation.perception.nearbyHostiles?.entities).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: zombie.id })]),
+    );
+
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) =>
+            event.type === "damage_reflex_started" &&
+            event.trigger === "hostile_approach",
+        ),
+      ).toBe(true),
+    );
+    expect(fake.bot.lookAt).toHaveBeenCalledWith(expect.any(Vec3), true);
+    await vi.waitFor(() =>
+      expect(fake.bot.attack).toHaveBeenCalledWith(zombie),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    const initialEntityEvents = events.filter(
+      (event) => event.type === "state_changed" && event.reason === "entities",
+    ).length;
+    Object.assign(zombie, {
+      equipment: [{ name: "iron_sword" }, null, null, null, null, null],
+    });
+    botEvents.emit("entityUpdate", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(initialEntityEvents + 1),
+    );
+
+    zombie.position = new Vec3(0, 64, 2.75);
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(initialEntityEvents + 2),
+    );
+    await body.stop();
+  });
+
   it("re-engages after a hostile leaves and returns to ordinary attack reach", async () => {
     const fake = makeFakeBot();
     const zombie = addFakeZombieEntity(fake);
@@ -2158,6 +2224,7 @@ describe("player body", () => {
         Object.assign(fake.bot.world, {
           raycast: vi.fn(() => wall),
         });
+        target.position = new Vec3(0, 64, 2);
       }
       if (scenario === "out-of-reach") target.position = new Vec3(0, 64, -5);
 
@@ -2165,7 +2232,10 @@ describe("player body", () => {
       const body = new MineflayerPlayerBody(() => fake.bot);
       const events: PlayerBodyEvent[] = [];
       body.onEvent((event) => events.push(event));
-      if (scenario !== "disabled") body.setDamageReflexEnabled(true);
+      if (scenario === "disabled") {
+        body.setDamageReflexEnabled(true);
+        body.setDamageReflexEnabled(false);
+      } else body.setDamageReflexEnabled(true);
       botEvents.emit("entityMoved", target);
       await vi.waitFor(() =>
         expect(

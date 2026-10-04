@@ -60,7 +60,7 @@ Mineflayer は`package.json`と`package-lock.json`で`4.39.0`、`mineflayer-path
 
 被害時の`bot_damaged`は`at`、`source`（`kind`・`name`・`category`、または`null`）、`confidence`（`observed`・`unknown`）を持ちます。`bot_death`の`cause`は任意です。死亡後1秒以内に対応する構造化通知を受けると、`bot_death_cause_updated`を一度だけ追加し、`deathAt`で元の死亡へ結び付けます。これは新たな死亡ではありません。更新されるcauseには`causeKey`、source、confidence、provenance（`damage_event`・`death_notification`）が含まれます。正規レジストリのMobならsource名はcanonicalなentity名になり、識別できない相手やplayer名の本文はgenericな`death_cause`とtranslation keyで表します。これらのeventは数値のentity ID・座標・usernameを含みません。sourceやcauseがない場合は攻撃者・死因を特定できません。vitals変化後に取り直す`self.health`も`null`になり得ます。これらは見えている手掛かりであり、完全なダメージ記録ではありません。移動・見渡し・攻撃を選んだ後も、それぞれの実行結果を別に確認します。
 
-Runtimeが`setDamageReflexEnabled(true)`にした間、Bodyはenable・spawn・所持品更新を契機に、明示的に観測した空slotまたは既知素材でより強いと分かる防具だけを所持品から装備します。同じBotの被害反応が優先され、その装備と並行しません。Bot自身が受けた`entityHurt`、または300msにまとめた観測で見える既知hostileが通常攻撃距離内にいる場合、Purposeの再判断を待たず短い反応を開始します。後から受けた被害は進行中の反応へまとめ、接近反応から`bot_damaged`を捏造しません。同じreach内での連続移動は一度にまとめ、通常攻撃距離外への退出を観測した後の再接近では再度反応します。spawn時にも現在の周囲を再確認します。反応の`damage_reflex_started`と集約された`damage_reflex_completed`にはtrigger（`damage`・`hostile_approach`）が付きます。同じ反応窓の被害はまとめ、所持する防具だけを空slotへ装備し、手持ちが剣・斧・槍なら維持し、それ以外の場合だけ所持する剣・斧・槍へ持ち替えます。sourceが分かる場合だけすばやく向き直り、通常視野・遮蔽・到達距離を再確認して攻撃を繰り返します。攻撃は装備の完了を待たずに始まり、操作可能な時間は最大約1秒です。死亡中は操作せず、同じ接続で次のspawnを最大約4秒待ちます。完了結果は自身の攻撃元がserver damage eventに現れた場合、または受信したserver inventory slot更新で装備を確認できた場合だけ成功証拠を持ちます。source不明時は対象を推測せず、装備以外の攻撃を行いません。`stopActiveOperation()`は通常操作だけを止め、永続停止・Bodyの`stop()`は反応も解除します。
+Runtimeが`setDamageReflexEnabled(true)`にした間、Bodyはenable・spawn・所持品更新を契機に、明示的に観測した空slotまたは既知素材でより強いと分かる防具だけを所持品から装備します。同じBotの被害反応が優先され、その装備と並行しません。Bot自身が受けた`entityHurt`、または300msにまとめた観測で視野外でも近距離かつ遮蔽のない既知hostileが通常攻撃距離内にいる場合、Purposeの再判断を待たず短い反応を開始します。後から受けた被害は進行中の反応へまとめ、接近反応から`bot_damaged`を捏造しません。同じreach内での連続移動は一度にまとめ、通常攻撃距離外への退出を観測した後の再接近では再度反応します。spawn時にも現在の周囲を再確認します。反応の`damage_reflex_started`と集約された`damage_reflex_completed`にはtrigger（`damage`・`hostile_approach`）が付きます。同じ反応窓の被害はまとめ、所持する防具だけを空slotへ装備し、手持ちが剣・斧・槍なら維持し、それ以外の場合だけ所持する剣・斧・槍へ持ち替えます。sourceが分かる場合だけすばやく向き直り、通常視野・遮蔽・到達距離を再確認して攻撃を繰り返します。攻撃は装備の完了を待たずに始まり、操作可能な時間は最大約1秒です。死亡中は操作せず、同じ接続で次のspawnを最大約4秒待ちます。完了結果は自身の攻撃元がserver damage eventに現れた場合、または受信したserver inventory slot更新で装備を確認できた場合だけ成功証拠を持ちます。source不明時は対象を推測せず、装備以外の攻撃を行いません。`stopActiveOperation()`は通常操作だけを止め、永続停止・Bodyの`stop()`は反応も解除します。
 
 ### 過去の代表的な実ゲーム確認（操作群別）
 
@@ -95,6 +95,8 @@ Runtimeが`setDamageReflexEnabled(true)`にした間、Bodyはenable・spawn・�
 ## 観測できる範囲
 
 `observe()` は ISO 形式の`observedAt`、自身のステータス・インベントリ・装備・時刻・画面、および可視範囲のブロックとエンティティを返します。視野は距離 16 ブロック、水平 110°、垂直 80° までで、ブロックやエンティティによる遮蔽を考慮します。ブロック候補は最大 3 回検索し、各検索で最大 192 件を調べます。画面中央の raycast が距離・視野内で最初に捉えたブロックは、候補検索から漏れても出力枠を優先します。結果はブロック名ごとに近い候補を交互に選び、最大 96 件を含めます。エンティティ候補は最大 128 件を調べ、結果には最大 64 件を含めます。検索上限で候補が残る可能性は`candidateSearchMayBeTruncated`で示し、出力上限による省略数も返します。読み込まれているだけで隠れているワールド要素は、現在見えている情報として公開しません。
+
+別枠の optional `perception.nearbyHostiles` は、Mineflayerが受信したMobのうち、正規レジストリで敵対種と分かり、16ブロック以内で遮蔽のない候補を視野角に関係なく最大16件返します。これは近くの敵対Mobの限定集合で、ワールド全体の一覧ではありません。`observedAt`・`source`・候補省略数・検索打切りフラグで、鮮度と範囲を区別します。
 
 可視エンティティには、Mineflayerが受信済みの装備種を`mainHand`、`offHand`、`head`、`torso`、`legs`、`feet`として含めます。slot keyの省略は未受信または取得できず不明、`null`は受信した空欄を表し、値はitem kind名だけです。`look_sweep`も各可視entityについて同じ情報を返します。
 

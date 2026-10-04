@@ -910,19 +910,31 @@ function semanticSignature(
         inventory: observation.self.inventory,
         equipment: observation.self.equipment,
       });
-    case "entities":
-      return JSON.stringify(
-        observation.perception.entities.map((entity) => ({
+    case "entities": {
+      const semanticEntities = (
+        entities: PlayerBodyObservation["perception"]["entities"],
+      ) =>
+        entities.map((entity) => ({
           id: entity.id,
           name: entity.name,
+          kind: entity.kind,
+          category: entity.category,
           position: [
             Math.round(entity.position.x * 2) / 2,
             Math.round(entity.position.y * 2) / 2,
             Math.round(entity.position.z * 2) / 2,
           ],
           health: entity.health,
-        })),
-      );
+          equipment: entity.equipment,
+          droppedItem: entity.droppedItem,
+        }));
+      return JSON.stringify({
+        visible: semanticEntities(observation.perception.entities),
+        nearbyHostiles: semanticEntities(
+          observation.perception.nearbyHostiles?.entities ?? [],
+        ),
+      });
+    }
     case "blocks":
       return JSON.stringify(
         observation.perception.blocks.map((block) => ({
@@ -3953,7 +3965,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         const observation = this.safeObserve(bot);
         if (observation === null) return;
         if (reason === "entities")
-          this.startVisibleHostileApproach(
+          this.startNearbyHostileApproach(
             bot,
             observation,
             scheduledLifeGeneration,
@@ -3972,7 +3984,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.stateTimers.set(reason, timer);
   }
 
-  private startVisibleHostileApproach(
+  private startNearbyHostileApproach(
     bot: Bot,
     observation: PlayerBodyObservation,
     lifeGeneration: number,
@@ -4001,7 +4013,30 @@ export class MineflayerPlayerBody implements PlayerBody {
         this.hostileApproachTargets.delete(previousTarget);
       }
     }
-    for (const visible of observation.perception.entities) {
+    const nearby = observation.perception.nearbyHostiles;
+    const freshNearbyHostiles =
+      nearby?.source === "client_received_unoccluded_nearby_hostiles" &&
+      nearby.observedAt === observation.observedAt &&
+      Number.isFinite(nearby.maxDistance) &&
+      nearby.maxDistance > 0 &&
+      nearby.maxDistance <= observation.perception.maxDistance
+        ? nearby.entities.filter(
+            (entity) =>
+              Number.isFinite(entity.distance) &&
+              entity.distance <= nearby.maxDistance,
+          )
+        : [];
+    const nearbyHostileIds = new Set(
+      freshNearbyHostiles.map((entity) => entity.id),
+    );
+    const candidates = [
+      ...observation.perception.entities,
+      ...freshNearbyHostiles,
+    ];
+    const visited = new Set<number>();
+    for (const visible of candidates) {
+      if (visited.has(visible.id)) continue;
+      visited.add(visible.id);
       const target = bot.entities[visible.id];
       if (
         target?.id !== visible.id ||
@@ -4012,7 +4047,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       )
         continue;
       try {
-        requireVisibleEntity(bot, target.id, attackRange);
+        if (nearbyHostileIds.has(visible.id))
+          requireReachableEntity(bot, target.id, attackRange);
+        else requireVisibleEntity(bot, target.id, attackRange);
       } catch {
         continue;
       }
