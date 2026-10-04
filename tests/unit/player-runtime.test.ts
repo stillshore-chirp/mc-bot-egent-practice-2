@@ -2361,11 +2361,18 @@ describe("integrated player runtime", () => {
     });
     const commits: boolean[] = [];
     let thoughtCount = 0;
+    let staleStartupResponse: (() => boolean) | undefined;
+    let freshSawStopResponse = false;
     const runtimeRef: { current?: PlayerRuntime } = {};
     const purpose: PlayerPurposePort = {
-      think: async ({ snapshot, signal }) => {
+      think: async ({ snapshot, signal, shouldStopAfterResponse }) => {
         thoughtCount += 1;
-        if (thoughtCount === 1) await firstThoughtGate;
+        if (thoughtCount === 1) {
+          staleStartupResponse = shouldStopAfterResponse;
+          await firstThoughtGate;
+        } else {
+          freshSawStopResponse = shouldStopAfterResponse?.() ?? false;
+        }
         const decision = action(`damage-freshness-${thoughtCount}`);
         const fixture = fixtureRef.current;
         if (fixture === undefined) throw new Error("runtime fixture missing");
@@ -2399,6 +2406,7 @@ describe("integrated player runtime", () => {
         source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
         confidence: "observed",
       });
+      expect(staleStartupResponse?.()).toBe(true);
       const revisionAfterFirstDamage = fixture.mind.snapshot().revision;
       expect(revisionAfterFirstDamage).toBe(revisionBeforeDamage + 1);
       for (const offset of [1_000, 2_000])
@@ -2418,6 +2426,7 @@ describe("integrated player runtime", () => {
       await waitFor(
         () => thoughtCount === 2 && fixture.body.started.length === 1,
       );
+      expect(freshSawStopResponse).toBe(false);
       expect(commits).toEqual([false, true]);
       expect(fixture.body.started).toEqual(["look"]);
       expect(fixture.mind.snapshot().pendingEventKinds).toContain(
@@ -2445,15 +2454,24 @@ describe("integrated player runtime", () => {
     let thoughtCount = 0;
     let deathAwareEventKinds: readonly string[] = [];
     let startupWasMarkedUrgent: boolean | undefined;
+    let staleStartupResponse: (() => boolean) | undefined;
+    let freshDeathAwareResponse: (() => boolean) | undefined;
     const runtimeRef: { current?: PlayerRuntime } = {};
     const purpose: PlayerPurposePort = {
-      think: async ({ snapshot, events, urgentPerceptionWake }) => {
+      think: async ({
+        snapshot,
+        events,
+        urgentPerceptionWake,
+        shouldStopAfterResponse,
+      }) => {
         thoughtCount += 1;
         if (thoughtCount === 1) {
           startupWasMarkedUrgent = urgentPerceptionWake;
+          staleStartupResponse = shouldStopAfterResponse;
           await unawareGate;
         } else {
           deathAwareEventKinds = events.map(({ kind }) => kind);
+          freshDeathAwareResponse = shouldStopAfterResponse;
           expect(urgentPerceptionWake).toBe(true);
           await deathAwareGate;
         }
@@ -2494,6 +2512,7 @@ describe("integrated player runtime", () => {
       };
       const initialRevision = fixture.mind.snapshot().revision;
       emitDeath();
+      expect(staleStartupResponse?.()).toBe(true);
       const invalidatedRevision = fixture.mind.snapshot().revision;
       expect(invalidatedRevision).toBe(initialRevision + 1);
       emitDeath();
@@ -2506,10 +2525,12 @@ describe("integrated player runtime", () => {
       releaseUnawareThought?.();
       await waitFor(() => thoughtCount === 2);
       expect(deathAwareEventKinds).toContain("bot_death");
+      expect(freshDeathAwareResponse?.()).toBe(false);
       const deathAwareRevision = fixture.mind.snapshot().revision;
       emitDeath();
       emitDeath();
       emitDeath();
+      expect(freshDeathAwareResponse?.()).toBe(false);
       expect(fixture.mind.snapshot().revision).toBe(deathAwareRevision);
       expect(fixture.mind.snapshot().latestDeath?.observedAt).toBe(
         latestEventAt,

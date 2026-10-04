@@ -814,7 +814,9 @@ export class PlayerRuntime {
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
           shouldStopAfterResponse: () =>
             this.#pendingThoughtWake?.kind === "body_outcome" ||
-            this.#pendingThoughtWake?.kind === "owner_proposal",
+            this.#pendingThoughtWake?.kind === "owner_proposal" ||
+            this.#activeThoughtDamageInvalidated ||
+            this.#activeThoughtDeathInvalidated,
           onResponsesRequestState: (active) => {
             if (this.#activeThought === controller) {
               this.#activeResponsesRequest = active;
