@@ -151,9 +151,15 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
-      expect(request.instructions).toContain("urgent wakeではSkill検索");
       expect(request.instructions).toContain(
-        "一つの情報取得・退避・防御・反撃操作",
+        "観測が無い場合のobserve_bodyは最大1回",
+      );
+      expect(request.instructions).toContain(
+        "利用可能な操作から今できる一つを直ちにcommit_action_decision",
+      );
+      expect(request.instructions).toContain("look:");
+      expect(request.instructions).not.toContain(
+        "死亡回収のexpectedOutcome先頭には",
       );
       const payload = requestUserPayload(request);
       expect(payload.observation).toMatchObject({ self: { health: 3 } });
@@ -1041,6 +1047,81 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("limits urgent observation retry to one and still commits an action", async () => {
+    const observation = bodyObservationFixture();
+    let observationAttempts = 0;
+    const repeatedObserveResponse = {
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "urgent-observe-first",
+          name: "observe_body",
+          arguments: "{}",
+        },
+        {
+          type: "function_call",
+          call_id: "urgent-observe-repeat",
+          name: "observe_body",
+          arguments: "{}",
+        },
+      ],
+      output_text: "",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as unknown as Response;
+    const fixture = openPurposeFixture(
+      [
+        repeatedObserveResponse,
+        functionCallResponse(
+          "urgent-action-after-bounded-observe",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => {
+        observationAttempts += 1;
+        if (observationAttempts === 1)
+          throw new Error("INITIAL_OBSERVATION_UNAVAILABLE");
+        return observation;
+      },
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-death-event",
+            kind: "bot_death",
+            summary: "Bot死亡を観測",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(2);
+      expect(fixture.requests).toHaveLength(2);
+      const secondRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(secondRequest.input);
+      expect(
+        input.some(
+          ({ type, output }) =>
+            type === "function_call_output" &&
+            String(output).includes("OBSERVATION_RETRY_LIMIT"),
+        ),
+      ).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("guides low-health choices from observation without fixing a survival priority", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
@@ -1076,6 +1157,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
+      expect(instructions).toContain("look:");
       expect(instructions).toContain(
         "食事を検討する時はowner依頼か自分の目的かを問わず",
       );

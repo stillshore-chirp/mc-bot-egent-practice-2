@@ -71,6 +71,7 @@ export interface PlayerPurposePort {
   think(input: {
     readonly snapshot: PlayerRuntimeSnapshot;
     readonly events: readonly PlayerRuntimeEvent[];
+    readonly urgentPerceptionWake?: boolean;
     readonly signal?: AbortSignal;
     readonly shouldStopAfterResponse?: () => boolean;
     readonly onResponsesRequestState?: (active: boolean) => void;
@@ -99,6 +100,7 @@ interface PendingThoughtWake {
   readonly kind: PlayerWakeKind;
   readonly reason: string;
   readonly damageAware: boolean;
+  readonly deathAware: boolean;
 }
 
 /** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
@@ -113,6 +115,8 @@ export class PlayerRuntime {
   #activeThoughtCommitted = false;
   #activeThoughtDamageAware = false;
   #activeThoughtDamageInvalidated = false;
+  #activeThoughtDeathAware = false;
+  #activeThoughtDeathInvalidated = false;
   #activeResponsesRequest = false;
   #activeResponsesRequestStartedAtMs: number | undefined;
   #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
@@ -547,6 +551,7 @@ export class PlayerRuntime {
         this.#activeThought !== undefined &&
         !this.#activeThoughtCommitted &&
         !this.#activeThoughtDamageAware &&
+        !this.#activeThoughtDeathAware &&
         !this.#activeThoughtDamageInvalidated;
       if (invalidateDecision) this.#activeThoughtDamageInvalidated = true;
       this.enqueueAndWake(
@@ -567,7 +572,7 @@ export class PlayerRuntime {
         event.at,
       );
       if (updated !== undefined)
-        this.#requestThought(updated.kind, updated.summary);
+        this.#requestThought(updated.kind, updated.summary, false, false, true);
       return;
     }
     if (type === "operation_started") {
@@ -603,6 +608,13 @@ export class PlayerRuntime {
     }
     if (type === "bot_death") {
       if (event.type !== "bot_death") return;
+      const deathWakeAlreadyAware =
+        this.#activeThoughtDeathAware ||
+        this.#activeThoughtDeathInvalidated ||
+        this.#pendingThoughtWake?.deathAware === true;
+      const invalidateDecision = !deathWakeAlreadyAware;
+      if (invalidateDecision && this.#activeThought !== undefined)
+        this.#activeThoughtDeathInvalidated = true;
       this.options.memory.recordEpisode({
         summary: "Bot自身がMinecraft内で死亡したことを観測",
         status: "observed",
@@ -613,8 +625,12 @@ export class PlayerRuntime {
         deathEventSummary(event.cause),
         at,
         "bot_death",
-        3_000,
-        event.cause === undefined ? {} : { deathCause: event.cause },
+        0,
+        {
+          invalidateDecision,
+          deathAware: true,
+          ...(event.cause === undefined ? {} : { deathCause: event.cause }),
+        },
       );
       return;
     }
@@ -670,6 +686,7 @@ export class PlayerRuntime {
       readonly invalidateDecision?: boolean;
       readonly deathCause?: PlayerBodyDeathCause;
       readonly damageAware?: boolean;
+      readonly deathAware?: boolean;
     } = {},
   ): void {
     const now = Date.parse(at);
@@ -695,13 +712,16 @@ export class PlayerRuntime {
     const invalidateDecision = options.invalidateDecision ?? !deferObservation;
     const event =
       kind === "bot_death"
-        ? this.options.mind.recordDeathEvent(at, summary, options.deathCause)
+        ? this.options.mind.recordDeathEvent(at, summary, options.deathCause, {
+            invalidateDecision,
+          })
         : this.options.mind.enqueueEvent(kind, summary, { invalidateDecision });
     this.#requestThought(
       kind,
       event.summary,
       false,
       options.damageAware ?? false,
+      options.deathAware ?? false,
     );
   }
 
@@ -710,10 +730,11 @@ export class PlayerRuntime {
     reason: string,
     acceptedPendingWake = false,
     damageAwareWake = false,
+    deathAwareWake = false,
   ): void {
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
     if (isUrgentPerceptionWake(kind) && this.#retryTimer !== undefined) {
-      this.#queueThoughtWake(kind, reason, damageAwareWake);
+      this.#queueThoughtWake(kind, reason, damageAwareWake, deathAwareWake);
       return;
     }
     const current = this.options.mind.snapshot();
@@ -737,7 +758,7 @@ export class PlayerRuntime {
       return;
     const activeThought = this.#activeThought;
     if (activeThought !== undefined) {
-      this.#queueThoughtWake(kind, reason, damageAwareWake);
+      this.#queueThoughtWake(kind, reason, damageAwareWake, deathAwareWake);
       if (kind === "owner_proposal") {
         if (this.#activeResponsesRequest) {
           this.#boundOwnerProposalSettlement(activeThought);
@@ -763,6 +784,11 @@ export class PlayerRuntime {
     this.#activeThoughtCommitted = false;
     this.#activeThoughtDamageAware = kind === "bot_damaged" || damageAwareWake;
     this.#activeThoughtDamageInvalidated = false;
+    this.#activeThoughtDeathAware =
+      kind === "bot_death" ||
+      kind === "bot_death_cause_updated" ||
+      deathAwareWake;
+    this.#activeThoughtDeathInvalidated = false;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     const events = this.options.mind.pendingEvents(32);
@@ -783,6 +809,8 @@ export class PlayerRuntime {
                   },
                 ]
               : events,
+          urgentPerceptionWake:
+            isUrgentPerceptionWake(kind) || damageAwareWake || deathAwareWake,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
           shouldStopAfterResponse: () =>
             this.#pendingThoughtWake?.kind === "body_outcome" ||
@@ -835,6 +863,7 @@ export class PlayerRuntime {
     kind: PlayerWakeKind,
     reason: string,
     damageAware = false,
+    deathAware = false,
   ): void {
     const pending = this.#pendingThoughtWake;
     const priority = (wake: PlayerWakeKind): number =>
@@ -847,15 +876,18 @@ export class PlayerRuntime {
             : wake === "operation_stalled"
               ? 2
               : 1;
+    const mergedAwareness = {
+      damageAware: damageAware || pending?.damageAware === true,
+      deathAware: deathAware || pending?.deathAware === true,
+    };
     if (pending !== undefined && priority(pending.kind) > priority(kind)) {
-      if (damageAware && !pending.damageAware)
-        this.#pendingThoughtWake = { ...pending, damageAware: true };
+      this.#pendingThoughtWake = { ...pending, ...mergedAwareness };
       return;
     }
     this.#pendingThoughtWake = {
       kind,
       reason,
-      damageAware: damageAware || pending?.damageAware === true,
+      ...mergedAwareness,
     };
   }
 
@@ -871,6 +903,8 @@ export class PlayerRuntime {
     this.#activeThoughtCommitted = false;
     this.#activeThoughtDamageAware = false;
     this.#activeThoughtDamageInvalidated = false;
+    this.#activeThoughtDeathAware = false;
+    this.#activeThoughtDeathInvalidated = false;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
@@ -903,6 +937,7 @@ export class PlayerRuntime {
       pending.reason,
       true,
       pending.damageAware,
+      pending.deathAware,
     );
   }
 

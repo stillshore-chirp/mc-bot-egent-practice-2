@@ -2429,6 +2429,105 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("rejects an unaware thought once, then commits through repeated death wakes", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseUnawareThought: (() => void) | undefined;
+    let releaseDeathAwareThought: (() => void) | undefined;
+    const unawareGate = new Promise<void>((resolve) => {
+      releaseUnawareThought = resolve;
+    });
+    const deathAwareGate = new Promise<void>((resolve) => {
+      releaseDeathAwareThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    let deathAwareEventKinds: readonly string[] = [];
+    let startupWasMarkedUrgent: boolean | undefined;
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, events, urgentPerceptionWake }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          startupWasMarkedUrgent = urgentPerceptionWake;
+          await unawareGate;
+        } else {
+          deathAwareEventKinds = events.map(({ kind }) => kind);
+          expect(urgentPerceptionWake).toBe(true);
+          await deathAwareGate;
+        }
+        const decision = action(`death-freshness-${thoughtCount}`);
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    runtimeRef.current = fixture.runtime;
+    fixture.mind.enqueueEvent("bot_death", "historical pending death");
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      expect(startupWasMarkedUrgent).toBe(false);
+      let eventTime = Date.now();
+      let latestEventAt = "";
+      const emitDeath = () => {
+        eventTime += 1;
+        latestEventAt = new Date(eventTime).toISOString();
+        fixture.body.emit({
+          type: "bot_death",
+          at: latestEventAt,
+        });
+      };
+      const initialRevision = fixture.mind.snapshot().revision;
+      emitDeath();
+      const invalidatedRevision = fixture.mind.snapshot().revision;
+      expect(invalidatedRevision).toBe(initialRevision + 1);
+      emitDeath();
+      emitDeath();
+      expect(fixture.mind.snapshot().revision).toBe(invalidatedRevision);
+      expect(fixture.mind.snapshot().latestDeath?.observedAt).toBe(
+        latestEventAt,
+      );
+
+      releaseUnawareThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(deathAwareEventKinds).toContain("bot_death");
+      const deathAwareRevision = fixture.mind.snapshot().revision;
+      emitDeath();
+      emitDeath();
+      emitDeath();
+      expect(fixture.mind.snapshot().revision).toBe(deathAwareRevision);
+      expect(fixture.mind.snapshot().latestDeath?.observedAt).toBe(
+        latestEventAt,
+      );
+
+      releaseDeathAwareThought?.();
+      await waitFor(
+        () => commits.includes(true) && fixture.body.started.length > 0,
+      );
+      expect(commits.slice(0, 2)).toEqual([false, true]);
+      expect(fixture.body.started).toContain("look");
+    } finally {
+      releaseUnawareThought?.();
+      releaseDeathAwareThought?.();
+      await fixture.close();
+    }
+  });
+
   it("keeps a damage-aware thought live when owner proposal wins the pending-wake priority", async () => {
     const fixtureRef: {
       current?: ReturnType<typeof createRuntimeFixture>;
@@ -2942,8 +3041,10 @@ describe("integrated player runtime", () => {
     try {
       await runtime.start();
       expect(runtime.snapshot.stopped).toBe(true);
+      body.emit({ type: "bot_death", at: new Date().toISOString() });
       expect(body.started).toHaveLength(0);
       expect(thoughtCount).toBe(0);
+      expect(runtime.snapshot.stopped).toBe(true);
       expect(mind.resume(stopped.stopGeneration - 1)).toBeUndefined();
     } finally {
       await runtime.shutdown();

@@ -719,6 +719,7 @@ export class PlayerMindStore {
     observedAt: string,
     summary: string,
     cause?: PlayerBodyDeathCause,
+    options: { readonly invalidateDecision?: boolean } = {},
   ): PlayerRuntimeEvent {
     const deathObservedAt = isoDate(observedAt);
     const safeSummary = bounded(summary, 400, "event summary");
@@ -742,7 +743,8 @@ export class PlayerMindStore {
       this.writeStored(
         {
           ...current,
-          revision: current.revision + 1,
+          revision:
+            current.revision + (options.invalidateDecision === false ? 0 : 1),
           latestDeath,
         },
         now,
