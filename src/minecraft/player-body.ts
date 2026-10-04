@@ -531,7 +531,7 @@ interface ActiveOperation {
   readonly startedAtMs: number;
   readonly startedLifeGeneration: number;
   resolvedMoveTarget?: Vec3;
-  moveRelativeNoPathFallbackAttempted: boolean;
+  moveRelativeLeadInputAttempted: boolean;
   done: Promise<PlayerOperationResult>;
   timedOut: boolean;
   lastProgressAt: number;
@@ -647,10 +647,6 @@ function errorDetail(error: unknown): string {
   if (error instanceof Error)
     return `${error.name}: ${error.message}`.slice(0, 320);
   return String(error).slice(0, 320);
-}
-
-function isNoPathError(error: unknown): boolean {
-  return error instanceof Error && error.name === "NoPath";
 }
 
 function digTimeoutFor(
@@ -2425,7 +2421,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       startedAt,
       startedAtMs: Date.now(),
       startedLifeGeneration: this.lifeGeneration,
-      moveRelativeNoPathFallbackAttempted: false,
+      moveRelativeLeadInputAttempted: false,
       done: Promise.resolve({
         operationId: "",
         operation,
@@ -2642,9 +2638,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       detail =
         "Mineflayer accepted the request, but the resulting world effect was not observable.";
     }
-    if (active.moveRelativeNoPathFallbackAttempted)
+    if (active.moveRelativeLeadInputAttempted)
       detail +=
-        " PathfinderはNoPathを返し、同じ水平目標方向へ短い通常移動入力を一度試しました。未到達は成功としていません。";
+        " Pathfinder開始前に、同じ水平目標方向へ短い通常移動入力を一度試しました。入力だけでは到達を成功扱いしません。";
 
     const completedAt = new Date().toISOString();
     const result: PlayerOperationResult = {
@@ -2940,7 +2936,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
   }
 
-  private isCurrentMoveRelativeFallback(
+  private isCurrentMoveRelativeInputCurrent(
     bot: Bot,
     signal: AbortSignal,
     active: ActiveOperation,
@@ -2970,13 +2966,13 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
   }
 
-  private async tryMoveRelativeNoPathFallback(
+  private async tryMoveRelativeLeadInput(
     bot: Bot,
     target: { readonly x: number; readonly y: number; readonly z: number },
     signal: AbortSignal,
     active: ActiveOperation,
   ): Promise<void> {
-    if (!this.isCurrentMoveRelativeFallback(bot, signal, active)) return;
+    if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) return;
     const controls = controlsTowardHorizontalTarget(bot, target);
     if (controls.length === 0) return;
     try {
@@ -2984,7 +2980,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     } catch {
       return;
     }
-    if (!this.isCurrentMoveRelativeFallback(bot, signal, active)) return;
+    if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) return;
 
     const waitController = new AbortController();
     const abortWait = (): void => waitController.abort(signal.reason);
@@ -3009,10 +3005,11 @@ export class MineflayerPlayerBody implements PlayerBody {
       for (const control of horizontalMovementControls)
         bot.setControlState(control, false);
       for (const control of controls) {
-        if (!this.isCurrentMoveRelativeFallback(bot, signal, active)) return;
+        if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active))
+          return;
         bot.setControlState(control, true);
         attempted = true;
-        active.moveRelativeNoPathFallbackAttempted = true;
+        active.moveRelativeLeadInputAttempted = true;
       }
       if (!attempted) return;
 
@@ -3020,7 +3017,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       await waitTicks(5, waitController.signal);
     } catch (error) {
       if (signal.aborted) throw error;
-      // A disconnected client can reject control input; preserve the original NoPath result.
+      // A disconnected client can reject control input; keep the existing operation result handling.
     } finally {
       signal.removeEventListener("abort", abortWait);
       bot.removeListener("end", endWait);
@@ -3064,6 +3061,15 @@ export class MineflayerPlayerBody implements PlayerBody {
           target.z,
           operation.range,
         );
+        if (operation.kind === "move_relative") {
+          await this.tryMoveRelativeLeadInput(bot, target, signal, active);
+          if (!this.isCurrentMoveRelativeInputCurrent(bot, signal, active)) {
+            if (signal.aborted) throw abortError(signal);
+            throw new Error(
+              "The Minecraft life or connection changed before relative pathfinding started.",
+            );
+          }
+        }
         let latestPathUpdateStatus: string | undefined;
         let observingPathUpdates = true;
         const capturePathUpdate = (results: {
@@ -3101,29 +3107,10 @@ export class MineflayerPlayerBody implements PlayerBody {
           });
         try {
           if (signal.aborted) return;
-          try {
-            await bot.pathfinder.goto(goal);
-          } catch (error) {
-            if (operation.kind === "move_relative" && isNoPathError(error))
-              await this.tryMoveRelativeNoPathFallback(
-                bot,
-                target,
-                signal,
-                active,
-              );
-            throw error;
-          }
+          await bot.pathfinder.goto(goal);
           if (latestPathUpdateStatus === "noPath") {
             const error = new Error("No path to the goal!");
-            if (operation.kind === "move_relative") {
-              error.name = "NoPath";
-              await this.tryMoveRelativeNoPathFallback(
-                bot,
-                target,
-                signal,
-                active,
-              );
-            }
+            if (operation.kind === "move_relative") error.name = "NoPath";
             throw error;
           }
         } finally {
