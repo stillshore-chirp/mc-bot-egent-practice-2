@@ -3829,6 +3829,8 @@ describe("player body", () => {
     const fake = makeFakeBot();
     fake.bot.entity.position.x = 4.2;
     fake.bot.entity.position.z = 2.4;
+    const setControlState = vi.fn();
+    Object.assign(fake.bot, { setControlState });
     const body = new MineflayerPlayerBody(() => fake.bot);
     let plannedGoal: unknown;
     const goto = vi
@@ -3848,8 +3850,101 @@ describe("player body", () => {
     expect(result.status).toBe("successful");
     expect(result.operation.kind).toBe("move_relative");
     expect(goto).toHaveBeenCalledOnce();
+    expect(setControlState).not.toHaveBeenCalledWith("right", true);
     expect(plannedGoal).toMatchObject({ x: 8, y: 64, z: 1 });
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("tries a brief same-direction control only after relative NoPath and keeps the failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const setControlState = vi.fn();
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      const result = await resultPromise;
+
+      expect(setControlState).toHaveBeenCalledWith("right", true);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+      expect(result.status).toBe("failed");
+      expect(result.detail).toContain("NoPath");
+      expect(result.detail).toContain("短い通常移動入力を一度試しました");
+      expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not use the NoPath fallback when a later relative-move error follows noPath status", async () => {
+    const fake = makeFakeBot();
+    const setControlState = vi.fn();
+    Object.assign(fake.bot, { setControlState });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const stopped = new Error("Path was stopped");
+    stopped.name = "PathStopped";
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(async () => {
+      fake.bot.emit("path_update", {
+        status: "noPath",
+        path: [],
+        cost: 0,
+        time: 0,
+        visitedNodes: 0,
+        generatedNodes: 0,
+      });
+      throw stopped;
+    });
+
+    const result = await body.execute({
+      kind: "move_relative",
+      offset: { x: 3, y: 0, z: 0 },
+      range: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(setControlState).not.toHaveBeenCalledWith("right", true);
+  });
+
+  it("releases the NoPath control immediately when the owner aborts", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const controller = new AbortController();
+      const setControlState = vi.fn((_control: string, enabled: boolean) => {
+        if (enabled) controller.abort(new Error("Owner stopped movement"));
+      });
+      Object.assign(fake.bot, { setControlState });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const noPath = new Error("No path to the goal!");
+      noPath.name = "NoPath";
+      vi.spyOn(fake.bot.pathfinder, "goto").mockRejectedValueOnce(noPath);
+
+      const resultPromise = body.execute(
+        {
+          kind: "move_relative",
+          offset: { x: 3, y: 0, z: 0 },
+          range: 1,
+        },
+        controller.signal,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(setControlState).toHaveBeenCalledWith("right", true);
+      expect(setControlState).toHaveBeenLastCalledWith("right", false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not claim a relative move succeeded without observed arrival", async () => {
