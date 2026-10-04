@@ -15,8 +15,9 @@ export function isHostileEntity(
 ): boolean {
   if (type === "player") return false;
   const entity = registry.entitiesByName[name];
-  if (entity?.type === "hostile") return true;
-  if (type !== "mob" || entity === undefined) return false;
+  if (entity === undefined) return type === "hostile";
+  if (entity.type === "hostile") return true;
+  if (type !== "mob" && type !== "hostile") return false;
   if (entity.type !== undefined && entity.type !== "mob") return false;
   return entity.category === "Hostile mobs";
 }

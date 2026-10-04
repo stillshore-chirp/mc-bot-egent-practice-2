@@ -45,6 +45,7 @@ describe("versioned hostile classification", () => {
       expect(isHostileEntity(name, entity?.type ?? "mob", registry261)).toBe(
         false,
       );
+      expect(isHostileEntity(name, "hostile", registry261)).toBe(false);
     }
     expect(isHostileEntity("player", "player", registry261)).toBe(false);
   });
@@ -58,12 +59,12 @@ describe("versioned hostile classification", () => {
     };
     expect(isHostileEntity("legacy_zombie", "mob", legacyRegistry)).toBe(true);
     expect(isHostileEntity("legacy_zombie", "hostile", legacyRegistry)).toBe(
-      false,
+      true,
     );
     expect(isHostileEntity("legacy_crystal", "mob", legacyRegistry)).toBe(
       false,
     );
-    expect(isHostileEntity("future_hostile", "hostile", registry)).toBe(false);
+    expect(isHostileEntity("future_hostile", "hostile", registry)).toBe(true);
     expect(isHostileEntity("future_unknown", "other", registry)).toBe(false);
   });
 });
