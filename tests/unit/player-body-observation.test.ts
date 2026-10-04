@@ -111,6 +111,8 @@ describe("nearby hostile observation", () => {
         fromRegistry(4, "creeper", new Vec3(8, 64, 4)),
         fromRegistry(5, "drowned", new Vec3(0, 64, 9)),
         fromRegistry(6, "player", new Vec3(0, 64, 6)),
+        fromRegistry(7, "end_crystal", new Vec3(0, 64, -1)),
+        fromRegistry(8, "strider", new Vec3(0, 64, 1)),
       ],
       false,
     );
@@ -120,6 +122,10 @@ describe("nearby hostile observation", () => {
     for (const name of ["zombie", "skeleton", "creeper", "drowned"])
       expect(registry.entitiesByName[name]?.type).toBe("hostile");
     expect(registry.entitiesByName.player?.type).toBe("player");
+    expect(registry.entitiesByName.end_crystal?.type).toBe("other");
+    expect(registry.entitiesByName.strider?.type).toBe("animal");
+    expect(registry.entitiesByName.end_crystal?.category).toBe("Hostile mobs");
+    expect(registry.entitiesByName.strider?.category).toBe("Hostile mobs");
 
     const observation = observePlayerBody(bot, undefined);
     expect(

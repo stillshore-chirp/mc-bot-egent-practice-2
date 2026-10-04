@@ -2100,6 +2100,25 @@ describe("player body", () => {
     const zombie = addFakeZombieEntity(fake);
     Object.assign(zombie, { type: zombieDefinition.type });
     zombie.position = new Vec3(0, 64, 2);
+    const decoys = ["end_crystal", "strider"].map((name, index) => {
+      const definition = registry.entitiesByName[name];
+      if (definition === undefined)
+        throw new Error(`Missing 26.1 ${name} registry entry`);
+      const decoy = {
+        id: index + 3,
+        name,
+        type: definition.type,
+        position: new Vec3(0, 64, -0.5 - index),
+        velocity: new Vec3(0, 0, 0),
+        yaw: 0,
+        pitch: 0,
+        height: 1.8,
+        metadata: [],
+      } as unknown as Entity;
+      (fake.bot.entities as Record<number, Entity>)[decoy.id] = decoy;
+      Object.assign(fake.bot.registry.entitiesByName, { [name]: definition });
+      return decoy;
+    });
     Object.assign(fake.bot.registry.entitiesByName, {
       zombie: zombieDefinition,
     });
@@ -2124,6 +2143,8 @@ describe("player body", () => {
     await vi.waitFor(() =>
       expect(fake.bot.attack).toHaveBeenCalledWith(zombie),
     );
+    for (const decoy of decoys)
+      expect(fake.bot.attack).not.toHaveBeenCalledWith(decoy);
     await body.stop();
   });
 

@@ -29,8 +29,41 @@ describe("versioned hostile classification", () => {
     }
   });
 
-  it("uses a hostile protocol type only when registry data is unavailable", () => {
-    expect(isHostileEntity("future_hostile", "hostile", registry)).toBe(true);
+  it("uses 26.1 registry types so hostile category alone does not promote other entities", () => {
+    const registry261 = minecraftData("26.1");
+    for (const name of ["zombie", "skeleton", "creeper", "drowned"]) {
+      const entity = registry261.entitiesByName[name];
+      expect(entity?.type, name).toBe("hostile");
+      expect(
+        isHostileEntity(name, entity?.type ?? "unknown", registry261),
+      ).toBe(true);
+    }
+    for (const name of ["end_crystal", "strider"]) {
+      const entity = registry261.entitiesByName[name];
+      expect(entity?.category, name).toBe("Hostile mobs");
+      expect(entity?.type).not.toBe("hostile");
+      expect(isHostileEntity(name, entity?.type ?? "mob", registry261)).toBe(
+        false,
+      );
+    }
+    expect(isHostileEntity("player", "player", registry261)).toBe(false);
+  });
+
+  it("keeps the category fallback only for legacy mob adapter data", () => {
+    const legacyRegistry = {
+      entitiesByName: {
+        legacy_zombie: { category: "Hostile mobs" },
+        legacy_crystal: { type: "other", category: "Hostile mobs" },
+      },
+    };
+    expect(isHostileEntity("legacy_zombie", "mob", legacyRegistry)).toBe(true);
+    expect(isHostileEntity("legacy_zombie", "hostile", legacyRegistry)).toBe(
+      false,
+    );
+    expect(isHostileEntity("legacy_crystal", "mob", legacyRegistry)).toBe(
+      false,
+    );
+    expect(isHostileEntity("future_hostile", "hostile", registry)).toBe(false);
     expect(isHostileEntity("future_unknown", "other", registry)).toBe(false);
   });
 });
