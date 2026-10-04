@@ -87,6 +87,17 @@ export interface BodyVisibleDroppedItem {
   readonly count: number;
 }
 
+export interface PlayerBodyNearbyHostiles {
+  /** Client-received hostile entities with an unoccluded ray, regardless of FOV. */
+  readonly source: "client_received_unoccluded_nearby_hostiles";
+  readonly observedAt: string;
+  readonly maxDistance: number;
+  readonly entityOutputLimit: number;
+  readonly omittedEntityCandidates: number;
+  readonly candidateSearchMayBeTruncated: boolean;
+  readonly entities: readonly BodyVisibleEntity[];
+}
+
 export interface BodyWindowSnapshot {
   readonly id: number;
   readonly type: string;
@@ -156,6 +167,8 @@ export interface PlayerBodyObservation {
     readonly placementCandidatesMayBeTruncated: boolean;
     readonly placementCandidates: readonly BodyPlacementCandidate[];
     readonly entities: readonly BodyVisibleEntity[];
+    /** Current client-received nearby hostiles, a visible subset rather than a world census. */
+    readonly nearbyHostiles?: PlayerBodyNearbyHostiles | undefined;
     readonly ownerPositionException?: {
       readonly username: string;
       readonly position: BodyPosition;
@@ -347,6 +360,8 @@ const nearbyDoorInteractionRange = 4.5;
 const entityCandidateLimit = 128;
 const blockOutputLimit = 96;
 const entityOutputLimit = 64;
+const nearbyHostileCandidateLimit = 128;
+const nearbyHostileOutputLimit = 16;
 const placementCandidateLimit = 24;
 const placementInteractionRange = 4.5;
 const airBlockNames = new Set(["air", "cave_air", "void_air"]);
@@ -558,6 +573,30 @@ function entityHealth(entity: Entity): number | null {
   return typeof entity.health === "number" && Number.isFinite(entity.health)
     ? entity.health
     : null;
+}
+
+function bodyVisibleEntity(
+  bot: Bot,
+  entity: Entity,
+  distance: number,
+  dimension: string,
+): BodyVisibleEntity {
+  const name = entityName(entity);
+  const equipment = visibleEntityEquipment(entity);
+  const droppedItem = visibleDroppedItem(bot, entity);
+  return {
+    id: entity.id,
+    name,
+    kind: entity.type,
+    category: bot.registry.entitiesByName[name]?.category ?? null,
+    position: positionOf(entity.position, dimension),
+    distance,
+    health: entityHealth(entity),
+    isPlayer: entity.username !== undefined,
+    ...(entity.username === undefined ? {} : { username: entity.username }),
+    ...(equipment === undefined ? {} : { equipment }),
+    ...(droppedItem === undefined ? {} : { droppedItem }),
+  };
 }
 
 function blockPositionKey(position: {
@@ -945,6 +984,11 @@ export function observePlayerBody(
     .map((entity) => ({ entity, distance: origin.distanceTo(entity.position) }))
     .filter(({ distance }) => distance <= maxVisibleDistance)
     .sort((left, right) => left.distance - right.distance);
+  const nearbyHostileCandidates = entityCandidates.filter(({ entity }) => {
+    if (entity.type !== "mob" || entity.username !== undefined) return false;
+    const name = entityName(entity);
+    return bot.registry.entitiesByName[name]?.category === "Hostile mobs";
+  });
   const visibleEntities: BodyVisibleEntity[] = [];
   for (const { entity, distance } of entityCandidates.slice(
     0,
@@ -957,24 +1001,32 @@ export function observePlayerBody(
     );
     if (!insideViewCone(bot, target) || !unoccludedToEntity(bot, entity))
       continue;
-    const name = entityName(entity);
-    const category = bot.registry.entitiesByName[name]?.category ?? null;
-    const equipment = visibleEntityEquipment(entity);
-    const droppedItem = visibleDroppedItem(bot, entity);
-    visibleEntities.push({
-      id: entity.id,
-      name,
-      kind: entity.type,
-      category,
-      position: positionOf(entity.position, dimension),
-      distance,
-      health: entityHealth(entity),
-      isPlayer: entity.username !== undefined,
-      ...(entity.username === undefined ? {} : { username: entity.username }),
-      ...(equipment === undefined ? {} : { equipment }),
-      ...(droppedItem === undefined ? {} : { droppedItem }),
-    });
+    visibleEntities.push(bodyVisibleEntity(bot, entity, distance, dimension));
   }
+
+  const unoccludedNearbyHostiles: BodyVisibleEntity[] = [];
+  for (const { entity, distance } of nearbyHostileCandidates.slice(
+    0,
+    nearbyHostileCandidateLimit,
+  )) {
+    if (!unoccludedToEntity(bot, entity)) continue;
+    unoccludedNearbyHostiles.push(
+      bodyVisibleEntity(bot, entity, distance, dimension),
+    );
+  }
+  const nearbyHostiles: PlayerBodyNearbyHostiles = {
+    source: "client_received_unoccluded_nearby_hostiles",
+    observedAt,
+    maxDistance: maxVisibleDistance,
+    entityOutputLimit: nearbyHostileOutputLimit,
+    omittedEntityCandidates: Math.max(
+      0,
+      unoccludedNearbyHostiles.length - nearbyHostileOutputLimit,
+    ),
+    candidateSearchMayBeTruncated:
+      nearbyHostileCandidates.length > nearbyHostileCandidateLimit,
+    entities: unoccludedNearbyHostiles.slice(0, nearbyHostileOutputLimit),
+  };
 
   const inventory: BodyItemStack[] = bot.inventory.slots.flatMap(
     (item, slot) => {
@@ -1113,6 +1165,7 @@ export function observePlayerBody(
       placementCandidatesMayBeTruncated: placementObservation.mayBeTruncated,
       placementCandidates: placementObservation.candidates,
       entities: visibleEntities.slice(0, entityOutputLimit),
+      nearbyHostiles,
       ...(ownerPositionException === undefined
         ? {}
         : { ownerPositionException }),

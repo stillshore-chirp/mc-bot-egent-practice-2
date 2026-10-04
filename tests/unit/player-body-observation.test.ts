@@ -1,0 +1,151 @@
+import { Vec3 } from "vec3";
+import type { Bot } from "mineflayer";
+import { describe, expect, it } from "vitest";
+import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
+
+interface FixtureEntity {
+  readonly id: number;
+  readonly name: string;
+  readonly type: string;
+  readonly position: Vec3;
+  readonly velocity: Vec3;
+  readonly height: number;
+  readonly health?: number;
+  readonly username?: string;
+  readonly equipment?: readonly (null | { readonly name: string })[];
+}
+
+function makeObservationBot(
+  entities: readonly FixtureEntity[],
+  blockPositiveX = true,
+): Bot {
+  const self = {
+    id: 1,
+    name: "player",
+    type: "player",
+    position: new Vec3(0, 64, 0),
+    velocity: new Vec3(0, 0, 0),
+    yaw: 0,
+    pitch: 0,
+    height: 1.8,
+    eyeHeight: 1.62,
+  };
+  const byId: Record<number, unknown> = { 1: self };
+  for (const entity of entities) byId[entity.id] = entity;
+  const inventory = { slots: Array.from({ length: 46 }, () => null) };
+  const bot = {
+    username: "bot",
+    version: "1.21.4",
+    entity: self,
+    entities: byId,
+    players: {},
+    game: { dimension: "overworld", gameMode: "survival" },
+    time: { day: 1, timeOfDay: 5_000, isDay: true },
+    isRaining: false,
+    health: 20,
+    food: 20,
+    foodSaturation: 5,
+    isSleeping: false,
+    experience: { level: 0, points: 0, progress: 0 },
+    inventory,
+    currentWindow: null,
+    registry: {
+      entitiesByName: {
+        zombie: { category: "Hostile mobs" },
+        skeleton: { category: "Hostile mobs" },
+        cow: { category: "Passive mobs" },
+        player: { category: "Hostile mobs" },
+      },
+      itemsByName: {},
+    },
+    findBlocks: () => [],
+    blockAt: () => null,
+    canSeeBlock: () => true,
+    getEquipmentDestSlot: () => 0,
+    world: {
+      raycast: (_origin: Vec3, direction: Vec3) =>
+        blockPositiveX && direction.x > 0.55
+          ? { position: new Vec3(1, 64, 1) }
+          : null,
+    },
+  };
+  return bot as unknown as Bot;
+}
+
+function mob(
+  id: number,
+  name: string,
+  position: Vec3,
+  extra: Partial<FixtureEntity> = {},
+): FixtureEntity {
+  return {
+    id,
+    name,
+    type: "mob",
+    position,
+    velocity: new Vec3(0, 0, 0),
+    height: 1.8,
+    health: 18,
+    ...extra,
+  };
+}
+
+describe("nearby hostile observation", () => {
+  it("adds unoccluded client-received hostiles outside FOV with current evidence", () => {
+    const observation = observePlayerBody(
+      makeObservationBot([
+        mob(2, "zombie", new Vec3(0, 64, -4)),
+        mob(3, "skeleton", new Vec3(0, 64, 4), {
+          equipment: [
+            { name: "iron_sword" },
+            null,
+            null,
+            null,
+            null,
+            { name: "diamond_helmet" },
+          ],
+        }),
+        mob(4, "skeleton", new Vec3(5, 64, 4)),
+        mob(5, "cow", new Vec3(-4, 64, 4)),
+        mob(6, "player", new Vec3(0, 64, 5), { username: "other" }),
+        mob(7, "zombie", new Vec3(0, 64, 17)),
+        mob(8, "zombie", new Vec3(0, 64, 6), { type: "player" }),
+      ]),
+      undefined,
+    );
+    const nearby = observation.perception.nearbyHostiles;
+    expect(nearby).toBeDefined();
+    expect(nearby?.observedAt).toBe(observation.observedAt);
+    expect(nearby?.source).toBe("client_received_unoccluded_nearby_hostiles");
+    expect(nearby?.maxDistance).toBe(16);
+    expect(nearby?.entities.map(({ id }) => id)).toEqual([2, 3]);
+    expect(observation.perception.entities.map(({ id }) => id)).toContain(2);
+    expect(nearby?.entities[1]?.equipment).toEqual({
+      mainHand: "iron_sword",
+      offHand: null,
+      feet: null,
+      legs: null,
+      torso: null,
+      head: "diamond_helmet",
+    });
+  });
+
+  it("caps nearby output and marks omitted candidates and a truncated scan", () => {
+    const hostiles = Array.from({ length: 130 }, (_, index) =>
+      mob(
+        index + 2,
+        index % 2 === 0 ? "zombie" : "skeleton",
+        new Vec3(index % 5, 64, -2 - (index % 12)),
+      ),
+    );
+    const observation = observePlayerBody(
+      makeObservationBot(hostiles, false),
+      undefined,
+    );
+    const nearby = observation.perception.nearbyHostiles;
+    expect(nearby?.entities).toHaveLength(16);
+    expect(nearby?.entityOutputLimit).toBe(16);
+    expect(nearby?.omittedEntityCandidates).toBe(112);
+    expect(nearby?.candidateSearchMayBeTruncated).toBe(true);
+  });
+});
