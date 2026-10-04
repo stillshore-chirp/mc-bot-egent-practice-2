@@ -1412,6 +1412,51 @@ describe("player body", () => {
     expect(events.some((event) => event.type === "disconnected")).toBe(true);
   });
 
+  it("does not emit observation-driven state changes while spawn admission is unavailable", async () => {
+    const fake = makeFakeBot();
+    let spawned = true;
+    const body = new MineflayerPlayerBody(() => {
+      if (!spawned) throw new Error("Bot is not spawned");
+      return fake.bot;
+    });
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    spawned = false;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+
+    expect(events.some((event) => event.type === "state_changed")).toBe(false);
+    await expect(body.observe()).rejects.toThrow("Bot is not spawned");
+  });
+
+  it("resumes observation-driven state changes with a fresh observation after spawn", async () => {
+    const fake = makeFakeBot();
+    let spawned = true;
+    const body = new MineflayerPlayerBody(() => {
+      if (!spawned) throw new Error("Bot is not spawned");
+      return fake.bot;
+    });
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    spawned = false;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+    spawned = true;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+
+    expect(
+      events.some(
+        (event) => event.type === "state_changed" && event.reason === "vitals",
+      ),
+    ).toBe(true);
+    await expect(body.observe()).resolves.toMatchObject({
+      self: { health: fake.bot.health },
+    });
+  });
+
   it("emits self damage with Mineflayer's attributed source but no private identity or position", () => {
     const fake = makeFakeBot();
     const zombie = {

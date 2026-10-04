@@ -2935,6 +2935,14 @@ export class MineflayerPlayerBody implements PlayerBody {
         this.stateTimers.delete(reason);
         const bot = this.boundBot;
         if (bot === undefined) return;
+        try {
+          if (this.getBot() !== bot) return;
+        } catch {
+          // Ignore entity updates while the client is between death and spawn.
+          // The death event is already durable; a fresh observation will follow
+          // once Mineflayer's spawn admission is restored.
+          return;
+        }
         const observation = this.safeObserve(bot);
         if (observation === null) return;
         const signature = semanticSignature(observation, reason);
