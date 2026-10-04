@@ -981,6 +981,206 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("enables the damage reflex only while autonomy is active", async () => {
+    const fixture = createRuntimeFixture();
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.reflexEnableCalls.length === 1);
+      expect(fixture.body.reflexEnableCalls).toEqual([true]);
+
+      const stopped = fixture.mind.stop();
+      if (stopped === undefined) throw new Error("TEST_STOP_NOT_PERSISTED");
+      await fixture.runtime.stopNow();
+      expect(fixture.body.reflexEnableCalls).toEqual([true, false]);
+      expect(fixture.body.lifecycleCalls.indexOf("reflex:false")).toBeLessThan(
+        fixture.body.lifecycleCalls.indexOf("stop"),
+      );
+
+      expect(fixture.mind.resume(stopped.stopGeneration)).toBeDefined();
+      fixture.runtime.onResume();
+      await waitFor(() => fixture.body.reflexEnableCalls.length === 3);
+      expect(fixture.body.reflexEnableCalls).toEqual([true, false, true]);
+
+      await fixture.runtime.shutdown();
+      expect(fixture.body.reflexEnableCalls.at(-1)).toBe(false);
+      expect(fixture.body.lifecycleCalls.at(-1)).toBe("stop");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("defers coalesced reflex outcomes until a damage-aware thought can commit", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const memoryEpisodes: { summary: string; status: string }[] = [];
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let purposeCalls = 0;
+    let secondThoughtAccepted: boolean | undefined;
+    let thirdThoughtEvents: readonly { kind: string; summary: string }[] = [];
+    let releaseSecondThought!: () => void;
+    const secondThoughtGate = new Promise<void>((resolve) => {
+      releaseSecondThought = resolve;
+    });
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: {
+        ...createMemoryPort(),
+        recordEpisode: ({ summary, status }) =>
+          memoryEpisodes.push({ summary, status }),
+      },
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events }) => {
+          purposeCalls += 1;
+          if (purposeCalls === 1) {
+            const decision = action("primary-action-before-reflex");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            mind.consumeEvents(events.map(({ id }) => id));
+            return { accepted: saved.accepted, decision };
+          }
+          if (purposeCalls === 2) {
+            await secondThoughtGate;
+            const decision = {
+              kind: "continue" as const,
+              reason: "Continue the current primary operation.",
+            };
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            secondThoughtAccepted = saved.accepted;
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            mind.consumeEvents(events.map(({ id }) => id));
+            return { accepted: saved.accepted, decision };
+          }
+          thirdThoughtEvents = events.map(({ kind, summary }) => ({
+            kind,
+            summary,
+          }));
+          return { accepted: false };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      const primaryOperationId = mind.snapshot().activeOperation?.operationId;
+      if (primaryOperationId === undefined)
+        throw new Error("TEST_PRIMARY_OPERATION_MISSING");
+
+      const firstDamageAt = new Date().toISOString();
+      body.emit({ type: "damage_reflex_started", at: firstDamageAt });
+      body.emit({
+        type: "bot_damaged",
+        at: firstDamageAt,
+        source: null,
+        confidence: "unknown",
+      });
+      await waitFor(() => purposeCalls === 2);
+      body.emit({
+        type: "damage_reflex_completed",
+        at: new Date(Date.parse(firstDamageAt) + 1_000).toISOString(),
+        operationKind: "attack",
+        status: "successful",
+        startedAt: firstDamageAt,
+        serverConfirmedAt: new Date(
+          Date.parse(firstDamageAt) + 500,
+        ).toISOString(),
+        sameLife: true,
+        summary: "hit_confirmed",
+      });
+      expect(mind.snapshot().lastOutcome).toBeUndefined();
+      expect(mind.snapshot().activeOperation?.operationId).toBe(
+        primaryOperationId,
+      );
+
+      const repeatedDamageAt = new Date(
+        Date.parse(firstDamageAt) + 5_000,
+      ).toISOString();
+      body.emit({
+        type: "bot_damaged",
+        at: repeatedDamageAt,
+        source: null,
+        confidence: "unknown",
+      });
+      body.emit({
+        type: "damage_reflex_completed",
+        at: new Date(Date.parse(repeatedDamageAt) + 1_000).toISOString(),
+        operationKind: "control",
+        status: "unverified",
+        startedAt: repeatedDamageAt,
+        serverConfirmedAt: null,
+        sameLife: null,
+        summary: "action_unverified",
+      });
+      releaseSecondThought();
+
+      await waitFor(() => purposeCalls === 3);
+      expect(secondThoughtAccepted).toBe(true);
+      expect(mind.snapshot().activeOperation?.operationId).toBe(
+        primaryOperationId,
+      );
+      const outcomes = mind.snapshot().recentOutcomes;
+      expect(
+        outcomes.some(
+          ({ kind, status, summary }) =>
+            kind === "attack" &&
+            status === "successful" &&
+            summary.includes("sameLife=true"),
+        ),
+      ).toBe(true);
+      expect(
+        outcomes.some(
+          ({ kind, status }) => kind === "control" && status === "unverified",
+        ),
+      ).toBe(true);
+      expect(
+        thirdThoughtEvents.some(
+          ({ kind, summary }) =>
+            kind === "body_outcome" && summary.includes("events=2"),
+        ),
+      ).toBe(true);
+      const wakeSummary = thirdThoughtEvents.find(
+        ({ kind }) => kind === "body_outcome",
+      )?.summary;
+      expect(wakeSummary).toContain("serverConfirmedAt=");
+      expect(wakeSummary).toContain("sameLife=true");
+      expect(wakeSummary).toContain("action_unverified");
+      expect(memoryEpisodes).toHaveLength(2);
+      expect(JSON.stringify(memoryEpisodes)).not.toContain("entityId");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("suppresses a delayed owner proposal response after the stop latch is set", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -3062,6 +3262,7 @@ describe("integrated player runtime", () => {
     try {
       await runtime.start();
       expect(runtime.snapshot.stopped).toBe(true);
+      expect(body.reflexEnableCalls).toEqual([]);
       body.emit({ type: "bot_death", at: new Date().toISOString() });
       expect(body.started).toHaveLength(0);
       expect(thoughtCount).toBe(0);
@@ -3267,6 +3468,8 @@ describe("integrated player runtime", () => {
 class DeferredBody implements PlayerBody {
   readonly started: string[] = [];
   readonly results: PlayerOperationResult[] = [];
+  readonly reflexEnableCalls: boolean[] = [];
+  readonly lifecycleCalls: string[] = [];
   #listeners = new Set<(event: PlayerBodyEvent) => void>();
   #active = 0;
   #recoveryOnNextResult = false;
@@ -3278,6 +3481,7 @@ class DeferredBody implements PlayerBody {
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
+  stopActiveCalls = 0;
 
   public requireRecoveryOnNextResult(): void {
     this.#recoveryOnNextResult = true;
@@ -3371,6 +3575,17 @@ class DeferredBody implements PlayerBody {
 
   public async stop(): Promise<void> {
     this.stopCalls += 1;
+    this.lifecycleCalls.push("stop");
+  }
+
+  public setDamageReflexEnabled(enabled: boolean): void {
+    this.reflexEnableCalls.push(enabled);
+    this.lifecycleCalls.push(`reflex:${enabled}`);
+  }
+
+  public async stopActiveOperation(): Promise<void> {
+    this.stopActiveCalls += 1;
+    this.lifecycleCalls.push("stop_active");
   }
   public knowledge(query: string): PlayerKnowledge {
     return {

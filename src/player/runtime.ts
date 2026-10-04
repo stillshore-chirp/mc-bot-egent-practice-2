@@ -56,6 +56,17 @@ interface ActiveBodyRun {
   promise: Promise<void>;
 }
 
+type DamageReflexCompletedEvent = Extract<
+  PlayerBodyEvent,
+  { readonly type: "damage_reflex_completed" }
+>;
+
+interface PendingDamageReflexOutcome {
+  readonly latest: DamageReflexCompletedEvent;
+  readonly confirmed?: DamageReflexCompletedEvent;
+  readonly count: number;
+}
+
 export interface PlayerConversationPort {
   nextTurn(): number;
   handleOwnerMessage(input: {
@@ -134,6 +145,7 @@ export class PlayerRuntime {
   #recoveryRequestedOperationIds = new Set<string>();
   #ownerProposalsAwaitingResolution = new Set<string>();
   #ownerConsumeOperations = new Set<string>();
+  #pendingDamageReflexOutcome: PendingDamageReflexOutcome | undefined;
   #bodyConnected = true;
   #lastDamageEventAtMs = Number.NEGATIVE_INFINITY;
   #started = false;
@@ -280,6 +292,7 @@ export class PlayerRuntime {
       this.options.mind.purposeCompletionWakeState().sequence;
     this.#scheduleDeadline(snapshot.wait?.wakeAt);
     if (!snapshot.stopped) {
+      this.#setDamageReflexEnabled(true);
       await this.#sampleSemanticState();
       this.#startSampler();
       const completionWake = this.options.mind.purposeCompletionWakeState();
@@ -366,7 +379,8 @@ export class PlayerRuntime {
 
   /** A fresh, owner-authenticated resume wakes the purpose agent. */
   public onResume(): void {
-    if (this.options.mind.snapshot().stopped) return;
+    if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
+    this.#setDamageReflexEnabled(true);
     void this.#sampleSemanticState();
     this.#startSampler();
     const completionWake = this.options.mind.purposeCompletionWakeState();
@@ -456,7 +470,7 @@ export class PlayerRuntime {
       this.#abortActiveBody("action_revision_changed");
       this.#replacementTail = this.#replacementTail
         .catch(() => undefined)
-        .then(() => this.#stopBody("action_revision_changed"));
+        .then(() => this.#stopPrimaryOperation("action_revision_changed"));
     }
   }
 
@@ -542,6 +556,11 @@ export class PlayerRuntime {
       typeof bodyEvent.at === "string"
         ? bodyEvent.at
         : new Date().toISOString();
+    if (event.type === "damage_reflex_started") return;
+    if (event.type === "damage_reflex_completed") {
+      this.#queueDamageReflexOutcome(event);
+      return;
+    }
     if (event.type === "bot_damaged") {
       const damageAt = Date.parse(event.at);
       this.#lastDamageEventAtMs = Number.isFinite(damageAt)
@@ -909,6 +928,9 @@ export class PlayerRuntime {
     this.#activeThoughtDeathInvalidated = false;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
+    const reflexWake = this.#persistPendingDamageReflexOutcome();
+    if (reflexWake !== undefined)
+      this.#queueThoughtWake("body_outcome", reflexWake, true, true);
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
       this.#pendingThoughtWake = undefined;
       return;
@@ -941,6 +963,61 @@ export class PlayerRuntime {
       pending.damageAware,
       pending.deathAware,
     );
+  }
+
+  #queueDamageReflexOutcome(event: DamageReflexCompletedEvent): void {
+    const pending = this.#pendingDamageReflexOutcome;
+    const confirmed =
+      event.status === "successful" &&
+      event.sameLife === true &&
+      event.serverConfirmedAt !== null
+        ? event
+        : pending?.confirmed;
+    this.#pendingDamageReflexOutcome = {
+      latest: event,
+      ...(confirmed === undefined ? {} : { confirmed }),
+      count: (pending?.count ?? 0) + 1,
+    };
+    if (this.#activeThought !== undefined) return;
+    const summary = this.#persistPendingDamageReflexOutcome();
+    if (summary !== undefined)
+      this.#requestThought("body_outcome", summary, true, true);
+  }
+
+  #persistPendingDamageReflexOutcome(): string | undefined {
+    const pending = this.#pendingDamageReflexOutcome;
+    if (pending === undefined) return undefined;
+    const results = [pending.confirmed, pending.latest].filter(
+      (event, index, all): event is DamageReflexCompletedEvent =>
+        event !== undefined && all.indexOf(event) === index,
+    );
+    const summary = `damage-reflex events=${pending.count}; ${results
+      .map(damageReflexEvidenceSummary)
+      .join("; ")}`;
+    for (const [index, event] of results.entries()) {
+      const evidenceSummary = `damage-reflex ${damageReflexEvidenceSummary(event)}`;
+      if (event.operationKind !== null) {
+        this.options.mind.recordOutcome({
+          evidence: {
+            operationId: `damage-reflex:${event.startedAt}:${index}`,
+            kind: event.operationKind,
+            status: event.status,
+            summary: evidenceSummary,
+            observedAt: event.at,
+          },
+        });
+      }
+      this.options.memory.recordEpisode({
+        summary: `被害時の身体反射: ${evidenceSummary}`,
+        status: event.status,
+        operationKind: event.operationKind ?? "damage_reflex",
+      });
+    }
+    this.options.mind.enqueueEvent("body_outcome", summary, {
+      invalidateDecision: false,
+    });
+    this.#pendingDamageReflexOutcome = undefined;
+    return summary;
   }
 
   async #replaceBodyOperation(
@@ -1096,6 +1173,7 @@ export class PlayerRuntime {
   }
 
   async #stopBody(reason: string): Promise<void> {
+    this.#setDamageReflexEnabled(false);
     const running = this.#activeBody;
     if (running !== undefined) await this.#settleBody(running, reason);
     try {
@@ -1105,10 +1183,17 @@ export class PlayerRuntime {
     }
   }
 
+  async #stopPrimaryOperation(reason: string): Promise<void> {
+    const running = this.#activeBody;
+    if (running !== undefined) await this.#settleBody(running, reason);
+  }
+
   async #settleBody(run: ActiveBodyRun, reason: string): Promise<void> {
     run.controller.abort(new Error(reason));
     try {
-      await this.options.body.stop();
+      if (this.options.body.stopActiveOperation !== undefined)
+        await this.options.body.stopActiveOperation();
+      else await this.options.body.stop();
     } catch (error) {
       this.#logFailure("PLAYER_BODY_CANCEL_FAILED", error);
     }
@@ -1118,6 +1203,19 @@ export class PlayerRuntime {
       /* Operation result persistence is handled inside the body owner. */
     }
     if (this.#activeBody === run) this.#activeBody = undefined;
+  }
+
+  #setDamageReflexEnabled(enabled: boolean): void {
+    try {
+      this.options.body.setDamageReflexEnabled?.(enabled);
+    } catch (error) {
+      this.#logFailure(
+        enabled
+          ? "PLAYER_DAMAGE_REFLEX_ENABLE_FAILED"
+          : "PLAYER_DAMAGE_REFLEX_DISABLE_FAILED",
+        error,
+      );
+    }
   }
 
   #abortActiveBody(reason: string): void {
@@ -1454,6 +1552,12 @@ function groundedOperationSummary(result: PlayerOperationResult): string {
   const observedEffect = result.observedEffect?.type;
   const movement = observedMovementSummary(result);
   return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}${movement}次の判断では結果の実観測を再確認する。`;
+}
+
+function damageReflexEvidenceSummary(
+  event: DamageReflexCompletedEvent,
+): string {
+  return `${event.summary}; operation=${event.operationKind ?? "none"}; status=${event.status}; startedAt=${event.startedAt}; serverConfirmedAt=${event.serverConfirmedAt ?? "unknown"}; sameLife=${event.sameLife ?? "unknown"}`;
 }
 
 function ownerConsumeOutcomeMessage(

@@ -83,6 +83,16 @@ const consumeEffectObservationPollTicks = 1;
 const deathEvidenceCorrelationMs = 1_000;
 const spawnAdmissionWaitMs = 3_000;
 const spawnAdmissionPollMs = 50;
+const damageReflexActiveWindowMs = 1_000;
+const damageReflexMaximumWallMs = 4_000;
+const damageReflexSpawnWaitMs = 3_000;
+const damageReflexAttackTicks = 6;
+const damageReflexArmorSlots = [
+  { destination: "head", matches: /(?:^|_)helmet$/u },
+  { destination: "torso", matches: /_chestplate$/u },
+  { destination: "legs", matches: /_leggings$/u },
+  { destination: "feet", matches: /_boots$/u },
+] as const;
 
 export interface PlayerBodyDamageSource {
   readonly kind: string;
@@ -95,6 +105,41 @@ export interface PlayerBodyDeathCause {
   readonly confidence: "observed" | "unknown";
   readonly provenance: "damage_event" | "death_notification";
   readonly causeKey?: string;
+}
+
+export type PlayerBodyDamageReflexOperationKind =
+  "equip" | "attack" | "control";
+
+export type PlayerBodyDamageReflexSummary =
+  | "hit_confirmed"
+  | "equipment_confirmed"
+  | "equipment_and_hit_confirmed"
+  | "action_unverified"
+  | "source_unknown"
+  | "interrupted"
+  | "failed";
+
+interface DamageReflexRun {
+  readonly bot: Bot;
+  readonly controller: AbortController;
+  readonly startedAt: string;
+  readonly startedAtMs: number;
+  readonly startLifeGeneration: number;
+  readonly sourceWasObserved: boolean;
+  latestSource: Entity | undefined;
+  firstOperationKind: PlayerBodyDamageReflexOperationKind | null;
+  firstOperationStartedAt: string | null;
+  operationKind: PlayerBodyDamageReflexOperationKind | null;
+  status: PlayerOperationStatus;
+  serverConfirmedAt: string | null;
+  sameLife: boolean | null;
+  equipmentConfirmed: boolean;
+  hitConfirmed: boolean;
+  expectedEquipSlot: number | undefined;
+  expectedEquipName: string | undefined;
+  deadlineReached: boolean;
+  failed: boolean;
+  done: Promise<void>;
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -341,6 +386,17 @@ export type PlayerBodyEvent =
       readonly source: PlayerBodyDamageSource | null;
       readonly confidence: "observed" | "unknown";
     }
+  | { readonly type: "damage_reflex_started"; readonly at: string }
+  | {
+      readonly type: "damage_reflex_completed";
+      readonly at: string;
+      readonly operationKind: PlayerBodyDamageReflexOperationKind | null;
+      readonly status: PlayerOperationStatus;
+      readonly startedAt: string;
+      readonly serverConfirmedAt: string | null;
+      readonly sameLife: boolean | null;
+      readonly summary: PlayerBodyDamageReflexSummary;
+    }
   | {
       readonly type: "bot_death";
       readonly at: string;
@@ -410,6 +466,8 @@ export interface PlayerBody {
     signal?: AbortSignal,
   ): Promise<PlayerOperationResult>;
   stop(): Promise<void>;
+  setDamageReflexEnabled?(enabled: boolean): void;
+  stopActiveOperation?(): Promise<void>;
   knowledge(query: string): PlayerKnowledge;
   onEvent(listener: (event: PlayerBodyEvent) => void): () => void;
 }
@@ -1420,6 +1478,10 @@ function captureServerBlockUpdates(
 
 export class MineflayerPlayerBody implements PlayerBody {
   private active: ActiveOperation | undefined;
+  private damageReflexEnabled = false;
+  private damageReflex: DamageReflexRun | undefined;
+  private lifeGeneration = 0;
+  private botLifeDead = false;
   private admission: Promise<void> = Promise.resolve();
   private readonly pendingOperationAdmissions = new Set<AbortController>();
   private readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
@@ -1496,6 +1558,338 @@ export class MineflayerPlayerBody implements PlayerBody {
       // A disconnected client will be rebound on the next body operation.
     }
     return () => this.listeners.delete(listener);
+  }
+
+  private startDamageReflex(bot: Bot, source: Entity | undefined): void {
+    if (
+      !this.damageReflexEnabled ||
+      this.boundBot !== bot ||
+      this.boundBotEnded
+    )
+      return;
+    const current = this.damageReflex;
+    if (current?.bot === bot) {
+      if (source !== undefined) current.latestSource = source;
+      return;
+    }
+    const startedAt = new Date().toISOString();
+    const reflex: DamageReflexRun = {
+      bot,
+      controller: new AbortController(),
+      startedAt,
+      startedAtMs: Date.now(),
+      startLifeGeneration: this.lifeGeneration,
+      sourceWasObserved: source !== undefined,
+      latestSource: source,
+      firstOperationKind: null,
+      firstOperationStartedAt: null,
+      operationKind: null,
+      status: "unverified",
+      serverConfirmedAt: null,
+      sameLife: null,
+      equipmentConfirmed: false,
+      hitConfirmed: false,
+      expectedEquipSlot: undefined,
+      expectedEquipName: undefined,
+      deadlineReached: false,
+      failed: false,
+      done: Promise.resolve(),
+    };
+    this.damageReflex = reflex;
+    reflex.done = this.runDamageReflex(reflex);
+  }
+
+  private damageReflexIsCurrent(reflex: DamageReflexRun): boolean {
+    return (
+      this.damageReflex === reflex &&
+      this.damageReflexEnabled &&
+      this.boundBot === reflex.bot &&
+      !this.boundBotEnded
+    );
+  }
+
+  private damageReflexIsAlive(reflex: DamageReflexRun): boolean {
+    return (
+      this.damageReflexIsCurrent(reflex) &&
+      !this.botLifeDead &&
+      Number.isFinite(reflex.bot.health) &&
+      reflex.bot.health > 0
+    );
+  }
+
+  private markDamageReflexAttempt(
+    reflex: DamageReflexRun,
+    operationKind: PlayerBodyDamageReflexOperationKind,
+  ): void {
+    if (reflex.firstOperationKind !== null) return;
+    reflex.firstOperationKind = operationKind;
+    reflex.firstOperationStartedAt = new Date().toISOString();
+  }
+
+  private markDamageReflexConfirmed(
+    reflex: DamageReflexRun,
+    operationKind: PlayerBodyDamageReflexOperationKind,
+    confirmedAt: string,
+  ): void {
+    if (operationKind === "attack") reflex.hitConfirmed = true;
+    else if (operationKind === "equip") reflex.equipmentConfirmed = true;
+    if (reflex.serverConfirmedAt !== null) return;
+    reflex.operationKind = operationKind;
+    reflex.status = "successful";
+    reflex.serverConfirmedAt = confirmedAt;
+    reflex.sameLife = this.lifeGeneration === reflex.startLifeGeneration;
+  }
+
+  private damageReflexTarget(reflex: DamageReflexRun): Entity | undefined {
+    const source = reflex.latestSource;
+    if (
+      source === undefined ||
+      reflex.bot.entities[source.id] !== source ||
+      !Number.isFinite(source.position.x) ||
+      !Number.isFinite(source.position.y) ||
+      !Number.isFinite(source.position.z)
+    )
+      return undefined;
+    return source;
+  }
+
+  private async waitForDamageReflexSpawn(
+    reflex: DamageReflexRun,
+    wallDeadline: number,
+  ): Promise<boolean> {
+    if (this.damageReflexIsAlive(reflex)) return true;
+    const waitMs = Math.min(damageReflexSpawnWaitMs, wallDeadline - Date.now());
+    if (waitMs <= 0) return false;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (spawned: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reflex.bot.removeListener("spawn", onSpawn);
+        reflex.bot.removeListener("health", onSpawn);
+        reflex.controller.signal.removeEventListener("abort", onAbort);
+        resolve(spawned && this.damageReflexIsAlive(reflex));
+      };
+      const onSpawn = (): void => {
+        if (this.damageReflexIsAlive(reflex)) finish(true);
+      };
+      const onAbort = (): void => finish(false);
+      const timer = setTimeout(() => finish(false), waitMs);
+      reflex.bot.once("spawn", onSpawn);
+      reflex.bot.on("health", onSpawn);
+      reflex.controller.signal.addEventListener("abort", onAbort, {
+        once: true,
+      });
+      if (reflex.controller.signal.aborted) onAbort();
+    });
+  }
+
+  private async equipDamageReflexItems(reflex: DamageReflexRun): Promise<void> {
+    const { bot } = reflex;
+    const inventory = bot.inventory;
+    if (
+      typeof inventory.items !== "function" ||
+      typeof bot.equip !== "function"
+    )
+      return;
+    const client = bot._client as unknown as PacketClient;
+    const confirmServerSlot = (slot: number): void => {
+      if (
+        reflex.expectedEquipSlot !== slot ||
+        inventory.slots[slot]?.name !== reflex.expectedEquipName
+      )
+        return;
+      this.markDamageReflexConfirmed(reflex, "equip", new Date().toISOString());
+    };
+    const onSetSlot = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (packet?.windowId === 0 && typeof packet.slot === "number")
+        confirmServerSlot(packet.slot);
+    };
+    const onSetPlayerInventory = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (typeof packet?.slotId !== "number") return;
+      const slotId = packet.slotId;
+      const inventorySlot =
+        slotId <= 8
+          ? slotId + 36
+          : slotId >= 36 && slotId <= 39
+            ? 44 - slotId
+            : slotId === 40
+              ? 45
+              : slotId;
+      confirmServerSlot(inventorySlot);
+    };
+    const onWindowItems = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (
+        packet?.windowId === 0 &&
+        Array.isArray(packet.items) &&
+        reflex.expectedEquipSlot !== undefined &&
+        reflex.expectedEquipSlot < packet.items.length
+      )
+        confirmServerSlot(reflex.expectedEquipSlot);
+    };
+    client.on("set_slot", onSetSlot);
+    client.on("set_player_inventory", onSetPlayerInventory);
+    client.on("window_items", onWindowItems);
+    try {
+      for (const armorSlot of damageReflexArmorSlots) {
+        if (
+          reflex.controller.signal.aborted ||
+          !this.damageReflexIsAlive(reflex)
+        )
+          break;
+        const slot = bot.getEquipmentDestSlot(armorSlot.destination);
+        if (inventory.slots[slot] != null) continue;
+        const item = inventory
+          .items()
+          .find((candidate) => armorSlot.matches.test(candidate.name));
+        if (item === undefined) continue;
+        reflex.expectedEquipSlot = slot;
+        reflex.expectedEquipName = item.name;
+        this.markDamageReflexAttempt(reflex, "equip");
+        try {
+          await waitForAction(
+            bot.equip(item, armorSlot.destination),
+            reflex.controller.signal,
+          );
+        } finally {
+          reflex.expectedEquipSlot = undefined;
+          reflex.expectedEquipName = undefined;
+        }
+      }
+      if (reflex.controller.signal.aborted || !this.damageReflexIsAlive(reflex))
+        return;
+      const weapon = inventory
+        .items()
+        .find((item) => /_(?:sword|axe|spear)$/u.test(item.name));
+      if (weapon === undefined || bot.heldItem?.name === weapon.name) return;
+      const slot = bot.getEquipmentDestSlot("hand");
+      reflex.expectedEquipSlot = slot;
+      reflex.expectedEquipName = weapon.name;
+      this.markDamageReflexAttempt(reflex, "equip");
+      try {
+        await waitForAction(
+          bot.equip(weapon, "hand"),
+          reflex.controller.signal,
+        );
+      } finally {
+        reflex.expectedEquipSlot = undefined;
+        reflex.expectedEquipName = undefined;
+      }
+    } finally {
+      client.removeListener("set_slot", onSetSlot);
+      client.removeListener("set_player_inventory", onSetPlayerInventory);
+      client.removeListener("window_items", onWindowItems);
+    }
+  }
+
+  private async runDamageReflex(reflex: DamageReflexRun): Promise<void> {
+    const { bot, controller } = reflex;
+    const signal = controller.signal;
+    const wallDeadline = reflex.startedAtMs + damageReflexMaximumWallMs;
+    let activeMs = 0;
+    let previousTickAt = Date.now();
+    const budgetTimer = setInterval(() => {
+      const now = Date.now();
+      if (this.damageReflexIsAlive(reflex)) activeMs += now - previousTickAt;
+      previousTickAt = now;
+      if (activeMs >= damageReflexActiveWindowMs || now >= wallDeadline) {
+        reflex.deadlineReached = true;
+        controller.abort(new Error("Damage reflex window elapsed"));
+      }
+    }, 50);
+    const attemptedTargets = new Set<Entity>();
+    const onOutgoingHit = (
+      target: Entity,
+      source: Entity | undefined,
+    ): void => {
+      if (source?.id !== bot.entity.id || !attemptedTargets.has(target)) return;
+      this.markDamageReflexConfirmed(
+        reflex,
+        "attack",
+        new Date().toISOString(),
+      );
+    };
+    bot.on("entityHurt", onOutgoingHit);
+    this.emit({ type: "damage_reflex_started", at: reflex.startedAt });
+    const equipment = this.equipDamageReflexItems(reflex).catch(() => {
+      reflex.failed = true;
+    });
+    try {
+      while (!signal.aborted) {
+        if (!this.damageReflexIsCurrent(reflex)) break;
+        if (!this.damageReflexIsAlive(reflex)) {
+          if (!(await this.waitForDamageReflexSpawn(reflex, wallDeadline)))
+            break;
+          continue;
+        }
+        const target = this.damageReflexTarget(reflex);
+        if (target !== undefined) {
+          this.markDamageReflexAttempt(reflex, "attack");
+          await waitForAction(
+            bot.lookAt(
+              target.position.offset(0, Math.max(0.1, target.height * 0.55), 0),
+              true,
+            ),
+            signal,
+          );
+          if (!this.damageReflexIsAlive(reflex)) continue;
+          const currentTarget = this.damageReflexTarget(reflex);
+          if (currentTarget === target) {
+            const visibleTarget = requireVisibleEntity(
+              bot,
+              target.id,
+              attackRange,
+            );
+            attemptedTargets.add(target);
+            bot.attack(visibleTarget);
+          }
+        }
+        await waitTicks(damageReflexAttackTicks, signal);
+      }
+    } catch {
+      if (!signal.aborted) reflex.failed = true;
+    } finally {
+      clearInterval(budgetTimer);
+      bot.removeListener("entityHurt", onOutgoingHit);
+      await equipment;
+      if (reflex.operationKind === null) {
+        reflex.operationKind = reflex.firstOperationKind;
+        if (reflex.deadlineReached) reflex.status = "unverified";
+        else if (signal.aborted) reflex.status = "interrupted";
+        else if (reflex.failed) reflex.status = "failed";
+      }
+      const summary: PlayerBodyDamageReflexSummary =
+        reflex.hitConfirmed && reflex.equipmentConfirmed
+          ? "equipment_and_hit_confirmed"
+          : reflex.hitConfirmed
+            ? "hit_confirmed"
+            : reflex.equipmentConfirmed
+              ? "equipment_confirmed"
+              : !reflex.sourceWasObserved
+                ? "source_unknown"
+                : reflex.deadlineReached
+                  ? "action_unverified"
+                  : signal.aborted
+                    ? "interrupted"
+                    : reflex.failed
+                      ? "failed"
+                      : "action_unverified";
+      this.emit({
+        type: "damage_reflex_completed",
+        at: new Date().toISOString(),
+        operationKind: reflex.operationKind,
+        status: reflex.status,
+        startedAt: reflex.firstOperationStartedAt ?? reflex.startedAt,
+        serverConfirmedAt: reflex.serverConfirmedAt,
+        sameLife: reflex.sameLife,
+        summary,
+      });
+      if (this.damageReflex === reflex) this.damageReflex = undefined;
+    }
   }
 
   public async execute(
@@ -1628,7 +2022,15 @@ export class MineflayerPlayerBody implements PlayerBody {
     throw initialError;
   }
 
-  public async stop(): Promise<void> {
+  public setDamageReflexEnabled(enabled: boolean): void {
+    this.damageReflexEnabled = enabled;
+    if (!enabled)
+      this.damageReflex?.controller.abort(
+        new Error("Player damage reflex disabled"),
+      );
+  }
+
+  public async stopActiveOperation(): Promise<void> {
     for (const pending of this.pendingOperationAdmissions)
       pending.abort(new Error("Player body stopped"));
     const active = this.active;
@@ -1638,11 +2040,18 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.stopBot(active.bot);
       await active.done;
     }
+  }
+
+  public async stop(): Promise<void> {
+    this.setDamageReflexEnabled(false);
+    const reflex = this.damageReflex;
+    await this.stopActiveOperation();
     try {
       this.stopBot(this.getBot());
     } catch {
       // The bot may already be disconnected; its current physical action cannot be controlled then.
     }
+    if (reflex !== undefined) await reflex.done;
   }
 
   private makeActive(
@@ -2842,6 +3251,8 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
+    if (this.damageReflex !== undefined && this.damageReflex.bot !== bot)
+      this.damageReflex.controller.abort(new Error("Minecraft bot changed"));
     for (const detach of this.botHandlers.splice(0)) detach();
     for (const detach of this.inventoryHandlers.splice(0)) detach();
     this.inventoryBoundBot = undefined;
@@ -2854,6 +3265,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.pendingBotDeath = undefined;
     this.boundBot = bot;
     this.boundBotEnded = false;
+    this.botLifeDead = !Number.isFinite(bot.health) || bot.health <= 0;
+    this.lifeGeneration += 1;
     this.lastStateSignatures.clear();
     this.lastBotDamage = undefined;
     this.pendingDeathNotice = undefined;
@@ -2871,7 +3284,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       ): (() => void) =>
       () =>
         this.scheduleStateEvent(reason);
-    listen("health", state("vitals"));
+    listen("health", () => {
+      if (this.boundBot === bot && bot.health <= 0) this.markBotLifeDead(bot);
+      this.scheduleStateEvent("vitals");
+    });
     listen("breath", state("vitals"));
     listen("experience", state("vitals"));
     listen("heldItemChanged", state("inventory"));
@@ -2903,6 +3319,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("entityUpdate", state("entities"));
     listen("entityHurt", (target: Entity, source: Entity | undefined) => {
       if (this.boundBot !== bot || target.id !== bot.entity.id) return;
+      this.startDamageReflex(bot, source);
       const at = new Date().toISOString();
       const observedSource = damageSource(bot, source);
       this.lastBotDamage = {
@@ -2958,6 +3375,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     );
     listen("death", () => {
       if (this.boundBot !== bot) return;
+      this.markBotLifeDead(bot);
       const now = Date.now();
       const notice = this.pendingDeathNotice;
       const damage = this.lastBotDamage;
@@ -3005,6 +3423,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
       this.boundBotEnded = true;
+      this.damageReflex?.controller.abort(
+        new Error("Minecraft connection ended"),
+      );
       if (this.pendingBotDeath?.bot === bot) {
         clearTimeout(this.pendingBotDeath.timer);
         this.pendingBotDeath = undefined;
@@ -3026,6 +3447,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("spawn", () => {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
+      this.lifeGeneration += 1;
+      this.botLifeDead = false;
       if (this.disconnectedSinceBind) {
         this.disconnectedSinceBind = false;
         this.emit({ type: "reconnected", at: new Date().toISOString() });
@@ -3033,6 +3456,12 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.scheduleStateEvent("position");
     });
     this.bindInventoryEventsWhenReady(bot);
+  }
+
+  private markBotLifeDead(bot: Bot): void {
+    if (this.boundBot !== bot || this.botLifeDead) return;
+    this.botLifeDead = true;
+    this.lifeGeneration += 1;
   }
 
   private bindInventoryEventsWhenReady(bot: Bot): void {

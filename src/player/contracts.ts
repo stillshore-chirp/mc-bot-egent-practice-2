@@ -363,6 +363,8 @@ export interface PlayerBodyPort {
     signal?: AbortSignal,
   ): Promise<PlayerOperationResult>;
   stop(): Promise<void>;
+  setDamageReflexEnabled?(enabled: boolean): void;
+  stopActiveOperation?(): Promise<void>;
   knowledge(query: string): PlayerKnowledge;
   onEvent(listener: (event: PlayerBodyEvent) => void): () => void;
 }
