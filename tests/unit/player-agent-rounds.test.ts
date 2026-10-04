@@ -152,7 +152,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "最初の観測がない場合だけobserve_bodyを一度使えます",
+        "最初のBody観測を一度試して取得できなくても",
       );
       expect(request.instructions).toContain(
         "今できる一手を選び、commit_action_decisionで確定",
@@ -1549,7 +1549,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("guides low-health choices from observation without fixing a survival priority", async () => {
+  it("requires an action-first low-health judgment without safety evaluation", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
       ...baseObservation,
@@ -1586,14 +1586,9 @@ describe("player agent response rounds", () => {
       const instructions = String(request.instructions);
       expect(instructions).toContain("look:");
       expect(instructions).toContain(
-        "食事を検討する時はowner依頼か自分の目的かを問わず",
+        "食事を目的として選ぶ時は現在わかるfood・inventoryを使って候補を選びます",
       );
-      expect(instructions).toContain(
-        "観測と照会で食べる必要がない、または可食アイテムがないと確認できた場合はconsumeしない",
-      );
-      expect(instructions).toContain(
-        "満腹や食料なしと断定せず、確認できない点を説明してください",
-      );
+      expect(instructions).toContain("候補があれば通常のconsume操作を試し");
       expect(instructions).toContain(
         "その根拠をproposal resolutionに伝えてください",
       );
@@ -1602,17 +1597,20 @@ describe("player agent response rounds", () => {
         .filter((line) => line.startsWith("食事"));
       expect(mealInstructionLines).toHaveLength(2);
       expect(mealInstructionLines[0]).toContain(
-        "満腹や食料なしと断定せず、確認できない点を説明してください",
+        "候補があれば通常のconsume操作を試し",
       );
-      expect(mealInstructionLines[1]).not.toContain("満腹や食料なしと断定せず");
       expect(instructions).toContain(
-        "ownerの行動指示がない時も、低healthやdamage",
+        "低healthまたはdamageを観測したら、現在の目的と使える装備・操作から今すぐ一手をcommitしてください",
       );
-      expect(instructions).toContain("見えている脅威と原因未特定の危険を区別");
-      expect(instructions).toContain("同じ条件・引数のまま繰り返さず");
-      expect(instructions).toContain("結果は観測で確認できた範囲だけ");
       expect(instructions).toContain(
-        "生存行動や退避を固定的な反射として強制せず、目的や周囲の状況から選択してください",
+        "危険の安全審査や追加観測を行動の前提にせず",
+      );
+      expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
+      expect(instructions).toContain(
+        "実際の消費・food変化だけを結果として扱います",
+      );
+      expect(instructions).toContain(
+        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
       );
       expect(requestUserPayload(request).observation).toMatchObject({
         self: { health: 4, food: 4, foodSaturation: 0, inventory: [] },
@@ -1622,7 +1620,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("waits for a route-relevant change after a failed retreat without ongoing damage", async () => {
+  it("tries another operation after a failed retreat without waiting for a route change", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
       ...baseObservation,
@@ -1636,20 +1634,17 @@ describe("player agent response rounds", () => {
     const fixture = openPurposeFixture(
       [
         functionCallResponse(
-          "wait-after-failed-retreat",
+          "alternate-after-failed-retreat",
           "commit_action_decision",
           {
             ...actionArguments(),
-            kind: "wait",
-            purpose:
-              "Wait for an observable change before choosing another route.",
-            operationJson: "",
-            expectedOutcome:
-              "A changed observation may reveal a feasible route.",
-            reason:
-              "The retreat path failed, but no ongoing environmental damage is observed; reconsider when the route or danger state changes.",
-            wakeOn: ["state_changed"],
-            wakeAt: "",
+            purpose: "Try a different route after the failed retreat.",
+            operationJson: JSON.stringify({
+              kind: "move_relative",
+              offset: { x: 0, y: 0, z: -2 },
+              range: 1,
+            }),
+            expectedOutcome: "The player changes position on another route.",
           },
         ),
       ],
@@ -1685,12 +1680,12 @@ describe("player agent response rounds", () => {
 
       expect(result.accepted).toBe(true);
       const decision = result.decision;
-      if (decision?.kind !== "wait")
-        throw new Error("EXPECTED_WAIT_AFTER_FAILED_RETREAT");
-      expect(decision.reason).toContain(
-        "no ongoing environmental damage is observed",
-      );
-      expect(decision.wakeOn).toEqual(["state_changed"]);
+      if (decision?.kind !== "act")
+        throw new Error("EXPECTED_ALTERNATE_ACTION_AFTER_FAILED_RETREAT");
+      expect(decision.operation).toMatchObject({
+        kind: "move_relative",
+        offset: { x: 0, y: 0, z: -2 },
+      });
       const input = requestUserPayload(fixture.requests[0]);
       expect(input.runtime).toMatchObject({
         lastOutcome: { kind: "move_to", status: "failed" },
@@ -1705,7 +1700,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "body操作がfailed、unverified、interrupted、cancelledになったら",
+        "Body操作がfailed、unverified、interrupted、cancelledならその結果を次判断に使います",
       );
     } finally {
       fixture.close();
@@ -2197,18 +2192,17 @@ describe("player agent response rounds", () => {
     const fixture = openPurposeFixture(
       [
         functionCallResponse(
-          "wait-after-stalled-owner-return",
+          "alternate-after-stalled-owner-return",
           "commit_action_decision",
           {
             ...actionArguments(),
-            kind: "wait",
-            purpose: "Return to the owner",
-            operationJson: "{}",
-            expectedOutcome: "",
-            reason:
-              "The route needs a fresh observation before another attempt.",
-            wakeOn: ["body_outcome"],
-            wakeAt: "",
+            purpose: "Try another way back to the owner.",
+            operationJson: JSON.stringify({
+              kind: "move_relative",
+              offset: { x: -2, y: 0, z: 0 },
+              range: 1,
+            }),
+            expectedOutcome: "The player advances by a different route.",
           },
         ),
       ],
@@ -2262,8 +2256,12 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
-      expect(instructions).toContain("閉じたドアへの回復を一度だけ");
-      expect(instructions).toContain("同じ回復手順を繰り返さず");
+      expect(instructions).toContain(
+        "閉じたドアの安全性や状態を追加観測で確定してから行動する段取りは要求しません",
+      );
+      expect(instructions).toContain(
+        "通常権限で試せるuse/dig/moveなどから一つ選び",
+      );
 
       const payload = requestUserPayload(fixture.requests[0]);
       expect(payload.events).toContainEqual(
@@ -3383,121 +3381,117 @@ describe("player agent response rounds", () => {
     "stale current observation",
     "invisible drop",
     "sweep beyond visible range",
-  ] as const)("does not commit death recovery with %s", async (failure) => {
-    const deathAt = "2026-09-25T00:00:05.000Z";
-    const baseBefore = bodyObservationFixture();
-    const beforeBody = {
-      ...baseBefore,
-      observedAt: "2026-09-25T00:00:00.000Z",
-      self: {
-        ...baseBefore.self,
-        position: {
-          ...baseBefore.self.position,
-          x: failure === "sweep beyond visible range" ? 30 : 0,
-        },
-      },
-    };
-    const beforeEvidence = toObservationEvidence(beforeBody);
-    if (failure === "missing pre-death position")
-      delete (beforeEvidence as { position?: unknown }).position;
-    const firstPostDeath = {
-      ...bodyObservationFixture(),
-      observedAt: "2026-09-25T00:00:08.000Z",
-    };
-    let current = {
-      ...bodyObservationFixture(),
-      observedAt: "2026-09-25T00:00:20.000Z",
-    };
-    if (failure === "dimension mismatch")
-      current = {
-        ...current,
-        dimension: "nether",
+  ] as const)(
+    "commits an operation despite unavailable recovery context %s",
+    async (failure) => {
+      const deathAt = "2026-09-25T00:00:05.000Z";
+      const baseBefore = bodyObservationFixture();
+      const beforeBody = {
+        ...baseBefore,
+        observedAt: "2026-09-25T00:00:00.000Z",
         self: {
-          ...current.self,
-          position: { ...current.self.position, dimension: "nether" },
+          ...baseBefore.self,
+          position: {
+            ...baseBefore.self.position,
+            x: failure === "sweep beyond visible range" ? 30 : 0,
+          },
         },
       };
-    if (failure === "stale current observation")
-      current = { ...current, observedAt: deathAt };
-    const expectedAnchorStatus = {
-      "missing pre-death position": "death_position_unavailable",
-      "dimension mismatch": "dimension_mismatch",
-      "unavailable current observation": "current_body_unavailable",
-      "stale current observation": "current_observation_not_after_death",
-      "invisible drop": "ready",
-      "sweep beyond visible range": "ready",
-    }[failure];
-    const expectedCode =
-      failure === "invisible drop"
-        ? "DEATH_RECOVERY_TARGET_NOT_CURRENTLY_VISIBLE"
-        : failure === "sweep beyond visible range"
-          ? "DEATH_RECOVERY_APPROACH_REQUIRED"
-          : "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
-    const action =
-      failure === "invisible drop"
-        ? ({ kind: "collect_item", entityId: 77 } as const)
-        : failure === "sweep beyond visible range"
-          ? ({ kind: "look_sweep", pitchDegrees: -25 } as const)
-          : ({
-              kind: "move_to",
-              position: { x: 0, y: 64, z: 0 },
-              range: 1,
-            } as const);
-    const fixture = openPurposeFixture(
-      [
-        (request) => {
-          expect(requestUserPayload(request).deathRecovery).toMatchObject({
-            anchorStatus: expectedAnchorStatus,
-          });
-          const actionInput = deathRecoveryActionArguments(
-            deathAt,
-            failure === "invisible drop"
-              ? "collect"
-              : failure === "sweep beyond visible range"
-                ? "sweep"
-                : "approach",
-            action,
-          );
-          return functionCallResponse(
-            `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
-            "commit_action_decision",
-            actionInput,
-          );
-        },
-        functionCallResponse(
-          `wait-after-${failure.replaceAll(" ", "-")}`,
-          "commit_action_decision",
-          deathRecoveryWaitArguments(),
-        ),
-      ],
-      undefined,
-      undefined,
-      failure === "unavailable current observation"
-        ? async () => {
-            throw new Error("SYNTHETIC_OBSERVATION_UNAVAILABLE");
-          }
-        : async () => current,
-    );
-
-    try {
-      recordDeathScenario(
-        fixture.mind,
-        beforeEvidence,
-        deathAt,
-        toObservationEvidence(firstPostDeath),
+      const beforeEvidence = toObservationEvidence(beforeBody);
+      if (failure === "missing pre-death position")
+        delete (beforeEvidence as { position?: unknown }).position;
+      const firstPostDeath = {
+        ...bodyObservationFixture(),
+        observedAt: "2026-09-25T00:00:08.000Z",
+      };
+      let current = {
+        ...bodyObservationFixture(),
+        observedAt: "2026-09-25T00:00:20.000Z",
+      };
+      if (failure === "dimension mismatch")
+        current = {
+          ...current,
+          dimension: "nether",
+          self: {
+            ...current.self,
+            position: { ...current.self.position, dimension: "nether" },
+          },
+        };
+      if (failure === "stale current observation")
+        current = { ...current, observedAt: deathAt };
+      const expectedAnchorStatus = {
+        "missing pre-death position": "death_position_unavailable",
+        "dimension mismatch": "dimension_mismatch",
+        "unavailable current observation": "current_body_unavailable",
+        "stale current observation": "current_observation_not_after_death",
+        "invisible drop": "ready",
+        "sweep beyond visible range": "ready",
+      }[failure];
+      const action =
+        failure === "invisible drop"
+          ? ({ kind: "collect_item", entityId: 77 } as const)
+          : failure === "sweep beyond visible range"
+            ? ({ kind: "look_sweep", pitchDegrees: -25 } as const)
+            : ({
+                kind: "move_to",
+                position: { x: 0, y: 64, z: 0 },
+                range: 1,
+              } as const);
+      const fixture = openPurposeFixture(
+        [
+          (request) => {
+            expect(requestUserPayload(request).deathRecovery).toMatchObject({
+              anchorStatus: expectedAnchorStatus,
+            });
+            const actionInput = deathRecoveryActionArguments(
+              deathAt,
+              failure === "invisible drop"
+                ? "collect"
+                : failure === "sweep beyond visible range"
+                  ? "sweep"
+                  : "approach",
+              action,
+            );
+            return functionCallResponse(
+              `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
+              "commit_action_decision",
+              actionInput,
+            );
+          },
+        ],
+        undefined,
+        undefined,
+        failure === "unavailable current observation"
+          ? async () => {
+              throw new Error("SYNTHETIC_OBSERVATION_UNAVAILABLE");
+            }
+          : async () => current,
       );
-      const result = await fixture.agent.think({
-        snapshot: fixture.mind.snapshot(),
-        events: [],
-      });
-      expect(result.accepted).toBe(true);
-      expect(result.decision?.kind).toBe("wait");
-      expect(JSON.stringify(fixture.requests[1])).toContain(expectedCode);
-      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
-    } finally {
-      fixture.close();
-    }
-  });
+
+      try {
+        recordDeathScenario(
+          fixture.mind,
+          beforeEvidence,
+          deathAt,
+          toObservationEvidence(firstPostDeath),
+        );
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+        expect(result.accepted).toBe(true);
+        const decision = result.decision;
+        if (decision?.kind !== "act")
+          throw new Error("EXPECTED_ACTION_WITH_INCOMPLETE_RECOVERY_CONTEXT");
+        expect(decision.operation).toEqual(action);
+        expect(fixture.mind.snapshot().activeOperation?.kind).toBe(action.kind);
+        expect(fixture.requests).toHaveLength(1);
+        expect(fixture.observationCalls).toBe(1);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
 
   it("allows general observation when the death anchor position is unavailable", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
@@ -3983,18 +3977,6 @@ function deathRecoveryActionArguments(
     reason:
       "The marker records one finite recovery stage for this death event.",
     wakeOn: ["body_outcome"],
-  };
-}
-
-function deathRecoveryWaitArguments(): Record<string, unknown> {
-  return {
-    ...actionArguments(),
-    kind: "wait",
-    operationJson: "",
-    purpose: "Wait for an observable change before further recovery judgment.",
-    expectedOutcome: "An owner or body event may justify a new judgment.",
-    reason: "The bounded recovery stages are unavailable or already used.",
-    wakeOn: ["state_changed"],
   };
 }
 
