@@ -323,6 +323,7 @@ function makeFakeBot(
       const delta = point.minus(entity.position.offset(0, 1.62, 0));
       entity.yaw = Math.atan2(-delta.x, -delta.z);
       entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+      setTimeout(() => bot.emit("physicsTick"), 0);
     }),
     clearControlStates: vi.fn(),
     deactivateItem: vi.fn(),
@@ -3357,6 +3358,108 @@ describe("player body", () => {
     const killed = await body.execute({ kind: "attack", entityId: 2 });
     expect(killed.status).toBe("successful");
     expect(killed.observedEffect).toEqual({ type: "entity_died", entityId: 2 });
+  });
+
+  it("forces a body aim and waits for physicsTick before a normal attack", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    fake.bot.entity.pitch = 1.4;
+    expect(
+      observePlayerBody(fake.bot, undefined).perception.entities.some(
+        (entity) => entity.id === target.id,
+      ),
+    ).toBe(false);
+
+    const botEvents = fake.bot as unknown as EventEmitter;
+    let aimedPoint: Vec3 | undefined;
+    let forcedLook = false;
+    const lookAt = vi.fn(async (point: Vec3, force?: boolean) => {
+      aimedPoint = point;
+      forcedLook = force === true;
+      const delta = point.minus(fake.bot.entity.position.offset(0, 1.62, 0));
+      fake.bot.entity.yaw = Math.atan2(-delta.x, -delta.z);
+      fake.bot.entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+    });
+    const attack = vi.fn((entity: Entity) => {
+      botEvents.emit("entityHurt", entity, fake.bot.entity);
+    });
+    Object.assign(fake.bot, { lookAt, attack });
+
+    const pending = new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "attack",
+      entityId: target.id,
+    });
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    botEvents.emit("physicsTick");
+    const result = await pending;
+
+    expect(result.status).toBe("successful");
+    expect(aimedPoint).toEqual(
+      target.position.offset(0, target.height * 0.55, 0),
+    );
+    expect(forcedLook).toBe(true);
+    expect(attack).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reflex-attack if death occurs while waiting for physicsTick", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const lookAt = vi.fn(async (point: Vec3) => {
+      const delta = point.minus(fake.bot.entity.position.offset(0, 1.62, 0));
+      fake.bot.entity.yaw = Math.atan2(-delta.x, -delta.z);
+      fake.bot.entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+    });
+    const attack = vi.fn();
+    Object.assign(fake.bot, { lookAt, attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, target);
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    botEvents.emit("physicsTick");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(attack).not.toHaveBeenCalled();
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+  });
+
+  it("does not attack when the owner aborts while waiting for physicsTick", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const lookAt = vi.fn(async () => undefined);
+    const attack = vi.fn();
+    Object.assign(fake.bot, { lookAt, attack });
+    const controller = new AbortController();
+    const pending = new MineflayerPlayerBody(() => fake.bot).execute(
+      { kind: "attack", entityId: target.id },
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    controller.abort(new Error("Owner stopped the action"));
+    const result = await pending;
+    botEvents.emit("physicsTick");
+
+    expect(result.status).toBe("interrupted");
+    expect(attack).not.toHaveBeenCalled();
+    expect(fake.bot.listenerCount("physicsTick")).toBe(0);
   });
 
   it("uses a visible entity with an empty hand without throwing", async () => {

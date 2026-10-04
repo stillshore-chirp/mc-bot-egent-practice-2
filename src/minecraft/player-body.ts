@@ -754,6 +754,37 @@ function waitTicks(ticks: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function waitForPhysicsTick(bot: Bot, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+
+    const timeout: { timer?: ReturnType<typeof setTimeout> } = {};
+    const cleanup = (): void => {
+      if (timeout.timer !== undefined) clearTimeout(timeout.timer);
+      bot.removeListener("physicsTick", onPhysicsTick);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onPhysicsTick = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(abortError(signal));
+    };
+
+    bot.once("physicsTick", onPhysicsTick);
+    signal.addEventListener("abort", onAbort, { once: true });
+    timeout.timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for a Minecraft physics tick"));
+    }, 250);
+  });
+}
+
 function closeWindowWithoutWaiting(bot: Bot, window: Window): boolean {
   try {
     // Stop and event callbacks must release local window ownership synchronously.
@@ -1831,15 +1862,26 @@ export class MineflayerPlayerBody implements PlayerBody {
         }
         const target = this.damageReflexTarget(reflex);
         if (target !== undefined) {
+          const attemptLifeGeneration = this.lifeGeneration;
+          const attemptBotEntity = bot.entity;
           this.markDamageReflexAttempt(reflex, "attack");
           await waitForAction(
-            bot.lookAt(
-              target.position.offset(0, Math.max(0.1, target.height * 0.55), 0),
-              true,
-            ),
+            bot.lookAt(entityBodyAimPoint(target), true),
             signal,
           );
-          if (!this.damageReflexIsAlive(reflex)) continue;
+          if (
+            !this.damageReflexIsAlive(reflex) ||
+            this.lifeGeneration !== attemptLifeGeneration ||
+            bot.entity !== attemptBotEntity
+          )
+            continue;
+          await waitForPhysicsTick(bot, signal);
+          if (
+            !this.damageReflexIsAlive(reflex) ||
+            this.lifeGeneration !== attemptLifeGeneration ||
+            bot.entity !== attemptBotEntity
+          )
+            continue;
           const currentTarget = this.damageReflexTarget(reflex);
           if (currentTarget === target) {
             const visibleTarget = requireVisibleEntity(
@@ -2658,12 +2700,34 @@ export class MineflayerPlayerBody implements PlayerBody {
         return;
       }
       case "attack": {
-        const entity = requireVisibleEntity(
+        const entity = requireReachableEntity(
           bot,
           operation.entityId,
           attackRange,
         );
-        bot.attack(entity);
+        const attemptLifeGeneration = this.lifeGeneration;
+        const attemptBotEntity = bot.entity;
+        await waitForAction(
+          bot.lookAt(entityBodyAimPoint(entity), true),
+          signal,
+        );
+        await waitForPhysicsTick(bot, signal);
+        throwIfAborted(signal);
+        if (
+          this.getBot() !== bot ||
+          this.boundBot !== bot ||
+          this.boundBotEnded ||
+          this.lifeGeneration !== attemptLifeGeneration ||
+          bot.entity !== attemptBotEntity ||
+          !Number.isFinite(bot.health) ||
+          bot.health <= 0
+        )
+          throw new Error(
+            "Minecraft bot or life changed while aiming to attack",
+          );
+        if (bot.entities[entity.id] !== entity)
+          throw new Error("Attack target changed while aiming");
+        bot.attack(requireVisibleEntity(bot, operation.entityId, attackRange));
         await waitTicks(6, signal);
         return;
       }
@@ -3595,22 +3659,39 @@ function requireVisibleEntity(
   entityId: number,
   reach: number,
 ): Entity {
-  const entity = bot.entities[entityId];
-  if (entity === undefined)
-    throw new Error(`Entity ${entityId} is not currently loaded`);
+  const entity = requireReachableEntity(bot, entityId, reach);
   const visible = observePlayerBody(bot, undefined).perception.entities.some(
     (candidate) => candidate.id === entityId,
   );
   if (!visible) throw new Error(`Entity ${entityId} is not currently visible`);
+  return entity;
+}
+
+function requireReachableEntity(
+  bot: Bot,
+  entityId: number,
+  reach: number,
+): Entity {
+  const entity = bot.entities[entityId];
+  if (entity === undefined)
+    throw new Error(`Entity ${entityId} is not currently loaded`);
   const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
-  const target = entity.position.offset(
-    0,
-    Math.max(0.1, entity.height * 0.55),
-    0,
-  );
+  const target = entityBodyAimPoint(entity);
   if (eye.distanceTo(target) > reach)
     throw new Error(`Entity ${entityId} is outside normal player reach`);
   return entity;
+}
+
+function entityBodyAimPoint(entity: Entity): Vec3 {
+  if (
+    !Number.isFinite(entity.position.x) ||
+    !Number.isFinite(entity.position.y) ||
+    !Number.isFinite(entity.position.z) ||
+    !Number.isFinite(entity.height) ||
+    entity.height <= 0
+  )
+    throw new Error("Entity body aim point is unavailable");
+  return entity.position.offset(0, entity.height * 0.55, 0);
 }
 
 function requireOpenWindow(bot: Bot): Window {
