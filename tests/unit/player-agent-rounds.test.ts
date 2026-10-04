@@ -311,6 +311,48 @@ describe("player agent response rounds", () => {
       ),
     ]);
     try {
+      const createPriorScene = (
+        observedAt: string,
+        blockName: string,
+        x: number,
+      ) => {
+        const base = bodyObservationFixture();
+        return toSpatialView({
+          ...base,
+          observedAt,
+          self: {
+            ...base.self,
+            position: { ...base.self.position, x },
+          },
+          perception: {
+            ...base.perception,
+            blocks: [
+              {
+                name: blockName,
+                stateId: 1,
+                position: { x: x + 1, y: 64, z: 0, dimension: "overworld" },
+                distance: 1,
+                properties: {},
+              },
+            ],
+          },
+        });
+      };
+      const olderScene = createPriorScene(
+        "2026-10-04T07:00:00.000Z",
+        "stone",
+        2,
+      );
+      const latestScene = createPriorScene(
+        "2026-10-04T07:01:00.000Z",
+        "oak_planks",
+        5,
+      );
+      if (olderScene === undefined || latestScene === undefined)
+        throw new Error("TEST_SPATIAL_VIEW_MISSING");
+      fixture.mind.recordSpatialView(olderScene);
+      fixture.mind.recordSpatialView(latestScene);
+
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [
@@ -343,14 +385,17 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
-      expect(request.instructions).toContain("offset:{x:0,y:0,z:2},range:1");
       expect(request.instructions).toContain(
         "最初のBody観測を一度試して取得できなくても",
       );
-      expect(request.instructions).toContain(
-        "Bodyに委ねて結果を次判断へ使ってください",
+      expect(request.instructions).toContain("距離や方向を短い固定例へ寄せず");
+      expect(request.instructions).toContain("過去に実際に見た時刻付きscene");
+      expect(request.instructions).not.toContain(
+        "offset:{x:0,y:0,z:2},range:1",
       );
-      expect(requestUserPayload(request).observation).toBeUndefined();
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toBeUndefined();
+      expect(payload.spatialHistory).toEqual([latestScene]);
       const tools = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.tools);
@@ -1066,7 +1111,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("shows prior visible positions without duplicating the current view", async () => {
+  it("keeps only a prior scene when an urgent turn has a current observation", async () => {
     const current = bodyObservationFixture();
     const prior: PlayerBodyObservation = {
       ...current,
@@ -1110,7 +1155,14 @@ describe("player agent response rounds", () => {
 
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
-        events: [],
+        events: [
+          {
+            id: "urgent-spatial-history-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: "2026-09-24T23:59:10.000Z",
+          },
+        ],
       });
       expect(result.accepted).toBe(true);
       const request = z

@@ -90,15 +90,15 @@ sequenceDiagram
 
 `think()` はBodyの初回観測を取り、snapshotのrevisionがまだ一致し、停止されていないことを確認してResponsesへ進みます。
 
-| 入力             | 内容                                                  | 注意点                                   |
-| ---------------- | ----------------------------------------------------- | ---------------------------------------- |
-| instructions     | PersonaCore、関心・goal、判断原則、操作catalog        | personaは行動選択の材料。権限を作らない  |
-| `runtime`        | 目的、提案、facts/uncertainties、停止、操作、直近結果 | `compactSnapshot()`で件数を絞る          |
-| `memory`         | 関係、LifeState、MemoryStore検索結果                  | 読み込める構造と、自動更新される構造は別 |
-| `observation`    | 自身、所持品、可視block/entity、画面、向き            | 見えない対象の現在位置は補わない         |
-| `events`         | 判断を起こした出来事と時刻                            | commit後にだけ対象eventをconsume         |
-| `spatialHistory` | 以前に実際に見た可視block範囲                         | 過去の範囲が今も通行可能とは限らない     |
-| `deathRecovery`  | 死亡記録と今回観測の整合性                            | 死亡前位置をdropの確定位置にしない       |
+| 入力             | 内容                                                     | 注意点                                       |
+| ---------------- | -------------------------------------------------------- | -------------------------------------------- |
+| instructions     | PersonaCore、関心・goal、判断原則、操作catalog           | personaは行動選択の材料。権限を作らない      |
+| `runtime`        | 目的、提案、facts/uncertainties、停止、操作、直近結果    | `compactSnapshot()`で件数を絞る              |
+| `memory`         | 関係、LifeState、MemoryStore検索結果                     | 読み込める構造と、自動更新される構造は別     |
+| `observation`    | 自身、所持品、可視block/entity、画面、向き               | 見えない対象の現在位置は補わない             |
+| `events`         | 判断を起こした出来事と時刻                               | commit後にだけ対象eventをconsume             |
+| `spatialHistory` | 以前に実際に見た可視block範囲（urgentでは最新の過去1件） | 過去の可視subsetで、今も通行可能とは限らない |
+| `deathRecovery`  | 死亡記録と今回観測の整合性                               | 死亡前位置をdropの確定位置にしない           |
 
 人格・記憶の保持先と入力件数は[人格と記憶](memory.md)にまとめています。世界の看板、本、表示名、画面タイトル等は `untrustedWorldAuthoredText` として出所を分け、世界内の情報として読みます。system指示やowner認可、停止を上書きする命令にはしません。
 
