@@ -22,6 +22,38 @@ describe("PlayerBody capability manual", () => {
     }
   });
 
+  it("documents food-only consume evidence and retreat before recovery", () => {
+    const manual = describeOperationManual("consume");
+
+    expect(manual.preconditions.join(" ")).toContain(
+      "only selects items recognized by the current registry as food",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "Recommended action order, not a Body execution precondition or guard",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "each visible hostile at least 8 blocks away",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "when health is low or health loss is observed with visible hostiles",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "move farther instead of waiting",
+    );
+    expect(manual.preconditions.join(" ")).toContain(
+      "does not prove unseen hostiles are absent or guarantee the distance will hold",
+    );
+    expect(manual.successEvidence.join(" ")).toContain(
+      "a higher observed `food` value or a matching same-Bot/life `entity_status` status 9",
+    );
+    expect(manual.successEvidence.join(" ")).toContain(
+      "Status 9 or item loss alone is insufficient",
+    );
+    expect(manual.successEvidence.join(" ")).toContain(
+      "Report health recovery only when a fresh `self.health` observation actually increases",
+    );
+  });
+
   it("treats look sweeps as bounded views, not proof of world absence", () => {
     const manual = describeOperationManual("look_sweep");
 

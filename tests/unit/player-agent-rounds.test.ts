@@ -1169,6 +1169,17 @@ describe("player agent response rounds", () => {
               isPlayer: false,
               droppedItem: { name: "diamond_sword", count: 1 },
             },
+            {
+              id: 78,
+              name: "item",
+              kind: "object",
+              category: null,
+              position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+              distance: 2,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "golden_apple", count: 1 },
+            },
           ],
         },
       };
@@ -1194,6 +1205,21 @@ describe("player agent response rounds", () => {
           "今回のBody観測に見えている落下物は自発的にcollect_itemを試し",
         );
         expect(request.instructions).toContain("武器・防具・道具を優先");
+        expect(request.instructions).toContain(
+          "回復に使えると分かる食料も積極的に集めてください",
+        );
+        expect(request.instructions).toContain(
+          "consumeは現在のregistryが食料と認識する所持品だけを使います",
+        );
+        expect(request.instructions).toContain(
+          "food値上昇または同じBot/lifeのentity_status status 9",
+        );
+        expect(request.instructions).toContain(
+          "各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+        );
+        expect(request.instructions).toContain(
+          "8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます",
+        );
         const purposeInput = requestUserPayload(request);
         const serializedObservation = z
           .record(z.string(), z.unknown())
@@ -1207,6 +1233,10 @@ describe("player agent response rounds", () => {
         expect(entities[0]).toMatchObject({
           id: 77,
           droppedItem: { name: "diamond_sword", count: 1 },
+        });
+        expect(entities[1]).toMatchObject({
+          id: 78,
+          droppedItem: { name: "golden_apple", count: 1 },
         });
       } finally {
         fixture.close();
@@ -1721,7 +1751,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("requires an action-first low-health judgment without safety evaluation", async () => {
+  it("moves away from a visible hostile before trying recovery food at low health", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
       ...baseObservation,
@@ -1730,16 +1760,49 @@ describe("player agent response rounds", () => {
         health: 4,
         food: 4,
         foodSaturation: 0,
-        inventory: [],
+        inventory: [
+          {
+            slot: 0,
+            itemId: 322,
+            name: "golden_apple",
+            count: 1,
+            metadata: 0,
+            durability: null,
+            maxDurability: null,
+            customName: null,
+            enchantments: [],
+          },
+        ],
+      },
+      perception: {
+        ...baseObservation.perception,
+        entities: [
+          {
+            id: 91,
+            name: "zombie",
+            kind: "mob",
+            category: "Hostile mobs",
+            position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+            distance: 2,
+            health: 20,
+            isPlayer: false,
+          },
+        ],
       },
     };
     const fixture = openPurposeFixture(
       [
-        functionCallResponse(
-          "low-health-guidance",
-          "commit_action_decision",
-          actionArguments(),
-        ),
+        functionCallResponse("low-health-retreat", "commit_action_decision", {
+          ...actionArguments(),
+          purpose: "Move away from the visible hostile before trying food.",
+          operationJson: JSON.stringify({
+            kind: "move_relative",
+            offset: { x: -5, y: 0, z: 0 },
+            range: 1,
+          }),
+          expectedOutcome:
+            "The movement result and next fresh observation show greater distance.",
+        }),
       ],
       undefined,
       undefined,
@@ -1747,29 +1810,46 @@ describe("player agent response rounds", () => {
     );
 
     try {
-      await fixture.agent.think({
+      const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
       });
 
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_relative" },
+      });
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
       expect(instructions).toContain("look:");
       expect(instructions).toContain(
-        "食事を目的として選ぶ時は現在わかるfood・inventoryを使って候補を選びます",
+        "食事を目的とする時は現在観測したfood・inventoryを使い",
       );
-      expect(instructions).toContain("候補があれば通常のconsume操作を試し");
+      expect(instructions).toContain("目的に合う所持食料を選びます");
       expect(instructions).toContain(
         "その根拠をproposal resolutionに伝えてください",
       );
-      const mealInstructionLines = instructions
-        .split("\n")
-        .filter((line) => line.startsWith("食事"));
-      expect(mealInstructionLines).toHaveLength(2);
-      expect(mealInstructionLines[0]).toContain(
-        "候補があれば通常のconsume操作を試し",
+      expect(instructions).toContain(
+        "各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+      );
+      expect(instructions).toContain(
+        "8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます",
+      );
+      expect(instructions).toContain(
+        "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
+      );
+      expect(instructions).toContain(
+        "危険の安全審査や追加観測を行動の前提にせず",
+      );
+      expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
+      expect(instructions).toContain(
+        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
+      );
+      expect(instructions).toContain(
+        "その根拠をproposal resolutionに伝えてください",
       );
       expect(instructions).toContain(
         "低healthまたはdamageを観測したら、現在の目的と使える装備・操作から今すぐ一手をcommitしてください",
@@ -1779,14 +1859,36 @@ describe("player agent response rounds", () => {
       );
       expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
       expect(instructions).toContain(
-        "実際の消費・food変化だけを結果として扱います",
+        "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
       );
       expect(instructions).toContain(
         "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
       );
-      expect(requestUserPayload(request).observation).toMatchObject({
-        self: { health: 4, food: 4, foodSaturation: 0, inventory: [] },
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toMatchObject({
+        self: {
+          health: 4,
+          food: 4,
+          foodSaturation: 0,
+          inventory: [{ name: "golden_apple", count: 1 }],
+        },
       });
+      const observationInput = z
+        .record(z.string(), z.unknown())
+        .parse(payload.observation);
+      const perception = z
+        .record(z.string(), z.unknown())
+        .parse(observationInput.perception);
+      expect(perception.entities).toMatchObject([
+        {
+          kind: "mob",
+          distance: 2,
+          category: "Hostile mobs",
+          untrustedWorldAuthoredText: {
+            displayName: { value: "zombie" },
+          },
+        },
+      ]);
     } finally {
       fixture.close();
     }

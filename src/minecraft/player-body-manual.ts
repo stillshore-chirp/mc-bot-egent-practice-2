@@ -48,6 +48,15 @@ const operationDetails: Partial<
     >
   >
 > = {
+  consume: {
+    preconditions: [
+      "`consume` only selects items recognized by the current registry as food. Recommended action order, not a Body execution precondition or guard: when health is low or health loss is observed with visible hostiles, move with `move_relative` until fresh observations place each visible hostile at least 8 blocks away; if any remain closer, move farther instead of waiting. Use the actual movement result and fresh distances before eating. This does not prove unseen hostiles are absent or guarantee the distance will hold.",
+      "Do not promise direct health recovery from eating; check fresh vitals after the operation.",
+    ],
+    successEvidence: [
+      "The current Body verifier requires a lower count of the selected food and either a higher observed `food` value or a matching same-Bot/life `entity_status` status 9. Status 9 or item loss alone is insufficient. Report health recovery only when a fresh `self.health` observation actually increases.",
+    ],
+  },
   look: {
     historicalTrial: {
       status: "historical_representative",

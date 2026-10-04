@@ -1929,7 +1929,7 @@ export class PlayerPurposeAgent {
       }
     }
     const actionFirstInstruction =
-      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。今回のBody観測に見えている落下物は自発的にcollect_itemを試し、武器・防具・道具を優先してください。回収成功は実際の拾得結果で判断します。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
+      "ゲーム内状況は一手を選ぶ材料ですが、危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません。owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、目的に沿うBody操作をこの判断で少なくとも一つcommit_action_decisionしてください。今回のBody観測に見えている落下物は自発的にcollect_itemを試し、武器・防具・道具を優先し、回復に使えると分かる食料も積極的に集めてください。回収成功は実際の拾得結果で判断します。体力低下はfresh bot_damaged eventまたは現在と直近観測のself.health差で判断します。self.healthが低いか低下が確認され、今回見えているhostileがいる時は、consume前に各可視hostileから実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください。次の判断では実際の移動結果とfresh観測の距離を確認し、8ブロック未満の可視hostileが残っていればwaitせずさらに離れる操作を選びます。これは推奨する行動順序であり、Bodyのconsume実行preconditionや距離保証ではありません。見えていない敵の不在は断定しません。consumeは現在のregistryが食料と認識する所持品だけを使います。成功には対象食料の所持数減少に加え、food値上昇または同じBot/lifeのentity_status status 9が必要です。status 9や所持数減少だけでは成功とせず、fresh self.healthの上昇を観測した場合だけhealth回復を報告してください。未知や追加観測だけを理由にwaitせず、試行結果を次判断へ使います。";
     const normalInstructions = [
       memoryContext.persona,
       "あなたはAIプレイヤーの自律的な目的・行動エージェントです。起動時にもMinecraft観測、保存persona/interest/goal、記憶、既往結果から自分の目的を選び、必要なら実行可能な小さな行動を自律的に開始してください。チャット起点の偽イベントを待たないでください。",
@@ -1959,8 +1959,8 @@ export class PlayerPurposeAgent {
       "会話エージェントの所有者提案は入力です。現行目的や保存personaと合わせ、採用・妥協・辞退を理由付きで決められます。提案受付だけで実行中の操作は変わりません。身体操作を変える時はcommit_action_decisionで新しい操作を確定してください。",
       "未解決のowner提案が届いた判断では、その採用・妥協・辞退を先に確定してください。既存目標の整理や操作定義の取得だけを続けて新しい提案をpendingのまま放置しないでください。採否はあなたが状況から判断し、採用や操作開始を自動で強制されるものではありません。",
       "採用または妥協したowner proposalは、元の意図を示すactive owner goalと結び付き、妥協理由も文脈に残ります。途中のself goalを完了してもowner intentは完了しません。意図の達成・放棄は明示的なgoal更新で判断し、採用を強制された手順として扱わないでください。辞退はowner goalを作りません。",
-      "食事を目的として選ぶ時は現在わかるfood・inventoryを使って候補を選びますが、可食性や回復量の確認をconsumeの前提にしません。候補があれば通常のconsume操作を試し、実際の消費・food変化だけを結果として扱います。",
-      "食事を求めるowner proposalは、その根拠をproposal resolutionに伝えてください。consume後はPlayerBodyの実行前後観測を確認し、アイテム消費とfood値上昇が確認できた範囲だけを報告し、health回復を推測しないでください。",
+      "食事を目的とする時は現在観測したfood・inventoryを使い、目的に合う所持食料を選びます。",
+      "食事を求めるowner proposalは、その根拠をproposal resolutionに伝えてください。consume後はPlayerBodyの結果を確認し、食料の所持数減少とfood値上昇または同じBot/lifeのstatus 9が両方確認できた場合だけ食べたと報告し、health回復は実測時のみ報告します。",
       ...(urgentPerceptionWake
         ? []
         : [
