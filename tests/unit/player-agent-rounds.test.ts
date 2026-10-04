@@ -321,17 +321,18 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("uses the bounded fallback when long-reply compaction exceeds the call budget", async () => {
+  it("delivers a long final reply in chunks within the existing call budget", async () => {
     let admittedCalls = 0;
     const fixture = openConversationFixture(() => {
       admittedCalls += 1;
       if (admittedCalls > 6) throw new Error("CALL_BUDGET_EXHAUSTED");
     });
+    const longReply = "長い回答です。".repeat(40);
     fixture.responses.push(
       ...Array.from({ length: 5 }, (_, index) =>
         functionCallResponse(`runtime-long-${index}`, "inspect_runtime", {}),
       ),
-      terminalResponse("長い回答です。".repeat(40)),
+      terminalResponse(longReply),
     );
 
     try {
@@ -342,15 +343,110 @@ describe("player agent response rounds", () => {
         turn,
       });
 
-      expect(admittedCalls).toBe(7);
+      expect(admittedCalls).toBe(6);
       expect(fixture.requests).toHaveLength(6);
       expect(
         z.record(z.string(), z.unknown()).parse(fixture.requests[5])
           .tool_choice,
       ).toBe("none");
-      expect(fixture.messages).toEqual([
-        "うまく短く整理できず、説明が不十分です。",
-      ]);
+      expect(fixture.messages).toHaveLength(2);
+      expect(fixture.messages.join("")).toBe(longReply);
+      expect(fixture.messages.every((message) => message.length <= 240)).toBe(
+        true,
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("flattens chat newlines, preserves Unicode boundaries, and marks truncation", async () => {
+    const fixture = openConversationFixture();
+    const longReply = `${"a".repeat(180)}\n${"😀".repeat(100)}`;
+    fixture.responses.push(terminalResponse(longReply));
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "説明してください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+      const delivered = fixture.messages.join("");
+      expect(delivered).toBe(longReply.replace("\n", " "));
+      expect(
+        fixture.messages.every((message) => !/[\r\n]/u.test(message)),
+      ).toBe(true);
+      expect(fixture.messages.join("")).not.toContain("省略");
+    } finally {
+      fixture.close();
+    }
+
+    const oversizedFixture = openConversationFixture();
+    const oversizedReply = "😀".repeat(1_000);
+    oversizedFixture.responses.push(terminalResponse(oversizedReply));
+    try {
+      await oversizedFixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "詳しく説明してください。",
+        turn: oversizedFixture.conversation.nextTurn(),
+      });
+      const delivered = oversizedFixture.messages.join("");
+      expect(oversizedFixture.messages).toHaveLength(8);
+      expect(
+        oversizedFixture.messages.every((message) => message.length <= 240),
+      ).toBe(true);
+      expect(delivered).toBe(`${"😀".repeat(957)}…（省略）`);
+      for (const chunk of oversizedFixture.messages) {
+        const first = chunk.charCodeAt(0);
+        const last = chunk.charCodeAt(chunk.length - 1);
+        expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+        expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+      }
+    } finally {
+      oversizedFixture.close();
+    }
+  });
+
+  it("stops chunked delivery before a new owner-stop generation and skips final audit", async () => {
+    const traceResults: string[] = [];
+    const trace = {
+      withSpan: async (
+        _stage: string,
+        _name: string,
+        options: { readonly resultKind?: string },
+        operation: () => Promise<unknown>,
+      ) => {
+        if (options.resultKind !== undefined)
+          traceResults.push(options.resultKind);
+        return operation();
+      },
+    } as unknown as TraceService;
+    const fixtureHolder: { current: ConversationFixture | undefined } = {
+      current: undefined,
+    };
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      async () => {
+        const activeFixture = fixtureHolder.current;
+        if (activeFixture === undefined) return;
+        const state = activeFixture.mind.snapshot();
+        activeFixture.mind.stop(state.stopGeneration);
+      },
+      trace,
+    );
+    fixtureHolder.current = fixture;
+    const reply = "x".repeat(500);
+    fixture.responses.push(terminalResponse(reply));
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "答えてください。",
+        turn: fixture.conversation.nextTurn(),
+      });
+      expect(fixture.messages).toEqual(["x".repeat(240)]);
+      expect(fixture.messages.join("")).not.toBe(reply);
+      expect(traceResults).toEqual([]);
     } finally {
       fixture.close();
     }
@@ -390,7 +486,7 @@ describe("player agent response rounds", () => {
         return result;
       },
     } as unknown as TraceService;
-    const privateReply = "PRIVATE_FINAL_REPLY_130";
+    const privateReply = "PRIVATE_FINAL_REPLY_130".repeat(20);
     let sayCalls = 0;
     const conversation = new PlayerConversationAgent({
       client: scriptedClient([terminalResponse(privateReply)], requests),
@@ -417,14 +513,14 @@ describe("player agent response rounds", () => {
         message: "状態を確認して",
         turn,
       });
-      expect(sayCalls).toBe(1);
+      expect(sayCalls).toBe(2);
       expect(traceResults).toEqual([
         {
           kind: "final_response",
           summary: "say_callback_completed",
         },
       ]);
-      expect(eventOrder).toEqual(["say", "audit-start", "audit-end"]);
+      expect(eventOrder).toEqual(["say", "say", "audit-start", "audit-end"]);
       expect(JSON.stringify(traceResults)).not.toContain(privateReply);
     } finally {
       mind.close();
@@ -4044,9 +4140,13 @@ describe("player agent response rounds", () => {
           turn,
         });
         expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
-        expect(fixture.messages).toEqual([
-          "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
-        ]);
+        expect(fixture.messages).toEqual(
+          failure === "stopped"
+            ? []
+            : [
+                "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
+              ],
+        );
         expect(fixture.messages.join(" ")).not.toContain("保存しました");
       } finally {
         fixture.close();
@@ -4733,6 +4833,8 @@ interface ConversationFixture {
 function openConversationFixture(
   beforeCall?: () => void,
   observeBody?: () => Promise<PlayerBodyObservation>,
+  onSay?: (text: string) => void | Promise<void>,
+  trace?: TraceService,
 ): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
@@ -4751,8 +4853,10 @@ function openConversationFixture(
     logger: pino({ level: "silent" }),
     ...(beforeCall === undefined ? {} : { beforeCall }),
     ...(observeBody === undefined ? {} : { observeBody }),
+    ...(trace === undefined ? {} : { trace }),
     say: async (text) => {
       messages.push(text);
+      await onSay?.(text);
     },
     onProposal: () => undefined,
     onStop: async () => undefined,
