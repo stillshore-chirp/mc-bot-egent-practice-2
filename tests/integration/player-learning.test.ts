@@ -497,22 +497,12 @@ describe("player skill learning", () => {
     });
     const purpose = new PlayerPurposeAgent({
       client: scriptedClient([
-        proposalResolutionResponse,
-        functionCallResponse(
-          "decision-1",
-          "commit_action_decision",
-          actionArguments(),
-        ),
-        textResponse(
-          "decision-final",
-          "The nearby route is a useful first step.",
-        ),
+        ownerProposalActionResponse,
         functionCallResponse(
           "outcome-wait-1",
           "commit_action_decision",
           waitArguments(),
         ),
-        textResponse("outcome-wait-final", "I will wait for another change."),
       ]),
       apiKey: "test-only",
       model: "gpt-6-luna",
@@ -550,6 +540,16 @@ describe("player skill learning", () => {
       const proposal = mind.snapshot().proposals[0];
       expect(proposal?.status).toBe("adopted");
       expect(proposal?.resolution).toContain("reassess");
+      expect(
+        mind
+          .snapshot()
+          .goals.some(
+            (goal) =>
+              goal.ownerProposalId === proposal?.id &&
+              goal.source === "owner" &&
+              goal.status === "active",
+          ),
+      ).toBe(true);
       expect(executed).toEqual(["move_to"]);
       expect(
         mind
@@ -1126,6 +1126,46 @@ function proposalResolutionResponse(request: unknown): Response {
     changeReason: "",
     goalSource: "none",
   });
+}
+
+function ownerProposalActionResponse(request: unknown): Response {
+  const runtime = recordOf(requestUserPayload(request).runtime);
+  const proposals = runtime?.proposals;
+  if (!Array.isArray(proposals))
+    throw new Error("owner proposals were not supplied");
+  const proposal: unknown = proposals.find(
+    (candidate: unknown) =>
+      recordOf(candidate)?.status === "pending" &&
+      recordOf(candidate)?.priorityPreference === 4,
+  );
+  const proposalId = recordOf(proposal)?.id;
+  if (typeof proposalId !== "string")
+    throw new Error("new pending owner proposal was not supplied");
+  const toolNames = requestToolNames(request);
+  if (!toolNames.includes("commit_action_decision"))
+    throw new Error("first-action request cannot commit a Body decision");
+  return functionCallResponse(
+    "owner-proposal-action",
+    "commit_action_decision",
+    {
+      ...actionArguments(),
+      stateUpdates: {
+        goalState: {
+          proposalId,
+          proposalDisposition: "adopted",
+          resolution: "Take one nearby step, then reassess the request.",
+          goalId: "",
+          goalTitle: "Explore the nearby forest clearing",
+          goalStatus: "active",
+          goalPriority: 4,
+          changeReason:
+            "The current owner request fits the visible first step.",
+          goalSource: "owner",
+        },
+        understanding: null,
+      },
+    },
+  );
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {

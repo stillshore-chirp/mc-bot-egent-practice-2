@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import pino from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import pino, { type Logger } from "pino";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 
@@ -93,6 +93,605 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(tool?.parameters);
       expect(parameters.properties).not.toHaveProperty("operationRefs");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("prioritizes a fresh damage judgment before historical skill review", async () => {
+    const fixture = openPurposeFixture(
+      [terminalResponse("The current threat needs an immediate decision.")],
+      () => undefined,
+      createMemoryPort(),
+      async () => {
+        const current = bodyObservationFixture();
+        return {
+          ...current,
+          self: { ...current.self, health: 3 },
+          perception: {
+            ...current.perception,
+            entities: [
+              {
+                id: 12,
+                name: "zombie",
+                kind: "mob",
+                category: "Hostile mobs",
+                position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+                distance: 1,
+                health: null,
+                isPlayer: false,
+              },
+            ],
+          },
+        };
+      },
+    );
+
+    try {
+      const runId = "urgent-damage-skip-learning-review";
+      recordSuccessfulSkillUse(fixture, runId, "urgent-damage-skill");
+      const events = [
+        ...fixture.mind.pendingEvents(),
+        {
+          id: "urgent-damage-event",
+          kind: "bot_damaged" as const,
+          summary:
+            "Bot自身への被害を観測。cause=mob:zombie; confidence=observed",
+          createdAt: new Date().toISOString(),
+        },
+      ];
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events,
+      });
+
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.observationCalls).toBe(1);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "最初のBody観測を一度試して取得できなくても",
+      );
+      expect(request.instructions).toContain(
+        "今できる一手を選び、commit_action_decisionで確定",
+      );
+      expect(request.instructions).toContain(
+        "今回の視界に近接hostileが見えるなら",
+      );
+      expect(request).toMatchObject({
+        model: "gpt-6-luna",
+        reasoning: { effort: "none" },
+      });
+      expect(fixture.requestOptions[0]).toMatchObject({
+        maxRetries: 0,
+        timeout: 10_000,
+      });
+      expect(request.instructions).toContain("look:");
+      expect(request.instructions).not.toContain(
+        "死亡回収のexpectedOutcome先頭には",
+      );
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toMatchObject({ self: { health: 3 } });
+      expect(JSON.stringify(payload.observation)).toContain("zombie");
+      expect(payload.runtime).not.toHaveProperty("skillActivity");
+      expect(payload.runtime).not.toHaveProperty("learningReferences");
+      const urgentEvents = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(payload.events);
+      expect(
+        urgentEvents.some(
+          (event) =>
+            event.kind === "bot_damaged" &&
+            typeof event.summary === "string" &&
+            event.summary.includes("cause=mob:zombie"),
+        ),
+      ).toBe(true);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      expect(tools.map(({ name }) => name)).toEqual([
+        "describe_operation",
+        "commit_action_decision",
+      ]);
+      expect(tools.map(({ name }) => name)).not.toContain("search_skills");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each(["normal", "urgent", "absent"] as const)(
+    "logs anonymous reflex-input metadata only when the %s serialized runtime contains it",
+    async (mode) => {
+      const logger = pino({ level: "silent" });
+      const info = vi.spyOn(logger, "info");
+      const observedAt = "2026-10-04T07:14:59.000Z";
+      const startedAt = "2026-10-04T07:14:57.000Z";
+      const serverConfirmedAt = "2026-10-04T07:14:58.000Z";
+      const resultSummary = `damage-reflex hit_confirmed; operation=attack; status=successful; startedAt=${startedAt}; serverConfirmedAt=${serverConfirmedAt}; sameLife=true`;
+      const eventSummary = `damage-reflex events=1; hit_confirmed; operation=attack; status=successful; startedAt=${startedAt}; serverConfirmedAt=${serverConfirmedAt}; sameLife=true`;
+      const fixture = openPurposeFixture(
+        [terminalResponse("I will use the confirmed attack result.")],
+        undefined,
+        createMemoryPort(),
+        async () => bodyObservationFixture(),
+        undefined,
+        logger,
+      );
+      const operationId = `damage-reflex:${startedAt}:0`;
+      if (mode !== "absent")
+        fixture.mind.recordOutcome({
+          evidence: {
+            operationId,
+            kind: "attack",
+            status: "successful",
+            summary: resultSummary,
+            observedAt,
+          },
+        });
+      const events =
+        mode === "normal"
+          ? [
+              {
+                id: `body_outcome:${operationId}`,
+                kind: "body_outcome" as const,
+                summary: eventSummary,
+                createdAt: observedAt,
+              },
+            ]
+          : mode === "urgent"
+            ? [
+                {
+                  id: "synthetic-damage-wake",
+                  kind: "bot_damaged" as const,
+                  summary: "Synthetic damage wake.",
+                  createdAt: observedAt,
+                },
+              ]
+            : [];
+
+      try {
+        await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events,
+        });
+
+        expect(fixture.requests).toHaveLength(1);
+        const payload = requestUserPayload(fixture.requests[0]);
+        const runtime = z
+          .record(z.string(), z.unknown())
+          .parse(payload.runtime);
+        const outcomes = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.recentOutcomes);
+        const markerCalls = info.mock.calls.filter(
+          ([, message]) =>
+            message ===
+            "serialized Purpose input includes damage reflex outcomes",
+        );
+        if (mode === "absent") {
+          expect(
+            outcomes.some(
+              ({ summary }) =>
+                typeof summary === "string" &&
+                summary.startsWith("damage-reflex "),
+            ),
+          ).toBe(false);
+          expect(markerCalls).toHaveLength(0);
+          return;
+        }
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            kind: "attack",
+            status: "successful",
+            summary: resultSummary,
+            observedAt,
+          }),
+        );
+        expect(markerCalls).toHaveLength(1);
+        const [fields, message] = markerCalls[0] ?? [];
+        expect(fields).toEqual({
+          reflexResultCount: 1,
+          confirmedSameLifeCount: 1,
+          latestResultObservedAt: observedAt,
+        });
+        expect(message).toBe(
+          "serialized Purpose input includes damage reflex outcomes",
+        );
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
+  it("distinguishes the last pre-death position from the current observation", async () => {
+    const beforeAt = "2026-10-04T07:14:55.000Z";
+    const deathAt = "2026-10-04T07:14:57.000Z";
+    const currentAt = "2026-10-04T07:14:59.000Z";
+    const base = bodyObservationFixture();
+    const previousLife = {
+      ...base,
+      observedAt: beforeAt,
+      self: {
+        ...base.self,
+        position: { ...base.self.position, x: 12, z: -4 },
+      },
+    };
+    const currentObservation = {
+      ...base,
+      observedAt: currentAt,
+      self: {
+        ...base.self,
+        position: { ...base.self.position, x: -3, z: 6 },
+      },
+    };
+    const fixture = openPurposeFixture(
+      [
+        terminalResponse(
+          "I will choose the next escape step from these facts.",
+        ),
+      ],
+      undefined,
+      createMemoryPort(),
+      async () => currentObservation,
+    );
+    fixture.mind.recordObservation(toObservationEvidence(previousLife));
+    fixture.mind.recordOutcome({
+      evidence: {
+        operationId: "previous-short-movement",
+        kind: "move_relative",
+        status: "failed",
+        summary: "A short relative move made no progress.",
+        observedAt: "2026-10-04T07:14:56.000Z",
+        movementDelta: { x: 0.04, y: 0, z: 1.96 },
+      },
+    });
+    const deathEvent = fixture.mind.recordDeathEvent(
+      deathAt,
+      "Synthetic death event.",
+    );
+
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [deathEvent],
+      });
+
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const payload = requestUserPayload(request);
+      const runtime = z.record(z.string(), z.unknown()).parse(payload.runtime);
+      const latestDeath = z
+        .record(z.string(), z.unknown())
+        .parse(runtime.latestDeath);
+      expect(latestDeath).toMatchObject({
+        observedAt: deathAt,
+        previousLife: {
+          observedAt: beforeAt,
+          dimension: "overworld",
+          position: { x: 12, y: 64, z: -4 },
+        },
+      });
+      expect(payload.observation).toMatchObject({
+        observedAt: currentAt,
+        self: { position: { x: -3, y: 64, z: 6 } },
+      });
+      const recentOutcomes = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(runtime.recentOutcomes);
+      expect(recentOutcomes).toContainEqual(
+        expect.objectContaining({
+          kind: "move_relative",
+          movementDelta: { x: 0, y: 0, z: 2 },
+        }),
+      );
+      expect(request.instructions).toContain(
+        "同じ場所へ戻る循環があれば別の実行可能な操作",
+      );
+      expect(request.instructions).toContain(
+        "所有やspawn設定が不明でも試行を妨げず",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("commits an urgent relative action with the no-Skill schema", async () => {
+    const fixture = openPurposeFixture([
+      functionCallResponse(
+        "urgent-relative-action-without-skill",
+        "commit_action_decision",
+        {
+          ...actionArguments(),
+          purpose:
+            "Take one short relative step using the current observation.",
+          operationJson: JSON.stringify({
+            kind: "move_relative",
+            offset: { x: 0, y: 0, z: 2 },
+            range: 1,
+          }),
+        },
+      ),
+    ]);
+    try {
+      const createPriorScene = (
+        observedAt: string,
+        blockName: string,
+        x: number,
+      ) => {
+        const base = bodyObservationFixture();
+        return toSpatialView({
+          ...base,
+          observedAt,
+          self: {
+            ...base.self,
+            position: { ...base.self.position, x },
+          },
+          perception: {
+            ...base.perception,
+            blocks: [
+              {
+                name: blockName,
+                stateId: 1,
+                position: { x: x + 1, y: 64, z: 0, dimension: "overworld" },
+                distance: 1,
+                properties: {},
+              },
+            ],
+          },
+        });
+      };
+      const olderScene = createPriorScene(
+        "2026-10-04T07:00:00.000Z",
+        "stone",
+        2,
+      );
+      const latestScene = createPriorScene(
+        "2026-10-04T07:01:00.000Z",
+        "oak_planks",
+        5,
+      );
+      if (olderScene === undefined || latestScene === undefined)
+        throw new Error("TEST_SPATIAL_VIEW_MISSING");
+      fixture.mind.recordSpatialView(olderScene);
+      fixture.mind.recordSpatialView(latestScene);
+
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-relative-action-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(1);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: {
+          kind: "move_relative",
+          offset: { x: 0, y: 0, z: 2 },
+        },
+      });
+      expect(fixture.mind.snapshot().activeOperation).toMatchObject({
+        kind: "move_relative",
+      });
+      expect(fixture.mind.snapshot().activeOperation?.skillId).toBeUndefined();
+      expect(
+        fixture.mind.snapshot().activeOperation?.skillVersion,
+      ).toBeUndefined();
+
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request.instructions).toContain(
+        "最初のBody観測を一度試して取得できなくても",
+      );
+      expect(request.instructions).toContain("距離や方向を短い固定例へ寄せず");
+      expect(request.instructions).toContain("過去に実際に見た時刻付きscene");
+      expect(request.instructions).not.toContain(
+        "offset:{x:0,y:0,z:2},range:1",
+      );
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toBeUndefined();
+      expect(payload.spatialHistory).toEqual([latestScene]);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      expect(tools.map(({ name }) => name)).toContain("observe_body");
+      expect(tools.map(({ name }) => name)).not.toContain("search_skills");
+      expect(fixture.requests).toHaveLength(1);
+      expect(
+        fixture.mind
+          .snapshot()
+          .recentAgentActivity.flatMap(({ toolCalls }) => toolCalls)
+          .map(({ name }) => name),
+      ).not.toContain("describe_operation");
+      const commitTool = tools.find(
+        ({ name }) => name === "commit_action_decision",
+      );
+      const parameters = z
+        .record(z.string(), z.unknown())
+        .parse(commitTool?.parameters);
+      const properties = z
+        .record(z.string(), z.unknown())
+        .parse(parameters.properties);
+      expect(properties.skillId).toMatchObject({ enum: [""] });
+      expect(properties.skillVersion).toMatchObject({
+        type: "integer",
+        minimum: 0,
+        maximum: 0,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses the instant first-action path for a newly received strong owner proposal", async () => {
+    const memory = createMemoryPort();
+    const staleProposalId = "resolved-owner-proposal-hidden-from-urgent";
+    memory.context = () => ({
+      persona: JSON.stringify({
+        name: "HelperBot",
+        currentInterests: ["nearby forest"],
+        goals: [{ ownerProposalId: staleProposalId, title: "old goal" }],
+      }),
+      ownerUsername: "owner",
+      relationship: {},
+      lifeState: {},
+      recalled: [],
+    });
+    const fixture = openPurposeFixture(
+      [terminalResponse("The current owner request has a first step.")],
+      undefined,
+      memory,
+    );
+    try {
+      const oldProposal = fixture.mind.addProposal({
+        title: "Already resolved owner goal",
+        reason: "Earlier request already adopted.",
+        priority: 4,
+      });
+      const oldGoal = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: {
+          title: "Continue earlier owner goal",
+          status: "active",
+          priority: 4,
+          changeReason: "Previously adopted.",
+          source: "owner",
+        },
+        proposalResolution: {
+          proposalId: oldProposal.id,
+          disposition: "adopted",
+          resolution: "Already accepted earlier.",
+        },
+      });
+      expect(oldGoal.accepted).toBe(true);
+      const proposal = fixture.mind.addProposal({
+        title: "Gather birch logs",
+        reason: "The owner asked for nearby wood.",
+        priority: 5,
+      });
+      const event = fixture.mind
+        .pendingEvents()
+        .findLast(({ kind }) => kind === "owner_proposal");
+      expect(event).toBeDefined();
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: event === undefined ? [] : [event],
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request).toMatchObject({
+        model: "gpt-6-luna",
+        reasoning: { effort: "none" },
+      });
+      expect(fixture.requestOptions[0]).toMatchObject({
+        maxRetries: 0,
+        timeout: 10_000,
+      });
+      expect(request.instructions).toContain("危険は創作せず");
+      expect(request.instructions).toContain("proposalDisposition");
+      expect(request.instructions).toContain(
+        "今回の入力runtime.proposalsにstatus=pendingとして載っているものだけ",
+      );
+      expect(request.instructions).not.toContain(staleProposalId);
+      expect(request.instructions).not.toContain("直近の被害・死亡");
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(request.tools);
+      const commitTool = tools.find(
+        ({ name }) => name === "commit_action_decision",
+      );
+      expect(JSON.stringify(commitTool?.parameters)).toContain(
+        "proposalDisposition",
+      );
+      expect(JSON.stringify(commitTool?.parameters)).toContain("proposalId");
+      expect(requestUserPayload(request).runtime).toMatchObject({
+        proposals: [
+          expect.objectContaining({ id: proposal.id, priorityPreference: 5 }),
+        ],
+      });
+      const payloadRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(requestUserPayload(request).runtime);
+      const goals = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(payloadRuntime.goals);
+      expect(goals).toHaveLength(1);
+      expect(goals[0]).not.toHaveProperty("ownerProposalId");
+      expect(JSON.stringify(payloadRuntime)).not.toContain(oldProposal.id);
+      expect(JSON.stringify(payloadRuntime)).not.toContain(staleProposalId);
+      expect(request.instructions).toContain("HelperBot");
+      expect(request.instructions).toContain("nearby forest");
+      expect(request.instructions).not.toContain('"goals"');
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps old proposal and startup death events on the normal Purpose path", async () => {
+    const fixture = openPurposeFixture([
+      terminalResponse("Continue the current purpose normally."),
+    ]);
+    try {
+      const adopted = fixture.mind.addProposal({
+        title: "Already resolved request",
+        reason: "Resolved before startup.",
+        priority: 5,
+      });
+      const resolved = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        proposalResolution: {
+          proposalId: adopted.id,
+          disposition: "adopted",
+          resolution: "Already incorporated into the active goal.",
+        },
+      });
+      expect(resolved.accepted).toBe(true);
+      fixture.mind.addProposal({
+        title: "Old high-priority proposal still pending",
+        reason: "Its startup wake must not be mistaken for a new request.",
+        priority: 5,
+      });
+      fixture.mind.recordDeathEvent(
+        "2026-09-25T00:00:00.000Z",
+        "Historical death event.",
+      );
+      const staleOwnerWakeAt = new Date(Date.now() - 120_000).toISOString();
+      const pending = fixture.mind
+        .pendingEvents()
+        .map((event) =>
+          event.kind === "owner_proposal"
+            ? { ...event, createdAt: staleOwnerWakeAt }
+            : event,
+        );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: pending,
+        urgentPerceptionWake: false,
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      expect(request).toMatchObject({ model: "test-model" });
+      expect(request).not.toHaveProperty("reasoning");
+      expect(fixture.requestOptions[0]).toEqual({});
+      expect(request.instructions).toContain(
+        "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
+      );
     } finally {
       fixture.close();
     }
@@ -455,7 +1054,9 @@ describe("player agent response rounds", () => {
       const knowledgeTool = tools.find(
         (tool) => tool.name === "ask_body_knowledge",
       );
-      expect(knowledgeTool?.description).toContain("初回観測");
+      expect(knowledgeTool?.description).toContain(
+        "操作を選ぶ前提として再観測しないでください",
+      );
       const inputItems = z
         .array(z.record(z.string(), z.unknown()))
         .parse(request.input);
@@ -548,6 +1149,178 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each(["ordinary", "urgent"] as const)(
+    "keeps visible dropped-item facts in the serialized %s Purpose input and prompts proactive collection",
+    async (wake) => {
+      const base = bodyObservationFixture();
+      const observation: PlayerBodyObservation = {
+        ...base,
+        perception: {
+          ...base.perception,
+          entities: [
+            {
+              id: 77,
+              name: "item",
+              kind: "object",
+              category: null,
+              position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+              distance: 1,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "diamond_sword", count: 1 },
+            },
+            {
+              id: 78,
+              name: "item",
+              kind: "object",
+              category: null,
+              position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+              distance: 2,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "golden_apple", count: 1 },
+            },
+            {
+              id: 91,
+              name: "zombie",
+              kind: "zombie",
+              category: "Hostile mobs",
+              position: { x: 2, y: 64, z: -1, dimension: "overworld" },
+              distance: 2.2,
+              health: 20,
+              isPlayer: false,
+              equipment: { mainHand: "iron_sword" },
+            },
+          ],
+          nearbyHostiles: {
+            source: "client_received_unoccluded_nearby_hostiles",
+            observedAt: base.observedAt,
+            maxDistance: 16,
+            entityOutputLimit: 16,
+            omittedEntityCandidates: 2,
+            candidateSearchMayBeTruncated: true,
+            entities: [
+              {
+                id: 91,
+                name: "zombie",
+                kind: "zombie",
+                category: "Hostile mobs",
+                position: { x: 2, y: 64, z: -1, dimension: "overworld" },
+                distance: 2.2,
+                health: 20,
+                isPlayer: false,
+                equipment: { mainHand: "iron_sword" },
+              },
+              {
+                id: 93,
+                name: "skeleton",
+                kind: "skeleton",
+                category: "Hostile mobs",
+                position: { x: -1, y: 64, z: 4, dimension: "overworld" },
+                distance: 4.1,
+                health: 20,
+                isPlayer: false,
+                equipment: { mainHand: "bow" },
+              },
+            ],
+          },
+        },
+      };
+      const fixture = openPurposeFixture(
+        [terminalResponse("Fixture response; no operation was executed.")],
+        undefined,
+        undefined,
+        async () => observation,
+      );
+
+      try {
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+          ...(wake === "urgent" ? { urgentPerceptionWake: true } : {}),
+        });
+
+        expect(result.accepted).toBe(false);
+        const request = z
+          .record(z.string(), z.unknown())
+          .parse(fixture.requests[0]);
+        expect(request.instructions).toContain(
+          "今回のBody観測に見えている落下物は自発的にcollect_itemを試し",
+        );
+        expect(request.instructions).toContain("武器・防具・道具を優先");
+        expect(request.instructions).toContain(
+          "回復に使えると分かる食料も積極的に集めてください",
+        );
+        expect(request.instructions).toContain(
+          "consumeは現在のregistryが食料と認識する所持品だけを使います",
+        );
+        expect(request.instructions).toContain(
+          "food値上昇または同じBot/lifeのentity_status status 9",
+        );
+        expect(request.instructions).toContain(
+          "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+        );
+        expect(request.instructions).toContain(
+          "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
+        );
+        const purposeInput = requestUserPayload(request);
+        const serializedObservation = z
+          .record(z.string(), z.unknown())
+          .parse(purposeInput.observation);
+        const perception = z
+          .record(z.string(), z.unknown())
+          .parse(serializedObservation.perception);
+        const entities = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(perception.entities);
+        expect(entities[0]).toMatchObject({
+          id: 77,
+          droppedItem: { name: "diamond_sword", count: 1 },
+        });
+        expect(entities[1]).toMatchObject({
+          id: 78,
+          droppedItem: { name: "golden_apple", count: 1 },
+        });
+        expect(entities[2]).toMatchObject({
+          id: 91,
+          position: { x: 2, y: 64, z: -1 },
+          equipment: { mainHand: "iron_sword" },
+          untrustedWorldAuthoredText: {
+            displayName: { trust: "untrusted_world_text", value: "zombie" },
+          },
+        });
+        const nearbyHostiles = z
+          .record(z.string(), z.unknown())
+          .parse(perception.nearbyHostiles);
+        expect(nearbyHostiles).toMatchObject({
+          source: "client_received_unoccluded_nearby_hostiles",
+          observedAt: base.observedAt,
+          maxDistance: 16,
+          observedHostileCountLowerBound: 2,
+          frontViewOverlapEntityCount: 1,
+          omittedEntityCandidates: 2,
+          candidateSearchMayBeTruncated: true,
+        });
+        const nearbyEntities = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(nearbyHostiles.entities);
+        expect(nearbyEntities).toHaveLength(1);
+        expect(nearbyEntities[0]).toMatchObject({
+          id: 93,
+          position: { x: -1, y: 64, z: 4 },
+          distance: 4.1,
+          equipment: { mainHand: "bow" },
+          untrustedWorldAuthoredText: {
+            displayName: { trust: "untrusted_world_text", value: "skeleton" },
+          },
+        });
+        expect(nearbyEntities[0]).not.toHaveProperty("name");
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("summarizes only retained movement after the latest active owner proposal", () => {
     const fixture = openPurposeFixture([]);
     try {
@@ -617,7 +1390,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("shows prior visible positions without duplicating the current view", async () => {
+  it("keeps only a prior scene when an urgent turn has a current observation", async () => {
     const current = bodyObservationFixture();
     const prior: PlayerBodyObservation = {
       ...current,
@@ -661,7 +1434,14 @@ describe("player agent response rounds", () => {
 
       const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
-        events: [],
+        events: [
+          {
+            id: "urgent-spatial-history-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: "2026-09-24T23:59:10.000Z",
+          },
+        ],
       });
       expect(result.accepted).toBe(true);
       const request = z
@@ -973,7 +1753,82 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("guides low-health choices from observation without fixing a survival priority", async () => {
+  it("limits urgent observation retry to one and still commits an action", async () => {
+    const observation = bodyObservationFixture();
+    let observationAttempts = 0;
+    const repeatedObserveResponse = {
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "urgent-observe-first",
+          name: "observe_body",
+          arguments: "{}",
+        },
+        {
+          type: "function_call",
+          call_id: "urgent-observe-repeat",
+          name: "observe_body",
+          arguments: "{}",
+        },
+      ],
+      output_text: "",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as unknown as Response;
+    const fixture = openPurposeFixture(
+      [
+        repeatedObserveResponse,
+        functionCallResponse(
+          "urgent-action-after-bounded-observe",
+          "commit_action_decision",
+          actionArguments(),
+        ),
+      ],
+      undefined,
+      undefined,
+      async () => {
+        observationAttempts += 1;
+        if (observationAttempts === 1)
+          throw new Error("INITIAL_OBSERVATION_UNAVAILABLE");
+        return observation;
+      },
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-death-event",
+            kind: "bot_death",
+            summary: "Bot死亡を観測",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(fixture.observationCalls).toBe(2);
+      expect(fixture.requests).toHaveLength(2);
+      const secondRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(secondRequest.input);
+      expect(
+        input.some(
+          ({ type, output }) =>
+            type === "function_call_output" &&
+            String(output).includes("OBSERVATION_RETRY_LIMIT"),
+        ),
+      ).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("moves away from a visible hostile before trying recovery food at low health", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
       ...baseObservation,
@@ -982,16 +1837,49 @@ describe("player agent response rounds", () => {
         health: 4,
         food: 4,
         foodSaturation: 0,
-        inventory: [],
+        inventory: [
+          {
+            slot: 0,
+            itemId: 322,
+            name: "golden_apple",
+            count: 1,
+            metadata: 0,
+            durability: null,
+            maxDurability: null,
+            customName: null,
+            enchantments: [],
+          },
+        ],
+      },
+      perception: {
+        ...baseObservation.perception,
+        entities: [
+          {
+            id: 91,
+            name: "zombie",
+            kind: "mob",
+            category: "Hostile mobs",
+            position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+            distance: 2,
+            health: 20,
+            isPlayer: false,
+          },
+        ],
       },
     };
     const fixture = openPurposeFixture(
       [
-        functionCallResponse(
-          "low-health-guidance",
-          "commit_action_decision",
-          actionArguments(),
-        ),
+        functionCallResponse("low-health-retreat", "commit_action_decision", {
+          ...actionArguments(),
+          purpose: "Move away from the visible hostile before trying food.",
+          operationJson: JSON.stringify({
+            kind: "move_relative",
+            offset: { x: -5, y: 0, z: 0 },
+            range: 1,
+          }),
+          expectedOutcome:
+            "The movement result and next fresh observation show greater distance.",
+        }),
       ],
       undefined,
       undefined,
@@ -999,53 +1887,91 @@ describe("player agent response rounds", () => {
     );
 
     try {
-      await fixture.agent.think({
+      const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
       });
 
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_relative" },
+      });
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
+      expect(instructions).toContain("look:");
       expect(instructions).toContain(
-        "食事を検討する時はowner依頼か自分の目的かを問わず",
+        "食事を目的とする時は現在観測したfood・inventoryを使い",
+      );
+      expect(instructions).toContain("目的に合う所持食料を選びます");
+      expect(instructions).toContain(
+        "その根拠をproposal resolutionに伝えてください",
       );
       expect(instructions).toContain(
-        "観測と照会で食べる必要がない、または可食アイテムがないと確認できた場合はconsumeしない",
+        "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
       );
       expect(instructions).toContain(
-        "満腹や食料なしと断定せず、確認できない点を説明してください",
+        "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
+      );
+      expect(instructions).toContain(
+        "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
+      );
+      expect(instructions).toContain(
+        "危険の安全審査や追加観測を行動の前提にせず",
+      );
+      expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
+      expect(instructions).toContain(
+        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
       );
       expect(instructions).toContain(
         "その根拠をproposal resolutionに伝えてください",
       );
-      const mealInstructionLines = instructions
-        .split("\n")
-        .filter((line) => line.startsWith("食事"));
-      expect(mealInstructionLines).toHaveLength(2);
-      expect(mealInstructionLines[0]).toContain(
-        "満腹や食料なしと断定せず、確認できない点を説明してください",
-      );
-      expect(mealInstructionLines[1]).not.toContain("満腹や食料なしと断定せず");
       expect(instructions).toContain(
-        "ownerの行動指示がない時も、低healthやdamage",
+        "低healthまたはdamageを観測したら、現在の目的と使える装備・操作から今すぐ一手をcommitしてください",
       );
-      expect(instructions).toContain("見えている脅威と原因未特定の危険を区別");
-      expect(instructions).toContain("同じ条件・引数のまま繰り返さず");
-      expect(instructions).toContain("結果は観測で確認できた範囲だけ");
       expect(instructions).toContain(
-        "生存行動や退避を固定的な反射として強制せず、目的や周囲の状況から選択してください",
+        "危険の安全審査や追加観測を行動の前提にせず",
       );
-      expect(requestUserPayload(request).observation).toMatchObject({
-        self: { health: 4, food: 4, foodSaturation: 0, inventory: [] },
+      expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
+      expect(instructions).toContain(
+        "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
+      );
+      expect(instructions).toContain(
+        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
+      );
+      const payload = requestUserPayload(request);
+      expect(payload.observation).toMatchObject({
+        self: {
+          health: 4,
+          food: 4,
+          foodSaturation: 0,
+          inventory: [{ name: "golden_apple", count: 1 }],
+        },
       });
+      const observationInput = z
+        .record(z.string(), z.unknown())
+        .parse(payload.observation);
+      const perception = z
+        .record(z.string(), z.unknown())
+        .parse(observationInput.perception);
+      expect(perception.entities).toMatchObject([
+        {
+          kind: "mob",
+          distance: 2,
+          category: "Hostile mobs",
+          untrustedWorldAuthoredText: {
+            displayName: { value: "zombie" },
+          },
+        },
+      ]);
     } finally {
       fixture.close();
     }
   });
 
-  it("waits for a route-relevant change after a failed retreat without ongoing damage", async () => {
+  it("tries another operation after a failed retreat without waiting for a route change", async () => {
     const baseObservation = bodyObservationFixture();
     const observation: PlayerBodyObservation = {
       ...baseObservation,
@@ -1059,20 +1985,17 @@ describe("player agent response rounds", () => {
     const fixture = openPurposeFixture(
       [
         functionCallResponse(
-          "wait-after-failed-retreat",
+          "alternate-after-failed-retreat",
           "commit_action_decision",
           {
             ...actionArguments(),
-            kind: "wait",
-            purpose:
-              "Wait for an observable change before choosing another route.",
-            operationJson: "",
-            expectedOutcome:
-              "A changed observation may reveal a feasible route.",
-            reason:
-              "The retreat path failed, but no ongoing environmental damage is observed; reconsider when the route or danger state changes.",
-            wakeOn: ["state_changed"],
-            wakeAt: "",
+            purpose: "Try a different route after the failed retreat.",
+            operationJson: JSON.stringify({
+              kind: "move_relative",
+              offset: { x: 0, y: 0, z: -2 },
+              range: 1,
+            }),
+            expectedOutcome: "The player changes position on another route.",
           },
         ),
       ],
@@ -1108,12 +2031,12 @@ describe("player agent response rounds", () => {
 
       expect(result.accepted).toBe(true);
       const decision = result.decision;
-      if (decision?.kind !== "wait")
-        throw new Error("EXPECTED_WAIT_AFTER_FAILED_RETREAT");
-      expect(decision.reason).toContain(
-        "no ongoing environmental damage is observed",
-      );
-      expect(decision.wakeOn).toEqual(["state_changed"]);
+      if (decision?.kind !== "act")
+        throw new Error("EXPECTED_ALTERNATE_ACTION_AFTER_FAILED_RETREAT");
+      expect(decision.operation).toMatchObject({
+        kind: "move_relative",
+        offset: { x: 0, y: 0, z: -2 },
+      });
       const input = requestUserPayload(fixture.requests[0]);
       expect(input.runtime).toMatchObject({
         lastOutcome: { kind: "move_to", status: "failed" },
@@ -1128,7 +2051,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "body操作がfailed、unverified、interrupted、cancelledになったら",
+        "Body操作がfailed、unverified、interrupted、cancelledならその結果を次判断に使います",
       );
     } finally {
       fixture.close();
@@ -1571,7 +2494,7 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "body操作がfailed、unverified、interrupted、cancelledになったら",
+        "Body操作がfailed、unverified、interrupted、cancelledならその結果を次判断に使います",
       );
       expect(JSON.stringify(request.input)).toContain(
         "Target position is occupied by oak_planks",
@@ -1620,18 +2543,17 @@ describe("player agent response rounds", () => {
     const fixture = openPurposeFixture(
       [
         functionCallResponse(
-          "wait-after-stalled-owner-return",
+          "alternate-after-stalled-owner-return",
           "commit_action_decision",
           {
             ...actionArguments(),
-            kind: "wait",
-            purpose: "Return to the owner",
-            operationJson: "{}",
-            expectedOutcome: "",
-            reason:
-              "The route needs a fresh observation before another attempt.",
-            wakeOn: ["body_outcome"],
-            wakeAt: "",
+            purpose: "Try another way back to the owner.",
+            operationJson: JSON.stringify({
+              kind: "move_relative",
+              offset: { x: -2, y: 0, z: 0 },
+              range: 1,
+            }),
+            expectedOutcome: "The player advances by a different route.",
           },
         ),
       ],
@@ -1685,8 +2607,12 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       const instructions = String(request.instructions);
-      expect(instructions).toContain("閉じたドアへの回復を一度だけ");
-      expect(instructions).toContain("同じ回復手順を繰り返さず");
+      expect(instructions).toContain(
+        "閉じたドアの安全性や状態を追加観測で確定してから行動する段取りは要求しません",
+      );
+      expect(instructions).toContain(
+        "通常権限で試せるuse/dig/moveなどから一つ選び",
+      );
 
       const payload = requestUserPayload(fixture.requests[0]);
       expect(payload.events).toContainEqual(
@@ -1931,6 +2857,61 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each([
+    {
+      toolName: "commit_goal_state",
+      argumentsValue: {
+        ...emptyGoalStateArguments(),
+        goalTitle: "Reassess the nearby threat",
+        goalStatus: "active",
+        goalSource: "self",
+      },
+    },
+    {
+      toolName: "update_understanding",
+      argumentsValue: {
+        facts: [{ summary: "A fresh state fact", source: "observed" }],
+        uncertainties: [],
+      },
+    },
+  ])(
+    "ends the Purpose run after a stale $toolName write",
+    async ({ toolName, argumentsValue }) => {
+      const mindRef: { current?: PlayerMindStore } = {};
+      const fixture = openPurposeFixture([
+        (_request, index) => {
+          const mind = mindRef.current;
+          if (index !== 0 || mind === undefined)
+            throw new Error("TEST_REVISION_FIXTURE_MISSING");
+          mind.enqueueEvent("state_changed", "A newer event arrived.");
+          return functionCallResponse(
+            "stale-state-write",
+            toolName,
+            argumentsValue,
+          );
+        },
+        terminalResponse("The stale state was somehow accepted."),
+      ]);
+      mindRef.current = fixture.mind;
+
+      try {
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+
+        expect(result.accepted).toBe(false);
+        expect(fixture.requests).toHaveLength(1);
+        expect(
+          fixture.mind.snapshot().recentAgentActivity.at(-1)?.toolCalls[0],
+        ).toMatchObject({ resultCode: "CAS_STALE", resultClass: "rejected" });
+        expect(fixture.mind.pendingEvents()).toHaveLength(1);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("reports unknown when a stale revision has no observable component delta", async () => {
     const mindRef: { current?: PlayerMindStore } = {};
     const fixture = openPurposeFixture([
@@ -2146,7 +3127,7 @@ describe("player agent response rounds", () => {
     }
   });
 
-  it("keeps requesting a user-facing final answer after conversation tools", async () => {
+  it("uses bounded runtime diagnostics for internal health questions", async () => {
     const directory = mkdtempSync(
       join(tmpdir(), "player-conversation-rounds-"),
     );
@@ -2154,10 +3135,8 @@ describe("player agent response rounds", () => {
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     const requests: unknown[] = [];
     const responses = [
-      functionCallResponse("status-check", "inspect_player_status", {}),
-      terminalResponse(
-        "I am exploring nearby and can help with the next step.",
-      ),
+      functionCallResponse("runtime-check", "inspect_runtime", {}),
+      terminalResponse("現在の処理状態を確認しました。"),
     ];
     const client = scriptedClient(responses, requests);
     const messages: string[] = [];
@@ -2169,6 +3148,36 @@ describe("player agent response rounds", () => {
       mind,
       memory: createMemoryPort(),
       logger: pino({ level: "silent" }),
+      inspectRuntime: () => ({
+        sampledAt: "2026-10-04T00:00:00.000Z",
+        process: { started: true, shuttingDown: false },
+        purpose: {
+          active: true,
+          activeForMs: 1_500,
+          awaitingResponse: false,
+          responseWaitForMs: null,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "connected",
+          activeOperation: null,
+          latestObservation: {
+            observedAt: "2026-10-04T00:00:00.000Z",
+            ageMs: 0,
+            health: 17,
+          },
+          lastResult: null,
+        },
+        pendingOwnerProposalCount: 2,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            responseStatus: "completed",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      }),
       say: async (text) => {
         messages.push(text);
       },
@@ -2181,14 +3190,40 @@ describe("player agent response rounds", () => {
       const turn = conversation.nextTurn();
       await conversation.handleOwnerMessage({
         username: "owner",
-        message: "What are you doing?",
+        message: "エージェントは死んでる？",
         turn,
       });
 
-      expect(messages).toEqual([
-        "I am exploring nearby and can help with the next step.",
-      ]);
+      expect(messages).toEqual(["現在の処理状態を確認しました。"]);
       expect(requests).toHaveLength(2);
+      const firstRequest = z.record(z.string(), z.unknown()).parse(requests[0]);
+      const instructions = z.string().parse(firstRequest.instructions);
+      const tools = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(firstRequest.tools);
+      expect(instructions).toContain("必ずinspect_runtimeを呼び");
+      expect(instructions).toContain("Minecraft内でBotが死亡したことと");
+      expect(instructions).toContain("会話turnにBody操作toolがないことだけで");
+      expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
+      expect(tools.map((tool) => tool.name)).toContain("describe_operation");
+      const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
+      const input = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(followup.input);
+      const toolOutput = input.find(
+        (item) => item.type === "function_call_output",
+      );
+      const diagnostics = JSON.parse(String(toolOutput?.output)) as {
+        runtime: {
+          purpose: { active: boolean };
+          recentDecisionFailures: unknown[];
+        };
+        conversation: { active: boolean };
+      };
+      expect(diagnostics.runtime.purpose.active).toBe(true);
+      expect(diagnostics.runtime.recentDecisionFailures).toHaveLength(1);
+      expect(diagnostics.conversation.active).toBe(true);
+      expect(JSON.stringify(diagnostics)).not.toContain("ownerUsername");
     } finally {
       mind.close();
     }
@@ -2697,121 +3732,117 @@ describe("player agent response rounds", () => {
     "stale current observation",
     "invisible drop",
     "sweep beyond visible range",
-  ] as const)("does not commit death recovery with %s", async (failure) => {
-    const deathAt = "2026-09-25T00:00:05.000Z";
-    const baseBefore = bodyObservationFixture();
-    const beforeBody = {
-      ...baseBefore,
-      observedAt: "2026-09-25T00:00:00.000Z",
-      self: {
-        ...baseBefore.self,
-        position: {
-          ...baseBefore.self.position,
-          x: failure === "sweep beyond visible range" ? 30 : 0,
-        },
-      },
-    };
-    const beforeEvidence = toObservationEvidence(beforeBody);
-    if (failure === "missing pre-death position")
-      delete (beforeEvidence as { position?: unknown }).position;
-    const firstPostDeath = {
-      ...bodyObservationFixture(),
-      observedAt: "2026-09-25T00:00:08.000Z",
-    };
-    let current = {
-      ...bodyObservationFixture(),
-      observedAt: "2026-09-25T00:00:20.000Z",
-    };
-    if (failure === "dimension mismatch")
-      current = {
-        ...current,
-        dimension: "nether",
+  ] as const)(
+    "commits an operation despite unavailable recovery context %s",
+    async (failure) => {
+      const deathAt = "2026-09-25T00:00:05.000Z";
+      const baseBefore = bodyObservationFixture();
+      const beforeBody = {
+        ...baseBefore,
+        observedAt: "2026-09-25T00:00:00.000Z",
         self: {
-          ...current.self,
-          position: { ...current.self.position, dimension: "nether" },
+          ...baseBefore.self,
+          position: {
+            ...baseBefore.self.position,
+            x: failure === "sweep beyond visible range" ? 30 : 0,
+          },
         },
       };
-    if (failure === "stale current observation")
-      current = { ...current, observedAt: deathAt };
-    const expectedAnchorStatus = {
-      "missing pre-death position": "death_position_unavailable",
-      "dimension mismatch": "dimension_mismatch",
-      "unavailable current observation": "current_body_unavailable",
-      "stale current observation": "current_observation_not_after_death",
-      "invisible drop": "ready",
-      "sweep beyond visible range": "ready",
-    }[failure];
-    const expectedCode =
-      failure === "invisible drop"
-        ? "DEATH_RECOVERY_TARGET_NOT_CURRENTLY_VISIBLE"
-        : failure === "sweep beyond visible range"
-          ? "DEATH_RECOVERY_APPROACH_REQUIRED"
-          : "DEATH_RECOVERY_CONTEXT_UNAVAILABLE";
-    const action =
-      failure === "invisible drop"
-        ? ({ kind: "collect_item", entityId: 77 } as const)
-        : failure === "sweep beyond visible range"
-          ? ({ kind: "look_sweep", pitchDegrees: -25 } as const)
-          : ({
-              kind: "move_to",
-              position: { x: 0, y: 64, z: 0 },
-              range: 1,
-            } as const);
-    const fixture = openPurposeFixture(
-      [
-        (request) => {
-          expect(requestUserPayload(request).deathRecovery).toMatchObject({
-            anchorStatus: expectedAnchorStatus,
-          });
-          const actionInput = deathRecoveryActionArguments(
-            deathAt,
-            failure === "invisible drop"
-              ? "collect"
-              : failure === "sweep beyond visible range"
-                ? "sweep"
-                : "approach",
-            action,
-          );
-          return functionCallResponse(
-            `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
-            "commit_action_decision",
-            actionInput,
-          );
-        },
-        functionCallResponse(
-          `wait-after-${failure.replaceAll(" ", "-")}`,
-          "commit_action_decision",
-          deathRecoveryWaitArguments(),
-        ),
-      ],
-      undefined,
-      undefined,
-      failure === "unavailable current observation"
-        ? async () => {
-            throw new Error("SYNTHETIC_OBSERVATION_UNAVAILABLE");
-          }
-        : async () => current,
-    );
-
-    try {
-      recordDeathScenario(
-        fixture.mind,
-        beforeEvidence,
-        deathAt,
-        toObservationEvidence(firstPostDeath),
+      const beforeEvidence = toObservationEvidence(beforeBody);
+      if (failure === "missing pre-death position")
+        delete (beforeEvidence as { position?: unknown }).position;
+      const firstPostDeath = {
+        ...bodyObservationFixture(),
+        observedAt: "2026-09-25T00:00:08.000Z",
+      };
+      let current = {
+        ...bodyObservationFixture(),
+        observedAt: "2026-09-25T00:00:20.000Z",
+      };
+      if (failure === "dimension mismatch")
+        current = {
+          ...current,
+          dimension: "nether",
+          self: {
+            ...current.self,
+            position: { ...current.self.position, dimension: "nether" },
+          },
+        };
+      if (failure === "stale current observation")
+        current = { ...current, observedAt: deathAt };
+      const expectedAnchorStatus = {
+        "missing pre-death position": "death_position_unavailable",
+        "dimension mismatch": "dimension_mismatch",
+        "unavailable current observation": "current_body_unavailable",
+        "stale current observation": "current_observation_not_after_death",
+        "invisible drop": "ready",
+        "sweep beyond visible range": "ready",
+      }[failure];
+      const action =
+        failure === "invisible drop"
+          ? ({ kind: "collect_item", entityId: 77 } as const)
+          : failure === "sweep beyond visible range"
+            ? ({ kind: "look_sweep", pitchDegrees: -25 } as const)
+            : ({
+                kind: "move_to",
+                position: { x: 0, y: 64, z: 0 },
+                range: 1,
+              } as const);
+      const fixture = openPurposeFixture(
+        [
+          (request) => {
+            expect(requestUserPayload(request).deathRecovery).toMatchObject({
+              anchorStatus: expectedAnchorStatus,
+            });
+            const actionInput = deathRecoveryActionArguments(
+              deathAt,
+              failure === "invisible drop"
+                ? "collect"
+                : failure === "sweep beyond visible range"
+                  ? "sweep"
+                  : "approach",
+              action,
+            );
+            return functionCallResponse(
+              `unsafe-recovery-${failure.replaceAll(" ", "-")}`,
+              "commit_action_decision",
+              actionInput,
+            );
+          },
+        ],
+        undefined,
+        undefined,
+        failure === "unavailable current observation"
+          ? async () => {
+              throw new Error("SYNTHETIC_OBSERVATION_UNAVAILABLE");
+            }
+          : async () => current,
       );
-      const result = await fixture.agent.think({
-        snapshot: fixture.mind.snapshot(),
-        events: [],
-      });
-      expect(result.accepted).toBe(true);
-      expect(result.decision?.kind).toBe("wait");
-      expect(JSON.stringify(fixture.requests[1])).toContain(expectedCode);
-      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
-    } finally {
-      fixture.close();
-    }
-  });
+
+      try {
+        recordDeathScenario(
+          fixture.mind,
+          beforeEvidence,
+          deathAt,
+          toObservationEvidence(firstPostDeath),
+        );
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [],
+        });
+        expect(result.accepted).toBe(true);
+        const decision = result.decision;
+        if (decision?.kind !== "act")
+          throw new Error("EXPECTED_ACTION_WITH_INCOMPLETE_RECOVERY_CONTEXT");
+        expect(decision.operation).toEqual(action);
+        expect(fixture.mind.snapshot().activeOperation?.kind).toBe(action.kind);
+        expect(fixture.requests).toHaveLength(1);
+        expect(fixture.observationCalls).toBe(1);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
 
   it("allows general observation when the death anchor position is unavailable", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
@@ -2909,6 +3940,7 @@ interface PurposeFixture {
   readonly skills: McSkillRepository;
   readonly observationCalls: number;
   readonly requests: unknown[];
+  readonly requestOptions: unknown[];
   close(): void;
 }
 
@@ -2921,6 +3953,7 @@ function openPurposeFixture(
   memory: PlayerMemoryPort = createMemoryPort(),
   observeBody?: () => Promise<PlayerBodyObservation>,
   onObservation?: (observation: PlayerBodyObservation) => void,
+  logger: Logger = pino({ level: "silent" }),
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-agent-rounds-"));
   temporaryDirectories.push(directory);
@@ -2932,6 +3965,7 @@ function openPurposeFixture(
     allowedOperationNames: playerOperationNames,
   });
   const requests: unknown[] = [];
+  const requestOptions: unknown[] = [];
   let observationCalls = 0;
   const body = {
     observe: async () => {
@@ -2941,7 +3975,7 @@ function openPurposeFixture(
       return observeBody();
     },
   } as unknown as PlayerBody;
-  const client = scriptedClient(responses, requests);
+  const client = scriptedClient(responses, requests, requestOptions);
   const agent = new PlayerPurposeAgent({
     client,
     apiKey: "test-only",
@@ -2951,7 +3985,7 @@ function openPurposeFixture(
     mind,
     memory,
     ownerPlayerId: "owner-player",
-    logger: pino({ level: "silent" }),
+    logger,
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     ...(onObservation === undefined ? {} : { onObservation }),
     onCommitted,
@@ -2965,6 +3999,7 @@ function openPurposeFixture(
       return observationCalls;
     },
     requests,
+    requestOptions,
     close: () => {
       skills.close();
       mind.close();
@@ -3099,11 +4134,13 @@ function openConversationFixture(): ConversationFixture {
 function scriptedClient(
   responses: ScriptedResponse[],
   requests: unknown[],
+  requestOptions?: unknown[],
 ): PlayerResponsesClient {
   return {
     responses: {
-      create: async (request: unknown) => {
+      create: async (request: unknown, options?: unknown) => {
         const index = requests.push(request) - 1;
+        requestOptions?.push(options ?? {});
         const response = responses.shift();
         if (response === undefined)
           throw new Error("TEST_RESPONSE_QUEUE_EMPTY");
@@ -3292,18 +4329,6 @@ function deathRecoveryActionArguments(
     reason:
       "The marker records one finite recovery stage for this death event.",
     wakeOn: ["body_outcome"],
-  };
-}
-
-function deathRecoveryWaitArguments(): Record<string, unknown> {
-  return {
-    ...actionArguments(),
-    kind: "wait",
-    operationJson: "",
-    purpose: "Wait for an observable change before further recovery judgment.",
-    expectedOutcome: "An owner or body event may justify a new judgment.",
-    reason: "The bounded recovery stages are unavailable or already used.",
-    wakeOn: ["state_changed"],
   };
 }
 

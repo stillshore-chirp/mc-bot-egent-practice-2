@@ -115,6 +115,76 @@ const positionOf = (position: {
   z: position.z,
 });
 
+type MovementPacketKind = "position" | "position_look" | "look";
+
+interface MovementPacketFiniteState {
+  readonly kind: MovementPacketKind;
+  readonly positionFinite: boolean | null;
+  readonly rotationFinite: boolean | null;
+}
+
+function movementPacketFiniteState(
+  name: unknown,
+  payload: unknown,
+): MovementPacketFiniteState | undefined {
+  if (name !== "position" && name !== "position_look" && name !== "look")
+    return undefined;
+  const packet =
+    typeof payload === "object" && payload !== null
+      ? (payload as Record<string, unknown>)
+      : {};
+  const finite = (value: unknown): boolean =>
+    typeof value === "number" && Number.isFinite(value);
+  return {
+    kind: name,
+    positionFinite:
+      name === "look"
+        ? null
+        : finite(packet.x) && finite(packet.y) && finite(packet.z),
+    rotationFinite:
+      name === "position" ? null : finite(packet.yaw) && finite(packet.pitch),
+  };
+}
+
+function guardMovementPacketWrites(
+  bot: Bot,
+  logger: MinecraftLogger,
+  isSpawned: () => boolean,
+): void {
+  const client = bot._client;
+  // The proxy below forwards with the original caller receiver.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const write = client.write;
+  if (typeof write !== "function") return;
+  const warnedKinds = new Set<MovementPacketKind>();
+  client.write = new Proxy(write, {
+    apply(target, thisArg, args) {
+      const finiteState = movementPacketFiniteState(args[0], args[1]);
+      if (
+        finiteState !== undefined &&
+        (finiteState.positionFinite === false ||
+          finiteState.rotationFinite === false)
+      ) {
+        if (!warnedKinds.has(finiteState.kind)) {
+          warnedKinds.add(finiteState.kind);
+          logger.warn(
+            {
+              packetKind: finiteState.kind,
+              positionFinite: finiteState.positionFinite,
+              rotationFinite: finiteState.rotationFinite,
+              clientPlayState: client.state === states.PLAY,
+              spawned: isSpawned(),
+            },
+            "Suppressed a movement packet with non-finite values",
+          );
+        }
+        return;
+      }
+      Reflect.apply(target, thisArg, args);
+    },
+  });
+}
+
 export interface EntityMetadataEntry {
   readonly key: number;
   readonly value: unknown;
@@ -603,7 +673,14 @@ export class MineflayerClient implements MinecraftPort {
     }
     this.intentionalDisconnect = false;
     const connectionEpoch = ++this.connectionEpoch;
-    const bot = mineflayer.createBot(this.options.bot);
+    const botOptions: BotOptions & {
+      readonly respawnPositionDelayMs?: number;
+    } =
+      this.options.bot.version === "26.1"
+        ? { ...this.options.bot, respawnPositionDelayMs: 0 }
+        : this.options.bot;
+    const bot = mineflayer.createBot(botOptions);
+    guardMovementPacketWrites(bot, this.logger, () => this.spawned);
     bot.loadPlugin(pathfinder);
     this.botInstance = bot;
     this.playerBodyInstance?.attach(bot);

@@ -7,6 +7,13 @@ import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { AppError } from "../domain/errors.js";
+import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import type { ArmorSlot } from "../domain/snapshot.js";
+import {
+  selectArmorUpgrades,
+  type EquippedArmorBySlot,
+} from "./player-armor-selection.js";
 import {
   playerOperationSchema,
   type PlayerOperation,
@@ -78,6 +85,222 @@ const maximumItemCollectionTimeoutMs = 45_000;
 // Mineflayer's consume acknowledgement can arrive just before its inventory and food packets.
 const consumeEffectObservationGraceMs = 1_000;
 const consumeEffectObservationPollTicks = 1;
+const deathEvidenceCorrelationMs = 1_000;
+const spawnAdmissionWaitMs = 3_000;
+const spawnAdmissionPollMs = 50;
+const damageReflexActiveWindowMs = 1_000;
+const damageReflexMaximumWallMs = 4_000;
+const damageReflexSpawnWaitMs = 3_000;
+const damageReflexAttackTicks = 6;
+const armorDestinations: readonly ArmorSlot[] = [
+  "head",
+  "torso",
+  "legs",
+  "feet",
+];
+const damageReflexArmorSlots = [
+  { destination: "head", matches: /(?:^|_)helmet$/u },
+  { destination: "torso", matches: /_chestplate$/u },
+  { destination: "legs", matches: /_leggings$/u },
+  { destination: "feet", matches: /_boots$/u },
+] as const;
+
+export interface PlayerBodyDamageSource {
+  readonly kind: string;
+  readonly name: string;
+  readonly category: string | null;
+}
+
+export interface PlayerBodyDeathCause {
+  readonly source: PlayerBodyDamageSource | null;
+  readonly confidence: "observed" | "unknown";
+  readonly provenance: "damage_event" | "death_notification";
+  readonly causeKey?: string;
+}
+
+export type PlayerBodyDamageReflexOperationKind =
+  "equip" | "attack" | "control";
+export type PlayerBodyDamageReflexTrigger = "damage" | "hostile_approach";
+
+export type PlayerBodyDamageReflexSummary =
+  | "hit_confirmed"
+  | "equipment_confirmed"
+  | "equipment_and_hit_confirmed"
+  | "action_unverified"
+  | "source_unknown"
+  | "interrupted"
+  | "failed";
+
+interface DamageReflexRun {
+  readonly bot: Bot;
+  readonly controller: AbortController;
+  trigger: PlayerBodyDamageReflexTrigger;
+  readonly startedAt: string;
+  readonly startedAtMs: number;
+  readonly startLifeGeneration: number;
+  readonly sourceWasObserved: boolean;
+  latestSource: Entity | undefined;
+  firstOperationKind: PlayerBodyDamageReflexOperationKind | null;
+  firstOperationStartedAt: string | null;
+  operationKind: PlayerBodyDamageReflexOperationKind | null;
+  status: PlayerOperationStatus;
+  serverConfirmedAt: string | null;
+  sameLife: boolean | null;
+  equipmentConfirmed: boolean;
+  hitConfirmed: boolean;
+  expectedEquipSlot: number | undefined;
+  expectedEquipName: string | undefined;
+  deadlineReached: boolean;
+  failed: boolean;
+  done: Promise<void>;
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function componentText(value: unknown, depth = 0): string {
+  if (depth > 8) return "";
+  if (typeof value === "string" || typeof value === "number")
+    return String(value);
+  if (Array.isArray(value))
+    return value.map((part) => componentText(part, depth + 1)).join("");
+  const component = recordOf(value);
+  if (component === undefined) return "";
+  const ownText =
+    typeof component.text === "string"
+      ? component.text
+      : typeof component[""] === "string"
+        ? component[""]
+        : "";
+  const extra = Array.isArray(component.extra)
+    ? component.extra.map((part) => componentText(part, depth + 1)).join("")
+    : "";
+  return `${ownText}${extra}`;
+}
+
+function registryMobSource(
+  bot: Bot,
+  component: unknown,
+  key: string,
+): PlayerBodyDamageSource | null {
+  if (key.startsWith("death.attack.player")) return null;
+  const candidate = recordOf(component);
+  const translated = candidate?.translate;
+  let registryName: string | undefined;
+  if (typeof translated === "string") {
+    const match = /^entity\.minecraft\.([a-z0-9_]+)$/u.exec(translated);
+    if (match !== null) registryName = match[1];
+  } else if (
+    typeof component === "string" ||
+    (typeof candidate?.text === "string" &&
+      candidate.extra === undefined &&
+      candidate.insertion === undefined)
+  ) {
+    const displayName =
+      typeof component === "string" ? component : candidate?.text;
+    const matches = Object.values(bot.registry.entitiesByName).filter(
+      (entry) =>
+        entry.displayName === displayName &&
+        typeof entry.category === "string" &&
+        /mobs?$/iu.test(entry.category),
+    );
+    if (matches.length === 1) registryName = matches[0]?.name;
+  }
+  if (registryName === undefined) return null;
+  const registryEntity = bot.registry.entitiesByName[registryName];
+  if (
+    registryEntity === undefined ||
+    typeof registryEntity.name !== "string" ||
+    typeof registryEntity.category !== "string" ||
+    !/mobs?$/iu.test(registryEntity.category)
+  )
+    return null;
+  return {
+    kind: "mob",
+    name: registryEntity.name,
+    category: registryEntity.category,
+  };
+}
+
+function deathNoticeCause(
+  bot: Bot,
+  value: unknown,
+  position: unknown,
+  sender: unknown,
+  username: string,
+): PlayerBodyDeathCause | undefined {
+  if (position !== "system" || sender !== null) return undefined;
+  const message = recordOf(value);
+  const json = recordOf(message?.json);
+  const key = json?.translate;
+  if (
+    typeof key !== "string" ||
+    !/^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(key)
+  )
+    return undefined;
+  const args = json?.with;
+  if (!Array.isArray(args)) return undefined;
+  const victim = componentText(args[0]).trim();
+  if (victim.length === 0 || !sameMinecraftIdentity(victim, username))
+    return undefined;
+  const source = registryMobSource(bot, args[1], key);
+  return {
+    source: source ?? { kind: "death_cause", name: key, category: null },
+    confidence: "observed",
+    provenance: "death_notification",
+    causeKey: key,
+  };
+}
+
+function damageSource(
+  bot: Bot,
+  entity: Entity | undefined,
+): PlayerBodyDamageSource | null {
+  if (entity === undefined) return null;
+  const rawKind = entity.type;
+  const kind =
+    typeof rawKind === "string" && /^[a-z0-9_.:-]{1,48}$/iu.test(rawKind)
+      ? rawKind.toLowerCase()
+      : "unknown";
+  const rawName = entity.name;
+  const registryName =
+    typeof rawName === "string" && /^[a-z0-9_.:-]{1,80}$/iu.test(rawName)
+      ? rawName.toLowerCase()
+      : undefined;
+  const registryEntity =
+    registryName === undefined
+      ? undefined
+      : bot.registry.entitiesByName[registryName];
+  if (registryEntity === undefined)
+    return { kind: "unknown", name: "unknown", category: null };
+  const name = registryEntity.name;
+  const rawCategory = registryEntity.category;
+  const category =
+    typeof rawCategory === "string" &&
+    rawCategory.length <= 80 &&
+    rawCategory.toLowerCase() !== "unknown"
+      ? rawCategory
+      : null;
+  return { kind, name, category };
+}
+
+function isKnownHostileEntity(bot: Bot, entity: Entity): boolean {
+  if (
+    entity.type !== "mob" ||
+    entity.username !== undefined ||
+    typeof entity.name !== "string"
+  )
+    return false;
+  const registryEntity = bot.registry.entitiesByName[entity.name];
+  return (
+    registryEntity?.name === entity.name &&
+    typeof registryEntity.category === "string" &&
+    /^hostile\s+mobs?$/iu.test(registryEntity.category)
+  );
+}
 interface LoadedPrismarineItem {
   toNotch(item: Item | null): unknown;
 }
@@ -185,7 +408,39 @@ export type PlayerBodyEvent =
         | "position"
         | "window";
     }
-  | { readonly type: "bot_death"; readonly at: string }
+  | {
+      readonly type: "bot_damaged";
+      readonly at: string;
+      readonly source: PlayerBodyDamageSource | null;
+      readonly confidence: "observed" | "unknown";
+    }
+  | {
+      readonly type: "damage_reflex_started";
+      readonly at: string;
+      readonly trigger?: PlayerBodyDamageReflexTrigger;
+    }
+  | {
+      readonly type: "damage_reflex_completed";
+      readonly at: string;
+      readonly trigger?: PlayerBodyDamageReflexTrigger;
+      readonly operationKind: PlayerBodyDamageReflexOperationKind | null;
+      readonly status: PlayerOperationStatus;
+      readonly startedAt: string;
+      readonly serverConfirmedAt: string | null;
+      readonly sameLife: boolean | null;
+      readonly summary: PlayerBodyDamageReflexSummary;
+    }
+  | {
+      readonly type: "bot_death";
+      readonly at: string;
+      readonly cause?: PlayerBodyDeathCause;
+    }
+  | {
+      readonly type: "bot_death_cause_updated";
+      readonly at: string;
+      readonly deathAt: string;
+      readonly cause: PlayerBodyDeathCause;
+    }
   | {
       readonly type: "disconnected";
       readonly at: string;
@@ -244,6 +499,8 @@ export interface PlayerBody {
     signal?: AbortSignal,
   ): Promise<PlayerOperationResult>;
   stop(): Promise<void>;
+  setDamageReflexEnabled?(enabled: boolean): void;
+  stopActiveOperation?(): Promise<void>;
   knowledge(query: string): PlayerKnowledge;
   onEvent(listener: (event: PlayerBodyEvent) => void): () => void;
 }
@@ -268,6 +525,9 @@ interface ActiveOperation {
   runFinished: boolean;
   botDisconnected: boolean;
   effectItemName?: string;
+  consumeStatusObserved?: boolean;
+  consumeStatusLifeGeneration?: number;
+  consumeStatusCleanup?: () => void;
   lookSweep?: PlayerBodyLookSweep;
   expectedTrade?: {
     readonly input1Name: string;
@@ -295,6 +555,18 @@ interface PacketClient {
   on(event: string, listener: (packet: unknown) => void): void;
   removeListener(event: string, listener: (packet: unknown) => void): void;
   write(event: string, packet: unknown): void;
+}
+
+function isOwnEatingCompletionPacket(
+  packet: unknown,
+  entityId: number,
+): boolean {
+  if (typeof packet !== "object" || packet === null) return false;
+  const status = packet as {
+    readonly entityId?: unknown;
+    readonly entityStatus?: unknown;
+  };
+  return status.entityId === entityId && status.entityStatus === 9;
 }
 
 class ActionTimeoutError extends Error {
@@ -419,6 +691,49 @@ function abortError(signal: AbortSignal): Error {
     : new Error("Player operation interrupted");
 }
 
+function waitForSpawnAdmissionPoll(
+  delayMs: number,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const finish = (callback: () => void): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => reject(abortError(signal)));
+    const timer = setTimeout(() => finish(resolve), delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isMinecraftNotConnected(error: unknown): error is AppError {
+  return (
+    error instanceof AppError && error.detail.code === "MINECRAFT_NOT_CONNECTED"
+  );
+}
+
+function interruptedBeforeSpawnAdmission(
+  operation: PlayerOperation,
+  startedAt: string,
+): PlayerOperationResult {
+  return {
+    operationId: randomUUID(),
+    operation,
+    status: "interrupted",
+    startedAt,
+    completedAt: new Date().toISOString(),
+    before: null,
+    after: null,
+    recoveryRequired: false,
+    detail: "Operation was cancelled before Minecraft spawn admission.",
+  };
+}
+
 function waitForItemCollectionPoll(signal: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (signal.aborted) {
@@ -484,6 +799,37 @@ function waitTicks(ticks: number, signal: AbortSignal): Promise<void> {
       reject(abortError(signal));
     };
     signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function waitForPhysicsTick(bot: Bot, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+
+    const timeout: { timer?: ReturnType<typeof setTimeout> } = {};
+    const cleanup = (): void => {
+      if (timeout.timer !== undefined) clearTimeout(timeout.timer);
+      bot.removeListener("physicsTick", onPhysicsTick);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onPhysicsTick = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(abortError(signal));
+    };
+
+    bot.once("physicsTick", onPhysicsTick);
+    signal.addEventListener("abort", onAbort, { once: true });
+    timeout.timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for a Minecraft physics tick"));
+    }, 250);
   });
 }
 
@@ -564,19 +910,31 @@ function semanticSignature(
         inventory: observation.self.inventory,
         equipment: observation.self.equipment,
       });
-    case "entities":
-      return JSON.stringify(
-        observation.perception.entities.map((entity) => ({
+    case "entities": {
+      const semanticEntities = (
+        entities: PlayerBodyObservation["perception"]["entities"],
+      ) =>
+        entities.map((entity) => ({
           id: entity.id,
           name: entity.name,
+          kind: entity.kind,
+          category: entity.category,
           position: [
             Math.round(entity.position.x * 2) / 2,
             Math.round(entity.position.y * 2) / 2,
             Math.round(entity.position.z * 2) / 2,
           ],
           health: entity.health,
-        })),
-      );
+          equipment: entity.equipment,
+          droppedItem: entity.droppedItem,
+        }));
+      return JSON.stringify({
+        visible: semanticEntities(observation.perception.entities),
+        nearbyHostiles: semanticEntities(
+          observation.perception.nearbyHostiles?.entities ?? [],
+        ),
+      });
+    }
     case "blocks":
       return JSON.stringify(
         observation.perception.blocks.map((block) => ({
@@ -874,13 +1232,15 @@ function operationEvidence(
     case "window_close":
       return before.window !== null && after.window === null;
     case "consume":
+      if (active.effectItemName === undefined) return false;
       return (
-        active.effectItemName !== undefined &&
-        after.self.food !== null &&
-        before.self.food !== null &&
-        after.self.food > before.self.food &&
         countNamedItem(after, active.effectItemName) <
-          countNamedItem(before, active.effectItemName)
+          countNamedItem(before, active.effectItemName) &&
+        ((after.self.food !== null &&
+          before.self.food !== null &&
+          after.self.food > before.self.food) ||
+          (active.consumeStatusObserved === true &&
+            active.consumeStatusLifeGeneration !== undefined))
       );
     case "toss":
       return (
@@ -1211,9 +1571,21 @@ function captureServerBlockUpdates(
 
 export class MineflayerPlayerBody implements PlayerBody {
   private active: ActiveOperation | undefined;
+  private damageReflexEnabled = false;
+  private damageReflex: DamageReflexRun | undefined;
+  private passiveArmorController: AbortController | undefined;
+  private passiveArmorTask: Promise<void> | undefined;
+  private passiveArmorEquipInFlight:
+    { readonly bot: Bot; readonly promise: Promise<void> } | undefined;
+  private passiveArmorPending = false;
+  private hostileApproachTargets = new Set<Entity>();
+  private lifeGeneration = 0;
+  private botLifeDead = false;
   private admission: Promise<void> = Promise.resolve();
+  private readonly pendingOperationAdmissions = new Set<AbortController>();
   private readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   private boundBot: Bot | undefined;
+  private boundBotEnded = false;
   private readonly botHandlers: (() => void)[] = [];
   private readonly inventoryHandlers: (() => void)[] = [];
   private inventoryBoundBot: Bot | undefined;
@@ -1226,6 +1598,30 @@ export class MineflayerPlayerBody implements PlayerBody {
     Extract<PlayerBodyEvent, { type: "state_changed" }>["reason"],
     string
   >();
+  private lastBotDamage:
+    | {
+        readonly bot: Bot;
+        readonly observedAtMs: number;
+        readonly source: PlayerBodyDamageSource | null;
+      }
+    | undefined;
+  private pendingDeathNotice:
+    | {
+        readonly bot: Bot;
+        readonly observedAtMs: number;
+        readonly cause: PlayerBodyDeathCause;
+      }
+    | undefined;
+  private pendingBotDeath:
+    | {
+        readonly bot: Bot;
+        readonly at: string;
+        readonly observedAtMs: number;
+        cause: PlayerBodyDeathCause | undefined;
+        causeUpdateEmitted: boolean;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    | undefined;
   private disconnectedSinceBind = false;
 
   public constructor(
@@ -1263,11 +1659,524 @@ export class MineflayerPlayerBody implements PlayerBody {
     return () => this.listeners.delete(listener);
   }
 
+  private schedulePassiveArmor(bot = this.boundBot): void {
+    if (
+      !this.damageReflexEnabled ||
+      bot === undefined ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return;
+    if (this.passiveArmorEquipInFlight?.bot === bot) {
+      this.passiveArmorPending = true;
+      return;
+    }
+    if (this.damageReflex !== undefined) {
+      this.passiveArmorPending = true;
+      return;
+    }
+    if (this.passiveArmorTask !== undefined) {
+      this.passiveArmorPending = true;
+      return;
+    }
+
+    const controller = new AbortController();
+    const lifeGeneration = this.lifeGeneration;
+    this.passiveArmorPending = false;
+    this.passiveArmorController = controller;
+    const task = Promise.resolve()
+      .then(() =>
+        this.equipPassiveArmor(bot, lifeGeneration, controller.signal),
+      )
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.passiveArmorTask !== task) return;
+        this.passiveArmorTask = undefined;
+        this.passiveArmorController = undefined;
+        const retry = this.passiveArmorPending;
+        this.passiveArmorPending = false;
+        const currentBot = this.boundBot;
+        if (retry && currentBot !== undefined)
+          this.schedulePassiveArmor(currentBot);
+      });
+    this.passiveArmorTask = task;
+  }
+
+  private passiveArmorIsCurrent(
+    bot: Bot,
+    lifeGeneration: number,
+    signal: AbortSignal,
+  ): boolean {
+    if (
+      signal.aborted ||
+      !this.damageReflexEnabled ||
+      this.damageReflex !== undefined ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      this.lifeGeneration !== lifeGeneration ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return false;
+    try {
+      return this.getBot() === bot;
+    } catch {
+      return false;
+    }
+  }
+
+  private async equipPassiveArmor(
+    bot: Bot,
+    lifeGeneration: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const inventory = initializedInventory(bot);
+    if (
+      inventory === undefined ||
+      typeof inventory.items !== "function" ||
+      typeof bot.equip !== "function"
+    )
+      return;
+
+    const planned = selectArmorUpgrades(
+      inventory.items(),
+      readEquippedArmor(bot, inventory.slots),
+    );
+    for (const candidate of planned) {
+      if (!this.passiveArmorIsCurrent(bot, lifeGeneration, signal)) return;
+      const next = selectArmorUpgrades(
+        inventory.items(),
+        readEquippedArmor(bot, inventory.slots),
+      ).find((upgrade) => upgrade.destination === candidate.destination);
+      if (next === undefined) continue;
+      await this.performPassiveArmorEquip(
+        bot,
+        next.item,
+        next.destination,
+        signal,
+      );
+      if (!this.passiveArmorIsCurrent(bot, lifeGeneration, signal)) return;
+    }
+  }
+
+  private async performPassiveArmorEquip(
+    bot: Bot,
+    item: Item,
+    destination: ArmorSlot,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const nativeEquip = Promise.resolve(bot.equip(item, destination));
+    const inFlight = { bot, promise: nativeEquip };
+    this.passiveArmorEquipInFlight = inFlight;
+    const clearWhenSettled = (failed: boolean): void => {
+      if (this.passiveArmorEquipInFlight !== inFlight) return;
+      this.passiveArmorEquipInFlight = undefined;
+      if (failed) {
+        this.passiveArmorPending = false;
+        return;
+      }
+      if (this.passiveArmorTask === undefined && this.passiveArmorPending)
+        this.schedulePassiveArmor(bot);
+    };
+    void nativeEquip.then(
+      () => clearWhenSettled(false),
+      () => clearWhenSettled(true),
+    );
+    await waitForAction(nativeEquip, signal);
+  }
+
+  private startDamageReflex(
+    bot: Bot,
+    source: Entity | undefined,
+    trigger: PlayerBodyDamageReflexTrigger = "damage",
+  ): void {
+    if (
+      !this.damageReflexEnabled ||
+      this.boundBot !== bot ||
+      this.boundBotEnded
+    )
+      return;
+    if (trigger === "damage" && source && isKnownHostileEntity(bot, source)) {
+      try {
+        requireReachableEntity(bot, source.id, attackRange);
+        this.hostileApproachTargets.add(source);
+      } catch {
+        // A distant damage source remains eligible for a later approach trigger.
+      }
+    }
+    const current = this.damageReflex;
+    if (current?.bot === bot) {
+      if (trigger === "damage") current.trigger = "damage";
+      if (source !== undefined) current.latestSource = source;
+      return;
+    }
+    const startedAt = new Date().toISOString();
+    const reflex: DamageReflexRun = {
+      bot,
+      controller: new AbortController(),
+      trigger,
+      startedAt,
+      startedAtMs: Date.now(),
+      startLifeGeneration: this.lifeGeneration,
+      sourceWasObserved: source !== undefined,
+      latestSource: source,
+      firstOperationKind: null,
+      firstOperationStartedAt: null,
+      operationKind: null,
+      status: "unverified",
+      serverConfirmedAt: null,
+      sameLife: null,
+      equipmentConfirmed: false,
+      hitConfirmed: false,
+      expectedEquipSlot: undefined,
+      expectedEquipName: undefined,
+      deadlineReached: false,
+      failed: false,
+      done: Promise.resolve(),
+    };
+    this.damageReflex = reflex;
+    if (this.passiveArmorTask !== undefined) this.passiveArmorPending = true;
+    this.passiveArmorController?.abort(new Error("Damage reflex has priority"));
+    reflex.done = this.runDamageReflex(reflex);
+  }
+
+  private damageReflexIsCurrent(reflex: DamageReflexRun): boolean {
+    return (
+      this.damageReflex === reflex &&
+      this.damageReflexEnabled &&
+      this.boundBot === reflex.bot &&
+      !this.boundBotEnded
+    );
+  }
+
+  private damageReflexIsAlive(reflex: DamageReflexRun): boolean {
+    return (
+      this.damageReflexIsCurrent(reflex) &&
+      !this.botLifeDead &&
+      Number.isFinite(reflex.bot.health) &&
+      reflex.bot.health > 0
+    );
+  }
+
+  private markDamageReflexAttempt(
+    reflex: DamageReflexRun,
+    operationKind: PlayerBodyDamageReflexOperationKind,
+  ): void {
+    if (reflex.firstOperationKind !== null) return;
+    reflex.firstOperationKind = operationKind;
+    reflex.firstOperationStartedAt = new Date().toISOString();
+  }
+
+  private markDamageReflexConfirmed(
+    reflex: DamageReflexRun,
+    operationKind: PlayerBodyDamageReflexOperationKind,
+    confirmedAt: string,
+  ): void {
+    if (operationKind === "attack") reflex.hitConfirmed = true;
+    else if (operationKind === "equip") reflex.equipmentConfirmed = true;
+    if (reflex.serverConfirmedAt !== null) return;
+    reflex.operationKind = operationKind;
+    reflex.status = "successful";
+    reflex.serverConfirmedAt = confirmedAt;
+    reflex.sameLife = this.lifeGeneration === reflex.startLifeGeneration;
+  }
+
+  private damageReflexTarget(reflex: DamageReflexRun): Entity | undefined {
+    const source = reflex.latestSource;
+    if (
+      source === undefined ||
+      reflex.bot.entities[source.id] !== source ||
+      !Number.isFinite(source.position.x) ||
+      !Number.isFinite(source.position.y) ||
+      !Number.isFinite(source.position.z)
+    )
+      return undefined;
+    return source;
+  }
+
+  private async waitForDamageReflexSpawn(
+    reflex: DamageReflexRun,
+    wallDeadline: number,
+  ): Promise<boolean> {
+    if (this.damageReflexIsAlive(reflex)) return true;
+    const waitMs = Math.min(damageReflexSpawnWaitMs, wallDeadline - Date.now());
+    if (waitMs <= 0) return false;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (spawned: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reflex.bot.removeListener("spawn", onSpawn);
+        reflex.bot.removeListener("health", onSpawn);
+        reflex.controller.signal.removeEventListener("abort", onAbort);
+        resolve(spawned && this.damageReflexIsAlive(reflex));
+      };
+      const onSpawn = (): void => {
+        if (this.damageReflexIsAlive(reflex)) finish(true);
+      };
+      const onAbort = (): void => finish(false);
+      const timer = setTimeout(() => finish(false), waitMs);
+      reflex.bot.once("spawn", onSpawn);
+      reflex.bot.on("health", onSpawn);
+      reflex.controller.signal.addEventListener("abort", onAbort, {
+        once: true,
+      });
+      if (reflex.controller.signal.aborted) onAbort();
+    });
+  }
+
+  private async equipDamageReflexItems(reflex: DamageReflexRun): Promise<void> {
+    const { bot } = reflex;
+    const passiveArmorTask = this.passiveArmorTask;
+    if (passiveArmorTask !== undefined) await passiveArmorTask;
+    if (
+      !this.damageReflexIsAlive(reflex) ||
+      this.passiveArmorEquipInFlight?.bot === bot
+    )
+      return;
+    const inventory = bot.inventory;
+    if (
+      typeof inventory.items !== "function" ||
+      typeof bot.equip !== "function"
+    )
+      return;
+    const client = bot._client as unknown as PacketClient;
+    const confirmServerSlot = (slot: number): void => {
+      if (
+        reflex.expectedEquipSlot !== slot ||
+        inventory.slots[slot]?.name !== reflex.expectedEquipName
+      )
+        return;
+      this.markDamageReflexConfirmed(reflex, "equip", new Date().toISOString());
+    };
+    const onSetSlot = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (packet?.windowId === 0 && typeof packet.slot === "number")
+        confirmServerSlot(packet.slot);
+    };
+    const onSetPlayerInventory = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (typeof packet?.slotId !== "number") return;
+      const slotId = packet.slotId;
+      const inventorySlot =
+        slotId <= 8
+          ? slotId + 36
+          : slotId >= 36 && slotId <= 39
+            ? 44 - slotId
+            : slotId === 40
+              ? 45
+              : slotId;
+      confirmServerSlot(inventorySlot);
+    };
+    const onWindowItems = (raw: unknown): void => {
+      const packet = recordOf(raw);
+      if (
+        packet?.windowId === 0 &&
+        Array.isArray(packet.items) &&
+        reflex.expectedEquipSlot !== undefined &&
+        reflex.expectedEquipSlot < packet.items.length
+      )
+        confirmServerSlot(reflex.expectedEquipSlot);
+    };
+    client.on("set_slot", onSetSlot);
+    client.on("set_player_inventory", onSetPlayerInventory);
+    client.on("window_items", onWindowItems);
+    try {
+      for (const armorSlot of damageReflexArmorSlots) {
+        if (
+          reflex.controller.signal.aborted ||
+          !this.damageReflexIsAlive(reflex)
+        )
+          break;
+        const slot = bot.getEquipmentDestSlot(armorSlot.destination);
+        if (inventory.slots[slot] != null) continue;
+        const item = inventory
+          .items()
+          .find((candidate) => armorSlot.matches.test(candidate.name));
+        if (item === undefined) continue;
+        reflex.expectedEquipSlot = slot;
+        reflex.expectedEquipName = item.name;
+        this.markDamageReflexAttempt(reflex, "equip");
+        try {
+          await waitForAction(
+            bot.equip(item, armorSlot.destination),
+            reflex.controller.signal,
+          );
+        } finally {
+          reflex.expectedEquipSlot = undefined;
+          reflex.expectedEquipName = undefined;
+        }
+      }
+      if (reflex.controller.signal.aborted || !this.damageReflexIsAlive(reflex))
+        return;
+      const heldItem = bot.heldItem;
+      if (heldItem != null && /_(?:sword|axe|spear)$/u.test(heldItem.name))
+        return;
+      const weapon = inventory
+        .items()
+        .find((item) => /_(?:sword|axe|spear)$/u.test(item.name));
+      if (weapon === undefined) return;
+      const slot = bot.getEquipmentDestSlot("hand");
+      reflex.expectedEquipSlot = slot;
+      reflex.expectedEquipName = weapon.name;
+      this.markDamageReflexAttempt(reflex, "equip");
+      try {
+        await waitForAction(
+          bot.equip(weapon, "hand"),
+          reflex.controller.signal,
+        );
+      } finally {
+        reflex.expectedEquipSlot = undefined;
+        reflex.expectedEquipName = undefined;
+      }
+    } finally {
+      client.removeListener("set_slot", onSetSlot);
+      client.removeListener("set_player_inventory", onSetPlayerInventory);
+      client.removeListener("window_items", onWindowItems);
+    }
+  }
+
+  private async runDamageReflex(reflex: DamageReflexRun): Promise<void> {
+    const { bot, controller } = reflex;
+    const signal = controller.signal;
+    const wallDeadline = reflex.startedAtMs + damageReflexMaximumWallMs;
+    let activeMs = 0;
+    let previousTickAt = Date.now();
+    const budgetTimer = setInterval(() => {
+      const now = Date.now();
+      if (this.damageReflexIsAlive(reflex)) activeMs += now - previousTickAt;
+      previousTickAt = now;
+      if (activeMs >= damageReflexActiveWindowMs || now >= wallDeadline) {
+        reflex.deadlineReached = true;
+        controller.abort(new Error("Damage reflex window elapsed"));
+      }
+    }, 50);
+    const attemptedTargets = new Set<Entity>();
+    const onOutgoingHit = (
+      target: Entity,
+      source: Entity | undefined,
+    ): void => {
+      if (source?.id !== bot.entity.id || !attemptedTargets.has(target)) return;
+      this.markDamageReflexConfirmed(
+        reflex,
+        "attack",
+        new Date().toISOString(),
+      );
+    };
+    bot.on("entityHurt", onOutgoingHit);
+    this.emit({
+      type: "damage_reflex_started",
+      at: reflex.startedAt,
+      trigger: reflex.trigger,
+    });
+    const equipment = this.equipDamageReflexItems(reflex).catch(() => {
+      reflex.failed = true;
+    });
+    try {
+      while (!signal.aborted) {
+        if (!this.damageReflexIsCurrent(reflex)) break;
+        if (
+          reflex.trigger === "hostile_approach" &&
+          !this.damageReflexIsAlive(reflex)
+        )
+          break;
+        if (!this.damageReflexIsAlive(reflex)) {
+          if (!(await this.waitForDamageReflexSpawn(reflex, wallDeadline)))
+            break;
+          continue;
+        }
+        const target = this.damageReflexTarget(reflex);
+        if (target !== undefined) {
+          const attemptLifeGeneration = this.lifeGeneration;
+          const attemptBotEntity = bot.entity;
+          this.markDamageReflexAttempt(reflex, "attack");
+          await waitForAction(
+            bot.lookAt(entityBodyAimPoint(target), true),
+            signal,
+          );
+          if (
+            !this.damageReflexIsAlive(reflex) ||
+            this.lifeGeneration !== attemptLifeGeneration ||
+            bot.entity !== attemptBotEntity
+          )
+            continue;
+          await waitForPhysicsTick(bot, signal);
+          if (
+            !this.damageReflexIsAlive(reflex) ||
+            this.lifeGeneration !== attemptLifeGeneration ||
+            bot.entity !== attemptBotEntity
+          )
+            continue;
+          const currentTarget = this.damageReflexTarget(reflex);
+          if (currentTarget === target) {
+            const visibleTarget = requireVisibleEntity(
+              bot,
+              target.id,
+              attackRange,
+            );
+            attemptedTargets.add(target);
+            bot.attack(visibleTarget);
+          }
+        }
+        await waitTicks(damageReflexAttackTicks, signal);
+      }
+    } catch {
+      if (!signal.aborted) reflex.failed = true;
+    } finally {
+      clearInterval(budgetTimer);
+      bot.removeListener("entityHurt", onOutgoingHit);
+      await equipment;
+      if (reflex.operationKind === null) {
+        reflex.operationKind = reflex.firstOperationKind;
+        if (reflex.deadlineReached) reflex.status = "unverified";
+        else if (signal.aborted) reflex.status = "interrupted";
+        else if (reflex.failed) reflex.status = "failed";
+      }
+      const summary: PlayerBodyDamageReflexSummary =
+        reflex.hitConfirmed && reflex.equipmentConfirmed
+          ? "equipment_and_hit_confirmed"
+          : reflex.hitConfirmed
+            ? "hit_confirmed"
+            : reflex.equipmentConfirmed
+              ? "equipment_confirmed"
+              : !reflex.sourceWasObserved
+                ? "source_unknown"
+                : reflex.deadlineReached
+                  ? "action_unverified"
+                  : signal.aborted
+                    ? "interrupted"
+                    : reflex.failed
+                      ? "failed"
+                      : "action_unverified";
+      this.emit({
+        type: "damage_reflex_completed",
+        at: new Date().toISOString(),
+        trigger: reflex.trigger,
+        operationKind: reflex.operationKind,
+        status: reflex.status,
+        startedAt: reflex.firstOperationStartedAt ?? reflex.startedAt,
+        serverConfirmedAt: reflex.serverConfirmedAt,
+        sameLife: reflex.sameLife,
+        summary,
+      });
+      if (this.damageReflex === reflex) {
+        this.damageReflex = undefined;
+        this.schedulePassiveArmor(bot);
+      }
+    }
+  }
+
   public async execute(
     rawOperation: PlayerOperation,
     signal?: AbortSignal,
   ): Promise<PlayerOperationResult> {
     const operation = playerOperationSchema.parse(rawOperation);
+    const requestedAt = new Date().toISOString();
     const previousAdmission = this.admission;
     let resolveAdmission!: () => void;
     const nextAdmission = new Promise<void>((resolve) => {
@@ -1277,11 +2186,38 @@ export class MineflayerPlayerBody implements PlayerBody {
       () => nextAdmission,
       () => nextAdmission,
     );
+    const admissionController = new AbortController();
+    const isAdmissionAborted = (): boolean =>
+      admissionController.signal.aborted;
+    const abortAdmission = (): void =>
+      admissionController.abort(signal?.reason);
+    if (signal?.aborted) abortAdmission();
+    else signal?.addEventListener("abort", abortAdmission, { once: true });
+    this.pendingOperationAdmissions.add(admissionController);
 
     let active: ActiveOperation | undefined;
     try {
       await previousAdmission;
-      const bot = this.getBot();
+      if (isAdmissionAborted())
+        return interruptedBeforeSpawnAdmission(operation, requestedAt);
+      let bot: Bot;
+      try {
+        bot = this.getBot();
+      } catch (error) {
+        if (!isMinecraftNotConnected(error)) throw error;
+        try {
+          bot = await this.waitForSpawnAdmission(
+            error,
+            admissionController.signal,
+          );
+        } catch (waitError) {
+          if (isAdmissionAborted())
+            return interruptedBeforeSpawnAdmission(operation, requestedAt);
+          throw waitError;
+        }
+      }
+      if (isAdmissionAborted())
+        return interruptedBeforeSpawnAdmission(operation, requestedAt);
       this.bindBot(bot);
       const previous = this.active;
       if (previous !== undefined) {
@@ -1289,6 +2225,8 @@ export class MineflayerPlayerBody implements PlayerBody {
           new Error("Replaced by a newer player operation"),
         );
         await previous.done;
+        if (isAdmissionAborted())
+          return interruptedBeforeSpawnAdmission(operation, requestedAt);
         if (
           !previous.actionSettled &&
           !(previous.botDisconnected && previous.bot !== bot)
@@ -1308,6 +2246,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
       active ??= this.makeActive(operation, bot, controller);
       this.active = active;
+      this.pendingOperationAdmissions.delete(admissionController);
       this.emit({
         type: "operation_started",
         at: active.startedAt,
@@ -1317,6 +2256,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       active.done = this.runActive(active);
     } finally {
       resolveAdmission();
+      this.pendingOperationAdmissions.delete(admissionController);
+      signal?.removeEventListener("abort", abortAdmission);
     }
 
     const result = await active.done;
@@ -1325,7 +2266,66 @@ export class MineflayerPlayerBody implements PlayerBody {
     return result;
   }
 
-  public async stop(): Promise<void> {
+  private async waitForSpawnAdmission(
+    initialError: AppError,
+    signal: AbortSignal,
+  ): Promise<Bot> {
+    const waitingBot = this.boundBot;
+    const isBoundBotEnded = (): boolean => this.boundBotEnded;
+    if (waitingBot === undefined || isBoundBotEnded()) throw initialError;
+    const deadline = Date.now() + spawnAdmissionWaitMs;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      if (this.boundBot !== waitingBot || isBoundBotEnded()) throw initialError;
+      await waitForSpawnAdmissionPoll(
+        Math.min(spawnAdmissionPollMs, deadline - Date.now()),
+        signal,
+      );
+      throwIfAborted(signal);
+      if (
+        Date.now() >= deadline ||
+        this.boundBot !== waitingBot ||
+        isBoundBotEnded()
+      )
+        throw initialError;
+      let admittedBot: Bot;
+      try {
+        admittedBot = this.getBot();
+      } catch (error) {
+        if (isMinecraftNotConnected(error)) continue;
+        throw error;
+      }
+      if (admittedBot !== waitingBot) throw initialError;
+      return admittedBot;
+    }
+    throw initialError;
+  }
+
+  public setDamageReflexEnabled(enabled: boolean): void {
+    this.damageReflexEnabled = enabled;
+    if (!enabled) {
+      this.passiveArmorPending = false;
+      this.passiveArmorController?.abort(
+        new Error("Player damage reflex disabled"),
+      );
+      this.damageReflex?.controller.abort(
+        new Error("Player damage reflex disabled"),
+      );
+      return;
+    }
+    try {
+      const bot = this.getBot();
+      this.bindBot(bot);
+      this.schedulePassiveArmor(bot);
+      this.scheduleStateEvent("entities");
+    } catch {
+      // Bind and inventory events will retry when this client becomes available.
+    }
+  }
+
+  public async stopActiveOperation(): Promise<void> {
+    for (const pending of this.pendingOperationAdmissions)
+      pending.abort(new Error("Player body stopped"));
     const active = this.active;
     if (active !== undefined) {
       active.controller.abort(new Error("Player body stopped"));
@@ -1333,11 +2333,18 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.stopBot(active.bot);
       await active.done;
     }
+  }
+
+  public async stop(): Promise<void> {
+    this.setDamageReflexEnabled(false);
+    const reflex = this.damageReflex;
+    await this.stopActiveOperation();
     try {
       this.stopBot(this.getBot());
     } catch {
       // The bot may already be disconnected; its current physical action cannot be controlled then.
     }
+    if (reflex !== undefined) await reflex.done;
   }
 
   private makeActive(
@@ -1400,8 +2407,8 @@ export class MineflayerPlayerBody implements PlayerBody {
         : operation.kind === "use" && operation.target.kind === "block"
           ? blockPosition(operation.target.position)
           : undefined;
-    const blockEvidence =
-      blockTarget === undefined
+    let blockEvidence =
+      blockTarget === undefined || operation.kind === "dig"
         ? undefined
         : captureServerBlockUpdates(bot, blockTarget);
     const attackEvidence = captureAttackEvidence(bot, operation, active);
@@ -1417,6 +2424,17 @@ export class MineflayerPlayerBody implements PlayerBody {
       controller.abort(new ActionTimeoutError(timeoutMs));
     }, timeoutMs);
     try {
+      if (operation.kind === "dig" && blockTarget !== undefined) {
+        const target = requireReachableBlock(bot, operation.position, false);
+        await waitForAction(
+          bot.lookAt(target.position.offset(0.5, 0.5, 0.5), true),
+          controller.signal,
+        );
+        throwIfAborted(controller.signal);
+        if (this.getBot() !== bot)
+          throw new Error("Minecraft bot changed while aiming to dig");
+        blockEvidence = captureServerBlockUpdates(bot, blockTarget);
+      }
       if (!controller.signal.aborted) {
         const action = this.dispatch(bot, operation, controller.signal, active);
         active.actionPromise = action;
@@ -1471,6 +2489,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       blockEvidence?.dispose();
       attackEvidence?.();
       itemCollectionEvidence?.();
+      active.consumeStatusCleanup?.();
+      delete active.consumeStatusCleanup;
       this.stopStallMonitor(active);
       this.cleanupAction(
         active,
@@ -1526,7 +2546,9 @@ export class MineflayerPlayerBody implements PlayerBody {
             : "Mineflayer observed this player damage the target; target death was not observed."
           : operation.kind === "collect_item"
             ? "Mineflayer observed this player collect the requested item entity and the matching inventory count increased."
-            : "Observed post-action state confirms the requested effect.";
+            : operation.kind === "consume"
+              ? "The requested item count decreased and food increase or this player's eating-completion status was observed; health recovery was not inferred."
+              : "Observed post-action state confirms the requested effect.";
     } else if (active.timedOut) {
       status = "unverified";
       detail =
@@ -1620,6 +2642,35 @@ export class MineflayerPlayerBody implements PlayerBody {
     } catch {
       return null;
     }
+  }
+
+  private captureConsumeStatus(bot: Bot, active: ActiveOperation): () => void {
+    const client = bot._client as unknown as PacketClient;
+    const entity = bot.entity;
+    const lifeGeneration = this.lifeGeneration;
+    const onEntityStatus = (packet: unknown): void => {
+      if (
+        !isOwnEatingCompletionPacket(packet, entity.id) ||
+        this.boundBot !== bot ||
+        this.boundBotEnded ||
+        this.disconnectedSinceBind ||
+        this.botLifeDead ||
+        this.lifeGeneration !== lifeGeneration ||
+        bot.entity !== entity ||
+        !Number.isFinite(bot.health) ||
+        bot.health <= 0
+      )
+        return;
+      try {
+        if (this.getBot() !== bot) return;
+      } catch {
+        return;
+      }
+      active.consumeStatusObserved = true;
+      active.consumeStatusLifeGeneration = lifeGeneration;
+    };
+    client.on("entity_status", onEntityStatus);
+    return () => client.removeListener("entity_status", onEntityStatus);
   }
 
   private async waitForConsumeEffectConfirmation(
@@ -1930,17 +2981,42 @@ export class MineflayerPlayerBody implements PlayerBody {
         return;
       }
       case "attack": {
-        const entity = requireVisibleEntity(
+        const entity = requireReachableEntity(
           bot,
           operation.entityId,
           attackRange,
         );
-        bot.attack(entity);
+        const attemptLifeGeneration = this.lifeGeneration;
+        const attemptBotEntity = bot.entity;
+        await waitForAction(
+          bot.lookAt(entityBodyAimPoint(entity), true),
+          signal,
+        );
+        await waitForPhysicsTick(bot, signal);
+        throwIfAborted(signal);
+        if (
+          this.getBot() !== bot ||
+          this.boundBot !== bot ||
+          this.boundBotEnded ||
+          this.lifeGeneration !== attemptLifeGeneration ||
+          bot.entity !== attemptBotEntity ||
+          !Number.isFinite(bot.health) ||
+          bot.health <= 0
+        )
+          throw new Error(
+            "Minecraft bot or life changed while aiming to attack",
+          );
+        if (bot.entities[entity.id] !== entity)
+          throw new Error("Attack target changed while aiming");
+        bot.attack(requireVisibleEntity(bot, operation.entityId, attackRange));
         await waitTicks(6, signal);
         return;
       }
       case "dig": {
         const block = requireReachableBlock(bot, operation.position);
+        if (this.getBot() !== bot)
+          throw new Error("Minecraft bot changed before digging");
+        throwIfAborted(signal);
         await bot.dig(block);
         return;
       }
@@ -2110,6 +3186,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         active.effectItemName = food.name;
         await bot.equip(food, "hand");
         if (signal.aborted) throw abortError(signal);
+        active.consumeStatusCleanup = this.captureConsumeStatus(bot, active);
         await bot.consume();
         return;
       }
@@ -2283,6 +3360,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     let settledTargetSince: number | undefined;
     let pathFailurePromise: Promise<never> | undefined;
     let rejectPathFailure: ((error: ItemCollectionError) => void) | undefined;
+    let lastVisibleTarget: Entity | undefined;
+    let lastVisibleAimPoint: Vec3 | undefined;
     const onPathUpdate = (results: {
       readonly status: string;
       readonly path?: readonly unknown[];
@@ -2318,6 +3397,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     const observeVisibleTarget = async (
       firstObservation: PlayerBodyObservation | null,
       deadline = Date.now() + itemCollectionVisibilityGraceMs,
+      attemptedViewRecovery = false,
     ): Promise<
       | {
           readonly observation: PlayerBodyObservation;
@@ -2338,16 +3418,46 @@ export class MineflayerPlayerBody implements PlayerBody {
               "invalid_target",
               "The requested visible entity is not an item entity.",
             );
+          const currentTarget = bot.entities[entityId];
+          if (currentTarget === undefined)
+            throw new ItemCollectionError(
+              "entity_removed",
+              "The requested item entity left the client entity table.",
+            );
+          if (
+            lastVisibleTarget !== undefined &&
+            currentTarget !== lastVisibleTarget
+          )
+            throw new ItemCollectionError(
+              "entity_removed",
+              "The requested item entity changed while it was being collected.",
+            );
+          lastVisibleTarget = currentTarget;
+          if (Number.isFinite(currentTarget.height) && currentTarget.height > 0)
+            lastVisibleAimPoint = new Vec3(
+              target.position.x,
+              target.position.y + Math.max(0.1, currentTarget.height * 0.55),
+              target.position.z,
+            );
           return { observation: firstObservation, target };
         }
       }
 
       if (pathPromise !== undefined) await stopPath();
       if (pickupObserved()) return undefined;
-      if (bot.entities[entityId] === undefined)
+      const currentTarget = bot.entities[entityId];
+      if (
+        currentTarget === undefined ||
+        (lastVisibleTarget !== undefined && currentTarget !== lastVisibleTarget)
+      )
         throw new ItemCollectionError(
           "entity_removed",
           "The requested item entity has left the current client entity table.",
+        );
+      if (currentTarget.name !== "item")
+        throw new ItemCollectionError(
+          "invalid_target",
+          "The requested visible entity is not an item entity.",
         );
       if (Date.now() >= deadline)
         throw new ItemCollectionError(
@@ -2355,9 +3465,53 @@ export class MineflayerPlayerBody implements PlayerBody {
           "The requested item did not return to the current visible view.",
         );
 
+      if (!attemptedViewRecovery && lastVisibleAimPoint !== undefined) {
+        const recoveryEntity = bot.entity;
+        const recoveryLifeGeneration = this.lifeGeneration;
+        attemptedViewRecovery = true;
+        const isCurrentLife = (): boolean => {
+          if (
+            this.boundBot !== bot ||
+            this.boundBotEnded ||
+            this.disconnectedSinceBind ||
+            this.lifeGeneration !== recoveryLifeGeneration ||
+            bot.entity !== recoveryEntity ||
+            bot.entities[entityId] !== lastVisibleTarget
+          )
+            return false;
+          try {
+            return this.getBot() === bot;
+          } catch {
+            return false;
+          }
+        };
+        try {
+          throwIfAborted(signal);
+          if (!isCurrentLife()) return undefined;
+          await waitForAction(bot.lookAt(lastVisibleAimPoint, true), signal);
+          if (pickupObserved()) return undefined;
+          if (!isCurrentLife()) return undefined;
+          await waitForPhysicsTick(bot, signal);
+          if (pickupObserved()) return undefined;
+          if (!isCurrentLife()) return undefined;
+          return await observeVisibleTarget(
+            this.safeObserve(bot),
+            deadline,
+            true,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          // Keep the existing visibility deadline if the bounded view turn fails.
+        }
+      }
+
       await waitForItemCollectionPoll(signal);
       if (pickupObserved()) return undefined;
-      return observeVisibleTarget(this.safeObserve(bot), deadline);
+      return observeVisibleTarget(
+        this.safeObserve(bot),
+        deadline,
+        attemptedViewRecovery,
+      );
     };
 
     try {
@@ -2523,6 +3677,12 @@ export class MineflayerPlayerBody implements PlayerBody {
 
   private bindBot(bot: Bot): void {
     if (this.boundBot === bot) return;
+    this.hostileApproachTargets = new Set<Entity>();
+    if (this.passiveArmorTask !== undefined)
+      this.passiveArmorPending = this.damageReflexEnabled;
+    this.passiveArmorController?.abort(new Error("Minecraft bot changed"));
+    if (this.damageReflex !== undefined && this.damageReflex.bot !== bot)
+      this.damageReflex.controller.abort(new Error("Minecraft bot changed"));
     for (const detach of this.botHandlers.splice(0)) detach();
     for (const detach of this.inventoryHandlers.splice(0)) detach();
     this.inventoryBoundBot = undefined;
@@ -2530,8 +3690,16 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.windowUpdateHandlers.clear();
     for (const timer of this.stateTimers.values()) clearTimeout(timer);
     this.stateTimers.clear();
+    if (this.pendingBotDeath !== undefined)
+      clearTimeout(this.pendingBotDeath.timer);
+    this.pendingBotDeath = undefined;
     this.boundBot = bot;
+    this.boundBotEnded = false;
+    this.botLifeDead = !Number.isFinite(bot.health) || bot.health <= 0;
+    this.lifeGeneration += 1;
     this.lastStateSignatures.clear();
+    this.lastBotDamage = undefined;
+    this.pendingDeathNotice = undefined;
     const listen = (
       event: keyof BotEvents,
       handler: (...args: never[]) => void,
@@ -2546,7 +3714,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       ): (() => void) =>
       () =>
         this.scheduleStateEvent(reason);
-    listen("health", state("vitals"));
+    listen("health", () => {
+      if (this.boundBot === bot && bot.health <= 0) this.markBotLifeDead(bot);
+      this.scheduleStateEvent("vitals");
+    });
     listen("breath", state("vitals"));
     listen("experience", state("vitals"));
     listen("heldItemChanged", state("inventory"));
@@ -2576,10 +3747,123 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("entityGone", state("entities"));
     listen("entityMoved", state("entities"));
     listen("entityUpdate", state("entities"));
-    listen("death", () =>
-      this.emit({ type: "bot_death", at: new Date().toISOString() }),
+    listen("entityHurt", (target: Entity, source: Entity | undefined) => {
+      if (this.boundBot !== bot || target.id !== bot.entity.id) return;
+      this.startDamageReflex(bot, source);
+      const at = new Date().toISOString();
+      const observedSource = damageSource(bot, source);
+      this.lastBotDamage = {
+        bot,
+        observedAtMs: Date.now(),
+        source: observedSource,
+      };
+      this.emit({
+        type: "bot_damaged",
+        at,
+        source: observedSource,
+        confidence: observedSource === null ? "unknown" : "observed",
+      });
+    });
+    listen(
+      "message",
+      (message: unknown, position: unknown, sender: unknown) => {
+        if (this.boundBot !== bot) return;
+        const cause = deathNoticeCause(
+          bot,
+          message,
+          position,
+          sender,
+          bot.username,
+        );
+        if (cause === undefined) return;
+        const now = Date.now();
+        const pendingDeath = this.pendingBotDeath;
+        if (
+          pendingDeath?.bot === bot &&
+          now >= pendingDeath.observedAtMs &&
+          now - pendingDeath.observedAtMs <= deathEvidenceCorrelationMs
+        ) {
+          if (
+            pendingDeath.cause?.provenance === "death_notification" ||
+            pendingDeath.causeUpdateEmitted
+          )
+            return;
+          if (JSON.stringify(pendingDeath.cause) === JSON.stringify(cause))
+            return;
+          pendingDeath.cause = cause;
+          pendingDeath.causeUpdateEmitted = true;
+          this.emit({
+            type: "bot_death_cause_updated",
+            at: new Date(now).toISOString(),
+            deathAt: pendingDeath.at,
+            cause,
+          });
+          return;
+        }
+        this.pendingDeathNotice = { bot, observedAtMs: now, cause };
+      },
     );
+    listen("death", () => {
+      if (this.boundBot !== bot) return;
+      this.markBotLifeDead(bot);
+      const now = Date.now();
+      const notice = this.pendingDeathNotice;
+      const damage = this.lastBotDamage;
+      const cause =
+        notice?.bot === bot &&
+        now >= notice.observedAtMs &&
+        now - notice.observedAtMs <= deathEvidenceCorrelationMs
+          ? notice.cause
+          : damage?.bot === bot &&
+              now >= damage.observedAtMs &&
+              now - damage.observedAtMs <= deathEvidenceCorrelationMs
+            ? {
+                source: damage.source,
+                confidence:
+                  damage.source === null
+                    ? ("unknown" as const)
+                    : ("observed" as const),
+                provenance: "damage_event" as const,
+              }
+            : undefined;
+      if (this.pendingBotDeath !== undefined)
+        clearTimeout(this.pendingBotDeath.timer);
+      const at = new Date(now).toISOString();
+      const pendingBotDeath = {
+        bot,
+        at,
+        observedAtMs: now,
+        cause,
+        causeUpdateEmitted: false,
+        timer: setTimeout(() => {
+          if (this.pendingBotDeath === pendingBotDeath)
+            this.pendingBotDeath = undefined;
+        }, deathEvidenceCorrelationMs),
+      };
+      this.pendingBotDeath = pendingBotDeath;
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
+      this.emit({
+        type: "bot_death",
+        at,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    });
     listen("end", (reason: unknown) => {
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
+      this.boundBotEnded = true;
+      this.passiveArmorPending = false;
+      this.passiveArmorController?.abort(
+        new Error("Minecraft connection ended"),
+      );
+      this.damageReflex?.controller.abort(
+        new Error("Minecraft connection ended"),
+      );
+      if (this.pendingBotDeath?.bot === bot) {
+        clearTimeout(this.pendingBotDeath.timer);
+        this.pendingBotDeath = undefined;
+      }
       this.disconnectedSinceBind = true;
       if (this.active?.bot === bot) {
         this.active.botDisconnected = true;
@@ -2595,13 +3879,34 @@ export class MineflayerPlayerBody implements PlayerBody {
       });
     });
     listen("spawn", () => {
+      this.lastBotDamage = undefined;
+      this.pendingDeathNotice = undefined;
+      this.passiveArmorPending = this.damageReflexEnabled;
+      this.passiveArmorController?.abort(new Error("Minecraft life changed"));
+      this.lifeGeneration += 1;
+      this.hostileApproachTargets = new Set<Entity>();
+      this.botLifeDead = false;
       if (this.disconnectedSinceBind) {
         this.disconnectedSinceBind = false;
         this.emit({ type: "reconnected", at: new Date().toISOString() });
       }
       this.scheduleStateEvent("position");
+      const staleEntityTimer = this.stateTimers.get("entities");
+      if (staleEntityTimer !== undefined) clearTimeout(staleEntityTimer);
+      this.stateTimers.delete("entities");
+      this.scheduleStateEvent("entities");
+      this.schedulePassiveArmor(bot);
     });
     this.bindInventoryEventsWhenReady(bot);
+    this.schedulePassiveArmor(bot);
+  }
+
+  private markBotLifeDead(bot: Bot): void {
+    if (this.boundBot !== bot || this.botLifeDead) return;
+    this.botLifeDead = true;
+    this.passiveArmorPending = this.damageReflexEnabled;
+    this.passiveArmorController?.abort(new Error("Minecraft life ended"));
+    this.lifeGeneration += 1;
   }
 
   private bindInventoryEventsWhenReady(bot: Bot): void {
@@ -2609,9 +3914,12 @@ export class MineflayerPlayerBody implements PlayerBody {
     const inventory = initializedInventory(bot);
     if (inventory !== undefined) {
       this.inventoryBoundBot = bot;
-      const onInventoryUpdate = (): void =>
+      const onInventoryUpdate = (): void => {
         this.scheduleStateEvent("inventory");
+        this.schedulePassiveArmor(bot);
+      };
       inventory.on("updateSlot", onInventoryUpdate);
+      this.schedulePassiveArmor(bot);
       this.inventoryHandlers.push(() =>
         inventory.removeListener("updateSlot", onInventoryUpdate),
       );
@@ -2633,13 +3941,35 @@ export class MineflayerPlayerBody implements PlayerBody {
     reason: Extract<PlayerBodyEvent, { type: "state_changed" }>["reason"],
   ): void {
     if (this.stateTimers.has(reason)) return;
+    const scheduledBot = this.boundBot;
+    const scheduledLifeGeneration = this.lifeGeneration;
     const timer = setTimeout(
       () => {
         this.stateTimers.delete(reason);
         const bot = this.boundBot;
-        if (bot === undefined) return;
+        if (
+          bot === undefined ||
+          (reason === "entities" &&
+            (bot !== scheduledBot ||
+              this.lifeGeneration !== scheduledLifeGeneration))
+        )
+          return;
+        try {
+          if (this.getBot() !== bot) return;
+        } catch {
+          // Ignore entity updates while the client is between death and spawn.
+          // The death event is already durable; a fresh observation will follow
+          // once Mineflayer's spawn admission is restored.
+          return;
+        }
         const observation = this.safeObserve(bot);
         if (observation === null) return;
+        if (reason === "entities")
+          this.startNearbyHostileApproach(
+            bot,
+            observation,
+            scheduledLifeGeneration,
+          );
         const signature = semanticSignature(observation, reason);
         if (this.lastStateSignatures.get(reason) === signature) return;
         this.lastStateSignatures.set(reason, signature);
@@ -2654,6 +3984,81 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.stateTimers.set(reason, timer);
   }
 
+  private startNearbyHostileApproach(
+    bot: Bot,
+    observation: PlayerBodyObservation,
+    lifeGeneration: number,
+  ): void {
+    if (
+      !this.damageReflexEnabled ||
+      this.boundBot !== bot ||
+      this.boundBotEnded ||
+      this.botLifeDead ||
+      this.lifeGeneration !== lifeGeneration ||
+      !Number.isFinite(bot.health) ||
+      bot.health <= 0
+    )
+      return;
+    for (const previousTarget of this.hostileApproachTargets) {
+      if (
+        bot.entities[previousTarget.id] !== previousTarget ||
+        !isKnownHostileEntity(bot, previousTarget)
+      ) {
+        this.hostileApproachTargets.delete(previousTarget);
+        continue;
+      }
+      try {
+        requireReachableEntity(bot, previousTarget.id, attackRange);
+      } catch {
+        this.hostileApproachTargets.delete(previousTarget);
+      }
+    }
+    const nearby = observation.perception.nearbyHostiles;
+    const freshNearbyHostiles =
+      nearby?.source === "client_received_unoccluded_nearby_hostiles" &&
+      nearby.observedAt === observation.observedAt &&
+      Number.isFinite(nearby.maxDistance) &&
+      nearby.maxDistance > 0 &&
+      nearby.maxDistance <= observation.perception.maxDistance
+        ? nearby.entities.filter(
+            (entity) =>
+              Number.isFinite(entity.distance) &&
+              entity.distance <= nearby.maxDistance,
+          )
+        : [];
+    const nearbyHostileIds = new Set(
+      freshNearbyHostiles.map((entity) => entity.id),
+    );
+    const candidates = [
+      ...observation.perception.entities,
+      ...freshNearbyHostiles,
+    ];
+    const visited = new Set<number>();
+    for (const visible of candidates) {
+      if (visited.has(visible.id)) continue;
+      visited.add(visible.id);
+      const target = bot.entities[visible.id];
+      if (
+        target?.id !== visible.id ||
+        visible.isPlayer ||
+        visible.kind !== "mob" ||
+        this.hostileApproachTargets.has(target) ||
+        !isKnownHostileEntity(bot, target)
+      )
+        continue;
+      try {
+        if (nearbyHostileIds.has(visible.id))
+          requireReachableEntity(bot, target.id, attackRange);
+        else requireVisibleEntity(bot, target.id, attackRange);
+      } catch {
+        continue;
+      }
+      this.hostileApproachTargets.add(target);
+      this.startDamageReflex(bot, target, "hostile_approach");
+      return;
+    }
+  }
+
   private emit(event: PlayerBodyEvent): void {
     for (const listener of this.listeners) {
       try {
@@ -2663,6 +4068,23 @@ export class MineflayerPlayerBody implements PlayerBody {
       }
     }
   }
+}
+
+function readEquippedArmor(
+  bot: Bot,
+  slots: readonly (Item | null)[],
+): EquippedArmorBySlot {
+  const equipped: Partial<Record<ArmorSlot, string | null>> = {};
+  for (const destination of armorDestinations) {
+    const index = bot.getEquipmentDestSlot(destination);
+    if (!Number.isInteger(index) || index < 0 || index >= slots.length)
+      continue;
+    const item = slots[index];
+    if (item === null) equipped[destination] = null;
+    else if (item !== undefined && typeof item.name === "string")
+      equipped[destination] = item.name;
+  }
+  return equipped;
 }
 
 function findInventoryItem(bot: Bot, name: string): Item {
@@ -2699,6 +4121,7 @@ function chooseFood(bot: Bot, requested?: string): Item {
 function requireReachableBlock(
   bot: Bot,
   rawPosition: { readonly x: number; readonly y: number; readonly z: number },
+  checkVisibility = true,
 ): Block {
   const position = blockPosition(rawPosition);
   const block = bot.blockAt(position);
@@ -2708,6 +4131,7 @@ function requireReachableBlock(
   const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
   if (eye.distanceTo(target) > interactRange + 0.15)
     throw new Error("Target block is outside normal player reach");
+  if (!checkVisibility) return block;
   if (!bot.canSeeBlock(block)) throw new Error("Target block is occluded");
   const visible = observePlayerBody(bot, undefined).perception.blocks.some(
     (candidate) => blockKey(candidate.position) === blockKey(position),
@@ -2722,22 +4146,39 @@ function requireVisibleEntity(
   entityId: number,
   reach: number,
 ): Entity {
-  const entity = bot.entities[entityId];
-  if (entity === undefined)
-    throw new Error(`Entity ${entityId} is not currently loaded`);
+  const entity = requireReachableEntity(bot, entityId, reach);
   const visible = observePlayerBody(bot, undefined).perception.entities.some(
     (candidate) => candidate.id === entityId,
   );
   if (!visible) throw new Error(`Entity ${entityId} is not currently visible`);
+  return entity;
+}
+
+function requireReachableEntity(
+  bot: Bot,
+  entityId: number,
+  reach: number,
+): Entity {
+  const entity = bot.entities[entityId];
+  if (entity === undefined)
+    throw new Error(`Entity ${entityId} is not currently loaded`);
   const eye = bot.entity.position.offset(0, entityEyeHeight(bot.entity), 0);
-  const target = entity.position.offset(
-    0,
-    Math.max(0.1, entity.height * 0.55),
-    0,
-  );
+  const target = entityBodyAimPoint(entity);
   if (eye.distanceTo(target) > reach)
     throw new Error(`Entity ${entityId} is outside normal player reach`);
   return entity;
+}
+
+function entityBodyAimPoint(entity: Entity): Vec3 {
+  if (
+    !Number.isFinite(entity.position.x) ||
+    !Number.isFinite(entity.position.y) ||
+    !Number.isFinite(entity.position.z) ||
+    !Number.isFinite(entity.height) ||
+    entity.height <= 0
+  )
+    throw new Error("Entity body aim point is unavailable");
+  return entity.position.offset(0, entity.height * 0.55, 0);
 }
 
 function requireOpenWindow(bot: Bot): Window {

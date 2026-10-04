@@ -126,6 +126,57 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("returns bounded process diagnostics without proposal text or internal ids", async () => {
+    const fixture = createRuntimeFixture();
+    try {
+      fixture.mind.addProposal({
+        title: "private proposal title",
+        reason: "private proposal reason",
+      });
+      fixture.mind.recordObservation(toObservationEvidence(observation()));
+      fixture.mind.recordAgentActivity({
+        ...agentActivity(1),
+        toolCalls: [
+          {
+            name: "commit_goal_state",
+            resultClass: "rejected",
+            resultCode: "CAS_STALE",
+            outputChars: 40,
+          },
+        ],
+      });
+
+      const diagnostics = fixture.runtime.inspectRuntime();
+      expect(diagnostics).toMatchObject({
+        process: { started: false, shuttingDown: false },
+        purpose: {
+          active: false,
+          awaitingResponse: false,
+          retryScheduled: false,
+        },
+        body: {
+          connectionState: "not_started",
+          latestObservation: {
+            health: observation().self.health,
+          },
+        },
+        pendingOwnerProposalCount: 1,
+        recentDecisionFailures: [
+          {
+            role: "purpose",
+            rejectionCodes: ["CAS_STALE"],
+            ageKnown: false,
+          },
+        ],
+      });
+      expect(JSON.stringify(diagnostics)).not.toContain("private proposal");
+      expect(JSON.stringify(diagnostics)).not.toContain("owner-player");
+      expect(JSON.stringify(diagnostics)).not.toContain("reason");
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("returns fixed reasons for each atomic thought rejection", () => {
     const directory = temporaryDirectory();
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
@@ -925,6 +976,269 @@ describe("integrated player runtime", () => {
         "提案への判断：The owner meal intent is being handled.",
         "自律行動を停止しました。再開の指示があるまで停止を続けます。",
       ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("enables the damage reflex only while autonomy is active", async () => {
+    const fixture = createRuntimeFixture();
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.reflexEnableCalls.length === 1);
+      expect(fixture.body.reflexEnableCalls).toEqual([true]);
+
+      const stopped = fixture.mind.stop();
+      if (stopped === undefined) throw new Error("TEST_STOP_NOT_PERSISTED");
+      await fixture.runtime.stopNow();
+      expect(fixture.body.reflexEnableCalls).toEqual([true, false]);
+      expect(fixture.body.lifecycleCalls.indexOf("reflex:false")).toBeLessThan(
+        fixture.body.lifecycleCalls.indexOf("stop"),
+      );
+
+      expect(fixture.mind.resume(stopped.stopGeneration)).toBeDefined();
+      fixture.runtime.onResume();
+      await waitFor(() => fixture.body.reflexEnableCalls.length === 3);
+      expect(fixture.body.reflexEnableCalls).toEqual([true, false, true]);
+
+      await fixture.runtime.shutdown();
+      expect(fixture.body.reflexEnableCalls.at(-1)).toBe(false);
+      expect(fixture.body.lifecycleCalls.at(-1)).toBe("stop");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("defers coalesced reflex outcomes until a damage-aware thought can commit", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const memoryEpisodes: { summary: string; status: string }[] = [];
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let purposeCalls = 0;
+    let secondThoughtAccepted: boolean | undefined;
+    let thirdThoughtEvents: readonly { kind: string; summary: string }[] = [];
+    let releaseSecondThought!: () => void;
+    const secondThoughtGate = new Promise<void>((resolve) => {
+      releaseSecondThought = resolve;
+    });
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: {
+        ...createMemoryPort(),
+        recordEpisode: ({ summary, status }) =>
+          memoryEpisodes.push({ summary, status }),
+      },
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot, events }) => {
+          purposeCalls += 1;
+          if (purposeCalls === 1) {
+            const decision = action("primary-action-before-reflex");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            mind.consumeEvents(events.map(({ id }) => id));
+            return { accepted: saved.accepted, decision };
+          }
+          if (purposeCalls === 2) {
+            await secondThoughtGate;
+            const decision = {
+              kind: "continue" as const,
+              reason: "Continue the current primary operation.",
+            };
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            secondThoughtAccepted = saved.accepted;
+            if (saved.accepted)
+              runtimeRef.current?.handleCommittedDecision(
+                saved.snapshot,
+                decision,
+              );
+            mind.consumeEvents(events.map(({ id }) => id));
+            return { accepted: saved.accepted, decision };
+          }
+          thirdThoughtEvents = events.map(({ kind, summary }) => ({
+            kind,
+            summary,
+          }));
+          return { accepted: false };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      const primaryOperationId = mind.snapshot().activeOperation?.operationId;
+      if (primaryOperationId === undefined)
+        throw new Error("TEST_PRIMARY_OPERATION_MISSING");
+
+      const firstDamageAt = new Date().toISOString();
+      body.emit({ type: "damage_reflex_started", at: firstDamageAt });
+      body.emit({
+        type: "bot_damaged",
+        at: firstDamageAt,
+        source: null,
+        confidence: "unknown",
+      });
+      await waitFor(() => purposeCalls === 2);
+      body.emit({
+        type: "damage_reflex_completed",
+        at: new Date(Date.parse(firstDamageAt) + 1_000).toISOString(),
+        operationKind: "attack",
+        status: "successful",
+        startedAt: firstDamageAt,
+        serverConfirmedAt: new Date(
+          Date.parse(firstDamageAt) + 500,
+        ).toISOString(),
+        sameLife: true,
+        summary: "hit_confirmed",
+      });
+      expect(mind.snapshot().lastOutcome).toBeUndefined();
+      expect(mind.snapshot().activeOperation?.operationId).toBe(
+        primaryOperationId,
+      );
+
+      const repeatedDamageAt = new Date(
+        Date.parse(firstDamageAt) + 5_000,
+      ).toISOString();
+      body.emit({
+        type: "bot_damaged",
+        at: repeatedDamageAt,
+        source: null,
+        confidence: "unknown",
+      });
+      body.emit({
+        type: "damage_reflex_completed",
+        at: new Date(Date.parse(repeatedDamageAt) + 1_000).toISOString(),
+        operationKind: "control",
+        status: "unverified",
+        startedAt: repeatedDamageAt,
+        serverConfirmedAt: null,
+        sameLife: null,
+        summary: "action_unverified",
+      });
+      releaseSecondThought();
+
+      await waitFor(() => purposeCalls === 3);
+      expect(secondThoughtAccepted).toBe(true);
+      expect(mind.snapshot().activeOperation?.operationId).toBe(
+        primaryOperationId,
+      );
+      const outcomes = mind.snapshot().recentOutcomes;
+      expect(
+        outcomes.some(
+          ({ kind, status, summary }) =>
+            kind === "attack" &&
+            status === "successful" &&
+            summary.includes("sameLife=true"),
+        ),
+      ).toBe(true);
+      expect(
+        outcomes.some(
+          ({ kind, status }) => kind === "control" && status === "unverified",
+        ),
+      ).toBe(true);
+      expect(
+        thirdThoughtEvents.some(
+          ({ kind, summary }) =>
+            kind === "body_outcome" && summary.includes("events=2"),
+        ),
+      ).toBe(true);
+      const wakeSummary = thirdThoughtEvents.find(
+        ({ kind }) => kind === "body_outcome",
+      )?.summary;
+      expect(wakeSummary).toContain("serverConfirmedAt=");
+      expect(wakeSummary).toContain("trigger=damage; sameLife=true");
+      expect(wakeSummary).toContain("sameLife=true");
+      expect(wakeSummary).toContain("action_unverified");
+      expect(memoryEpisodes).toHaveLength(2);
+      expect(memoryEpisodes[0]?.summary).toContain("身体反射の結果:");
+      expect(memoryEpisodes[0]?.summary).not.toContain("被害時");
+      expect(JSON.stringify(memoryEpisodes)).not.toContain("entityId");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("passes a hostile-approach reflex to Purpose without recording damage", async () => {
+    const purposeInputs: { kind: string; summary: string }[][] = [];
+    const episodeSummaries: string[] = [];
+    const memory = {
+      ...createMemoryPort(),
+      recordEpisode: ({ summary }: { readonly summary: string }) =>
+        episodeSummaries.push(summary),
+    };
+    const fixture = createRuntimeFixture(
+      {
+        think: async ({ events }) => {
+          purposeInputs.push(
+            events.map(({ kind, summary }) => ({ kind, summary })),
+          );
+          return { accepted: true };
+        },
+      },
+      memory,
+    );
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => purposeInputs.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const completedAt = new Date().toISOString();
+      const approachCompletion = {
+        type: "damage_reflex_completed",
+        at: completedAt,
+        operationKind: "attack",
+        status: "successful",
+        startedAt: completedAt,
+        serverConfirmedAt: completedAt,
+        sameLife: true,
+        summary: "hit_confirmed",
+        trigger: "hostile_approach",
+      } as unknown as PlayerBodyEvent;
+      fixture.body.emit(approachCompletion);
+
+      await waitFor(() => purposeInputs.length >= 2);
+      const resultInput = purposeInputs.find((events) =>
+        events.some(({ kind }) => kind === "body_outcome"),
+      );
+      const result = resultInput?.find(({ kind }) => kind === "body_outcome");
+      expect(result?.summary).toContain(
+        "trigger=hostile_approach; sameLife=true",
+      );
+      expect(resultInput?.some(({ kind }) => kind === "bot_damaged")).toBe(
+        false,
+      );
+      expect(fixture.mind.snapshot().recentOutcomes[0]?.summary).toContain(
+        "trigger=hostile_approach",
+      );
+      expect(episodeSummaries[0]).toContain("身体反射の結果:");
+      expect(episodeSummaries[0]).not.toContain("被害時");
     } finally {
       await fixture.close();
     }
@@ -2187,6 +2501,14 @@ describe("integrated player runtime", () => {
       await runtime.start();
       await waitFor(() => thoughtCount === 1);
       body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(thoughtCount).toBe(1);
+      body.emit({
         type: "operation_stalled",
         operationId: "body-1",
         operation: "look",
@@ -2201,20 +2523,484 @@ describe("integrated player runtime", () => {
           purpose: "wait for the action result",
           reason: "only reevaluate on a body outcome",
           wakeOn: ["body_outcome"],
+          wakeAt: new Date(Date.now() + 60_000).toISOString(),
         },
       });
       expect(newWait.accepted).toBe(true);
 
       releaseFirstThought?.();
       await waitFor(() => thoughtCount === 2);
-      expect(followupWaitKinds).toEqual(["body_outcome"]);
+      expect(followupWaitKinds).toEqual(
+        expect.arrayContaining(["body_outcome", "deadline"]),
+      );
       expect(followupEventKinds).toContain("operation_stalled");
 
-      body.emit({ type: "bot_death", at: new Date().toISOString() });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(thoughtCount).toBe(2);
+      expect(followupEventKinds).toContain("bot_damaged");
+
+      const deathAt = new Date().toISOString();
+      body.emit({ type: "bot_death", at: deathAt });
+      await waitFor(() => thoughtCount === 3);
+      expect(followupEventKinds).toContain("bot_damaged");
+
+      body.emit({
+        type: "bot_death_cause_updated",
+        at: new Date(Date.parse(deathAt) + 100).toISOString(),
+        deathAt,
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          confidence: "observed",
+          provenance: "death_notification",
+          causeKey: "death.attack.mob",
+        },
+      });
+      await waitFor(() => thoughtCount === 4);
+      expect(followupEventKinds).toContain("bot_death");
+      expect(followupEventKinds).toContain("bot_death_cause_updated");
+      expect(mind.snapshot().latestDeath?.cause?.source?.name).toBe("zombie");
     } finally {
       releaseFirstThought?.();
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
+  it("keeps urgent damage wakes pending through a Purpose retry backoff", async () => {
+    let thoughtCount = 0;
+    let latestEventKinds: readonly string[] = [];
+    let rejectFirstThought: ((error: Error) => void) | undefined;
+    const firstThoughtGate = new Promise<void>((_resolve, reject) => {
+      rejectFirstThought = reject;
+    });
+    const fixture = createRuntimeFixture({
+      think: async ({ events }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) await firstThoughtGate;
+        latestEventKinds = events.map(({ kind }) => kind);
+        return { accepted: true };
+      },
+    });
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      vi.useFakeTimers();
+      rejectFirstThought?.(new Error("simulated transient Purpose failure"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fixture.runtime.busy).toBe(false);
+
+      const baseAt = Date.now();
+      for (let index = 0; index < 3; index += 1) {
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + index * 1_000).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      }
+      expect(thoughtCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(thoughtCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(thoughtCount).toBe(2);
+      expect(latestEventKinds).toContain("bot_damaged");
+    } finally {
+      await fixture.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a startup judgment after the first fresh damage event before dispatch", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseFirstThought: (() => void) | undefined;
+    const firstThoughtGate = new Promise<void>((resolve) => {
+      releaseFirstThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    let staleStartupResponse: (() => boolean) | undefined;
+    let freshSawStopResponse = false;
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, signal, shouldStopAfterResponse }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          staleStartupResponse = shouldStopAfterResponse;
+          await firstThoughtGate;
+        } else {
+          freshSawStopResponse = shouldStopAfterResponse?.() ?? false;
+        }
+        const decision = action(`damage-freshness-${thoughtCount}`);
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        if (signal?.aborted) return { accepted: false };
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    fixture.mind.enqueueEvent("bot_death", "historical death wake");
+    runtimeRef.current = fixture.runtime;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const revisionBeforeDamage = fixture.mind.snapshot().revision;
+      const baseAt = Date.now();
+      fixture.body.emit({
+        type: "bot_damaged",
+        at: new Date(baseAt).toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      expect(staleStartupResponse?.()).toBe(true);
+      const revisionAfterFirstDamage = fixture.mind.snapshot().revision;
+      expect(revisionAfterFirstDamage).toBe(revisionBeforeDamage + 1);
+      for (const offset of [1_000, 2_000])
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + offset).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      expect(fixture.mind.snapshot().revision).toBe(revisionAfterFirstDamage);
+
+      releaseFirstThought?.();
+      await waitFor(
+        () => thoughtCount === 2 && fixture.body.started.length === 1,
+      );
+      expect(freshSawStopResponse).toBe(false);
+      expect(commits).toEqual([false, true]);
+      expect(fixture.body.started).toEqual(["look"]);
+      expect(fixture.mind.snapshot().pendingEventKinds).toContain(
+        "bot_damaged",
+      );
+    } finally {
+      releaseFirstThought?.();
+      await fixture.close();
+    }
+  });
+
+  it("rejects an unaware thought once, then commits through repeated death wakes", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseUnawareThought: (() => void) | undefined;
+    let releaseDeathAwareThought: (() => void) | undefined;
+    const unawareGate = new Promise<void>((resolve) => {
+      releaseUnawareThought = resolve;
+    });
+    const deathAwareGate = new Promise<void>((resolve) => {
+      releaseDeathAwareThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    let deathAwareEventKinds: readonly string[] = [];
+    let startupWasMarkedUrgent: boolean | undefined;
+    let staleStartupResponse: (() => boolean) | undefined;
+    let freshDeathAwareResponse: (() => boolean) | undefined;
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({
+        snapshot,
+        events,
+        urgentPerceptionWake,
+        shouldStopAfterResponse,
+      }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          startupWasMarkedUrgent = urgentPerceptionWake;
+          staleStartupResponse = shouldStopAfterResponse;
+          await unawareGate;
+        } else {
+          deathAwareEventKinds = events.map(({ kind }) => kind);
+          freshDeathAwareResponse = shouldStopAfterResponse;
+          expect(urgentPerceptionWake).toBe(true);
+          await deathAwareGate;
+        }
+        const decision = action(`death-freshness-${thoughtCount}`);
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    runtimeRef.current = fixture.runtime;
+    fixture.mind.enqueueEvent("bot_death", "historical pending death");
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      expect(startupWasMarkedUrgent).toBe(false);
+      let eventTime = Date.now();
+      let latestEventAt = "";
+      const emitDeath = () => {
+        eventTime += 1;
+        latestEventAt = new Date(eventTime).toISOString();
+        fixture.body.emit({
+          type: "bot_death",
+          at: latestEventAt,
+        });
+      };
+      const initialRevision = fixture.mind.snapshot().revision;
+      emitDeath();
+      expect(staleStartupResponse?.()).toBe(true);
+      const invalidatedRevision = fixture.mind.snapshot().revision;
+      expect(invalidatedRevision).toBe(initialRevision + 1);
+      emitDeath();
+      emitDeath();
+      expect(fixture.mind.snapshot().revision).toBe(invalidatedRevision);
+      expect(fixture.mind.snapshot().latestDeath?.observedAt).toBe(
+        latestEventAt,
+      );
+
+      releaseUnawareThought?.();
+      await waitFor(() => thoughtCount === 2);
+      expect(deathAwareEventKinds).toContain("bot_death");
+      expect(freshDeathAwareResponse?.()).toBe(false);
+      const deathAwareRevision = fixture.mind.snapshot().revision;
+      emitDeath();
+      emitDeath();
+      emitDeath();
+      expect(freshDeathAwareResponse?.()).toBe(false);
+      expect(fixture.mind.snapshot().revision).toBe(deathAwareRevision);
+      expect(fixture.mind.snapshot().latestDeath?.observedAt).toBe(
+        latestEventAt,
+      );
+
+      releaseDeathAwareThought?.();
+      await waitFor(
+        () => commits.includes(true) && fixture.body.started.length > 0,
+      );
+      expect(commits.slice(0, 2)).toEqual([false, true]);
+      expect(fixture.body.started).toContain("look");
+    } finally {
+      releaseUnawareThought?.();
+      releaseDeathAwareThought?.();
+      await fixture.close();
+    }
+  });
+
+  it("keeps a damage-aware thought live when owner proposal wins the pending-wake priority", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let releaseFreshThought: (() => void) | undefined;
+    const freshThoughtGate = new Promise<void>((resolve) => {
+      releaseFreshThought = resolve;
+    });
+    const commits: boolean[] = [];
+    let thoughtCount = 0;
+    let freshEvents: readonly string[] = [];
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, signal, events }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { accepted: false };
+        }
+        freshEvents = events.map(({ kind }) => kind);
+        await freshThoughtGate;
+        const decision = action("damage-aware-owner-proposal");
+        const fixture = fixtureRef.current;
+        if (fixture === undefined) throw new Error("runtime fixture missing");
+        const saved = fixture.mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        commits.push(saved.accepted);
+        if (saved.accepted)
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+        return {
+          accepted: saved.accepted,
+          ...(saved.accepted ? { decision } : {}),
+        };
+      },
+    };
+    const fixture = createRuntimeFixture(purpose);
+    fixtureRef.current = fixture;
+    runtimeRef.current = fixture.runtime;
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      const baseAt = Date.now();
+      fixture.body.emit({
+        type: "bot_damaged",
+        at: new Date(baseAt).toISOString(),
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+      });
+      fixture.mind.addProposal({
+        title: "Return to the owner",
+        reason: "Meet me.",
+      });
+      fixture.runtime.onOwnerProposal();
+      await waitFor(() => thoughtCount === 2);
+      expect(freshEvents).toContain("bot_damaged");
+      const revisionBeforeRepeat = fixture.mind.snapshot().revision;
+
+      for (const offset of [1_000, 2_000])
+        fixture.body.emit({
+          type: "bot_damaged",
+          at: new Date(baseAt + offset).toISOString(),
+          source: {
+            kind: "mob",
+            name: "zombie",
+            category: "Hostile mobs",
+          },
+          confidence: "observed",
+        });
+      expect(fixture.mind.snapshot().revision).toBe(revisionBeforeRepeat);
+      expect(commits).toEqual([]);
+
+      releaseFreshThought?.();
+      await waitFor(() => fixture.body.started.length === 1);
+      expect(commits).toEqual([true]);
+      expect(fixture.body.started).toEqual(["look"]);
+    } finally {
+      releaseFreshThought?.();
+      await fixture.close();
+    }
+  });
+
+  it("coalesces a legacy death-wake backlog and delivers the latest request and death at startup", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const initialMind = PlayerMindStore.open(databasePath);
+    const initial = initialMind.snapshot();
+    const wait = initialMind.commitThought({
+      expectedRevision: initial.revision,
+      decision: {
+        kind: "wait",
+        purpose: "continue the saved owner task",
+        reason: "wait for startup or an owner request",
+        wakeOn: ["startup", "owner_proposal"],
+      },
+    });
+    expect(wait.accepted).toBe(true);
+    initialMind.enqueueEvent("owner_proposal", "最新の採集依頼を確認");
+    initialMind.close();
+
+    const legacyDb = new Database(databasePath);
+    const insertDeath = legacyDb.prepare(
+      "INSERT INTO player_runtime_events(id, kind, summary, created_at, consumed_at) VALUES(?, 'bot_death', ?, ?, NULL)",
+    );
+    for (let index = 0; index < 100; index += 1) {
+      insertDeath.run(
+        `legacy-death-${index}`,
+        "Bot自身の死亡を観測",
+        new Date(
+          Date.parse("2026-10-01T00:00:00.000Z") + index * 1_000,
+        ).toISOString(),
+      );
+    }
+    legacyDb.close();
+
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    let purposeEvents: readonly { kind: string; summary: string }[] = [];
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ events }) => {
+          purposeEvents = events.map(({ kind, summary }) => ({
+            kind,
+            summary,
+          }));
+          return { accepted: true };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+
+    try {
+      const pendingDeaths = mind
+        .pendingEvents(64)
+        .filter(({ kind }) => kind === "bot_death");
+      expect(pendingDeaths).toHaveLength(1);
+      expect(pendingDeaths[0]?.id).toBe("legacy-death-99");
+      expect(
+        mind
+          .pendingEvents(32)
+          .some(
+            ({ kind, summary }) =>
+              kind === "owner_proposal" && summary.includes("最新の採集依頼"),
+          ),
+      ).toBe(true);
+      const retainedHistory = new Database(databasePath, { readonly: true });
+      try {
+        expect(
+          retainedHistory
+            .prepare(
+              "SELECT COUNT(*) AS count FROM player_runtime_events WHERE kind = 'bot_death'",
+            )
+            .get(),
+        ).toEqual({ count: 100 });
+      } finally {
+        retainedHistory.close();
+      }
+
+      await runtime.start();
+      await waitFor(() => purposeEvents.length > 0);
+      expect(purposeEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "owner_proposal",
+            summary: "最新の採集依頼を確認",
+          }),
+          expect.objectContaining({
+            kind: "bot_death",
+            summary: "Bot自身の死亡を観測",
+          }),
+        ]),
+      );
+    } finally {
       await runtime.shutdown();
       skills.close();
       mind.close();
@@ -2539,8 +3325,11 @@ describe("integrated player runtime", () => {
     try {
       await runtime.start();
       expect(runtime.snapshot.stopped).toBe(true);
+      expect(body.reflexEnableCalls).toEqual([]);
+      body.emit({ type: "bot_death", at: new Date().toISOString() });
       expect(body.started).toHaveLength(0);
       expect(thoughtCount).toBe(0);
+      expect(runtime.snapshot.stopped).toBe(true);
       expect(mind.resume(stopped.stopGeneration - 1)).toBeUndefined();
     } finally {
       await runtime.shutdown();
@@ -2742,6 +3531,8 @@ describe("integrated player runtime", () => {
 class DeferredBody implements PlayerBody {
   readonly started: string[] = [];
   readonly results: PlayerOperationResult[] = [];
+  readonly reflexEnableCalls: boolean[] = [];
+  readonly lifecycleCalls: string[] = [];
   #listeners = new Set<(event: PlayerBodyEvent) => void>();
   #active = 0;
   #recoveryOnNextResult = false;
@@ -2753,6 +3544,7 @@ class DeferredBody implements PlayerBody {
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
+  stopActiveCalls = 0;
 
   public requireRecoveryOnNextResult(): void {
     this.#recoveryOnNextResult = true;
@@ -2846,6 +3638,17 @@ class DeferredBody implements PlayerBody {
 
   public async stop(): Promise<void> {
     this.stopCalls += 1;
+    this.lifecycleCalls.push("stop");
+  }
+
+  public setDamageReflexEnabled(enabled: boolean): void {
+    this.reflexEnableCalls.push(enabled);
+    this.lifecycleCalls.push(`reflex:${enabled}`);
+  }
+
+  public async stopActiveOperation(): Promise<void> {
+    this.stopActiveCalls += 1;
+    this.lifecycleCalls.push("stop_active");
   }
   public knowledge(query: string): PlayerKnowledge {
     return {
@@ -3011,7 +3814,10 @@ function createMemoryPort(): PlayerMemoryPort {
   };
 }
 
-function createRuntimeFixture(purpose?: PlayerPurposePort) {
+function createRuntimeFixture(
+  purpose?: PlayerPurposePort,
+  memory: PlayerMemoryPort = createMemoryPort(),
+) {
   const directory = temporaryDirectory();
   const databasePath = join(directory, "player.sqlite");
   const mind = PlayerMindStore.open(databasePath);
@@ -3023,7 +3829,7 @@ function createRuntimeFixture(purpose?: PlayerPurposePort) {
     playerId: "owner-player",
     body,
     mind,
-    memory: createMemoryPort(),
+    memory,
     skills,
     conversation: {
       nextTurn: () => 1,

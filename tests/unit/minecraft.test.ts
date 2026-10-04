@@ -81,9 +81,9 @@ describe("Minecraft boundary", () => {
 
       // Model two catch-up physics ticks and their movement writes in one JS task.
       bot.emit("physicsTick");
-      bot._client.write("position", {});
+      bot._client.write("position", { x: 1, y: 2, z: 3 });
       bot.emit("physicsTick");
-      bot._client.write("position", {});
+      bot._client.write("position", { x: 1, y: 2, z: 3 });
       expect(
         bot._client.write.mock.calls.map(([name]) => name as string),
       ).toEqual(["tick_end", "position", "tick_end", "position"]);
@@ -97,6 +97,102 @@ describe("Minecraft boundary", () => {
       expect(bot._client.write).toHaveBeenCalledTimes(4);
       await disconnecting;
       expect(bot.listenerCount("physicsTick")).toBe(0);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("suppresses non-finite movement packet fields before protocol writes", async () => {
+    const bot = createSpawnableBot(false);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const createBot = vi
+      .spyOn(mineflayer, "createBot")
+      .mockReturnValue(
+        bot as unknown as ReturnType<typeof mineflayer.createBot>,
+      );
+    try {
+      const client = new MineflayerClient(
+        {
+          bot: { username: "login@example.invalid" },
+          ownerUsername: "fixture_owner",
+          pathfinderThinkTimeoutMs: 100,
+          pathfinderTickTimeoutMs: 10,
+          collectTimeoutMs: 100,
+        },
+        logger,
+      );
+      const connection = client.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await connection;
+      bot._client.write.mockClear();
+
+      bot._client.write("position", {
+        x: Number.NaN,
+        y: 0,
+        z: 0,
+        onGround: false,
+      });
+      bot._client.write("look", {
+        yaw: 0,
+        pitch: Number.POSITIVE_INFINITY,
+        onGround: false,
+      });
+      bot._client.write("position_look", {
+        x: 1,
+        y: 2,
+        z: 3,
+        yaw: 0,
+        pitch: Number.NaN,
+        onGround: false,
+      });
+      bot._client.write("position", {
+        x: 1,
+        y: 2,
+        z: 3,
+        onGround: true,
+      });
+      bot._client.write("look", { yaw: 1, pitch: 0, onGround: true });
+      bot._client.write("tick_end", {});
+
+      expect(
+        bot._client.write.mock.calls.map(([name]) => name as string),
+      ).toEqual(["position", "look", "tick_end"]);
+      expect(logger.warn).toHaveBeenNthCalledWith(
+        1,
+        {
+          packetKind: "position",
+          positionFinite: false,
+          rotationFinite: null,
+          clientPlayState: true,
+          spawned: true,
+        },
+        "Suppressed a movement packet with non-finite values",
+      );
+      expect(logger.warn).toHaveBeenNthCalledWith(
+        2,
+        {
+          packetKind: "look",
+          positionFinite: null,
+          rotationFinite: false,
+          clientPlayState: true,
+          spawned: true,
+        },
+        "Suppressed a movement packet with non-finite values",
+      );
+      expect(logger.warn).toHaveBeenNthCalledWith(
+        3,
+        {
+          packetKind: "position_look",
+          positionFinite: true,
+          rotationFinite: false,
+          clientPlayState: true,
+          spawned: true,
+        },
+        "Suppressed a movement packet with non-finite values",
+      );
+      const disconnecting = client.disconnect("fixture stop");
+      await disconnecting;
     } finally {
       createBot.mockRestore();
     }

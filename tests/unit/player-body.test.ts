@@ -3,7 +3,9 @@ import { Vec3 } from "vec3";
 import { describe, expect, it, vi } from "vitest";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
+import type { Item } from "prismarine-item";
 import type { Window } from "prismarine-windows";
+import { AppError } from "../../src/domain/errors.js";
 import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
 import {
   MineflayerPlayerBody,
@@ -102,6 +104,20 @@ function addItemToInventory(
   };
   inventory.slots[slot] = next;
   inventory.emit("updateSlot", slot, previous, next);
+}
+
+function installFakeArmorEquip(fake: ReturnType<typeof makeFakeBot>) {
+  const inventory = fake.inventory as EventEmitter & {
+    slots: (Record<string, unknown> | null)[];
+  };
+  const equip = vi.fn(async (item: Item, destination: string) => {
+    const slot = fake.bot.getEquipmentDestSlot(destination);
+    const previous = inventory.slots[slot] ?? null;
+    inventory.slots[slot] = item as unknown as Record<string, unknown>;
+    inventory.emit("updateSlot", slot, previous, item);
+  });
+  Object.assign(fake.bot, { equip });
+  return equip;
 }
 
 function emitItemPickup(
@@ -321,6 +337,7 @@ function makeFakeBot(
       const delta = point.minus(entity.position.offset(0, 1.62, 0));
       entity.yaw = Math.atan2(-delta.x, -delta.z);
       entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+      setTimeout(() => bot.emit("physicsTick"), 0);
     }),
     clearControlStates: vi.fn(),
     deactivateItem: vi.fn(),
@@ -416,6 +433,36 @@ function addOffAxisStoneCandidates(
   }
   if (added !== count)
     throw new Error(`Only added ${added} of ${count} stone candidates`);
+}
+
+function registerFakeZombie(fake: ReturnType<typeof makeFakeBot>): void {
+  Object.assign(fake.bot.registry.entitiesByName, {
+    zombie: {
+      name: "zombie",
+      displayName: "Zombie",
+      type: "hostile",
+      category: "Hostile mobs",
+    },
+  });
+}
+
+function addFakeZombieEntity(
+  fake: ReturnType<typeof makeFakeBot>,
+  id = 2,
+): Entity {
+  const zombie = {
+    id,
+    name: "zombie",
+    type: "mob",
+    position: new Vec3(0, 64, -2),
+    velocity: new Vec3(0, 0, 0),
+    yaw: 0,
+    pitch: 0,
+    height: 1.95,
+    metadata: [],
+  } as unknown as Entity;
+  (fake.bot.entities as Record<number, Entity>)[id] = zombie;
+  return zombie;
 }
 
 function addWallWithOpening(fake: ReturnType<typeof makeFakeBot>): Vec3 {
@@ -534,10 +581,11 @@ function preparePlaceFixture(fake: ReturnType<typeof makeFakeBot>): Vec3 {
 function prepareConsumeFixture(
   fake: ReturnType<typeof makeFakeBot>,
   food = 19,
+  itemName = "bread",
 ): Record<string, unknown> {
   const bread = {
     type: 5,
-    name: "bread",
+    name: itemName,
     count: 1,
     metadata: 0,
     durabilityUsed: null,
@@ -554,13 +602,24 @@ function prepareConsumeFixture(
   const registry = fake.bot.registry as unknown as {
     foodsByName: Record<string, { effectiveQuality: number }>;
   };
-  registry.foodsByName.bread = { effectiveQuality: 2 };
+  registry.foodsByName[itemName] = { effectiveQuality: 2 };
   Object.assign(fake.bot, {
     equip: vi.fn(async (item: unknown) => {
       Object.assign(fake.bot, { heldItem: item });
     }),
   });
   return bread;
+}
+
+function emitEatingCompletion(
+  fake: ReturnType<typeof makeFakeBot>,
+  entityId = fake.bot.entity.id,
+): void {
+  const client = fake.bot._client as unknown as EventEmitter;
+  client.emit("entity_status", {
+    entityId,
+    entityStatus: 9,
+  });
 }
 
 describe("player body", () => {
@@ -697,6 +756,135 @@ describe("player body", () => {
     }
   });
 
+  it("confirms full-food golden-apple consumption from own eating status and item decrease", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          emitEatingCompletion(fake);
+          setTimeout(() => {
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, apple, null);
+          }, 200);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.food).toBe(20);
+      expect(result.after?.self.food).toBe(20);
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "golden_apple" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat an inventory decrease without own eating status as confirmed", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          setTimeout(() => {
+            emitEatingCompletion(fake, fake.bot.entity.id + 1);
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, apple, null);
+          }, 100);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).not.toContainEqual(
+        expect.objectContaining({ name: "golden_apple" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not confirm own eating status without an item decrease", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      prepareConsumeFixture(fake, 20, "golden_apple");
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => emitEatingCompletion(fake)),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "golden_apple", count: 1 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores eating status after the consume operation changes life", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const apple = prepareConsumeFixture(fake, 20, "golden_apple");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      Object.assign(fake.bot, {
+        consume: vi.fn(async () => {
+          fake.bot.emit("spawn");
+          emitEatingCompletion(fake);
+          inventory.slots[36] = null;
+          fake.inventory.emit("updateSlot", 36, apple, null);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "golden_apple",
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps a consume without observed state changes unverified", async () => {
     vi.useFakeTimers();
     try {
@@ -718,6 +906,11 @@ describe("player body", () => {
       expect(result.after?.self.inventory).toContainEqual(
         expect.objectContaining({ name: "bread", count: 1 }),
       );
+      expect(
+        (fake.bot._client as unknown as EventEmitter).listenerCount(
+          "entity_status",
+        ),
+      ).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -744,6 +937,11 @@ describe("player body", () => {
       expect(result.after?.self.inventory).toContainEqual(
         expect.objectContaining({ name: "bread", count: 1 }),
       );
+      expect(
+        (fake.bot._client as unknown as EventEmitter).listenerCount(
+          "entity_status",
+        ),
+      ).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1081,40 +1279,144 @@ describe("player body", () => {
     }
   });
 
-  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+  it("re-aims once at the last visible item point and confirms the later pickup", async () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
       const item = addItemEntity(fake.bot);
       const body = new MineflayerPlayerBody(() => fake.bot);
-      let cancelPath: (() => void) | undefined;
-      vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
-        () =>
-          new Promise<void>((_resolve, reject) => {
-            cancelPath = () => reject(new Error("Path stopped"));
-            fake.bot.entity.yaw = Math.PI / 2;
-            item.position = new Vec3(0, 64, -12);
-          }),
-      );
-      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
-        if (goal === null) cancelPath?.();
+      let cancelFirstPath: (() => void) | undefined;
+      let physicsTickSent = false;
+      fake.bot.on("physicsTick", () => {
+        physicsTickSent = true;
       });
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              cancelFirstPath = () => reject(new Error("Path stopped"));
+              fake.bot.entity.yaw = Math.PI / 2;
+            }),
+        )
+        .mockImplementationOnce(async () => {
+          expect(physicsTickSent).toBe(true);
+          fake.bot.entity.position = new Vec3(0, 64, -4.5);
+          emitItemPickup(fake, item);
+          removeItemEntity(fake.bot, item.id);
+        });
+      vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+        if (goal === null) cancelFirstPath?.();
+      });
+      const lookAt = vi.spyOn(fake.bot, "lookAt");
 
       const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
-      await vi.advanceTimersByTimeAsync(1_250);
+      await vi.advanceTimersByTimeAsync(1_000);
       const result = await resultPromise;
 
-      expect(result.status).toBe("failed");
-      expect(result.itemCollectionOutcome).toBe("target_unobservable");
-      expect(result.after?.perception.entities).not.toContain(
-        expect.objectContaining({ id: 2 }),
-      );
-      expect(result.detail).toContain(
-        "did not return to the current visible view",
+      expect(result.status).toBe("successful");
+      expect(result.itemCollectionOutcome).toBe("collected");
+      expect(result.observedEffect).toEqual({
+        type: "item_collected",
+        entityId: 2,
+      });
+      expect(goto).toHaveBeenCalledTimes(2);
+      expect(lookAt).toHaveBeenCalledTimes(1);
+      expect(lookAt).toHaveBeenCalledWith(
+        new Vec3(0, 64 + item.height * 0.55, -5),
+        true,
       );
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    let cancelPath: (() => void) | undefined;
+    let obstructed = false;
+    const originalRaycast = fake.bot.world.raycast.bind(fake.bot.world);
+    vi.spyOn(fake.bot.world, "raycast").mockImplementation(
+      (origin, direction, range, matching) => {
+        if (obstructed && matching !== undefined)
+          return makeBlock(
+            "stone",
+            1,
+            new Vec3(0, 64, -3),
+          ) as unknown as ReturnType<typeof fake.bot.world.raycast>;
+        return originalRaycast(origin, direction, range, matching);
+      },
+    );
+    vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+          fake.bot.entity.yaw = Math.PI / 2;
+          item.position = new Vec3(1, 64, -5);
+          obstructed = true;
+        }),
+    );
+    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+    const lookAt = vi.spyOn(fake.bot, "lookAt");
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("failed");
+    expect(result.itemCollectionOutcome).toBe("target_unobservable");
+    expect(result.after?.perception.entities).not.toContain(
+      expect.objectContaining({ id: 2 }),
+    );
+    expect(result.detail).toContain(
+      "did not return to the current visible view",
+    );
+    expect(result.observedEffect).toBeUndefined();
+    expect(lookAt).toHaveBeenCalledTimes(1);
+    expect(lookAt).toHaveBeenCalledWith(
+      new Vec3(0, 64 + item.height * 0.55, -5),
+      true,
+    );
+  });
+
+  it("does not resume collection after owner stop during the recovery physics tick", async () => {
+    const fake = makeFakeBot();
+    addItemEntity(fake.bot);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const controller = new AbortController();
+    let cancelPath: (() => void) | undefined;
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          cancelPath = () => reject(new Error("Path stopped"));
+          fake.bot.entity.yaw = Math.PI / 2;
+        }),
+    );
+    vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
+      if (goal === null) cancelPath?.();
+    });
+    const lookAt = vi
+      .spyOn(fake.bot, "lookAt")
+      .mockImplementation(async () => undefined);
+    const resultPromise = body.execute(
+      { kind: "collect_item", entityId: 2 },
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(fake.bot.listenerCount("physicsTick")).toBe(1),
+    );
+    controller.abort(new Error("Owner stopped collection"));
+    const result = await resultPromise;
+
+    expect(result.status).toBe("interrupted");
+    expect(result.observedEffect).toBeUndefined();
+    expect(goto).toHaveBeenCalledTimes(1);
+    expect(fake.bot.listenerCount("physicsTick")).toBe(0);
+    expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
   it("aborts the visibility grace wait without starting an item path", async () => {
@@ -1167,6 +1469,7 @@ describe("player body", () => {
 
     expect(removedResult.status).toBe("failed");
     expect(removedResult.itemCollectionOutcome).toBe("entity_removed");
+    expect(disappeared.bot.lookAt).not.toHaveBeenCalled();
 
     const noPath = makeFakeBot();
     addItemEntity(noPath.bot);
@@ -1399,6 +1702,1069 @@ describe("player body", () => {
     (second.bot as unknown as EventEmitter).emit("spawn");
     expect(events.some((event) => event.type === "reconnected")).toBe(true);
     expect(events.some((event) => event.type === "disconnected")).toBe(true);
+  });
+
+  it("does not emit observation-driven state changes while spawn admission is unavailable", async () => {
+    const fake = makeFakeBot();
+    let spawned = true;
+    const body = new MineflayerPlayerBody(() => {
+      if (!spawned) throw new Error("Bot is not spawned");
+      return fake.bot;
+    });
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    spawned = false;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+
+    expect(events.some((event) => event.type === "state_changed")).toBe(false);
+    await expect(body.observe()).rejects.toThrow("Bot is not spawned");
+  });
+
+  it("resumes observation-driven state changes with a fresh observation after spawn", async () => {
+    const fake = makeFakeBot();
+    let spawned = true;
+    const body = new MineflayerPlayerBody(() => {
+      if (!spawned) throw new Error("Bot is not spawned");
+      return fake.bot;
+    });
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    spawned = false;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+    spawned = true;
+    (fake.bot as unknown as EventEmitter).emit("health");
+    await new Promise((resolve) => setTimeout(resolve, 175));
+
+    expect(
+      events.some(
+        (event) => event.type === "state_changed" && event.reason === "vitals",
+      ),
+    ).toBe(true);
+    await expect(body.observe()).resolves.toMatchObject({
+      self: { health: fake.bot.health },
+    });
+  });
+
+  it("emits self damage with Mineflayer's attributed source but no private identity or position", () => {
+    const fake = makeFakeBot();
+    const zombie = {
+      id: 2,
+      name: "zombie",
+      type: "mob",
+      position: new Vec3(0, 64, -2),
+      username: "private-player-name",
+    } as unknown as Entity;
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      fake.bot.entity,
+      zombie,
+    );
+
+    const damageEvent = events.find((event) => event.type === "bot_damaged");
+    expect(damageEvent?.type).toBe("bot_damaged");
+    if (damageEvent?.type !== "bot_damaged") {
+      throw new Error("expected bot damage event");
+    }
+    expect(damageEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(damageEvent).toEqual({
+      type: "bot_damaged",
+      at: damageEvent.at,
+      source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+      confidence: "observed",
+    });
+    expect(JSON.stringify(damageEvent)).not.toContain("private-player-name");
+    expect(JSON.stringify(damageEvent)).not.toContain('"position"');
+    expect(JSON.stringify(damageEvent)).not.toContain('"id"');
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      zombie,
+      fake.bot.entity,
+    );
+    expect(events.filter((event) => event.type === "bot_damaged")).toHaveLength(
+      1,
+    );
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      fake.bot.entity,
+      undefined,
+    );
+    expect(events.at(-1)).toMatchObject({
+      type: "bot_damaged",
+      source: null,
+      confidence: "unknown",
+    });
+  });
+
+  it("equips the best carried known armor while enabled without damage", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "leather_helmet", 1);
+    addItemToInventory(fake, "diamond_helmet", 1);
+    addItemToInventory(fake, "iron_chestplate", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(2));
+
+    expect(
+      equip.mock.calls.map(([item, destination]) => ({
+        item: item.name,
+        destination,
+      })),
+    ).toEqual([
+      { item: "diamond_helmet", destination: "head" },
+      { item: "iron_chestplate", destination: "torso" },
+    ]);
+    await body.stop();
+  });
+
+  it("reacts to inventory updates but keeps stronger and unknown equipped armor", async () => {
+    const fake = makeFakeBot();
+    const slots = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    slots.slots[5] = { name: "diamond_helmet", count: 1 };
+    slots.slots[6] = { name: "modded_chestplate", count: 1 };
+    slots.slots[7] = { name: "diamond_leggings", count: 1 };
+    slots.slots[8] = { name: "netherite_boots", count: 1 };
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "diamond_chestplate", 1);
+    addItemToInventory(fake, "golden_leggings", 1);
+    addItemToInventory(fake, "iron_boots", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).not.toHaveBeenCalled();
+
+    addItemToInventory(fake, "netherite_leggings", 1);
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    expect(equip.mock.calls[0]?.[0].name).toBe("netherite_leggings");
+    expect(equip.mock.calls[0]?.[1]).toBe("legs");
+    await body.stop();
+  });
+
+  it("does not use queued armor from a dead life and retries after spawn", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const equip = installFakeArmorEquip(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).not.toHaveBeenCalled();
+
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    expect(equip.mock.calls[0]?.[0].name).toBe("iron_helmet");
+    await body.stop();
+  });
+
+  it("cancels queued passive armor when the body is stopped", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const equip = installFakeArmorEquip(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await body.stop();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(equip).not.toHaveBeenCalled();
+  });
+
+  it("keeps reflex attack moving while a native passive equip is unsettled", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "iron_sword", 1);
+    const inventory = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const botEvents = fake.bot as unknown as EventEmitter;
+    let finishNativeEquip!: () => void;
+    const nativeEquip = new Promise<void>((resolve) => {
+      finishNativeEquip = resolve;
+    });
+    const equip = vi.fn((item: Item, destination: string) => {
+      if (destination === "head")
+        return nativeEquip.then(() => {
+          const slot = fake.bot.getEquipmentDestSlot(destination);
+          const previous = inventory.slots[slot] ?? null;
+          inventory.slots[slot] = item as unknown as Record<string, unknown>;
+          fake.inventory.emit("updateSlot", slot, previous, item);
+        });
+      return Promise.resolve();
+    });
+    const attack = vi.fn((target: Entity) =>
+      botEvents.emit("entityHurt", target, fake.bot.entity),
+    );
+    Object.assign(fake.bot, { equip, attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled());
+    expect(equip).toHaveBeenCalledTimes(1);
+    await body.stop();
+    expect(
+      events.some((event) => event.type === "damage_reflex_completed"),
+    ).toBe(true);
+
+    finishNativeEquip();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(equip).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry passive armor in a loop after native equip rejects", async () => {
+    const fake = makeFakeBot();
+    addItemToInventory(fake, "iron_helmet", 1);
+    const inventory = fake.inventory;
+    const equip = vi.fn((_item: Item, _destination: string) => {
+      inventory.emit("updateSlot", 40, null, null);
+      return Promise.reject(new Error("native equip rejected"));
+    });
+    Object.assign(fake.bot, { equip });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    body.onEvent(() => undefined);
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() => expect(equip).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(equip).toHaveBeenCalledTimes(1);
+    await body.stop();
+  });
+
+  it("coalesces damage into a visible short retaliation without cancelling the active operation", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    Object.assign(fake.bot, { setControlState: vi.fn() });
+    const attack = vi.fn((_target: Entity) => {
+      botEvents.emit("entityHurt", zombie, fake.bot.entity);
+    });
+    Object.assign(fake.bot, { attack });
+
+    const pendingControl = body.execute({
+      kind: "control",
+      controls: { forward: true },
+      ticks: 100,
+    });
+    await vi.waitFor(() =>
+      expect(events.some((event) => event.type === "operation_started")).toBe(
+        true,
+      ),
+    );
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+
+    await vi.waitFor(() => expect(attack.mock.calls.length).toBeGreaterThan(0));
+    expect(fake.bot.lookAt).toHaveBeenCalledWith(expect.any(Vec3), true);
+    await body.stopActiveOperation();
+    await expect(pendingControl).resolves.toMatchObject({
+      operation: { kind: "control" },
+      status: "interrupted",
+    });
+    const attacksAfterPrimaryStop = attack.mock.calls.length;
+    await vi.waitFor(() =>
+      expect(attack.mock.calls.length).toBeGreaterThan(attacksAfterPrimaryStop),
+    );
+
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+    const completion = events.find(
+      (event) => event.type === "damage_reflex_completed",
+    );
+    expect(completion).toMatchObject({
+      operationKind: "attack",
+      status: "successful",
+      sameLife: true,
+      summary: "hit_confirmed",
+    });
+    if (completion?.type !== "damage_reflex_completed")
+      throw new Error("expected reflex completion");
+    expect(typeof completion.serverConfirmedAt).toBe("string");
+    expect(JSON.stringify(completion)).not.toContain("zombie");
+    expect(JSON.stringify(completion)).not.toContain('"id"');
+  });
+
+  it("starts one reflex for a nearby hostile before damage and coalesces later damage", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const attack = vi.fn((target: Entity) =>
+      botEvents.emit("entityHurt", target, fake.bot.entity),
+    );
+    Object.assign(fake.bot, { attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    botEvents.emit("entityMoved", zombie);
+    botEvents.emit("entityMoved", zombie);
+
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_started"),
+      ).toBe(true),
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_started"),
+    ).toMatchObject({ trigger: "hostile_approach" });
+    expect(events.some((event) => event.type === "bot_damaged")).toBe(false);
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled(), {
+      timeout: 1_000,
+    });
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() =>
+      expect(events.some((event) => event.type === "bot_damaged")).toBe(true),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    botEvents.emit("entityMoved", zombie);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(
+      () =>
+        expect(
+          events.filter((event) => event.type === "damage_reflex_started"),
+        ).toHaveLength(2),
+      { timeout: 1_000 },
+    );
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started")[1],
+    ).toMatchObject({ trigger: "hostile_approach" });
+    await body.stop();
+  });
+
+  it("starts a nearby hostile approach behind the current view and wakes when it moves", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    zombie.position = new Vec3(0, 64, 2);
+    registerFakeZombie(fake);
+    const observation = observePlayerBody(fake.bot, undefined);
+    expect(observation.perception.entities).toEqual([]);
+    expect(observation.perception.nearbyHostiles?.entities).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: zombie.id })]),
+    );
+
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) =>
+            event.type === "damage_reflex_started" &&
+            event.trigger === "hostile_approach",
+        ),
+      ).toBe(true),
+    );
+    expect(fake.bot.lookAt).toHaveBeenCalledWith(expect.any(Vec3), true);
+    await vi.waitFor(() =>
+      expect(fake.bot.attack).toHaveBeenCalledWith(zombie),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    const initialEntityEvents = events.filter(
+      (event) => event.type === "state_changed" && event.reason === "entities",
+    ).length;
+    Object.assign(zombie, {
+      equipment: [{ name: "iron_sword" }, null, null, null, null, null],
+    });
+    botEvents.emit("entityUpdate", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(initialEntityEvents + 1),
+    );
+
+    zombie.position = new Vec3(0, 64, 2.75);
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(initialEntityEvents + 2),
+    );
+    await body.stop();
+  });
+
+  it("re-engages after a hostile leaves and returns to ordinary attack reach", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(1),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    zombie.position = new Vec3(0, 64, -5);
+    botEvents.emit("entityMoved", zombie);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+
+    zombie.position = new Vec3(0, 64, -2);
+    botEvents.emit("entityMoved", zombie);
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(2),
+    );
+    await body.stop();
+  });
+
+  it("rejects passive, player, occluded, out-of-reach, and disabled hostile approaches", async () => {
+    const cases = [
+      "passive",
+      "player",
+      "occluded",
+      "out-of-reach",
+      "disabled",
+    ] as const;
+    for (const scenario of cases) {
+      const fake = makeFakeBot();
+      const target = addFakeZombieEntity(fake);
+      registerFakeZombie(fake);
+      if (scenario === "passive")
+        Object.assign(fake.bot.registry.entitiesByName, {
+          zombie: {
+            name: "zombie",
+            displayName: "Zombie",
+            type: "mob",
+            category: "Passive mobs",
+          },
+        });
+      if (scenario === "player")
+        Object.assign(target, { type: "player", username: "other" });
+      if (scenario === "occluded") {
+        const wall = makeBlock("stone", 1, new Vec3(0, 64, -1));
+        Object.assign(fake.bot.world, {
+          raycast: vi.fn(() => wall),
+        });
+        target.position = new Vec3(0, 64, 2);
+      }
+      if (scenario === "out-of-reach") target.position = new Vec3(0, 64, -5);
+
+      const botEvents = fake.bot as unknown as EventEmitter;
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      if (scenario === "disabled") {
+        body.setDamageReflexEnabled(true);
+        body.setDamageReflexEnabled(false);
+      } else body.setDamageReflexEnabled(true);
+      botEvents.emit("entityMoved", target);
+      await vi.waitFor(() =>
+        expect(
+          events.some(
+            (event) =>
+              event.type === "state_changed" && event.reason === "entities",
+          ),
+        ).toBe(true),
+      );
+      expect(
+        events.some((event) => event.type === "damage_reflex_started"),
+      ).toBe(false);
+      expect(fake.bot.attack).not.toHaveBeenCalled();
+      await body.stop();
+    }
+  });
+
+  it("rechecks a stationary hostile on spawn after replacing an old-life timer", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+    botEvents.emit("entityMoved", zombie);
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+
+    await vi.waitFor(() =>
+      expect(
+        events.filter((event) => event.type === "damage_reflex_started"),
+      ).toHaveLength(1),
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_started"),
+    ).toMatchObject({ trigger: "hostile_approach" });
+    await body.stop();
+  });
+
+  it("equips only owned items into empty armor slots and recognizes a spear from server slot packets", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "iron_chestplate", 1);
+    addItemToInventory(fake, "golden_spear", 1);
+    addItemToInventory(fake, "iron_boots", 1);
+    const slots = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const bootsInventorySlot = slots.slots.findIndex(
+      (item) => item?.name === "iron_boots",
+    );
+    slots.slots[8] = slots.slots[bootsInventorySlot] ?? null;
+    slots.slots[bootsInventorySlot] = null;
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const clientEvents = fake.bot._client as unknown as EventEmitter;
+    const equipCalls: { name: string; destination: string }[] = [];
+    const actionOrder: string[] = [];
+    const attack = vi.fn((_target: Entity) => {
+      actionOrder.push("attack");
+      botEvents.emit("entityHurt", zombie, fake.bot.entity);
+    });
+    Object.assign(fake.bot, {
+      equip: vi.fn(async (item: Item, destination: string) => {
+        equipCalls.push({ name: item.name, destination });
+        actionOrder.push(`equip:${destination}`);
+        const slot = fake.bot.getEquipmentDestSlot(destination);
+        const previous = slots.slots[slot] ?? null;
+        slots.slots[slot] = item as unknown as Record<string, unknown>;
+        fake.inventory.emit("updateSlot", slot, previous, item);
+        clientEvents.emit("set_slot", { windowId: 0, slot, item: {} });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }),
+      attack,
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(equipCalls).toHaveLength(3));
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled());
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+
+    expect(equipCalls).toEqual([
+      { name: "golden_helmet", destination: "head" },
+      { name: "iron_chestplate", destination: "torso" },
+      { name: "golden_spear", destination: "hand" },
+    ]);
+    expect(equipCalls.some((call) => call.destination === "feet")).toBe(false);
+    expect(attack).toHaveBeenCalled();
+    expect(actionOrder.indexOf("attack")).toBeLessThan(
+      actionOrder.indexOf("equip:torso"),
+    );
+    const completion = events.find(
+      (event) => event.type === "damage_reflex_completed",
+    );
+    expect(completion).toMatchObject({
+      operationKind: "equip",
+      status: "successful",
+      sameLife: true,
+      summary: "equipment_and_hit_confirmed",
+    });
+    if (completion?.type !== "damage_reflex_completed")
+      throw new Error("expected reflex completion");
+    expect(typeof completion.serverConfirmedAt).toBe("string");
+  });
+
+  it("keeps an equipped melee weapon while still filling empty armor slots", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_spear", 1);
+    addItemToInventory(fake, "iron_sword", 1);
+    addItemToInventory(fake, "golden_helmet", 1);
+    addItemToInventory(fake, "iron_chestplate", 1);
+    const inventory = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    const swordSlot = inventory.slots.findIndex(
+      (item) => item?.name === "iron_sword",
+    );
+    const heldSword = inventory.slots[swordSlot];
+    inventory.slots[36] = heldSword ?? null;
+    inventory.slots[swordSlot] = null;
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const clientEvents = fake.bot._client as unknown as EventEmitter;
+    const equipCalls: { name: string; destination: string }[] = [];
+    const attack = vi.fn((_target: Entity) => {
+      botEvents.emit("entityHurt", zombie, fake.bot.entity);
+    });
+    Object.assign(fake.bot, {
+      heldItem: heldSword,
+      equip: vi.fn(async (item: Item, destination: string) => {
+        equipCalls.push({ name: item.name, destination });
+        const slot = fake.bot.getEquipmentDestSlot(destination);
+        const previous = inventory.slots[slot] ?? null;
+        inventory.slots[slot] = item as unknown as Record<string, unknown>;
+        fake.inventory.emit("updateSlot", slot, previous, item);
+        clientEvents.emit("set_slot", { windowId: 0, slot, item: {} });
+      }),
+      attack,
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(equipCalls).toHaveLength(2));
+    await vi.waitFor(() => expect(attack).toHaveBeenCalled());
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+
+    expect(equipCalls).toEqual([
+      { name: "golden_helmet", destination: "head" },
+      { name: "iron_chestplate", destination: "torso" },
+    ]);
+    expect(fake.bot.heldItem?.name).toBe("iron_sword");
+    expect(inventory.slots.some((item) => item?.name === "golden_spear")).toBe(
+      true,
+    );
+    expect(
+      events.find((event) => event.type === "damage_reflex_completed"),
+    ).toMatchObject({
+      status: "successful",
+      summary: "equipment_and_hit_confirmed",
+    });
+  });
+
+  it("does not treat optimistic inventory updates as server-confirmed reflex equipment", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    addItemToInventory(fake, "golden_helmet", 1);
+    const slots = fake.inventory as EventEmitter & {
+      slots: (Record<string, unknown> | null)[];
+    };
+    Object.assign(fake.bot, {
+      equip: vi.fn(async (item: Item, destination: string) => {
+        const slot = fake.bot.getEquipmentDestSlot(destination);
+        const previous = slots.slots[slot] ?? null;
+        slots.slots[slot] = item as unknown as Record<string, unknown>;
+        fake.inventory.emit("updateSlot", slot, previous, item);
+      }),
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    (fake.bot as unknown as EventEmitter).emit(
+      "entityHurt",
+      fake.bot.entity,
+      zombie,
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    const completion = events.find(
+      (event) => event.type === "damage_reflex_completed",
+    );
+    expect(completion).toMatchObject({
+      operationKind: "attack",
+      status: "unverified",
+      serverConfirmedAt: null,
+      sameLife: null,
+      summary: "action_unverified",
+    });
+    expect(fake.bot.attack).toHaveBeenCalled();
+  });
+
+  it("holds a damage reflex through death and resumes after the next spawned life", async () => {
+    const fake = makeFakeBot();
+    const zombie = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const attack = vi.fn((_target: Entity) => {
+      if (attack.mock.calls.length > 1)
+        botEvents.emit("entityHurt", zombie, fake.bot.entity);
+    });
+    Object.assign(fake.bot, { attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    await vi.waitFor(() => expect(attack.mock.calls.length).toBeGreaterThan(0));
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    const attacksWhileDead = attack.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(attack).toHaveBeenCalledTimes(attacksWhileDead);
+
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    botEvents.emit("health");
+    await vi.waitFor(() =>
+      expect(attack.mock.calls.length).toBeGreaterThan(attacksWhileDead),
+    );
+    await vi.waitFor(
+      () =>
+        expect(
+          events.some((event) => event.type === "damage_reflex_completed"),
+        ).toBe(true),
+      { timeout: 2_000 },
+    );
+
+    expect(
+      events.filter((event) => event.type === "damage_reflex_started"),
+    ).toHaveLength(1);
+    expect(
+      events.find((event) => event.type === "damage_reflex_completed"),
+    ).toMatchObject({
+      operationKind: "attack",
+      status: "successful",
+      sameLife: false,
+      summary: "hit_confirmed",
+    });
+  });
+
+  it("retains damage attribution through a positive health packet before death", () => {
+    const fake = makeFakeBot();
+    const zombie = {
+      id: 2,
+      name: "zombie",
+      type: "mob",
+      position: new Vec3(0, 64, -2),
+    } as unknown as Entity;
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+
+    botEvents.emit("entityHurt", fake.bot.entity, zombie);
+    fake.bot.health = 2.33;
+    botEvents.emit("health");
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+
+    expect(events.find((event) => event.type === "bot_death")).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "damage_event",
+      },
+    });
+    expect(events.filter((event) => event.type === "bot_death")).toHaveLength(
+      1,
+    );
+    botEvents.emit("end", "test complete");
+  });
+
+  it("resolves a registry-backed attacker translation in a self death notice", () => {
+    const fake = makeFakeBot();
+    registerFakeZombie(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+
+    botEvents.emit(
+      "message",
+      {
+        json: {
+          translate: "death.attack.mob",
+          with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+        },
+      },
+      "system",
+      null,
+    );
+    botEvents.emit("death");
+
+    const deathEvent = events.at(-1);
+    expect(deathEvent?.type).toBe("bot_death");
+    if (deathEvent?.type !== "bot_death") {
+      throw new Error("expected bot death event");
+    }
+    expect(deathEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(deathEvent).toEqual({
+      type: "bot_death",
+      at: deathEvent.at,
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "death_notification",
+        causeKey: "death.attack.mob",
+      },
+    });
+    botEvents.emit("end", "test complete");
+  });
+
+  it("resolves only exact registry display names and preserves unknown or player attackers generically", () => {
+    const observeCause = (key: string, attacker: unknown) => {
+      const fake = makeFakeBot();
+      registerFakeZombie(fake);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const botEvents = fake.bot as unknown as EventEmitter;
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: key,
+            with: [{ text: "bot" }, attacker],
+          },
+        },
+        "system",
+        null,
+      );
+      botEvents.emit("death");
+      const death = events.find((event) => event.type === "bot_death");
+      botEvents.emit("end", "test complete");
+      return death;
+    };
+
+    expect(observeCause("death.attack.mob", { text: "Zombie" })).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        causeKey: "death.attack.mob",
+      },
+    });
+    expect(
+      observeCause("death.attack.mob", { text: "Custom Zombie" }),
+    ).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: {
+          kind: "death_cause",
+          name: "death.attack.mob",
+          category: null,
+        },
+        causeKey: "death.attack.mob",
+      },
+    });
+    expect(
+      observeCause("death.attack.player", { text: "Zombie" }),
+    ).toMatchObject({
+      type: "bot_death",
+      cause: {
+        source: {
+          kind: "death_cause",
+          name: "death.attack.player",
+          category: null,
+        },
+        causeKey: "death.attack.player",
+      },
+    });
+  });
+
+  it("attaches a late self death notice to the same death without another death event", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      registerFakeZombie(fake);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const botEvents = fake.bot as unknown as EventEmitter;
+      fake.bot.health = 0;
+      botEvents.emit("health");
+      botEvents.emit("death");
+      const death = events.find((event) => event.type === "bot_death");
+      expect(death).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(500);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.mob",
+            with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+          },
+        },
+        "system",
+        null,
+      );
+
+      expect(events.filter((event) => event.type === "bot_death")).toHaveLength(
+        1,
+      );
+      expect(events.at(-1)).toMatchObject({
+        type: "bot_death_cause_updated",
+        deathAt: death?.at,
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          causeKey: "death.attack.mob",
+          confidence: "observed",
+          provenance: "death_notification",
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.arrow",
+            with: [{ text: "bot" }, { text: "Arrow" }],
+          },
+        },
+        "system",
+        null,
+      );
+      expect(
+        events.filter((event) => event.type === "bot_death_cause_updated"),
+      ).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({
+        type: "bot_death_cause_updated",
+        cause: {
+          source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+          causeKey: "death.attack.mob",
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(901);
+      botEvents.emit(
+        "message",
+        {
+          json: {
+            translate: "death.attack.mob",
+            with: [{ text: "bot" }, { translate: "entity.minecraft.zombie" }],
+          },
+        },
+        "system",
+        null,
+      );
+      expect(
+        events.filter((event) => event.type === "bot_death_cause_updated"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not turn player-authored or another player's death text into self-cause", () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const message = (victim: string) => ({
+      json: {
+        translate: "death.attack.mob",
+        with: [{ text: victim }, { text: "Zombie" }],
+      },
+    });
+
+    botEvents.emit("message", message("bot"), "chat", null);
+    botEvents.emit("message", message("another"), "system", null);
+    botEvents.emit("message", message("bot"), "system", "player-uuid");
+    botEvents.emit("death");
+
+    const deathEvent = events.at(-1);
+    expect(deathEvent?.type).toBe("bot_death");
+    if (deathEvent?.type !== "bot_death") {
+      throw new Error("expected bot death event");
+    }
+    expect(deathEvent.at).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(deathEvent).toEqual({ type: "bot_death", at: deathEvent.at });
   });
 
   it("limits block and entity perception to visible, unoccluded targets and labels unknowns", () => {
@@ -1873,6 +3239,110 @@ describe("player body", () => {
     }
   });
 
+  it("aims at a loaded, reachable block before rechecking view and digging", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    const targetKey = "0,64,2";
+    fake.blocks.set(targetKey, makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    Object.assign(fake.bot, { digTime: vi.fn(() => 1_000) });
+    expect(
+      observePlayerBody(fake.bot, "owner").perception.blocks.some(
+        (block) => block.position.z === target.z,
+      ),
+    ).toBe(false);
+    vi.mocked(fake.bot.dig).mockImplementationOnce(async () => {
+      expect(fake.bot.lookAt).toHaveBeenCalledWith(
+        target.offset(0.5, 0.5, 0.5),
+        true,
+      );
+      expect(
+        observePlayerBody(fake.bot, "owner").perception.blocks.some(
+          (block) => block.position.z === target.z,
+        ),
+      ).toBe(true);
+      fake.blocks.set(targetKey, makeBlock("air", 0, target));
+      (fake.bot._client as unknown as EventEmitter).emit("block_change", {
+        location: target,
+        type: 0,
+      });
+    });
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+
+    expect(fake.bot.dig).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe("successful");
+  });
+
+  it("does not dig after aiming if the block stays occluded or the Bot changes", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    const targetKey = "0,64,2";
+    fake.blocks.set(targetKey, makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    Object.assign(fake.bot, { digTime: vi.fn(() => 1_000) });
+    fake.hiddenBlockKeys.add(targetKey);
+    let currentBot = fake.bot;
+    const body = new MineflayerPlayerBody(() => currentBot);
+
+    const occluded = await body.execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+    expect(fake.bot.lookAt).toHaveBeenCalledTimes(1);
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+    expect(occluded.status).toBe("failed");
+    expect(occluded.detail).toContain("Target block is occluded");
+
+    fake.hiddenBlockKeys.delete(targetKey);
+    const replacement = makeFakeBot();
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(async () => {
+      currentBot = replacement.bot;
+    });
+    const changedBot = await body.execute({
+      kind: "dig",
+      position: { x: target.x, y: target.y, z: target.z },
+    });
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+    expect(changedBot.status).toBe("failed");
+    expect(changedBot.detail).toContain("Minecraft bot changed while aiming");
+  });
+
+  it("does not start digging when the operation is cancelled while aiming", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, 2);
+    fake.blocks.set("0,64,2", makeBlock("stone", 1, target));
+    fake.candidates.push(target);
+    const controller = new AbortController();
+    let markLookStarted!: () => void;
+    const lookStarted = new Promise<void>((resolve) => {
+      markLookStarted = resolve;
+    });
+    let resolveLook!: () => void;
+    const pendingLook = new Promise<void>((resolve) => {
+      resolveLook = resolve;
+    });
+    vi.mocked(fake.bot.lookAt).mockImplementationOnce(async () => {
+      markLookStarted();
+      await pendingLook;
+    });
+
+    const resultPromise = new MineflayerPlayerBody(() => fake.bot).execute(
+      { kind: "dig", position: { x: target.x, y: target.y, z: target.z } },
+      controller.signal,
+    );
+    await lookStarted;
+    controller.abort(new Error("Owner stopped the operation"));
+    const result = await resultPromise;
+    resolveLook();
+
+    expect(result.status).toBe("interrupted");
+    expect(fake.bot.dig).not.toHaveBeenCalled();
+  });
+
   it("waits for the target's server block update after native placement resolves", async () => {
     vi.useFakeTimers();
     try {
@@ -2121,6 +3591,164 @@ describe("player body", () => {
 
     expect(result.status).toBe("successful");
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
+  });
+
+  it("waits for spawn admission before executing a selected relative move", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const notConnected = new AppError({
+        category: "connection",
+        code: "MINECRAFT_NOT_CONNECTED",
+        message: "not connected",
+        retryable: true,
+      });
+      let admitted = false;
+      const body = new MineflayerPlayerBody(() => {
+        if (!admitted) throw notConnected;
+        return fake.bot;
+      });
+      body.attach(fake.bot);
+      const goto = vi
+        .spyOn(fake.bot.pathfinder, "goto")
+        .mockImplementationOnce(async () => {
+          fake.bot.entity.position.x = 13;
+        });
+
+      const pending = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(goto).not.toHaveBeenCalled();
+
+      (fake.bot as unknown as EventEmitter).emit("spawn");
+      await vi.advanceTimersByTimeAsync(100);
+      expect(goto).not.toHaveBeenCalled();
+
+      fake.bot.entity.position.x = 10;
+      admitted = true;
+      await vi.advanceTimersByTimeAsync(50);
+      const result = await pending;
+
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.position.x).toBe(10);
+      expect(goto).toHaveBeenCalledOnce();
+      expect(goto.mock.calls[0]?.[0]).toMatchObject({ x: 13, y: 64, z: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a pending spawn admission through signal or body stop", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const cancellation of ["signal", "stop"] as const) {
+        const fake = makeFakeBot();
+        const notConnected = new AppError({
+          category: "connection",
+          code: "MINECRAFT_NOT_CONNECTED",
+          message: "not connected",
+          retryable: true,
+        });
+        const body = new MineflayerPlayerBody(() => {
+          throw notConnected;
+        });
+        body.attach(fake.bot);
+        const goto = vi.spyOn(fake.bot.pathfinder, "goto");
+        const controller = new AbortController();
+        const pending = body.execute(
+          {
+            kind: "move_relative",
+            offset: { x: 3, y: 0, z: 0 },
+            range: 1,
+          },
+          cancellation === "signal" ? controller.signal : undefined,
+        );
+        await vi.advanceTimersByTimeAsync(50);
+
+        if (cancellation === "signal") controller.abort();
+        else await body.stop();
+        const result = await pending;
+
+        expect(result.status).toBe("interrupted");
+        expect(result.before).toBeNull();
+        expect(goto).not.toHaveBeenCalled();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves spawn admission errors on timeout and bot replacement", async () => {
+    vi.useFakeTimers();
+    try {
+      const notConnected = new AppError({
+        category: "connection",
+        code: "MINECRAFT_NOT_CONNECTED",
+        message: "not connected",
+        retryable: true,
+      });
+      const denied = new AppError({
+        category: "permission",
+        code: "MINECRAFT_ACTION_DENIED",
+        message: "action denied",
+        retryable: false,
+      });
+      const deniedFixture = makeFakeBot();
+      const deniedBody = new MineflayerPlayerBody(() => {
+        throw denied;
+      });
+      deniedBody.attach(deniedFixture.bot);
+      await expect(
+        deniedBody.execute({
+          kind: "move_relative",
+          offset: { x: 3, y: 0, z: 0 },
+          range: 1,
+        }),
+      ).rejects.toBe(denied);
+
+      const timeoutFixture = makeFakeBot();
+      const timeoutBody = new MineflayerPlayerBody(() => {
+        throw notConnected;
+      });
+      timeoutBody.attach(timeoutFixture.bot);
+      const timedOut = timeoutBody.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      const timeoutExpectation = expect(timedOut).rejects.toBe(notConnected);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await timeoutExpectation;
+
+      const oldBot = makeFakeBot();
+      const replacementBot = makeFakeBot();
+      let currentBot = oldBot.bot;
+      const replacementBody = new MineflayerPlayerBody(() => {
+        if (currentBot === oldBot.bot) throw notConnected;
+        return currentBot;
+      });
+      replacementBody.attach(oldBot.bot);
+      const replacementGoto = vi.spyOn(replacementBot.bot.pathfinder, "goto");
+      const replaced = replacementBody.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      const replacementExpectation =
+        expect(replaced).rejects.toBe(notConnected);
+      await Promise.resolve();
+      (oldBot.bot as unknown as EventEmitter).emit("end", "replaced");
+      currentBot = replacementBot.bot;
+      replacementBody.attach(replacementBot.bot);
+      await vi.advanceTimersByTimeAsync(50);
+      await replacementExpectation;
+      expect(replacementGoto).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("resolves a relative move from the observed start and verifies arrival", async () => {
@@ -2409,6 +4037,108 @@ describe("player body", () => {
     const killed = await body.execute({ kind: "attack", entityId: 2 });
     expect(killed.status).toBe("successful");
     expect(killed.observedEffect).toEqual({ type: "entity_died", entityId: 2 });
+  });
+
+  it("forces a body aim and waits for physicsTick before a normal attack", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    fake.bot.entity.pitch = 1.4;
+    expect(
+      observePlayerBody(fake.bot, undefined).perception.entities.some(
+        (entity) => entity.id === target.id,
+      ),
+    ).toBe(false);
+
+    const botEvents = fake.bot as unknown as EventEmitter;
+    let aimedPoint: Vec3 | undefined;
+    let forcedLook = false;
+    const lookAt = vi.fn(async (point: Vec3, force?: boolean) => {
+      aimedPoint = point;
+      forcedLook = force === true;
+      const delta = point.minus(fake.bot.entity.position.offset(0, 1.62, 0));
+      fake.bot.entity.yaw = Math.atan2(-delta.x, -delta.z);
+      fake.bot.entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+    });
+    const attack = vi.fn((entity: Entity) => {
+      botEvents.emit("entityHurt", entity, fake.bot.entity);
+    });
+    Object.assign(fake.bot, { lookAt, attack });
+
+    const pending = new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "attack",
+      entityId: target.id,
+    });
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    botEvents.emit("physicsTick");
+    const result = await pending;
+
+    expect(result.status).toBe("successful");
+    expect(aimedPoint).toEqual(
+      target.position.offset(0, target.height * 0.55, 0),
+    );
+    expect(forcedLook).toBe(true);
+    expect(attack).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reflex-attack if death occurs while waiting for physicsTick", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const lookAt = vi.fn(async (point: Vec3) => {
+      const delta = point.minus(fake.bot.entity.position.offset(0, 1.62, 0));
+      fake.bot.entity.yaw = Math.atan2(-delta.x, -delta.z);
+      fake.bot.entity.pitch = Math.atan2(delta.y, Math.hypot(delta.x, delta.z));
+    });
+    const attack = vi.fn();
+    Object.assign(fake.bot, { lookAt, attack });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    body.setDamageReflexEnabled(true);
+
+    botEvents.emit("entityHurt", fake.bot.entity, target);
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    fake.bot.health = 0;
+    botEvents.emit("health");
+    botEvents.emit("death");
+    botEvents.emit("physicsTick");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(attack).not.toHaveBeenCalled();
+    body.setDamageReflexEnabled(false);
+    await vi.waitFor(() =>
+      expect(
+        events.some((event) => event.type === "damage_reflex_completed"),
+      ).toBe(true),
+    );
+  });
+
+  it("does not attack when the owner aborts while waiting for physicsTick", async () => {
+    const fake = makeFakeBot();
+    const target = addFakeZombieEntity(fake);
+    registerFakeZombie(fake);
+    const botEvents = fake.bot as unknown as EventEmitter;
+    const lookAt = vi.fn(async () => undefined);
+    const attack = vi.fn();
+    Object.assign(fake.bot, { lookAt, attack });
+    const controller = new AbortController();
+    const pending = new MineflayerPlayerBody(() => fake.bot).execute(
+      { kind: "attack", entityId: target.id },
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
+    expect(attack).not.toHaveBeenCalled();
+    controller.abort(new Error("Owner stopped the action"));
+    const result = await pending;
+    botEvents.emit("physicsTick");
+
+    expect(result.status).toBe("interrupted");
+    expect(attack).not.toHaveBeenCalled();
+    expect(fake.bot.listenerCount("physicsTick")).toBe(0);
   });
 
   it("uses a visible entity with an empty hand without throwing", async () => {

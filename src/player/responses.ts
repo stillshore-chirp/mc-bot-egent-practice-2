@@ -23,6 +23,13 @@ export type PlayerResponsesClient = Pick<OpenAI, "responses">;
 export const playerResponseCompactionThreshold = 16_000;
 
 export type PlayerAgentRole = "purpose" | "conversation";
+type PlayerReasoningEffort = Exclude<
+  NonNullable<ResponseCreateParamsNonStreaming["reasoning"]>["effort"],
+  null | undefined
+>;
+
+const instantPurposeRequestTimeoutMs = 10_000;
+
 export const playerAgentRequestErrorCauses = [
   "request_failed",
   "owner_proposal",
@@ -47,6 +54,7 @@ export const playerAgentToolNames = [
   "stop_autonomy",
   "resume_autonomy",
   "inspect_player_status",
+  "inspect_runtime",
   "search_memory",
   "observe_body",
   "locate_owner",
@@ -152,6 +160,8 @@ export interface PlayerAgentCallResult {
 export interface RunPlayerAgentInput {
   readonly client: PlayerResponsesClient;
   readonly model: string;
+  /** Explicit effort for a latency-sensitive purpose decision. */
+  readonly reasoningEffort?: PlayerReasoningEffort;
   readonly instructions: string;
   readonly input: string;
   readonly tools: readonly PlayerAgentTool[];
@@ -280,6 +290,9 @@ export async function runPlayerAgent(
         input.client.responses.create(
           {
             model: input.model,
+            ...(input.reasoningEffort === undefined
+              ? {}
+              : { reasoning: { effort: input.reasoningEffort } }),
             instructions: input.instructions,
             input: messages,
             tools,
@@ -296,7 +309,11 @@ export async function runPlayerAgent(
           } satisfies ResponseCreateParamsNonStreaming,
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
-            ...(input.beforeCall === undefined ? {} : { maxRetries: 0 }),
+            ...(input.reasoningEffort === "none"
+              ? { maxRetries: 0, timeout: instantPurposeRequestTimeoutMs }
+              : input.beforeCall === undefined
+                ? {}
+                : { maxRetries: 0 }),
           },
         );
       response =
@@ -582,11 +599,14 @@ function safeCommitRejectionCode(
 ): PlayerThoughtCommitRejectionCode | undefined {
   if (!isRecord(value)) return undefined;
   if (value.ok !== false) return undefined;
-  if (toolName === "commit_goal_state")
-    return value.rejectionCode === "GOAL_CAPACITY" ||
-      value.code === "GOAL_CAPACITY"
-      ? "GOAL_CAPACITY"
+  if (toolName === "commit_goal_state" || toolName === "update_understanding") {
+    const code = value.rejectionCode ?? value.code;
+    return code === "CAS_STALE" ||
+      code === "STOPPED" ||
+      (toolName === "commit_goal_state" && code === "GOAL_CAPACITY")
+      ? code
       : undefined;
+  }
   if (toolName !== "commit_action_decision") return undefined;
   const code = value.rejectionCode;
   return code === "CAS_STALE" ||

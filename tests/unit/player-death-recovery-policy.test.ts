@@ -31,19 +31,14 @@ afterEach(() => {
 });
 
 describe("death recovery judgment policy", () => {
-  it("abandons a pending fresh validation observation when the thought is aborted", async () => {
+  it("commits a recovery action without a second validation observation", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
     const anchor = { x: 10, y: 64, z: 0 };
     let observationCount = 0;
-    let notifyDeathObservationStarted!: () => void;
-    let rejectPendingObservation: ((error: Error) => void) | undefined;
-    const deathObservationStarted = new Promise<void>((resolve) => {
-      notifyDeathObservationStarted = resolve;
-    });
     const fixture = openPurposeFixture(
       [
         functionCallResponse(
-          "death-validation-observation",
+          "death-recovery-action",
           "commit_action_decision",
           deathRecoveryActionArguments(deathAt, "approach", {
             kind: "move_to",
@@ -54,19 +49,11 @@ describe("death recovery judgment policy", () => {
       ],
       () => {
         observationCount += 1;
-        if (observationCount === 1)
-          return Promise.resolve(
-            bodyObservationFixture("2026-09-25T00:00:20.000Z"),
-          );
-        notifyDeathObservationStarted();
-        return new Promise<PlayerBodyObservation>((_resolve, reject) => {
-          rejectPendingObservation = reject;
-        });
+        return Promise.resolve(
+          bodyObservationFixture("2026-09-25T00:00:20.000Z"),
+        );
       },
     );
-    const controller = new AbortController();
-    let thought: ReturnType<typeof fixture.agent.think> | undefined;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
 
     try {
       recordDeathScenario(
@@ -79,37 +66,18 @@ describe("death recovery judgment policy", () => {
           bodyObservationFixture("2026-09-25T00:00:08.000Z"),
         ),
       );
-      thought = fixture.agent.think({
+      const result = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
-        signal: controller.signal,
       });
-      await deathObservationStarted;
-      controller.abort(new Error("TEST_THOUGHT_ABORTED"));
-
-      const settled = await Promise.race([
-        thought.then(
-          () => true,
-          () => true,
-        ),
-        new Promise<boolean>((resolve) => {
-          timeout = setTimeout(() => resolve(false), 1_000);
-        }),
-      ]);
-      if (timeout !== undefined) clearTimeout(timeout);
-      expect(settled).toBe(true);
-      await expect(thought).rejects.toThrow("TEST_THOUGHT_ABORTED");
-      expect(observationCount).toBe(2);
+      expect(result.accepted).toBe(true);
+      expect(result.decision?.kind).toBe("act");
+      expect(observationCount).toBe(1);
       expect(fixture.requests).toHaveLength(1);
-      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
-      expect(
-        fixture.mind.snapshot().latestDeath?.recoveryStagesUsed,
-      ).toBeUndefined();
+      expect(fixture.mind.snapshot().latestDeath?.recoveryStagesUsed).toContain(
+        "approach",
+      );
     } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
-      controller.abort(new Error("TEST_CLEANUP_ABORT"));
-      rejectPendingObservation?.(new Error("TEST_CLEANUP_OBSERVATION"));
-      await thought?.catch(() => undefined);
       fixture.close();
     }
   });
@@ -237,9 +205,7 @@ describe("death recovery judgment policy", () => {
     };
     const observationTimes = [
       "2026-09-25T00:00:20.000Z",
-      "2026-09-25T00:00:21.000Z",
       "2026-09-25T00:00:30.000Z",
-      "2026-09-25T00:00:31.000Z",
     ];
     let observationIndex = 0;
     const fixture = openPurposeFixture(
@@ -275,7 +241,7 @@ describe("death recovery judgment policy", () => {
         if (observedAt === undefined)
           throw new Error("TEST_OBSERVATION_SEQUENCE_EXHAUSTED");
         return bodyObservationFixture(observedAt, {
-          hazard: observationIndex <= 2,
+          hazard: observationIndex === 1,
         });
       },
     );
@@ -323,13 +289,13 @@ describe("death recovery judgment policy", () => {
       expect(second.accepted).toBe(true);
       expect(second.decision?.kind).toBe("act");
       expect(fixture.requests).toHaveLength(2);
-      expect(observationIndex).toBe(4);
+      expect(observationIndex).toBe(2);
     } finally {
       fixture.close();
     }
   });
 
-  it("keeps dimension mismatch as a recovery context blocker", async () => {
+  it("commits an action with a dimension-mismatched recovery context", async () => {
     const deathAt = "2026-09-25T00:00:05.000Z";
     const fixture = openPurposeFixture(
       [
@@ -347,7 +313,6 @@ describe("death recovery judgment policy", () => {
             }),
           );
         },
-        terminalResponse("No more decision is available in this fixture."),
       ],
       async () => {
         return bodyObservationFixture("2026-09-25T00:00:20.000Z", {
@@ -369,11 +334,10 @@ describe("death recovery judgment policy", () => {
         events: [],
       });
 
-      expect(result.accepted).toBe(false);
-      expect(JSON.stringify(fixture.requests[1])).toContain(
-        "DEATH_RECOVERY_CONTEXT_UNAVAILABLE",
-      );
-      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
+      expect(result.accepted).toBe(true);
+      expect(result.decision?.kind).toBe("act");
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().activeOperation?.kind).toBe("move_to");
     } finally {
       fixture.close();
     }
@@ -584,15 +548,6 @@ function functionCallResponse(
       },
     ],
     output_text: "",
-    usage: { input_tokens: 1, output_tokens: 1 },
-  } as unknown as Response;
-}
-
-function terminalResponse(outputText: string): Response {
-  return {
-    status: "completed",
-    output: [],
-    output_text: outputText,
     usage: { input_tokens: 1, output_tokens: 1 },
   } as unknown as Response;
 }
