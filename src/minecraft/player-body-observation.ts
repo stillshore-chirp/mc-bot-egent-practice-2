@@ -68,6 +68,17 @@ export interface BodyVisibleEntity {
   readonly health: number | null;
   readonly isPlayer: boolean;
   readonly username?: string;
+  /** Omitted slots are unknown; null means explicitly empty. */
+  readonly equipment?: BodyVisibleEntityEquipment;
+}
+
+export interface BodyVisibleEntityEquipment {
+  readonly mainHand?: string | null;
+  readonly offHand?: string | null;
+  readonly head?: string | null;
+  readonly torso?: string | null;
+  readonly legs?: string | null;
+  readonly feet?: string | null;
 }
 
 export interface BodyWindowSnapshot {
@@ -176,6 +187,17 @@ const lookSweepEntitySchema = z
     category: z.string().max(80).nullable(),
     position: lookSweepPositionSchema,
     distance: z.number().min(0),
+    equipment: z
+      .object({
+        mainHand: z.string().min(1).max(80).nullable().optional(),
+        offHand: z.string().min(1).max(80).nullable().optional(),
+        head: z.string().min(1).max(80).nullable().optional(),
+        torso: z.string().min(1).max(80).nullable().optional(),
+        legs: z.string().min(1).max(80).nullable().optional(),
+        feet: z.string().min(1).max(80).nullable().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -264,12 +286,13 @@ export function summarizeLookSweepView(
       })),
     visibleEntities: entities
       .slice(0, playerBodyLookSweepEntityLimit)
-      .map(({ name, kind, category, position, distance }) => ({
+      .map(({ name, kind, category, position, distance, equipment }) => ({
         name: name.slice(0, 80),
         kind: kind.slice(0, 80),
         category: category?.slice(0, 80) ?? null,
         position: { x: position.x, y: position.y, z: position.z },
         distance,
+        ...(equipment === undefined ? {} : { equipment }),
       })),
     omittedBlockCandidates,
     omittedEntityCandidates,
@@ -448,6 +471,39 @@ function windowSnapshot(window: Window | null): BodyWindowSnapshot | null {
 
 function entityName(entity: Entity): string {
   return entity.name ?? entity.displayName ?? entity.type;
+}
+
+function visibleEntityEquipment(
+  entity: Entity,
+): BodyVisibleEntityEquipment | undefined {
+  const rawEquipment = (entity as unknown as { readonly equipment?: unknown })
+    .equipment;
+  if (!Array.isArray(rawEquipment)) return undefined;
+  const slots = rawEquipment as readonly (Item | null | undefined)[];
+
+  // prismarine-entity uses the 1.9+ order for current supported protocols.
+  const slotNames = [
+    "mainHand",
+    "offHand",
+    "feet",
+    "legs",
+    "torso",
+    "head",
+  ] as const;
+  const equipment: Partial<Record<(typeof slotNames)[number], string | null>> =
+    {};
+  slotNames.forEach((name, index) => {
+    const item = slots[index];
+    if (item === undefined) return;
+    if (item === null) {
+      equipment[name] = null;
+      return;
+    }
+    if (typeof item.name === "string" && item.name.length > 0)
+      equipment[name] = item.name.slice(0, 80);
+  });
+
+  return Object.keys(equipment).length === 0 ? undefined : equipment;
 }
 
 function entityHealth(entity: Entity): number | null {
@@ -855,6 +911,7 @@ export function observePlayerBody(
       continue;
     const name = entityName(entity);
     const category = bot.registry.entitiesByName[name]?.category ?? null;
+    const equipment = visibleEntityEquipment(entity);
     visibleEntities.push({
       id: entity.id,
       name,
@@ -865,6 +922,7 @@ export function observePlayerBody(
       health: entityHealth(entity),
       isPlayer: entity.username !== undefined,
       ...(entity.username === undefined ? {} : { username: entity.username }),
+      ...(equipment === undefined ? {} : { equipment }),
     });
   }
 
