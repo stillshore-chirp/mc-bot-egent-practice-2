@@ -1817,7 +1817,7 @@ function applyGoalAndProposalResolution(
     goalChange?.id !== undefined &&
     goalChange.source === "owner" &&
     (goalChange.status === "active" || goalChange.status === "paused") &&
-    goalById?.source === "owner";
+    goalById.source === "owner";
   const goalChangeForLink = mismatchedProposalLink ? undefined : goalChange;
   const shouldLinkExplicitGoal =
     proposal !== undefined &&
