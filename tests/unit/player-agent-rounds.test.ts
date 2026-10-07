@@ -1209,6 +1209,9 @@ describe("player agent response rounds", () => {
       });
       expect(request.instructions).toContain("危険は創作せず");
       expect(request.instructions).toContain("proposalDisposition");
+      expect(request.instructions).toContain("採否の判定名だけで終えず");
+      expect(request.instructions).toContain("提案の具体的な対象・数量・条件");
+      expect(request.instructions).toContain("これから試す次の一手");
       expect(request.instructions).toContain(
         "今回の入力runtime.proposalsにstatus=pendingとして載っているものだけ",
       );

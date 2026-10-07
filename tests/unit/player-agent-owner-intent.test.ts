@@ -1094,7 +1094,9 @@ describe("player owner intent context", () => {
             "The owner is now asking me to eat one of the foods from the recent conversation.",
           priority: 3,
         }),
-        terminalResponse("I will consider that alongside my current state."),
+        terminalResponse(
+          "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
+        ),
       );
       await conversation.handleOwnerMessage({
         username: "owner",
@@ -1114,7 +1116,25 @@ describe("player owner intent context", () => {
       expect(String(secondRequest.instructions)).toContain(
         "質問、否定、引用、他者を対象にした発話",
       );
+      expect(String(secondRequest.instructions)).toContain(
+        "propose_goal_changeはstatus=pendingの依頼案を保存するだけ",
+      );
+      expect(String(secondRequest.instructions)).toContain(
+        "goalを更新・採用・達成した、または操作を始めたと言い切らない",
+      );
       expect(proposalWakeups).toBe(1);
+      const proposalContinuation = record(fixture.requests[2]);
+      if (!Array.isArray(proposalContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const proposalOutput = proposalContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(proposalOutput?.output))).toMatchObject({
+        ok: true,
+        proposalStatus: "pending",
+        title: "Eat one of the foods the owner mentioned",
+      });
+      expect(fixture.mind.snapshot().goals).toEqual([]);
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({
           title: "Eat one of the foods the owner mentioned",
@@ -1123,6 +1143,41 @@ describe("player owner intent context", () => {
       );
       expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
       expect(messages).toHaveLength(2);
+      expect(messages[1]).toBe(
+        "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("gives ordinary owner proposal resolutions a concrete first-person shape", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Gather three birch logs",
+      reason: "The owner wants three birch logs.",
+      priority: 3,
+    });
+    fixture.responses.push(
+      terminalResponse("I will check the nearby trees and begin with one cut."),
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = record(fixture.requests[0]);
+      const instructions = String(request.instructions);
+      expect(instructions).toContain("採否の判定名だけで終えず");
+      expect(instructions).toContain("提案の具体的な対象・数量・条件");
+      expect(instructions).toContain("これから試す次の一手");
+      expect(instructions).not.toContain("priority 4以上の新しいowner提案");
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({ id: proposal.id, status: "pending" }),
+      );
     } finally {
       fixture.close();
     }
