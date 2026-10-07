@@ -21,6 +21,7 @@ import type {
 } from "../../src/player/contracts.js";
 import {
   compactSnapshot,
+  conversationReplyNeedsRefresh,
   PlayerConversationAgent,
   PlayerPurposeAgent,
   playerOperationCatalog,
@@ -1147,6 +1148,259 @@ describe("player owner intent context", () => {
       expect(messages[1]).toBe(
         "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
       );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("refreshes a drafted reply only when current goals or action results changed", () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    try {
+      const initial = fixture.mind.snapshot();
+      const pendingProposal: OwnerProposal = {
+        id: "pending-only",
+        title: "Gather a few logs",
+        reason: "The owner asked for logs.",
+        createdAt: "2026-10-08T00:00:00.000Z",
+        priorityPreference: 2,
+        status: "pending",
+      };
+      const passiveUpdate: PlayerRuntimeSnapshot = {
+        ...initial,
+        revision: initial.revision + 1,
+        pendingEventKinds: ["state_changed"],
+        proposals: [...initial.proposals, pendingProposal],
+      };
+
+      expect(conversationReplyNeedsRefresh(initial, passiveUpdate)).toBe(false);
+      expect(
+        conversationReplyNeedsRefresh(initial, {
+          ...passiveUpdate,
+          actionRevision: initial.actionRevision + 1,
+        }),
+      ).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("discards a stale draft and makes one response-only pass from resolved goal state", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Gather a few logs",
+      reason: "The owner wants logs for the shelter.",
+      priority: 3,
+    });
+    const observation = bodyObservationFixture();
+    const observedAt = "2026-10-08T00:00:01.000Z";
+    const observationWithDrop: PlayerBodyObservation = {
+      ...observation,
+      observedAt,
+      self: {
+        ...observation.self,
+        inventory: [
+          {
+            slot: 0,
+            itemId: 297,
+            name: "bread",
+            count: 2,
+            metadata: 0,
+            durability: null,
+            maxDurability: null,
+            customName: null,
+            enchantments: [],
+          },
+        ],
+      },
+      perception: {
+        ...observation.perception,
+        entities: [
+          {
+            id: 44,
+            name: "item",
+            kind: "item",
+            category: "Item",
+            position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+            distance: 2,
+            health: null,
+            isPlayer: false,
+            droppedItem: { name: "golden_apple", count: 1 },
+          },
+        ],
+      },
+    };
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => observationWithDrop,
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("refresh-observe", "observe_body", {}),
+      async () => {
+        const current = fixture.mind.snapshot();
+        const changed = fixture.mind.commitGoalState({
+          expectedRevision: current.revision,
+          goal: {
+            title: "Gather a few logs for the shelter",
+            status: "active",
+            priority: 3,
+            changeReason: "The current situation supports this goal.",
+            source: "owner",
+          },
+          proposalResolution: {
+            proposalId: proposal.id,
+            disposition: "adopted",
+            resolution: "I will gather them after checking what is nearby.",
+          },
+        });
+        expect(changed.accepted).toBe(true);
+        return terminalResponse("I will start the pending plan now.");
+      },
+      terminalResponse("I have taken the shelter logs as my active goal."),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What do you want to do?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(3);
+      expect(messages).toEqual([
+        "I have taken the shelter logs as my active goal.",
+      ]);
+      const refreshedRequest = record(fixture.requests[2]);
+      const initialRequest = record(fixture.requests[0]);
+      const refreshedInputText = Array.isArray(refreshedRequest.input)
+        ? refreshedRequest.input
+            .map((item) => {
+              const content = record(item).content;
+              return typeof content === "string" ? content : "";
+            })
+            .join("\n")
+        : String(refreshedRequest.input);
+      expect(refreshedRequest.tools).toEqual([]);
+      expect(refreshedRequest.tool_choice).toBe("none");
+      expect(String(initialRequest.instructions)).toContain(
+        "『何が欲しい』『何をしたい』",
+      );
+      expect(String(initialRequest.instructions)).toContain(
+        "inspect_player_statusやobserve_bodyを使い",
+      );
+      expect(refreshedInputText).toContain("Gather a few logs for the shelter");
+      expect(refreshedInputText).toContain(observedAt);
+      expect(refreshedInputText).toContain('"name":"golden_apple"');
+      expect(refreshedInputText).toContain('"count":1');
+      expect(refreshedInputText).not.toContain('"id":44');
+      expect(refreshedInputText).not.toContain('"x":2');
+      expect(refreshedInputText).not.toContain(
+        "I will start the pending plan now.",
+      );
+      expect(String(refreshedRequest.instructions)).toContain(
+        "snapshot以降の実行状況が不明なら",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses a freshly inspected player snapshot as the drafted reply baseline", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(async () => {
+      const current = fixture.mind.snapshot();
+      const changed = fixture.mind.commitGoalState({
+        expectedRevision: current.revision,
+        goal: {
+          title: "Find shelter wood",
+          status: "active",
+          priority: 2,
+          changeReason: "The owner asked for current intent.",
+          source: "owner",
+        },
+      });
+      expect(changed.accepted).toBe(true);
+      return functionCallResponse(
+        "inspect-current-status",
+        "inspect_player_status",
+        {},
+      );
+    }, terminalResponse("I am working toward finding shelter wood."));
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What goal are you working on?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(2);
+      expect(messages).toEqual(["I am working toward finding shelter wood."]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not refresh or deliver a conversation draft after its turn becomes stale", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(async () => {
+      conversation.nextTurn();
+      return terminalResponse("This belongs to an older owner turn.");
+    });
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What do you want to do?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(messages).toEqual([]);
     } finally {
       fixture.close();
     }
