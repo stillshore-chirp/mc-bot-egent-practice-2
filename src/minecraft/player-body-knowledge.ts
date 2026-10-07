@@ -62,13 +62,26 @@ export interface PlayerKnowledge {
   readonly observedAt: string;
   readonly query: string;
   readonly facts: readonly RegistryKnowledgeFact[];
-  readonly inferences: readonly {
-    readonly kind: "craftability";
-    readonly itemName: string;
-    readonly currentlyCraftable: boolean;
-    readonly basis: readonly string[];
-  }[];
+  readonly inferences: readonly PlayerCraftabilityInference[];
   readonly truncated: boolean;
+}
+
+export interface PlayerCraftabilityInference {
+  readonly kind: "craftability";
+  readonly itemName: string;
+  /** Compatibility field: checks one item while assuming a crafting table. */
+  readonly currentlyCraftable: boolean;
+  readonly assessedCount: 1;
+  readonly recipeStatus: "known" | "none" | "unknown";
+  readonly tableRequirement: "required" | "not_required" | "mixed" | "unknown";
+  /** Whether the Body's crafting-table search found one within 4.5 blocks. */
+  readonly craftingTableNearby: boolean | null;
+  /** Whether one item can be made using the currently available surface. */
+  readonly craftableWithCurrentSurface: boolean | null;
+  /** Material sufficiency for one item, assuming a crafting table is available. */
+  readonly materialAvailabilityWithTable:
+    "sufficient" | "insufficient" | "unknown";
+  readonly basis: readonly string[];
 }
 
 const stopWords = new Set([
@@ -111,16 +124,10 @@ function matches(
 
 function recipeFacts(
   bot: Bot,
-  itemId: number,
   itemName: string,
+  recipes: readonly Recipe[] | undefined,
 ): RegistryKnowledgeFact[] {
-  let recipes: Recipe[];
-  try {
-    recipes = bot.recipesAll(itemId, null, true);
-  } catch {
-    return [];
-  }
-  return recipes.slice(0, 12).map((recipe) => ({
+  return (recipes ?? []).slice(0, 12).map((recipe) => ({
     kind: "recipe",
     result: {
       id: recipe.result.id,
@@ -136,13 +143,115 @@ function recipeFacts(
   }));
 }
 
+function registryRecipes(
+  bot: Bot,
+  itemId: number,
+): readonly Recipe[] | undefined {
+  try {
+    return bot.recipesAll(itemId, null, true);
+  } catch {
+    return undefined;
+  }
+}
+
+type CraftingTableLookup =
+  | {
+      readonly status: "nearby";
+      readonly block: NonNullable<ReturnType<Bot["findBlock"]>>;
+    }
+  | { readonly status: "not_found" | "unknown" };
+
+function nearbyCraftingTable(bot: Bot): CraftingTableLookup {
+  const tableId = bot.registry.blocksByName.crafting_table?.id;
+  if (tableId === undefined) return { status: "unknown" };
+  try {
+    const block = bot.findBlock({ matching: tableId, maxDistance: 4.5 });
+    return block === null
+      ? { status: "not_found" }
+      : { status: "nearby", block };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+function craftableWithSurface(
+  bot: Bot,
+  itemId: number,
+  craftingSurface: Parameters<Bot["recipesFor"]>[3],
+): boolean | null {
+  try {
+    return bot.recipesFor(itemId, null, 1, craftingSurface).length > 0;
+  } catch {
+    return null;
+  }
+}
+
+function tableRequirement(
+  recipes: readonly Recipe[] | undefined,
+): PlayerCraftabilityInference["tableRequirement"] {
+  if (recipes === undefined || recipes.length === 0) return "unknown";
+  const hasTableRecipe = recipes.some(({ requiresTable }) => requiresTable);
+  const hasInventoryRecipe = recipes.some(
+    ({ requiresTable }) => !requiresTable,
+  );
+  if (hasTableRecipe && hasInventoryRecipe) return "mixed";
+  return hasTableRecipe ? "required" : "not_required";
+}
+
+function craftabilityInference(
+  bot: Bot,
+  itemId: number,
+  itemName: string,
+  recipes: readonly Recipe[] | undefined,
+  table: CraftingTableLookup,
+): PlayerCraftabilityInference {
+  const craftableWithTable = craftableWithSurface(bot, itemId, true);
+  const craftableWithoutTable = craftableWithSurface(bot, itemId, false);
+  const craftableWithCurrentSurface =
+    table.status === "nearby"
+      ? craftableWithSurface(bot, itemId, table.block)
+      : table.status === "not_found"
+        ? craftableWithoutTable
+        : craftableWithoutTable === true
+          ? true
+          : null;
+  const recipeStatus =
+    recipes === undefined ? "unknown" : recipes.length === 0 ? "none" : "known";
+
+  return {
+    kind: "craftability",
+    itemName,
+    currentlyCraftable: craftableWithTable === true,
+    assessedCount: 1,
+    recipeStatus,
+    tableRequirement: tableRequirement(recipes),
+    craftingTableNearby:
+      table.status === "unknown" ? null : table.status === "nearby",
+    craftableWithCurrentSurface,
+    materialAvailabilityWithTable:
+      recipeStatus !== "known" || craftableWithTable === null
+        ? "unknown"
+        : craftableWithTable
+          ? "sufficient"
+          : "insufficient",
+    basis: [
+      "registry recipes",
+      "current inventory counts for one item",
+      "currentlyCraftable assumes a crafting table",
+      "craftingTableNearby uses the Body 4.5-block search",
+    ],
+  };
+}
+
 export function queryPlayerKnowledge(bot: Bot, query: string): PlayerKnowledge {
   const terms = queryTerms(query);
   const facts: RegistryKnowledgeFact[] = [];
-  const inferences: PlayerKnowledge["inferences"][number][] = [];
+  const inferences: PlayerCraftabilityInference[] = [];
+  let table: CraftingTableLookup | undefined;
 
   for (const item of bot.registry.itemsArray) {
     if (!matches(query, terms, [item.name, item.displayName])) continue;
+    const recipes = registryRecipes(bot, item.id);
     const food = bot.registry.foodsByName[item.name];
     facts.push({
       kind: "item",
@@ -157,24 +266,11 @@ export function queryPlayerKnowledge(bot: Bot, query: string): PlayerKnowledge {
           ? null
           : { foodPoints: food.foodPoints, saturation: food.saturation },
     });
-    facts.push(...recipeFacts(bot, item.id, item.name));
-
-    let craftable = false;
-    try {
-      craftable = bot.recipesFor(item.id, null, 1, true).length > 0;
-    } catch {
-      // Registry recipe data can be incomplete for modded servers.
-    }
-    inferences.push({
-      kind: "craftability",
-      itemName: item.name,
-      currentlyCraftable: craftable,
-      basis: [
-        "registry recipes",
-        "current inventory counts",
-        "crafting table assumed available",
-      ],
-    });
+    facts.push(...recipeFacts(bot, item.name, recipes));
+    table ??= nearbyCraftingTable(bot);
+    inferences.push(
+      craftabilityInference(bot, item.id, item.name, recipes, table),
+    );
     if (facts.length >= factLimit) break;
   }
 
