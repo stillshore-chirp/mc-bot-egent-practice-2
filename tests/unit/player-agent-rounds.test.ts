@@ -1303,8 +1303,10 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
-      expect(request).toMatchObject({ model: "test-model" });
-      expect(request).not.toHaveProperty("reasoning");
+      expect(request).toMatchObject({
+        model: "test-model",
+        reasoning: { effort: "medium" },
+      });
       expect(fixture.requestOptions[0]).toEqual({});
       expect(request.instructions).toContain(
         "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
