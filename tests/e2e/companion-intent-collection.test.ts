@@ -12,6 +12,7 @@ import {
   companionHostileObservationConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
+  ownerGoalAndObservationFreshAfterRequest,
   singleFreshWoodGoalQuantity,
   successfulCollectionActionObservedAfter,
 } from "./companion-intent-collection.js";
@@ -141,6 +142,56 @@ describe("companion intent collection acceptance helpers", () => {
         updatedAfter: Date.parse("2026-10-07T00:00:03.000Z"),
       }),
     ).toBe(0);
+  });
+
+  it("accepts the same goal update and observation in either post-request order", () => {
+    const requestSentAt = Date.parse("2026-10-07T00:00:01.000Z");
+    const goalUpdatedAt = "2026-10-07T00:00:02.000Z";
+    expect(
+      ownerGoalAndObservationFreshAfterRequest({
+        goalId: "goal-1",
+        expectedGoalId: "goal-1",
+        goalUpdatedAt,
+        observationAt: Date.parse("2026-10-07T00:00:03.000Z"),
+        requestSentAt,
+      }),
+    ).toBe(true);
+    expect(
+      ownerGoalAndObservationFreshAfterRequest({
+        goalId: "goal-1",
+        expectedGoalId: "goal-1",
+        goalUpdatedAt: "2026-10-07T00:00:03.000Z",
+        observationAt: Date.parse("2026-10-07T00:00:02.000Z"),
+        requestSentAt,
+      }),
+    ).toBe(true);
+    expect(
+      ownerGoalAndObservationFreshAfterRequest({
+        goalId: "goal-2",
+        expectedGoalId: "goal-1",
+        goalUpdatedAt,
+        observationAt: Date.parse("2026-10-07T00:00:03.000Z"),
+        requestSentAt,
+      }),
+    ).toBe(false);
+    expect(
+      ownerGoalAndObservationFreshAfterRequest({
+        goalId: "goal-1",
+        expectedGoalId: "goal-1",
+        goalUpdatedAt: "2026-10-07T00:00:00.000Z",
+        observationAt: Date.parse("2026-10-07T00:00:03.000Z"),
+        requestSentAt,
+      }),
+    ).toBe(false);
+    expect(
+      ownerGoalAndObservationFreshAfterRequest({
+        goalId: "goal-1",
+        expectedGoalId: "goal-1",
+        goalUpdatedAt,
+        observationAt: Date.parse("2026-10-07T00:00:00.000Z"),
+        requestSentAt,
+      }),
+    ).toBe(false);
   });
 
   it("selects collection only as an explicit standalone case", () => {

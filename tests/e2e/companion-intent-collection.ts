@@ -68,6 +68,25 @@ export interface CompanionOwnerJudgment {
   readonly proposalDisposition?: string;
 }
 
+export function ownerGoalAndObservationFreshAfterRequest(input: {
+  readonly goalId: string | undefined;
+  readonly expectedGoalId: string;
+  readonly goalUpdatedAt: string | undefined;
+  readonly observationAt: number | undefined;
+  readonly requestSentAt: number;
+}): boolean {
+  const goalUpdatedAt = Date.parse(input.goalUpdatedAt ?? "");
+  return (
+    input.goalId === input.expectedGoalId &&
+    Number.isFinite(input.requestSentAt) &&
+    Number.isFinite(goalUpdatedAt) &&
+    goalUpdatedAt >= input.requestSentAt &&
+    input.observationAt !== undefined &&
+    Number.isFinite(input.observationAt) &&
+    input.observationAt >= input.requestSentAt
+  );
+}
+
 function resolvedProposalIds(input: {
   readonly proposals: readonly CompanionOwnerProposal[];
   readonly judgments: readonly CompanionOwnerJudgment[];

@@ -71,6 +71,7 @@ import {
   companionHostileObservationConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
+  ownerGoalAndObservationFreshAfterRequest,
   singleFreshWoodGoalQuantity,
   successfulCollectionActionObservedAfter,
 } from "./companion-intent-collection.js";
@@ -12437,12 +12438,14 @@ async function runCompanionIntentCollectionCase(
         freshBodyObservationAt = observationAt;
       }
       const goal = activeWoodGoal(player, followupSentAt);
-      const goalUpdatedAt = Date.parse(goal?.updatedAt ?? "");
       return (
-        goal?.id === initialGoal.id &&
-        freshBodyObservationAt !== undefined &&
-        Number.isFinite(goalUpdatedAt) &&
-        goalUpdatedAt >= freshBodyObservationAt &&
+        ownerGoalAndObservationFreshAfterRequest({
+          goalId: goal?.id,
+          expectedGoalId: initialGoal.id,
+          goalUpdatedAt: goal?.updatedAt,
+          observationAt: freshBodyObservationAt,
+          requestSentAt: followupSentAt,
+        }) &&
         singleFreshWoodGoalQuantity({
           goals: player.goals,
           proposals: player.proposals,
