@@ -1,7 +1,7 @@
 ---
 name: Change proposal
 about: 機能、設計、文書、ルール、保守の変更を追跡する
-title: "[Feature]: "
+title: "変更提案："
 labels: enhancement
 ---
 
@@ -39,8 +39,8 @@ labels: enhancement
 
 - 検証:
 - 関連file、config、runtime、docs:
-- 権限・外部状態への影響:
+- 外部状態への影響:
 
 ## 公開安全性と残るrisk
 
-公開できないsecret、個人情報、実環境log原文、追跡IDを貼らない。未確認範囲と次の最短actionを記録する。
+公開できないsecret、個人情報、実環境log原文、追跡IDを貼らない。未確認範囲と次の判断材料を記録する。

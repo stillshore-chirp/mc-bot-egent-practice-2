@@ -1,78 +1,33 @@
-# 完了ゲート報告
+# 製品evidence報告
 
-## 判定
+## 対象と判定
 
-- 完了可否:
 - 主Issue:
-- 対象面: governance / Minecraft runtime / GitHub共同作業面 / 混在
+- 対象機能・利用者:
 - scope / 非対象:
-- P0 / P1 / P2:
-- 判定理由:
+- 受け入れ条件と判定:
 
-## Checkpointとsnapshot
+## Snapshotと条件
 
-- current checkpoint: implementation / focused_verification / code_freeze / measurement / publication_freeze / external_gate / review_fix / accepted
 - base / HEAD:
-- target paths:
-- owner / lane:
-- task budget（context / deadline / runtime / output cap）:
-- review budget（HEAD / cycle / severity / reacquire condition）:
-- execution conditions:
-- publication scope:
+- 対象path:
+- 関連config / artifact:
+- 実行または観測条件:
 
-## Input closureとevidence
+## Evidence
 
-- input paths:
-- related config:
-- generated artifacts:
-- conditions:
-- stable evidence:
-- volatile delivery state:
-- evidence artifact reference:
-- 再利用したevidenceと一致条件:
-- 失効したgate、invalidation reason、reacquire scope:
+| 対象条件 | 根拠の種類（code / test / Minecraft観測 / static governance） | 結果 | artifact reference |
+|---|---|---|---|
+|  |  |  |  |
 
-| gate | phase・HEAD / base | closure | result / artifact | invalidation / reacquire |
-|---|---|---|---|---|
-|  |  |  |  |  |
+## Minecraft実環境の観測（該当時）
 
-## 委任lane
+- 環境区分、条件、時間範囲:
+- 実際に観測した状態:
+- 未観測範囲:
 
-- scope / acceptance:
-- target HEAD / base / owned paths:
-- verification:
-- unperformed checks:
-- remaining risks:
-- stop reason:
-- snapshot / diff:
-- output artifact:
-- timeout、scope shrink、reassignment:
-- primary-only workの理由（該当時）:
+## 公開安全性と限界
 
-## 検証
-
-| 検証 | 結果 | 条件・証跡 |
-|---|---|---|
-|  |  |  |
-
-## PR / CI / review
-
-- latest HEAD:
-- push / pull_request CI:
-- latest meaningful changeへのreview:
-- actionableな未解決thread:
-- GitHub mergeability:
-- review未提供または未確認の範囲:
-
-## 公開安全性
-
-- 対象file・本文・artifact:
-- 実行した検査:
-- 一般化・maskした情報:
-- 検出結果:
-
-## 未実行項目と残るrisk
-
-| 項目 | 理由 | 残るrisk / 次の最短action |
-|---|---|---|
-|  |  |  |
+- 対象情報の一般化・mask:
+- 未検証の製品結果:
+- 残るrisk:

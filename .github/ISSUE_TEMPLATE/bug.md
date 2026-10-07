@@ -1,7 +1,7 @@
 ---
 name: Bug Report
 about: 不具合、回帰、想定外のbot・runtime挙動
-title: "[Bug]: "
+title: "不具合："
 labels: bug
 ---
 
@@ -38,7 +38,7 @@ labels: bug
 - [ ] 再現または再現不能の理由が記録されている。
 - [ ] 期待挙動と検証方法が明確である。
 - [ ] 回帰testまたは代替evidenceがある。
-- [ ] 未確認範囲と残るriskがPRへ残る。
+- [ ] 未確認範囲と残るriskが記録されている。
 
 ## 公開安全性
 

@@ -1,78 +1,35 @@
-# エージェントハーネス設計・保守ガイド
+# エージェントハーネスのリポジトリ仕様
 
-この文書は、Codex、Claude Code、Cursorで共有する、正本の読者・配置、委任、evidence、task-stateの最小契約です。説明文であり、機械検証や製品runtimeの代替ではありません。
+この文書は、正本の配置、evidenceとtask-stateのデータ契約、instruction budgetを定義します。共通の作業運用は実行環境の指示に従います。説明文であり、validatorや製品runtimeの代替ではありません。
 
 ## 正本、読者、責務
 
 | 正本 | 読者 | 責務 |
 |---|---|---|
-| AGENTS.md、最寄りのAGENTS.md | 3製品 | hard gate、権限境界、最小実行 |
-| .agents/skills/<name>/SKILL.md | 3製品 | task固有の発動条件、手順、handoff |
-| docs/ai-governance/ | agent、reviewer | Issue、evidence、完了の判定基準 |
-| この文書 | agent、reviewer、保守者 | 委任、snapshot、closure、task-state、runtime境界 |
+| AGENTS.md、最寄りのAGENTS.md | 3製品 | Minecraft製品固有の契約と正本へのrouting |
+| .agents/skills/<name>/SKILL.md | 3製品 | task固有のMinecraft観測境界、Issue品質、公開安全性 |
+| docs/ai-governance/ | agent、reviewer、保守者 | 製品固有のevidence基準と文書配置 |
+| この文書 | agent、保守者 | task-state、input closure、validator、instruction budget |
 | scripts/validate_governance.py | CI、保守者 | 形式、存在、参照、identity、budgetのstatic検査 |
 
-CLAUDE.md、.claude/rules/、.claude/skills/、.cursor/rules/は正本へ到達するrouterです。adapterへ本文を複製せず、routerの不調をhard gateの緩和に使いません。
+CLAUDE.md、.claude/、.cursor/は正本へ接続するrouterです。本文を複製せず、routerの不調を製品境界の緩和に使いません。
 
-## 読み分けと変更影響
+## Evidenceとinput closure
 
-全体の安全境界はroot、実在するpath固有契約は最寄りのAGENTS.md、task手順はSkillへ置きます。設計heuristicは[agent-principles](agent-principles.md)、保守判断は[maintenance policy](ai-governance/13-maintenance-policy.md)を読みます。logic、共有処理、API、型、data契約を変える時は、参照追跡と関連testで影響範囲を確認します。
+evidenceはHEAD / base、対象path、関連config、生成artifact、実行条件と結果に対応付けます。GitHubのCI・review・threadなど外部の状態は、repository上の検証結果と区別します。測定結果に後から公開用annotationを加える場合、annotationは測定scopeと区別します。
 
-## 配送checkpoint
+input closureは、evidenceの妥当性に関係するpath、config、artifact、conditionsの集合です。task-stateに保存されたclosureと現在の条件が一致する場合に限り、対応するcompleted evidenceを参照できます。
 
-配送は次の順で進め、各段階でHEAD、base、owner、入力閉包、終了条件を固定します。
+## task-state/v1
 
-1. implementation: scope、acceptance、非対象、owner、変更pathを確定。
-2. focused_verification: pathに対応する最小十分なtest・構造確認を実行。
-3. code_freeze: source、test、設定、生成物とgateのinput closureを固定。
-4. measurement: 固定snapshotとscopeで実行数、wall-clock、照会数、output bytesを記録。
-5. publication_freeze: Issue、PR、report、artifactの公開内容と安全性を固定。
-6. external_gate: 必要なCI、review、thread、mergeabilityを確認。
-7. review_fix: actionableな修正後、closureと交差するgateだけを再取得。
-8. accepted: latest HEAD / base、acceptance、CI、review、thread、mergeabilityを同一snapshotで照合。
+cross-sessionのfield sourceは[task-state/v1 template](ai-governance/templates/task-state.json)です。status、snapshot、lane、completed evidence、input closure、measurement、publication、invalidated gates、remaining work、risks、blockersのshapeはこのtemplateとvalidatorが定義します。complete状態には未完了作業、invalidated gate、blockerがなく、evidenceがpassであることを要します。static validatorはこのdata contractを確認します。
 
-高コストgateはcode_freeze、測定scope、公開境界、再取得条件の確定後に選びます。
+## Minecraft runtimeの観測限界
 
-## snapshot、evidence、input closure
+Minecraft runtimeを使う検証では、owner、PID、process group、port、readiness、cleanupを実行条件として記録します。runtimeを使わない検証はその範囲を明記します。static validatorのPASSはtool発見、Hook注入、runtime routing、権限、実環境の成功を保証しません。
 
-stable evidenceはHEAD / base、変更path、関連config、生成artifact、実行条件、結果、artifact referenceに束縛します。CI、review、thread、mergeability、待機中statusはvolatile delivery stateとして分離します。
+## instruction budgetとstatic validator
 
-gate ledgerは gate、snapshot phase・HEAD・base、input paths、関連config、artifact、conditions、result、artifact referenceを持ち、失効時はinvalidation reasonとreacquire scopeを追記します。base、owned path、設定、生成物、条件がclosureと交差したgateだけを失効させ、同じclosureと条件の成功evidenceは再利用します。timeoutは失敗でもevidence失効でもなく、laneをrunningのままeventまたはbackoffで再待機します。
+root AGENTS.mdは180行・16KiB、nested AGENTS.mdは100行・8KiB、adapterは30行・4KiB、canonical Skillは180行・16KiB、rootと有効なnested ruleの合計は24KiBを上限とします。source-sizeはestimateで、実際のtoken telemetryではありません。
 
-測定artifactへ後からreport annotationを加える場合は、annotationを測定scope外へ分離するかpublication gateへ移します。推定token量をobserved telemetryと表現しません。
-
-## bounded laneとevidence package
-
-委任時にrisk lane、owner、target HEAD / base、target paths、acceptance、depends_on、snapshot phase、write ownership、runtime resource、port、cleanup、output cap、completion、verification、reuse evidence、invalidation conditionを固定します。最小contextは目的、受け入れ条件、非対象、HEAD / base、対象path、依存、停止条件だけにします。
-
-completed laneは、status、scope / revision、conclusion、changed paths、verification、unperformed checks、remaining risks、stop reason、snapshot / diff、artifact referenceを含むcompact evidence packageを返します。raw logや長いfile全文は含めません。
-
-task budgetは、primaryとlaneごとの最小context、owned paths、実行時間またはdeadline、runtime資源、output capを開始時に固定します。review budgetは、対象HEAD、review cycle数、確認するseverityとclosure、再取得条件を固定します。包括reviewはcode freeze後に依頼し、指摘を集約して修正します。修正後はreview対象HEADからの差分、関連検証、CI、thread、mergeabilityを照合し、修正だけを理由に再reviewを依頼しません。再依頼は前回評価できなかった重大な論点がある場合に限り、同一PRで最大2回です。P0/P1またはsecurity・acceptance contradictionは予算外でもblockingとして扱い、上限後も残る場合はmergeを止めます。
-
-checkpointを逃した時だけ同じownerへ一度partial resultを求め、進展がなければscope shrink、縮小後も進展がなければreassignします。partial / unverifiedは未確認範囲と再開条件を保持します。primaryが分離可能な作業を直接行う場合は、specific reason、subagent不能のevidence、scope shrink history、reassignment history、primary-only question、target paths、output capを記録します。
-
-## task-stateとruntime境界
-
-cross-sessionのfield sourceは[task-state/v1 template](ai-governance/templates/task-state.json)だけです。resume時は現在のsnapshotとclosureを照合し、条件一致のcompleted evidenceをartifact referenceで再利用します。completeはacceptanceと必要gateを満たし、remaining work、invalidated gate、blockerがない場合だけです。blockedは権限・外部状態など真の停止理由がある場合だけで、利用者の不在や返答待ちだけではblockerにしません。
-
-- 現在の依頼が対象と影響を定めている作業は、必要な開発・実環境の停止、backup、再起動、copy試験、適用、rollbackを同じ権限範囲で続け、工程ごとの再確認を求めません。依頼にIssue / PRのmerge・closeまで含まれる場合も同様です。
-- 追加確認なしで進める依頼では、利用者が1か月以上不在でも、依頼・既存資料・実環境の照合から対象と工程を自律的に確定し、確認質問への回答を再開条件にしません。危険な項目を確定できない場合は安全な代替または保留を選び、その工程だけを止めて独立作業を続けます。不在は権限やsecret境界を広げません。
-- 失敗や不確実性が出たら対象と現状を照合し、原本・backupを保全して復旧可能性を確かめ、危険な工程だけを止めます。toolやplatformの拒否、実行環境停止、認証切れ、依存先の不通は迂回せず記録し、backoff中に安全な独立作業を続けます。同じAPI照会を反復したり、busy loopで待ったりしません。
-
-Minecraft runtimeを使うlaneはowner、PID、process group、port、readiness、cleanupを起動前に固定し、成功・停止・失敗・割込みの全経路でprocess groupとport解放を確認します。runtimeを使わない場合はその旨を記録します。validatorのstatic PASSはtool発見、Hook注入、runtime routing、権限、実環境成功を保証しません。
-
-## instruction budget
-
-root AGENTS.mdは180行・16KiB、nested AGENTS.mdは100行・8KiB、adapterは30行・4KiB、canonical Skillは180行・16KiB、rootと有効なnested ruleの合計は24KiBを上限とします。source-sizeはestimateで、実際のtoken telemetryではありません。形式、参照、frontmatter、Skill identity、task-state、budgetは[validate_governance.py](../scripts/validate_governance.py)で検査します。
-
-## PR monitor契約
-
-各runの冒頭に、state、headRefOid、updatedAt、reviewDecision、mergeStateStatusだけからなる軽量keyを取得します。MERGEDまたはCLOSEDならstateを最優先し、そのrunでscheduled taskを削除して監視を終了し、review・thread・CI・mergeabilityの詳細を取得しません。UNKNOWNや空のsecondary fieldはterminal stateを覆しません。
-
-OPENで外部待ちが必要な時、keyが変わらない間は詳細照会や定時通知をせず、eventまたはbackoffで待機します。利用者から返答がないことだけで依頼済み作業を止めません。
-
-logical checkpointまたはdeadlineで継続価値と実行可能性を再評価し、目的が完了したら待機を終了します。timeout回数を完了条件にしません。schedulerの継続はhost/runtimeが稼働している間に限られ、この文書だけでは保証できません。
-
-## 保守境界
-
-この契約は静的なrepository governanceです。Codex desktop scheduler、各toolの実際の発見、GitHub権限、Minecraft server、LLM provider、実データ、production logの状態は、対応する実行またはread-only観測なしに成功と断定しません。
+形式、参照、frontmatter、Skill identity、task-state、budgetは[validate_governance.py](../scripts/validate_governance.py)で検査します。static検査は製品runtimeや外部サービスの状態を判定しません。
