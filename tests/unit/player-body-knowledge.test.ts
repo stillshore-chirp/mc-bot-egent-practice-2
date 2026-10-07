@@ -1,7 +1,18 @@
 import type { Bot } from "mineflayer";
 import type { Recipe } from "prismarine-recipe";
+import minecraftData from "minecraft-data";
+import prismarineRecipe from "prismarine-recipe";
 import { describe, expect, it, vi } from "vitest";
-import { queryPlayerKnowledge } from "../../src/minecraft/player-body-knowledge.js";
+import {
+  queryPlayerKnowledge,
+  type RegistryKnowledgeFact,
+} from "../../src/minecraft/player-body-knowledge.js";
+
+type RecipeFact = Extract<RegistryKnowledgeFact, { kind: "recipe" }>;
+
+function isRecipeFact(fact: RegistryKnowledgeFact): fact is RecipeFact {
+  return fact.kind === "recipe";
+}
 
 const chest = {
   id: 1,
@@ -71,6 +82,26 @@ function inference(bot: Bot) {
   return queryPlayerKnowledge(bot, "chest").inferences[0];
 }
 
+function createRegistryBot(): Bot {
+  const registry = minecraftData("1.21.11");
+  const loadRecipes = prismarineRecipe as unknown as (
+    data: typeof registry,
+  ) => {
+    Recipe: {
+      find(itemId: number, metadata: number | null): Recipe[];
+    };
+  };
+  const { Recipe: RegistryRecipe } = loadRecipes(registry);
+
+  return {
+    version: registry.version.minecraftVersion ?? "1.21.11",
+    registry,
+    recipesAll: (itemId: number) => RegistryRecipe.find(itemId, null),
+    recipesFor: () => [],
+    findBlock: () => null,
+  } as unknown as Bot;
+}
+
 describe("player body knowledge craftability", () => {
   it("separates table-assumed materials from the unavailable current surface", () => {
     const bot = createBot({
@@ -130,5 +161,53 @@ describe("player body knowledge craftability", () => {
       tableRequirement: "unknown",
       materialAvailabilityWithTable: "unknown",
     });
+  });
+
+  it("normalizes actual shaped and shapeless registry recipe inputs", () => {
+    const bot = createRegistryBot();
+    const recipeFacts = (query: string, resultName: string) =>
+      queryPlayerKnowledge(bot, query)
+        .facts.filter(isRecipeFact)
+        .filter((fact) => fact.result.name === resultName);
+
+    const bedRecipe = recipeFacts("white_bed", "white_bed").find((fact) =>
+      fact.ingredients.some((ingredient) => ingredient.name === "white_wool"),
+    );
+    expect(
+      bedRecipe?.ingredients.find(
+        (ingredient) => ingredient.name === "white_wool",
+      )?.count,
+    ).toBe(3);
+    expect(
+      bedRecipe?.ingredients.some(
+        (ingredient) =>
+          ingredient.name.endsWith("_planks") && ingredient.count === 3,
+      ),
+    ).toBe(true);
+
+    const tableRecipe = recipeFacts("crafting_table", "crafting_table").find(
+      (fact) => fact.ingredients.some((ingredient) => ingredient.count === 4),
+    );
+    expect(
+      tableRecipe?.ingredients.find((ingredient) =>
+        ingredient.name.endsWith("_planks"),
+      )?.count,
+    ).toBe(4);
+
+    const planksRecipe = recipeFacts("oak_planks", "oak_planks")[0];
+    expect(planksRecipe?.result.count).toBe(4);
+    expect(planksRecipe?.ingredients).toContainEqual({
+      id: minecraftData("1.21.11").itemsByName.oak_log.id,
+      name: "oak_log",
+      count: 1,
+    });
+
+    const cakeRecipe = recipeFacts("cake", "cake")[0];
+    expect(cakeRecipe?.ingredients).toContainEqual(
+      expect.objectContaining({ name: "wheat", count: 3 }),
+    );
+    expect(cakeRecipe?.ingredients).not.toContainEqual(
+      expect.objectContaining({ name: "cake" }),
+    );
   });
 });

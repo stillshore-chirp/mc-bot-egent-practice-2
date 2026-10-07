@@ -122,6 +122,38 @@ function matches(
   return terms.every((term) => haystack.includes(term));
 }
 
+function recipeIngredientFacts(
+  bot: Bot,
+  recipe: Recipe,
+): Extract<RegistryKnowledgeFact, { kind: "recipe" }>["ingredients"] {
+  const counts = new Map<number, number>();
+  const add = (id: number, count: number) => {
+    if (id < 0 || !Number.isFinite(count) || count <= 0) return;
+    counts.set(id, (counts.get(id) ?? 0) + count);
+  };
+  const runtimeRecipe = recipe as Omit<Recipe, "ingredients" | "inShape"> & {
+    ingredients: Recipe["ingredients"] | null;
+    inShape: Recipe["inShape"] | null;
+  };
+
+  // prismarine-recipe stores either a shaped grid or shapeless ingredients;
+  // its declarations omit that either field can be null at runtime.
+  for (const ingredient of runtimeRecipe.ingredients ?? []) {
+    add(ingredient.id, Math.abs(ingredient.count));
+  }
+  for (const row of runtimeRecipe.inShape ?? []) {
+    for (const ingredient of row) {
+      add(ingredient.id, 1);
+    }
+  }
+
+  return [...counts].map(([id, count]) => ({
+    id,
+    name: bot.registry.items[id]?.name ?? `item_${id}`,
+    count,
+  }));
+}
+
 function recipeFacts(
   bot: Bot,
   itemName: string,
@@ -135,11 +167,7 @@ function recipeFacts(
       count: recipe.result.count,
     },
     requiresTable: recipe.requiresTable,
-    ingredients: recipe.ingredients.map((ingredient) => ({
-      id: ingredient.id,
-      name: bot.registry.items[ingredient.id]?.name ?? `item_${ingredient.id}`,
-      count: ingredient.count,
-    })),
+    ingredients: recipeIngredientFacts(bot, recipe),
   }));
 }
 
