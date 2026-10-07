@@ -12,6 +12,7 @@ import { playerOperationNames } from "../../src/minecraft/player-body-schema.js"
 import type {
   PlayerBody,
   PlayerBodyObservation,
+  PlayerKnowledge,
 } from "../../src/minecraft/player-body.js";
 import type {
   OwnerProposal,
@@ -42,6 +43,200 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("uses registry prerequisites and Body results to continue the same owner goal", async () => {
+    let observation = observationWithInventory([
+      itemStack(0, 17, "oak_log", 1),
+      itemStack(1, 35, "white_wool", 3),
+    ]);
+    const knowledgeQueries: string[] = [];
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      undefined,
+      async () => observation,
+      (query) => {
+        knowledgeQueries.push(query);
+        if (query === "white_bed")
+          return knowledgeFixture(
+            query,
+            1,
+            true,
+            [
+              { name: "white_wool", count: 3 },
+              { name: "oak_planks", count: 3 },
+            ],
+            false,
+          );
+        if (query === "oak_planks")
+          return knowledgeFixture(
+            query,
+            4,
+            false,
+            [{ name: "oak_log", count: 1 }],
+            true,
+          );
+        if (query === "crafting_table")
+          return knowledgeFixture(
+            query,
+            1,
+            false,
+            [{ name: "oak_planks", count: 4 }],
+            true,
+          );
+        throw new Error("UNEXPECTED_KNOWLEDGE_QUERY");
+      },
+    );
+    const savedGoal = fixture.mind.commitGoalState({
+      expectedRevision: fixture.mind.snapshot().revision,
+      goal: {
+        id: "owner-bed-goal",
+        title: "Make a white bed",
+        status: "active",
+        priority: 3,
+        changeReason: "The owner asked for a bed.",
+        source: "owner",
+      },
+    });
+    expect(savedGoal.accepted).toBe(true);
+    try {
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: "failed-direct-bed-craft",
+          kind: "craft",
+          status: "failed",
+          summary:
+            "failure=no_recipe_for_current_inventory_and_surface; bed materials or surface were missing",
+          observedAt: "2026-10-08T00:00:00.000Z",
+        },
+      });
+      fixture.responses.push(
+        functionCallResponse("bed-recipe", "ask_body_knowledge", {
+          query: "white_bed",
+        }),
+        functionCallResponse("plank-recipe", "ask_body_knowledge", {
+          query: "oak_planks",
+        }),
+        functionCallResponse(
+          "prepare-planks",
+          "commit_action_decision",
+          craftActionArguments("owner-bed-goal", "oak_planks"),
+        ),
+      );
+      const prepared = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(prepared).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "craft", item: "oak_planks", count: 1 },
+        },
+      });
+      expect(knowledgeQueries).toEqual(["white_bed", "oak_planks"]);
+      const initialRequest = record(fixture.requests[0]);
+      expect(JSON.stringify(initialRequest.input)).toContain(
+        "failure=no_recipe_for_current_inventory_and_surface",
+      );
+      const instructions = String(initialRequest.instructions);
+      expect(instructions).toContain("ownerから新しい依頼がない時も");
+      expect(instructions).toContain("同じownerの意図への催促・言い換え");
+      expect(JSON.stringify(initialRequest.tools)).toContain(
+        "currentlyCraftableは作業台がある前提",
+      );
+      const firstKnowledge = functionCallOutputs(fixture.requests.slice(0, 3));
+      expect(firstKnowledge).toContain('"assessedCount":1');
+      expect(firstKnowledge).toContain('"craftingTableNearby":false');
+      expect(firstKnowledge).toContain(
+        '"materialAvailabilityWithTable":"insufficient"',
+      );
+      expect(firstKnowledge).toContain('"count":4');
+      const firstDecision = prepared.decision;
+      if (firstDecision?.kind !== "act")
+        throw new Error("TEST_PREPARATION_ACTION_MISSING");
+
+      observation = observationWithInventory([
+        itemStack(0, 5, "oak_planks", 4),
+        itemStack(1, 35, "white_wool", 3),
+      ]);
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: firstDecision.operationId,
+          kind: "craft",
+          status: "successful",
+          summary:
+            "craft successful; the fresh inventory contains four oak planks",
+          observedAt: "2026-10-08T00:00:05.000Z",
+          expectedOutcome: firstDecision.expectedOutcome,
+        },
+      });
+      fixture.responses.push(
+        functionCallResponse("table-recipe", "ask_body_knowledge", {
+          query: "crafting_table",
+        }),
+        functionCallResponse(
+          "continue-bed-goal",
+          "commit_action_decision",
+          craftActionArguments("owner-bed-goal", "crafting_table"),
+        ),
+      );
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(continued).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "craft", item: "crafting_table", count: 1 },
+        },
+      });
+      expect(knowledgeQueries).toEqual([
+        "white_bed",
+        "oak_planks",
+        "crafting_table",
+      ]);
+      const continuedKnowledge = functionCallOutputs(fixture.requests.slice(3));
+      expect(continuedKnowledge).toContain('"craftingTableNearby":false');
+      expect(continuedKnowledge).toContain(
+        '"materialAvailabilityWithTable":"sufficient"',
+      );
+      const continuationRequest = record(fixture.requests[3]);
+      expect(JSON.stringify(continuationRequest.input)).toContain(
+        "craft successful; the fresh inventory contains four oak planks",
+      );
+      if (!Array.isArray(continuationRequest.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const continuationPayload = JSON.parse(
+        String(record(continuationRequest.input[0]).content),
+      ) as {
+        observation: {
+          self: {
+            inventory: readonly { name: string; count: number }[];
+          };
+        };
+      };
+      expect(continuationPayload.observation.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "oak_planks", count: 4 }),
+      );
+      expect(
+        fixture.mind
+          .snapshot()
+          .goals.filter(({ source }) => source === "owner"),
+      ).toEqual([
+        expect.objectContaining({
+          id: "owner-bed-goal",
+          title: "Make a white bed",
+          status: "active",
+        }),
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it.each(["body_outcome", "owner_proposal"] as const)(
     "keeps completed response usage and skips stale purpose tools and rounds when %s arrives",
     async (staleKind) => {
@@ -2088,6 +2283,7 @@ function openPurposeFixture(
   ownerPositionExceptions: boolean[] = [],
   onRoundActivity?: (activity: PlayerAgentRoundActivity) => void,
   observeBody?: PlayerBody["observe"],
+  knowledgeBody?: PlayerBody["knowledge"],
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -2121,6 +2317,11 @@ function openPurposeFixture(
         };
       }
       return observation;
+    },
+    knowledge: (query: string) => {
+      if (knowledgeBody === undefined)
+        throw new Error("TEST_BODY_KNOWLEDGE_NOT_CONFIGURED");
+      return knowledgeBody(query);
     },
   } as unknown as PlayerBody;
   const agent = new PlayerPurposeAgent({
@@ -2202,6 +2403,85 @@ function bodyObservationFixture(): PlayerBodyObservation {
       entities: [],
     },
     window: null,
+  };
+}
+
+function observationWithInventory(
+  inventory: PlayerBodyObservation["self"]["inventory"],
+  observedAt = "2026-10-08T00:00:01.000Z",
+): PlayerBodyObservation {
+  const observation = bodyObservationFixture();
+  return {
+    ...observation,
+    observedAt,
+    self: { ...observation.self, inventory },
+  };
+}
+
+function itemStack(
+  slot: number,
+  itemId: number,
+  name: string,
+  count: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId,
+    name,
+    count,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
+    customName: null,
+    enchantments: [],
+  };
+}
+
+function knowledgeFixture(
+  query: string,
+  outputCount: number,
+  requiresTable: boolean,
+  ingredients: readonly { readonly name: string; readonly count: number }[],
+  craftable: boolean,
+): PlayerKnowledge {
+  return {
+    source: "minecraft_registry",
+    gameVersion: "test",
+    registryVersion: "test",
+    observedAt: "2026-10-08T00:00:02.000Z",
+    query,
+    facts: [
+      {
+        kind: "recipe",
+        result: { id: 1, name: query, count: outputCount },
+        requiresTable,
+        ingredients: ingredients.map((ingredient, id) => ({
+          id,
+          ...ingredient,
+        })),
+      },
+    ],
+    inferences: [
+      {
+        kind: "craftability",
+        itemName: query,
+        currentlyCraftable: craftable,
+        assessedCount: 1,
+        recipeStatus: "known",
+        tableRequirement: requiresTable ? "required" : "not_required",
+        craftingTableNearby: false,
+        craftableWithCurrentSurface: craftable,
+        materialAvailabilityWithTable: craftable
+          ? "sufficient"
+          : "insufficient",
+        basis: [
+          craftable
+            ? "Materials support one recipe."
+            : "Materials are insufficient.",
+        ],
+      },
+    ],
+    truncated: false,
   };
 }
 
@@ -2345,6 +2625,26 @@ function actionArguments(
   return args;
 }
 
+function craftActionArguments(
+  goalId: string,
+  item: string,
+): Record<string, unknown> {
+  const args = actionArguments(
+    goalArguments({
+      id: goalId,
+      title: "Make a white bed",
+      status: "active",
+      source: "owner",
+      reason: "Continue the same owner goal through a prerequisite.",
+    }),
+  );
+  args.operationJson = JSON.stringify({ kind: "craft", item, count: 1 });
+  args.purpose = `Prepare ${item} as the next step toward the existing bed goal.`;
+  args.expectedOutcome = `Observe the result of crafting ${item}.`;
+  args.reason = "The current recipe facts and inventory support this step.";
+  return args;
+}
+
 function resolveProposal(
   mind: PlayerMindStore,
   snapshot: PlayerRuntimeSnapshot,
@@ -2367,4 +2667,18 @@ function record(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     throw new Error("TEST_EXPECTED_OBJECT");
   return value as Record<string, unknown>;
+}
+
+function functionCallOutputs(requests: readonly unknown[]): string {
+  return requests
+    .flatMap((request) => {
+      const input = record(request).input;
+      return Array.isArray(input)
+        ? input
+            .filter((item) => record(item).type === "function_call_output")
+            .map((item) => record(item).output)
+        : [];
+    })
+    .filter((output): output is string => typeof output === "string")
+    .join("\n");
 }
