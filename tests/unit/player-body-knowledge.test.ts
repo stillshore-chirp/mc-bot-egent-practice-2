@@ -12,11 +12,14 @@ const chest = {
   enchantCategories: [],
 };
 
-const craftingTableRecipe = {
-  result: { id: chest.id, count: 1 },
+const craftingTableRecipe: Recipe = {
+  result: { id: chest.id, metadata: null, count: 1 },
+  inShape: [],
+  outShape: [],
   requiresTable: true,
-  ingredients: [{ id: 2, count: 8 }],
-} as Recipe;
+  ingredients: [{ id: 2, metadata: null, count: 8 }],
+  delta: [],
+};
 
 const craftingTable = { name: "crafting_table" };
 

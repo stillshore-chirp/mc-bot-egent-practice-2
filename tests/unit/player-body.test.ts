@@ -5101,11 +5101,14 @@ describe("player body", () => {
     Object.assign(fake.bot.registry.itemsByName, {
       chest: { id: 1, name: "chest" },
     });
-    const recipe = {
-      result: { id: 1, count: 1 },
+    const recipe: Recipe = {
+      result: { id: 1, metadata: null, count: 1 },
+      inShape: [],
+      outShape: [],
       requiresTable: false,
       ingredients: [],
-    } as Recipe;
+      delta: [],
+    };
     Object.assign(fake.bot, {
       recipesFor: vi.fn(() => [recipe]),
       craft: vi.fn(async () => {
