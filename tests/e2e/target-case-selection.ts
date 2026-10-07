@@ -3,6 +3,8 @@ export const TARGETABLE_CASES = [
   "game_action_discretion",
   "food_intent_continuity",
   "companion_intent_collection",
+  "companion_proactive_food",
+  "companion_proactive_bed",
   "gather_multi_target_continuity",
   "death_recovery",
   "underwater_item_recovery",
@@ -30,11 +32,17 @@ const TARGET_CASE_PREREQUISITES: Partial<
   unknown_composite: ["autonomous_life"],
 };
 
+const OPT_IN_ONLY_CASES = new Set<string>([
+  "companion_proactive_food",
+  "companion_proactive_bed",
+]);
+
 export function isCaseSelectedForTarget(
   targetCase: TargetableCase | undefined,
   caseId: string,
 ): boolean {
-  if (targetCase === undefined || caseId === targetCase) return true;
+  if (targetCase === undefined) return !OPT_IN_ONLY_CASES.has(caseId);
+  if (caseId === targetCase) return true;
   return TARGET_CASE_PREREQUISITES[targetCase]?.includes(caseId) === true;
 }
 
