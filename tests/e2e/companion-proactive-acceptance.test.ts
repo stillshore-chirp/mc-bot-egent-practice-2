@@ -10,6 +10,8 @@ import {
   COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
+  evaluateThreatPositioningCandidates,
+  isFreshPurposeDecisionForAction,
   parsePlayerGameModeReadback,
   proactiveBedCompletionConfirmed,
   proactiveFoodUseConfirmed,
@@ -171,6 +173,95 @@ describe("companion proactive acceptance", () => {
         action: { ...successfulMove, healthBefore: 18 },
       }),
     ).toBe(false);
+  });
+
+  it("selects a later fresh-Purpose action after an earlier stale action", () => {
+    const fixtureAt = Date.parse("2026-10-08T12:00:01.000Z");
+    const earlierStaleAction = {
+      ...successfulMove,
+      startedAt: "2026-10-08T12:00:02.000Z",
+      completedAt: "2026-10-08T12:00:03.000Z",
+    } as const;
+    const laterFreshAction = {
+      ...successfulMove,
+      kind: "move_relative",
+      startedAt: "2026-10-08T12:00:04.000Z",
+      completedAt: "2026-10-08T12:00:05.000Z",
+    } as const;
+    const oldJudgment = {
+      revision: 1,
+      decidedAt: "2026-10-08T11:59:00.000Z",
+      kind: "act",
+      operationKind: "move_to",
+    } as const;
+    const before = { recentJudgments: [oldJudgment] };
+    const after = {
+      recentJudgments: [
+        oldJudgment,
+        {
+          revision: 2,
+          decidedAt: "2026-10-08T12:00:03.500Z",
+          kind: "act",
+          operationKind: "move_relative",
+        },
+      ],
+    };
+    const validResponse = {
+      ownerPromptCount: 0,
+      freshPurposeDecision: true,
+      naturalRegenerationDisabled: true,
+      freshHostileObservationBefore: true,
+      bodyHostileCountBefore: 1,
+      serverHostileCountBefore: 1,
+      serverDistanceBefore: 14,
+      bodyDistanceBefore: 13.8,
+      bodyServerDistanceAlignedBefore: true,
+      bodyHostileCountAfter: 1,
+      serverHostileCountAfter: 1,
+      serverPositionChanged: true,
+      bodyServerPositionAlignedAfter: true,
+      bodyDistanceAfter: 15.2,
+      serverDistanceAfter: 15,
+      bodyServerDistanceAlignedAfter: true,
+      healthBefore: 20,
+      rconHealthAfter: 20,
+      bodyHealthBefore: 20,
+      bodyHealthAfter: 20,
+      bodyServerHealthAlignedBefore: true,
+      bodyServerHealthAlignedAfter: true,
+    };
+    const evaluated: string[] = [];
+    const selection = evaluateThreatPositioningCandidates(
+      [earlierStaleAction, laterFreshAction],
+      (action) => {
+        const purposeDecisionLinkedToAction = isFreshPurposeDecisionForAction(
+          before,
+          after,
+          action,
+          fixtureAt,
+        );
+        evaluated.push(`${action.kind}:${purposeDecisionLinkedToAction}`);
+        return {
+          accepted: proactiveThreatResponseConfirmed({
+            ...validResponse,
+            action,
+            purposeDecisionLinkedToAction,
+            actionStartedBeforeDamage:
+              Date.parse(action.startedAt) <
+              Date.parse("2026-10-08T12:00:10.000Z"),
+            bodyObservationAfterAction:
+              Date.parse("2026-10-08T12:00:06.000Z") >=
+              Date.parse(action.completedAt),
+          }),
+          purposeDecisionLinkedToAction,
+        };
+      },
+    );
+
+    expect(evaluated).toEqual(["move_to:false", "move_relative:true"]);
+    expect(selection?.candidate).toBe(laterFreshAction);
+    expect(selection?.accepted).toBe(true);
+    expect(selection?.purposeDecisionLinkedToAction).toBe(true);
   });
 
   it("accepts purposeful approach or exact-item collection with inventory delta and hunger recovery", () => {

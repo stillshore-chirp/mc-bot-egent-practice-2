@@ -81,6 +81,20 @@ export interface CompanionProactiveAction {
   readonly observedEffectEntityId?: number;
 }
 
+export function evaluateThreatPositioningCandidates<
+  T,
+  E extends { readonly accepted: boolean },
+>(
+  candidates: readonly T[],
+  evaluate: (candidate: T) => E,
+): (E & { readonly candidate: T }) | undefined {
+  const evaluations = candidates.map((candidate) => ({
+    candidate,
+    ...evaluate(candidate),
+  }));
+  return evaluations.find(({ accepted }) => accepted) ?? evaluations.at(-1);
+}
+
 export interface CompanionProactivePort {
   readonly targetCase: CompanionProactiveTargetCase;
   readonly botName: string;
@@ -437,63 +451,78 @@ async function runThreatPhase(
           Date.parse(startedAt) >= Date.parse(hostileObservation.observedAt) &&
           isThreatPositioningAction(kind),
       );
-      const action =
-        positioningActions.find(
-          ({ status, sameLife, recoveryRequired }) =>
-            status === "successful" && sameLife && !recoveryRequired,
-        ) ?? positioningActions.at(-1);
-      const actionStartedAt = Date.parse(action?.startedAt ?? "");
-      const actionCompletedAt = Date.parse(action?.completedAt ?? "");
       const latestBodyAction = capture.actions
         .filter(({ startedAt }) => Date.parse(startedAt) >= fixtureAt)
         .at(-1);
-      const purposeDecisionLinkedToAction =
-        action !== undefined &&
-        isFreshPurposeDecisionForAction(
-          playerBefore,
-          player,
-          action,
-          fixtureAt,
-        );
-      const actionStartedBeforeDamage =
-        action !== undefined &&
-        (firstDamageAt === undefined || actionStartedAt < firstDamageAt);
-      const bodyActionStartHealthMatchesBaseline =
-        action?.healthBefore === healthBefore;
-      const bodyObservationAfterAction =
-        action !== undefined &&
-        Number.isFinite(actionCompletedAt) &&
-        Date.parse(bodyAfter.observedAt) >= actionCompletedAt;
       const freshDecision = freshPurposeDecision(playerBefore, player);
       const ownerPromptCount = 0;
-      const accepted = proactiveThreatResponseConfirmed({
-        ownerPromptCount,
-        freshPurposeDecision: freshDecision,
-        purposeDecisionLinkedToAction,
-        naturalRegenerationDisabled: true,
-        freshHostileObservationBefore: preObservationConfirmed,
-        bodyHostileCountBefore,
-        serverHostileCountBefore: serverCountBefore,
-        serverDistanceBefore: serverDistanceAtSpawn,
-        bodyDistanceBefore,
-        bodyServerDistanceAlignedBefore,
-        action,
-        actionStartedBeforeDamage,
-        bodyObservationAfterAction,
-        bodyHostileCountAfter,
-        serverHostileCountAfter: fixtureCountAfter,
-        serverPositionChanged: bodyPositionChanged,
-        bodyServerPositionAlignedAfter,
-        bodyDistanceAfter: bodyDistanceAfter ?? -1,
-        serverDistanceAfter,
-        bodyServerDistanceAlignedAfter,
-        healthBefore,
-        rconHealthAfter,
-        bodyHealthBefore,
-        bodyHealthAfter,
-        bodyServerHealthAlignedBefore: bodyHealthBefore === healthBefore,
-        bodyServerHealthAlignedAfter: bodyHealthAfter === rconHealthAfter,
-      });
+      const evaluation = evaluateThreatPositioningCandidates(
+        positioningActions,
+        (action) => {
+          const actionStartedAt = Date.parse(action.startedAt);
+          const actionCompletedAt = Date.parse(action.completedAt);
+          const purposeDecisionLinkedToAction = isFreshPurposeDecisionForAction(
+            playerBefore,
+            player,
+            action,
+            fixtureAt,
+          );
+          const actionStartedBeforeDamage =
+            firstDamageAt === undefined || actionStartedAt < firstDamageAt;
+          const bodyActionStartHealthMatchesBaseline =
+            action.healthBefore === healthBefore;
+          const bodyObservationAfterAction =
+            Number.isFinite(actionCompletedAt) &&
+            Date.parse(bodyAfter.observedAt) >= actionCompletedAt;
+          const accepted = proactiveThreatResponseConfirmed({
+            ownerPromptCount,
+            freshPurposeDecision: freshDecision,
+            purposeDecisionLinkedToAction,
+            naturalRegenerationDisabled: true,
+            freshHostileObservationBefore: preObservationConfirmed,
+            bodyHostileCountBefore,
+            serverHostileCountBefore: serverCountBefore,
+            serverDistanceBefore: serverDistanceAtSpawn,
+            bodyDistanceBefore,
+            bodyServerDistanceAlignedBefore,
+            action,
+            actionStartedBeforeDamage,
+            bodyObservationAfterAction,
+            bodyHostileCountAfter,
+            serverHostileCountAfter: fixtureCountAfter,
+            serverPositionChanged: bodyPositionChanged,
+            bodyServerPositionAlignedAfter,
+            bodyDistanceAfter: bodyDistanceAfter ?? -1,
+            serverDistanceAfter,
+            bodyServerDistanceAlignedAfter,
+            healthBefore,
+            rconHealthAfter,
+            bodyHealthBefore,
+            bodyHealthAfter,
+            bodyServerHealthAlignedBefore: bodyHealthBefore === healthBefore,
+            bodyServerHealthAlignedAfter: bodyHealthAfter === rconHealthAfter,
+          });
+          return {
+            accepted,
+            actionStartedAt,
+            purposeDecisionLinkedToAction,
+            actionStartedBeforeDamage,
+            bodyActionStartHealthMatchesBaseline,
+            bodyObservationAfterAction,
+          };
+        },
+      );
+      const action = evaluation?.candidate;
+      const actionStartedAt = evaluation?.actionStartedAt ?? Number.NaN;
+      const purposeDecisionLinkedToAction =
+        evaluation?.purposeDecisionLinkedToAction ?? false;
+      const actionStartedBeforeDamage =
+        evaluation?.actionStartedBeforeDamage ?? false;
+      const bodyActionStartHealthMatchesBaseline =
+        evaluation?.bodyActionStartHealthMatchesBaseline ?? false;
+      const bodyObservationAfterAction =
+        evaluation?.bodyObservationAfterAction ?? false;
+      const accepted = evaluation?.accepted ?? false;
       latest = {
         proactivePhase: "threat",
         ownerPromptCount,
@@ -626,9 +655,9 @@ function freshPurposeDecision(
   );
 }
 
-function isFreshPurposeDecisionForAction(
-  before: PlayerEvidence,
-  after: PlayerEvidence,
+export function isFreshPurposeDecisionForAction(
+  before: Pick<PlayerEvidence, "recentJudgments">,
+  after: Pick<PlayerEvidence, "recentJudgments">,
   action: CompanionProactiveAction,
   fixtureAt: number,
 ): boolean {
