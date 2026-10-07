@@ -140,11 +140,20 @@ interface PendingThoughtWake {
   readonly deathAware: boolean;
 }
 
+interface EquipmentOutcomeNotificationState {
+  readonly failedSignatures: Set<string>;
+  lastSuccessfulSignature: string | undefined;
+}
+
 /** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
 export class PlayerRuntime {
   readonly #eventTimes = new Map<string, number>();
   readonly #semanticSignatures = new Map<string, string>();
   readonly #pendingSemanticChanges = new Set<string>();
+  readonly #equipmentOutcomeNotifications = new Map<
+    Extract<PlayerOperation, { kind: "equip" }>["destination"],
+    EquipmentOutcomeNotificationState
+  >();
   readonly #lifetime = new AbortController();
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
@@ -1395,7 +1404,12 @@ export class PlayerRuntime {
     if (this.#activeBody === run) this.#activeBody = undefined;
     if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)
       await this.#sayWhileActive(ownerConsumeOutcomeMessage(result, outcome));
-    if (reportEquip !== undefined && !saved.stopped && !this.#shuttingDown)
+    if (
+      reportEquip !== undefined &&
+      !saved.stopped &&
+      !this.#shuttingDown &&
+      this.#shouldReportEquipmentOutcome(reportEquip, result, outcome)
+    )
       await this.#sayWhileActive(
         equipmentOutcomeMessage(reportEquip, result, outcome),
       );
@@ -1415,6 +1429,74 @@ export class PlayerRuntime {
       );
       this.#requestThought(event.kind, event.summary);
     }
+  }
+
+  #shouldReportEquipmentOutcome(
+    operation: Extract<PlayerOperation, { kind: "equip" }>,
+    result: PlayerOperationResult | undefined,
+    outcome: McSkillOutcomeStatus,
+  ): boolean {
+    const resultMatches =
+      result?.operation.kind === "equip" &&
+      result.operation.item === operation.item &&
+      result.operation.destination === operation.destination;
+    const before = equipmentSlotObservation(
+      resultMatches ? result.before : null,
+      operation.destination,
+    );
+    const after = equipmentSlotObservation(
+      resultMatches ? result.after : null,
+      operation.destination,
+    );
+    const equipmentChanged =
+      before.state !== "unobserved" &&
+      after.state !== "unobserved" &&
+      JSON.stringify(before) !== JSON.stringify(after);
+    const successful =
+      outcome === "successful" &&
+      after.state === "item" &&
+      after.itemName === operation.item;
+    const signature = JSON.stringify({
+      item: operation.item,
+      destination: operation.destination,
+      outcome,
+      detail:
+        result?.detail === undefined ? null : sanitizeDetail(result.detail),
+      failureReason: result?.failureReason ?? null,
+      sameLife: result?.sameLife ?? null,
+      recoveryRequired: result?.recoveryRequired ?? false,
+      before,
+      after,
+    });
+    const state = this.#equipmentOutcomeNotifications.get(
+      operation.destination,
+    ) ?? {
+      failedSignatures: new Set<string>(),
+      lastSuccessfulSignature: undefined,
+    };
+
+    if (equipmentChanged) {
+      state.failedSignatures.clear();
+      state.lastSuccessfulSignature = undefined;
+    }
+    if (successful) {
+      if (state.lastSuccessfulSignature === signature) return false;
+      state.failedSignatures.clear();
+      state.lastSuccessfulSignature = signature;
+      this.#equipmentOutcomeNotifications.set(operation.destination, state);
+      return true;
+    }
+
+    state.lastSuccessfulSignature = undefined;
+    if (state.failedSignatures.has(signature)) return false;
+    state.failedSignatures.add(signature);
+    while (state.failedSignatures.size > 12) {
+      const oldest = state.failedSignatures.values().next().value;
+      if (oldest === undefined) break;
+      state.failedSignatures.delete(oldest);
+    }
+    this.#equipmentOutcomeNotifications.set(operation.destination, state);
+    return true;
   }
 
   async #stopBody(reason: string): Promise<void> {
@@ -2055,6 +2137,36 @@ function equipmentOutcomeMessage(
   if (outcome === "successful" && equipment?.name === operation.item)
     return `${statusMessage[outcome]}${observedMessage}`;
   return `${statusMessage[outcome]}${observedMessage}原因は観測から特定できていません。`;
+}
+
+function equipmentSlotObservation(
+  observation: PlayerBodyObservation | null | undefined,
+  destination: Extract<PlayerOperation, { kind: "equip" }>["destination"],
+):
+  | { readonly state: "unobserved" }
+  | { readonly state: "empty" }
+  | {
+      readonly state: "item";
+      readonly itemName: string;
+      readonly count: number;
+    } {
+  if (
+    observation === null ||
+    observation === undefined ||
+    !Object.prototype.hasOwnProperty.call(
+      observation.self.equipment,
+      destination,
+    )
+  )
+    return { state: "unobserved" };
+  const equipment = observation.self.equipment[destination];
+  if (equipment === null) return { state: "empty" };
+  if (equipment === undefined) return { state: "unobserved" };
+  return {
+    state: "item",
+    itemName: equipment.name,
+    count: equipment.count,
+  };
 }
 
 const equipmentDestinationLabel: Record<

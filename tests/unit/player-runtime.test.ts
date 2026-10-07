@@ -953,6 +953,134 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("suppresses repeated equip failure notices until the result changes", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Try the helmet",
+      reason: "The owner asked the bot to equip the helmet.",
+      priority: 4,
+    });
+    const before = observation();
+    const afterEquipped: PlayerBodyObservation = {
+      ...before,
+      self: {
+        ...before.self,
+        equipment: { head: observedStack("iron_helmet", 5) },
+      },
+    };
+    let startedCount = 0;
+    const submit = async (options: {
+      readonly id: string;
+      readonly status: PlayerOperationResult["status"];
+      readonly detail: string;
+      readonly before?: PlayerBodyObservation;
+      readonly after?: PlayerBodyObservation;
+      readonly resolution?: string;
+    }): Promise<Extract<PlayerThoughtDecision, { kind: "act" }>> => {
+      const operation = {
+        kind: "equip" as const,
+        item: "iron_helmet",
+        destination: "head" as const,
+      };
+      fixture.body.setResultObservations(
+        options.before ?? before,
+        options.after ?? before,
+      );
+      fixture.body.setResultDetail(options.detail);
+      const decision = action(options.id, operation);
+      const saved = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision,
+        ...(options.resolution === undefined
+          ? {}
+          : {
+              proposalResolution: {
+                proposalId: proposal.id,
+                disposition: "adopted" as const,
+                resolution: options.resolution,
+              },
+            }),
+      });
+      if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      startedCount += 1;
+      await waitFor(() => fixture.body.started.length === startedCount);
+      fixture.body.completeActive(options.status);
+      await waitFor(
+        () =>
+          fixture.mind.snapshot().lastOutcome?.operationId ===
+          decision.operationId,
+      );
+      return decision;
+    };
+
+    try {
+      const firstFailure = await submit({
+        id: "equip-repeat-1",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+        resolution: "I will try the helmet and check the result.",
+      });
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[0]).toBe(
+        "I will try the helmet and check the result.",
+      );
+      expect(fixture.messages[1]).toContain("装備操作は失敗しました。");
+
+      const repeatedFailure = await submit({
+        id: "equip-repeat-2",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+      });
+      expect(fixture.messages).toHaveLength(2);
+      expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+        operationId: repeatedFailure.operationId,
+        kind: "equip",
+        status: "failed",
+      });
+      expect(fixture.mind.snapshot().lastOutcome?.summary).toContain(
+        "detail=The requested item cannot be equipped",
+      );
+
+      await submit({
+        id: "equip-repeat-success",
+        status: "successful",
+        detail: "Observed post-action state confirms the requested effect.",
+        after: afterEquipped,
+      });
+      await waitFor(() => fixture.messages.length === 3);
+
+      await submit({
+        id: "equip-repeat-after-success",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+      });
+      await waitFor(() => fixture.messages.length === 4);
+
+      await submit({
+        id: "equip-distinct-failure",
+        status: "failed",
+        detail: "The equipment request was rejected by the client.",
+      });
+      await waitFor(() => fixture.messages.length === 5);
+
+      await submit({
+        id: "equip-distinct-failure-repeat",
+        status: "failed",
+        detail: "The equipment request was rejected by the client.",
+      });
+      expect(fixture.messages).toHaveLength(5);
+      expect(
+        fixture.mind
+          .pendingEvents(32)
+          .some(({ kind }) => kind === "body_outcome"),
+      ).toBe(true);
+      expect(firstFailure.operationId).not.toBe(repeatedFailure.operationId);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("preserves a non-meal owner resolution when consuming food as preparation", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
