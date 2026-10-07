@@ -1845,8 +1845,7 @@ function applyGoalAndProposalResolution(
   // An explicit update to a live owner goal is the caller's semantic link.
   // Keep its original proposal provenance and do not create a duplicate goal
   // for the newer proposal.
-  if (explicitlyUpdatedDifferentLinkedGoal)
-    return { accepted: true, goals };
+  if (explicitlyUpdatedDifferentLinkedGoal) return { accepted: true, goals };
 
   const proposalTitle = bounded(proposal.title, 240, "goal title");
   const linkedGoal = goals.find((goal) => goal.ownerProposalId === proposal.id);
