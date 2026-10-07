@@ -97,6 +97,9 @@ import {
   COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
   COMPANION_PROACTIVE_RUN_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
   CompanionProactiveAcceptanceError,
   companionProactivePhaseForTarget,
   isCompanionProactiveTarget,
@@ -338,6 +341,7 @@ const CASE_BUDGETS = {
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_BUDGET,
   companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
   companion_proactive_bed: COMPANION_PROACTIVE_CASE_BUDGET,
+  companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
@@ -367,6 +371,7 @@ const CASE_DEADLINES = {
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
   companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   companion_proactive_bed: COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
@@ -5320,6 +5325,14 @@ async function main(): Promise<void> {
                     `data get entity ${context.botName} Pos`,
                   ),
                 ),
+              countTaggedHostile: (center) =>
+                countCompanionHostileFixture(context.rcon, center, 32),
+              nearestTaggedHostileDistance: (playerPosition) =>
+                nearestCompanionHostileFixtureDistance(
+                  context.rcon,
+                  playerPosition,
+                  32,
+                ),
               readTaggedDropPosition: async (tag, item, center) =>
                 parsePosition(
                   await context.rcon.command(
@@ -9967,11 +9980,13 @@ async function prepareRun(): Promise<RunState> {
   const targetSpecificRunBudget =
     targetCase === "companion_proactive_food"
       ? COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET
-      : isCompanionProactiveTarget(targetCase)
-        ? COMPANION_PROACTIVE_RUN_BUDGET
-        : isCompanionHostilePurposeOnly()
-          ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
-          : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
+      : targetCase === "companion_proactive_threat"
+        ? COMPANION_PROACTIVE_THREAT_RUN_BUDGET
+        : isCompanionProactiveTarget(targetCase)
+          ? COMPANION_PROACTIVE_RUN_BUDGET
+          : isCompanionHostilePurposeOnly()
+            ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
+            : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
   const runBudget =
     targetCase === "companion_intent_collection" ||
     isCompanionProactiveTarget(targetCase)
@@ -10643,6 +10658,7 @@ async function readWorldDayTime(rcon: LocalRcon): Promise<number> {
 async function countCompanionHostileFixture(
   rcon: LocalRcon,
   origin: Position,
+  maxDistance = 16,
 ): Promise<number> {
   const reset = await rcon.command(
     `scoreboard players set ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 0`,
@@ -10650,7 +10666,7 @@ async function countCompanionHostileFixture(
   if (classifyRconReply(reset) !== "success")
     incomplete("COMPANION_HOSTILE_SERVER_ORACLE_UNAVAILABLE");
   const countReply = await rcon.command(
-    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
+    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..${maxDistance}] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
   );
   if (
     !isNoEntitySelectionReply(countReply) &&
@@ -12756,6 +12772,7 @@ interface CapturedCompanionHostilePurposeAction {
   readonly completedAt: string;
   readonly sameLife: boolean;
   readonly recoveryRequired: boolean;
+  readonly healthBefore?: number | null;
   readonly operationEntityId?: number;
   readonly observedEffectType?: string;
   readonly observedEffectEntityId?: number;
@@ -12782,6 +12799,9 @@ function installCompanionHostilePurposeActionCapture(
       completedAt: result.completedAt,
       sameLife: result.sameLife === true,
       recoveryRequired: result.recoveryRequired,
+      ...(result.before === null
+        ? {}
+        : { healthBefore: result.before.self.health }),
       ...(result.operation.kind === "collect_item"
         ? { operationEntityId: result.operation.entityId }
         : {}),
@@ -12809,17 +12829,22 @@ function installCompanionHostilePurposeActionCapture(
 async function nearestCompanionHostileFixtureDistance(
   rcon: LocalRcon,
   playerPosition: Position,
+  maxDistance = 16,
 ): Promise<number> {
   const positionReply = await rcon.command(
-    `execute positioned ${playerPosition.x} ${playerPosition.y} ${playerPosition.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16,sort=nearest,limit=1] run data get entity @s Pos`,
+    `execute positioned ${playerPosition.x} ${playerPosition.y} ${playerPosition.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..${maxDistance},sort=nearest,limit=1] run data get entity @s Pos`,
   );
+  if (isNoEntitySelectionReply(positionReply)) {
+    if (maxDistance > 16) return -1;
+    incomplete("COMPANION_HOSTILE_PURPOSE_SERVER_DISTANCE_UNAVAILABLE");
+  }
   const nearestPosition = parsePosition(positionReply);
   const distance = Math.hypot(
     nearestPosition.x - playerPosition.x,
     nearestPosition.y - playerPosition.y,
     nearestPosition.z - playerPosition.z,
   );
-  if (!Number.isFinite(distance) || distance < 0 || distance > 16) {
+  if (!Number.isFinite(distance) || distance < 0 || distance > maxDistance) {
     incomplete("COMPANION_HOSTILE_PURPOSE_SERVER_DISTANCE_UNAVAILABLE");
   }
   return distance;

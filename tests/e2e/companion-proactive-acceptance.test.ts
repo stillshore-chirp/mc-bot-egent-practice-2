@@ -7,8 +7,12 @@ import {
   COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
   COMPANION_PROACTIVE_RUN_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
   proactiveBedCompletionConfirmed,
   proactiveFoodUseConfirmed,
+  proactiveThreatResponseConfirmed,
 } from "./companion-proactive-acceptance.js";
 import {
   isCaseSelectedForTarget,
@@ -41,20 +45,21 @@ const successfulMove = {
   completedAt: "2026-10-08T12:00:02.000Z",
   sameLife: true,
   recoveryRequired: false,
+  healthBefore: 20,
 } as const;
 
 describe("companion proactive acceptance", () => {
-  it("keeps food and bed as independent opt-in targets", () => {
+  it("keeps proactive targets as independent opt-in cases", () => {
     for (const target of [
       "companion_proactive_food",
       "companion_proactive_bed",
+      "companion_proactive_threat",
     ] as const) {
       expect(TARGETABLE_CASES).toContain(target);
       expect(isCaseSelectedForTarget(undefined, target)).toBe(false);
       expect(isCaseSelectedForTarget(target, target)).toBe(true);
       expect(isCaseSelectedForTarget(target, "autonomous_life")).toBe(false);
     }
-    expect(TARGETABLE_CASES).not.toContain("companion_proactive_threat");
   });
 
   it("caps the food probe separately while retaining the bed budget", () => {
@@ -74,6 +79,85 @@ describe("companion proactive acceptance", () => {
     });
     expect(COMPANION_PROACTIVE_CASE_DEADLINE_MS).toBe(20 * 60_000);
     expect(COMPANION_PROACTIVE_RUN_BUDGET.durationMs).toBe(25 * 60_000);
+    expect(COMPANION_PROACTIVE_THREAT_CASE_BUDGET).toEqual({
+      llmCalls: 32,
+      totalTokens: 280_000,
+    });
+    expect(COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS).toBe(8 * 60_000);
+    expect(COMPANION_PROACTIVE_THREAT_RUN_BUDGET.durationMs).toBe(10 * 60_000);
+  });
+
+  it("requires Purpose-linked same-life position adjustment before damage with readbacks", () => {
+    const valid = {
+      ownerPromptCount: 0,
+      freshPurposeDecision: true,
+      purposeDecisionLinkedToAction: true,
+      naturalRegenerationDisabled: true,
+      freshHostileObservationBefore: true,
+      bodyHostileCountBefore: 1,
+      serverHostileCountBefore: 1,
+      serverDistanceBefore: 14,
+      bodyDistanceBefore: 13.8,
+      bodyServerDistanceAlignedBefore: true,
+      action: successfulMove,
+      actionStartedBeforeDamage: true,
+      bodyObservationAfterAction: true,
+      bodyHostileCountAfter: 1,
+      serverHostileCountAfter: 1,
+      serverPositionChanged: true,
+      bodyServerPositionAlignedAfter: true,
+      bodyDistanceAfter: 15.2,
+      serverDistanceAfter: 15,
+      bodyServerDistanceAlignedAfter: true,
+      healthBefore: 20,
+      rconHealthAfter: 20,
+      bodyHealthBefore: 20,
+      bodyHealthAfter: 20,
+      bodyServerHealthAlignedBefore: true,
+      bodyServerHealthAlignedAfter: true,
+    };
+    expect(proactiveThreatResponseConfirmed(valid)).toBe(true);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        action: { ...successfulMove, kind: "control" },
+        bodyDistanceAfter: 13.9,
+        serverDistanceAfter: 14.1,
+      }),
+    ).toBe(true);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        actionStartedBeforeDamage: false,
+      }),
+    ).toBe(false);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        purposeDecisionLinkedToAction: false,
+      }),
+    ).toBe(false);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        serverPositionChanged: false,
+      }),
+    ).toBe(false);
+    expect(
+      proactiveThreatResponseConfirmed({ ...valid, ownerPromptCount: 1 }),
+    ).toBe(false);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        bodyServerHealthAlignedAfter: false,
+      }),
+    ).toBe(false);
+    expect(
+      proactiveThreatResponseConfirmed({
+        ...valid,
+        action: { ...successfulMove, healthBefore: 18 },
+      }),
+    ).toBe(false);
   });
 
   it("accepts purposeful approach or exact-item collection with inventory delta and hunger recovery", () => {

@@ -163,5 +163,13 @@ describe("targeted E2E case selection", () => {
       isCaseSelectedForTarget(undefined, "gather_multi_target_continuity"),
     ).toBe(true);
     expect(isCaseSelectedForTarget(undefined, "integrated_result")).toBe(true);
+    for (const optInTarget of [
+      "companion_proactive_food",
+      "companion_proactive_bed",
+      "companion_proactive_threat",
+    ] as const) {
+      expect(isCaseSelectedForTarget(undefined, optInTarget)).toBe(false);
+      expect(isCaseSelectedForTarget(optInTarget, optInTarget)).toBe(true);
+    }
   });
 });

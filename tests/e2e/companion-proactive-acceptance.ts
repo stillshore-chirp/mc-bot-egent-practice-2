@@ -5,6 +5,7 @@ import type { PlayerEvidence } from "./ai-player-live.js";
 export const COMPANION_PROACTIVE_TARGETS = [
   { targetCase: "companion_proactive_food", phase: "food" },
   { targetCase: "companion_proactive_bed", phase: "bed" },
+  { targetCase: "companion_proactive_threat", phase: "threat" },
 ] as const;
 
 export type CompanionProactiveTargetCase =
@@ -35,6 +36,12 @@ export const COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET = {
   durationMs: 10 * 60_000,
   ...COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
 } as const;
+export const COMPANION_PROACTIVE_THREAT_CASE_BUDGET =
+  COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET;
+export const COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS =
+  COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS;
+export const COMPANION_PROACTIVE_THREAT_RUN_BUDGET =
+  COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET;
 
 export function isCompanionProactiveTarget(
   targetCase: string | undefined,
@@ -61,6 +68,7 @@ export interface CompanionProactiveAction {
   readonly completedAt: string;
   readonly sameLife: boolean;
   readonly recoveryRequired: boolean;
+  readonly healthBefore?: number | null;
   readonly operationEntityId?: number;
   readonly observedEffectType?: string;
   readonly observedEffectEntityId?: number;
@@ -97,6 +105,12 @@ export interface CompanionProactivePort {
     item: string,
     center: CompanionProactivePosition,
   ) => Promise<CompanionProactivePosition>;
+  readonly countTaggedHostile: (
+    center: CompanionProactivePosition,
+  ) => Promise<number>;
+  readonly nearestTaggedHostileDistance: (
+    playerPosition: CompanionProactivePosition,
+  ) => Promise<number>;
   readonly isBlock: (
     position: CompanionProactivePosition,
     block: string,
@@ -193,12 +207,396 @@ export function proactiveBedCompletionConfirmed(input: {
   return Object.values(input).every(Boolean);
 }
 
+export function proactiveThreatResponseConfirmed(input: {
+  readonly ownerPromptCount: number;
+  readonly freshPurposeDecision: boolean;
+  readonly purposeDecisionLinkedToAction: boolean;
+  readonly naturalRegenerationDisabled: boolean;
+  readonly freshHostileObservationBefore: boolean;
+  readonly bodyHostileCountBefore: number;
+  readonly serverHostileCountBefore: number;
+  readonly serverDistanceBefore: number;
+  readonly bodyDistanceBefore: number;
+  readonly bodyServerDistanceAlignedBefore: boolean;
+  readonly action: CompanionProactiveAction | undefined;
+  readonly actionStartedBeforeDamage: boolean;
+  readonly bodyObservationAfterAction: boolean;
+  readonly bodyHostileCountAfter: number;
+  readonly serverHostileCountAfter: number;
+  readonly serverPositionChanged: boolean;
+  readonly bodyServerPositionAlignedAfter: boolean;
+  readonly bodyDistanceAfter: number;
+  readonly serverDistanceAfter: number;
+  readonly bodyServerDistanceAlignedAfter: boolean;
+  readonly healthBefore: number;
+  readonly rconHealthAfter: number;
+  readonly bodyHealthBefore: number | null;
+  readonly bodyHealthAfter: number | null;
+  readonly bodyServerHealthAlignedBefore: boolean;
+  readonly bodyServerHealthAlignedAfter: boolean;
+}): boolean {
+  const action = input.action;
+  return (
+    input.ownerPromptCount === 0 &&
+    input.freshPurposeDecision &&
+    input.purposeDecisionLinkedToAction &&
+    input.naturalRegenerationDisabled &&
+    input.freshHostileObservationBefore &&
+    input.serverHostileCountBefore === 1 &&
+    input.bodyHostileCountBefore === 1 &&
+    input.serverDistanceBefore >= 12 &&
+    input.serverDistanceBefore <= 16 &&
+    Number.isFinite(input.bodyDistanceBefore) &&
+    input.bodyServerDistanceAlignedBefore &&
+    action?.status === "successful" &&
+    action.sameLife &&
+    !action.recoveryRequired &&
+    action.healthBefore === input.healthBefore &&
+    isThreatPositioningAction(action.kind) &&
+    input.actionStartedBeforeDamage &&
+    input.bodyObservationAfterAction &&
+    input.serverHostileCountAfter === 1 &&
+    input.bodyHostileCountAfter === 1 &&
+    input.serverPositionChanged &&
+    input.bodyServerPositionAlignedAfter &&
+    Number.isFinite(input.bodyDistanceAfter) &&
+    Number.isFinite(input.serverDistanceAfter) &&
+    input.bodyServerDistanceAlignedAfter &&
+    input.healthBefore > 0 &&
+    input.rconHealthAfter > 0 &&
+    input.bodyHealthBefore === input.healthBefore &&
+    input.bodyHealthAfter === input.rconHealthAfter &&
+    input.bodyServerHealthAlignedBefore &&
+    input.bodyServerHealthAlignedAfter
+  );
+}
+
+function isThreatPositioningAction(kind: string): boolean {
+  return kind === "move_to" || kind === "move_relative" || kind === "control";
+}
+
 export async function runCompanionProactiveAcceptanceCase(
   port: CompanionProactivePort,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
-  return companionProactivePhaseForTarget(port.targetCase) === "food"
-    ? runFoodPhase(port)
-    : runBedPhase(port);
+  const phase = companionProactivePhaseForTarget(port.targetCase);
+  if (phase === "food") return runFoodPhase(port);
+  if (phase === "bed") return runBedPhase(port);
+  return runThreatPhase(port);
+}
+
+async function runThreatPhase(
+  port: CompanionProactivePort,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const capture = port.captureActions();
+  const tag = "ai_e2e_companion_hostile";
+  let fixtureTouched = false;
+  let cleanupConfirmed = false;
+  let fixtureOrigin: CompanionProactivePosition | undefined;
+  let result: Readonly<Record<string, boolean | number | string>> | undefined;
+  const responseBaseline = port.responses().length;
+  try {
+    await prepareArena(port, true);
+    const positionBefore = await port.readPosition();
+    fixtureOrigin = positionBefore;
+    const bodyBeforeSpawn = await port.body.observe();
+    const healthBefore = await port.readHealth();
+    const bodyHealthBefore = bodyBeforeSpawn.self.health;
+    if (
+      distance(positionBefore, bodyBeforeSpawn.self.position) > 0.75 ||
+      healthBefore <= 0 ||
+      bodyHealthBefore !== healthBefore
+    ) {
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_BASELINE_UNCONFIRMED",
+      );
+    }
+    if ((await port.countTaggedHostile(positionBefore)) !== 0)
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_FIXTURE_BASELINE_NOT_EMPTY",
+      );
+
+    const playerBefore = await port.readPlayer();
+    const fixtureAt = Date.now();
+    fixtureTouched = true;
+    await port.rcon.command(
+      `summon minecraft:zombie ${positionBefore.x + 14} ${positionBefore.y} ${positionBefore.z} {PersistenceRequired:1b,Tags:["${tag}"]}`,
+    );
+    const serverCountBefore = await port.countTaggedHostile(positionBefore);
+    if (serverCountBefore !== 1)
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_FIXTURE_COUNT_UNCONFIRMED",
+      );
+    const positionAfterSpawn = await port.readPosition();
+    const serverDistanceAtSpawn =
+      await port.nearestTaggedHostileDistance(positionAfterSpawn);
+
+    const hostileObservation = await waitForThreatObservation(
+      port,
+      fixtureAt,
+      5_000,
+    );
+    if (hostileObservation === undefined)
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_BODY_OBSERVATION_UNAVAILABLE",
+      );
+    const aggregate = hostileObservation.perception.nearbyHostiles?.aggregate;
+    const bodyHostileCountBefore = aggregate?.clientReceivedHostileCount ?? -1;
+    const bodyZombieCountBefore =
+      aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? -1;
+    const bodyDistanceBefore = nearestBodyHostileDistance(hostileObservation);
+    const serverPositionAtObservation = await port.readPosition();
+    const serverDistanceBefore = await port.nearestTaggedHostileDistance(
+      serverPositionAtObservation,
+    );
+    const serverHostileCountAtObservation = await port.countTaggedHostile(
+      serverPositionAtObservation,
+    );
+    const bodyServerPositionAlignedBefore =
+      distance(serverPositionAtObservation, hostileObservation.self.position) <=
+      0.75;
+    const bodyServerDistanceAlignedBefore =
+      bodyDistanceBefore !== null &&
+      Math.abs(bodyDistanceBefore - serverDistanceBefore) <= 2;
+    let firstDamageAt: number | undefined;
+    const healthAtHostileObservation = await port.readHealth();
+    if (healthAtHostileObservation < healthBefore) firstDamageAt = fixtureAt;
+    const preObservationConfirmed =
+      Date.parse(hostileObservation.observedAt) >= fixtureAt &&
+      bodyHostileCountBefore === 1 &&
+      bodyZombieCountBefore === 1 &&
+      serverHostileCountAtObservation === 1 &&
+      serverDistanceAtSpawn >= 12 &&
+      serverDistanceAtSpawn <= 16 &&
+      bodyDistanceBefore !== null &&
+      bodyServerPositionAlignedBefore;
+    port.updateDiagnostic({
+      proactivePhase: "threat",
+      ownerPromptCount: 0,
+      fixtureActionsExcludedFromAcceptance: true,
+      fixtureCountBefore: serverCountBefore,
+      healthAtHostileObservation,
+      bodyHostileCountBefore,
+      bodyZombieCountBefore,
+      hostileObservationFresh:
+        Date.parse(hostileObservation.observedAt) >= fixtureAt,
+      startDistance: serverDistanceAtSpawn,
+      distanceAtBodyObservation: serverDistanceBefore,
+      bodyStartDistance: bodyDistanceBefore ?? -1,
+      bodyServerDistanceAlignedBefore,
+      bodyServerPositionAlignedBefore,
+      healthBefore,
+      bodyHealthBefore,
+      bodyServerHealthAlignedBefore: bodyHealthBefore === healthBefore,
+      preObservationConfirmed,
+    });
+    if (!preObservationConfirmed)
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_FIXTURE_NOT_CONFIRMED",
+      );
+
+    let latest: Readonly<Record<string, boolean | number | string>> = {};
+    let bodyPositionChanged = false;
+    const after = await port.observeForPlayer(7 * 60_000, async (player) => {
+      const bodyAfter = await port.body.observe();
+      const rconHealthAfter = await port.readHealth();
+      const bodyHealthAfter = bodyAfter.self.health;
+      if (firstDamageAt === undefined && rconHealthAfter < healthBefore)
+        firstDamageAt = Date.now();
+      const positionAfter = await port.readPosition();
+      bodyPositionChanged =
+        distance(serverPositionAtObservation, positionAfter) > 0.05;
+      const fixtureCountAfter = await port.countTaggedHostile(positionBefore);
+      const serverDistanceAfter =
+        fixtureCountAfter === 1
+          ? await port.nearestTaggedHostileDistance(positionAfter)
+          : -1;
+      const bodyHostileCountAfter =
+        bodyAfter.perception.nearbyHostiles?.aggregate
+          ?.clientReceivedHostileCount ?? -1;
+      const bodyZombieCountAfter =
+        bodyAfter.perception.nearbyHostiles?.aggregate?.byKind.find(
+          ({ name }) => name === "zombie",
+        )?.count ?? -1;
+      const bodyDistanceAfter = nearestBodyHostileDistance(bodyAfter);
+      const bodyServerPositionAlignedAfter =
+        distance(positionAfter, bodyAfter.self.position) <= 0.75;
+      const bodyServerDistanceAlignedAfter =
+        bodyDistanceAfter !== null &&
+        serverDistanceAfter >= 0 &&
+        Math.abs(bodyDistanceAfter - serverDistanceAfter) <= 2;
+      const positioningActions = capture.actions.filter(
+        ({ kind, startedAt }) =>
+          Date.parse(startedAt) >= fixtureAt &&
+          Date.parse(startedAt) >= Date.parse(hostileObservation.observedAt) &&
+          isThreatPositioningAction(kind),
+      );
+      const action =
+        positioningActions.find(
+          ({ status, sameLife, recoveryRequired }) =>
+            status === "successful" && sameLife && !recoveryRequired,
+        ) ?? positioningActions.at(-1);
+      const actionStartedAt = Date.parse(action?.startedAt ?? "");
+      const actionCompletedAt = Date.parse(action?.completedAt ?? "");
+      const latestBodyAction = capture.actions
+        .filter(({ startedAt }) => Date.parse(startedAt) >= fixtureAt)
+        .at(-1);
+      const purposeDecisionLinkedToAction =
+        action !== undefined &&
+        isFreshPurposeDecisionForAction(
+          playerBefore,
+          player,
+          action,
+          fixtureAt,
+        );
+      const actionStartedBeforeDamage =
+        action !== undefined &&
+        (firstDamageAt === undefined || actionStartedAt < firstDamageAt);
+      const bodyActionStartHealthMatchesBaseline =
+        action?.healthBefore === healthBefore;
+      const bodyObservationAfterAction =
+        action !== undefined &&
+        Number.isFinite(actionCompletedAt) &&
+        Date.parse(bodyAfter.observedAt) >= actionCompletedAt;
+      const freshDecision = freshPurposeDecision(playerBefore, player);
+      const ownerPromptCount = 0;
+      const accepted = proactiveThreatResponseConfirmed({
+        ownerPromptCount,
+        freshPurposeDecision: freshDecision,
+        purposeDecisionLinkedToAction,
+        naturalRegenerationDisabled: true,
+        freshHostileObservationBefore: preObservationConfirmed,
+        bodyHostileCountBefore,
+        serverHostileCountBefore: serverCountBefore,
+        serverDistanceBefore: serverDistanceAtSpawn,
+        bodyDistanceBefore,
+        bodyServerDistanceAlignedBefore,
+        action,
+        actionStartedBeforeDamage,
+        bodyObservationAfterAction,
+        bodyHostileCountAfter,
+        serverHostileCountAfter: fixtureCountAfter,
+        serverPositionChanged: bodyPositionChanged,
+        bodyServerPositionAlignedAfter,
+        bodyDistanceAfter: bodyDistanceAfter ?? -1,
+        serverDistanceAfter,
+        bodyServerDistanceAlignedAfter,
+        healthBefore,
+        rconHealthAfter,
+        bodyHealthBefore,
+        bodyHealthAfter,
+        bodyServerHealthAlignedBefore: bodyHealthBefore === healthBefore,
+        bodyServerHealthAlignedAfter: bodyHealthAfter === rconHealthAfter,
+      });
+      latest = {
+        proactivePhase: "threat",
+        ownerPromptCount,
+        freshPurposeDecisionObserved: freshDecision,
+        purposeDecisionLinkedToBodyAction: purposeDecisionLinkedToAction,
+        fixtureCountBefore: serverCountBefore,
+        healthAtHostileObservation,
+        fixtureCountAfter,
+        hostileObservationFresh: true,
+        bodyHostileCountBefore,
+        bodyZombieCountBefore,
+        bodyHostileCountAfter,
+        bodyZombieCountAfter,
+        startDistance: serverDistanceAtSpawn,
+        distanceAtBodyObservation: serverDistanceBefore,
+        bodyStartDistance: bodyDistanceBefore,
+        distanceAfter: serverDistanceAfter,
+        bodyDistanceAfter: bodyDistanceAfter ?? -1,
+        bodyServerDistanceAlignedBefore,
+        bodyServerDistanceAlignedAfter,
+        bodyServerPositionAlignedBefore,
+        bodyServerPositionAlignedAfter,
+        serverPositionChangeBlocks: distance(
+          serverPositionAtObservation,
+          positionAfter,
+        ),
+        bodyPositionChanged,
+        bodyActionObserved: action !== undefined,
+        bodyActionKind: action?.kind ?? "none",
+        bodyActionSuccessful: action?.status === "successful",
+        bodyActionSameLife: action?.sameLife === true,
+        bodyActionRecoveryRequired: action?.recoveryRequired === true,
+        bodyActionIsPositioning: isThreatPositioningAction(action?.kind ?? ""),
+        bodyActionStartHealth: action?.healthBefore ?? -1,
+        bodyActionStartHealthMatchesBaseline,
+        positioningActionCount: positioningActions.length,
+        latestBodyActionKind: latestBodyAction?.kind ?? "none",
+        bodyActionStartedBeforeDamage: actionStartedBeforeDamage,
+        bodyObservationAfterAction,
+        firstDamageObserved: firstDamageAt !== undefined,
+        firstDamageAfterBodyAction:
+          firstDamageAt === undefined ||
+          (action !== undefined && actionStartedAt < firstDamageAt),
+        ownerReplyCount: port.responses().length - responseBaseline,
+        healthBefore,
+        healthAfter: rconHealthAfter,
+        bodyHealthBefore,
+        bodyHealthAfter: bodyHealthAfter ?? -1,
+        bodyServerHealthAlignedBefore: bodyHealthBefore === healthBefore,
+        bodyServerHealthAlignedAfter: bodyHealthAfter === rconHealthAfter,
+        responseConfirmed: accepted,
+      };
+      port.updateDiagnostic(latest);
+      return accepted;
+    });
+    if (after === undefined)
+      throw new CompanionProactiveAcceptanceError(
+        "PROACTIVE_THREAT_RESPONSE_NOT_CONFIRMED",
+      );
+    result = latest;
+  } finally {
+    capture.restore();
+    if (fixtureTouched) {
+      await port.rcon
+        .command(`kill @e[type=minecraft:zombie,tag=${tag}]`)
+        .catch(() => undefined);
+      cleanupConfirmed =
+        fixtureOrigin !== undefined &&
+        (await port.countTaggedHostile(fixtureOrigin).catch(() => -1)) === 0;
+    }
+    port.updateDiagnostic({ fixtureCleanupConfirmed: cleanupConfirmed });
+  }
+  if (!cleanupConfirmed)
+    throw new CompanionProactiveAcceptanceError(
+      "PROACTIVE_THREAT_FIXTURE_CLEANUP_UNCONFIRMED",
+    );
+  return result;
+}
+
+async function waitForThreatObservation(
+  port: CompanionProactivePort,
+  fixtureAt: number,
+  timeoutMs: number,
+): Promise<PlayerBodyObservation | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const observation = await port.body.observe();
+    const aggregate = observation.perception.nearbyHostiles?.aggregate;
+    const fresh = Date.parse(observation.observedAt) >= fixtureAt;
+    const zombieCount =
+      aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? 0;
+    if (
+      fresh &&
+      aggregate?.clientReceivedHostileCount === 1 &&
+      zombieCount === 1
+    )
+      return observation;
+    await sleep(200);
+  }
+  return undefined;
+}
+
+function nearestBodyHostileDistance(
+  observation: PlayerBodyObservation,
+): number | null {
+  const distances =
+    observation.perception.nearbyHostiles?.aggregate?.byDirection
+      .map(({ nearestDistance }) => nearestDistance)
+      .filter((value): value is number => value !== null) ?? [];
+  return distances.length === 0 ? null : Math.min(...distances);
 }
 
 function freshPurposeDecision(
@@ -219,6 +617,30 @@ function freshPurposeDecision(
           name === "commit_action_decision" && resultClass === "ok",
       ),
   );
+}
+
+function isFreshPurposeDecisionForAction(
+  before: PlayerEvidence,
+  after: PlayerEvidence,
+  action: CompanionProactiveAction,
+  fixtureAt: number,
+): boolean {
+  const priorRevisions = new Set(
+    before.recentJudgments.map(({ revision }) => revision),
+  );
+  const actionStartedAt = Date.parse(action.startedAt);
+  return after.recentJudgments.some((judgment) => {
+    const decidedAt = Date.parse(judgment.decidedAt ?? "");
+    return (
+      judgment.revision !== undefined &&
+      !priorRevisions.has(judgment.revision) &&
+      judgment.kind === "act" &&
+      judgment.operationKind === action.kind &&
+      Number.isFinite(decidedAt) &&
+      decidedAt >= fixtureAt &&
+      decidedAt <= actionStartedAt
+    );
+  });
 }
 
 function newOwnerGoal(
@@ -715,14 +1137,23 @@ async function runBedPhase(
   }
 }
 
-async function prepareArena(port: CompanionProactivePort): Promise<void> {
+async function prepareArena(
+  port: CompanionProactivePort,
+  forThreat = false,
+): Promise<void> {
   await port.setGamerule("advanceTime", false);
   await port.setGamerule("spawnMobs", false);
-  await port.rcon.command("fill -12 64 -12 12 72 12 air");
-  await port.rcon.command("fill -12 63 -12 12 63 12 stone");
+  if (forThreat) await port.setGamerule("naturalRegeneration", false);
+  const radius = forThreat ? 24 : 12;
+  await port.rcon.command(
+    `fill -${radius} 64 -${radius} ${radius} 72 ${radius} air`,
+  );
+  await port.rcon.command(
+    `fill -${radius} 63 -${radius} ${radius} 63 ${radius} stone`,
+  );
   await port.rcon.command(`effect clear ${port.botName}`);
   await port.rcon.command(`clear ${port.botName}`);
-  await port.rcon.command("time set 1000");
+  await port.rcon.command(`time set ${forThreat ? 18_000 : 1_000}`);
   await port.rcon.command(`tp ${port.botName} 0.5 64 0.5`);
   const player = await port.readPosition();
   const body = (await port.body.observe()).self.position;

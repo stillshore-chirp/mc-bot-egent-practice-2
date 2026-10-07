@@ -5,6 +5,7 @@ export const TARGETABLE_CASES = [
   "companion_intent_collection",
   "companion_proactive_food",
   "companion_proactive_bed",
+  "companion_proactive_threat",
   "gather_multi_target_continuity",
   "death_recovery",
   "underwater_item_recovery",
@@ -35,6 +36,7 @@ const TARGET_CASE_PREREQUISITES: Partial<
 const OPT_IN_ONLY_CASES = new Set<string>([
   "companion_proactive_food",
   "companion_proactive_bed",
+  "companion_proactive_threat",
 ]);
 
 export function isCaseSelectedForTarget(
