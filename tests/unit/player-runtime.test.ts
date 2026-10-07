@@ -953,6 +953,85 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it.each([
+    {
+      label: "unknown registry item",
+      operation: { kind: "craft", item: "mod:missing_item", count: 1 },
+      failureReason: {
+        code: "unknown_registry_item",
+        itemName: "mod:missing_item",
+      },
+      expectedSummary:
+        "failure=unknown_registry_item; registryにmod:missing_itemがありません",
+      expectedChat: undefined,
+    },
+    {
+      label: "missing inventory item",
+      operation: {
+        kind: "equip",
+        item: "iron_helmet",
+        destination: "head",
+      },
+      failureReason: {
+        code: "item_not_in_inventory",
+        itemName: "iron_helmet",
+      },
+      expectedSummary:
+        "failure=item_not_in_inventory; 所持品にiron_helmetがありません",
+      expectedChat: "所持品にiron_helmetがありません。",
+    },
+    {
+      label: "no recipe from observed inventory and surface",
+      operation: { kind: "craft", item: "minecraft:white_bed", count: 1 },
+      failureReason: {
+        code: "no_recipe_for_current_inventory_and_surface",
+        itemName: "minecraft:white_bed",
+      },
+      expectedSummary:
+        "failure=no_recipe_for_current_inventory_and_surface; 現在の所持品と利用可能な作業面でminecraft:white_bedのrecipeなし",
+      expectedChat: undefined,
+    },
+  ] as const)("preserves the confirmed $label reason", async (scenario) => {
+    const fixture = createRuntimeFixture();
+    const before = observation();
+    fixture.body.setResultObservations(before, before);
+    fixture.body.setResultDetail("A concise underlying operation error.");
+    fixture.body.setResultFailureReason(scenario.failureReason);
+    const decision = action(`failure-reason-${scenario.label}`, {
+      ...scenario.operation,
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+    });
+    if (!saved.accepted) throw new Error("TEST_FAILURE_REASON_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("failed");
+      await waitFor(
+        () =>
+          fixture.mind.snapshot().lastOutcome?.operationId ===
+          decision.operationId,
+      );
+      expect(fixture.mind.snapshot().lastOutcome?.summary).toContain(
+        scenario.expectedSummary,
+      );
+      if (scenario.expectedChat !== undefined) {
+        await waitFor(() => fixture.messages.length === 1);
+        expect(fixture.messages[0]).toContain(scenario.expectedChat);
+        expect(fixture.messages[0]).not.toContain(
+          "原因は観測から特定できていません。",
+        );
+      } else {
+        expect(fixture.messages).toHaveLength(0);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("suppresses repeated equip failure notices until the result changes", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -4236,6 +4315,7 @@ class DeferredBody implements PlayerBody {
   #resultAfter: PlayerBodyObservation | null = null;
   #resultSameLife: boolean | null | undefined;
   #resultDetail: string | undefined;
+  #resultFailureReason: PlayerOperationResult["failureReason"];
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
@@ -4267,6 +4347,12 @@ class DeferredBody implements PlayerBody {
 
   public setResultDetail(value: string): void {
     this.#resultDetail = value;
+  }
+
+  public setResultFailureReason(
+    value: NonNullable<PlayerOperationResult["failureReason"]>,
+  ): void {
+    this.#resultFailureReason = value;
   }
 
   public completeActive(status: PlayerOperationResult["status"]): void {
@@ -4321,6 +4407,9 @@ class DeferredBody implements PlayerBody {
           ...(this.#resultDetail === undefined
             ? {}
             : { detail: this.#resultDetail }),
+          ...(this.#resultFailureReason === undefined
+            ? {}
+            : { failureReason: this.#resultFailureReason }),
           recoveryRequired,
           ...(this.#lookSweepOnNextResult === undefined
             ? {}
@@ -4328,6 +4417,7 @@ class DeferredBody implements PlayerBody {
         };
         this.#resultSameLife = undefined;
         this.#resultDetail = undefined;
+        this.#resultFailureReason = undefined;
         this.#lookSweepOnNextResult = undefined;
         if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);

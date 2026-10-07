@@ -1923,6 +1923,9 @@ function groundedOperationSummary(
         ? "sameLife=true"
         : "sameLife=unknown";
   const parts = [
+    ...(result.failureReason === undefined
+      ? []
+      : [groundedFailureReasonSummary(result.failureReason)]),
     before.core,
     after.core,
     sameLife,
@@ -1950,6 +1953,20 @@ function groundedOperationSummary(
     summary = next;
   }
   return summary;
+}
+
+function groundedFailureReasonSummary(
+  failureReason: NonNullable<PlayerOperationResult["failureReason"]>,
+): string {
+  const itemName = safeDamageToken(failureReason.itemName, 80);
+  switch (failureReason.code) {
+    case "unknown_registry_item":
+      return `failure=unknown_registry_item; registryに${itemName}がありません`;
+    case "item_not_in_inventory":
+      return `failure=item_not_in_inventory; 所持品に${itemName}がありません`;
+    case "no_recipe_for_current_inventory_and_surface":
+      return `failure=no_recipe_for_current_inventory_and_surface; 現在の所持品と利用可能な作業面で${itemName}のrecipeなし`;
+  }
 }
 
 interface CompactHostileProjection {
@@ -2136,7 +2153,14 @@ function equipmentOutcomeMessage(
           : `実行後、${equipmentArea}には${equipment.name}があり、${operation.item}は確認できませんでした。`;
   if (outcome === "successful" && equipment?.name === operation.item)
     return `${statusMessage[outcome]}${observedMessage}`;
-  return `${statusMessage[outcome]}${observedMessage}原因は観測から特定できていません。`;
+  const failureReason = operationMatches ? result.failureReason : undefined;
+  const itemMissingFromInventory =
+    failureReason?.code === "item_not_in_inventory" &&
+    failureReason.itemName === operation.item;
+  const reasonMessage = itemMissingFromInventory
+    ? `所持品に${operation.item}がありません。`
+    : "原因は観測から特定できていません。";
+  return `${statusMessage[outcome]}${observedMessage}${reasonMessage}`;
 }
 
 function equipmentSlotObservation(
