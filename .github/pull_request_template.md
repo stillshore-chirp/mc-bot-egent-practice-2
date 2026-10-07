@@ -1,47 +1,25 @@
 <!-- PRのタイトルと本文は日本語を原則とします。識別子、path、version、GitHub構文は原表記を維持できます。 -->
 
-## 主Issue
+## 関連Issue
 
-- 完全解決: Closes #N / 部分対応: Refs #N
-- 主Issue:
-- 対応範囲:
-- 非対象:
+- Issue:
 
-## 変更内容と保持した挙動
+## 目的と変更内容
 
--
--
+- 成立させる状態:
+- 変更した製品の挙動・文書:
+- 保持した挙動:
 
-## 参照した外部正本
+## 検証と製品evidence
 
-- repository:
-- branch / version:
-- commit SHA:
-- 確認日:
-
-## 検証とevidence
-
-- 実行したcommand、test、結果:
-- checkpoint / snapshot:
-- input closure（path / config / artifact / conditions）:
-- 再利用・失効・再取得したgate:
-- Minecraft実環境観測（実施時のみ。公開可能な要約）:
+- 確認した結果とartifact reference:
+- Minecraft実環境の観測（実施時のみ。公開可能な要約）:
+- 未確認の製品結果:
 
 ## 公開安全性
 
-- 対象と実施した検査:
-- 一般化・maskした情報:
-- 検出結果:
+Minecraft username、UUID、server情報、world seed、会話やmemoryの実内容、log原文、追跡IDを含めず、公開可能な要約にします。
 
-## CI / review / mergeability
+## 残るrisk
 
-- latest HEAD:
-- push / pull_request CI:
-- latest meaningful changeへのreview:
-- actionableな未解決thread:
-- GitHub mergeability:
-
-## 未実行項目と残るrisk
-
-- 未実行項目・理由:
-- 残るrisk・次の最短action:
+-

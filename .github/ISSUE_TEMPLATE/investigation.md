@@ -1,7 +1,7 @@
 ---
 name: Investigation
 about: 実装前の調査、設計調査、原因調査
-title: "[Investigation]: "
+title: "調査："
 ---
 
 ## 調査目的と背景
@@ -30,11 +30,11 @@ title: "[Investigation]: "
   - [ ]
 - 対象: code / config / test / docs / Minecraft / log / data
 - 非対象:
-- read-only / write操作と権限:
+- 観測または変更の対象範囲:
 - 検証・成果物:
 
 ## 完了条件と公開安全性
 
-- [ ] 結果、根拠、未確認範囲、次の最短actionが記録されている。
+- [ ] 結果、根拠、未確認範囲、次の判断材料が記録されている。
 - [ ] 実環境観測とcode上の仮説が分離されている。
 - [ ] secret、個人情報、log原文、追跡IDを公開していない。

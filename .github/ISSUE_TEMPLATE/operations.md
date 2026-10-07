@@ -1,7 +1,7 @@
 ---
 name: Operations / Minecraft Investigation
 about: Minecraft server、bot runtime、LLM、記憶、外部serviceの実環境調査
-title: "[Ops]: "
+title: "運用調査："
 labels: operations
 ---
 
@@ -11,7 +11,7 @@ labels: operations
 - 環境区分: local / CI / staging / production / Minecraft
 - 対象server・runtime（公開可能な一般化名）:
 - 発生日時または期間:
-- 許可された操作:
+- 依頼に含む操作・影響範囲:
 
 ## 影響と判断の根拠
 
@@ -31,10 +31,10 @@ labels: operations
 
 - 対応方針:
 - 非対象:
-- [ ] read-only確認とwrite操作の要否が明記されている。
+- [ ] 観測・変更の対象範囲が明記されている。
 - [ ] Minecraft内の観測結果と推論が分離されている。
 - [ ] 検証、cleanup、rollback・復旧方針が明記されている。
-- [ ] 残るriskと次の最短actionが記録されている。
+- [ ] 残るriskと次の判断材料が記録されている。
 
 ## 公開安全性
 

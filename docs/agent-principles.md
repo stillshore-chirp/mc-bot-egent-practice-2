@@ -1,35 +1,14 @@
 # Agent Principles
 
-この文書は、将来の設計・実装で判断を助けるheuristicをまとめます。実行順序、安全境界、完了条件は [`AGENTS.md`](../AGENTS.md)、ルールの配置は [`docs/agent-harness.md`](agent-harness.md) を優先します。
+この文書はMinecraft AIコンパニオンの設計heuristicです。製品固有の境界は[AGENTS.md](../AGENTS.md)、共通の作業運用は実行環境の指示に従います。
 
-## Hard gateとheuristic
+## AIコンパニオンの設計
 
-この文書の原則は、明示したhard gateを除いてheuristicです。複数の原則が競合する場合は、要件、安全性、変更容易性、誤用リスク、検証可能性を比較します。
-
-次はhard gateです。
-
-- secret、個人情報、認証情報を公開しない。
-- 永続記憶と外部サービスのデータ整合性を壊さない。Minecraft内の危険や死亡を伴う行動、owner要求に基づく変更、自律的な建築はAIプレイヤーが判断する通常のゲーム行動に含める。
-- 未実施の検証や未観測の実環境状態を事実として報告しない。
-- ownerの永続停止、通常のBukkit・サーバー権限、認証・認可、外部アクセス境界をLLM判断で迂回しない。credential、shell、任意コード、server admin accessを公開しない。
-- 必須CI失敗、actionableな重大指摘、未解決threadを隠して完了扱いにしない。
-- 無関係な差分や利用者データを破壊しない。
-
-## 長期taskと文書
-
-- 最初に目標、受け入れ条件、非対象、依存関係、検証方法を明らかにします。
-- boundedな依頼は、真のblockerがない限り調査、実装、検証、配送まで完遂します。
-- 途中状態には、完了事項、未完了事項、次の最短action、検証、残るriskを追跡可能に残します。
-- 挙動、setup、architecture、運用の意味が変わったら、対応する正本を同じ変更で更新します。
-- 同じ長文を複数文書へcopyせず、正本と短い案内を分けます。
-
-## AIコンパニオンの境界
-
-- Minecraftで実際に観測された状態を、行動の成功・失敗の正本にします。
-- 既定のAIプレイヤー／行動系GPTがゲーム内の危険、死亡、建築変更を含む行動を判断し、強いowner要求に応じて選択を変えられます。PlayerBodyは判断結果のゲーム操作を実行します。即時停止、通常のサーバー権限、認証・認可、外部アクセスは別の検証可能な境界で守ります。
-- AIプレイヤーの既定経路は `src/player` と `src/app/player-application.ts`、判断知識を担うMC Bot Skillsは `src/mc-skills` に置きます。旧 `src/skills`、`src/decision`、`src/reflexes`、tool executionはhelperとして扱い、共通の行動禁止規則を定めません。詳細は[自律プレイヤー](autonomous-player.md)と[PlayerBody](player-body.md)を参照します。
-- 長時間または複数工程の行動は中断可能にし、失敗、再開、取消、重複実行を扱える境界を検討します。
-- 人格の一貫性、出来事、場所、約束の記憶では、観測事実、プレイヤーの発言、AIの推論、未確認情報を区別します。
+- Minecraftで継続する一人のAIプレイヤーとして、人格、関係、出来事、場所、約束の記憶を一貫させます。
+- 人格、会話、記憶と、世界の観測、行動実行、外部接続を区別し、各情報の由来と確度を保ちます。
+- 既定のAIプレイヤー／行動系GPTがゲーム内の危険、死亡、建築変更を含む行動を判断し、強いowner要求に応じて選択を変えられます。PlayerBodyは判断結果のゲーム操作を実行します。
+- AIプレイヤーの既定経路はsrc/playerとsrc/app/player-application.ts、判断知識を担うMC Bot Skillsはsrc/mc-skillsに置きます。旧src/skills、src/decision、src/reflexes、tool executionはhelperとして扱い、共通の行動禁止規則を定めません。詳細は[自律プレイヤー](autonomous-player.md)と[PlayerBody](player-body.md)を参照します。
+- 長時間または複数工程の行動は中断可能にし、失敗、再開、取消、重複実行を扱える境界を設計します。
 - sessionをまたぐ同一性を、会話履歴だけに依存させず、明示的で検証可能な状態として設計します。
 
 ## KISS、YAGNI、DRY
@@ -37,28 +16,25 @@
 - 要件を満たす最小の構造から始め、未使用の拡張点、provider抽象、汎用agent基盤を先行追加しません。
 - 将来可能性だけを理由にinterface、factory、plugin、DSLを増やしません。
 - 重複回数だけで共通化せず、変更理由、lifecycle、契約が同じかを確認します。
-- 安全性、観測性、error処理、data整合性に必要な備えは、利用前でも検討します。
+- 安全性、観測性、error処理、data整合性に必要な備えは、利用前でも設計します。
 
 ## SRP、SoC、依存方向
 
 - file、class、function、componentの責務を、名前と公開契約から説明できる状態にします。
 - 会話・計画、ゲーム観測、行動実行、記憶、外部接続の関心を区別し、一つの変更が無関係な領域へ波及しない構造を選びます。
 - logging、metrics、retry、authorizationなどの横断的関心は、一貫して適用できる境界へ置きます。
-- 分割は行数ではなく、独立して変更・検証できる責務で判断します。
+- 分割は行数ではなく、独立して変更・評価できる責務で判断します。
 
-## 外部統合、error、可観測性
+## 外部統合と可観測性
 
-- 外部API、LLM、Minecraft接続、storageの抽象化は、差替え、契約test、障害分離に実益がある境界へ置きます。
-- 想定可能な失敗にはretry、停止、fallback、利用者通知の方針を明示し、fallbackで不整合や設定不備を隠しません。
+- 外部API、LLM、Minecraft接続、storageの抽象化は、差替え、契約確認、障害分離に実益がある境界へ置きます。
+- 想定可能な失敗にはretry、停止、fallback、利用者通知の方針を設計し、fallbackで不整合や設定不備を隠しません。
 - 再実行される副作用ではidempotency、checkpoint、deduplicationを検討します。
-- logは必要最小限のcontextを持たせ、secret、個人情報、会話全文、実識別子を残しません。
 - 原因判定では観測された失敗、説明するcode・config・data、再現または対照確認を接続します。
 
-## Testと依存
+## Testと依存の設計
 
-- unit testを判断logic、integration testを境界契約、E2Eを重要な会話・行動・停止・回復の流れへ使います。
-- 時刻、乱数、network、LLM、Minecraft server、storageなどの非決定要素を制御します。
-- bug修正では修正前に失敗する条件を回帰testへ残します。
-- flaky testを再実行で隠さず、待機条件、競合、非同期、環境差の原因を直します。
+- unit testは判断logic、integration testは境界契約、E2Eは重要な会話・行動・停止・回復の流れに向けて設計します。
+- 時刻、乱数、network、LLM、Minecraft server、storageなどの非決定要素は、再現性と原因の切り分けを助ける形で制御します。
+- flaky testは再実行で隠さず、待機条件、競合、非同期、環境差など原因となる設計を見直します。
 - 依存は最小限に保ち、標準機能や既存依存で十分な場合は追加しません。
-- 環境依存file、credential、実データ、生成された実環境logを追跡しません。
