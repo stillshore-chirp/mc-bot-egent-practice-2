@@ -3497,16 +3497,19 @@ export function createOwnerReturnApplicationWithBodyCapture(
   application: ReturnType<ApplicationFactory>;
   restoreProbe?: () => void;
 }> {
-  const captureBodyForTargetedUnknownCase = targetCase === "unknown_composite";
+  const captureBodyForTargetedCase =
+    targetCase === "unknown_composite" ||
+    targetCase === "companion_intent_collection";
   if (
     targetCase !== "death_recovery" &&
     !ownerReturnRequestGateEnabled(targetCase) &&
     !isUnderwaterItemRecoveryTargeted(targetCase) &&
     !isArmorCapabilityTargeted(targetCase) &&
-    !captureBodyForTargetedUnknownCase
+    !captureBodyForTargetedCase
   )
     return { application: createApplication(config, beforeCall) };
 
+  activeApplicationPlayerBody = undefined;
   const restoreProbe = installGameActionPlacementObservationProbe(
     onPlayerBodyCreated,
     onObservation,
@@ -5203,13 +5206,21 @@ async function main(): Promise<void> {
       return;
     }
     if (state.targetCase === "companion_intent_collection") {
+      const applicationPlayerBody = activeApplicationPlayerBody;
+      if (applicationPlayerBody === undefined)
+        incomplete("COMPANION_INTENT_APPLICATION_BODY_UNAVAILABLE");
       await connectApplication(activeApp, state);
       const collectionResult = await recordCase(
         state,
         "companion_intent_collection",
         CASE_DEADLINES.companion_intent_collection,
         requireLiveContext(),
-        async (context) => runCompanionIntentCollectionCase(state, context),
+        async (context) =>
+          runCompanionIntentCollectionCase(
+            state,
+            context,
+            applicationPlayerBody,
+          ),
       );
       state.status = collectionResult.status;
       if (collectionResult.status !== "pass")
@@ -12254,6 +12265,7 @@ function activeWoodGoal(
 async function runCompanionIntentCollectionCase(
   state: RunState,
   context: CaseContext,
+  body: MineflayerPlayerBody,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   let fixture: CompanionIntentCollectionFixture | undefined;
   let origin: Position | undefined;
@@ -12476,9 +12488,6 @@ async function runCompanionIntentCollectionCase(
     let fixtureLogRemovedFromInitial: number | undefined;
     let inventoryThresholdAchievedAt: number | undefined;
     let lastOracleReadAt = 0;
-    const body = activeApplicationPlayerBody;
-    if (body === undefined)
-      incomplete("COMPANION_INTENT_APPLICATION_BODY_UNAVAILABLE");
     const progress = await observeForPlayer(
       context,
       150_000,
@@ -12644,7 +12653,9 @@ async function runCompanionIntentCollectionCase(
       finalRequestedQuantity: 3,
       freshBodyObservationAfterFollowup: true,
       successfulBodyCollectionAfterFollowup: true,
-      serverInventoryIncreaseAfterFollowup: true,
+      serverInventoryIncreaseAfterFollowup:
+        inventoryAfterFollowup !== undefined &&
+        inventoryAfterFollowup > inventoryBeforeFollowup.counts.oak_log,
       serverOakLogCountAfterGoal: inventoryAfterFollowup ?? 0,
       bodyOakLogCountAfterGoal: bodyOakCountAfterGoal ?? 0,
       inventoryThresholdObservedAfterGoal:

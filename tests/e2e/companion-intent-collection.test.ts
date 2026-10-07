@@ -1,10 +1,18 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
   COMPANION_INTENT_COLLECTION_CASE_BUDGET,
   COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
+  createOwnerReturnApplicationWithBodyCapture,
   runBudgetCoversCase,
 } from "./ai-player-live.js";
+import { createApplication } from "../../src/app/application.js";
+import type { AppConfig } from "../../src/config/schema.js";
 import {
   COMPANION_HOSTILE_DETAIL_LIMIT,
   COMPANION_HOSTILE_FIXTURE_COUNT,
@@ -205,6 +213,72 @@ describe("companion intent collection acceptance helpers", () => {
     expect(
       isCaseSelectedForTarget("companion_intent_collection", "autonomous_life"),
     ).toBe(false);
+  });
+
+  it("captures the application's Body before the targeted case starts", async () => {
+    const temporaryRoot = mkdtempSync(
+      join(tmpdir(), "companion-intent-body-capture-"),
+    );
+    const config: AppConfig = {
+      minecraft: {
+        host: "127.0.0.1",
+        port: 25565,
+        username: "companion-body-capture-bot",
+        auth: "offline",
+        version: "1.21.11",
+      },
+      ownerUsername: "companion-body-capture-owner",
+      openai: { apiKey: "test-only-value", model: "test-model" },
+      databasePath: join(temporaryRoot, "player.sqlite"),
+      personaPath: fileURLToPath(
+        new URL("../../config/persona.example.json", import.meta.url),
+      ),
+      logLevel: "silent",
+      limits: {
+        maxMoveDistance: 128,
+        maxGatherCount: 64,
+        taskTimeoutMs: 900_000,
+        skillRetryLimit: 2,
+        followDistance: 3,
+        hungerThreshold: 14,
+        memoryContextLimit: 12,
+      },
+      reconnect: { enabled: false, maxAttempts: 0, delayMs: 250 },
+      dashboard: {
+        enabled: false,
+        host: "127.0.0.1",
+        port: 4310,
+        staticDirectory: "dashboard/dist",
+        maxAgeDays: 30,
+        maxTraces: 500,
+      },
+    };
+    let capturedBodies = 0;
+    let application: ReturnType<typeof createApplication> | undefined;
+    let restoreProbe: (() => void) | undefined;
+    try {
+      const created = createOwnerReturnApplicationWithBodyCapture(
+        "companion_intent_collection",
+        createApplication,
+        config,
+        () => {
+          throw new Error("PROVIDER_REQUEST_NOT_EXPECTED_IN_FACTORY_TEST");
+        },
+        () => {
+          capturedBodies += 1;
+        },
+      );
+      application = created.application;
+      restoreProbe = created.restoreProbe;
+      expect(capturedBodies).toBe(1);
+    } finally {
+      try {
+        await application?.shutdown("test_complete");
+      } finally {
+        restoreProbe?.();
+        rmSync(temporaryRoot, { recursive: true, force: true });
+      }
+    }
   });
 
   it("keeps the collection case inside its short provider budget", () => {
