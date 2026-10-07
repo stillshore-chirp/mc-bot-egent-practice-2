@@ -1059,6 +1059,24 @@ function countNamedItem(
   );
 }
 
+function countNamedItemInPlayerStorage(
+  observation: PlayerBodyObservation | null,
+  itemName: string,
+  inventoryStart: number,
+  inventoryEnd: number,
+): number {
+  return (
+    observation?.self.inventory
+      .filter(
+        (item) =>
+          item.slot >= inventoryStart &&
+          item.slot < inventoryEnd &&
+          item.name === itemName,
+      )
+      .reduce((total, item) => total + item.count, 0) ?? 0
+  );
+}
+
 function stackAt(observation: PlayerBodyObservation | null, slot: number) {
   return observation?.self.inventory.find((item) => item.slot === slot) ?? null;
 }
@@ -1275,8 +1293,19 @@ function operationEvidence(
     }
     case "craft":
       return (
-        countNamedItem(after, operation.item) >=
-        countNamedItem(before, operation.item) + operation.count
+        countNamedItemInPlayerStorage(
+          after,
+          operation.item,
+          bot.inventory.inventoryStart,
+          bot.inventory.inventoryEnd,
+        ) >=
+        countNamedItemInPlayerStorage(
+          before,
+          operation.item,
+          bot.inventory.inventoryStart,
+          bot.inventory.inventoryEnd,
+        ) +
+          operation.count
       );
     case "open_window":
       return after.window !== null && before.window?.id !== after.window.id;

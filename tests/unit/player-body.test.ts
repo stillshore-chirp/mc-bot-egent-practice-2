@@ -108,6 +108,31 @@ function addItemToInventory(
   inventory.emit("updateSlot", slot, previous, next);
 }
 
+function setInventorySlotItem(
+  fake: ReturnType<typeof makeFakeBot>,
+  slot: number,
+  name: string,
+  count: number,
+): void {
+  const inventory = fake.inventory as EventEmitter & {
+    slots: (Record<string, unknown> | null)[];
+  };
+  const previous = inventory.slots[slot] ?? null;
+  const next = {
+    type: 1,
+    name,
+    count,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+  };
+  inventory.slots[slot] = next;
+  inventory.emit("updateSlot", slot, previous, next);
+}
+
 function installFakeArmorEquip(fake: ReturnType<typeof makeFakeBot>) {
   const inventory = fake.inventory as EventEmitter & {
     slots: (Record<string, unknown> | null)[];
@@ -195,6 +220,8 @@ function makeFakeBot(
   };
   Object.assign(inventory, {
     slots: inventorySlots,
+    inventoryStart: 9,
+    inventoryEnd: 45,
     items: () =>
       inventorySlots.filter(
         (item): item is Record<string, unknown> => item !== null,
@@ -5153,8 +5180,12 @@ describe("player body", () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
+      Object.assign(fake.inventory, {
+        inventoryStart: 13,
+        inventoryEnd: 38,
+      });
       const craft = vi.fn(async () => {
-        setTimeout(() => addItemToInventory(fake, "chest", 1), 300);
+        setTimeout(() => setInventorySlotItem(fake, 13, "chest", 1), 300);
       });
       configureFakeChestCraft(fake, craft);
       const body = new MineflayerPlayerBody(() => fake.bot);
@@ -5171,7 +5202,43 @@ describe("player body", () => {
       expect(result.status).toBe("successful");
       expect(result.before?.self.inventory).toHaveLength(0);
       expect(result.after?.self.inventory).toContainEqual(
-        expect.objectContaining({ name: "chest", count: 1 }),
+        expect.objectContaining({ name: "chest", count: 1, slot: 13 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { label: "result", slot: 0 },
+    { label: "crafting grid", slot: 1 },
+  ])("does not count a $label slot as crafted inventory", async ({ slot }) => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      Object.assign(fake.inventory, {
+        inventoryStart: 13,
+        inventoryEnd: 38,
+      });
+      configureFakeChestCraft(
+        fake,
+        vi.fn(async () => {
+          setInventorySlotItem(fake, slot, "chest", 1);
+        }),
+      );
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "craft",
+        item: "chest",
+        count: 1,
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "chest", count: 1, slot }),
       );
     } finally {
       vi.useRealTimers();
