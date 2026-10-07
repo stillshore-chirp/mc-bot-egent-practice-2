@@ -69,6 +69,7 @@ import {
   COMPANION_HOSTILE_FIXTURE_COUNT,
   bodyOakLogInventoryCount,
   companionHostileObservationConfirmed,
+  companionIntentCollectionProgressConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
   ownerGoalAndObservationFreshAfterRequest,
@@ -12830,11 +12831,11 @@ async function runCompanionIntentCollectionCase(
               : inventoryAfterFollowup - inventoryBeforeFollowup.counts.oak_log,
           fixtureLogRemovedFromInitial: fixtureLogRemovedFromInitial ?? null,
         });
-        return (
-          successfulBodyCollectionAfterFollowup &&
-          inventoryThresholdAchievedAt !== undefined &&
-          (fixtureLogRemovedFromInitial ?? 0) >= 3
-        );
+        return companionIntentCollectionProgressConfirmed({
+          successfulBodyCollectionAfterFollowup,
+          inventoryThresholdAchievedAt,
+          fixtureLogRemovedFromInitial,
+        });
       },
     );
     if (progress === undefined)

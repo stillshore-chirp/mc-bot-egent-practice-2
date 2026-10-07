@@ -18,6 +18,7 @@ import {
   COMPANION_HOSTILE_FIXTURE_COUNT,
   bodyOakLogInventoryCount,
   companionHostileObservationConfirmed,
+  companionIntentCollectionProgressConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
   ownerGoalAndObservationFreshAfterRequest,
@@ -333,6 +334,30 @@ describe("companion intent collection acceptance helpers", () => {
         ],
         previousOperationIds: new Set(["operation-1"]),
         requestSentAt: Date.parse("2026-10-07T00:00:01.000Z"),
+      }),
+    ).toBe(false);
+  });
+
+  it("does not require collection from the nearby fixture blocks", () => {
+    expect(
+      companionIntentCollectionProgressConfirmed({
+        successfulBodyCollectionAfterFollowup: true,
+        inventoryThresholdAchievedAt: Date.parse("2026-10-07T00:00:03.000Z"),
+        fixtureLogRemovedFromInitial: 0,
+      }),
+    ).toBe(true);
+    expect(
+      companionIntentCollectionProgressConfirmed({
+        successfulBodyCollectionAfterFollowup: false,
+        inventoryThresholdAchievedAt: Date.parse("2026-10-07T00:00:03.000Z"),
+        fixtureLogRemovedFromInitial: 0,
+      }),
+    ).toBe(false);
+    expect(
+      companionIntentCollectionProgressConfirmed({
+        successfulBodyCollectionAfterFollowup: true,
+        inventoryThresholdAchievedAt: undefined,
+        fixtureLogRemovedFromInitial: 0,
       }),
     ).toBe(false);
   });

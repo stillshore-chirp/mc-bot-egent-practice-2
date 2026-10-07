@@ -229,3 +229,20 @@ export function successfulCollectionActionObservedAfter(input: {
     return true;
   });
 }
+
+export interface CompanionIntentCollectionProgressEvidence {
+  readonly successfulBodyCollectionAfterFollowup: boolean;
+  readonly inventoryThresholdAchievedAt: number | undefined;
+  /** Recorded for diagnosis only; the owner's goal does not constrain source blocks. */
+  readonly fixtureLogRemovedFromInitial: number | undefined;
+}
+
+export function companionIntentCollectionProgressConfirmed(
+  input: CompanionIntentCollectionProgressEvidence,
+): boolean {
+  return (
+    input.successfulBodyCollectionAfterFollowup &&
+    input.inventoryThresholdAchievedAt !== undefined &&
+    Number.isFinite(input.inventoryThresholdAchievedAt)
+  );
+}
