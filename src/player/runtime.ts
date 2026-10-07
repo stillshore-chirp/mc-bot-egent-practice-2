@@ -1715,33 +1715,46 @@ export class PlayerRuntime {
     )
       return;
 
+    const now = Date.now();
     const kinds = [...this.#pendingSemanticChanges].sort();
-    const minimumGapMs = kinds.includes("vitals")
-      ? 3_000
-      : kinds.length === 1 && kinds[0] === "time"
-        ? 60_000
-        : 12_000;
-    const previous = this.#eventTimes.get("semantic-opportunity") ?? 0;
-    const delayMs = previous + minimumGapMs - Date.now();
-    if (delayMs <= 0) {
+    const eligible: string[] = [];
+    let nextDelayMs = Number.POSITIVE_INFINITY;
+    for (const kind of kinds) {
+      const minimumGapMs =
+        kind === "vitals" ? 3_000 : kind === "time" ? 60_000 : 12_000;
+      const previous = this.#eventTimes.get(`semantic-kind:${kind}`) ?? 0;
+      const delayMs = previous + minimumGapMs - now;
+      if (delayMs <= 0) eligible.push(kind);
+      else nextDelayMs = Math.min(nextDelayMs, delayMs);
+    }
+    if (eligible.length > 0) {
+      const at = new Date(now).toISOString();
       const queued = this.enqueueAndWake(
         "state_changed",
-        `観測上の意味のある変化: ${kinds.join(", ")}`,
-        new Date().toISOString(),
+        `観測上の意味のある変化: ${eligible.join(", ")}`,
+        at,
         "semantic-opportunity",
-        minimumGapMs,
+        0,
       );
-      if (queued) this.#pendingSemanticChanges.clear();
-      else this.#scheduleSemanticOpportunity();
-      return;
+      if (queued) {
+        const deliveredAt = Date.now();
+        for (const kind of eligible) {
+          this.#pendingSemanticChanges.delete(kind);
+          this.#eventTimes.set(`semantic-kind:${kind}`, deliveredAt);
+        }
+      }
+      if (this.#pendingSemanticChanges.size === 0) return;
+      nextDelayMs = Math.min(
+        nextDelayMs,
+        queued ? Number.POSITIVE_INFINITY : 1,
+      );
     }
-
     this.#semanticWakeTimer = setTimeout(
       () => {
         this.#semanticWakeTimer = undefined;
         this.#scheduleSemanticOpportunity();
       },
-      Math.max(1, delayMs),
+      Math.max(1, nextDelayMs),
     );
     this.#semanticWakeTimer.unref();
   }
