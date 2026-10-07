@@ -12606,14 +12606,24 @@ async function runCompanionIntentCollectionCase(
       ...(finalPlayer.wait?.reason === undefined
         ? {}
         : { waitReason: finalPlayer.wait.reason }),
-      completionJudgments: finalPlayer.recentJudgments
-        .filter(
-          ({ kind, decidedAt }) =>
-            kind === "complete" &&
-            Number.isFinite(Date.parse(decidedAt ?? "")) &&
-            Date.parse(decidedAt ?? "") >= achievedAt,
-        )
-        .map(({ decidedAt, summary }) => ({ decidedAt, summary })),
+      completionJudgments: finalPlayer.recentJudgments.flatMap(
+        ({ kind, decidedAt, summary }) => {
+          if (
+            kind !== "complete" ||
+            decidedAt === undefined ||
+            !Number.isFinite(Date.parse(decidedAt)) ||
+            Date.parse(decidedAt) < achievedAt
+          ) {
+            return [];
+          }
+          return [
+            {
+              decidedAt,
+              ...(summary === undefined ? {} : { summary }),
+            },
+          ];
+        },
+      ),
     };
     updateCompanionIntentCollectionDiagnostic(state, {
       goalStatusAfterCollection,
