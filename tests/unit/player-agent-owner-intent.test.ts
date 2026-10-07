@@ -720,7 +720,7 @@ describe("player owner intent context", () => {
       functionCallResponse("continue-owner-intent", "propose_goal_change", {
         title: "Gather the wood the owner meant",
         reason:
-          "The owner asked me to gather the wood discussed earlier; Purpose should take a fresh observation and choose the first step.",
+          "The owner asked me to gather the wood discussed earlier; I should use a fresh observation and choose the first step.",
         priority: 4,
       }),
       terminalResponse(
@@ -745,7 +745,7 @@ describe("player owner intent context", () => {
       );
       const initialRequest = record(fixture.requests[0]);
       expect(String(initialRequest.instructions)).toContain(
-        "観測失敗だけを理由に目的提案を止めず",
+        "明確な依頼は観測失敗だけを理由に放置しません",
       );
       const continuation = record(fixture.requests[1]);
       if (!Array.isArray(continuation.input))
@@ -789,7 +789,7 @@ describe("player owner intent context", () => {
     fixture.responses.push(
       functionCallResponse(
         "reassess-current-plan",
-        "request_current_purpose_reassessment",
+        "reassess_my_current_plan",
         { reason },
       ),
       terminalResponse(
@@ -812,7 +812,7 @@ describe("player owner intent context", () => {
         "That route is stuck. I will check the area again and try another way.",
       ]);
       expect(String(record(fixture.requests[0]).instructions)).toContain(
-        "request_current_purpose_reassessment",
+        "reassess_my_current_plan",
       );
       const continuation = record(fixture.requests[1]);
       if (!Array.isArray(continuation.input))
@@ -867,11 +867,9 @@ describe("player owner intent context", () => {
         return pendingResponse;
       },
       terminalResponse("This stale reply should not be sent."),
-      functionCallResponse(
-        "stopped-reassessment",
-        "request_current_purpose_reassessment",
-        { reason: "Owner feedback asks me to reconsider the current route." },
-      ),
+      functionCallResponse("stopped-reassessment", "reassess_my_current_plan", {
+        reason: "Owner feedback asks me to reconsider the current route.",
+      }),
       terminalResponse("I heard you."),
     );
     const staleTurn = conversation.nextTurn();
@@ -886,11 +884,9 @@ describe("player owner intent context", () => {
       await requestStarted;
       currentTurn = conversation.nextTurn();
       resolveResponse(
-        functionCallResponse(
-          "stale-reassessment",
-          "request_current_purpose_reassessment",
-          { reason: "Owner feedback asks me to reconsider the current route." },
-        ),
+        functionCallResponse("stale-reassessment", "reassess_my_current_plan", {
+          reason: "Owner feedback asks me to reconsider the current route.",
+        }),
       );
       await staleRequest;
       expect(wakeCount).toBe(0);
@@ -1117,11 +1113,16 @@ describe("player owner intent context", () => {
         "質問、否定、引用、他者を対象にした発話",
       );
       expect(String(secondRequest.instructions)).toContain(
-        "propose_goal_changeはstatus=pendingの依頼案を保存するだけ",
+        "あなたはMinecraft世界でownerと過ごす一人のAIプレイヤーです",
       );
       expect(String(secondRequest.instructions)).toContain(
-        "goalを更新・採用・達成した、または操作を始めたと言い切らない",
+        "propose_goal_changeの結果がpendingなら、active goalはまだ更新されていません",
       );
+      expect(String(secondRequest.instructions)).toContain(
+        "ownerには理解した具体的な条件と自分がまず試すことを一人称の未来の意向として伝え",
+      );
+      expect(String(secondRequest.instructions)).not.toContain("Purposeが");
+      expect(String(secondRequest.instructions)).not.toContain("Purposeへ");
       expect(proposalWakeups).toBe(1);
       const proposalContinuation = record(fixture.requests[2]);
       if (!Array.isArray(proposalContinuation.input))
@@ -1171,9 +1172,12 @@ describe("player owner intent context", () => {
       expect(result.accepted).toBe(false);
       const request = record(fixture.requests[0]);
       const instructions = String(request.instructions);
-      expect(instructions).toContain("採否の判定名だけで終えず");
-      expect(instructions).toContain("提案の具体的な対象・数量・条件");
-      expect(instructions).toContain("これから試す次の一手");
+      expect(instructions).toContain(
+        "proposalDispositionはstate保存用のenumです",
+      );
+      expect(instructions).toContain("一人称の短い会話で伝えます");
+      expect(instructions).toContain("希望された具体的な対象・数量・条件");
+      expect(instructions).toContain("これから自分が試す一手");
       expect(instructions).not.toContain("priority 4以上の新しいowner提案");
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({ id: proposal.id, status: "pending" }),

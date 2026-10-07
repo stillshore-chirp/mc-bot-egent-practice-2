@@ -1207,11 +1207,18 @@ describe("player agent response rounds", () => {
         maxRetries: 0,
         timeout: 10_000,
       });
-      expect(request.instructions).toContain("危険は創作せず");
+      expect(request.instructions).toContain(
+        "観測されていない危険は創作しません",
+      );
       expect(request.instructions).toContain("proposalDisposition");
-      expect(request.instructions).toContain("採否の判定名だけで終えず");
-      expect(request.instructions).toContain("提案の具体的な対象・数量・条件");
-      expect(request.instructions).toContain("これから試す次の一手");
+      expect(request.instructions).toContain(
+        "proposalDispositionはstate保存用のenumです",
+      );
+      expect(request.instructions).toContain(
+        "一人称の短い会話で伝えてください",
+      );
+      expect(request.instructions).toContain("具体的な対象・数量・条件");
+      expect(request.instructions).toContain("これから自分が試す一手");
       expect(request.instructions).toContain(
         "今回の入力runtime.proposalsにstatus=pendingとして載っているものだけ",
       );
@@ -3914,7 +3921,7 @@ describe("player agent response rounds", () => {
         .parse(firstRequest.tools);
       expect(instructions).toContain("必ずinspect_runtimeを呼び");
       expect(instructions).toContain("Minecraft内でBotが死亡したことと");
-      expect(instructions).toContain("会話turnにBody操作toolがないことだけで");
+      expect(instructions).toContain("会話turnでBody操作toolを使わない時も");
       expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
       expect(tools.map((tool) => tool.name)).toContain("describe_operation");
       const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
