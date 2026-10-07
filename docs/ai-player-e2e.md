@@ -48,13 +48,15 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 次の3つは既定matrixから除外した実GPT opt-in targetです。いずれも一回の単独targetで実行します。
 
-- `companion_proactive_food`: owner指示なし・無被弾・health 20で、food 6–8時に視認可能な約4ブロック先のbreadを自発的に取得・使用する流れを観測します。取得前のdropと空inventory、成功same-life Body接近または収集操作、RCON上の接近、Body/RCON inventory delta、drop消失、食料ゲージ上昇を照合します。`collect_item`を使った場合は同じentityへの`item_collected`も記録しますが、固定tool選択は要求しません。このcaseは空腹回復だけを確認し、health回復は検証しません。fixture設置前の行動は受入証拠に含めません。
+- `companion_proactive_food`: owner指示なし・無被弾・health 20で、food 6–8時に視認可能な約4ブロック先のbreadを自発的に取得・使用する流れを観測します。fixture準備はHunger effect amplifier 40を設定し、RCONでfoodを200ms間隔・最大45秒まで待ちます。取得前のdropと空inventory、成功same-life Body接近または収集操作、RCON上の接近、Body/RCON inventory delta、drop消失、食料ゲージ上昇を照合します。`collect_item`を使った場合は同じentityへの`item_collected`も記録しますが、固定tool選択は要求しません。このcaseは空腹回復だけを確認し、health回復は検証しません。fixture設置前の行動は受入証拠に含めません。
 - `companion_proactive_bed`: 一度の作成依頼から同じgoalの継続、crafting tableとbedの設置、対象owner goal自身の`completed` / `complete`状態を確認します。設置位置はBody perceptionから見つけてRCONでblock readbackし、設置後に視認できず位置を発見できない場合は未確認です。Bed依頼一回だけではBot自身の希望や返答の意味を証明できず、その意味確認は別のprivate ConversationAgent probeで行います。
 - `companion_proactive_threat`: owner指示なしのfresh applicationで、夜間・自然spawn停止の隔離arenaに実AIのzombieを1体、Botから約14ブロックへ配置します。このtargetだけ合成owner/guest clientをspectatorへ切り替え、RCONの`playerGameType`で両clientがspectator、Botがsurvivalのままであることを確認します。
   fresh Body observationとserver oracleで敵の存在・距離を照合し、fresh Purposeの同じ移動判断から始まったsame-lifeの位置変更Body actionを確認します。action前Body healthがbaselineと一致し、自然回復を無効にしたうえで、action後のBody/RCON位置・敵距離・HPを照合します。
   移動方向や特定の移動toolは固定せず、HP低下なしも許容します。この代表caseは被弾前の位置調整だけを見ます。他の応答方法はこのcaseで判定せず、製品失敗とは扱いません。機械判定は被弾前の位置変更とBody/RCONの物理結果を確認します。P3の受入では、保存されたjudgmentの目的と距離・体力変化を照合して戦術的な意味を判断します。被弾時刻はRCON healthの観測時点であり、連続tick単位の判定ではありません。fixture cleanupを確認します。
 
-foodとthreat targetは32 calls / 280,000 known tokens、case期限8分、run全体10分までで停止します。食料使用の観測窓はfixture設置後3分です。bed targetは80 calls / 800,000 known tokens、case期限20分、run全体25分を使います。foodの初回実測は`RUN_LLM_BUDGET_EXCEEDED`でincompleteでした。Body/RCON上の取得は確認しましたがconsumeはなく、合格扱いにしません。food 15時のgolden appleでは温存判断があり得るため、次runではbreadとfood 6–8を使います。成功条件は維持し、予算上限は既知の初回消費を踏まえて下げました。既存API key、Paper jar、EULA、Java 21の設定を使い、run artifactには会話本文を含めません。意味確認用probeのraw会話は公開しません。
+foodとthreat targetは32 calls / 280,000 known tokens、case期限8分、run全体10分までで停止します。食料使用の観測窓はfixture設置後3分です。bed targetは80 calls / 800,000 known tokens、case期限20分、run全体25分を使います。
+
+foodのgolden apple初回runは`RUN_LLM_BUDGET_EXCEEDED`でincompleteでした。Body/RCON上の取得は確認しましたがconsumeはなく、合格扱いにしません。breadへ変更した次のrunはfixture開始前に`PROACTIVE_FOOD_HUNGER_FIXTURE_UNAVAILABLE`でincompleteでした（81秒、9 calls、30,603 known tokens）。そのartifactにfood readback値はなく、到達値は不明です。これはfixture準備の失敗で、Botの自律行動の成否を示しません。次のfixture確認ではHunger effect amplifier 40、200ms readback、最大45秒の条件を使い、fixture wait終了時のfood/health実測値だけをdiagnosticへ残します。既存API key、Paper jar、EULA、Java 21の設定を使い、run artifactに会話本文を含めません。意味確認用probeのraw会話は公開しません。
 
 ```sh
 AI_PLAYER_E2E_CONFIRMED=YES AI_PLAYER_E2E_TARGET_CASE=companion_proactive_food npm exec -- tsx tests/e2e/ai-player-live.ts

@@ -679,15 +679,36 @@ async function runFoodPhase(
   const responseBaseline = port.responses().length;
   try {
     await prepareArena(port);
+    const foodFixtureStartFood = await port.readFoodLevel();
+    const foodFixtureStartHealth = await port.readHealth();
     await port.rcon.command(
-      `effect give ${port.botName} minecraft:hunger 120 8 true`,
+      `effect give ${port.botName} minecraft:hunger 120 40 true`,
     );
     const hungerDeadline = Date.now() + 45_000;
+    const hungerEffectAppliedAt = Date.now();
     let foodBefore = await port.readFoodLevel();
+    let hungerSamples = 1;
     while (foodBefore > 8 && Date.now() < hungerDeadline) {
       await sleep(200);
       foodBefore = await port.readFoodLevel();
+      hungerSamples += 1;
     }
+    const hungerHealthAtStop = await port.readHealth();
+    const hungerBandConfirmed = foodBefore >= 6 && foodBefore <= 8;
+    port.updateDiagnostic({
+      foodFixtureAmplifier: 40,
+      foodFixtureDeadlineMs: 45_000,
+      foodFixturePollIntervalMs: 200,
+      foodFixtureStartFood,
+      foodFixtureStartHealth,
+      foodFixtureObservedFood: foodBefore,
+      foodFixtureObservedHealth: hungerHealthAtStop,
+      foodFixtureElapsedMs: Date.now() - hungerEffectAppliedAt,
+      foodFixtureSampleCount: hungerSamples,
+      foodFixtureBandConfirmed: hungerBandConfirmed,
+      foodFixtureHealthPreserved:
+        foodFixtureStartHealth === 20 && hungerHealthAtStop === 20,
+    });
     if (foodBefore < 6 || foodBefore > 8)
       throw new CompanionProactiveAcceptanceError(
         "PROACTIVE_FOOD_HUNGER_FIXTURE_UNAVAILABLE",
