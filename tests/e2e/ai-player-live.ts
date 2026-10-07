@@ -103,6 +103,7 @@ import {
   CompanionProactiveAcceptanceError,
   companionProactivePhaseForTarget,
   isCompanionProactiveTarget,
+  parsePlayerGameModeReadback,
   runCompanionProactiveAcceptanceCase,
   type CompanionProactiveTargetCase,
 } from "./companion-proactive-acceptance.js";
@@ -5284,6 +5285,14 @@ async function main(): Promise<void> {
           const applicationPlayerBody = activeApplicationPlayerBody;
           if (applicationPlayerBody === undefined)
             incomplete("COMPANION_PROACTIVE_APPLICATION_BODY_UNAVAILABLE");
+          if (targetCase === "companion_proactive_threat")
+            await prepareThreatObserverPlayers(
+              state,
+              context.rcon,
+              context.ownerName,
+              state.guestName,
+              context.botName,
+            );
           try {
             return await runCompanionProactiveAcceptanceCase({
               targetCase,
@@ -10465,6 +10474,51 @@ async function setAndVerifyGamerule(
   const reportedValue = /(?:^|\s)(true|false|\d+)$/u.exec(readback)?.[1];
   if (!ruleIdDisplayed || reportedValue !== String(value))
     incomplete(readbackFailure);
+}
+
+async function prepareThreatObserverPlayers(
+  state: RunState,
+  rcon: LocalRcon,
+  ownerName: string,
+  guestName: string,
+  botName: string,
+): Promise<void> {
+  const ownerMode = await setThreatObserverSpectator(rcon, ownerName);
+  const guestMode = await setThreatObserverSpectator(rcon, guestName);
+  const botMode = await readPlayerGameMode(rcon, botName);
+  const ownerSpectatorVerified = ownerMode === 3;
+  const guestSpectatorVerified = guestMode === 3;
+  const botSurvivalVerified = botMode === 0;
+  state.companionProactiveDiagnostic = {
+    phase: "threat",
+    ownerSpectatorVerified,
+    guestSpectatorVerified,
+    botSurvivalVerified,
+  };
+  if (
+    !ownerSpectatorVerified ||
+    !guestSpectatorVerified ||
+    !botSurvivalVerified
+  ) {
+    incomplete("COMPANION_PROACTIVE_THREAT_PLAYER_MODES_UNCONFIRMED");
+  }
+}
+
+async function setThreatObserverSpectator(
+  rcon: LocalRcon,
+  playerName: string,
+): Promise<number | undefined> {
+  await rcon.command(`gamemode spectator ${playerName}`);
+  return readPlayerGameMode(rcon, playerName);
+}
+
+async function readPlayerGameMode(
+  rcon: LocalRcon,
+  playerName: string,
+): Promise<number | undefined> {
+  return parsePlayerGameModeReadback(
+    await rcon.command(`data get entity ${playerName} playerGameType`),
+  );
 }
 
 async function assertNoOperators(state: RunState): Promise<void> {

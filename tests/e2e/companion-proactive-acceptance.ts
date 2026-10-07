@@ -61,6 +61,13 @@ export function companionProactivePhaseForTarget(
   return target.phase;
 }
 
+export function parsePlayerGameModeReadback(reply: string): number | undefined {
+  const value = /(?:^|:\s*)(\d+)\s*$/u.exec(reply.trim())?.[1];
+  if (value === undefined) return undefined;
+  const gameMode = Number(value);
+  return Number.isSafeInteger(gameMode) ? gameMode : undefined;
+}
+
 export interface CompanionProactiveAction {
   readonly kind: string;
   readonly status: string;

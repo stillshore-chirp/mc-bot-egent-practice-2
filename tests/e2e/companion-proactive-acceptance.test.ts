@@ -10,6 +10,7 @@ import {
   COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
+  parsePlayerGameModeReadback,
   proactiveBedCompletionConfirmed,
   proactiveFoodUseConfirmed,
   proactiveThreatResponseConfirmed,
@@ -49,6 +50,18 @@ const successfulMove = {
 } as const;
 
 describe("companion proactive acceptance", () => {
+  it("parses the playerGameType value from an RCON entity readback", () => {
+    expect(
+      parsePlayerGameModeReadback(
+        "Example player has the following entity data: 3",
+      ),
+    ).toBe(3);
+    expect(parsePlayerGameModeReadback("Example player has following: 0")).toBe(
+      0,
+    );
+    expect(parsePlayerGameModeReadback("No entity was found")).toBeUndefined();
+  });
+
   it("keeps proactive targets as independent opt-in cases", () => {
     for (const target of [
       "companion_proactive_food",
