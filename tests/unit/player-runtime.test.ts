@@ -88,6 +88,38 @@ describe("integrated player runtime", () => {
     expect(signature(nearbyEast)).not.toBe(signature(nearbySouth));
   });
 
+  it("wakes on dropped item name and count changes without tracking drop position", () => {
+    const base = observation();
+    const drop = (id: number, name: string, count: number) => ({
+      id,
+      name: "item",
+      kind: "item",
+      category: null,
+      position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+      distance: 2,
+      health: null,
+      isPlayer: false,
+      droppedItem: { name, count },
+    });
+    const signature = (
+      entities: PlayerBodyObservation["perception"]["entities"],
+    ) =>
+      semanticSignatures({
+        ...base,
+        perception: { ...base.perception, entities },
+      }).drops;
+
+    expect(signature([drop(1, "diamond", 2)])).not.toBe(
+      signature([drop(1, "diamond", 3)]),
+    );
+    expect(signature([drop(1, "diamond", 2)])).not.toBe(
+      signature([drop(1, "emerald", 2)]),
+    );
+    expect(signature([drop(1, "diamond", 2), drop(2, "diamond", 3)])).toBe(
+      signature([drop(3, "diamond", 5)]),
+    );
+  });
+
   it("wakes on the nearest relevant block band without counting duplicate blocks", () => {
     const base = observation();
     const log = {
@@ -916,6 +948,213 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.messages.length === 1);
       expect(fixture.messages[0]).toContain(scenario.expected);
       expect(fixture.messages[0]).not.toContain(scenario.unexpected);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    {
+      label: "unknown registry item",
+      operation: { kind: "craft", item: "mod:missing_item", count: 1 },
+      failureReason: {
+        code: "unknown_registry_item",
+        itemName: "mod:missing_item",
+      },
+      expectedSummary:
+        "failure=unknown_registry_item; registryにmod:missing_itemがありません",
+      expectedChat: undefined,
+    },
+    {
+      label: "missing inventory item",
+      operation: {
+        kind: "equip",
+        item: "iron_helmet",
+        destination: "head",
+      },
+      failureReason: {
+        code: "item_not_in_inventory",
+        itemName: "iron_helmet",
+      },
+      expectedSummary:
+        "failure=item_not_in_inventory; 所持品にiron_helmetがありません",
+      expectedChat: "所持品にiron_helmetがありません。",
+    },
+    {
+      label: "no recipe from observed inventory and surface",
+      operation: { kind: "craft", item: "minecraft:white_bed", count: 1 },
+      failureReason: {
+        code: "no_recipe_for_current_inventory_and_surface",
+        itemName: "minecraft:white_bed",
+      },
+      expectedSummary:
+        "failure=no_recipe_for_current_inventory_and_surface; 現在の所持品と利用可能な作業面でminecraft:white_bedのrecipeなし",
+      expectedChat: undefined,
+    },
+  ] as const)("preserves the confirmed $label reason", async (scenario) => {
+    const fixture = createRuntimeFixture();
+    const before = observation();
+    fixture.body.setResultObservations(before, before);
+    fixture.body.setResultDetail("A concise underlying operation error.");
+    fixture.body.setResultFailureReason(scenario.failureReason);
+    const decision = action(`failure-reason-${scenario.label}`, {
+      ...scenario.operation,
+    });
+    const saved = fixture.mind.commitThought({
+      expectedRevision: fixture.mind.snapshot().revision,
+      decision,
+    });
+    if (!saved.accepted) throw new Error("TEST_FAILURE_REASON_COMMIT_REJECTED");
+
+    try {
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.body.completeActive("failed");
+      await waitFor(
+        () =>
+          fixture.mind.snapshot().lastOutcome?.operationId ===
+          decision.operationId,
+      );
+      expect(fixture.mind.snapshot().lastOutcome?.summary).toContain(
+        scenario.expectedSummary,
+      );
+      if (scenario.expectedChat !== undefined) {
+        await waitFor(() => fixture.messages.length === 1);
+        expect(fixture.messages[0]).toContain(scenario.expectedChat);
+        expect(fixture.messages[0]).not.toContain(
+          "原因は観測から特定できていません。",
+        );
+      } else {
+        expect(fixture.messages).toHaveLength(0);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("suppresses repeated equip failure notices until the result changes", async () => {
+    const fixture = createRuntimeFixture();
+    const proposal = fixture.mind.addProposal({
+      title: "Try the helmet",
+      reason: "The owner asked the bot to equip the helmet.",
+      priority: 4,
+    });
+    const before = observation();
+    const afterEquipped: PlayerBodyObservation = {
+      ...before,
+      self: {
+        ...before.self,
+        equipment: { head: observedStack("iron_helmet", 5) },
+      },
+    };
+    let startedCount = 0;
+    const submit = async (options: {
+      readonly id: string;
+      readonly status: PlayerOperationResult["status"];
+      readonly detail: string;
+      readonly before?: PlayerBodyObservation;
+      readonly after?: PlayerBodyObservation;
+      readonly resolution?: string;
+    }): Promise<Extract<PlayerThoughtDecision, { kind: "act" }>> => {
+      const operation = {
+        kind: "equip" as const,
+        item: "iron_helmet",
+        destination: "head" as const,
+      };
+      fixture.body.setResultObservations(
+        options.before ?? before,
+        options.after ?? before,
+      );
+      fixture.body.setResultDetail(options.detail);
+      const decision = action(options.id, operation);
+      const saved = fixture.mind.commitThought({
+        expectedRevision: fixture.mind.snapshot().revision,
+        decision,
+        ...(options.resolution === undefined
+          ? {}
+          : {
+              proposalResolution: {
+                proposalId: proposal.id,
+                disposition: "adopted" as const,
+                resolution: options.resolution,
+              },
+            }),
+      });
+      if (!saved.accepted) throw new Error("TEST_EQUIP_COMMIT_REJECTED");
+      fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+      startedCount += 1;
+      await waitFor(() => fixture.body.started.length === startedCount);
+      fixture.body.completeActive(options.status);
+      await waitFor(
+        () =>
+          fixture.mind.snapshot().lastOutcome?.operationId ===
+          decision.operationId,
+      );
+      return decision;
+    };
+
+    try {
+      const firstFailure = await submit({
+        id: "equip-repeat-1",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+        resolution: "I will try the helmet and check the result.",
+      });
+      await waitFor(() => fixture.messages.length === 2);
+      expect(fixture.messages[0]).toBe(
+        "I will try the helmet and check the result.",
+      );
+      expect(fixture.messages[1]).toContain("装備操作は失敗しました。");
+
+      const repeatedFailure = await submit({
+        id: "equip-repeat-2",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+      });
+      expect(fixture.messages).toHaveLength(2);
+      expect(fixture.mind.snapshot().lastOutcome).toMatchObject({
+        operationId: repeatedFailure.operationId,
+        kind: "equip",
+        status: "failed",
+      });
+      expect(fixture.mind.snapshot().lastOutcome?.summary).toContain(
+        "detail=The requested item cannot be equipped",
+      );
+
+      await submit({
+        id: "equip-repeat-success",
+        status: "successful",
+        detail: "Observed post-action state confirms the requested effect.",
+        after: afterEquipped,
+      });
+      await waitFor(() => fixture.messages.length === 3);
+
+      await submit({
+        id: "equip-repeat-after-success",
+        status: "failed",
+        detail: "The requested item cannot be equipped in this slot.",
+      });
+      await waitFor(() => fixture.messages.length === 4);
+
+      await submit({
+        id: "equip-distinct-failure",
+        status: "failed",
+        detail: "The equipment request was rejected by the client.",
+      });
+      await waitFor(() => fixture.messages.length === 5);
+
+      await submit({
+        id: "equip-distinct-failure-repeat",
+        status: "failed",
+        detail: "The equipment request was rejected by the client.",
+      });
+      expect(fixture.messages).toHaveLength(5);
+      expect(
+        fixture.mind
+          .pendingEvents(32)
+          .some(({ kind }) => kind === "body_outcome"),
+      ).toBe(true);
+      expect(firstFailure.operationId).not.toBe(repeatedFailure.operationId);
     } finally {
       await fixture.close();
     }
@@ -2727,6 +2966,134 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("flushes a coalesced drop change once while preserving a later Purpose wait", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let thoughtCount = 0;
+    const seenEvents: string[][] = [];
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        seenEvents.push(
+          events.map(({ kind, summary }) => `${kind}:${summary}`),
+        );
+        const nextWait =
+          thoughtCount === 1
+            ? {
+                kind: "wait" as const,
+                purpose: "watch nearby useful changes",
+                reason: "wait for a semantic observation",
+                wakeOn: ["state_changed" as const],
+              }
+            : thoughtCount === 3
+              ? {
+                  kind: "wait" as const,
+                  purpose: "wait for a body result",
+                  reason: "do not wake for ordinary observations",
+                  wakeOn: ["body_outcome" as const],
+                }
+              : undefined;
+        if (nextWait !== undefined) {
+          const runtimeFixture = fixtureRef.current;
+          if (runtimeFixture === undefined)
+            throw new Error("runtime fixture unavailable");
+          const saved = runtimeFixture.mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision: nextWait,
+          });
+          if (!saved.accepted) return { accepted: false };
+          runtimeFixture.runtime.handleCommittedDecision(
+            saved.snapshot,
+            nextWait,
+          );
+        }
+        fixtureRef.current?.mind.consumeEvents(events.map(({ id }) => id));
+        return {
+          accepted: true,
+          ...(nextWait === undefined ? {} : { decision: nextWait }),
+        };
+      },
+    });
+    fixtureRef.current = fixture;
+
+    const dropObservation = (count: number): PlayerBodyObservation => {
+      const base = observation();
+      return {
+        ...base,
+        observedAt: new Date().toISOString(),
+        perception: {
+          ...base.perception,
+          entities: [
+            {
+              id: 1,
+              name: "item",
+              kind: "item",
+              category: null,
+              position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+              distance: 2,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "diamond", count },
+            },
+          ],
+        },
+      };
+    };
+    const emitDropCount = (count: number): void => {
+      fixture.body.setObservation(dropObservation(count));
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "entities",
+        at: new Date().toISOString(),
+      });
+    };
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      expect(fixture.mind.snapshot().wait?.wakeOn).toEqual(["state_changed"]);
+
+      vi.useFakeTimers();
+      emitDropCount(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(thoughtCount).toBe(2);
+      expect(seenEvents[1]?.some((event) => event.includes("drops"))).toBe(
+        true,
+      );
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      emitDropCount(2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(thoughtCount).toBe(2);
+      await vi.advanceTimersByTimeAsync(10_999);
+      expect(thoughtCount).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(thoughtCount).toBe(3);
+      expect(seenEvents[2]?.some((event) => event.includes("drops"))).toBe(
+        true,
+      );
+      expect(fixture.mind.snapshot().wait?.wakeOn).toEqual(["body_outcome"]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      emitDropCount(3);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(thoughtCount).toBe(3);
+      expect(
+        fixture.mind
+          .pendingEvents(64)
+          .some(
+            ({ kind, summary }) =>
+              kind === "state_changed" && summary.includes("drops"),
+          ),
+      ).toBe(true);
+    } finally {
+      await fixture.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("clears a queued body outcome on explicit stop and does not restart after settlement", async () => {
     const directory = temporaryDirectory();
     const databasePath = join(directory, "player.sqlite");
@@ -3948,6 +4315,7 @@ class DeferredBody implements PlayerBody {
   #resultAfter: PlayerBodyObservation | null = null;
   #resultSameLife: boolean | null | undefined;
   #resultDetail: string | undefined;
+  #resultFailureReason: PlayerOperationResult["failureReason"];
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
@@ -3979,6 +4347,12 @@ class DeferredBody implements PlayerBody {
 
   public setResultDetail(value: string): void {
     this.#resultDetail = value;
+  }
+
+  public setResultFailureReason(
+    value: NonNullable<PlayerOperationResult["failureReason"]>,
+  ): void {
+    this.#resultFailureReason = value;
   }
 
   public completeActive(status: PlayerOperationResult["status"]): void {
@@ -4033,6 +4407,9 @@ class DeferredBody implements PlayerBody {
           ...(this.#resultDetail === undefined
             ? {}
             : { detail: this.#resultDetail }),
+          ...(this.#resultFailureReason === undefined
+            ? {}
+            : { failureReason: this.#resultFailureReason }),
           recoveryRequired,
           ...(this.#lookSweepOnNextResult === undefined
             ? {}
@@ -4040,6 +4417,7 @@ class DeferredBody implements PlayerBody {
         };
         this.#resultSameLife = undefined;
         this.#resultDetail = undefined;
+        this.#resultFailureReason = undefined;
         this.#lookSweepOnNextResult = undefined;
         if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);

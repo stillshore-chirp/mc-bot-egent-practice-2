@@ -12,6 +12,7 @@ import { playerOperationNames } from "../../src/minecraft/player-body-schema.js"
 import type {
   PlayerBody,
   PlayerBodyObservation,
+  PlayerKnowledge,
 } from "../../src/minecraft/player-body.js";
 import type {
   OwnerProposal,
@@ -21,6 +22,7 @@ import type {
 } from "../../src/player/contracts.js";
 import {
   compactSnapshot,
+  conversationReplyNeedsRefresh,
   PlayerConversationAgent,
   PlayerPurposeAgent,
   playerOperationCatalog,
@@ -41,6 +43,200 @@ afterEach(() => {
 });
 
 describe("player owner intent context", () => {
+  it("uses registry prerequisites and Body results to continue the same owner goal", async () => {
+    let observation = observationWithInventory([
+      itemStack(0, 17, "oak_log", 1),
+      itemStack(1, 35, "white_wool", 3),
+    ]);
+    const knowledgeQueries: string[] = [];
+    const fixture = openPurposeFixture(
+      createMemoryPort(),
+      [],
+      undefined,
+      async () => observation,
+      (query) => {
+        knowledgeQueries.push(query);
+        if (query === "white_bed")
+          return knowledgeFixture(
+            query,
+            1,
+            true,
+            [
+              { name: "white_wool", count: 3 },
+              { name: "oak_planks", count: 3 },
+            ],
+            false,
+          );
+        if (query === "oak_planks")
+          return knowledgeFixture(
+            query,
+            4,
+            false,
+            [{ name: "oak_log", count: 1 }],
+            true,
+          );
+        if (query === "crafting_table")
+          return knowledgeFixture(
+            query,
+            1,
+            false,
+            [{ name: "oak_planks", count: 4 }],
+            true,
+          );
+        throw new Error("UNEXPECTED_KNOWLEDGE_QUERY");
+      },
+    );
+    const savedGoal = fixture.mind.commitGoalState({
+      expectedRevision: fixture.mind.snapshot().revision,
+      goal: {
+        id: "owner-bed-goal",
+        title: "Make a white bed",
+        status: "active",
+        priority: 3,
+        changeReason: "The owner asked for a bed.",
+        source: "owner",
+      },
+    });
+    expect(savedGoal.accepted).toBe(true);
+    try {
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: "failed-direct-bed-craft",
+          kind: "craft",
+          status: "failed",
+          summary:
+            "failure=no_recipe_for_current_inventory_and_surface; bed materials or surface were missing",
+          observedAt: "2026-10-08T00:00:00.000Z",
+        },
+      });
+      fixture.responses.push(
+        functionCallResponse("bed-recipe", "ask_body_knowledge", {
+          query: "white_bed",
+        }),
+        functionCallResponse("plank-recipe", "ask_body_knowledge", {
+          query: "oak_planks",
+        }),
+        functionCallResponse(
+          "prepare-planks",
+          "commit_action_decision",
+          craftActionArguments("owner-bed-goal", "oak_planks"),
+        ),
+      );
+      const prepared = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(prepared).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "craft", item: "oak_planks", count: 1 },
+        },
+      });
+      expect(knowledgeQueries).toEqual(["white_bed", "oak_planks"]);
+      const initialRequest = record(fixture.requests[0]);
+      expect(JSON.stringify(initialRequest.input)).toContain(
+        "failure=no_recipe_for_current_inventory_and_surface",
+      );
+      const instructions = String(initialRequest.instructions);
+      expect(instructions).toContain("ownerから新しい依頼がない時も");
+      expect(instructions).toContain("同じownerの意図への催促・言い換え");
+      expect(JSON.stringify(initialRequest.tools)).toContain(
+        "currentlyCraftableは作業台がある前提",
+      );
+      const firstKnowledge = functionCallOutputs(fixture.requests.slice(0, 3));
+      expect(firstKnowledge).toContain('"assessedCount":1');
+      expect(firstKnowledge).toContain('"craftingTableNearby":false');
+      expect(firstKnowledge).toContain(
+        '"materialAvailabilityWithTable":"insufficient"',
+      );
+      expect(firstKnowledge).toContain('"count":4');
+      const firstDecision = prepared.decision;
+      if (firstDecision?.kind !== "act")
+        throw new Error("TEST_PREPARATION_ACTION_MISSING");
+
+      observation = observationWithInventory([
+        itemStack(0, 5, "oak_planks", 4),
+        itemStack(1, 35, "white_wool", 3),
+      ]);
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: firstDecision.operationId,
+          kind: "craft",
+          status: "successful",
+          summary:
+            "craft successful; the fresh inventory contains four oak planks",
+          observedAt: "2026-10-08T00:00:05.000Z",
+          expectedOutcome: firstDecision.expectedOutcome,
+        },
+      });
+      fixture.responses.push(
+        functionCallResponse("table-recipe", "ask_body_knowledge", {
+          query: "crafting_table",
+        }),
+        functionCallResponse(
+          "continue-bed-goal",
+          "commit_action_decision",
+          craftActionArguments("owner-bed-goal", "crafting_table"),
+        ),
+      );
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(continued).toMatchObject({
+        accepted: true,
+        decision: {
+          kind: "act",
+          operation: { kind: "craft", item: "crafting_table", count: 1 },
+        },
+      });
+      expect(knowledgeQueries).toEqual([
+        "white_bed",
+        "oak_planks",
+        "crafting_table",
+      ]);
+      const continuedKnowledge = functionCallOutputs(fixture.requests.slice(3));
+      expect(continuedKnowledge).toContain('"craftingTableNearby":false');
+      expect(continuedKnowledge).toContain(
+        '"materialAvailabilityWithTable":"sufficient"',
+      );
+      const continuationRequest = record(fixture.requests[3]);
+      expect(JSON.stringify(continuationRequest.input)).toContain(
+        "craft successful; the fresh inventory contains four oak planks",
+      );
+      if (!Array.isArray(continuationRequest.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const continuationPayload = JSON.parse(
+        String(record(continuationRequest.input[0]).content),
+      ) as {
+        observation: {
+          self: {
+            inventory: readonly { name: string; count: number }[];
+          };
+        };
+      };
+      expect(continuationPayload.observation.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "oak_planks", count: 4 }),
+      );
+      expect(
+        fixture.mind
+          .snapshot()
+          .goals.filter(({ source }) => source === "owner"),
+      ).toEqual([
+        expect.objectContaining({
+          id: "owner-bed-goal",
+          title: "Make a white bed",
+          status: "active",
+        }),
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it.each(["body_outcome", "owner_proposal"] as const)(
     "keeps completed response usage and skips stale purpose tools and rounds when %s arrives",
     async (staleKind) => {
@@ -1152,6 +1348,259 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("refreshes a drafted reply only when current goals or action results changed", () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    try {
+      const initial = fixture.mind.snapshot();
+      const pendingProposal: OwnerProposal = {
+        id: "pending-only",
+        title: "Gather a few logs",
+        reason: "The owner asked for logs.",
+        createdAt: "2026-10-08T00:00:00.000Z",
+        priorityPreference: 2,
+        status: "pending",
+      };
+      const passiveUpdate: PlayerRuntimeSnapshot = {
+        ...initial,
+        revision: initial.revision + 1,
+        pendingEventKinds: ["state_changed"],
+        proposals: [...initial.proposals, pendingProposal],
+      };
+
+      expect(conversationReplyNeedsRefresh(initial, passiveUpdate)).toBe(false);
+      expect(
+        conversationReplyNeedsRefresh(initial, {
+          ...passiveUpdate,
+          actionRevision: initial.actionRevision + 1,
+        }),
+      ).toBe(true);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("discards a stale draft and makes one response-only pass from resolved goal state", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Gather a few logs",
+      reason: "The owner wants logs for the shelter.",
+      priority: 3,
+    });
+    const observation = bodyObservationFixture();
+    const observedAt = "2026-10-08T00:00:01.000Z";
+    const observationWithDrop: PlayerBodyObservation = {
+      ...observation,
+      observedAt,
+      self: {
+        ...observation.self,
+        inventory: [
+          {
+            slot: 0,
+            itemId: 297,
+            name: "bread",
+            count: 2,
+            metadata: 0,
+            durability: null,
+            maxDurability: null,
+            customName: null,
+            enchantments: [],
+          },
+        ],
+      },
+      perception: {
+        ...observation.perception,
+        entities: [
+          {
+            id: 44,
+            name: "item",
+            kind: "item",
+            category: "Item",
+            position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+            distance: 2,
+            health: null,
+            isPlayer: false,
+            droppedItem: { name: "golden_apple", count: 1 },
+          },
+        ],
+      },
+    };
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => observationWithDrop,
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("refresh-observe", "observe_body", {}),
+      async () => {
+        const current = fixture.mind.snapshot();
+        const changed = fixture.mind.commitGoalState({
+          expectedRevision: current.revision,
+          goal: {
+            title: "Gather a few logs for the shelter",
+            status: "active",
+            priority: 3,
+            changeReason: "The current situation supports this goal.",
+            source: "owner",
+          },
+          proposalResolution: {
+            proposalId: proposal.id,
+            disposition: "adopted",
+            resolution: "I will gather them after checking what is nearby.",
+          },
+        });
+        expect(changed.accepted).toBe(true);
+        return terminalResponse("I will start the pending plan now.");
+      },
+      terminalResponse("I have taken the shelter logs as my active goal."),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What do you want to do?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(3);
+      expect(messages).toEqual([
+        "I have taken the shelter logs as my active goal.",
+      ]);
+      const refreshedRequest = record(fixture.requests[2]);
+      const initialRequest = record(fixture.requests[0]);
+      const refreshedInputText = Array.isArray(refreshedRequest.input)
+        ? refreshedRequest.input
+            .map((item) => {
+              const content = record(item).content;
+              return typeof content === "string" ? content : "";
+            })
+            .join("\n")
+        : String(refreshedRequest.input);
+      expect(refreshedRequest.tools).toEqual([]);
+      expect(refreshedRequest.tool_choice).toBe("none");
+      expect(String(initialRequest.instructions)).toContain(
+        "『何が欲しい』『何をしたい』",
+      );
+      expect(String(initialRequest.instructions)).toContain(
+        "inspect_player_statusやobserve_bodyを使い",
+      );
+      expect(refreshedInputText).toContain("Gather a few logs for the shelter");
+      expect(refreshedInputText).toContain(observedAt);
+      expect(refreshedInputText).toContain('"name":"golden_apple"');
+      expect(refreshedInputText).toContain('"count":1');
+      expect(refreshedInputText).not.toContain('"id":44');
+      expect(refreshedInputText).not.toContain('"x":2');
+      expect(refreshedInputText).not.toContain(
+        "I will start the pending plan now.",
+      );
+      expect(String(refreshedRequest.instructions)).toContain(
+        "snapshot以降の実行状況が不明なら",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("uses a freshly inspected player snapshot as the drafted reply baseline", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(async () => {
+      const current = fixture.mind.snapshot();
+      const changed = fixture.mind.commitGoalState({
+        expectedRevision: current.revision,
+        goal: {
+          title: "Find shelter wood",
+          status: "active",
+          priority: 2,
+          changeReason: "The owner asked for current intent.",
+          source: "owner",
+        },
+      });
+      expect(changed.accepted).toBe(true);
+      return functionCallResponse(
+        "inspect-current-status",
+        "inspect_player_status",
+        {},
+      );
+    }, terminalResponse("I am working toward finding shelter wood."));
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What goal are you working on?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(2);
+      expect(messages).toEqual(["I am working toward finding shelter wood."]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not refresh or deliver a conversation draft after its turn becomes stale", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(async () => {
+      conversation.nextTurn();
+      return terminalResponse("This belongs to an older owner turn.");
+    });
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "What do you want to do?",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(messages).toEqual([]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("gives ordinary owner proposal resolutions a concrete first-person shape", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
     const proposal = fixture.mind.addProposal({
@@ -1834,6 +2283,7 @@ function openPurposeFixture(
   ownerPositionExceptions: boolean[] = [],
   onRoundActivity?: (activity: PlayerAgentRoundActivity) => void,
   observeBody?: PlayerBody["observe"],
+  knowledgeBody?: PlayerBody["knowledge"],
 ): PurposeFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-owner-intent-"));
   temporaryDirectories.push(directory);
@@ -1867,6 +2317,11 @@ function openPurposeFixture(
         };
       }
       return observation;
+    },
+    knowledge: (query: string) => {
+      if (knowledgeBody === undefined)
+        throw new Error("TEST_BODY_KNOWLEDGE_NOT_CONFIGURED");
+      return knowledgeBody(query);
     },
   } as unknown as PlayerBody;
   const agent = new PlayerPurposeAgent({
@@ -1948,6 +2403,85 @@ function bodyObservationFixture(): PlayerBodyObservation {
       entities: [],
     },
     window: null,
+  };
+}
+
+function observationWithInventory(
+  inventory: PlayerBodyObservation["self"]["inventory"],
+  observedAt = "2026-10-08T00:00:01.000Z",
+): PlayerBodyObservation {
+  const observation = bodyObservationFixture();
+  return {
+    ...observation,
+    observedAt,
+    self: { ...observation.self, inventory },
+  };
+}
+
+function itemStack(
+  slot: number,
+  itemId: number,
+  name: string,
+  count: number,
+): PlayerBodyObservation["self"]["inventory"][number] {
+  return {
+    slot,
+    itemId,
+    name,
+    count,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
+    customName: null,
+    enchantments: [],
+  };
+}
+
+function knowledgeFixture(
+  query: string,
+  outputCount: number,
+  requiresTable: boolean,
+  ingredients: readonly { readonly name: string; readonly count: number }[],
+  craftable: boolean,
+): PlayerKnowledge {
+  return {
+    source: "minecraft_registry",
+    gameVersion: "test",
+    registryVersion: "test",
+    observedAt: "2026-10-08T00:00:02.000Z",
+    query,
+    facts: [
+      {
+        kind: "recipe",
+        result: { id: 1, name: query, count: outputCount },
+        requiresTable,
+        ingredients: ingredients.map((ingredient, id) => ({
+          id,
+          ...ingredient,
+        })),
+      },
+    ],
+    inferences: [
+      {
+        kind: "craftability",
+        itemName: query,
+        currentlyCraftable: craftable,
+        assessedCount: 1,
+        recipeStatus: "known",
+        tableRequirement: requiresTable ? "required" : "not_required",
+        craftingTableNearby: false,
+        craftableWithCurrentSurface: craftable,
+        materialAvailabilityWithTable: craftable
+          ? "sufficient"
+          : "insufficient",
+        basis: [
+          craftable
+            ? "Materials support one recipe."
+            : "Materials are insufficient.",
+        ],
+      },
+    ],
+    truncated: false,
   };
 }
 
@@ -2091,6 +2625,26 @@ function actionArguments(
   return args;
 }
 
+function craftActionArguments(
+  goalId: string,
+  item: string,
+): Record<string, unknown> {
+  const args = actionArguments(
+    goalArguments({
+      id: goalId,
+      title: "Make a white bed",
+      status: "active",
+      source: "owner",
+      reason: "Continue the same owner goal through a prerequisite.",
+    }),
+  );
+  args.operationJson = JSON.stringify({ kind: "craft", item, count: 1 });
+  args.purpose = `Prepare ${item} as the next step toward the existing bed goal.`;
+  args.expectedOutcome = `Observe the result of crafting ${item}.`;
+  args.reason = "The current recipe facts and inventory support this step.";
+  return args;
+}
+
 function resolveProposal(
   mind: PlayerMindStore,
   snapshot: PlayerRuntimeSnapshot,
@@ -2113,4 +2667,18 @@ function record(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     throw new Error("TEST_EXPECTED_OBJECT");
   return value as Record<string, unknown>;
+}
+
+function functionCallOutputs(requests: readonly unknown[]): string {
+  return requests
+    .flatMap((request) => {
+      const input = record(request).input;
+      return Array.isArray(input)
+        ? input
+            .filter((item) => record(item).type === "function_call_output")
+            .map((item) => record(item).output)
+        : [];
+    })
+    .filter((output): output is string => typeof output === "string")
+    .join("\n");
 }

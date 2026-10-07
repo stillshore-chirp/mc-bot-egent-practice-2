@@ -140,10 +140,20 @@ interface PendingThoughtWake {
   readonly deathAware: boolean;
 }
 
+interface EquipmentOutcomeNotificationState {
+  readonly failedSignatures: Set<string>;
+  lastSuccessfulSignature: string | undefined;
+}
+
 /** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
 export class PlayerRuntime {
   readonly #eventTimes = new Map<string, number>();
   readonly #semanticSignatures = new Map<string, string>();
+  readonly #pendingSemanticChanges = new Set<string>();
+  readonly #equipmentOutcomeNotifications = new Map<
+    Extract<PlayerOperation, { kind: "equip" }>["destination"],
+    EquipmentOutcomeNotificationState
+  >();
   readonly #lifetime = new AbortController();
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
@@ -164,6 +174,7 @@ export class PlayerRuntime {
   #revisionRetryUsed = false;
   #deadlineTimer: NodeJS.Timeout | undefined;
   #sampleTimer: NodeJS.Timeout | undefined;
+  #semanticWakeTimer: NodeJS.Timeout | undefined;
   #vitalsWakeTimer: NodeJS.Timeout | undefined;
   #samplePromise: Promise<void> | undefined;
   #retryDelayMs = 5_000;
@@ -830,7 +841,7 @@ export class PlayerRuntime {
       readonly damageAware?: boolean;
       readonly deathAware?: boolean;
     } = {},
-  ): void {
+  ): boolean {
     const now = Date.parse(at);
     const previous = this.#eventTimes.get(key) ?? 0;
     if (Number.isFinite(now) && now - previous < minimumGapMs) {
@@ -839,12 +850,14 @@ export class PlayerRuntime {
           invalidateDecision: true,
         });
         this.#requestThought(kind, event.summary, false, true);
+        return true;
       }
       if (kind === "state_changed" && summary.includes("vitals")) {
         this.options.mind.enqueueEvent(kind, summary);
         this.#scheduleVitalsWake(Math.max(1, minimumGapMs - (now - previous)));
+        return true;
       }
-      return;
+      return false;
     }
     this.#eventTimes.set(key, Number.isFinite(now) ? now : Date.now());
     const deferObservation =
@@ -865,6 +878,7 @@ export class PlayerRuntime {
       options.damageAware ?? false,
       options.deathAware ?? false,
     );
+    return true;
   }
 
   #requestThought(
@@ -1390,7 +1404,12 @@ export class PlayerRuntime {
     if (this.#activeBody === run) this.#activeBody = undefined;
     if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)
       await this.#sayWhileActive(ownerConsumeOutcomeMessage(result, outcome));
-    if (reportEquip !== undefined && !saved.stopped && !this.#shuttingDown)
+    if (
+      reportEquip !== undefined &&
+      !saved.stopped &&
+      !this.#shuttingDown &&
+      this.#shouldReportEquipmentOutcome(reportEquip, result, outcome)
+    )
       await this.#sayWhileActive(
         equipmentOutcomeMessage(reportEquip, result, outcome),
       );
@@ -1410,6 +1429,74 @@ export class PlayerRuntime {
       );
       this.#requestThought(event.kind, event.summary);
     }
+  }
+
+  #shouldReportEquipmentOutcome(
+    operation: Extract<PlayerOperation, { kind: "equip" }>,
+    result: PlayerOperationResult | undefined,
+    outcome: McSkillOutcomeStatus,
+  ): boolean {
+    const resultMatches =
+      result?.operation.kind === "equip" &&
+      result.operation.item === operation.item &&
+      result.operation.destination === operation.destination;
+    const before = equipmentSlotObservation(
+      resultMatches ? result.before : null,
+      operation.destination,
+    );
+    const after = equipmentSlotObservation(
+      resultMatches ? result.after : null,
+      operation.destination,
+    );
+    const equipmentChanged =
+      before.state !== "unobserved" &&
+      after.state !== "unobserved" &&
+      JSON.stringify(before) !== JSON.stringify(after);
+    const successful =
+      outcome === "successful" &&
+      after.state === "item" &&
+      after.itemName === operation.item;
+    const signature = JSON.stringify({
+      item: operation.item,
+      destination: operation.destination,
+      outcome,
+      detail:
+        result?.detail === undefined ? null : sanitizeDetail(result.detail),
+      failureReason: result?.failureReason ?? null,
+      sameLife: result?.sameLife ?? null,
+      recoveryRequired: result?.recoveryRequired ?? false,
+      before,
+      after,
+    });
+    const state = this.#equipmentOutcomeNotifications.get(
+      operation.destination,
+    ) ?? {
+      failedSignatures: new Set<string>(),
+      lastSuccessfulSignature: undefined,
+    };
+
+    if (equipmentChanged) {
+      state.failedSignatures.clear();
+      state.lastSuccessfulSignature = undefined;
+    }
+    if (successful) {
+      if (state.lastSuccessfulSignature === signature) return false;
+      state.failedSignatures.clear();
+      state.lastSuccessfulSignature = signature;
+      this.#equipmentOutcomeNotifications.set(operation.destination, state);
+      return true;
+    }
+
+    state.lastSuccessfulSignature = undefined;
+    if (state.failedSignatures.has(signature)) return false;
+    state.failedSignatures.add(signature);
+    while (state.failedSignatures.size > 12) {
+      const oldest = state.failedSignatures.values().next().value;
+      if (oldest === undefined) break;
+      state.failedSignatures.delete(oldest);
+    }
+    this.#equipmentOutcomeNotifications.set(operation.destination, state);
+    return true;
   }
 
   async #stopBody(reason: string): Promise<void> {
@@ -1568,21 +1655,15 @@ export class PlayerRuntime {
               criticalVitals &&
               Date.now() - this.#lastDamageEventAtMs <
                 damageObservationCoalesceMs;
-            const gap = criticalVitals
-              ? 3_000
-              : meaningful.includes("time")
-                ? 60_000
-                : 12_000;
-            if (!damageAlreadyReported)
-              this.enqueueAndWake(
-                "state_changed",
-                `観測上の意味のある変化: ${meaningful.join(", ")}`,
-                observation.observedAt,
-                `semantic:${meaningful.sort().join(",")}`,
-                gap,
-              );
+            if (damageAlreadyReported)
+              this.#pendingSemanticChanges.delete("vitals");
+            for (const kind of meaningful) {
+              if (!(kind === "vitals" && damageAlreadyReported))
+                this.#pendingSemanticChanges.add(kind);
+            }
           }
         }
+        this.#scheduleSemanticOpportunity();
       } catch (error) {
         // Disconnects and transient observation errors are handled by body/reconnect events.
         this.#logFailure("PLAYER_OBSERVATION_FAILED", error);
@@ -1614,9 +1695,68 @@ export class PlayerRuntime {
   #stopSampler(): void {
     if (this.#sampleTimer !== undefined) clearInterval(this.#sampleTimer);
     this.#sampleTimer = undefined;
+    if (this.#semanticWakeTimer !== undefined)
+      clearTimeout(this.#semanticWakeTimer);
+    this.#semanticWakeTimer = undefined;
     if (this.#vitalsWakeTimer !== undefined)
       clearTimeout(this.#vitalsWakeTimer);
     this.#vitalsWakeTimer = undefined;
+  }
+
+  #scheduleSemanticOpportunity(): void {
+    if (this.#semanticWakeTimer !== undefined)
+      clearTimeout(this.#semanticWakeTimer);
+    this.#semanticWakeTimer = undefined;
+    if (this.#pendingSemanticChanges.size === 0) return;
+    if (
+      this.#shuttingDown ||
+      !this.#bodyConnected ||
+      this.options.mind.snapshot().stopped
+    )
+      return;
+
+    const now = Date.now();
+    const kinds = [...this.#pendingSemanticChanges].sort();
+    const eligible: string[] = [];
+    let nextDelayMs = Number.POSITIVE_INFINITY;
+    for (const kind of kinds) {
+      const minimumGapMs =
+        kind === "vitals" ? 3_000 : kind === "time" ? 60_000 : 12_000;
+      const previous = this.#eventTimes.get(`semantic-kind:${kind}`) ?? 0;
+      const delayMs = previous + minimumGapMs - now;
+      if (delayMs <= 0) eligible.push(kind);
+      else nextDelayMs = Math.min(nextDelayMs, delayMs);
+    }
+    if (eligible.length > 0) {
+      const at = new Date(now).toISOString();
+      const queued = this.enqueueAndWake(
+        "state_changed",
+        `観測上の意味のある変化: ${eligible.join(", ")}`,
+        at,
+        "semantic-opportunity",
+        0,
+      );
+      if (queued) {
+        const deliveredAt = Date.now();
+        for (const kind of eligible) {
+          this.#pendingSemanticChanges.delete(kind);
+          this.#eventTimes.set(`semantic-kind:${kind}`, deliveredAt);
+        }
+      }
+      if (this.#pendingSemanticChanges.size === 0) return;
+      nextDelayMs = Math.min(
+        nextDelayMs,
+        queued ? Number.POSITIVE_INFINITY : 1,
+      );
+    }
+    this.#semanticWakeTimer = setTimeout(
+      () => {
+        this.#semanticWakeTimer = undefined;
+        this.#scheduleSemanticOpportunity();
+      },
+      Math.max(1, nextDelayMs),
+    );
+    this.#semanticWakeTimer.unref();
   }
 
   #scheduleVitalsWake(delayMs: number): void {
@@ -1796,6 +1936,9 @@ function groundedOperationSummary(
         ? "sameLife=true"
         : "sameLife=unknown";
   const parts = [
+    ...(result.failureReason === undefined
+      ? []
+      : [groundedFailureReasonSummary(result.failureReason)]),
     before.core,
     after.core,
     sameLife,
@@ -1823,6 +1966,20 @@ function groundedOperationSummary(
     summary = next;
   }
   return summary;
+}
+
+function groundedFailureReasonSummary(
+  failureReason: NonNullable<PlayerOperationResult["failureReason"]>,
+): string {
+  const itemName = safeDamageToken(failureReason.itemName, 80);
+  switch (failureReason.code) {
+    case "unknown_registry_item":
+      return `failure=unknown_registry_item; registryに${itemName}がありません`;
+    case "item_not_in_inventory":
+      return `failure=item_not_in_inventory; 所持品に${itemName}がありません`;
+    case "no_recipe_for_current_inventory_and_surface":
+      return `failure=no_recipe_for_current_inventory_and_surface; 現在の所持品と利用可能な作業面で${itemName}のrecipeなし`;
+  }
 }
 
 interface CompactHostileProjection {
@@ -2009,7 +2166,44 @@ function equipmentOutcomeMessage(
           : `実行後、${equipmentArea}には${equipment.name}があり、${operation.item}は確認できませんでした。`;
   if (outcome === "successful" && equipment?.name === operation.item)
     return `${statusMessage[outcome]}${observedMessage}`;
-  return `${statusMessage[outcome]}${observedMessage}原因は観測から特定できていません。`;
+  const failureReason = operationMatches ? result.failureReason : undefined;
+  const itemMissingFromInventory =
+    failureReason?.code === "item_not_in_inventory" &&
+    failureReason.itemName === operation.item;
+  const reasonMessage = itemMissingFromInventory
+    ? `所持品に${operation.item}がありません。`
+    : "原因は観測から特定できていません。";
+  return `${statusMessage[outcome]}${observedMessage}${reasonMessage}`;
+}
+
+function equipmentSlotObservation(
+  observation: PlayerBodyObservation | null | undefined,
+  destination: Extract<PlayerOperation, { kind: "equip" }>["destination"],
+):
+  | { readonly state: "unobserved" }
+  | { readonly state: "empty" }
+  | {
+      readonly state: "item";
+      readonly itemName: string;
+      readonly count: number;
+    } {
+  if (
+    observation === null ||
+    observation === undefined ||
+    !Object.prototype.hasOwnProperty.call(
+      observation.self.equipment,
+      destination,
+    )
+  )
+    return { state: "unobserved" };
+  const equipment = observation.self.equipment[destination];
+  if (equipment === null) return { state: "empty" };
+  if (equipment === undefined) return { state: "unobserved" };
+  return {
+    state: "item",
+    itemName: equipment.name,
+    count: equipment.count,
+  };
 }
 
 const equipmentDestinationLabel: Record<
@@ -2189,6 +2383,19 @@ export function semanticSignatures(
     .sort()
     .slice(0, 32)
     .join(",");
+  const droppedItemCounts = new Map<string, number>();
+  for (const { droppedItem } of observation.perception.entities) {
+    if (droppedItem === undefined) continue;
+    const name = droppedItem.name.slice(0, 80);
+    droppedItemCounts.set(
+      name,
+      (droppedItemCounts.get(name) ?? 0) + droppedItem.count,
+    );
+  }
+  const drops = [...droppedItemCounts]
+    .map(([name, count]) => `${name}:${count}`)
+    .sort()
+    .join(",");
   const hostileMap = hostileMapSignature(observation);
   const nearestRelevantBlocks = new Map<string, number>();
   for (const { name, distance } of observation.perception.blocks) {
@@ -2217,6 +2424,7 @@ export function semanticSignatures(
     environment,
     inventory,
     entities,
+    drops,
     hostileMap,
     blocks: relevantBlocks,
     time: `${observation.time.day ?? "unknown"}:${timeBand}:${observation.time.raining ?? "unknown"}`,

@@ -5,6 +5,7 @@ import minecraftData from "minecraft-data";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
+import type { Recipe } from "prismarine-recipe";
 import type { Window } from "prismarine-windows";
 import { AppError } from "../../src/domain/errors.js";
 import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
@@ -107,6 +108,31 @@ function addItemToInventory(
   inventory.emit("updateSlot", slot, previous, next);
 }
 
+function setInventorySlotItem(
+  fake: ReturnType<typeof makeFakeBot>,
+  slot: number,
+  name: string,
+  count: number,
+): void {
+  const inventory = fake.inventory as EventEmitter & {
+    slots: (Record<string, unknown> | null)[];
+  };
+  const previous = inventory.slots[slot] ?? null;
+  const next = {
+    type: 1,
+    name,
+    count,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+  };
+  inventory.slots[slot] = next;
+  inventory.emit("updateSlot", slot, previous, next);
+}
+
 function installFakeArmorEquip(fake: ReturnType<typeof makeFakeBot>) {
   const inventory = fake.inventory as EventEmitter & {
     slots: (Record<string, unknown> | null)[];
@@ -194,6 +220,8 @@ function makeFakeBot(
   };
   Object.assign(inventory, {
     slots: inventorySlots,
+    inventoryStart: 9,
+    inventoryEnd: 45,
     items: () =>
       inventorySlots.filter(
         (item): item is Record<string, unknown> => item !== null,
@@ -415,6 +443,27 @@ function makeFakeBot(
       deferWindowOpen = false;
     },
   };
+}
+
+function configureFakeChestCraft(
+  fake: ReturnType<typeof makeFakeBot>,
+  craft: () => Promise<void>,
+): void {
+  Object.assign(fake.bot.registry.itemsByName, {
+    chest: { id: 1, name: "chest" },
+  });
+  const recipe: Recipe = {
+    result: { id: 1, metadata: null, count: 1 },
+    inShape: [],
+    outShape: [],
+    requiresTable: false,
+    ingredients: [],
+    delta: [],
+  };
+  Object.assign(fake.bot, {
+    recipesFor: vi.fn(() => [recipe]),
+    craft,
+  });
 }
 
 function addOffAxisStoneCandidates(
@@ -5033,6 +5082,220 @@ describe("player body", () => {
       await Promise.resolve();
       expect(fake.bot.closeWindow).toHaveBeenCalledWith(lateWindow);
       expect(fake.bot.currentWindow).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a structured reason when a craft item is absent from the registry", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "unknown_item",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "unknown_registry_item",
+      itemName: "unknown_item",
+    });
+  });
+
+  it("returns a structured reason when a requested item is absent from inventory", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "equip",
+      item: "diamond_sword",
+      destination: "hand",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "item_not_in_inventory",
+      itemName: "diamond_sword",
+    });
+  });
+
+  it("reports no recipe for the current inventory and surface without guessing why", async () => {
+    const fake = makeFakeBot();
+    Object.assign(fake.bot.registry.itemsByName, {
+      chest: { id: 1, name: "chest" },
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "chest",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "no_recipe_for_current_inventory_and_surface",
+      itemName: "chest",
+    });
+    expect(result.detail).toContain(
+      "current inventory and available crafting surface",
+    );
+  });
+
+  it("does not infer a structured cause from a generic craft rejection", async () => {
+    const fake = makeFakeBot();
+    Object.assign(fake.bot.registry.itemsByName, {
+      chest: { id: 1, name: "chest" },
+    });
+    const recipe: Recipe = {
+      result: { id: 1, metadata: null, count: 1 },
+      inShape: [],
+      outShape: [],
+      requiresTable: false,
+      ingredients: [],
+      delta: [],
+    };
+    Object.assign(fake.bot, {
+      recipesFor: vi.fn(() => [recipe]),
+      craft: vi.fn(async () => {
+        throw new Error("server craft rejected");
+      }),
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "chest",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBeUndefined();
+    expect(result.detail).toContain("server craft rejected");
+  });
+
+  it("confirms craft after a delayed inventory update", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      Object.assign(fake.inventory, {
+        inventoryStart: 13,
+        inventoryEnd: 38,
+      });
+      const craft = vi.fn(async () => {
+        setTimeout(() => setInventorySlotItem(fake, 13, "chest", 1), 300);
+      });
+      configureFakeChestCraft(fake, craft);
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "craft",
+        item: "chest",
+        count: 1,
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await resultPromise;
+
+      expect(craft).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe("successful");
+      expect(result.before?.self.inventory).toHaveLength(0);
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "chest", count: 1, slot: 13 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { label: "result", slot: 0 },
+    { label: "crafting grid", slot: 1 },
+  ])("does not count a $label slot as crafted inventory", async ({ slot }) => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      Object.assign(fake.inventory, {
+        inventoryStart: 13,
+        inventoryEnd: 38,
+      });
+      configureFakeChestCraft(
+        fake,
+        vi.fn(async () => {
+          setInventorySlotItem(fake, slot, "chest", 1);
+        }),
+      );
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "craft",
+        item: "chest",
+        count: 1,
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "chest", count: 1, slot }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a craft unverified when its inventory count does not increase", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      configureFakeChestCraft(
+        fake,
+        vi.fn(async () => undefined),
+      );
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "craft",
+        item: "chest",
+        count: 1,
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("unverified");
+      expect(result.after?.self.inventory).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the bounded craft inventory wait when the Body stops", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      configureFakeChestCraft(
+        fake,
+        vi.fn(async () => {
+          setTimeout(() => addItemToInventory(fake, "chest", 1), 300);
+        }),
+      );
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "craft",
+        item: "chest",
+        count: 1,
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      const stopping = body.stop();
+      await stopping;
+      const result = await resultPromise;
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(result.status).toBe("interrupted");
+      expect(result.sameLife).toBe(true);
+      expect(result.after?.self.inventory).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }

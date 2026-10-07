@@ -263,6 +263,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export async function runPlayerAgent(
   input: RunPlayerAgentInput,
 ): Promise<PlayerAgentCallResult> {
+  const reasoningEffort = input.reasoningEffort ?? "medium";
   const runSequence = ++nextRunSequence;
   const role = input.role ?? "purpose";
   const byName = new Map(
@@ -292,9 +293,7 @@ export async function runPlayerAgent(
         input.client.responses.create(
           {
             model: input.model,
-            ...(input.reasoningEffort === undefined
-              ? {}
-              : { reasoning: { effort: input.reasoningEffort } }),
+            reasoning: { effort: reasoningEffort },
             instructions: input.instructions,
             input: messages,
             tools,
@@ -314,7 +313,7 @@ export async function runPlayerAgent(
           } satisfies ResponseCreateParamsNonStreaming,
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
-            ...(input.reasoningEffort === "none"
+            ...(reasoningEffort === "none"
               ? { maxRetries: 0, timeout: instantPurposeRequestTimeoutMs }
               : input.beforeCall === undefined
                 ? {}

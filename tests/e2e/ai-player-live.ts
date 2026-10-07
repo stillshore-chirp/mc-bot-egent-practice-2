@@ -42,6 +42,7 @@ import {
   type PlayerItemCollectionOutcome,
   type PlayerItemCollectionPathFailureReason,
   type PlayerBodyObservationOptions,
+  type PlayerOperationFailureReason,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
@@ -90,6 +91,24 @@ import {
   gatherFixtureCleanupProofConfirmed,
   type GatherDropReadbackClass,
 } from "./gather-drop-readback.js";
+import {
+  COMPANION_PROACTIVE_BED_CASE_BUDGET,
+  COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_BED_RUN_BUDGET,
+  COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+  COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
+  COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
+  CompanionProactiveAcceptanceError,
+  captureProactiveActionDetails,
+  companionProactivePhaseForTarget,
+  isCompanionProactiveTarget,
+  parsePlayerGameModeReadback,
+  runCompanionProactiveAcceptanceCase,
+  type CompanionProactiveTargetCase,
+} from "./companion-proactive-acceptance.js";
 import {
   gatherTargetAcceptedGoalCount,
   hasResolvedGatherTargetOwnerGoal,
@@ -323,6 +342,9 @@ const CASE_BUDGETS = {
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_BUDGET,
+  companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+  companion_proactive_bed: COMPANION_PROACTIVE_BED_CASE_BUDGET,
+  companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
@@ -350,6 +372,9 @@ const CASE_DEADLINES = {
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
+  companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
+  companion_proactive_bed: COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS,
+  companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
@@ -1461,7 +1486,7 @@ interface RunBudget {
   readonly totalTokens: number;
 }
 
-interface PlayerEvidence {
+export interface PlayerEvidence {
   readonly revision: number;
   readonly actionRevision: number;
   readonly stopped: boolean;
@@ -3369,6 +3394,7 @@ interface RunState {
   gatherProgressReplySidecarRetained?: boolean;
   companionIntentCollectionDiagnostic?: SafeEvidence;
   companionIntentDialogueSidecarRetained?: boolean;
+  companionProactiveDiagnostic?: SafeEvidence;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -3542,7 +3568,8 @@ export function createOwnerReturnApplicationWithBodyCapture(
 }> {
   const captureBodyForTargetedCase =
     targetCase === "unknown_composite" ||
-    targetCase === "companion_intent_collection";
+    targetCase === "companion_intent_collection" ||
+    isCompanionProactiveTarget(targetCase);
   if (
     targetCase !== "death_recovery" &&
     !ownerReturnRequestGateEnabled(targetCase) &&
@@ -5246,6 +5273,133 @@ async function main(): Promise<void> {
       if (noFoodReplanResult.status !== "pass")
         state.failureCode ??=
           noFoodReplanResult.reason ?? "NO_FOOD_REPLAN_NOT_CONFIRMED";
+      return;
+    }
+    if (isCompanionProactiveTarget(state.targetCase)) {
+      const targetCase: CompanionProactiveTargetCase = state.targetCase;
+      const proactiveResult = await recordCase(
+        state,
+        targetCase,
+        caseDeadlineForRun(targetCase, targetCase),
+        requireLiveContext(),
+        async (context) => {
+          await connectApplication(activeApp, state);
+          const applicationPlayerBody = activeApplicationPlayerBody;
+          if (applicationPlayerBody === undefined)
+            incomplete("COMPANION_PROACTIVE_APPLICATION_BODY_UNAVAILABLE");
+          if (targetCase === "companion_proactive_threat")
+            await prepareThreatObserverPlayers(
+              state,
+              context.rcon,
+              context.ownerName,
+              state.guestName,
+              context.botName,
+            );
+          try {
+            return await runCompanionProactiveAcceptanceCase({
+              targetCase,
+              botName: context.botName,
+              body: applicationPlayerBody,
+              rcon: context.rcon,
+              responses: () => state.responses,
+              readPlayer: async () =>
+                playerOf(await collect(context.runtime.app)),
+              observeForPlayer: (timeoutMs, predicate) =>
+                observeForPlayer(context, timeoutMs, predicate),
+              sendOwnerChat: (message) => sendChat(context.owner, message),
+              updateDiagnostic: (update) => {
+                state.companionProactiveDiagnostic = {
+                  phase: companionProactivePhaseForTarget(targetCase),
+                  ...state.companionProactiveDiagnostic,
+                  ...update,
+                };
+              },
+              readHealth: () => rconEntityHealth(context.rcon, context.botName),
+              readFoodLevel: () => rconFoodLevel(context.rcon, context.botName),
+              readInventoryCount: async (item) => {
+                const reply = await context.rcon.command(
+                  `clear ${context.botName} minecraft:${item} 0`,
+                );
+                const count = parseGatherMultiTargetItemCountReply(
+                  reply,
+                  context.botName,
+                );
+                if (count === undefined)
+                  incomplete(
+                    "COMPANION_PROACTIVE_INVENTORY_ORACLE_UNAVAILABLE",
+                  );
+                return count;
+              },
+              readPosition: async () =>
+                parsePosition(
+                  await context.rcon.command(
+                    `data get entity ${context.botName} Pos`,
+                  ),
+                ),
+              countTaggedHostile: (center) =>
+                countCompanionHostileFixture(context.rcon, center, 32),
+              nearestTaggedHostileDistance: (playerPosition) =>
+                nearestCompanionHostileFixtureDistance(
+                  context.rcon,
+                  playerPosition,
+                  32,
+                ),
+              readTaggedDropPosition: async (tag, item, center) =>
+                parsePosition(
+                  await context.rcon.command(
+                    `execute positioned ${center.x} ${center.y} ${center.z} as @e[type=minecraft:item,tag=${tag},distance=..16,sort=nearest,limit=1,nbt={Item:{id:"minecraft:${item}"}}] run data get entity @s Pos`,
+                  ),
+                ),
+              countTaggedDrop: async (tag, item, center) => {
+                const holder = "#proactive_drop";
+                const reset = await context.rcon.command(
+                  `scoreboard players set ${holder} ai_e2e 0`,
+                );
+                if (classifyRconReply(reset) !== "success")
+                  incomplete("COMPANION_PROACTIVE_DROP_ORACLE_UNAVAILABLE");
+                const countReply = await context.rcon.command(
+                  `execute positioned ${center.x} ${center.y} ${center.z} as @e[type=minecraft:item,tag=${tag},distance=..16,nbt={Item:{id:"minecraft:${item}"}}] run scoreboard players add ${holder} ai_e2e 1`,
+                );
+                if (
+                  !isNoEntitySelectionReply(countReply) &&
+                  classifyRconReply(countReply) !== "success"
+                )
+                  incomplete("COMPANION_PROACTIVE_DROP_ORACLE_UNAVAILABLE");
+                const scoreReply = await context.rcon.command(
+                  `scoreboard players get ${holder} ai_e2e`,
+                );
+                const count = parseScore(scoreReply, holder);
+                if (
+                  count === undefined ||
+                  !Number.isSafeInteger(count) ||
+                  count < 0
+                )
+                  incomplete("COMPANION_PROACTIVE_DROP_ORACLE_UNAVAILABLE");
+                return count;
+              },
+              captureActions: () => {
+                const capture = installCompanionHostilePurposeActionCapture(
+                  applicationPlayerBody,
+                );
+                return { actions: capture.actions, restore: capture.restore };
+              },
+              setGamerule: (rule, value) =>
+                setAndVerifyGamerule(context.rcon, rule, value),
+              isBlock: (position, block) =>
+                isBlock(context.rcon, position, block),
+            });
+          } catch (error) {
+            if (error instanceof CompanionProactiveAcceptanceError)
+              incomplete(error.code);
+            throw error;
+          }
+        },
+      );
+      state.status = proactiveResult.status;
+      if (proactiveResult.status !== "pass")
+        state.failureCode ??=
+          proactiveResult.reason ??
+          "COMPANION_PROACTIVE_ACCEPTANCE_NOT_CONFIRMED";
       return;
     }
     if (state.targetCase === "companion_intent_collection") {
@@ -9766,6 +9920,12 @@ async function prepareRun(): Promise<RunState> {
     requestedTargetCase === undefined || requestedTargetCase.length === 0
       ? undefined
       : (requestedTargetCase as TargetableCase);
+  if (
+    isCompanionProactiveTarget(targetCase) &&
+    selectedDiagnosticProbeCount > 0
+  ) {
+    incomplete("COMPANION_PROACTIVE_REAL_API_TARGET_REQUIRED");
+  }
   const hostilePurposeModeValue =
     process.env.AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY;
   if (
@@ -9828,23 +9988,31 @@ async function prepareRun(): Promise<RunState> {
     incomplete("JAVA_21_NOT_FOUND");
   }
   const configuredRunBudget = runBudgetFromEnvironment();
-  const companionIntentRunBudget = isCompanionHostilePurposeOnly()
-    ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
-    : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
+  const targetSpecificRunBudget =
+    targetCase === "companion_proactive_food"
+      ? COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET
+      : targetCase === "companion_proactive_bed"
+        ? COMPANION_PROACTIVE_BED_RUN_BUDGET
+        : targetCase === "companion_proactive_threat"
+          ? COMPANION_PROACTIVE_THREAT_RUN_BUDGET
+          : isCompanionHostilePurposeOnly()
+            ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
+            : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
   const runBudget =
-    targetCase === "companion_intent_collection"
+    targetCase === "companion_intent_collection" ||
+    isCompanionProactiveTarget(targetCase)
       ? {
           durationMs: Math.min(
             configuredRunBudget.durationMs,
-            companionIntentRunBudget.durationMs,
+            targetSpecificRunBudget.durationMs,
           ),
           llmCalls: Math.min(
             configuredRunBudget.llmCalls,
-            companionIntentRunBudget.llmCalls,
+            targetSpecificRunBudget.llmCalls,
           ),
           totalTokens: Math.min(
             configuredRunBudget.totalTokens,
-            companionIntentRunBudget.totalTokens,
+            targetSpecificRunBudget.totalTokens,
           ),
         }
       : configuredRunBudget;
@@ -10310,6 +10478,51 @@ async function setAndVerifyGamerule(
     incomplete(readbackFailure);
 }
 
+async function prepareThreatObserverPlayers(
+  state: RunState,
+  rcon: LocalRcon,
+  ownerName: string,
+  guestName: string,
+  botName: string,
+): Promise<void> {
+  const ownerMode = await setThreatObserverSpectator(rcon, ownerName);
+  const guestMode = await setThreatObserverSpectator(rcon, guestName);
+  const botMode = await readPlayerGameMode(rcon, botName);
+  const ownerSpectatorVerified = ownerMode === 3;
+  const guestSpectatorVerified = guestMode === 3;
+  const botSurvivalVerified = botMode === 0;
+  state.companionProactiveDiagnostic = {
+    phase: "threat",
+    ownerSpectatorVerified,
+    guestSpectatorVerified,
+    botSurvivalVerified,
+  };
+  if (
+    !ownerSpectatorVerified ||
+    !guestSpectatorVerified ||
+    !botSurvivalVerified
+  ) {
+    incomplete("COMPANION_PROACTIVE_THREAT_PLAYER_MODES_UNCONFIRMED");
+  }
+}
+
+async function setThreatObserverSpectator(
+  rcon: LocalRcon,
+  playerName: string,
+): Promise<number | undefined> {
+  await rcon.command(`gamemode spectator ${playerName}`);
+  return readPlayerGameMode(rcon, playerName);
+}
+
+async function readPlayerGameMode(
+  rcon: LocalRcon,
+  playerName: string,
+): Promise<number | undefined> {
+  return parsePlayerGameModeReadback(
+    await rcon.command(`data get entity ${playerName} playerGameType`),
+  );
+}
+
 async function assertNoOperators(state: RunState): Promise<void> {
   const ops = JSON.parse(
     await readFile(join(state.serverDirectory, "ops.json"), "utf8"),
@@ -10501,6 +10714,7 @@ async function readWorldDayTime(rcon: LocalRcon): Promise<number> {
 async function countCompanionHostileFixture(
   rcon: LocalRcon,
   origin: Position,
+  maxDistance = 16,
 ): Promise<number> {
   const reset = await rcon.command(
     `scoreboard players set ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 0`,
@@ -10508,7 +10722,7 @@ async function countCompanionHostileFixture(
   if (classifyRconReply(reset) !== "success")
     incomplete("COMPANION_HOSTILE_SERVER_ORACLE_UNAVAILABLE");
   const countReply = await rcon.command(
-    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
+    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..${maxDistance}] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
   );
   if (
     !isNoEntitySelectionReply(countReply) &&
@@ -12614,6 +12828,15 @@ interface CapturedCompanionHostilePurposeAction {
   readonly completedAt: string;
   readonly sameLife: boolean;
   readonly recoveryRequired: boolean;
+  readonly healthBefore?: number | null;
+  readonly operationEntityId?: number;
+  readonly observedEffectType?: string;
+  readonly observedEffectEntityId?: number;
+  readonly targetRegistry?: string;
+  readonly requestedCount?: number | null;
+  readonly targetItemCountBefore?: number | null;
+  readonly targetItemCountAfter?: number | null;
+  readonly bodyFailureCode?: PlayerOperationFailureReason["code"] | null;
 }
 
 function installCompanionHostilePurposeActionCapture(
@@ -12630,6 +12853,16 @@ function installCompanionHostilePurposeActionCapture(
     signal,
   ) => {
     const result = await originalExecute(operation, signal);
+    const operationItem =
+      result.operation.kind === "craft" || result.operation.kind === "place"
+        ? result.operation.item
+        : undefined;
+    const requestedCount =
+      result.operation.kind === "craft"
+        ? result.operation.count
+        : result.operation.kind === "place"
+          ? 1
+          : undefined;
     actions.push({
       kind: result.operation.kind,
       status: result.status,
@@ -12637,6 +12870,28 @@ function installCompanionHostilePurposeActionCapture(
       completedAt: result.completedAt,
       sameLife: result.sameLife === true,
       recoveryRequired: result.recoveryRequired,
+      ...(result.before === null
+        ? {}
+        : { healthBefore: result.before.self.health }),
+      ...(result.operation.kind === "collect_item"
+        ? { operationEntityId: result.operation.entityId }
+        : {}),
+      ...(result.observedEffect === undefined
+        ? {}
+        : {
+            observedEffectType: result.observedEffect.type,
+            observedEffectEntityId: result.observedEffect.entityId,
+          }),
+      ...captureProactiveActionDetails({
+        kind: result.operation.kind,
+        ...(operationItem === undefined ? {} : { item: operationItem }),
+        ...(requestedCount === undefined ? {} : { requestedCount }),
+        ...(result.failureReason === undefined
+          ? {}
+          : { failureCode: result.failureReason.code }),
+        beforeInventory: result.before?.self.inventory ?? null,
+        afterInventory: result.after?.self.inventory ?? null,
+      }),
     });
     return result;
   };
@@ -12655,17 +12910,22 @@ function installCompanionHostilePurposeActionCapture(
 async function nearestCompanionHostileFixtureDistance(
   rcon: LocalRcon,
   playerPosition: Position,
+  maxDistance = 16,
 ): Promise<number> {
   const positionReply = await rcon.command(
-    `execute positioned ${playerPosition.x} ${playerPosition.y} ${playerPosition.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16,sort=nearest,limit=1] run data get entity @s Pos`,
+    `execute positioned ${playerPosition.x} ${playerPosition.y} ${playerPosition.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..${maxDistance},sort=nearest,limit=1] run data get entity @s Pos`,
   );
+  if (isNoEntitySelectionReply(positionReply)) {
+    if (maxDistance > 16) return -1;
+    incomplete("COMPANION_HOSTILE_PURPOSE_SERVER_DISTANCE_UNAVAILABLE");
+  }
   const nearestPosition = parsePosition(positionReply);
   const distance = Math.hypot(
     nearestPosition.x - playerPosition.x,
     nearestPosition.y - playerPosition.y,
     nearestPosition.z - playerPosition.z,
   );
-  if (!Number.isFinite(distance) || distance < 0 || distance > 16) {
+  if (!Number.isFinite(distance) || distance < 0 || distance > maxDistance) {
     incomplete("COMPANION_HOSTILE_PURPOSE_SERVER_DISTANCE_UNAVAILABLE");
   }
   return distance;
@@ -21544,6 +21804,7 @@ async function writeArtifact(state: RunState): Promise<void> {
       deathRecoveryTarget: state.deathRecoveryTargetDiagnostic ?? null,
       companionIntentCollection:
         state.companionIntentCollectionDiagnostic ?? null,
+      companionProactiveAcceptance: state.companionProactiveDiagnostic ?? null,
       observationBoundary: {
         replyReceived:
           state.observationBoundaryDiagnostic?.replyReceived === true,

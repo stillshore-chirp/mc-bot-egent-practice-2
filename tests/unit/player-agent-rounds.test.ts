@@ -197,7 +197,6 @@ describe("player agent response rounds", () => {
     temporaryDirectories.push(directory);
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     const requests: unknown[] = [];
-    let toolExecutions = 0;
     let sayCalls = 0;
     const trace = {
       withSpan: async (
@@ -227,10 +226,7 @@ describe("player agent response rounds", () => {
       memory: createMemoryPort(),
       logger: pino({ level: "silent" }),
       trace,
-      inspectRuntime: () => {
-        toolExecutions += 1;
-        return undefined;
-      },
+      inspectRuntime: () => undefined,
       say: async () => {
         sayCalls += 1;
       },
@@ -246,7 +242,20 @@ describe("player agent response rounds", () => {
         message: "エージェントは死んでいる？",
         turn,
       });
-      expect(toolExecutions).toBe(1);
+      expect(requests).toHaveLength(2);
+      const finalRequest = z.record(z.string(), z.unknown()).parse(requests[1]);
+      const finalRequestInput = finalRequest.input;
+      if (!Array.isArray(finalRequestInput))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      expect(
+        finalRequestInput.filter((item) => {
+          const inputItem = z.record(z.string(), z.unknown()).parse(item);
+          return (
+            inputItem.type === "function_call" &&
+            inputItem.call_id === "trace-failure-tool"
+          );
+        }),
+      ).toHaveLength(1);
       expect(sayCalls).toBe(1);
     } finally {
       mind.close();
@@ -1303,8 +1312,10 @@ describe("player agent response rounds", () => {
       const request = z
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
-      expect(request).toMatchObject({ model: "test-model" });
-      expect(request).not.toHaveProperty("reasoning");
+      expect(request).toMatchObject({
+        model: "test-model",
+        reasoning: { effort: "medium" },
+      });
       expect(fixture.requestOptions[0]).toEqual({});
       expect(request.instructions).toContain(
         "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
