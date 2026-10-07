@@ -10625,7 +10625,11 @@ async function runCompanionHostileObservationProbe(
     const routeY = Math.floor(origin.y);
     const routeZ = Math.floor(origin.z);
     for (const step of [1, 2, 3]) {
-      const routeBlock = { x: routeX, y: routeY, z: routeZ + step };
+      const routeBlock = {
+        x: Math.floor(routeX),
+        y: routeY,
+        z: routeZ + step,
+      };
       if (
         !(await isBlock(rcon, routeBlock, "air")) ||
         !(await isBlock(rcon, { ...routeBlock, y: routeY + 1 }, "air")) ||
