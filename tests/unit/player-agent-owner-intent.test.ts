@@ -1119,7 +1119,7 @@ describe("player owner intent context", () => {
         "propose_goal_changeの結果がpendingなら、active goalはまだ更新されていません",
       );
       expect(String(secondRequest.instructions)).toContain(
-        "ownerには理解した具体的な条件と自分がまず試すことを一人称の未来の意向として伝え",
+        "owner向け進捗では内部案の提出・共有ではなく、理解した具体的な条件と自分がまず試すことを一人称の未来の意向として伝えます",
       );
       expect(String(secondRequest.instructions)).not.toContain("Purposeが");
       expect(String(secondRequest.instructions)).not.toContain("Purposeへ");
