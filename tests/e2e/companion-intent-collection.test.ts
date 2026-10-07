@@ -14,10 +14,16 @@ import {
 import { createApplication } from "../../src/app/application.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import {
+  COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
+  COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
+  COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
   COMPANION_HOSTILE_DETAIL_LIMIT,
   COMPANION_HOSTILE_FIXTURE_COUNT,
   bodyOakLogInventoryCount,
+  companionHostileSameGoalNextActionObserved,
   companionHostileObservationConfirmed,
+  companionHostilePurposeModeAllowed,
+  companionHostilePurposeMoveConfirmed,
   companionIntentCollectionProgressConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
@@ -213,6 +219,152 @@ describe("companion intent collection acceptance helpers", () => {
     ).toBe(true);
     expect(
       isCaseSelectedForTarget("companion_intent_collection", "autonomous_life"),
+    ).toBe(false);
+  });
+
+  it("keeps the real hostile-Purpose submode on its real-API target only", () => {
+    expect(
+      companionHostilePurposeModeAllowed({
+        selected: false,
+        targetCase: undefined,
+        noGptDiagnosticSelected: false,
+      }),
+    ).toBe(true);
+    expect(
+      companionHostilePurposeModeAllowed({
+        selected: true,
+        targetCase: "companion_intent_collection",
+        noGptDiagnosticSelected: false,
+      }),
+    ).toBe(true);
+    expect(
+      companionHostilePurposeModeAllowed({
+        selected: true,
+        targetCase: "companion_intent_collection",
+        noGptDiagnosticSelected: true,
+      }),
+    ).toBe(false);
+    expect(
+      companionHostilePurposeModeAllowed({
+        selected: true,
+        targetCase: "damage_response",
+        noGptDiagnosticSelected: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("reserves the real-Purpose case deadline and rejects setup that consumes it", () => {
+    expect(
+      runBudgetCoversCase(
+        COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
+        COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
+        COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
+        3 * 60_000,
+      ),
+    ).toBe(true);
+    expect(
+      runBudgetCoversCase(
+        COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
+        COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
+        COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
+        3 * 60_000 + 1,
+      ),
+    ).toBe(false);
+  });
+
+  it("requires a real post-request Purpose-selected sameLife retreat and cross-oracle distance gain", () => {
+    const evidence = {
+      requestSentAt: Date.parse("2026-10-07T00:00:01.000Z"),
+      judgment: {
+        kind: "act",
+        operationKind: "move_relative",
+        decidedAt: "2026-10-07T00:00:02.000Z",
+      },
+      operation: {
+        kind: "move_relative",
+        status: "successful",
+        startedAt: "2026-10-07T00:00:02.100Z",
+        completedAt: "2026-10-07T00:00:03.000Z",
+        sameLife: true,
+        recoveryRequired: false,
+      },
+      bodyCountBefore: 4,
+      bodyCountAfter: 4,
+      serverCountBefore: 4,
+      serverCountAfter: 4,
+      bodyDistanceBefore: 3.5,
+      bodyDistanceAfter: 5.2,
+      serverDistanceBefore: 3.5,
+      serverDistanceAfter: 5,
+      bodyServerDistanceAligned: true,
+      bodyServerPositionAligned: true,
+      bodyServerHealthAligned: true,
+      bodyHealthDidNotDecrease: true,
+      serverHealthDidNotDecrease: true,
+    } as const;
+    expect(companionHostilePurposeMoveConfirmed(evidence)).toBe(true);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        operation: { ...evidence.operation, sameLife: false },
+      }),
+    ).toBe(false);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        serverDistanceAfter: evidence.serverDistanceBefore,
+      }),
+    ).toBe(false);
+  });
+
+  it("records the same active owner goal and a later action without inferring intent", () => {
+    const input = {
+      goalIdBefore: "goal-1",
+      goalIdAfter: "goal-1",
+      goalStatusAfter: "active",
+      afterRevision: 4,
+      actionCompletedAt: "2026-10-07T00:00:03.000Z",
+      judgments: [
+        {
+          revision: 5,
+          kind: "act",
+          operationKind: "move_relative",
+          decidedAt: "2026-10-07T00:00:04.000Z",
+        },
+      ],
+    } as const;
+    expect(companionHostileSameGoalNextActionObserved(input)).toBe(true);
+    expect(
+      companionHostileSameGoalNextActionObserved({
+        ...input,
+        goalIdAfter: "goal-2",
+      }),
+    ).toBe(false);
+    expect(
+      companionHostileSameGoalNextActionObserved({
+        ...input,
+        goalStatusAfter: "completed",
+      }),
+    ).toBe(false);
+    expect(
+      companionHostileSameGoalNextActionObserved({
+        ...input,
+        judgments: [
+          { ...input.judgments[0], decidedAt: "2026-10-07T00:00:02.000Z" },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      companionHostileSameGoalNextActionObserved({
+        ...input,
+        judgments: [
+          {
+            revision: 5,
+            kind: "act",
+            decidedAt: "2026-10-07T00:00:04.000Z",
+          },
+        ],
+      }),
     ).toBe(false);
   });
 

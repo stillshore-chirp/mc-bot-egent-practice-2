@@ -71,6 +71,20 @@ AI_PLAYER_E2E_MAX_DURATION_MINUTES=10 \
 npm exec -- tsx tests/e2e/ai-player-live.ts
 ```
 
+同じtargetへ`AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY=YES`を追加すると、通常採集caseの代わりに実Purposeの脅威応答submodeを一度だけ実行します。隔離worldで採集goalを受け入れた後、現在のBot位置を基準に整数block座標の足場・空気を確認し、自然spawn無効・時間進行停止の夜間にNoAI敵4体を配置します。敵から距離を取りながら同じ採集goalを続けるowner依頼を送り、依頼後のPurpose判断に対応する実Body移動、同一life、敵までのBody/RCON距離増加、fresh hostile aggregate、Body/RCON位置・体力の照合を検査します。移動後に同じactive owner goalが保持され、次のaction判断が観測されたことも記録しますが、自動判定は意味上の採集継続を断定しません。次判断のsummary・operation metadataとgoal evidenceはprivate sidecarに保存し、採集再開の一手か退避の反復かをprivate reviewで確認します。移動距離・操作を直接指定したり、LLM応答の固定文字列で合否を決めたりせず、依頼した木材の採集完了やfixtureブロックからの取得も要求しません。fixture敵と採集用ブロック/dropをcleanupし、元のdaytimeをRCONで読戻します。
+
+このreal-API submodeは`AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY`等のno-GPT診断flagとは併用できません。case上限は18 calls / 160,000 known tokens / 6分、起動余裕を含むrun上限は18 calls / 160,000 known tokens / 9分です。case開始前の準備が3分を超えて6分の実行枠を確保できない場合はprovider呼び出し前に未完了で停止します。会話とgoal evidenceはmode `0600`のprivate sidecarだけに保存し、public artifactには固定の状態値・数値・operation kindだけを記録します。会話の意味解釈はprivate review対象として残します。実行例:
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=companion_intent_collection \
+AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY=YES \
+AI_PLAYER_E2E_MAX_LLM_CALLS=18 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=160000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=9 \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
+
 同じtargetで`AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY=YES`を追加すると、別runとしてNoAI zombieを100体だけ隔離worldへ配置し、server oracleとfresh Body client aggregate、詳細上限16件、candidate truncationなしを照合します。probe選択時はAPI送信前に`process.env.OPENAI_API_KEY`を削除し、既定applicationやAPI clientを起動せずprovider要求を送らない0-call診断です。fixture中は日中凍結から夜へ移してRCONで確認し、tag付きfixtureの全件cleanup後、元のdaytimeもRCONで読戻します。server上の100体を確認した後、client aggregateが100体を示すfresh observationを最大5秒・200ms間隔で待ちます。期限まで同期しない場合は未完了で終了します。probe本体は180秒以内、server起動・world準備・cleanupを含む所要は通常3〜5分を見込みます（server起動待ちは最大150秒）。このprobeのpassは収集caseや世界全体のhostile censusを証明しません。実行例:
 
 ```sh

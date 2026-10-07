@@ -1,5 +1,27 @@
 export const COMPANION_HOSTILE_FIXTURE_COUNT = 100;
 export const COMPANION_HOSTILE_DETAIL_LIMIT = 16;
+export const COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT = 4;
+export const COMPANION_HOSTILE_PURPOSE_CASE_BUDGET = {
+  llmCalls: 18,
+  totalTokens: 160_000,
+} as const;
+export const COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS = 6 * 60_000;
+export const COMPANION_HOSTILE_PURPOSE_RUN_BUDGET = {
+  durationMs: 9 * 60_000,
+  ...COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
+} as const;
+
+export function companionHostilePurposeModeAllowed(input: {
+  readonly selected: boolean;
+  readonly targetCase: string | undefined;
+  readonly noGptDiagnosticSelected: boolean;
+}): boolean {
+  return (
+    !input.selected ||
+    (input.targetCase === "companion_intent_collection" &&
+      !input.noGptDiagnosticSelected)
+  );
+}
 
 export interface CompanionHostileObservationEvidence {
   readonly serverCountBefore: number;
@@ -47,6 +69,121 @@ export function companionHostileObservationConfirmed(
     input.entityOutputLimit === COMPANION_HOSTILE_DETAIL_LIMIT &&
     input.detailCount <= COMPANION_HOSTILE_DETAIL_LIMIT &&
     !input.candidateSearchMayBeTruncated
+  );
+}
+
+export interface CompanionHostilePurposeMoveEvidence {
+  readonly requestSentAt: number;
+  readonly judgment: {
+    readonly kind?: string;
+    readonly operationKind?: string;
+    readonly decidedAt?: string;
+  };
+  readonly operation: {
+    readonly kind: string;
+    readonly status: string;
+    readonly startedAt: string;
+    readonly completedAt: string;
+    readonly sameLife?: boolean;
+    readonly recoveryRequired: boolean;
+  };
+  readonly bodyCountBefore: number;
+  readonly bodyCountAfter: number;
+  readonly serverCountBefore: number;
+  readonly serverCountAfter: number;
+  readonly bodyDistanceBefore: number;
+  readonly bodyDistanceAfter: number;
+  readonly serverDistanceBefore: number;
+  readonly serverDistanceAfter: number;
+  readonly bodyServerDistanceAligned: boolean;
+  readonly bodyServerPositionAligned: boolean;
+  readonly bodyServerHealthAligned: boolean;
+  readonly bodyHealthDidNotDecrease: boolean;
+  readonly serverHealthDidNotDecrease: boolean;
+}
+
+export function companionHostilePurposeMoveConfirmed(
+  input: CompanionHostilePurposeMoveEvidence,
+): boolean {
+  const decidedAt = Date.parse(input.judgment.decidedAt ?? "");
+  const startedAt = Date.parse(input.operation.startedAt);
+  const completedAt = Date.parse(input.operation.completedAt);
+  const distances = [
+    input.bodyDistanceBefore,
+    input.bodyDistanceAfter,
+    input.serverDistanceBefore,
+    input.serverDistanceAfter,
+  ];
+  return (
+    Number.isFinite(input.requestSentAt) &&
+    Number.isFinite(decidedAt) &&
+    Number.isFinite(startedAt) &&
+    Number.isFinite(completedAt) &&
+    decidedAt >= input.requestSentAt &&
+    startedAt >= decidedAt &&
+    startedAt >= input.requestSentAt &&
+    completedAt >= startedAt &&
+    input.judgment.kind === "act" &&
+    input.judgment.operationKind === input.operation.kind &&
+    (input.operation.kind === "move_to" ||
+      input.operation.kind === "move_relative") &&
+    input.operation.status === "successful" &&
+    input.operation.sameLife === true &&
+    !input.operation.recoveryRequired &&
+    input.bodyCountBefore === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
+    input.bodyCountAfter === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
+    input.serverCountBefore === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
+    input.serverCountAfter === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
+    distances.every((distance) => Number.isFinite(distance) && distance >= 0) &&
+    input.bodyDistanceBefore <= 6 &&
+    input.bodyDistanceAfter >= input.bodyDistanceBefore + 0.75 &&
+    input.serverDistanceAfter >= input.serverDistanceBefore + 0.75 &&
+    input.bodyServerDistanceAligned &&
+    input.bodyServerPositionAligned &&
+    input.bodyServerHealthAligned &&
+    input.bodyHealthDidNotDecrease &&
+    input.serverHealthDidNotDecrease
+  );
+}
+
+export interface CompanionHostileNextActionJudgment {
+  readonly revision?: number;
+  readonly decidedAt?: string;
+  readonly kind?: string;
+  readonly operationKind?: string;
+}
+
+export function companionHostileSameGoalNextActionObserved(input: {
+  readonly goalIdBefore: string;
+  readonly goalIdAfter: string | undefined;
+  readonly goalStatusAfter: string | undefined;
+  readonly afterRevision: number;
+  readonly actionCompletedAt: string;
+  readonly judgments: readonly CompanionHostileNextActionJudgment[];
+}): boolean {
+  const actionCompletedAt = Date.parse(input.actionCompletedAt);
+  if (
+    input.goalIdBefore.trim().length === 0 ||
+    input.goalIdAfter !== input.goalIdBefore ||
+    input.goalStatusAfter !== "active" ||
+    !Number.isSafeInteger(input.afterRevision) ||
+    !Number.isFinite(actionCompletedAt)
+  ) {
+    return false;
+  }
+  return input.judgments.some(
+    ({ revision, decidedAt, kind, operationKind }) => {
+      const judgmentAt = Date.parse(decidedAt ?? "");
+      return (
+        revision !== undefined &&
+        revision > input.afterRevision &&
+        Number.isFinite(judgmentAt) &&
+        judgmentAt >= actionCompletedAt &&
+        kind === "act" &&
+        typeof operationKind === "string" &&
+        operationKind.trim().length > 0
+      );
+    },
   );
 }
 

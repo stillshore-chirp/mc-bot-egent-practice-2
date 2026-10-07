@@ -66,9 +66,16 @@ import {
   type GatherMultiTargetItemCountReadResult,
 } from "./gather-multi-target-acceptance.js";
 import {
+  COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
+  COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
+  COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
+  COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
   COMPANION_HOSTILE_FIXTURE_COUNT,
   bodyOakLogInventoryCount,
+  companionHostileSameGoalNextActionObserved,
   companionHostileObservationConfirmed,
+  companionHostilePurposeModeAllowed,
+  companionHostilePurposeMoveConfirmed,
   companionIntentCollectionProgressConfirmed,
   completionJudgmentObservedAfter,
   freshResolvedOwnerWoodGoalCount,
@@ -359,10 +366,21 @@ const COMPANION_INTENT_COLLECTION_RUN_BUDGET = {
   totalTokens: 360_000,
 } as const;
 
+function isCompanionHostilePurposeOnly(): boolean {
+  return process.env.AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY === "YES";
+}
+
 function caseBudgetForRun(
   targetCase: TargetableCase | undefined,
   caseId: keyof typeof CASE_BUDGETS,
 ) {
+  if (
+    targetCase === "companion_intent_collection" &&
+    caseId === "companion_intent_collection" &&
+    isCompanionHostilePurposeOnly()
+  ) {
+    return COMPANION_HOSTILE_PURPOSE_CASE_BUDGET;
+  }
   return targetCase === "unknown_composite" && caseId === "unknown_composite"
     ? UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET
     : CASE_BUDGETS[caseId];
@@ -372,27 +390,50 @@ function caseDeadlineForRun(
   targetCase: TargetableCase | undefined,
   caseId: keyof typeof CASE_DEADLINES,
 ) {
+  if (
+    targetCase === "companion_intent_collection" &&
+    caseId === "companion_intent_collection" &&
+    isCompanionHostilePurposeOnly()
+  ) {
+    return COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS;
+  }
   return targetCase === "unknown_composite" && caseId === "unknown_composite"
     ? UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS
     : CASE_DEADLINES[caseId];
 }
 
 function caseBudgetsForRun(targetCase: TargetableCase | undefined) {
-  return targetCase === "unknown_composite"
+  const budgets =
+    targetCase === "unknown_composite"
+      ? {
+          ...CASE_BUDGETS,
+          unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET,
+        }
+      : CASE_BUDGETS;
+  return targetCase === "companion_intent_collection" &&
+    isCompanionHostilePurposeOnly()
     ? {
-        ...CASE_BUDGETS,
-        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_BUDGET,
+        ...budgets,
+        companion_intent_collection: COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
       }
-    : CASE_BUDGETS;
+    : budgets;
 }
 
 function caseDeadlinesForRun(targetCase: TargetableCase | undefined) {
-  return targetCase === "unknown_composite"
+  const deadlines =
+    targetCase === "unknown_composite"
+      ? {
+          ...CASE_DEADLINES,
+          unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS,
+        }
+      : CASE_DEADLINES;
+  return targetCase === "companion_intent_collection" &&
+    isCompanionHostilePurposeOnly()
     ? {
-        ...CASE_DEADLINES,
-        unknown_composite: UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS,
+        ...deadlines,
+        companion_intent_collection: COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
       }
-    : CASE_DEADLINES;
+    : deadlines;
 }
 
 type Status = "pass" | "fail" | "incomplete";
@@ -5214,14 +5255,20 @@ async function main(): Promise<void> {
       const collectionResult = await recordCase(
         state,
         "companion_intent_collection",
-        CASE_DEADLINES.companion_intent_collection,
+        caseDeadlineForRun(state.targetCase, "companion_intent_collection"),
         requireLiveContext(),
         async (context) =>
-          runCompanionIntentCollectionCase(
-            state,
-            context,
-            applicationPlayerBody,
-          ),
+          isCompanionHostilePurposeOnly()
+            ? runCompanionHostilePurposeContinuityCase(
+                state,
+                context,
+                applicationPlayerBody,
+              )
+            : runCompanionIntentCollectionCase(
+                state,
+                context,
+                applicationPlayerBody,
+              ),
       );
       state.status = collectionResult.status;
       if (collectionResult.status !== "pass")
@@ -9706,9 +9753,37 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("E2E_PROBE_FLAGS_MUTUALLY_EXCLUSIVE");
   }
+  const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
+  if (
+    requestedTargetCase !== undefined &&
+    requestedTargetCase.length > 0 &&
+    !TARGETABLE_CASES.includes(requestedTargetCase as TargetableCase)
+  ) {
+    incomplete("E2E_TARGET_CASE_INVALID");
+  }
+  const targetCase =
+    requestedTargetCase === undefined || requestedTargetCase.length === 0
+      ? undefined
+      : (requestedTargetCase as TargetableCase);
+  const hostilePurposeModeValue =
+    process.env.AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY;
+  if (
+    hostilePurposeModeValue !== undefined &&
+    hostilePurposeModeValue !== "YES"
+  ) {
+    incomplete("COMPANION_HOSTILE_PURPOSE_FLAG_INVALID");
+  }
+  if (
+    !companionHostilePurposeModeAllowed({
+      selected: isCompanionHostilePurposeOnly(),
+      targetCase,
+      noGptDiagnosticSelected: selectedDiagnosticProbeCount > 0,
+    })
+  ) {
+    incomplete("COMPANION_HOSTILE_PURPOSE_MODE_SELECTION_INVALID");
+  }
   const noGptProbeOnly = isNoGptDiagnosticProbeOnly();
   if (noGptProbeOnly) delete process.env.OPENAI_API_KEY;
-  const requestedTargetCase = process.env.AI_PLAYER_E2E_TARGET_CASE?.trim();
   if (
     process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" &&
     requestedTargetCase !== "gather_multi_target_continuity"
@@ -9721,16 +9796,6 @@ async function prepareRun(): Promise<RunState> {
   ) {
     incomplete("COMPANION_HOSTILE_ORACLE_PROBE_TARGET_REQUIRED");
   }
-  if (
-    requestedTargetCase !== undefined &&
-    requestedTargetCase.length > 0 &&
-    !TARGETABLE_CASES.includes(requestedTargetCase as TargetableCase)
-  )
-    incomplete("E2E_TARGET_CASE_INVALID");
-  const targetCase =
-    requestedTargetCase === undefined || requestedTargetCase.length === 0
-      ? undefined
-      : (requestedTargetCase as TargetableCase);
   const serverJarValue = process.env.AI_PLAYER_E2E_SERVER_JAR;
   if (serverJarValue === undefined || serverJarValue.trim() === "")
     incomplete("SERVER_JAR_REQUIRED");
@@ -9762,20 +9827,23 @@ async function prepareRun(): Promise<RunState> {
     incomplete("JAVA_21_NOT_FOUND");
   }
   const configuredRunBudget = runBudgetFromEnvironment();
+  const companionIntentRunBudget = isCompanionHostilePurposeOnly()
+    ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
+    : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
   const runBudget =
     targetCase === "companion_intent_collection"
       ? {
           durationMs: Math.min(
             configuredRunBudget.durationMs,
-            COMPANION_INTENT_COLLECTION_RUN_BUDGET.durationMs,
+            companionIntentRunBudget.durationMs,
           ),
           llmCalls: Math.min(
             configuredRunBudget.llmCalls,
-            COMPANION_INTENT_COLLECTION_RUN_BUDGET.llmCalls,
+            companionIntentRunBudget.llmCalls,
           ),
           totalTokens: Math.min(
             configuredRunBudget.totalTokens,
-            COMPANION_INTENT_COLLECTION_RUN_BUDGET.totalTokens,
+            companionIntentRunBudget.totalTokens,
           ),
         }
       : configuredRunBudget;
@@ -10418,7 +10486,8 @@ async function prepareNoFoodFixtureProbe(
 
 const COMPANION_HOSTILE_FIXTURE_TAG = "ai_e2e_companion_hostile";
 const COMPANION_HOSTILE_COUNT_HOLDER = "#companion_hostile_count";
-const COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT = 4;
+const COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT =
+  COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT;
 
 async function readWorldDayTime(rcon: LocalRcon): Promise<number> {
   const reply = await rcon.command("time query daytime");
@@ -12535,6 +12604,781 @@ function activeWoodGoal(
     },
   );
   return goals.length === 1 ? goals[0] : undefined;
+}
+
+interface CapturedCompanionHostilePurposeAction {
+  readonly kind: string;
+  readonly status: BodyOperationStatus;
+  readonly startedAt: string;
+  readonly completedAt: string;
+  readonly sameLife: boolean;
+  readonly recoveryRequired: boolean;
+}
+
+function installCompanionHostilePurposeActionCapture(
+  body: MineflayerPlayerBody,
+): Readonly<{
+  actions: CapturedCompanionHostilePurposeAction[];
+  restore: () => void;
+}> {
+  const originalOwnExecute = Object.getOwnPropertyDescriptor(body, "execute");
+  const originalExecute = body.execute.bind(body);
+  const actions: CapturedCompanionHostilePurposeAction[] = [];
+  const instrumentedExecute: typeof body.execute = async (
+    operation,
+    signal,
+  ) => {
+    const result = await originalExecute(operation, signal);
+    actions.push({
+      kind: result.operation.kind,
+      status: result.status,
+      startedAt: result.startedAt,
+      completedAt: result.completedAt,
+      sameLife: result.sameLife === true,
+      recoveryRequired: result.recoveryRequired,
+    });
+    return result;
+  };
+  body.execute = instrumentedExecute;
+  return {
+    actions,
+    restore: () => {
+      if (body.execute !== instrumentedExecute) return;
+      if (originalOwnExecute === undefined)
+        Reflect.deleteProperty(body, "execute");
+      else Object.defineProperty(body, "execute", originalOwnExecute);
+    },
+  };
+}
+
+async function nearestCompanionHostileFixtureDistance(
+  rcon: LocalRcon,
+  playerPosition: Position,
+): Promise<number> {
+  const positionReply = await rcon.command(
+    `execute positioned ${playerPosition.x} ${playerPosition.y} ${playerPosition.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16,sort=nearest,limit=1] run data get entity @s Pos`,
+  );
+  const nearestPosition = parsePosition(positionReply);
+  const distance = Math.hypot(
+    nearestPosition.x - playerPosition.x,
+    nearestPosition.y - playerPosition.y,
+    nearestPosition.z - playerPosition.z,
+  );
+  if (!Number.isFinite(distance) || distance < 0 || distance > 16) {
+    incomplete("COMPANION_HOSTILE_PURPOSE_SERVER_DISTANCE_UNAVAILABLE");
+  }
+  return distance;
+}
+
+async function findCompanionHostilePurposeSpawnPositions(
+  rcon: LocalRcon,
+  playerPosition: Position,
+): Promise<readonly Position[]> {
+  const base = {
+    x: Math.floor(playerPosition.x),
+    y: Math.floor(playerPosition.y),
+    z: Math.floor(playerPosition.z),
+  };
+  if (
+    !Number.isSafeInteger(base.x) ||
+    !Number.isSafeInteger(base.y) ||
+    !Number.isSafeInteger(base.z)
+  ) {
+    incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_POSITION_UNAVAILABLE");
+  }
+  const candidateLayouts = [
+    [
+      [-3, 0],
+      [3, 0],
+      [0, -3],
+      [0, 3],
+    ],
+    [
+      [-4, 0],
+      [4, 0],
+      [0, -4],
+      [0, 4],
+    ],
+  ] as const;
+  for (const layout of candidateLayouts) {
+    const positions = layout.map(([offsetX, offsetZ]) => ({
+      x: base.x + offsetX + 0.5,
+      y: base.y,
+      z: base.z + offsetZ + 0.5,
+    }));
+    let available = true;
+    for (const position of positions) {
+      const block = {
+        x: Math.floor(position.x),
+        y: Math.floor(position.y),
+        z: Math.floor(position.z),
+      };
+      if (
+        !(await isBlock(rcon, block, "air")) ||
+        !(await isBlock(rcon, { ...block, y: block.y + 1 }, "air")) ||
+        !(await isBlock(rcon, { ...block, y: block.y - 1 }, "stone"))
+      ) {
+        available = false;
+        break;
+      }
+    }
+    if (available) return positions;
+  }
+  incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_LAYOUT_UNAVAILABLE");
+}
+
+async function runCompanionHostilePurposeContinuityCase(
+  state: RunState,
+  context: CaseContext,
+  body: MineflayerPlayerBody,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  let fixture: CompanionIntentCollectionFixture | undefined;
+  let origin: Position | undefined;
+  let originalDayTime: number | undefined;
+  let dayTimeTouched = false;
+  let hostileFixtureTouched = false;
+  let actionCapture:
+    ReturnType<typeof installCompanionHostilePurposeActionCapture> | undefined;
+  let result: Readonly<Record<string, boolean | number | string>> | undefined;
+  let primaryError: unknown;
+  let primaryFailed = false;
+  let cleanupConfirmed: boolean | undefined;
+  let privateGoalEvidence:
+    | {
+        readonly capturedAt: string;
+        readonly goalId: string;
+        readonly status: string;
+        readonly title: string;
+        readonly changeReason: string;
+        readonly purpose: string;
+        readonly waitReason?: string;
+        readonly completionJudgments: readonly {
+          readonly decidedAt?: string;
+          readonly summary?: string;
+        }[];
+        readonly nextJudgment?: {
+          readonly revision?: number;
+          readonly decidedAt?: string;
+          readonly kind?: string;
+          readonly operationKind?: string;
+          readonly summary?: string;
+        };
+      }
+    | undefined;
+  const conversationTurns: {
+    readonly prompt: string;
+    readonly sentAt: number;
+  }[] = [];
+  updateCompanionIntentCollectionDiagnostic(state, {
+    hostilePurposeModeSelected: true,
+    hostilePurposeFixtureConfigured: false,
+    hostilePurposeMoveJudgmentObserved: false,
+    hostilePurposeBodyMoveConfirmed: false,
+    hostilePurposeNextActionObserved: false,
+    hostilePurposeSameOwnerGoalRetained: false,
+  });
+
+  try {
+    const quiet = await observeForPlayer(
+      context,
+      30_000,
+      (player) => !player.stopped && !isOperationActive(player),
+    );
+    if (quiet === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_PRECONDITION_NOT_QUIET");
+
+    await removeAutonomousResourceFixture(context.rcon);
+    const scenarioOrigin = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    origin = scenarioOrigin;
+    fixture = await findCompanionIntentCollectionFixture(
+      context.rcon,
+      scenarioOrigin,
+    );
+    for (const item of GATHER_MULTI_TARGET_ITEMS) {
+      await context.rcon.command(`clear ${context.botName} minecraft:${item}`);
+    }
+    const inventoryBaseline = await readGatherMultiTargetItemCounts(
+      (item) =>
+        context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+      context.botName,
+    );
+    if (inventoryBaseline.reason !== "parsed")
+      incomplete("COMPANION_HOSTILE_PURPOSE_INVENTORY_BASELINE_UNAVAILABLE");
+    if (inventoryBaseline.counts.oak_log !== 0)
+      incomplete("COMPANION_HOSTILE_PURPOSE_INVENTORY_NOT_EMPTY");
+
+    await context.rcon.command(
+      `tp ${context.botName} ${scenarioOrigin.x} ${scenarioOrigin.y} ${scenarioOrigin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
+    );
+    const rotation = await readLearningFixtureRotation(
+      context.rcon,
+      context.botName,
+    );
+    if (
+      rotation === undefined ||
+      angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
+      Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
+    ) {
+      incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_ORIENTATION_UNAVAILABLE");
+    }
+    for (const log of fixture.oakLogs) {
+      await context.rcon.command(`setblock ${log.x} ${log.y} ${log.z} oak_log`);
+    }
+    if (
+      !(
+        await Promise.all(
+          fixture.oakLogs.map((log) => isBlock(context.rcon, log, "oak_log")),
+        )
+      ).every(Boolean)
+    ) {
+      incomplete("COMPANION_HOSTILE_PURPOSE_WOOD_FIXTURE_UNAVAILABLE");
+    }
+
+    await setAndVerifyGamerule(context.rcon, "advanceTime", false);
+    await setAndVerifyGamerule(context.rcon, "spawnMobs", false);
+    originalDayTime = await readWorldDayTime(context.rcon);
+    dayTimeTouched = true;
+    await context.rcon.command("time set 18000");
+    if ((await readWorldDayTime(context.rcon)) !== 18_000)
+      incomplete("COMPANION_HOSTILE_PURPOSE_NIGHT_NOT_CONFIRMED");
+
+    const woodFixtureConfiguredAt = Date.now();
+    const freshVisiblePlayer = await observeForPlayer(
+      context,
+      20_000,
+      (player) => {
+        const observationAt = Date.parse(
+          player.lastObservation?.observedAt ?? "",
+        );
+        return (
+          Number.isFinite(observationAt) &&
+          observationAt >= woodFixtureConfiguredAt &&
+          (player.lastObservation?.visibleBlockNames ?? []).includes("oak_log")
+        );
+      },
+    );
+    if (freshVisiblePlayer === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_NOT_FRESHLY_OBSERVED");
+
+    const initialPrompt =
+      "近くの木材を12本くらい集めておいて。あとで作業に使いたいんだ。";
+    const previousProposalIds = new Set(
+      freshVisiblePlayer.proposals.map(({ id }) => id),
+    );
+    const initialRequestSentAt = Date.now();
+    conversationTurns.push({
+      prompt: initialPrompt,
+      sentAt: initialRequestSentAt,
+    });
+    sendChat(context.owner, initialPrompt);
+    const initialIntent = await observeForPlayer(context, 60_000, (player) => {
+      const goal = activeWoodGoal(player, initialRequestSentAt);
+      return (
+        goal !== undefined &&
+        singleFreshWoodGoalQuantity({
+          goals: player.goals,
+          proposals: player.proposals,
+          judgments: player.recentJudgments,
+          updatedAfter: initialRequestSentAt,
+        }) === 12
+      );
+    });
+    if (initialIntent === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_OWNER_GOAL_NOT_ACCEPTED");
+    const initialGoal = activeWoodGoal(initialIntent, initialRequestSentAt);
+    if (initialGoal?.ownerProposalId === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_OWNER_GOAL_UNAVAILABLE");
+    if (previousProposalIds.has(initialGoal.ownerProposalId))
+      incomplete("COMPANION_HOSTILE_PURPOSE_OWNER_PROPOSAL_NOT_FRESH");
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeOwnerGoalAccepted: true,
+      hostilePurposeInitialGoalQuantity: 12,
+    });
+
+    const hostileBaselinePosition = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    if (
+      (await countCompanionHostileFixture(
+        context.rcon,
+        hostileBaselinePosition,
+      )) !== 0
+    ) {
+      incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_BASELINE_NOT_EMPTY");
+    }
+    const hostileSpawnPositions =
+      await findCompanionHostilePurposeSpawnPositions(
+        context.rcon,
+        hostileBaselinePosition,
+      );
+    hostileFixtureTouched = true;
+    for (const position of hostileSpawnPositions) {
+      await context.rcon.command(
+        `summon minecraft:zombie ${position.x} ${position.y} ${position.z} {NoAI:1b,Silent:1b,PersistenceRequired:1b,Tags:["${COMPANION_HOSTILE_FIXTURE_TAG}"]}`,
+      );
+    }
+    const hostileFixtureConfiguredAt = Date.now();
+    const hostileCountBefore = await countCompanionHostileFixture(
+      context.rcon,
+      hostileBaselinePosition,
+    );
+    if (hostileCountBefore !== COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT)
+      incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT_UNCONFIRMED");
+    const hostileBefore = await waitForCompanionHostileAggregate(
+      body,
+      COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
+      hostileFixtureConfiguredAt,
+      "COMPANION_HOSTILE_PURPOSE_BODY_AGGREGATE_UNAVAILABLE",
+    );
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeFixtureConfigured: true,
+      hostilePurposeServerCountBefore: hostileCountBefore,
+      hostilePurposeBodyCountBefore:
+        hostileBefore.observation.perception.nearbyHostiles?.aggregate
+          ?.clientReceivedHostileCount ?? -1,
+      hostilePurposeFreshBodyObservationBeforeRequest: true,
+      hostilePurposeNightTimeConfirmed: true,
+      hostilePurposeNaturalSpawnsDisabled: true,
+    });
+
+    const beforeThreatRequest = playerOf(await collect(context.runtime.app));
+    const activeGoalBefore = beforeThreatRequest.goals.find(
+      ({ id, ownerProposalId, source, status }) =>
+        id === initialGoal.id &&
+        ownerProposalId === initialGoal.ownerProposalId &&
+        source === "owner" &&
+        status === "active",
+    );
+    if (activeGoalBefore === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_OWNER_GOAL_NOT_ACTIVE");
+    const bodyBefore = await body.observe();
+    const serverPositionBefore = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    const serverCountBefore = await countCompanionHostileFixture(
+      context.rcon,
+      serverPositionBefore,
+    );
+    const bodyCountBefore =
+      bodyBefore.perception.nearbyHostiles?.aggregate
+        ?.clientReceivedHostileCount ?? -1;
+    const bodyDistanceBefore = companionHostileNearestDistance(bodyBefore);
+    const serverDistanceBefore = await nearestCompanionHostileFixtureDistance(
+      context.rcon,
+      serverPositionBefore,
+    );
+    const bodyHealthBefore = bodyBefore.self.health;
+    const serverHealthBefore = await rconEntityHealth(
+      context.rcon,
+      context.botName,
+    );
+    if (
+      bodyHealthBefore === null ||
+      Math.hypot(
+        bodyBefore.self.position.x - serverPositionBefore.x,
+        bodyBefore.self.position.y - serverPositionBefore.y,
+        bodyBefore.self.position.z - serverPositionBefore.z,
+      ) > 0.75 ||
+      serverCountBefore !== COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT ||
+      bodyCountBefore !== COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT ||
+      bodyDistanceBefore > 6 ||
+      Math.abs(bodyDistanceBefore - serverDistanceBefore) > 1.5
+    ) {
+      incomplete("COMPANION_HOSTILE_PURPOSE_THREAT_BASELINE_UNCONFIRMED");
+    }
+    const previousJudgmentRevision = Math.max(
+      0,
+      ...beforeThreatRequest.recentJudgments.flatMap(({ revision }) =>
+        revision === undefined ? [] : [revision],
+      ),
+    );
+    actionCapture = installCompanionHostilePurposeActionCapture(body);
+    const followupPrompt =
+      "ちょっと、敵がかなり近いよ。うまく距離を取りながら、木集めの続きをお願い。";
+    const followupSentAt = Date.now();
+    conversationTurns.push({ prompt: followupPrompt, sentAt: followupSentAt });
+    sendChat(context.owner, followupPrompt);
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeThreatRequestSent: true,
+      hostilePurposeBodyDistanceBefore: Number(bodyDistanceBefore.toFixed(2)),
+      hostilePurposeServerDistanceBefore: Number(
+        serverDistanceBefore.toFixed(2),
+      ),
+      hostilePurposeBodyHealthBefore: bodyHealthBefore,
+      hostilePurposeServerHealthBefore: serverHealthBefore,
+    });
+
+    let moveJudgment: PlayerEvidence["recentJudgments"][number] | undefined;
+    let moveAction: CapturedCompanionHostilePurposeAction | undefined;
+    const movePlayer = await observeForPlayer(context, 120_000, (player) => {
+      const goal = player.goals.find(
+        ({ id, ownerProposalId, source, status }) =>
+          id === initialGoal.id &&
+          ownerProposalId === initialGoal.ownerProposalId &&
+          source === "owner" &&
+          status === "active",
+      );
+      if (goal === undefined) return false;
+      const judgments = [...player.recentJudgments]
+        .filter(
+          ({ kind, operationKind, revision, decidedAt }) =>
+            kind === "act" &&
+            (operationKind === "move_to" ||
+              operationKind === "move_relative") &&
+            revision !== undefined &&
+            revision > previousJudgmentRevision &&
+            Date.parse(decidedAt ?? "") >= followupSentAt,
+        )
+        .sort((left, right) => (right.revision ?? 0) - (left.revision ?? 0));
+      for (const judgment of judgments) {
+        const decidedAt = Date.parse(judgment.decidedAt ?? "");
+        const action = actionCapture?.actions.find(
+          ({ kind, startedAt, status, sameLife, recoveryRequired }) =>
+            kind === judgment.operationKind &&
+            Date.parse(startedAt) >= Math.max(followupSentAt, decidedAt) &&
+            status === "successful" &&
+            sameLife &&
+            !recoveryRequired,
+        );
+        if (action !== undefined) {
+          moveJudgment = judgment;
+          moveAction = action;
+          return true;
+        }
+      }
+      return false;
+    });
+    if (
+      movePlayer === undefined ||
+      moveJudgment === undefined ||
+      moveAction === undefined
+    )
+      incomplete("COMPANION_HOSTILE_PURPOSE_MOVE_JUDGMENT_NOT_OBSERVED");
+    const acceptedMoveJudgment = moveJudgment;
+    const acceptedMoveAction = moveAction;
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeMoveJudgmentObserved: true,
+      hostilePurposeMoveOperationKind: acceptedMoveAction.kind,
+    });
+
+    const serverPositionAfter = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    const { observation: bodyAfter } = await waitForCompanionHostileAggregate(
+      body,
+      COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
+      Date.parse(acceptedMoveAction.completedAt),
+      "COMPANION_HOSTILE_PURPOSE_POST_MOVE_BODY_AGGREGATE_UNAVAILABLE",
+    );
+    const serverCountAfter = await countCompanionHostileFixture(
+      context.rcon,
+      serverPositionAfter,
+    );
+    const bodyDistanceAfter = companionHostileNearestDistance(bodyAfter);
+    const serverDistanceAfter = await nearestCompanionHostileFixtureDistance(
+      context.rcon,
+      serverPositionAfter,
+    );
+    const bodyHealthAfter = bodyAfter.self.health;
+    const serverHealthAfter = await rconEntityHealth(
+      context.rcon,
+      context.botName,
+    );
+    if (bodyHealthAfter === null)
+      incomplete("COMPANION_HOSTILE_PURPOSE_BODY_HEALTH_UNAVAILABLE");
+    const bodyServerPositionAligned =
+      Math.hypot(
+        bodyBefore.self.position.x - serverPositionBefore.x,
+        bodyBefore.self.position.y - serverPositionBefore.y,
+        bodyBefore.self.position.z - serverPositionBefore.z,
+      ) <= 0.75 &&
+      Math.hypot(
+        bodyAfter.self.position.x - serverPositionAfter.x,
+        bodyAfter.self.position.y - serverPositionAfter.y,
+        bodyAfter.self.position.z - serverPositionAfter.z,
+      ) <= 0.75;
+    const bodyServerDistanceAligned =
+      Math.abs(bodyDistanceBefore - serverDistanceBefore) <= 1.5 &&
+      Math.abs(bodyDistanceAfter - serverDistanceAfter) <= 1.5;
+    const bodyServerHealthAligned =
+      Math.abs(bodyHealthBefore - serverHealthBefore) <= 1 &&
+      Math.abs(bodyHealthAfter - serverHealthAfter) <= 1;
+    const bodyHealthDidNotDecrease = bodyHealthAfter >= bodyHealthBefore;
+    const serverHealthDidNotDecrease = serverHealthAfter >= serverHealthBefore;
+    const moveConfirmed = companionHostilePurposeMoveConfirmed({
+      requestSentAt: followupSentAt,
+      judgment: acceptedMoveJudgment,
+      operation: acceptedMoveAction,
+      bodyCountBefore,
+      bodyCountAfter:
+        bodyAfter.perception.nearbyHostiles?.aggregate
+          ?.clientReceivedHostileCount ?? -1,
+      serverCountBefore,
+      serverCountAfter,
+      bodyDistanceBefore,
+      bodyDistanceAfter,
+      serverDistanceBefore,
+      serverDistanceAfter,
+      bodyServerDistanceAligned,
+      bodyServerPositionAligned,
+      bodyServerHealthAligned,
+      bodyHealthDidNotDecrease,
+      serverHealthDidNotDecrease,
+    });
+    if (!moveConfirmed)
+      incomplete("COMPANION_HOSTILE_PURPOSE_MOVE_NOT_CONFIRMED");
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeBodyMoveConfirmed: true,
+      hostilePurposeBodyDistanceAfter: Number(bodyDistanceAfter.toFixed(2)),
+      hostilePurposeServerDistanceAfter: Number(serverDistanceAfter.toFixed(2)),
+      hostilePurposeBodyHealthAfter: bodyHealthAfter,
+      hostilePurposeServerHealthAfter: serverHealthAfter,
+      hostilePurposeBodyServerDistanceAligned: bodyServerDistanceAligned,
+      hostilePurposeBodyServerPositionAligned: bodyServerPositionAligned,
+      hostilePurposeBodyServerHealthAligned: bodyServerHealthAligned,
+      hostilePurposeBodyHealthDidNotDecrease: bodyHealthDidNotDecrease,
+      hostilePurposeServerHealthDidNotDecrease: serverHealthDidNotDecrease,
+    });
+
+    const moveJudgmentRevision = acceptedMoveJudgment.revision;
+    if (moveJudgmentRevision === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_MOVE_REVISION_UNAVAILABLE");
+    const nextJudgmentPlayer = await observeForPlayer(
+      context,
+      60_000,
+      (player) => {
+        const goal = player.goals.find(
+          ({ id, ownerProposalId, source }) =>
+            id === initialGoal.id &&
+            ownerProposalId === initialGoal.ownerProposalId &&
+            source === "owner",
+        );
+        return companionHostileSameGoalNextActionObserved({
+          goalIdBefore: initialGoal.id,
+          goalIdAfter: goal?.id,
+          goalStatusAfter: goal?.status,
+          afterRevision: moveJudgmentRevision,
+          actionCompletedAt: acceptedMoveAction.completedAt,
+          judgments: player.recentJudgments,
+        });
+      },
+    );
+    if (nextJudgmentPlayer === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_NEXT_GOAL_JUDGMENT_NOT_OBSERVED");
+    const finalGoal = nextJudgmentPlayer.goals.find(
+      ({ id }) => id === initialGoal.id,
+    );
+    const nextActionJudgment = nextJudgmentPlayer.recentJudgments.find(
+      ({ revision, decidedAt, kind, operationKind }) =>
+        revision !== undefined &&
+        revision > moveJudgmentRevision &&
+        Date.parse(decidedAt ?? "") >=
+          Date.parse(acceptedMoveAction.completedAt) &&
+        kind === "act" &&
+        typeof operationKind === "string" &&
+        operationKind.trim().length > 0,
+    );
+    if (finalGoal === undefined || nextActionJudgment === undefined)
+      incomplete("COMPANION_HOSTILE_PURPOSE_NEXT_ACTION_EVIDENCE_UNAVAILABLE");
+    privateGoalEvidence = {
+      capturedAt: new Date().toISOString(),
+      goalId: finalGoal.id,
+      status: finalGoal.status ?? "unknown",
+      title: finalGoal.title ?? "",
+      changeReason: finalGoal.changeReason ?? "",
+      purpose: nextJudgmentPlayer.purpose ?? "",
+      ...(nextJudgmentPlayer.wait?.reason === undefined
+        ? {}
+        : { waitReason: nextJudgmentPlayer.wait.reason }),
+      completionJudgments: nextJudgmentPlayer.recentJudgments.flatMap(
+        ({ kind, decidedAt, summary }) =>
+          kind !== "complete" || decidedAt === undefined
+            ? []
+            : [{ decidedAt, ...(summary === undefined ? {} : { summary }) }],
+      ),
+      nextJudgment: {
+        ...(nextActionJudgment.revision === undefined
+          ? {}
+          : { revision: nextActionJudgment.revision }),
+        ...(nextActionJudgment.decidedAt === undefined
+          ? {}
+          : { decidedAt: nextActionJudgment.decidedAt }),
+        ...(nextActionJudgment.kind === undefined
+          ? {}
+          : { kind: nextActionJudgment.kind }),
+        ...(nextActionJudgment.operationKind === undefined
+          ? {}
+          : { operationKind: nextActionJudgment.operationKind }),
+        ...(nextActionJudgment.summary === undefined
+          ? {}
+          : { summary: nextActionJudgment.summary }),
+      },
+    };
+    updateCompanionIntentCollectionDiagnostic(state, {
+      hostilePurposeNextActionObserved: true,
+      hostilePurposeNextActionOperationKind:
+        nextActionJudgment.operationKind ?? "unknown",
+      hostilePurposeSameOwnerGoalRetained: true,
+    });
+    result = {
+      hostilePurposeMode: "real_purpose",
+      hostilePurposeFixtureConfigured: true,
+      hostilePurposeFixtureCount: COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
+      hostilePurposeOwnerGoalAccepted: true,
+      hostilePurposeInitialGoalQuantity: 12,
+      hostilePurposeThreatRequestSent: true,
+      hostilePurposeMoveJudgmentObserved: true,
+      hostilePurposeMoveOperationKind: acceptedMoveAction.kind,
+      hostilePurposeBodyMoveStatus: acceptedMoveAction.status,
+      hostilePurposeBodyMoveSameLife: acceptedMoveAction.sameLife,
+      hostilePurposeBodyMoveRecoveryRequired:
+        acceptedMoveAction.recoveryRequired,
+      hostilePurposeBodyCountBefore: bodyCountBefore,
+      hostilePurposeBodyCountAfter:
+        bodyAfter.perception.nearbyHostiles?.aggregate
+          ?.clientReceivedHostileCount ?? -1,
+      hostilePurposeServerCountBefore: serverCountBefore,
+      hostilePurposeServerCountAfter: serverCountAfter,
+      hostilePurposeBodyDistanceBefore: Number(bodyDistanceBefore.toFixed(2)),
+      hostilePurposeBodyDistanceAfter: Number(bodyDistanceAfter.toFixed(2)),
+      hostilePurposeServerDistanceBefore: Number(
+        serverDistanceBefore.toFixed(2),
+      ),
+      hostilePurposeServerDistanceAfter: Number(serverDistanceAfter.toFixed(2)),
+      hostilePurposeBodyHealthBefore: bodyHealthBefore,
+      hostilePurposeBodyHealthAfter: bodyHealthAfter,
+      hostilePurposeServerHealthBefore: serverHealthBefore,
+      hostilePurposeServerHealthAfter: serverHealthAfter,
+      hostilePurposeBodyServerDistanceAligned: bodyServerDistanceAligned,
+      hostilePurposeBodyServerPositionAligned: bodyServerPositionAligned,
+      hostilePurposeBodyServerHealthAligned: bodyServerHealthAligned,
+      hostilePurposeNextActionObserved: true,
+      hostilePurposeNextActionOperationKind:
+        nextActionJudgment.operationKind ?? "unknown",
+      hostilePurposeSameOwnerGoalRetained: true,
+    };
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
+  } finally {
+    actionCapture?.restore();
+    if (origin !== undefined) {
+      try {
+        if (hostileFixtureTouched) {
+          await context.rcon.command(
+            `kill @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG}]`,
+          );
+          if (
+            (await countCompanionHostileFixture(context.rcon, origin)) !== 0
+          ) {
+            incomplete("COMPANION_HOSTILE_PURPOSE_FIXTURE_CLEANUP_UNVERIFIED");
+          }
+          await waitForCompanionHostileAggregate(
+            body,
+            0,
+            Date.now(),
+            "COMPANION_HOSTILE_PURPOSE_BODY_CLEANUP_UNVERIFIED",
+          );
+          updateCompanionIntentCollectionDiagnostic(state, {
+            hostilePurposeFixtureCleanupConfirmed: true,
+            hostilePurposeBodyCleanupConfirmed: true,
+          });
+        }
+      } catch (error) {
+        if (!primaryFailed) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
+      if (fixture !== undefined) {
+        try {
+          await cleanupCompanionIntentCollectionFixture(
+            context.rcon,
+            origin,
+            fixture,
+          );
+          updateCompanionIntentCollectionDiagnostic(state, {
+            hostilePurposeWoodFixtureCleanupConfirmed: true,
+          });
+        } catch (error) {
+          if (!primaryFailed) {
+            primaryFailed = true;
+            primaryError = error;
+          }
+        }
+      }
+    }
+    if (dayTimeTouched && originalDayTime !== undefined) {
+      try {
+        await context.rcon.command(`time set ${originalDayTime}`);
+        if ((await readWorldDayTime(context.rcon)) !== originalDayTime)
+          incomplete("COMPANION_HOSTILE_PURPOSE_TIME_RESTORE_UNVERIFIED");
+        updateCompanionIntentCollectionDiagnostic(state, {
+          hostilePurposeTimeRestoreConfirmed: true,
+        });
+      } catch (error) {
+        if (!primaryFailed) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
+    }
+    const cleanupDiagnostic = state.companionIntentCollectionDiagnostic;
+    const woodFixtureCleanupConfirmed =
+      cleanupDiagnostic?.hostilePurposeWoodFixtureCleanupConfirmed === true;
+    const hostileServerCleanupConfirmed =
+      cleanupDiagnostic?.hostilePurposeFixtureCleanupConfirmed === true;
+    const hostileBodyCleanupConfirmed =
+      cleanupDiagnostic?.hostilePurposeBodyCleanupConfirmed === true;
+    const timeRestoreConfirmed =
+      cleanupDiagnostic?.hostilePurposeTimeRestoreConfirmed === true;
+    cleanupConfirmed =
+      woodFixtureCleanupConfirmed &&
+      (!hostileFixtureTouched ||
+        (hostileServerCleanupConfirmed && hostileBodyCleanupConfirmed)) &&
+      (!dayTimeTouched || timeRestoreConfirmed);
+    if (conversationTurns.length > 0) {
+      try {
+        const replyCount = await retainCompanionIntentDialogue(
+          state,
+          conversationTurns,
+          privateGoalEvidence,
+        );
+        updateCompanionIntentCollectionDiagnostic(state, {
+          privateDialogueRetained: true,
+          dialogueReplyCount: replyCount,
+          conversationReviewStatus: "pending_private_review",
+        });
+      } catch (error) {
+        if (!primaryFailed) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
+    }
+  }
+
+  if (primaryFailed) throw primaryError;
+  if (result === undefined)
+    incomplete("COMPANION_HOSTILE_PURPOSE_RESULT_UNAVAILABLE");
+  if (!cleanupConfirmed)
+    incomplete("COMPANION_HOSTILE_PURPOSE_CLEANUP_UNVERIFIED");
+  return {
+    ...result,
+    fixtureCleanupConfirmed: cleanupConfirmed,
+    privateDialogueRetained:
+      state.companionIntentDialogueSidecarRetained === true,
+    dialogueReplyCount:
+      Number(state.companionIntentCollectionDiagnostic?.dialogueReplyCount) ||
+      0,
+    conversationReviewStatus: (() => {
+      const value =
+        state.companionIntentCollectionDiagnostic?.conversationReviewStatus;
+      return typeof value === "string" ? value : "unavailable";
+    })(),
+  };
 }
 
 async function runCompanionIntentCollectionCase(
@@ -20242,6 +21086,13 @@ async function retainCompanionIntentDialogue(
           readonly decidedAt?: string;
           readonly summary?: string;
         }[];
+        readonly nextJudgment?: {
+          readonly revision?: number;
+          readonly decidedAt?: string;
+          readonly kind?: string;
+          readonly operationKind?: string;
+          readonly summary?: string;
+        };
       }
     | undefined,
 ): Promise<number> {
