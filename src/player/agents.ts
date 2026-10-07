@@ -674,7 +674,8 @@ function summarizeConversationBodyObservation(
             available: true,
             source: nearbyHostiles.source,
             observedAt: nearbyHostiles.observedAt,
-            coverage: "client_received_unoccluded_hostile_subset",
+            coverage: "client_received_hostile_candidates",
+            detailCoverage: "raycast_unoccluded_hostile_details",
             maxDistance: nearbyHostiles.maxDistance,
             entityOutputLimit: nearbyHostiles.entityOutputLimit,
             observedHostileCountLowerBound: uniqueNearbyEntities.size,
@@ -700,7 +701,9 @@ function summarizeConversationBodyObservation(
 }
 
 type ConversationHostileAggregate = NonNullable<
-  NonNullable<PlayerBodyObservation["perception"]["nearbyHostiles"]>["aggregate"]
+  NonNullable<
+    PlayerBodyObservation["perception"]["nearbyHostiles"]
+  >["aggregate"]
 >;
 
 function summarizeConversationHostileAggregate(
@@ -2273,7 +2276,7 @@ export class PlayerPurposeAgent {
         : [
             "低healthまたはdamageを観測したら、現在の目的と使える装備・操作から今すぐ一手をcommitしてください。危険の安全審査や追加観測を行動の前提にせず、攻撃・位置変更・装備など選んだ操作を試し、Bodyの実結果を次判断へ使います。",
           ]),
-      "Body操作は常に一つです。実行中の操作は被害やdeath eventだけで置換せず、Purposeが新しい操作をcommitした場合だけ置換します。実行中ならcontinueか、次に試すBody操作をcommitしてください。",
+      "Body操作は常に一つです。同じライフ中の被害wakeだけで実行中操作を無条件cancelせず、Purposeは観測・目的・直近結果から置換が必要か判断できます。death/connectionなどでlifeをまたいだmove_to/move_relativeはBodyが中断し、goal cleanupした結果とfresh観測を受けて次の一手を再評価してください。実行中操作がある時はcontinueか、次に試すBody操作をcommitしてください。",
       "対象が見えない、経路がstallした、操作結果がfailed/unverifiedでも、追加観測や安全確認だけを理由に待ちません。現在のscene・過去の観測・Body結果から別の通常操作を一つ選び、Bodyに試させます。",
       "ownerへのmove_toがstallした場合も、閉じたドアの安全性や状態を追加観測で確定してから行動する段取りは要求しません。通常権限で試せるuse/dig/moveなどから一つ選び、実結果を次判断へ使います。owner到達やgoal完了は実観測なしに断定しません。",
       "runtime.recentMovementは保持されたBody結果の正味変位で、対象との距離や経路の成否ではありません。迂回で一時的に遠ざかる場合も、通過する目印と元の目的方向へ戻る契機を判断してください。",
@@ -2720,6 +2723,20 @@ function compactFirstActionSnapshot(
   snapshot: PlayerRuntimeSnapshot,
   urgentOwnerProposal: PlayerRuntimeSnapshot["proposals"][number] | undefined,
 ): unknown {
+  const continuingOwnerGoals = snapshot.goals
+    .filter(isContinuingLinkedOwnerGoal)
+    .slice(-3);
+  const continuingOwnerGoalIds = new Set(
+    continuingOwnerGoals.map(({ id }) => id),
+  );
+  const recentOtherGoals = snapshot.goals
+    .filter(
+      (goal) =>
+        (goal.status === "active" || goal.status === "paused") &&
+        !continuingOwnerGoalIds.has(goal.id),
+    )
+    .slice(-3);
+  const compactGoals = [...continuingOwnerGoals, ...recentOtherGoals];
   const pendingProposals = snapshot.proposals
     .filter(({ status }) => status === "pending")
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
@@ -2734,17 +2751,16 @@ function compactFirstActionSnapshot(
     stopped: snapshot.stopped,
     stopGeneration: snapshot.stopGeneration,
     purpose: snapshot.purpose.slice(0, 600),
-    goals: snapshot.goals
-      .filter(({ status }) => status === "active" || status === "paused")
-      .slice(-3)
-      .map(({ id, title, status, priority, source, updatedAt }) => ({
+    goals: compactGoals.map(
+      ({ id, title, status, priority, source, updatedAt }) => ({
         id,
         title,
         status,
         priority,
         source,
         updatedAt,
-      })),
+      }),
+    ),
     proposals: proposals.map(
       ({ id, title, reason, createdAt, priorityPreference, status }) => ({
         id,
@@ -2828,9 +2844,8 @@ function compactFirstActionSnapshot(
         summary: summary.slice(0, 240),
         operationKind: operationKind ?? null,
       })),
-    recentOutcomes: snapshot.recentOutcomes
-      .slice(-2)
-      .map(({ kind, status, summary, observedAt, movementDelta }) => ({
+    recentOutcomes: compactFirstActionOutcomes(snapshot).map(
+      ({ kind, status, summary, observedAt, movementDelta }) => ({
         kind,
         status,
         summary: summary.slice(0, 240),
@@ -2844,8 +2859,44 @@ function compactFirstActionSnapshot(
                 z: Math.round(movementDelta.z * 10) / 10,
               },
             }),
-      })),
+      }),
+    ),
   };
+}
+
+function compactFirstActionOutcomes(
+  snapshot: PlayerRuntimeSnapshot,
+): PlayerRuntimeSnapshot["recentOutcomes"] {
+  const recent = snapshot.recentOutcomes.slice(-8);
+  const tail = recent.slice(-2);
+  const latestReflexIndex = recent.findLastIndex(({ summary }) =>
+    summary.startsWith("damage-reflex "),
+  );
+  const priorOutcomes = recent.slice(
+    0,
+    latestReflexIndex < 0 ? Math.max(0, recent.length - 2) : latestReflexIndex,
+  );
+  const priorActionFailure = priorOutcomes.findLast(
+    ({ kind, status }) =>
+      (kind === "collect_item" ||
+        kind === "move_to" ||
+        kind === "move_relative" ||
+        kind === "control") &&
+      (status === "failed" ||
+        status === "unverified" ||
+        status === "interrupted" ||
+        status === "cancelled"),
+  );
+  if (
+    priorActionFailure === undefined ||
+    tail.some(
+      ({ operationId }) => operationId === priorActionFailure.operationId,
+    )
+  )
+    return tail;
+  return [...tail, priorActionFailure].sort((left, right) =>
+    left.observedAt.localeCompare(right.observedAt),
+  );
 }
 
 function compactFirstActionMemory(

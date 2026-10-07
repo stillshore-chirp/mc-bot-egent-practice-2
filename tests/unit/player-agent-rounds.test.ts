@@ -792,6 +792,126 @@ describe("player agent response rounds", () => {
     },
   );
 
+  it.each(["collect_item", "move_to"] as const)(
+    "retains a recent failed %s alongside reflex results in urgent Purpose input",
+    async (failedKind) => {
+      const failureAt = "2026-10-07T01:00:00.000Z";
+      const firstReflexAt = "2026-10-07T01:00:01.000Z";
+      const latestReflexAt = "2026-10-07T01:00:02.000Z";
+      const fixture = openPurposeFixture(
+        [terminalResponse("I will reconsider the previous result.")],
+        undefined,
+        undefined,
+        async () => bodyObservationFixture(),
+      );
+      const proposal = fixture.mind.addProposal({
+        title: "Collect iron and meet the owner",
+        reason: "Keep the owner's collection and meeting intent active.",
+        priority: 4,
+      });
+      const ownerGoalCommit = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        proposalResolution: {
+          proposalId: proposal.id,
+          disposition: "adopted",
+          resolution: "Keep the collection and meeting intent active.",
+        },
+      });
+      expect(ownerGoalCommit.accepted).toBe(true);
+      const ownerGoalId = ownerGoalCommit.snapshot.goals.find(
+        ({ ownerProposalId }) => ownerProposalId === proposal.id,
+      )?.id;
+      expect(ownerGoalId).toBeDefined();
+      for (let index = 0; index < 4; index += 1) {
+        const selfGoalCommit = fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          goal: {
+            id: `self-subgoal-${index}`,
+            title: `Inspect local route ${index}`,
+            status: "active",
+            priority: 1,
+            changeReason: "Purpose added a local subgoal.",
+            source: "self",
+          },
+        });
+        expect(selfGoalCommit.accepted).toBe(true);
+      }
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: `failed-${failedKind}`,
+          kind: failedKind,
+          status: "failed",
+          summary: `${failedKind} failed before the reflex; choose another route or method.`,
+          observedAt: failureAt,
+        },
+      });
+      for (const [index, observedAt] of [
+        firstReflexAt,
+        latestReflexAt,
+      ].entries())
+        fixture.mind.recordOutcome({
+          evidence: {
+            operationId: `damage-reflex-${index}`,
+            kind: "attack",
+            status: "successful",
+            summary: `damage-reflex hit_confirmed; operation=attack; status=successful; startedAt=${observedAt}; serverConfirmedAt=${observedAt}; sameLife=true`,
+            observedAt,
+          },
+        });
+
+      try {
+        await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [
+            {
+              id: "urgent-after-failed-action",
+              kind: "bot_damaged",
+              summary: "A recent damage wake requires a fresh judgment.",
+              createdAt: latestReflexAt,
+            },
+          ],
+        });
+
+        const payload = requestUserPayload(fixture.requests[0]);
+        const runtime = z
+          .record(z.string(), z.unknown())
+          .parse(payload.runtime);
+        const outcomes = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.recentOutcomes);
+        const goals = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.goals);
+        expect(goals).toContainEqual(
+          expect.objectContaining({
+            id: ownerGoalId,
+            title: "Collect iron and meet the owner",
+            status: "active",
+            source: "owner",
+          }),
+        );
+        expect(goals.length).toBeLessThanOrEqual(6);
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            kind: failedKind,
+            status: "failed",
+            summary: `${failedKind} failed before the reflex; choose another route or method.`,
+            observedAt: failureAt,
+          }),
+        );
+        expect(
+          outcomes.filter(
+            ({ summary }) =>
+              typeof summary === "string" &&
+              summary.startsWith("damage-reflex "),
+          ),
+        ).toHaveLength(2);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("distinguishes the last pre-death position from the current observation", async () => {
     const beforeAt = "2026-10-04T07:14:55.000Z";
     const deathAt = "2026-10-04T07:14:57.000Z";
@@ -1704,17 +1824,19 @@ describe("player agent response rounds", () => {
               ],
               omittedKindGroupCount: 0,
               omittedKindEntityCount: 0,
-              byDirection: ([
-                "north",
-                "northeast",
-                "east",
-                "southeast",
-                "south",
-                "southwest",
-                "west",
-                "northwest",
-                "coincident",
-              ] as const).map((direction) => ({
+              byDirection: (
+                [
+                  "north",
+                  "northeast",
+                  "east",
+                  "southeast",
+                  "south",
+                  "southwest",
+                  "west",
+                  "northwest",
+                  "coincident",
+                ] as const
+              ).map((direction) => ({
                 direction,
                 count: direction === "north" ? 62 : 0,
                 nearestDistance: direction === "north" ? 2.2 : null,
@@ -2496,9 +2618,7 @@ describe("player agent response rounds", () => {
       expect(instructions).toContain(
         "体力低下や被害があっても生存や退避を固定の最優先にせず",
       );
-      expect(instructions).toContain(
-        "一定距離まで離れる固定条件を使わず",
-      );
+      expect(instructions).toContain("一定距離まで離れる固定条件を使わず");
       expect(instructions).not.toContain("8ブロック");
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",

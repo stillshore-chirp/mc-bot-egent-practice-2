@@ -421,17 +421,19 @@ describe("player owner intent context", () => {
             ],
             omittedKindGroupCount: 0,
             omittedKindEntityCount: 0,
-            byDirection: ([
-              "north",
-              "northeast",
-              "east",
-              "southeast",
-              "south",
-              "southwest",
-              "west",
-              "northwest",
-              "coincident",
-            ] as const).map((direction) => ({
+            byDirection: (
+              [
+                "north",
+                "northeast",
+                "east",
+                "southeast",
+                "south",
+                "southwest",
+                "west",
+                "northwest",
+                "coincident",
+              ] as const
+            ).map((direction) => ({
               direction,
               count: direction === "north" ? 60 : 0,
               nearestDistance: direction === "north" ? 2.2 : null,
@@ -542,7 +544,8 @@ describe("player owner intent context", () => {
         available: true,
         source: "client_received_unoccluded_nearby_hostiles",
         observedAt: baseObservation.observedAt,
-        coverage: "client_received_unoccluded_hostile_subset",
+        coverage: "client_received_hostile_candidates",
+        detailCoverage: "raycast_unoccluded_hostile_details",
         maxDistance: 16,
         entityOutputLimit: 16,
         observedHostileCountLowerBound: 2,
@@ -703,7 +706,9 @@ describe("player owner intent context", () => {
           "The owner asked me to gather the wood discussed earlier; Purpose should take a fresh observation and choose the first step.",
         priority: 4,
       }),
-      terminalResponse("観測を再試行しました。木を集める目的は続けて進めます。"),
+      terminalResponse(
+        "観測を再試行しました。木を集める目的は続けて進めます。",
+      ),
     );
 
     try {

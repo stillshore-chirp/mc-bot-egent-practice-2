@@ -18,6 +18,7 @@ import type {
   PlayerOperation,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
+import type { BodyNearbyHostileDirection } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
   compactSnapshot,
@@ -71,6 +72,20 @@ describe("integrated player runtime", () => {
     expect(wet.environment).not.toBe(dry.environment);
     expect(wetLow.vitals).not.toBe(wet.vitals);
     expect(signature({ health: 19 }).vitals).not.toBe(dry.vitals);
+  });
+
+  it("wakes on hostile candidate distance and direction changes", () => {
+    const base = observation();
+    const nearbyEast = withHostileAggregate(base, 2, "east", 4.2);
+    const sameEast = withHostileAggregate(base, 2, "east", 4.2);
+    const closerEast = withHostileAggregate(base, 2, "east", 2.6);
+    const nearbySouth = withHostileAggregate(base, 2, "south", 4.2);
+    const signature = (value: PlayerBodyObservation) =>
+      semanticSignatures(value).hostileMap;
+
+    expect(signature(nearbyEast)).toBe(signature(sameEast));
+    expect(signature(nearbyEast)).not.toBe(signature(closerEast));
+    expect(signature(nearbyEast)).not.toBe(signature(nearbySouth));
   });
 
   it("wakes on the nearest relevant block band without counting duplicate blocks", () => {
@@ -1886,6 +1901,117 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("keeps cross-life hostile snapshots separate and drops movement delta", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const before = withHostileAggregate(observation(), 2, "east", 3.4, true);
+    const after = withHostileAggregate(
+      {
+        ...before,
+        observedAt: new Date().toISOString(),
+        self: {
+          ...before.self,
+          health: 14,
+          position: { x: 8, y: 70, z: -5, dimension: "overworld" },
+        },
+      },
+      1,
+      "south",
+      6.2,
+      true,
+    );
+    body.setResultObservations(before, after);
+    body.setResultSameLife(false);
+    body.setResultDetail(
+      "A long diagnostic from the interrupted native action. ".repeat(12),
+    );
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let followupSummary: string | undefined;
+    let thoughtCount = 0;
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot }) => {
+          thoughtCount += 1;
+          if (thoughtCount > 1) {
+            followupSummary = snapshot.lastOutcome?.summary;
+            return { accepted: true };
+          }
+          const decision: Extract<PlayerThoughtDecision, { kind: "act" }> = {
+            ...action("move-after-respawn"),
+            operation: {
+              kind: "move_to",
+              position: { x: 9, y: 70, z: -5 },
+              range: 1,
+            },
+            expectedOutcome:
+              "Move toward a new destination and verify the route checkpoint. ".repeat(
+                5,
+              ),
+          };
+          const saved = mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision,
+          });
+          if (saved.accepted)
+            runtimeRef.current?.handleCommittedDecision(
+              saved.snapshot,
+              decision,
+            );
+          return { accepted: saved.accepted, decision };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started[0] === "move_to");
+      body.completeActive("interrupted");
+      await waitFor(() => followupSummary !== undefined);
+      expect(followupSummary).toContain("sameLife=false/no-cross-life-delta");
+      expect(followupSummary).toContain("pre=client:18/16m,min=3.4m,hp=20");
+      expect(followupSummary).toContain("post=client:9/16m,min=6.2m,hp=14");
+      expect(followupSummary).toContain("min=3.4m");
+      expect(followupSummary).toContain("min=6.2m");
+      expect(followupSummary).toContain("+7");
+      expect(followupSummary).toContain("not a world census");
+      expect(followupSummary).toContain("preRay=check16/16,unocc0,occ8,skip2");
+      expect(followupSummary).toContain("postRay=check9/16,unocc0,occ8,skip0");
+      expect(followupSummary).toContain(
+        "移動差分はライフ変更をまたぐため記録しない",
+      );
+      expect(mind.snapshot().lastOutcome?.movementDelta).toBeUndefined();
+      expect(followupSummary).not.toContain("観測した移動差分=Δx:");
+      expect(followupSummary?.length).toBeLessThanOrEqual(680);
+      expect(followupSummary?.slice(0, 240)).toContain(
+        "pre=client:18/16m,min=3.4m,hp=20",
+      );
+      expect(followupSummary?.slice(0, 240)).toContain(
+        "post=client:9/16m,min=6.2m,hp=14",
+      );
+      expect(followupSummary?.slice(0, 240)).toContain("sameLife=false");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it.each(["successful", "failed"] as const)(
     "starts a fresh purpose thought after a %s body outcome and one completion",
     async (outcome) => {
@@ -3184,6 +3310,25 @@ describe("integrated player runtime", () => {
     const body = new DeferredBody();
     body.setObservation(beforeDeath);
     const firstMind = PlayerMindStore.open(databasePath);
+    const ownerProposal = firstMind.addProposal({
+      title: "Return to the owner after recovering the emeralds",
+      reason: "The owner asked the companion to recover and return.",
+      priority: 4,
+    });
+    const ownerGoalCommit = firstMind.commitGoalState({
+      expectedRevision: firstMind.snapshot().revision,
+      proposalResolution: {
+        proposalId: ownerProposal.id,
+        disposition: "adopted",
+        resolution: "Keep the recovery and return intent active.",
+      },
+    });
+    if (!ownerGoalCommit.accepted)
+      throw new Error("TEST_OWNER_GOAL_COMMIT_REJECTED");
+    const ownerGoalId = ownerGoalCommit.snapshot.goals.find(
+      ({ ownerProposalId }) => ownerProposalId === ownerProposal.id,
+    )?.id;
+    if (ownerGoalId === undefined) throw new Error("TEST_OWNER_GOAL_MISSING");
     const firstSkills = openSkills(databasePath, directory);
     let firstPurposeCalls = 0;
     const firstRuntime = new PlayerRuntime({
@@ -3213,6 +3358,14 @@ describe("integrated player runtime", () => {
       body.emit({ type: "bot_death", at: deathObservedAt });
       await waitFor(
         () => firstMind.snapshot().latestDeath?.observedAt === deathObservedAt,
+      );
+      expect(firstMind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoalId,
+          ownerProposalId: ownerProposal.id,
+          source: "owner",
+          status: "active",
+        }),
       );
       expect(firstMind.snapshot().latestDeath?.beforeObservation).toMatchObject(
         {
@@ -3299,6 +3452,14 @@ describe("integrated player runtime", () => {
       );
       const restoredDeath = mind.snapshot().latestDeath;
       expect(restoredDeath).toBeDefined();
+      expect(mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoalId,
+          ownerProposalId: ownerProposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
       expect(purposeSnapshots.at(-1)?.latestDeath).toEqual(restoredDeath);
       const compact = z
         .record(z.string(), z.unknown())
@@ -3667,6 +3828,8 @@ class DeferredBody implements PlayerBody {
   #observation = observation();
   #resultBefore: PlayerBodyObservation | null = null;
   #resultAfter: PlayerBodyObservation | null = null;
+  #resultSameLife: boolean | null | undefined;
+  #resultDetail: string | undefined;
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
@@ -3690,6 +3853,14 @@ class DeferredBody implements PlayerBody {
   ): void {
     this.#resultBefore = before;
     this.#resultAfter = after;
+  }
+
+  public setResultSameLife(value: boolean | null): void {
+    this.#resultSameLife = value;
+  }
+
+  public setResultDetail(value: string): void {
+    this.#resultDetail = value;
   }
 
   public completeActive(status: PlayerOperationResult["status"]): void {
@@ -3738,11 +3909,19 @@ class DeferredBody implements PlayerBody {
           completedAt: new Date().toISOString(),
           before: this.#resultBefore,
           after: this.#resultAfter,
+          ...(this.#resultSameLife === undefined
+            ? {}
+            : { sameLife: this.#resultSameLife }),
+          ...(this.#resultDetail === undefined
+            ? {}
+            : { detail: this.#resultDetail }),
           recoveryRequired,
           ...(this.#lookSweepOnNextResult === undefined
             ? {}
             : { lookSweep: this.#lookSweepOnNextResult }),
         };
+        this.#resultSameLife = undefined;
+        this.#resultDetail = undefined;
         this.#lookSweepOnNextResult = undefined;
         if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);
@@ -3876,6 +4055,100 @@ function observedStack(
     maxDurability: null,
     customName: null,
     enchantments: [],
+  };
+}
+
+function withHostileAggregate(
+  base: PlayerBodyObservation,
+  count: number,
+  activeDirection: BodyNearbyHostileDirection,
+  nearestDistance: number,
+  allDirections = false,
+): PlayerBodyObservation {
+  const directions = [
+    "north",
+    "northeast",
+    "east",
+    "southeast",
+    "south",
+    "southwest",
+    "west",
+    "northwest",
+    "coincident",
+  ] as const;
+  const offsets: Record<BodyNearbyHostileDirection, { x: number; z: number }> =
+    {
+      north: { x: 0, z: -5 },
+      northeast: { x: 5, z: -5 },
+      east: { x: 5, z: 0 },
+      southeast: { x: 5, z: 5 },
+      south: { x: 0, z: 5 },
+      southwest: { x: -5, z: 5 },
+      west: { x: -5, z: 0 },
+      northwest: { x: -5, z: -5 },
+      coincident: { x: 0, z: 0 },
+    };
+  const offset = offsets[activeDirection];
+  const bounds = {
+    min: { ...offset, y: 0 },
+    max: { ...offset, y: 1 },
+  };
+  const totalCount = count * (allDirections ? directions.length : 1);
+  const aggregate = {
+    source: "client_received_hostile_entity_candidates" as const,
+    countScope: "client_entity_table_within_max_distance" as const,
+    maxDistance: 16,
+    clientReceivedHostileCount: totalCount,
+    worldAbsenceEstablished: false as const,
+    directionFrame: "minecraft_cardinal_from_self_position" as const,
+    relativeOffsetFrame: "entity_position_minus_self_position" as const,
+    relativeOffsetBounds: totalCount === 0 ? null : bounds,
+    byKind: totalCount === 0 ? [] : [{ name: "zombie", count: totalCount }],
+    omittedKindGroupCount: 0,
+    omittedKindEntityCount: 0,
+    byDirection: directions.map((direction) => {
+      const active =
+        (allDirections || direction === activeDirection) && count > 0;
+      const directionOffset = offsets[direction];
+      return {
+        direction,
+        count: active ? count : 0,
+        nearestDistance: active ? nearestDistance : null,
+        farthestDistance: active ? nearestDistance + 0.4 : null,
+        relativeOffsetBounds: active
+          ? {
+              min: { ...directionOffset, y: 0 },
+              max: { ...directionOffset, y: 1 },
+            }
+          : null,
+      };
+    }),
+    occlusionCheck: {
+      method: "raycast_entity_body_point" as const,
+      candidateLimit: 16,
+      candidatesChecked: Math.min(totalCount, 16),
+      unoccludedCandidates: 0,
+      occludedCandidates: Math.min(totalCount, 8),
+      uncheckedCandidates: Math.max(0, totalCount - 16),
+      detailOutputLimit: 16,
+      omittedUnoccludedDetails: 0,
+    },
+  };
+  return {
+    ...base,
+    perception: {
+      ...base.perception,
+      nearbyHostiles: {
+        source: "client_received_unoccluded_nearby_hostiles",
+        observedAt: base.observedAt,
+        maxDistance: 16,
+        entityOutputLimit: 16,
+        omittedEntityCandidates: 0,
+        candidateSearchMayBeTruncated: false,
+        entities: [],
+        aggregate,
+      },
+    },
   };
 }
 

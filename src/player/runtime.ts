@@ -13,9 +13,11 @@ import type {
   PlayerBodyDamageSource,
   PlayerBodyDeathCause,
   PlayerBodyEvent,
+  PlayerBodyObservation,
   PlayerOperation,
   PlayerOperationResult,
 } from "../minecraft/player-body.js";
+import type { BodyNearbyHostileDirection } from "../minecraft/player-body-observation.js";
 import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
 import type { TraceService, TraceSession } from "../trace/service.js";
 import type {
@@ -1297,7 +1299,7 @@ export class PlayerRuntime {
         ? run.controller.signal.aborted
           ? "操作を中断し、実行終了を確認"
           : "操作toolが結果を返さず、ゲーム内結果は未検証"
-        : `期待したstep=${sanitizeDetail(expectedOutcome)}。${groundedOperationSummary(result)}`;
+        : groundedOperationSummary(result, expectedOutcome);
     const observedAt = result?.completedAt ?? new Date().toISOString();
     const movementDelta =
       result === undefined ? undefined : observedMovementDelta(result);
@@ -1763,15 +1765,148 @@ function withoutPrivateObservationDetails(
   return visibleEvidence;
 }
 
-function groundedOperationSummary(result: PlayerOperationResult): string {
-  const status = result.status;
-  const beforeAvailable = result.before !== null;
-  const afterAvailable = result.after !== null;
-  const detail =
-    result.detail === undefined ? "" : sanitizeDetail(result.detail);
-  const observedEffect = result.observedEffect?.type;
-  const movement = observedMovementSummary(result);
-  return `${result.operation.kind} は ${status}。実行前観測=${beforeAvailable ? "あり" : "なし"}、実行後観測=${afterAvailable ? "あり" : "なし"}.${observedEffect === undefined ? "" : `確認済み効果=${observedEffect}。`}${detail.length === 0 ? "" : `結果概要=${detail}。`}${movement}次の判断では結果の実観測を再確認する。`;
+function groundedOperationSummary(
+  result: PlayerOperationResult,
+  expectedOutcome: string,
+): string {
+  const before = compactHostileProjection("pre", result.before);
+  const after = compactHostileProjection("post", result.after);
+  const sameLife =
+    result.sameLife === false
+      ? "sameLife=false/no-cross-life-delta"
+      : result.sameLife === true
+        ? "sameLife=true"
+        : "sameLife=unknown";
+  const parts = [
+    before.core,
+    after.core,
+    sameLife,
+    "client-table only; not a world census; zero or unavailable is not absence; dirs are Minecraft cardinal",
+    before.directions,
+    after.directions,
+    before.occlusion,
+    after.occlusion,
+    `${result.operation.kind}=${result.status}`,
+    ...(result.observedEffect === undefined
+      ? []
+      : [`effect=${result.observedEffect.type}`]),
+    ...(result.detail === undefined
+      ? []
+      : [`detail=${sanitizeDetail(result.detail).slice(0, 40)}`]),
+    observedMovementSummary(result),
+    `expected=${sanitizeDetail(expectedOutcome).slice(0, 60)}`,
+    "次の判断は実観測で見直す。",
+  ];
+  let summary = "";
+  for (const part of parts) {
+    if (part.length === 0) continue;
+    const next = summary.length === 0 ? part : `${summary}; ${part}`;
+    if (next.length > 680) break;
+    summary = next;
+  }
+  return summary;
+}
+
+interface CompactHostileProjection {
+  readonly core: string;
+  readonly directions: string;
+  readonly occlusion: string;
+}
+
+function compactHostileProjection(
+  phase: "pre" | "post",
+  observation: PlayerBodyObservation | null,
+): CompactHostileProjection {
+  if (observation === null)
+    return {
+      core: `${phase}=unavailable,hp=unknown`,
+      directions: `${phase}Dirs=unknown`,
+      occlusion: `${phase}Ray=unknown`,
+    };
+  const health = compactObservedNumber(observation.self.health);
+  const nearbyHostiles = observation.perception.nearbyHostiles;
+  if (nearbyHostiles === undefined)
+    return {
+      core: `${phase}=unavailable,hp=${health}`,
+      directions: `${phase}Dirs=unknown`,
+      occlusion: `${phase}Ray=unknown`,
+    };
+  const aggregate = nearbyHostiles.aggregate;
+  if (aggregate === undefined) {
+    const nearestVisible = nearbyHostiles.entities.reduce<number | undefined>(
+      (nearest, entity) =>
+        nearest === undefined || entity.distance < nearest
+          ? entity.distance
+          : nearest,
+      undefined,
+    );
+    return {
+      core: `${phase}=visible:${compactObservedCount(nearbyHostiles.entities.length)},min=${nearestVisible === undefined ? "unknown" : formatObservedDistance(nearestVisible)},hp=${health}`,
+      directions: `${phase}Dirs=unknown`,
+      occlusion: `${phase}Ray=unknown`,
+    };
+  }
+  const occupied = aggregate.byDirection
+    .filter(({ count }) => count > 0)
+    .sort(
+      (left, right) =>
+        right.count - left.count ||
+        left.direction.localeCompare(right.direction),
+    );
+  const topDirections = occupied
+    .slice(0, 2)
+    .map(
+      ({ direction, count, nearestDistance }) =>
+        `${hostileDirectionLabel(direction)}:${compactObservedCount(count)}${nearestDistance === null ? "" : `@${formatObservedDistance(nearestDistance)}`}`,
+    )
+    .join(",");
+  const nearestDistance = occupied.reduce<number | undefined>(
+    (nearest, { nearestDistance: candidate }) =>
+      candidate === null
+        ? nearest
+        : nearest === undefined || candidate < nearest
+          ? candidate
+          : nearest,
+    undefined,
+  );
+  const check = aggregate.occlusionCheck;
+  return {
+    core: `${phase}=client:${compactObservedCount(aggregate.clientReceivedHostileCount)}/${formatObservedDistance(aggregate.maxDistance)},min=${nearestDistance === undefined ? "unknown" : formatObservedDistance(nearestDistance)},hp=${health}`,
+    directions: `${phase}Dirs=${topDirections || "none"}${occupied.length > 2 ? `+${occupied.length - 2}` : ""}`,
+    occlusion: `${phase}Ray=check${compactObservedCount(check.candidatesChecked)}/${compactObservedCount(check.candidateLimit)},unocc${compactObservedCount(check.unoccludedCandidates)},occ${compactObservedCount(check.occludedCandidates)},skip${compactObservedCount(check.uncheckedCandidates)},visible${compactObservedCount(nearbyHostiles.entities.length)}`,
+  };
+}
+
+function hostileDirectionLabel(direction: BodyNearbyHostileDirection): string {
+  const labels = {
+    north: "N",
+    northeast: "NE",
+    east: "E",
+    southeast: "SE",
+    south: "S",
+    southwest: "SW",
+    west: "W",
+    northwest: "NW",
+    coincident: "C",
+  } as const;
+  return labels[direction];
+}
+
+function formatObservedDistance(distance: number): string {
+  return `${compactObservedNumber(Math.max(0, distance))}m`;
+}
+
+function compactObservedNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value))
+    return "unknown";
+  const formatted = String(Number(value.toFixed(1)));
+  return formatted.length <= 8 ? formatted : "large";
+}
+
+function compactObservedCount(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "unknown";
+  const formatted = String(Math.trunc(value));
+  return formatted.length <= 4 ? formatted : "many";
 }
 
 function damageReflexEvidenceSummary(
@@ -1896,10 +2031,17 @@ function consumeItemCountDecreased(result: PlayerOperationResult): boolean {
 }
 
 function observedMovementSummary(result: PlayerOperationResult): string {
+  if (
+    result.sameLife === false &&
+    (result.operation.kind === "move_to" ||
+      result.operation.kind === "move_relative" ||
+      result.operation.kind === "control")
+  )
+    return "移動差分はライフ変更をまたぐため記録しない。";
   const movement = observedMovementDelta(result);
   if (movement === undefined) return "";
   const { x, y, z } = movement;
-  return `観測した移動差分=Δx:${x.toFixed(1)},Δy:${y.toFixed(1)},Δz:${z.toFixed(1)},距離:${Math.hypot(x, y, z).toFixed(1)}。`;
+  return `観測した移動差分=Δx:${compactObservedNumber(x)},Δy:${compactObservedNumber(y)},Δz:${compactObservedNumber(z)},距離:${compactObservedNumber(Math.hypot(x, y, z))}。`;
 }
 
 function observedMovementDelta(
@@ -1911,6 +2053,7 @@ function observedMovementDelta(
     result.operation.kind !== "control"
   )
     return undefined;
+  if (result.sameLife === false) return undefined;
   const { before, after } = result;
   if (before === null || after === null) return undefined;
   if (before.dimension !== after.dimension) return undefined;
@@ -2028,6 +2171,7 @@ export function semanticSignatures(
     .sort()
     .slice(0, 32)
     .join(",");
+  const hostileMap = hostileMapSignature(observation);
   const nearestRelevantBlocks = new Map<string, number>();
   for (const { name, distance } of observation.perception.blocks) {
     if (
@@ -2055,11 +2199,43 @@ export function semanticSignatures(
     environment,
     inventory,
     entities,
+    hostileMap,
     blocks: relevantBlocks,
     time: `${observation.time.day ?? "unknown"}:${timeBand}:${observation.time.raining ?? "unknown"}`,
     position: `${observation.dimension}:${Math.floor(x / 8)}:${Math.floor(y / 8)}:${Math.floor(z / 8)}`,
     window,
   };
+}
+
+function hostileMapSignature(observation: PlayerBodyObservation): string {
+  const nearbyHostiles = observation.perception.nearbyHostiles;
+  if (nearbyHostiles === undefined) return "unavailable";
+  const aggregate = nearbyHostiles.aggregate;
+  if (aggregate === undefined)
+    return nearbyHostiles.entities
+      .map(({ kind, distance }) => `${kind}:${threatDistanceBand(distance)}`)
+      .sort()
+      .slice(0, 32)
+      .join(",");
+  const kinds = aggregate.byKind
+    .map(({ name, count }) => `${name}:${count}`)
+    .sort()
+    .slice(0, 32)
+    .join(",");
+  const directions = aggregate.byDirection
+    .map(
+      ({ direction, count, nearestDistance }) =>
+        `${direction}:${count}:${nearestDistance === null ? "none" : threatDistanceBand(nearestDistance)}`,
+    )
+    .join(",");
+  return `${aggregate.countScope}:${aggregate.clientReceivedHostileCount}:${kinds}:${aggregate.omittedKindGroupCount}:${aggregate.omittedKindEntityCount}:${directions}`;
+}
+
+function threatDistanceBand(distance: number): string {
+  if (distance < 3) return "close";
+  if (distance < 6) return "near";
+  if (distance < 10) return "medium";
+  return "far";
 }
 
 function distanceBand(distance: number): string {
