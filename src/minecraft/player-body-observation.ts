@@ -89,7 +89,7 @@ export interface BodyVisibleDroppedItem {
 }
 
 export interface PlayerBodyNearbyHostiles {
-  /** Client-received hostile entities with an unoccluded ray, regardless of FOV. */
+  /** Detailed entities below have an unoccluded ray, regardless of FOV. */
   readonly source: "client_received_unoccluded_nearby_hostiles";
   readonly observedAt: string;
   readonly maxDistance: number;
@@ -97,6 +97,72 @@ export interface PlayerBodyNearbyHostiles {
   readonly omittedEntityCandidates: number;
   readonly candidateSearchMayBeTruncated: boolean;
   readonly entities: readonly BodyVisibleEntity[];
+  /** All client-received hostile candidates in range, before occlusion checks. */
+  readonly aggregate?: PlayerBodyNearbyHostileAggregate | undefined;
+}
+
+export type BodyNearbyHostileDirection =
+  | "north"
+  | "northeast"
+  | "east"
+  | "southeast"
+  | "south"
+  | "southwest"
+  | "west"
+  | "northwest"
+  /** Same horizontal X/Z column; Y remains represented in offset bounds. */
+  | "coincident";
+
+export interface BodyNearbyHostileOffsetBounds {
+  readonly min: BodyBlockCoordinates;
+  readonly max: BodyBlockCoordinates;
+}
+
+export interface BodyNearbyHostileKindCount {
+  /** Registry/entity name, not a display name. */
+  readonly name: string;
+  readonly count: number;
+}
+
+export interface BodyNearbyHostileDirectionCount {
+  readonly direction: BodyNearbyHostileDirection;
+  readonly count: number;
+  /** Three-dimensional distance to entity positions. */
+  readonly nearestDistance: number | null;
+  readonly farthestDistance: number | null;
+  /** Entity position minus the bot position, in world X/Y/Z coordinates. */
+  readonly relativeOffsetBounds: BodyNearbyHostileOffsetBounds | null;
+}
+
+export interface PlayerBodyNearbyHostileAggregate {
+  readonly source: "client_received_hostile_entity_candidates";
+  readonly countScope: "client_entity_table_within_max_distance";
+  /** Euclidean range; hostile aggregation is independent of FOV and occlusion. */
+  readonly maxDistance: number;
+  /** Exact for the client entity table and range; not a world census. */
+  readonly clientReceivedHostileCount: number;
+  readonly worldAbsenceEstablished: false;
+  /** Minecraft world compass: +X east, +Z south; independent of bot yaw. */
+  readonly directionFrame: "minecraft_cardinal_from_self_position";
+  readonly relativeOffsetFrame: "entity_position_minus_self_position";
+  readonly relativeOffsetBounds: BodyNearbyHostileOffsetBounds | null;
+  /** Largest groups by registry/entity name; counts include every candidate. */
+  readonly byKind: readonly BodyNearbyHostileKindCount[];
+  readonly omittedKindGroupCount: number;
+  readonly omittedKindEntityCount: number;
+  /** Fixed compass bins; aggregate offsets include occluded candidates. */
+  readonly byDirection: readonly BodyNearbyHostileDirectionCount[];
+  /** Raycasts are bounded to the nearest candidate subset used for details. */
+  readonly occlusionCheck: {
+    readonly method: "raycast_entity_body_point";
+    readonly candidateLimit: number;
+    readonly candidatesChecked: number;
+    readonly unoccludedCandidates: number;
+    readonly occludedCandidates: number;
+    readonly uncheckedCandidates: number;
+    readonly detailOutputLimit: number;
+    readonly omittedUnoccludedDetails: number;
+  };
 }
 
 export interface BodyWindowSnapshot {
@@ -363,9 +429,39 @@ const blockOutputLimit = 96;
 const entityOutputLimit = 64;
 const nearbyHostileCandidateLimit = 128;
 const nearbyHostileOutputLimit = 16;
+const nearbyHostileKindSummaryLimit = 32;
 const placementCandidateLimit = 24;
 const placementInteractionRange = 4.5;
 const airBlockNames = new Set(["air", "cave_air", "void_air"]);
+
+const nearbyHostileDirections = [
+  "north",
+  "northeast",
+  "east",
+  "southeast",
+  "south",
+  "southwest",
+  "west",
+  "northwest",
+  "coincident",
+] as const satisfies readonly BodyNearbyHostileDirection[];
+
+interface MutableNearbyHostileOffsetBounds {
+  count: number;
+  minX: number;
+  minY: number;
+  minZ: number;
+  maxX: number;
+  maxY: number;
+  maxZ: number;
+}
+
+interface MutableNearbyHostileDirectionCount {
+  count: number;
+  nearestDistance: number | null;
+  farthestDistance: number | null;
+  readonly offsets: MutableNearbyHostileOffsetBounds;
+}
 
 const placementFaces: readonly {
   readonly face: BodyPlacementFace;
@@ -597,6 +693,175 @@ function bodyVisibleEntity(
     ...(entity.username === undefined ? {} : { username: entity.username }),
     ...(equipment === undefined ? {} : { equipment }),
     ...(droppedItem === undefined ? {} : { droppedItem }),
+  };
+}
+
+function createNearbyHostileOffsetBounds(): MutableNearbyHostileOffsetBounds {
+  return {
+    count: 0,
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    minZ: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY,
+    maxZ: Number.NEGATIVE_INFINITY,
+  };
+}
+
+function includeNearbyHostileOffset(
+  bounds: MutableNearbyHostileOffsetBounds,
+  x: number,
+  y: number,
+  z: number,
+): void {
+  bounds.count += 1;
+  bounds.minX = Math.min(bounds.minX, x);
+  bounds.minY = Math.min(bounds.minY, y);
+  bounds.minZ = Math.min(bounds.minZ, z);
+  bounds.maxX = Math.max(bounds.maxX, x);
+  bounds.maxY = Math.max(bounds.maxY, y);
+  bounds.maxZ = Math.max(bounds.maxZ, z);
+}
+
+function nearbyHostileOffsetBounds(
+  bounds: MutableNearbyHostileOffsetBounds,
+): BodyNearbyHostileOffsetBounds | null {
+  if (bounds.count === 0) return null;
+  return {
+    min: { x: bounds.minX, y: bounds.minY, z: bounds.minZ },
+    max: { x: bounds.maxX, y: bounds.maxY, z: bounds.maxZ },
+  };
+}
+
+function nearbyHostileDirection(
+  offsetX: number,
+  offsetZ: number,
+): BodyNearbyHostileDirection {
+  if (offsetX === 0 && offsetZ === 0) return "coincident";
+  const sector =
+    (Math.round(Math.atan2(offsetX, -offsetZ) / (Math.PI / 4)) + 8) % 8;
+  return nearbyHostileDirections[sector] ?? "coincident";
+}
+
+function safeHostileKindName(entity: Entity): string {
+  const name = entityName(entity);
+  return /^[a-z0-9_:-]{1,80}$/u.test(name) ? name : "unknown_hostile";
+}
+
+function compareEntityNames(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function summarizeNearbyHostiles(input: {
+  readonly candidates: readonly {
+    readonly entity: Entity;
+    readonly distance: number;
+  }[];
+  readonly selfPosition: Vec3;
+  readonly maxDistance: number;
+  readonly candidateLimit: number;
+  readonly candidatesChecked: number;
+  readonly unoccludedCandidates: number;
+  readonly detailOutputLimit: number;
+}): PlayerBodyNearbyHostileAggregate {
+  const { candidates, selfPosition } = input;
+  const kindCounts = new Map<string, number>();
+  const overallOffsets = createNearbyHostileOffsetBounds();
+  const directionCounts = new Map<
+    BodyNearbyHostileDirection,
+    MutableNearbyHostileDirectionCount
+  >(
+    nearbyHostileDirections.map((direction) => [
+      direction,
+      {
+        count: 0,
+        nearestDistance: null,
+        farthestDistance: null,
+        offsets: createNearbyHostileOffsetBounds(),
+      },
+    ]),
+  );
+
+  for (const { entity, distance } of candidates) {
+    const offsetX = entity.position.x - selfPosition.x;
+    const offsetY = entity.position.y - selfPosition.y;
+    const offsetZ = entity.position.z - selfPosition.z;
+    includeNearbyHostileOffset(overallOffsets, offsetX, offsetY, offsetZ);
+    const direction = directionCounts.get(
+      nearbyHostileDirection(offsetX, offsetZ),
+    );
+    if (direction !== undefined) {
+      direction.count += 1;
+      direction.nearestDistance =
+        direction.nearestDistance === null
+          ? distance
+          : Math.min(direction.nearestDistance, distance);
+      direction.farthestDistance =
+        direction.farthestDistance === null
+          ? distance
+          : Math.max(direction.farthestDistance, distance);
+      includeNearbyHostileOffset(direction.offsets, offsetX, offsetY, offsetZ);
+    }
+    const name = safeHostileKindName(entity);
+    kindCounts.set(name, (kindCounts.get(name) ?? 0) + 1);
+  }
+
+  const orderedKinds = [...kindCounts.entries()].sort(
+    ([leftName, leftCount], [rightName, rightCount]) =>
+      rightCount - leftCount || compareEntityNames(leftName, rightName),
+  );
+  const includedKinds = orderedKinds.slice(0, nearbyHostileKindSummaryLimit);
+  const omittedKinds = orderedKinds.slice(nearbyHostileKindSummaryLimit);
+  const checkedCandidates = Math.min(
+    candidates.length,
+    input.candidatesChecked,
+  );
+  const unoccludedCandidates = Math.min(
+    checkedCandidates,
+    input.unoccludedCandidates,
+  );
+
+  return {
+    source: "client_received_hostile_entity_candidates",
+    countScope: "client_entity_table_within_max_distance",
+    maxDistance: input.maxDistance,
+    clientReceivedHostileCount: candidates.length,
+    worldAbsenceEstablished: false,
+    directionFrame: "minecraft_cardinal_from_self_position",
+    relativeOffsetFrame: "entity_position_minus_self_position",
+    relativeOffsetBounds: nearbyHostileOffsetBounds(overallOffsets),
+    byKind: includedKinds.map(([name, count]) => ({ name, count })),
+    omittedKindGroupCount: omittedKinds.length,
+    omittedKindEntityCount: omittedKinds.reduce(
+      (total, [, count]) => total + count,
+      0,
+    ),
+    byDirection: nearbyHostileDirections.map((directionName) => {
+      const direction = directionCounts.get(directionName);
+      return {
+        direction: directionName,
+        count: direction?.count ?? 0,
+        nearestDistance: direction?.nearestDistance ?? null,
+        farthestDistance: direction?.farthestDistance ?? null,
+        relativeOffsetBounds:
+          direction === undefined
+            ? null
+            : nearbyHostileOffsetBounds(direction.offsets),
+      };
+    }),
+    occlusionCheck: {
+      method: "raycast_entity_body_point",
+      candidateLimit: input.candidateLimit,
+      candidatesChecked: checkedCandidates,
+      unoccludedCandidates,
+      occludedCandidates: checkedCandidates - unoccludedCandidates,
+      uncheckedCandidates: candidates.length - checkedCandidates,
+      detailOutputLimit: input.detailOutputLimit,
+      omittedUnoccludedDetails: Math.max(
+        0,
+        unoccludedCandidates - input.detailOutputLimit,
+      ),
+    },
   };
 }
 
@@ -1005,11 +1270,12 @@ export function observePlayerBody(
     visibleEntities.push(bodyVisibleEntity(bot, entity, distance, dimension));
   }
 
-  const unoccludedNearbyHostiles: BodyVisibleEntity[] = [];
-  for (const { entity, distance } of nearbyHostileCandidates.slice(
+  const nearbyHostileCandidatesToCheck = nearbyHostileCandidates.slice(
     0,
     nearbyHostileCandidateLimit,
-  )) {
+  );
+  const unoccludedNearbyHostiles: BodyVisibleEntity[] = [];
+  for (const { entity, distance } of nearbyHostileCandidatesToCheck) {
     if (!unoccludedToEntity(bot, entity)) continue;
     unoccludedNearbyHostiles.push(
       bodyVisibleEntity(bot, entity, distance, dimension),
@@ -1027,6 +1293,15 @@ export function observePlayerBody(
     candidateSearchMayBeTruncated:
       nearbyHostileCandidates.length > nearbyHostileCandidateLimit,
     entities: unoccludedNearbyHostiles.slice(0, nearbyHostileOutputLimit),
+    aggregate: summarizeNearbyHostiles({
+      candidates: nearbyHostileCandidates,
+      selfPosition: origin,
+      maxDistance: maxVisibleDistance,
+      candidateLimit: nearbyHostileCandidateLimit,
+      candidatesChecked: nearbyHostileCandidatesToCheck.length,
+      unoccludedCandidates: unoccludedNearbyHostiles.length,
+      detailOutputLimit: nearbyHostileOutputLimit,
+    }),
   };
 
   const inventory: BodyItemStack[] = bot.inventory.slots.flatMap(

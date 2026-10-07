@@ -96,7 +96,9 @@ Runtimeが`setDamageReflexEnabled(true)`にした間、Bodyはenable・spawn・�
 
 `observe()` は ISO 形式の`observedAt`、自身のステータス・インベントリ・装備・時刻・画面、および可視範囲のブロックとエンティティを返します。視野は距離 16 ブロック、水平 110°、垂直 80° までで、ブロックやエンティティによる遮蔽を考慮します。ブロック候補は最大 3 回検索し、各検索で最大 192 件を調べます。画面中央の raycast が距離・視野内で最初に捉えたブロックは、候補検索から漏れても出力枠を優先します。結果はブロック名ごとに近い候補を交互に選び、最大 96 件を含めます。エンティティ候補は最大 128 件を調べ、結果には最大 64 件を含めます。検索上限で候補が残る可能性は`candidateSearchMayBeTruncated`で示し、出力上限による省略数も返します。読み込まれているだけで隠れているワールド要素は、現在見えている情報として公開しません。
 
-別枠の optional `perception.nearbyHostiles` は、Mineflayerが受信したMobのうち、正規レジストリで敵対種と分かり、16ブロック以内で遮蔽のない候補を視野角に関係なく最大16件返します。これは近くの敵対Mobの限定集合で、ワールド全体の一覧ではありません。`observedAt`・`source`・候補省略数・検索打切りフラグで、鮮度と範囲を区別します。
+別枠の optional `perception.nearbyHostiles` は、詳細な `entities` と `aggregate` を分けて返します。`aggregate.clientReceivedHostileCount` は、Mineflayer が受信した entity table のうち正規レジストリで敵対種と分かり、Bot からユークリッド距離16ブロック以内にある全候補を数えます。視野角と遮蔽はこの集計から除外条件にしません。この数は受信済み entity table の限定範囲で正確ですが、未受信の敵や範囲外も含むワールド総数ではなく、`worldAbsenceEstablished` は常に `false` です。
+
+集計の `byKind` は種類別の上位最大32件、`byDirection` は北・北東・東・南東・南・南西・西・北西と同じ水平 X/Z 列の9固定区分です。方角は bot の向きでなく Minecraft の世界座標（+X が東、+Z が南）を基準にし、全候補（遮蔽候補を含む）の相対 X/Y/Z 範囲と距離を集計します。raycast による遮蔽確認は距離の近い最大128候補に限り、詳細 `entities` は視野角に関係なく遮蔽のない候補から最大16件を返します。`aggregate.occlusionCheck` は確認済み・遮蔽あり・未確認の件数と、詳細出力で省略した数を区別します。外側の `observedAt` は観測時刻です。未受信のワールド要素は推定せず、遮蔽された候補も個別の可視entityではなく集計値で表します。
 
 可視エンティティには、Mineflayerが受信済みの装備種を`mainHand`、`offHand`、`head`、`torso`、`legs`、`feet`として含めます。slot keyの省略は未受信または取得できず不明、`null`は受信した空欄を表し、値はitem kind名だけです。`look_sweep`も各可視entityについて同じ情報を返します。
 
@@ -111,6 +113,8 @@ Mineflayer が値を取得できない体力、酸素、液体・炎の状態、
 `move_to`では、経路探索が`noPath`を報告しても目的地の観測が優先して成功を確認します。`goto()`が正常終了しても到達を観測できず、最新の経路更新が`noPath`なら`failed`を返します。後続の経路更新は古い`noPath`を置き換え、中断と timeout の分類を維持します。
 
 `move_relative`ではPathfinder開始前に、同じ水平目標方向へ約250msの通常移動入力を一度だけ試します。owner停止・切断・死亡で入力を解除し、入力だけでは成功とせず、実行後の観測で未到達なら到達を確認できない結果として返します。
+
+`move_to` と `move_relative` の結果には `sameLife` があり、操作の開始から終了まで同じ Bot life と接続を保てたかを示します。死亡・respawn または接続断を跨ぐ移動は pathfinder を中断して `interrupted` とし、respawn 後の位置が目標範囲にあっても旧移動の成功とは扱いません。spawn admission 前に未開始で取り消された結果では `sameLife` は `null` です。`recoveryRequired` が真なら native 処理が残っているため、通常の再接続経路で解消するまで次の操作を開始しません。
 
 `collect_item`は開始時点で通常の視野内にあるitem entityだけを受け付けます。追跡中は現在観測できた位置だけへ経路を更新します。視界を失った場合はpathfinderを止め、最後に実際に見えていたitem位置のbody pointへ一度向き直ってphysics tick後に再観測し、それでも遮蔽・視界外・出力上限で見えなければ停止します。`GoalNear`は整数block nodeの半径1を使い、goal到達後も可視itemとの3D距離が2.5秒の観測猶予後に1.25 blockを超える場合は`pickup_out_of_range`で停止します。拾得は対象IDに一致する`playerCollect` eventと、そのitem名の所持数増加を最大1秒の再観測内で確認します。eventだけ届き所持数増加を確認できない場合は`unverified`とし、単なる接近やentity消失を拾得成功とは扱いません。pathfinderの`noPath`・`timeout`イベントと`goto()`拒否は、結果の`itemCollectionPathFailureReason`で固定enumに分けます。可視性を失った後のentity位置や、拒否error本文は結果に含めません。
 

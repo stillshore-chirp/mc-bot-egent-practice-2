@@ -94,17 +94,19 @@ sequenceDiagram
 
 `think()` はBodyの初回観測を取り、snapshotのrevisionがまだ一致し、停止されていないことを確認してResponsesへ進みます。
 
-| 入力             | 内容                                                     | 注意点                                       |
-| ---------------- | -------------------------------------------------------- | -------------------------------------------- |
-| instructions     | PersonaCore、関心・goal、判断原則、操作catalog           | personaは行動選択の材料。権限を作らない      |
-| `runtime`        | 目的、提案、facts/uncertainties、停止、操作、直近結果    | `compactSnapshot()`で件数を絞る              |
-| `memory`         | 関係、LifeState、MemoryStore検索結果                     | 読み込める構造と、自動更新される構造は別     |
-| `observation`    | 自身、所持品、可視block/entity、画面、向き               | 見えない対象の現在位置は補わない             |
-| `events`         | 判断を起こした出来事と時刻                               | commit後にだけ対象eventをconsume             |
-| `spatialHistory` | 以前に実際に見た可視block範囲（urgentでは最新の過去1件） | 過去の可視subsetで、今も通行可能とは限らない |
-| `deathRecovery`  | 死亡記録と今回観測の整合性                               | 死亡前位置をdropの確定位置にしない           |
+| 入力             | 内容                                                     | 注意点                                           |
+| ---------------- | -------------------------------------------------------- | ------------------------------------------------ |
+| instructions     | PersonaCore、関心・goal、判断原則、操作catalog           | personaは行動選択の材料。権限を作らない          |
+| `runtime`        | 目的、提案、facts/uncertainties、停止、操作、直近結果    | `compactSnapshot()`で件数を絞る                  |
+| `memory`         | 関係、LifeState、MemoryStore検索結果                     | 読み込める構造と、自動更新される構造は別         |
+| `observation`    | 自身、所持品、可視block/entity、画面、向き、近傍敵集計   | 敵集計は受信済み近傍だけで、world censusではない |
+| `events`         | 判断を起こした出来事と時刻                               | commit後にだけ対象eventをconsume                 |
+| `spatialHistory` | 以前に実際に見た可視block範囲（urgentでは最新の過去1件） | 過去の可視subsetで、今も通行可能とは限らない     |
+| `deathRecovery`  | 死亡記録と今回観測の整合性                               | 死亡前位置をdropの確定位置にしない               |
 
 人格・記憶の保持先と入力件数は[人格と記憶](memory.md)にまとめています。世界の看板、本、表示名、画面タイトル等は `untrustedWorldAuthoredText` として出所を分け、世界内の情報として読みます。system指示やowner認可、停止を上書きする命令にはしません。
+
+`observation.perception.nearbyHostiles.aggregate` は、受信済み entity table の16ブロック以内にいる敵対候補の数・種類・世界方角と相対位置範囲をまとめます。遮蔽未確認の候補も集計に含み、詳細 `entities` はraycastで遮蔽がない候補の上限16件です。これは受信済み範囲の集計であり、world censusや敵がいないことの証明として説明しません。方角・出力上限・遮蔽確認数の詳細は [PlayerBody の観測範囲](player-body.md#観測できる範囲) を参照してください。
 
 ### 必要な情報を追加で得るtool
 
@@ -180,6 +182,8 @@ owner proposalの連続到着で30秒期限は延長しません。期限内にH
 ## 7. 身体操作・結果・再起動
 
 Runtimeは現在の操作をcancelし、そのpromiseがsettleした後、最新 `actionRevision`・operation ID・停止状態を再確認して次を始めます。`activeOperation.startedAt` はcommit時に設定され、Body開始eventでも互換更新されます。実際にBody開始を観測した時刻は `bodyStartedAt` を使います。
+
+`move_to` と `move_relative` の結果は `sameLife` で操作中の死亡・respawn・接続境界を区別します。境界を跨いだ移動はBodyが `interrupted` とし、respawn後の位置が目標に届いていても旧移動の成功として保存しません。現在の状態から再判断し、`recoveryRequired` が返った場合は通常の再接続が終わるまで次の操作を待ちます。
 
 結果保存の順序は、Bodyのafter観測 → McSkillRepositoryのtrusted receipt/outcome → MemoryStoreのepisode → MindStoreの結果とeventです。複数storeをまたぐ単一transactionではありません。receipt保存失敗は `PLAYER_SKILL_EVIDENCE_FAILED` として記録され、モデルの成功申告で補いません。
 

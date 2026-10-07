@@ -44,7 +44,7 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 
 受け入れケースはownerとguestの実Minecraftチャットを使い、AIプレイヤーの判断は既定runtimeから実際のGPTへ送ります。API keyは既存の環境変数またはローカルdotenvから読み、artifactや標準出力に書きません。Minecraftログ、会話本文、プレイヤー名、UUID、座標、Skill本文はartifactへ保存しません。artifactには合成seed、case結果、上限と計測usage、固定分類コードだけを記録します。`damage_response`のcase evidenceには`usageUnknownRequestErrorCalls`と`usageUnknownResponseUsageMissingCalls`の集計件数を記録します。結果JSONは、Node.js `os.tmpdir()` 以下の `ai-player-e2e-results/` にmode `0600`で保存します。Paper stdout/stderrは一時領域のmode `0600`のprivate logに記録し、artifactや標準出力へ本文を出しません。失敗・未完了時は診断用copyを同じ一時領域の `ai-player-e2e-private-diagnostics/` にmode `0600`で残し、固定の分類コードとpathだけを表示します。成功時のprivate logは既定で削除します。終了時に自分で起動したserver processを停止し、一時world・DB・Skill交換ファイルを削除します。子process終了、server/RCONのloopback listener閉鎖、一時world削除を確認し、どれかが確認できない場合はpassになりません。Body smoke用clientと既定applicationのspawn位置がずれる可能性を避けるため、位置baselineはapplication接続後に取り、ブロック・所持品のbaselineはsmoke操作より前の状態を使います。
 
-後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`death_recovery`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`、`owner_stop_latch`、`underwater_item_recovery`、`armor_capability`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`、`skill_exchange`は前提caseなしで対象caseだけを実行します。`owner_stop_latch`はownerの永続停止が後続caseへ影響しないよう、明示target時だけ実行し、既定の全case matrixには含めません。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。単独の`skill_exchange`ではrepository seedの`mc-skill-gathering`を使い、receipt由来の学習成果とは扱いません。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
+後段caseを切り分ける時は`AI_PLAYER_E2E_TARGET_CASE`に`owner_return_through_door`、`food_intent_continuity`、`companion_intent_collection`、`gather_multi_target_continuity`、`death_recovery`、`game_action_discretion`、`damage_response`、`no_food_replan`、`learning_reuse`、`skill_compactness_and_knowledge_separation`、`skill_exchange`、`unknown_composite`、`parallel_dialogue_stop`、`owner_stop_latch`、`underwater_item_recovery`、`armor_capability`のいずれか一つを指定できます。新規Paper world、非OP Body smoke、既定runtime、実GPT、server oracleとcleanupは維持し、未選択caseは`CASE_NOT_SELECTED`の未完了としてartifactへ残します。`owner_return_through_door`、`food_intent_continuity`、`companion_intent_collection`、`gather_multi_target_continuity`、`game_action_discretion`、`damage_response`、`no_food_replan`、`parallel_dialogue_stop`、`skill_exchange`は前提caseなしで対象caseだけを実行します。`owner_stop_latch`はownerの永続停止が後続caseへ影響しないよう、明示target時だけ実行し、既定の全case matrixには含めません。`learning_reuse`と`unknown_composite`は前提として`autonomous_life`だけを実行し、`skill_compactness_and_knowledge_separation`は`autonomous_life`と`learning_reuse`を実行してその実測runtime履歴を引き継ぎます。単独の`skill_exchange`ではrepository seedの`mc-skill-gathering`を使い、receipt由来の学習成果とは扱いません。targeted runのcase結果は対応する受け入れ条件の根拠にできますが、それだけでrun全体やIssue全体をpassにしません。統合条件には共通runtime・DBを引き継ぐ重なりのある部分runを用い、長時間の全case連続耐久は #76 で確認します。障害物fixtureのRCON照会は各コマンドを2秒で打ち切り、応答遅延でfixture確認を飛ばしたり、復元不能を成功扱いにしたりしません。
 
 `skill_exchange`では、Markdownの`sourceVersion`を新しいexport activityの同じSkill ID/versionへ結び付け、編集前にDB readbackで対応revisionの存在を確認します。版が不明または一致しなければ未完了として記録します。再利用は、相談前の活動snapshot以後に`purpose` roleで新しい`search_skills` tool callがあり、同じ取り込み済みSkill ID/versionの新しい検索activityが記録され、その時刻が同revisionのsuccessful dig outcome以前であることを確認します。検索activityは直接一致と基礎カテゴリ候補のfallbackを受け入れ、`read_skill`のactivityは検索の証拠に数えません。続けて新規outcomeのSkill ID/versionとRCONの`air`読戻しを確認し、fixtureを`air`へ戻して読戻します。公開artifactには判定用booleanだけを残します。
 
@@ -53,6 +53,46 @@ Body smokeでは非OP Botを隔離world内の固定された安全な開始位�
 `underwater_item_recovery`は明示target時だけ実行し、既定matrixには加えません。隔離worldの浅い1段水場に原木itemを1個置き、座標や操作名を指定しないowner依頼を送ります。fixture後の新鮮なBody観測でitemと水中状態を確認し、新しい成功`collect_item`結果、RCONの所持数+1と周辺item dropなしを照合します。続けてBody/runtimeの水外状態と、Bot足元のair・stoneを確認して乾地への復帰を判定します。読取不能や上限到達は未完了です。cleanupでは水場と残ったfixture dropだけを復元し、拾得品は所持品に残します。停止後に古い操作が再開しない条件は既存のowner-stop targetとunit境界を共有します。
 
 初回提供の手動受け入れでは、浅水での対象一致pickupと独立した所持数増加、ownerの永続停止境界、未確認を成功として記録しないことを対象にし、この人工fixtureでの自律帰岸保証は含めません。`underwater_item_recovery`のtargeted caseは帰岸まで測定し、乾地が確認できなければ`incomplete`を維持します。このcaseの未完了と初回提供の手動受け入れ判断は分けて記録します。移動保持実験はP1の距離帯リスクと実改善未確認を踏まえて撤回し、追加地形matrixや新Issueへ広げません。
+
+## コンパニオンの意図更新と実採集target
+
+`companion_intent_collection`は単独targetです。既定runtimeへ数量を含む省略的な木材依頼を送り、採用済みowner goalの初期数量を確認した後、目の前に並ぶfixtureの原木を指す比喩・苛立ち・数量変更を含む追記を送ります。追記で依頼者に意味の訂正を説明させず、同じgoal IDの更新時刻がrequest後のfresh Body observation以降であることを確認します。
+
+その後、goal更新後の新しいBody採集操作、同じ短い観測窓でBody inventoryとRCON oracle双方に3本以上の原木があること、初期配置したfixture 8個から通算で3個以上減ったことを照合します。goalのstatusと達成後の`complete`判断を別に記録し、15秒以内に得られない場合は未確認と明示します。固定応答文字列は合否に使いません。case上限は32 calls / 280,000 known tokens / 8分、起動余裕を含むrun上限は40 calls / 360,000 known tokens / 10分です。
+
+実GPT runの短い会話とBot返信は一時領域 `ai-player-e2e-private-diagnostics/` のmode `0600` sidecarへ保存し、標準出力にはpathだけを表示します。public artifactには会話本文・goal title・座標・識別子を含めず、会話の意味解釈は`pending_private_review`として残します。behavioral evidenceだけで誤変換・比喩・苛立ちへの意味理解を合格扱いしません。実行例:
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=companion_intent_collection \
+AI_PLAYER_E2E_MAX_LLM_CALLS=40 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=360000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=10 \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
+
+同じtargetへ`AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY=YES`を追加すると、通常採集caseの代わりに実Purposeの脅威応答submodeを一度だけ実行します。隔離worldで採集goalを受け入れた後、現在のBot位置を基準に整数block座標の足場・空気を確認し、自然spawn無効・時間進行停止の夜間にNoAI敵4体を配置します。敵から距離を取りながら同じ採集goalを続けるowner依頼を送り、依頼後のPurpose判断に対応する実Body移動、同一life、敵までのBody/RCON距離増加、fresh hostile aggregate、Body/RCON位置・体力の照合を検査します。移動後に同じactive owner goalが保持され、次のaction判断が観測されたことも記録しますが、自動判定は意味上の採集継続を断定しません。次判断のsummary・operation metadataとgoal evidenceはprivate sidecarに保存し、採集再開の一手か退避の反復かをprivate reviewで確認します。移動距離・操作を直接指定したり、LLM応答の固定文字列で合否を決めたりせず、依頼した木材の採集完了やfixtureブロックからの取得も要求しません。fixture敵と採集用ブロック/dropをcleanupし、元のdaytimeをRCONで読戻します。
+
+このreal-API submodeは`AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY`等のno-GPT診断flagとは併用できません。case上限は18 calls / 160,000 known tokens / 6分、起動余裕を含むrun上限は18 calls / 160,000 known tokens / 9分です。case開始前の準備が3分を超えて6分の実行枠を確保できない場合はprovider呼び出し前に未完了で停止します。会話とgoal evidenceはmode `0600`のprivate sidecarだけに保存し、public artifactには固定の状態値・数値・operation kindだけを記録します。会話の意味解釈はprivate review対象として残します。実行例:
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=companion_intent_collection \
+AI_PLAYER_E2E_COMPANION_HOSTILE_PURPOSE_ONLY=YES \
+AI_PLAYER_E2E_MAX_LLM_CALLS=18 \
+AI_PLAYER_E2E_MAX_TOTAL_TOKENS=160000 \
+AI_PLAYER_E2E_MAX_DURATION_MINUTES=9 \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
+
+同じtargetで`AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY=YES`を追加すると、別runとしてNoAI zombieを100体だけ隔離worldへ配置し、server oracleとfresh Body client aggregate、詳細上限16件、candidate truncationなしを照合します。probe選択時はAPI送信前に`process.env.OPENAI_API_KEY`を削除し、既定applicationやAPI clientを起動せずprovider要求を送らない0-call診断です。fixture中は日中凍結から夜へ移してRCONで確認し、tag付きfixtureの全件cleanup後、元のdaytimeもRCONで読戻します。server上の100体を確認した後、client aggregateが100体を示すfresh observationを最大5秒・200ms間隔で待ちます。期限まで同期しない場合は未完了で終了します。probe本体は180秒以内、server起動・world準備・cleanupを含む所要は通常3〜5分を見込みます（server起動待ちは最大150秒）。このprobeのpassは収集caseや世界全体のhostile censusを証明しません。実行例:
+
+```sh
+AI_PLAYER_E2E_CONFIRMED=YES \
+AI_PLAYER_E2E_TARGET_CASE=companion_intent_collection \
+AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY=YES \
+npm exec -- tsx tests/e2e/ai-player-live.ts
+```
 
 ## Issue #83の代表的な複数対象採集case
 

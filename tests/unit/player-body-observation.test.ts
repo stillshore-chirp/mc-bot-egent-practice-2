@@ -197,5 +197,135 @@ describe("nearby hostile observation", () => {
     expect(nearby?.entityOutputLimit).toBe(16);
     expect(nearby?.omittedEntityCandidates).toBe(112);
     expect(nearby?.candidateSearchMayBeTruncated).toBe(true);
+    expect(nearby?.aggregate?.clientReceivedHostileCount).toBe(130);
+    expect(nearby?.aggregate?.occlusionCheck).toEqual({
+      method: "raycast_entity_body_point",
+      candidateLimit: 128,
+      candidatesChecked: 128,
+      unoccludedCandidates: 128,
+      occludedCandidates: 0,
+      uncheckedCandidates: 2,
+      detailOutputLimit: 16,
+      omittedUnoccludedDetails: 112,
+    });
+    expect(
+      nearby?.aggregate?.byKind.reduce((total, { count }) => total + count, 0),
+    ).toBe(130);
+  });
+
+  it("aggregates 100 received hostiles while keeping a bounded detail list", () => {
+    const directions = [
+      [0, -1],
+      [1, -1],
+      [1, 0],
+      [1, 1],
+      [0, 1],
+      [-1, 1],
+      [-1, 0],
+      [-1, -1],
+    ] as const;
+    const hostiles = Array.from({ length: 100 }, (_, index) => {
+      const [dx, dz] = directions[index % directions.length] ?? [0, -1];
+      const radius = 2 + (Math.floor(index / directions.length) % 8) * 0.5;
+      return mob(
+        index + 2,
+        index % 2 === 0 ? "zombie" : "skeleton",
+        new Vec3(dx * radius, 64 + ((index % 3) - 1), dz * radius),
+      );
+    });
+    const observation = observePlayerBody(
+      makeObservationBot(hostiles, false),
+      undefined,
+    );
+    const nearby = observation.perception.nearbyHostiles;
+    const aggregate = nearby?.aggregate;
+
+    expect(nearby?.entities).toHaveLength(16);
+    expect(aggregate?.clientReceivedHostileCount).toBe(100);
+    expect(aggregate?.maxDistance).toBe(16);
+    expect(aggregate?.worldAbsenceEstablished).toBe(false);
+    expect(aggregate?.countScope).toBe(
+      "client_entity_table_within_max_distance",
+    );
+    expect(aggregate?.byKind).toEqual([
+      { name: "skeleton", count: 50 },
+      { name: "zombie", count: 50 },
+    ]);
+    expect(
+      Object.fromEntries(
+        aggregate?.byDirection.map(({ direction, count }) => [
+          direction,
+          count,
+        ]) ?? [],
+      ),
+    ).toEqual({
+      north: 13,
+      northeast: 13,
+      east: 13,
+      southeast: 13,
+      south: 12,
+      southwest: 12,
+      west: 12,
+      northwest: 12,
+      coincident: 0,
+    });
+    expect(
+      aggregate?.byDirection
+        .map(({ count }) => count)
+        .reduce((a, b) => a + b, 0),
+    ).toBe(100);
+    expect(aggregate?.relativeOffsetBounds).toEqual({
+      min: { x: -5.5, y: -1, z: -5.5 },
+      max: { x: 5.5, y: 1, z: 5.5 },
+    });
+    expect(aggregate?.occlusionCheck).toEqual({
+      method: "raycast_entity_body_point",
+      candidateLimit: 128,
+      candidatesChecked: 100,
+      unoccludedCandidates: 100,
+      occludedCandidates: 0,
+      uncheckedCandidates: 0,
+      detailOutputLimit: 16,
+      omittedUnoccludedDetails: 84,
+    });
+  });
+
+  it("keeps occluded candidates in aggregate counts but out of visible details", () => {
+    const observation = observePlayerBody(
+      makeObservationBot([
+        mob(2, "zombie", new Vec3(5, 64, 0)),
+        mob(3, "skeleton", new Vec3(0, 64, -4)),
+      ]),
+      undefined,
+    );
+    const nearby = observation.perception.nearbyHostiles;
+    const aggregate = nearby?.aggregate;
+
+    expect(aggregate?.clientReceivedHostileCount).toBe(2);
+    expect(
+      aggregate?.byDirection.find(({ direction }) => direction === "east")
+        ?.count,
+    ).toBe(1);
+    expect(
+      aggregate?.byDirection.find(({ direction }) => direction === "east")
+        ?.relativeOffsetBounds,
+    ).toEqual({
+      min: { x: 5, y: 0, z: 0 },
+      max: { x: 5, y: 0, z: 0 },
+    });
+    expect(
+      aggregate?.byDirection.find(({ direction }) => direction === "north")
+        ?.relativeOffsetBounds,
+    ).toEqual({
+      min: { x: 0, y: 0, z: -4 },
+      max: { x: 0, y: 0, z: -4 },
+    });
+    expect(aggregate?.occlusionCheck).toMatchObject({
+      candidatesChecked: 2,
+      unoccludedCandidates: 1,
+      occludedCandidates: 1,
+      uncheckedCandidates: 0,
+    });
+    expect(nearby?.entities.map(({ id }) => id)).toEqual([3]);
   });
 });

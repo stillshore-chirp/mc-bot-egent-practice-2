@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 
 import { McSkillRepository } from "../../src/mc-skills/index.js";
@@ -403,6 +404,60 @@ describe("player owner intent context", () => {
           entityOutputLimit: 16,
           omittedEntityCandidates: 2,
           candidateSearchMayBeTruncated: true,
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            countScope: "client_entity_table_within_max_distance",
+            maxDistance: 16,
+            clientReceivedHostileCount: 100,
+            worldAbsenceEstablished: false,
+            directionFrame: "minecraft_cardinal_from_self_position",
+            relativeOffsetFrame: "entity_position_minus_self_position",
+            relativeOffsetBounds: {
+              min: { x: -10, y: -3, z: -8 },
+              max: { x: 12, y: 4, z: 15 },
+            },
+            byKind: [
+              { name: "zombie", count: 70 },
+              { name: "skeleton", count: 30 },
+            ],
+            omittedKindGroupCount: 0,
+            omittedKindEntityCount: 0,
+            byDirection: (
+              [
+                "north",
+                "northeast",
+                "east",
+                "southeast",
+                "south",
+                "southwest",
+                "west",
+                "northwest",
+                "coincident",
+              ] as const
+            ).map((direction) => ({
+              direction,
+              count: direction === "north" ? 60 : 0,
+              nearestDistance: direction === "north" ? 2.2 : null,
+              farthestDistance: direction === "north" ? 15 : null,
+              relativeOffsetBounds:
+                direction === "north"
+                  ? {
+                      min: { x: -4, y: -1, z: -14 },
+                      max: { x: 3, y: 2, z: -1 },
+                    }
+                  : null,
+            })),
+            occlusionCheck: {
+              method: "raycast_entity_body_point",
+              candidateLimit: 16,
+              candidatesChecked: 16,
+              unoccludedCandidates: 10,
+              occludedCandidates: 6,
+              uncheckedCandidates: 84,
+              detailOutputLimit: 16,
+              omittedUnoccludedDetails: 0,
+            },
+          },
           entities: [
             ...entities.slice(9, 10),
             {
@@ -451,10 +506,10 @@ describe("player owner intent context", () => {
 
       const initialRequest = record(fixture.requests[0]);
       expect(String(initialRequest.instructions)).toContain(
-        "敵など現在の周辺情報（種類・距離・方角・装備）を尋ねられたらobserve_bodyを使い",
+        "敵など現在の周辺情報を尋ねられたらobserve_bodyを使います",
       );
       expect(String(initialRequest.instructions)).toContain(
-        "両方の一覧にある同じ敵は一度だけ数え",
+        "aggregate.byKind/byDirection/relativeOffsetBoundsは出力上限前の候補の種類・方角・相対分布",
       );
       expect(JSON.stringify(initialRequest.tools)).toContain(
         '"name":"observe_body"',
@@ -490,7 +545,8 @@ describe("player owner intent context", () => {
         available: true,
         source: "client_received_unoccluded_nearby_hostiles",
         observedAt: baseObservation.observedAt,
-        coverage: "client_received_unoccluded_hostile_subset",
+        coverage: "client_received_hostile_candidates",
+        detailCoverage: "raycast_unoccluded_hostile_details",
         maxDistance: 16,
         entityOutputLimit: 16,
         observedHostileCountLowerBound: 2,
@@ -499,6 +555,62 @@ describe("player owner intent context", () => {
         candidateSearchMayBeTruncated: true,
         worldAbsenceEstablished: false,
       });
+      expect(nearbySummary).toMatchObject({
+        aggregate: {
+          source: "client_received_hostile_entity_candidates",
+          countScope: "client_entity_table_within_max_distance",
+          maxDistance: 16,
+          clientReceivedHostileCount: 100,
+          worldAbsenceEstablished: false,
+          directionFrame: "minecraft_cardinal_from_self_position",
+          relativeOffsetFrame: "entity_position_minus_self_position",
+          relativeOffsetBounds: {
+            min: { x: -10, y: -3, z: -8 },
+            max: { x: 12, y: 4, z: 15 },
+          },
+          byKind: [
+            { name: "zombie", count: 70 },
+            { name: "skeleton", count: 30 },
+          ],
+          omittedKindGroupCount: 0,
+          omittedKindEntityCount: 0,
+          occlusionCheck: {
+            method: "raycast_entity_body_point",
+            candidateLimit: 16,
+            candidatesChecked: 16,
+            unoccludedCandidates: 10,
+            occludedCandidates: 6,
+            uncheckedCandidates: 84,
+            detailOutputLimit: 16,
+            omittedUnoccludedDetails: 0,
+          },
+        },
+      });
+      const aggregate = record(record(nearbySummary).aggregate);
+      const directionCounts = z
+        .array(
+          z.object({
+            direction: z.string(),
+            count: z.number(),
+            nearestDistance: z.number().nullable(),
+            farthestDistance: z.number().nullable(),
+          }),
+        )
+        .parse(aggregate.byDirection);
+      expect(
+        directionCounts.some(
+          (entry) =>
+            entry.direction === "north" &&
+            entry.count === 60 &&
+            entry.nearestDistance === 2.2 &&
+            entry.farthestDistance === 15,
+        ),
+      ).toBe(true);
+      expect(
+        directionCounts.some(
+          (entry) => entry.direction === "coincident" && entry.count === 0,
+        ),
+      ).toBe(true);
       const nearbyEntities = record(nearbySummary).entities as Record<
         string,
         unknown
@@ -523,6 +635,293 @@ describe("player owner intent context", () => {
       expect(serializedOutput).not.toContain('"id"');
       expect(messages).toEqual(["視界内にゾンビがいます。"]);
     } finally {
+      fixture.close();
+    }
+  });
+
+  it("retries one failed conversation observation with a fresh bounded read", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const observation = bodyObservationFixture();
+    let attempts = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("TRANSIENT_OBSERVATION_FAILURE");
+        return observation;
+      },
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("retry-observation", "observe_body", {}),
+      terminalResponse("I checked again and have a fresh view."),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "近くの状況を見て。",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(attempts).toBe(2);
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      const output = JSON.parse(String(toolOutput?.output)) as unknown;
+      expect(record(output)).toMatchObject({
+        available: true,
+        attempts: 2,
+        freshRetryUsed: true,
+        observedAt: observation.observedAt,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("still wakes Purpose for an actionable request after both fresh observations fail", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let attempts = 0;
+    let proposalWakeups = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => {
+        attempts += 1;
+        throw new Error("OBSERVATION_UNAVAILABLE");
+      },
+      say: async () => undefined,
+      onProposal: () => {
+        proposalWakeups += 1;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("failed-observation", "observe_body", {}),
+      functionCallResponse("continue-owner-intent", "propose_goal_change", {
+        title: "Gather the wood the owner meant",
+        reason:
+          "The owner asked me to gather the wood discussed earlier; I should use a fresh observation and choose the first step.",
+        priority: 4,
+      }),
+      terminalResponse(
+        "観測を再試行しました。木を集める目的は続けて進めます。",
+      ),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "あの木、ちゃんと集めて。さっき周りを見れてなかったよ。",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(attempts).toBe(2);
+      expect(proposalWakeups).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the wood the owner meant",
+          status: "pending",
+        }),
+      );
+      const initialRequest = record(fixture.requests[0]);
+      expect(String(initialRequest.instructions)).toContain(
+        "明確な依頼は観測失敗だけを理由に放置しません",
+      );
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const observationOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(String(observationOutput?.output)).toContain(
+        '"freshRetryExhausted":true',
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("routes owner feedback to current-purpose reassessment without making another goal", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const reassessmentReasons: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onPurposeReassessment: (reason) => {
+        reassessmentReasons.push(reason);
+        return true;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const reason =
+      "The route keeps returning to the blocked entrance; reconsider how to reach the existing collection goal.";
+    fixture.responses.push(
+      functionCallResponse(
+        "reassess-current-plan",
+        "reassess_my_current_plan",
+        { reason },
+      ),
+      terminalResponse(
+        "That route is stuck. I will check the area again and try another way.",
+      ),
+    );
+    const turn = conversation.nextTurn();
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "It keeps looping at that entrance. Rethink the route.",
+        turn,
+      });
+
+      expect(reassessmentReasons).toEqual([reason]);
+      expect(fixture.mind.snapshot().goals).toEqual([]);
+      expect(fixture.mind.snapshot().proposals).toEqual([]);
+      expect(messages).toEqual([
+        "That route is stuck. I will check the area again and try another way.",
+      ]);
+      expect(String(record(fixture.requests[0]).instructions)).toContain(
+        "reassess_my_current_plan",
+      );
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(toolOutput?.output))).toMatchObject({
+        ok: true,
+        requested: true,
+        alreadyRequested: false,
+        goalChanged: false,
+        bodyCancelled: false,
+      });
+    } finally {
+      conversation.finishTurn(turn);
+      fixture.close();
+    }
+  });
+
+  it("rejects stale and stopped current-purpose reassessment requests", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let wakeCount = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onPurposeReassessment: () => {
+        wakeCount += 1;
+        return true;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let resolveResponse!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    });
+    fixture.responses.push(
+      () => {
+        markRequestStarted();
+        return pendingResponse;
+      },
+      terminalResponse("This stale reply should not be sent."),
+      functionCallResponse("stopped-reassessment", "reassess_my_current_plan", {
+        reason: "Owner feedback asks me to reconsider the current route.",
+      }),
+      terminalResponse("I heard you."),
+    );
+    const staleTurn = conversation.nextTurn();
+    const staleRequest = conversation.handleOwnerMessage({
+      username: "owner",
+      message: "Rethink the route.",
+      turn: staleTurn,
+    });
+    let currentTurn: number | undefined;
+
+    try {
+      await requestStarted;
+      currentTurn = conversation.nextTurn();
+      resolveResponse(
+        functionCallResponse("stale-reassessment", "reassess_my_current_plan", {
+          reason: "Owner feedback asks me to reconsider the current route.",
+        }),
+      );
+      await staleRequest;
+      expect(wakeCount).toBe(0);
+      expect(fixture.requests).toHaveLength(2);
+      const staleContinuation = record(fixture.requests[1]);
+      if (!Array.isArray(staleContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const staleOutput = staleContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(staleOutput?.output))).toMatchObject({
+        ok: false,
+        code: "STALE_CONVERSATION",
+      });
+
+      fixture.mind.stop();
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Rethink the route.",
+        turn: currentTurn,
+      });
+      expect(wakeCount).toBe(0);
+      expect(fixture.requests).toHaveLength(4);
+      const stoppedContinuation = record(fixture.requests[3]);
+      if (!Array.isArray(stoppedContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = stoppedContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(toolOutput?.output))).toMatchObject({
+        ok: false,
+        code: "STOPPED_OR_STALE",
+      });
+    } finally {
+      if (currentTurn !== undefined) conversation.finishTurn(currentTurn);
       fixture.close();
     }
   });
@@ -691,7 +1090,9 @@ describe("player owner intent context", () => {
             "The owner is now asking me to eat one of the foods from the recent conversation.",
           priority: 3,
         }),
-        terminalResponse("I will consider that alongside my current state."),
+        terminalResponse(
+          "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
+        ),
       );
       await conversation.handleOwnerMessage({
         username: "owner",
@@ -711,7 +1112,30 @@ describe("player owner intent context", () => {
       expect(String(secondRequest.instructions)).toContain(
         "質問、否定、引用、他者を対象にした発話",
       );
+      expect(String(secondRequest.instructions)).toContain(
+        "あなたはMinecraft世界でownerと過ごす一人のAIプレイヤーです",
+      );
+      expect(String(secondRequest.instructions)).toContain(
+        "propose_goal_changeの結果がpendingなら、active goalはまだ更新されていません",
+      );
+      expect(String(secondRequest.instructions)).toContain(
+        "owner向け進捗では内部案の提出・共有ではなく、理解した具体的な条件と自分がまず試すことを一人称の未来の意向として伝えます",
+      );
+      expect(String(secondRequest.instructions)).not.toContain("Purposeが");
+      expect(String(secondRequest.instructions)).not.toContain("Purposeへ");
       expect(proposalWakeups).toBe(1);
+      const proposalContinuation = record(fixture.requests[2]);
+      if (!Array.isArray(proposalContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const proposalOutput = proposalContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(proposalOutput?.output))).toMatchObject({
+        ok: true,
+        proposalStatus: "pending",
+        title: "Eat one of the foods the owner mentioned",
+      });
+      expect(fixture.mind.snapshot().goals).toEqual([]);
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({
           title: "Eat one of the foods the owner mentioned",
@@ -720,6 +1144,44 @@ describe("player owner intent context", () => {
       );
       expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
       expect(messages).toHaveLength(2);
+      expect(messages[1]).toBe(
+        "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("gives ordinary owner proposal resolutions a concrete first-person shape", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const proposal = fixture.mind.addProposal({
+      title: "Gather three birch logs",
+      reason: "The owner wants three birch logs.",
+      priority: 3,
+    });
+    fixture.responses.push(
+      terminalResponse("I will check the nearby trees and begin with one cut."),
+    );
+
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+
+      expect(result.accepted).toBe(false);
+      const request = record(fixture.requests[0]);
+      const instructions = String(request.instructions);
+      expect(instructions).toContain(
+        "proposalDispositionはstate保存用のenumです",
+      );
+      expect(instructions).toContain("一人称の短い会話で伝えます");
+      expect(instructions).toContain("希望された具体的な対象・数量・条件");
+      expect(instructions).toContain("これから自分が試す一手");
+      expect(instructions).not.toContain("priority 4以上の新しいowner提案");
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({ id: proposal.id, status: "pending" }),
+      );
     } finally {
       fixture.close();
     }

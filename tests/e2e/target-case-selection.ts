@@ -2,6 +2,7 @@ export const TARGETABLE_CASES = [
   "owner_return_through_door",
   "game_action_discretion",
   "food_intent_continuity",
+  "companion_intent_collection",
   "gather_multi_target_continuity",
   "death_recovery",
   "underwater_item_recovery",

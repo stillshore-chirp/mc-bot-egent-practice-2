@@ -792,6 +792,126 @@ describe("player agent response rounds", () => {
     },
   );
 
+  it.each(["collect_item", "move_to"] as const)(
+    "retains a recent failed %s alongside reflex results in urgent Purpose input",
+    async (failedKind) => {
+      const failureAt = "2026-10-07T01:00:00.000Z";
+      const firstReflexAt = "2026-10-07T01:00:01.000Z";
+      const latestReflexAt = "2026-10-07T01:00:02.000Z";
+      const fixture = openPurposeFixture(
+        [terminalResponse("I will reconsider the previous result.")],
+        undefined,
+        undefined,
+        async () => bodyObservationFixture(),
+      );
+      const proposal = fixture.mind.addProposal({
+        title: "Collect iron and meet the owner",
+        reason: "Keep the owner's collection and meeting intent active.",
+        priority: 4,
+      });
+      const ownerGoalCommit = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        proposalResolution: {
+          proposalId: proposal.id,
+          disposition: "adopted",
+          resolution: "Keep the collection and meeting intent active.",
+        },
+      });
+      expect(ownerGoalCommit.accepted).toBe(true);
+      const ownerGoalId = ownerGoalCommit.snapshot.goals.find(
+        ({ ownerProposalId }) => ownerProposalId === proposal.id,
+      )?.id;
+      expect(ownerGoalId).toBeDefined();
+      for (let index = 0; index < 4; index += 1) {
+        const selfGoalCommit = fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          goal: {
+            id: `self-subgoal-${index}`,
+            title: `Inspect local route ${index}`,
+            status: "active",
+            priority: 1,
+            changeReason: "Purpose added a local subgoal.",
+            source: "self",
+          },
+        });
+        expect(selfGoalCommit.accepted).toBe(true);
+      }
+      fixture.mind.recordOutcome({
+        evidence: {
+          operationId: `failed-${failedKind}`,
+          kind: failedKind,
+          status: "failed",
+          summary: `${failedKind} failed before the reflex; choose another route or method.`,
+          observedAt: failureAt,
+        },
+      });
+      for (const [index, observedAt] of [
+        firstReflexAt,
+        latestReflexAt,
+      ].entries())
+        fixture.mind.recordOutcome({
+          evidence: {
+            operationId: `damage-reflex-${index}`,
+            kind: "attack",
+            status: "successful",
+            summary: `damage-reflex hit_confirmed; operation=attack; status=successful; startedAt=${observedAt}; serverConfirmedAt=${observedAt}; sameLife=true`,
+            observedAt,
+          },
+        });
+
+      try {
+        await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: [
+            {
+              id: "urgent-after-failed-action",
+              kind: "bot_damaged",
+              summary: "A recent damage wake requires a fresh judgment.",
+              createdAt: latestReflexAt,
+            },
+          ],
+        });
+
+        const payload = requestUserPayload(fixture.requests[0]);
+        const runtime = z
+          .record(z.string(), z.unknown())
+          .parse(payload.runtime);
+        const outcomes = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.recentOutcomes);
+        const goals = z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(runtime.goals);
+        expect(goals).toContainEqual(
+          expect.objectContaining({
+            id: ownerGoalId,
+            title: "Collect iron and meet the owner",
+            status: "active",
+            source: "owner",
+          }),
+        );
+        expect(goals.length).toBeLessThanOrEqual(6);
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            kind: failedKind,
+            status: "failed",
+            summary: `${failedKind} failed before the reflex; choose another route or method.`,
+            observedAt: failureAt,
+          }),
+        );
+        expect(
+          outcomes.filter(
+            ({ summary }) =>
+              typeof summary === "string" &&
+              summary.startsWith("damage-reflex "),
+          ),
+        ).toHaveLength(2);
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
   it("distinguishes the last pre-death position from the current observation", async () => {
     const beforeAt = "2026-10-04T07:14:55.000Z";
     const deathAt = "2026-10-04T07:14:57.000Z";
@@ -1087,8 +1207,18 @@ describe("player agent response rounds", () => {
         maxRetries: 0,
         timeout: 10_000,
       });
-      expect(request.instructions).toContain("危険は創作せず");
+      expect(request.instructions).toContain(
+        "観測されていない危険は創作しません",
+      );
       expect(request.instructions).toContain("proposalDisposition");
+      expect(request.instructions).toContain(
+        "proposalDispositionはstate保存用のenumです",
+      );
+      expect(request.instructions).toContain(
+        "一人称の短い会話で伝えてください",
+      );
+      expect(request.instructions).toContain("具体的な対象・数量・条件");
+      expect(request.instructions).toContain("これから自分が試す一手");
       expect(request.instructions).toContain(
         "今回の入力runtime.proposalsにstatus=pendingとして載っているものだけ",
       );
@@ -1686,6 +1816,60 @@ describe("player agent response rounds", () => {
             entityOutputLimit: 16,
             omittedEntityCandidates: 2,
             candidateSearchMayBeTruncated: true,
+            aggregate: {
+              source: "client_received_hostile_entity_candidates",
+              countScope: "client_entity_table_within_max_distance",
+              maxDistance: 16,
+              clientReceivedHostileCount: 100,
+              worldAbsenceEstablished: false,
+              directionFrame: "minecraft_cardinal_from_self_position",
+              relativeOffsetFrame: "entity_position_minus_self_position",
+              relativeOffsetBounds: {
+                min: { x: -12, y: -2, z: -9 },
+                max: { x: 10, y: 4, z: 13 },
+              },
+              byKind: [
+                { name: "zombie", count: 84 },
+                { name: "skeleton", count: 16 },
+              ],
+              omittedKindGroupCount: 0,
+              omittedKindEntityCount: 0,
+              byDirection: (
+                [
+                  "north",
+                  "northeast",
+                  "east",
+                  "southeast",
+                  "south",
+                  "southwest",
+                  "west",
+                  "northwest",
+                  "coincident",
+                ] as const
+              ).map((direction) => ({
+                direction,
+                count: direction === "north" ? 62 : 0,
+                nearestDistance: direction === "north" ? 2.2 : null,
+                farthestDistance: direction === "north" ? 15.8 : null,
+                relativeOffsetBounds:
+                  direction === "north"
+                    ? {
+                        min: { x: -3, y: -1, z: -15 },
+                        max: { x: 2, y: 3, z: -1 },
+                      }
+                    : null,
+              })),
+              occlusionCheck: {
+                method: "raycast_entity_body_point",
+                candidateLimit: 16,
+                candidatesChecked: 16,
+                unoccludedCandidates: 11,
+                occludedCandidates: 5,
+                uncheckedCandidates: 84,
+                detailOutputLimit: 16,
+                omittedUnoccludedDetails: 0,
+              },
+            },
             entities: [
               {
                 id: 91,
@@ -1732,11 +1916,13 @@ describe("player agent response rounds", () => {
           .record(z.string(), z.unknown())
           .parse(fixture.requests[0]);
         expect(request.instructions).toContain(
-          "今回のBody観測に見えている落下物は自発的にcollect_itemを試し",
+          "落下物は現在の目的や能力に関係するものをcollect_itemで試し",
         );
-        expect(request.instructions).toContain("武器・防具・道具を優先");
         expect(request.instructions).toContain(
-          "回復に使えると分かる食料も積極的に集めてください",
+          "体力低下や被害があっても生存や退避を固定の最優先にせず",
+        );
+        expect(request.instructions).toContain(
+          "一定距離まで離れる固定条件を使わず",
         );
         expect(request.instructions).toContain(
           "consumeは現在のregistryが食料と認識する所持品だけを使います",
@@ -1744,12 +1930,7 @@ describe("player agent response rounds", () => {
         expect(request.instructions).toContain(
           "food値上昇または同じBot/lifeのentity_status status 9",
         );
-        expect(request.instructions).toContain(
-          "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
-        );
-        expect(request.instructions).toContain(
-          "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
-        );
+        expect(request.instructions).not.toContain("8ブロック");
         const purposeInput = requestUserPayload(request);
         const serializedObservation = z
           .record(z.string(), z.unknown())
@@ -1780,6 +1961,16 @@ describe("player agent response rounds", () => {
           .record(z.string(), z.unknown())
           .parse(perception.nearbyHostiles);
         expect(nearbyHostiles).toMatchObject({
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            clientReceivedHostileCount: 100,
+            byKind: [
+              { name: "zombie", count: 84 },
+              { name: "skeleton", count: 16 },
+            ],
+          },
+        });
+        expect(nearbyHostiles).toMatchObject({
           source: "client_received_unoccluded_nearby_hostiles",
           observedAt: base.observedAt,
           maxDistance: 16,
@@ -1788,6 +1979,40 @@ describe("player agent response rounds", () => {
           omittedEntityCandidates: 2,
           candidateSearchMayBeTruncated: true,
         });
+        expect(nearbyHostiles).toMatchObject({
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            countScope: "client_entity_table_within_max_distance",
+            maxDistance: 16,
+            clientReceivedHostileCount: 100,
+            worldAbsenceEstablished: false,
+            directionFrame: "minecraft_cardinal_from_self_position",
+            relativeOffsetFrame: "entity_position_minus_self_position",
+            byKind: [
+              { name: "zombie", count: 84 },
+              { name: "skeleton", count: 16 },
+            ],
+            occlusionCheck: {
+              method: "raycast_entity_body_point",
+              candidateLimit: 16,
+              candidatesChecked: 16,
+              unoccludedCandidates: 11,
+              occludedCandidates: 5,
+              uncheckedCandidates: 84,
+              detailOutputLimit: 16,
+              omittedUnoccludedDetails: 0,
+            },
+          },
+        });
+        const hostileAggregate = z
+          .record(z.string(), z.unknown())
+          .parse(nearbyHostiles.aggregate);
+        assertNearbyDirectionCount(hostileAggregate.byDirection, "north", 62);
+        assertNearbyDirectionCount(
+          hostileAggregate.byDirection,
+          "coincident",
+          0,
+        );
         const nearbyEntities = z
           .array(z.record(z.string(), z.unknown()))
           .parse(nearbyHostiles.entities);
@@ -2403,11 +2628,10 @@ describe("player agent response rounds", () => {
         "その根拠をproposal resolutionに伝えてください",
       );
       expect(instructions).toContain(
-        "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+        "体力低下や被害があっても生存や退避を固定の最優先にせず",
       );
-      expect(instructions).toContain(
-        "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
-      );
+      expect(instructions).toContain("一定距離まで離れる固定条件を使わず");
+      expect(instructions).not.toContain("8ブロック");
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
       );
@@ -2415,9 +2639,6 @@ describe("player agent response rounds", () => {
         "危険の安全審査や追加観測を行動の前提にせず",
       );
       expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
-      expect(instructions).toContain(
-        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
-      );
       expect(instructions).toContain(
         "その根拠をproposal resolutionに伝えてください",
       );
@@ -2430,9 +2651,6 @@ describe("player agent response rounds", () => {
       expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
-      );
-      expect(instructions).toContain(
-        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
       );
       const payload = requestUserPayload(request);
       expect(payload.observation).toMatchObject({
@@ -3703,7 +3921,7 @@ describe("player agent response rounds", () => {
         .parse(firstRequest.tools);
       expect(instructions).toContain("必ずinspect_runtimeを呼び");
       expect(instructions).toContain("Minecraft内でBotが死亡したことと");
-      expect(instructions).toContain("会話turnにBody操作toolがないことだけで");
+      expect(instructions).toContain("会話turnでBody操作toolを使わない時も");
       expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
       expect(tools.map((tool) => tool.name)).toContain("describe_operation");
       const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
@@ -5031,6 +5249,19 @@ function requestUserPayload(request: unknown): Record<string, unknown> {
   return z
     .record(z.string(), z.unknown())
     .parse(JSON.parse(userMessage.content));
+}
+
+function assertNearbyDirectionCount(
+  value: unknown,
+  direction: string,
+  count: number,
+): void {
+  const bins = z
+    .array(z.object({ direction: z.string(), count: z.number() }))
+    .parse(value);
+  expect(
+    bins.some((bin) => bin.direction === direction && bin.count === count),
+  ).toBe(true);
 }
 
 function actionArguments(

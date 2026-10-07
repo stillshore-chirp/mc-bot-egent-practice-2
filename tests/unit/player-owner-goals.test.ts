@@ -258,6 +258,78 @@ describe("owner proposal goals", () => {
     }
   });
 
+  it.each(["commitThought", "commitGoalState"] as const)(
+    "updates an explicitly selected live goal across proposal IDs through %s",
+    (path) => {
+      const { mind } = openMind();
+      try {
+        const first = mind.addProposal({
+          title: "Collect 4 oak logs",
+          reason: "The owner wants oak logs for a build.",
+        });
+        const firstResult = resolve(
+          mind,
+          first.id,
+          "adopted",
+          "commitGoalState",
+        );
+        expect(firstResult.accepted).toBe(true);
+        const originalGoal = firstResult.snapshot.goals.find(
+          (entry) => entry.ownerProposalId === first.id,
+        );
+        expect(originalGoal).toBeDefined();
+        if (originalGoal === undefined)
+          throw new Error("first linked goal missing");
+
+        const second = mind.addProposal({
+          title: "Collect 8 oak logs",
+          reason: "The owner updated the requested quantity.",
+        });
+        const goal = {
+          id: originalGoal.id,
+          title: second.title,
+          status: "active" as const,
+          priority: originalGoal.priority,
+          changeReason: second.reason,
+          source: "owner" as const,
+        };
+        const proposalResolution = {
+          proposalId: second.id,
+          disposition: "adopted" as const,
+          resolution: "Update the existing collection goal.",
+        };
+        const result =
+          path === "commitThought"
+            ? mind.commitThought({
+                expectedRevision: mind.snapshot().revision,
+                decision: action("update-oak-log-quantity"),
+                goal,
+                proposalResolution,
+              })
+            : mind.commitGoalState({
+                expectedRevision: mind.snapshot().revision,
+                goal,
+                proposalResolution,
+              });
+
+        expect(result.accepted).toBe(true);
+        expect(result.snapshot.goals).toHaveLength(1);
+        expect(result.snapshot.goals[0]).toMatchObject({
+          id: originalGoal.id,
+          ownerProposalId: first.id,
+          title: second.title,
+          status: "active",
+          changeReason: second.reason,
+        });
+        expect(result.snapshot.proposals).toContainEqual(
+          expect.objectContaining({ id: second.id, status: "adopted" }),
+        );
+      } finally {
+        mind.close();
+      }
+    },
+  );
+
   it("preserves a self intermediate goal alongside the linked owner goal", () => {
     const { mind } = openMind();
     try {

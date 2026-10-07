@@ -18,6 +18,7 @@ import type {
   PlayerOperation,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
+import type { BodyNearbyHostileDirection } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
 import {
   compactSnapshot,
@@ -71,6 +72,20 @@ describe("integrated player runtime", () => {
     expect(wet.environment).not.toBe(dry.environment);
     expect(wetLow.vitals).not.toBe(wet.vitals);
     expect(signature({ health: 19 }).vitals).not.toBe(dry.vitals);
+  });
+
+  it("wakes on hostile candidate distance and direction changes", () => {
+    const base = observation();
+    const nearbyEast = withHostileAggregate(base, 2, "east", 4.2);
+    const sameEast = withHostileAggregate(base, 2, "east", 4.2);
+    const closerEast = withHostileAggregate(base, 2, "east", 2.6);
+    const nearbySouth = withHostileAggregate(base, 2, "south", 4.2);
+    const signature = (value: PlayerBodyObservation) =>
+      semanticSignatures(value).hostileMap;
+
+    expect(signature(nearbyEast)).toBe(signature(sameEast));
+    expect(signature(nearbyEast)).not.toBe(signature(closerEast));
+    expect(signature(nearbyEast)).not.toBe(signature(nearbySouth));
   });
 
   it("wakes on the nearest relevant block band without counting duplicate blocks", () => {
@@ -636,6 +651,116 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("wakes a fresh purpose reassessment without immediately cancelling its body or changing goals", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const initialObservation = observation();
+    body.setObservation(initialObservation);
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const seenObservations: PlayerBodyObservation[] = [];
+    const seenWakeEvents: PlayerRuntimeSnapshot["pendingEventKinds"][] = [];
+    let thoughtCount = 0;
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        seenWakeEvents.push(events.map(({ kind }) => kind));
+        seenObservations.push(await body.observe());
+        if (thoughtCount > 1) {
+          mind.consumeEvents(events.map(({ id }) => id));
+          return { accepted: true };
+        }
+        const decision = action("owner-plan-current-operation");
+        const saved = mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          mind.consumeEvents(events.map(({ id }) => id));
+        }
+        return { accepted: saved.accepted, decision };
+      },
+    };
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose,
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+    const proposal = mind.addProposal({
+      title: "Collect iron and return to the owner",
+      reason: "Continue the existing collection and return request.",
+      priority: 4,
+    });
+    const ownerGoalCommit = mind.commitGoalState({
+      expectedRevision: mind.snapshot().revision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "I will collect the iron, then return to you.",
+      },
+    });
+    if (!ownerGoalCommit.accepted)
+      throw new Error("TEST_OWNER_GOAL_COMMIT_REJECTED");
+    const goalsBefore = ownerGoalCommit.snapshot.goals;
+    const ownerGoalId = goalsBefore.find(
+      ({ ownerProposalId }) => ownerProposalId === proposal.id,
+    )?.id;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      const actionRevision = runtime.snapshot.actionRevision;
+      const activeOperationId = runtime.snapshot.activeOperation?.operationId;
+      const reassessmentObservation: PlayerBodyObservation = {
+        ...initialObservation,
+        observedAt: new Date(Date.now() + 1_000).toISOString(),
+        self: { ...initialObservation.self, health: 16 },
+      };
+      body.setObservation(reassessmentObservation);
+
+      expect(
+        runtime.onOwnerFeedbackNeedsReassessment(
+          "The current route keeps looping; choose a different way toward the same goal.",
+        ),
+      ).toBe(true);
+      await waitFor(() => thoughtCount === 2);
+
+      expect(seenWakeEvents[1]).toContain("manual");
+      expect(seenObservations[1]).toMatchObject({
+        observedAt: reassessmentObservation.observedAt,
+        self: { health: 16 },
+      });
+      expect(body.started).toEqual(["look"]);
+      expect(body.stopCalls).toBe(0);
+      expect(body.stopActiveCalls).toBe(0);
+      expect(body.results).toHaveLength(0);
+      expect(runtime.snapshot.actionRevision).toBe(actionRevision);
+      expect(runtime.snapshot.activeOperation?.operationId).toBe(
+        activeOperationId,
+      );
+      expect(runtime.snapshot.goals).toEqual(goalsBefore);
+      expect(ownerGoalId).toBeDefined();
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("returns a resolved owner proposal reason without starting a rejected action", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -650,7 +775,7 @@ describe("integrated player runtime", () => {
       wakeOn: ["state_changed"],
     };
     const resolution =
-      "観測したfood値では食べる必要がなく、可食アイテムも確認できないため今回は実行しません。";
+      "私はfood値から今すぐ食べる必要はないと見て、今回は食べないことにします。";
     const saved = fixture.mind.commitThought({
       expectedRevision: fixture.mind.snapshot().revision,
       decision,
@@ -665,7 +790,7 @@ describe("integrated player runtime", () => {
     try {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+      expect(fixture.messages[0]).toBe(resolution);
       expect(fixture.body.started).toHaveLength(0);
     } finally {
       await fixture.close();
@@ -716,7 +841,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will eat one piece of bread, then check how I feel.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -726,7 +851,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will eat one piece of bread, then check how I feel.",
+      );
       expect(fixture.messages[1]).toContain("food値が13から18へ増えた");
       expect(fixture.messages[1]).toContain("体力回復は確認していません");
       expect(fixture.messages[1]).not.toContain("体力が回復しました");
@@ -805,7 +932,8 @@ describe("integrated player runtime", () => {
       kind: "consume",
       item: "bread",
     });
-    const resolution = "I will eat first, then continue the shelter goal.";
+    const resolution =
+      "I will eat one bread, then continue building the shelter.";
     const saved = fixture.mind.commitThought({
       expectedRevision: fixture.mind.snapshot().revision,
       decision,
@@ -821,7 +949,7 @@ describe("integrated player runtime", () => {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.body.started.length === 1);
       await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+      expect(fixture.messages[0]).toBe(resolution);
 
       fixture.body.completeActive("failed");
       await waitFor(() => fixture.messages.length === 2);
@@ -875,7 +1003,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will try the bread and verify the result.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -885,7 +1013,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will try the bread and verify the result.",
+      );
       expect(fixture.messages[1]).toContain(
         "食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした",
       );
@@ -933,7 +1063,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will try eating the bread, then check the result.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -943,7 +1073,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("failed");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will try eating the bread, then check the result.",
+      );
       expect(fixture.messages[1]).toContain("食事操作は失敗し");
       expect(fixture.messages[1]).toContain("原因は観測から特定できていません");
       expect(fixture.messages[1]).not.toContain("満腹");
@@ -1055,7 +1187,8 @@ describe("integrated player runtime", () => {
                 proposalResolution: {
                   proposalId: ownerProposalRef.current,
                   disposition: "adopted" as const,
-                  resolution: "The owner meal intent is being handled.",
+                  resolution:
+                    "I will keep working on the owner's meal request.",
                 },
               }
             : {}),
@@ -1099,7 +1232,7 @@ describe("integrated player runtime", () => {
       expect(purposeCalls).toBe(1);
       expect(fixture.body.started).toEqual(["consume"]);
       expect(fixture.messages).toEqual([
-        "提案への判断：The owner meal intent is being handled.",
+        "I will keep working on the owner's meal request.",
         "自律行動を停止しました。再開の指示があるまで停止を続けます。",
       ]);
     } finally {
@@ -1534,7 +1667,7 @@ describe("integrated player runtime", () => {
         "observe a changed view",
       );
       expect(followupSnapshot?.lastOutcome?.summary).toContain(
-        "期待したstep=observe a changed view",
+        "expected=observe a changed view",
       );
       expect(followupSnapshot?.lastOutcome?.lookSweep).toEqual(scanEvidence);
       if (followupSnapshot === undefined)
@@ -1883,6 +2016,117 @@ describe("integrated player runtime", () => {
       });
     } finally {
       reopened.close();
+    }
+  });
+
+  it("keeps cross-life hostile snapshots separate and drops movement delta", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const before = withHostileAggregate(observation(), 2, "east", 3.4, true);
+    const after = withHostileAggregate(
+      {
+        ...before,
+        observedAt: new Date().toISOString(),
+        self: {
+          ...before.self,
+          health: 14,
+          position: { x: 8, y: 70, z: -5, dimension: "overworld" },
+        },
+      },
+      1,
+      "south",
+      6.2,
+      true,
+    );
+    body.setResultObservations(before, after);
+    body.setResultSameLife(false);
+    body.setResultDetail(
+      "A long diagnostic from the interrupted native action. ".repeat(12),
+    );
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    let followupSummary: string | undefined;
+    let thoughtCount = 0;
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose: {
+        think: async ({ snapshot }) => {
+          thoughtCount += 1;
+          if (thoughtCount > 1) {
+            followupSummary = snapshot.lastOutcome?.summary;
+            return { accepted: true };
+          }
+          const decision: Extract<PlayerThoughtDecision, { kind: "act" }> = {
+            ...action("move-after-respawn"),
+            operation: {
+              kind: "move_to",
+              position: { x: 9, y: 70, z: -5 },
+              range: 1,
+            },
+            expectedOutcome:
+              "Move toward a new destination and verify the route checkpoint. ".repeat(
+                5,
+              ),
+          };
+          const saved = mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision,
+          });
+          if (saved.accepted)
+            runtimeRef.current?.handleCommittedDecision(
+              saved.snapshot,
+              decision,
+            );
+          return { accepted: saved.accepted, decision };
+        },
+      },
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started[0] === "move_to");
+      body.completeActive("interrupted");
+      await waitFor(() => followupSummary !== undefined);
+      expect(followupSummary).toContain("sameLife=false/no-cross-life-delta");
+      expect(followupSummary).toContain("pre=client:18/16m,min=3.4m,hp=20");
+      expect(followupSummary).toContain("post=client:9/16m,min=6.2m,hp=14");
+      expect(followupSummary).toContain("min=3.4m");
+      expect(followupSummary).toContain("min=6.2m");
+      expect(followupSummary).toContain("+7");
+      expect(followupSummary).toContain("not a world census");
+      expect(followupSummary).toContain("preRay=check16/16,unocc0,occ8,skip2");
+      expect(followupSummary).toContain("postRay=check9/16,unocc0,occ8,skip0");
+      expect(followupSummary).toContain(
+        "移動差分はライフ変更をまたぐため記録しない",
+      );
+      expect(mind.snapshot().lastOutcome?.movementDelta).toBeUndefined();
+      expect(followupSummary).not.toContain("観測した移動差分=Δx:");
+      expect(followupSummary?.length).toBeLessThanOrEqual(680);
+      expect(followupSummary?.slice(0, 240)).toContain(
+        "pre=client:18/16m,min=3.4m,hp=20",
+      );
+      expect(followupSummary?.slice(0, 240)).toContain(
+        "post=client:9/16m,min=6.2m,hp=14",
+      );
+      expect(followupSummary?.slice(0, 240)).toContain("sameLife=false");
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
     }
   });
 
@@ -3184,6 +3428,25 @@ describe("integrated player runtime", () => {
     const body = new DeferredBody();
     body.setObservation(beforeDeath);
     const firstMind = PlayerMindStore.open(databasePath);
+    const ownerProposal = firstMind.addProposal({
+      title: "Return to the owner after recovering the emeralds",
+      reason: "The owner asked the companion to recover and return.",
+      priority: 4,
+    });
+    const ownerGoalCommit = firstMind.commitGoalState({
+      expectedRevision: firstMind.snapshot().revision,
+      proposalResolution: {
+        proposalId: ownerProposal.id,
+        disposition: "adopted",
+        resolution: "Keep the recovery and return intent active.",
+      },
+    });
+    if (!ownerGoalCommit.accepted)
+      throw new Error("TEST_OWNER_GOAL_COMMIT_REJECTED");
+    const ownerGoalId = ownerGoalCommit.snapshot.goals.find(
+      ({ ownerProposalId }) => ownerProposalId === ownerProposal.id,
+    )?.id;
+    if (ownerGoalId === undefined) throw new Error("TEST_OWNER_GOAL_MISSING");
     const firstSkills = openSkills(databasePath, directory);
     let firstPurposeCalls = 0;
     const firstRuntime = new PlayerRuntime({
@@ -3213,6 +3476,14 @@ describe("integrated player runtime", () => {
       body.emit({ type: "bot_death", at: deathObservedAt });
       await waitFor(
         () => firstMind.snapshot().latestDeath?.observedAt === deathObservedAt,
+      );
+      expect(firstMind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoalId,
+          ownerProposalId: ownerProposal.id,
+          source: "owner",
+          status: "active",
+        }),
       );
       expect(firstMind.snapshot().latestDeath?.beforeObservation).toMatchObject(
         {
@@ -3299,6 +3570,14 @@ describe("integrated player runtime", () => {
       );
       const restoredDeath = mind.snapshot().latestDeath;
       expect(restoredDeath).toBeDefined();
+      expect(mind.snapshot().goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoalId,
+          ownerProposalId: ownerProposal.id,
+          source: "owner",
+          status: "active",
+        }),
+      );
       expect(purposeSnapshots.at(-1)?.latestDeath).toEqual(restoredDeath);
       const compact = z
         .record(z.string(), z.unknown())
@@ -3667,6 +3946,8 @@ class DeferredBody implements PlayerBody {
   #observation = observation();
   #resultBefore: PlayerBodyObservation | null = null;
   #resultAfter: PlayerBodyObservation | null = null;
+  #resultSameLife: boolean | null | undefined;
+  #resultDetail: string | undefined;
   #lookSweepOnNextResult: PlayerBodyLookSweep | undefined;
   maxConcurrent = 0;
   stopCalls = 0;
@@ -3690,6 +3971,14 @@ class DeferredBody implements PlayerBody {
   ): void {
     this.#resultBefore = before;
     this.#resultAfter = after;
+  }
+
+  public setResultSameLife(value: boolean | null): void {
+    this.#resultSameLife = value;
+  }
+
+  public setResultDetail(value: string): void {
+    this.#resultDetail = value;
   }
 
   public completeActive(status: PlayerOperationResult["status"]): void {
@@ -3738,11 +4027,19 @@ class DeferredBody implements PlayerBody {
           completedAt: new Date().toISOString(),
           before: this.#resultBefore,
           after: this.#resultAfter,
+          ...(this.#resultSameLife === undefined
+            ? {}
+            : { sameLife: this.#resultSameLife }),
+          ...(this.#resultDetail === undefined
+            ? {}
+            : { detail: this.#resultDetail }),
           recoveryRequired,
           ...(this.#lookSweepOnNextResult === undefined
             ? {}
             : { lookSweep: this.#lookSweepOnNextResult }),
         };
+        this.#resultSameLife = undefined;
+        this.#resultDetail = undefined;
         this.#lookSweepOnNextResult = undefined;
         if (this.#finishActive === finish) this.#finishActive = undefined;
         this.results.push(result);
@@ -3876,6 +4173,100 @@ function observedStack(
     maxDurability: null,
     customName: null,
     enchantments: [],
+  };
+}
+
+function withHostileAggregate(
+  base: PlayerBodyObservation,
+  count: number,
+  activeDirection: BodyNearbyHostileDirection,
+  nearestDistance: number,
+  allDirections = false,
+): PlayerBodyObservation {
+  const directions = [
+    "north",
+    "northeast",
+    "east",
+    "southeast",
+    "south",
+    "southwest",
+    "west",
+    "northwest",
+    "coincident",
+  ] as const;
+  const offsets: Record<BodyNearbyHostileDirection, { x: number; z: number }> =
+    {
+      north: { x: 0, z: -5 },
+      northeast: { x: 5, z: -5 },
+      east: { x: 5, z: 0 },
+      southeast: { x: 5, z: 5 },
+      south: { x: 0, z: 5 },
+      southwest: { x: -5, z: 5 },
+      west: { x: -5, z: 0 },
+      northwest: { x: -5, z: -5 },
+      coincident: { x: 0, z: 0 },
+    };
+  const offset = offsets[activeDirection];
+  const bounds = {
+    min: { ...offset, y: 0 },
+    max: { ...offset, y: 1 },
+  };
+  const totalCount = count * (allDirections ? directions.length : 1);
+  const aggregate = {
+    source: "client_received_hostile_entity_candidates" as const,
+    countScope: "client_entity_table_within_max_distance" as const,
+    maxDistance: 16,
+    clientReceivedHostileCount: totalCount,
+    worldAbsenceEstablished: false as const,
+    directionFrame: "minecraft_cardinal_from_self_position" as const,
+    relativeOffsetFrame: "entity_position_minus_self_position" as const,
+    relativeOffsetBounds: totalCount === 0 ? null : bounds,
+    byKind: totalCount === 0 ? [] : [{ name: "zombie", count: totalCount }],
+    omittedKindGroupCount: 0,
+    omittedKindEntityCount: 0,
+    byDirection: directions.map((direction) => {
+      const active =
+        (allDirections || direction === activeDirection) && count > 0;
+      const directionOffset = offsets[direction];
+      return {
+        direction,
+        count: active ? count : 0,
+        nearestDistance: active ? nearestDistance : null,
+        farthestDistance: active ? nearestDistance + 0.4 : null,
+        relativeOffsetBounds: active
+          ? {
+              min: { ...directionOffset, y: 0 },
+              max: { ...directionOffset, y: 1 },
+            }
+          : null,
+      };
+    }),
+    occlusionCheck: {
+      method: "raycast_entity_body_point" as const,
+      candidateLimit: 16,
+      candidatesChecked: Math.min(totalCount, 16),
+      unoccludedCandidates: 0,
+      occludedCandidates: Math.min(totalCount, 8),
+      uncheckedCandidates: Math.max(0, totalCount - 16),
+      detailOutputLimit: 16,
+      omittedUnoccludedDetails: 0,
+    },
+  };
+  return {
+    ...base,
+    perception: {
+      ...base.perception,
+      nearbyHostiles: {
+        source: "client_received_unoccluded_nearby_hostiles",
+        observedAt: base.observedAt,
+        maxDistance: 16,
+        entityOutputLimit: 16,
+        omittedEntityCandidates: 0,
+        candidateSearchMayBeTruncated: false,
+        entities: [],
+        aggregate,
+      },
+    },
   };
 }
 

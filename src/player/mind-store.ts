@@ -1812,6 +1812,12 @@ function applyGoalAndProposalResolution(
     resolution?.disposition !== "declined" &&
     goalById?.ownerProposalId !== undefined &&
     goalById.ownerProposalId !== proposal.id;
+  const explicitlyUpdatedDifferentLinkedGoal =
+    mismatchedProposalLink &&
+    goalChange?.id !== undefined &&
+    goalChange.source === "owner" &&
+    (goalChange.status === "active" || goalChange.status === "paused") &&
+    goalById.source === "owner";
   const goalChangeForLink = mismatchedProposalLink ? undefined : goalChange;
   const shouldLinkExplicitGoal =
     proposal !== undefined &&
@@ -1835,6 +1841,11 @@ function applyGoalAndProposalResolution(
     resolution.disposition === "declined"
   )
     return { accepted: true, goals };
+
+  // An explicit update to a live owner goal is the caller's semantic link.
+  // Keep its original proposal provenance and do not create a duplicate goal
+  // for the newer proposal.
+  if (explicitlyUpdatedDifferentLinkedGoal) return { accepted: true, goals };
 
   const proposalTitle = bounded(proposal.title, 240, "goal title");
   const linkedGoal = goals.find((goal) => goal.ownerProposalId === proposal.id);

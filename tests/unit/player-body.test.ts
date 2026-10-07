@@ -3921,10 +3921,94 @@ describe("player body", () => {
     });
 
     expect(result.status).toBe("failed");
+    expect(result.detail).toContain("NoPath");
+    expect(result.detail).not.toContain("PathStopped");
     expect(
       setControlState.mock.calls.filter(([, enabled]) => enabled),
     ).toHaveLength(1);
     expect(setControlState).toHaveBeenLastCalledWith("right", false);
+  });
+
+  it("cancels relative pathfinding on life change and rejects cross-life arrival", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const finishGoto = vi.fn();
+      const goto = vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishGoto.mockImplementation(resolve);
+          }),
+      );
+      const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+
+      const resultPromise = body.execute({
+        kind: "move_relative",
+        offset: { x: 3, y: 0, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(goto).toHaveBeenCalledOnce();
+
+      fake.bot.health = 0;
+      fake.bot.emit("health");
+      fake.bot.emit("death");
+      fake.bot.health = 20;
+      fake.bot.entity.position.x = 3;
+      fake.bot.emit("spawn");
+      finishGoto();
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.sameLife).toBe(false);
+      expect(result.before?.self.position.x).toBe(0);
+      expect(result.after?.self.position.x).toBe(3);
+      expect(result.detail).toContain("bot life");
+      expect(setGoal).toHaveBeenCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("interrupts travel and clears its path when the connection ends", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      let finishGoto!: () => void;
+      const goto = vi.spyOn(fake.bot.pathfinder, "goto").mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishGoto = resolve;
+          }),
+      );
+      const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+      const resultPromise = body.execute({
+        kind: "move_to",
+        position: { x: 3, y: 64, z: 0 },
+        range: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(goto).toHaveBeenCalledOnce();
+
+      fake.bot.entity.position.x = 3;
+      fake.bot.emit("end", "test disconnect");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_001);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("interrupted");
+      expect(result.sameLife).toBe(false);
+      expect(result.after?.self.position.x).toBe(3);
+      expect(result.recoveryRequired).toBe(true);
+      expect(result.detail).toContain("native action is still pending");
+      expect(setGoal).toHaveBeenCalledWith(null);
+      finishGoto();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends relative movement input before an unresolved pathfinder request", async () => {
@@ -4026,7 +4110,8 @@ describe("player body", () => {
       await vi.advanceTimersByTimeAsync(0);
       const result = await resultPromise;
 
-      expect(result.status).toBe("failed");
+      expect(result.status).toBe("interrupted");
+      expect(result.sameLife).toBe(false);
       expect(
         setControlState.mock.calls.filter(([, enabled]) => enabled),
       ).toHaveLength(1);
