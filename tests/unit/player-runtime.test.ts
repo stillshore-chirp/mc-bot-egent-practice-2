@@ -88,6 +88,38 @@ describe("integrated player runtime", () => {
     expect(signature(nearbyEast)).not.toBe(signature(nearbySouth));
   });
 
+  it("wakes on dropped item name and count changes without tracking drop position", () => {
+    const base = observation();
+    const drop = (id: number, name: string, count: number) => ({
+      id,
+      name: "item",
+      kind: "item",
+      category: null,
+      position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+      distance: 2,
+      health: null,
+      isPlayer: false,
+      droppedItem: { name, count },
+    });
+    const signature = (
+      entities: PlayerBodyObservation["perception"]["entities"],
+    ) =>
+      semanticSignatures({
+        ...base,
+        perception: { ...base.perception, entities },
+      }).drops;
+
+    expect(signature([drop(1, "diamond", 2)])).not.toBe(
+      signature([drop(1, "diamond", 3)]),
+    );
+    expect(signature([drop(1, "diamond", 2)])).not.toBe(
+      signature([drop(1, "emerald", 2)]),
+    );
+    expect(signature([drop(1, "diamond", 2), drop(2, "diamond", 3)])).toBe(
+      signature([drop(3, "diamond", 5)]),
+    );
+  });
+
   it("wakes on the nearest relevant block band without counting duplicate blocks", () => {
     const base = observation();
     const log = {
@@ -2724,6 +2756,134 @@ describe("integrated player runtime", () => {
       await runtime.shutdown();
       skills.close();
       mind.close();
+    }
+  });
+
+  it("flushes a coalesced drop change once while preserving a later Purpose wait", async () => {
+    const fixtureRef: {
+      current?: ReturnType<typeof createRuntimeFixture>;
+    } = {};
+    let thoughtCount = 0;
+    const seenEvents: string[][] = [];
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        seenEvents.push(
+          events.map(({ kind, summary }) => `${kind}:${summary}`),
+        );
+        const nextWait =
+          thoughtCount === 1
+            ? {
+                kind: "wait" as const,
+                purpose: "watch nearby useful changes",
+                reason: "wait for a semantic observation",
+                wakeOn: ["state_changed" as const],
+              }
+            : thoughtCount === 3
+              ? {
+                  kind: "wait" as const,
+                  purpose: "wait for a body result",
+                  reason: "do not wake for ordinary observations",
+                  wakeOn: ["body_outcome" as const],
+                }
+              : undefined;
+        if (nextWait !== undefined) {
+          const runtimeFixture = fixtureRef.current;
+          if (runtimeFixture === undefined)
+            throw new Error("runtime fixture unavailable");
+          const saved = runtimeFixture.mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision: nextWait,
+          });
+          if (!saved.accepted) return { accepted: false };
+          runtimeFixture.runtime.handleCommittedDecision(
+            saved.snapshot,
+            nextWait,
+          );
+        }
+        fixtureRef.current?.mind.consumeEvents(events.map(({ id }) => id));
+        return {
+          accepted: true,
+          ...(nextWait === undefined ? {} : { decision: nextWait }),
+        };
+      },
+    });
+    fixtureRef.current = fixture;
+
+    const dropObservation = (count: number): PlayerBodyObservation => {
+      const base = observation();
+      return {
+        ...base,
+        observedAt: new Date().toISOString(),
+        perception: {
+          ...base.perception,
+          entities: [
+            {
+              id: 1,
+              name: "item",
+              kind: "item",
+              category: null,
+              position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+              distance: 2,
+              health: null,
+              isPlayer: false,
+              droppedItem: { name: "diamond", count },
+            },
+          ],
+        },
+      };
+    };
+    const emitDropCount = (count: number): void => {
+      fixture.body.setObservation(dropObservation(count));
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "entities",
+        at: new Date().toISOString(),
+      });
+    };
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => thoughtCount === 1);
+      expect(fixture.mind.snapshot().wait?.wakeOn).toEqual(["state_changed"]);
+
+      vi.useFakeTimers();
+      emitDropCount(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(thoughtCount).toBe(2);
+      expect(seenEvents[1]?.some((event) => event.includes("drops"))).toBe(
+        true,
+      );
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      emitDropCount(2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(thoughtCount).toBe(2);
+      await vi.advanceTimersByTimeAsync(10_999);
+      expect(thoughtCount).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(thoughtCount).toBe(3);
+      expect(seenEvents[2]?.some((event) => event.includes("drops"))).toBe(
+        true,
+      );
+      expect(fixture.mind.snapshot().wait?.wakeOn).toEqual(["body_outcome"]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      emitDropCount(3);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(thoughtCount).toBe(3);
+      expect(
+        fixture.mind
+          .pendingEvents(64)
+          .some(
+            ({ kind, summary }) =>
+              kind === "state_changed" && summary.includes("drops"),
+          ),
+      ).toBe(true);
+    } finally {
+      await fixture.close();
+      vi.useRealTimers();
     }
   });
 

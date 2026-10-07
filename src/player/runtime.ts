@@ -144,6 +144,7 @@ interface PendingThoughtWake {
 export class PlayerRuntime {
   readonly #eventTimes = new Map<string, number>();
   readonly #semanticSignatures = new Map<string, string>();
+  readonly #pendingSemanticChanges = new Set<string>();
   readonly #lifetime = new AbortController();
   #unsubscribeBody: (() => void) | undefined;
   #activeBody: ActiveBodyRun | undefined;
@@ -164,6 +165,7 @@ export class PlayerRuntime {
   #revisionRetryUsed = false;
   #deadlineTimer: NodeJS.Timeout | undefined;
   #sampleTimer: NodeJS.Timeout | undefined;
+  #semanticWakeTimer: NodeJS.Timeout | undefined;
   #vitalsWakeTimer: NodeJS.Timeout | undefined;
   #samplePromise: Promise<void> | undefined;
   #retryDelayMs = 5_000;
@@ -830,7 +832,7 @@ export class PlayerRuntime {
       readonly damageAware?: boolean;
       readonly deathAware?: boolean;
     } = {},
-  ): void {
+  ): boolean {
     const now = Date.parse(at);
     const previous = this.#eventTimes.get(key) ?? 0;
     if (Number.isFinite(now) && now - previous < minimumGapMs) {
@@ -839,12 +841,14 @@ export class PlayerRuntime {
           invalidateDecision: true,
         });
         this.#requestThought(kind, event.summary, false, true);
+        return true;
       }
       if (kind === "state_changed" && summary.includes("vitals")) {
         this.options.mind.enqueueEvent(kind, summary);
         this.#scheduleVitalsWake(Math.max(1, minimumGapMs - (now - previous)));
+        return true;
       }
-      return;
+      return false;
     }
     this.#eventTimes.set(key, Number.isFinite(now) ? now : Date.now());
     const deferObservation =
@@ -865,6 +869,7 @@ export class PlayerRuntime {
       options.damageAware ?? false,
       options.deathAware ?? false,
     );
+    return true;
   }
 
   #requestThought(
@@ -1568,21 +1573,15 @@ export class PlayerRuntime {
               criticalVitals &&
               Date.now() - this.#lastDamageEventAtMs <
                 damageObservationCoalesceMs;
-            const gap = criticalVitals
-              ? 3_000
-              : meaningful.includes("time")
-                ? 60_000
-                : 12_000;
-            if (!damageAlreadyReported)
-              this.enqueueAndWake(
-                "state_changed",
-                `観測上の意味のある変化: ${meaningful.join(", ")}`,
-                observation.observedAt,
-                `semantic:${meaningful.sort().join(",")}`,
-                gap,
-              );
+            if (damageAlreadyReported)
+              this.#pendingSemanticChanges.delete("vitals");
+            for (const kind of meaningful) {
+              if (!(kind === "vitals" && damageAlreadyReported))
+                this.#pendingSemanticChanges.add(kind);
+            }
           }
         }
+        this.#scheduleSemanticOpportunity();
       } catch (error) {
         // Disconnects and transient observation errors are handled by body/reconnect events.
         this.#logFailure("PLAYER_OBSERVATION_FAILED", error);
@@ -1614,9 +1613,55 @@ export class PlayerRuntime {
   #stopSampler(): void {
     if (this.#sampleTimer !== undefined) clearInterval(this.#sampleTimer);
     this.#sampleTimer = undefined;
+    if (this.#semanticWakeTimer !== undefined)
+      clearTimeout(this.#semanticWakeTimer);
+    this.#semanticWakeTimer = undefined;
     if (this.#vitalsWakeTimer !== undefined)
       clearTimeout(this.#vitalsWakeTimer);
     this.#vitalsWakeTimer = undefined;
+  }
+
+  #scheduleSemanticOpportunity(): void {
+    if (this.#semanticWakeTimer !== undefined)
+      clearTimeout(this.#semanticWakeTimer);
+    this.#semanticWakeTimer = undefined;
+    if (this.#pendingSemanticChanges.size === 0) return;
+    if (
+      this.#shuttingDown ||
+      !this.#bodyConnected ||
+      this.options.mind.snapshot().stopped
+    )
+      return;
+
+    const kinds = [...this.#pendingSemanticChanges].sort();
+    const minimumGapMs = kinds.includes("vitals")
+      ? 3_000
+      : kinds.length === 1 && kinds[0] === "time"
+        ? 60_000
+        : 12_000;
+    const previous = this.#eventTimes.get("semantic-opportunity") ?? 0;
+    const delayMs = previous + minimumGapMs - Date.now();
+    if (delayMs <= 0) {
+      const queued = this.enqueueAndWake(
+        "state_changed",
+        `観測上の意味のある変化: ${kinds.join(", ")}`,
+        new Date().toISOString(),
+        "semantic-opportunity",
+        minimumGapMs,
+      );
+      if (queued) this.#pendingSemanticChanges.clear();
+      else this.#scheduleSemanticOpportunity();
+      return;
+    }
+
+    this.#semanticWakeTimer = setTimeout(
+      () => {
+        this.#semanticWakeTimer = undefined;
+        this.#scheduleSemanticOpportunity();
+      },
+      Math.max(1, delayMs),
+    );
+    this.#semanticWakeTimer.unref();
   }
 
   #scheduleVitalsWake(delayMs: number): void {
@@ -2189,6 +2234,19 @@ export function semanticSignatures(
     .sort()
     .slice(0, 32)
     .join(",");
+  const droppedItemCounts = new Map<string, number>();
+  for (const { droppedItem } of observation.perception.entities) {
+    if (droppedItem === undefined) continue;
+    const name = droppedItem.name.slice(0, 80);
+    droppedItemCounts.set(
+      name,
+      (droppedItemCounts.get(name) ?? 0) + droppedItem.count,
+    );
+  }
+  const drops = [...droppedItemCounts]
+    .map(([name, count]) => `${name}:${count}`)
+    .sort()
+    .join(",");
   const hostileMap = hostileMapSignature(observation);
   const nearestRelevantBlocks = new Map<string, number>();
   for (const { name, distance } of observation.perception.blocks) {
@@ -2217,6 +2275,7 @@ export function semanticSignatures(
     environment,
     inventory,
     entities,
+    drops,
     hostileMap,
     blocks: relevantBlocks,
     time: `${observation.time.day ?? "unknown"}:${timeBand}:${observation.time.raining ?? "unknown"}`,
