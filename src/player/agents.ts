@@ -2025,7 +2025,7 @@ export class PlayerPurposeAgent {
       createPlayerTool({
         name: "ask_body_knowledge",
         description:
-          "英語のMinecraft registry ID/keywordでitem、block、entity、enchantmentの事実と関連recipeを照会する。例: oak_planks, crafting_table, zombie, sharpness。recipe factsは出力数・材料・requiresTable、craftability inferenceは1個分です。currentlyCraftableは作業台がある前提なので、craftingTableNearbyとcraftableWithCurrentSurfaceを区別してください。null/unknownは不在や不足の証拠ではなく、1個分から必要数や不足数を断定しません。日本語だけのqueryや可視範囲・操作方法の質問には使わず、可視範囲は渡された観測で確認してください。",
+          "英語のMinecraft registry ID/keywordでitem、block、entity、enchantmentの事実と関連recipeを照会する。例: oak_planks, crafting_table, zombie, sharpness。recipe factsは出力数・材料・requiresTable、craftability inferenceは1個分です。currentlyCraftableは作業台がある前提なので、craftingTableNearbyとcraftableWithCurrentSurfaceを区別してください。null/unknownは不在や不足の証拠ではなく、1個分から必要数や不足数を断定しません。日本語だけのqueryや可視範囲・操作方法の質問には使わず、可視範囲はこの判断に渡された観測で確認し、操作を選ぶ前提として再観測しないでください。",
         schema: knowledgeInput,
         execute: async ({ query }) => this.options.body.knowledge(query),
       }),
@@ -2591,7 +2591,7 @@ export class PlayerPurposeAgent {
       }
     }
     const actionFirstInstruction =
-      "owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、現在の目的に沿う小さなBody操作を少なくとも一つcommit_action_decisionしてください。目的の達成条件、ownerの強い要望、現在の体力・所持品・装備・地形・敵の詳細とaggregate、直近の操作結果を合わせて次の一手を選びます。ownerから新しい依頼がない時も、現在のgoalや自分の目的と体力・food・装備・敵・可視drop・直近結果を見比べ、有用で実行可能な機会を選びます。dropを一律に拾わず、目的への寄与、所持品、危険と手間を比べます。体力低下や被害があっても生存や退避を固定の最優先にせず、観測した脅威と目的から戦闘、位置変更、装備、回復、拾得などを判断します。一定距離まで離れる固定条件を使わず、移動後は実結果とfresh観測で脅威・目的進捗を見直します。同じ場所へ戻る、同じ失敗条件で同じ操作を繰り返す、または脅威が変わらない時は、根拠のない同じ距離移動を重ねず、前提か方法を変えます。被害への即応が落ち着いたら、元のowner目的に戻れるかを確認し、次の短い一手を選んでください。合理的にwaitする時は何を待ち、どのeventまたは時刻に再評価するかを示します。consumeは現在のregistryが食料と認識する所持品だけを使います。成功には対象食料の所持数減少に加え、food値上昇または同じBot/lifeのentity_status status 9が必要です。status 9や所持数減少だけでは成功とせず、fresh self.healthの上昇を観測した場合だけhealth回復を報告してください。未知や追加観測だけを理由にwaitせず、選んだ操作の結果を次判断へ使います。";
+      "owner停止、Body未接続/利用不能、または通常権限と現行schemaで操作できる候補がない場合を除き、現在の目的に沿う小さなBody操作を少なくとも一つcommit_action_decisionしてください。目的の達成条件、ownerの強い要望、現在の体力・所持品・装備・地形・敵の詳細とaggregate、直近の操作結果を合わせて次の一手を選びます。ownerから新しい依頼がない時も、現在のgoalや自分の目的と体力・food・装備・敵・可視drop・直近結果を見比べ、有用で実行可能な機会を選びます。落下物は現在の目的や能力に関係するものをcollect_itemで試し、拾得は実結果で判断します。ただしdropを一律に拾わず、目的への寄与、所持品、危険と手間を比べます。体力低下や被害があっても生存や退避を固定の最優先にせず、観測した脅威と目的から戦闘、位置変更、装備、回復、拾得などを判断します。一定距離まで離れる固定条件を使わず、移動後は実結果とfresh観測で脅威・目的進捗を見直します。同じ場所へ戻る、同じ失敗条件で同じ操作を繰り返す、または脅威が変わらない時は、根拠のない同じ距離移動を重ねず、前提か方法を変えます。被害への即応が落ち着いたら、元のowner目的に戻れるかを確認し、次の短い一手を選んでください。合理的にwaitする時は何を待ち、どのeventまたは時刻に再評価するかを示します。consumeは現在のregistryが食料と認識する所持品だけを使います。成功には対象食料の所持数減少に加え、food値上昇または同じBot/lifeのentity_status status 9が必要です。status 9や所持数減少だけでは成功とせず、fresh self.healthの上昇を観測した場合だけhealth回復を報告してください。未知や追加観測だけを理由にwaitせず、選んだ操作の結果を次判断へ使います。";
     const normalInstructions = [
       memoryContext.persona,
       "あなたはMinecraft世界にいるAIプレイヤー本人です。ownerとの関係、観測、記憶、既往結果を自分の経験としてつなぎ、自分で目的を選んで必要な小さな行動を始めてください。チャット起点の偽イベントを待たないでください。",

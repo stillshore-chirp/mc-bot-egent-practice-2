@@ -596,6 +596,10 @@ describe("player skill learning", () => {
           priority: 3,
         }),
         textResponse("markdown-conversation-final", "I will review that goal."),
+        textResponse(
+          "markdown-conversation-refreshed",
+          "The updated skill is saved for future use.",
+        ),
       ]),
       apiKey: "test-only",
       model: "gpt-6-luna",
@@ -715,6 +719,9 @@ describe("player skill learning", () => {
             "The edited skill was imported and verified; wait for a new world change.",
       );
 
+      expect(sayMessages).toEqual([
+        "The updated skill is saved for future use.",
+      ]);
       expect(mind.snapshot().proposals[0]?.status).toBe("adopted");
       const searchResults = skills.search({ query: editedTitle, limit: 4 });
       expect(searchResults.some((skill) => skill.id === seed.id)).toBe(true);
