@@ -712,6 +712,10 @@ function abortError(signal: AbortSignal): Error {
     : new Error("Player operation interrupted");
 }
 
+function isAbortSignalAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
 function waitForSpawnAdmissionPoll(
   delayMs: number,
   signal: AbortSignal,
@@ -2950,8 +2954,7 @@ export class MineflayerPlayerBody implements PlayerBody {
   private abortActiveTravelForLifecycleChange(bot: Bot, message: string): void {
     const active = this.active;
     if (
-      active === undefined ||
-      active.bot !== bot ||
+      active?.bot !== bot ||
       active.runFinished ||
       (active.operation.kind !== "move_to" &&
         active.operation.kind !== "move_relative") ||
@@ -3135,12 +3138,18 @@ export class MineflayerPlayerBody implements PlayerBody {
           try {
             await bot.pathfinder.goto(goal);
           } catch (error) {
-            if (!signal.aborted && latestPathUpdateStatus === "noPath") {
+            if (
+              !isAbortSignalAborted(signal) &&
+              latestPathUpdateStatus === "noPath"
+            ) {
               const noPath = new Error("No path to the goal!");
               if (operation.kind === "move_relative") noPath.name = "NoPath";
               throw noPath;
             }
-            if (!signal.aborted && latestPathUpdateStatus === "timeout") {
+            if (
+              !isAbortSignalAborted(signal) &&
+              latestPathUpdateStatus === "timeout"
+            ) {
               const timeout = new Error(
                 "Pathfinder timed out before confirming the requested goal.",
               );

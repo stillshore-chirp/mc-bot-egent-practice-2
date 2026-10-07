@@ -4110,7 +4110,8 @@ describe("player body", () => {
       await vi.advanceTimersByTimeAsync(0);
       const result = await resultPromise;
 
-      expect(result.status).toBe("failed");
+      expect(result.status).toBe("interrupted");
+      expect(result.sameLife).toBe(false);
       expect(
         setControlState.mock.calls.filter(([, enabled]) => enabled),
       ).toHaveLength(1);
