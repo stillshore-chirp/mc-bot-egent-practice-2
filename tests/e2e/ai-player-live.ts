@@ -93,6 +93,9 @@ import {
 import {
   COMPANION_PROACTIVE_CASE_BUDGET,
   COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+  COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
   COMPANION_PROACTIVE_RUN_BUDGET,
   CompanionProactiveAcceptanceError,
   companionProactivePhaseForTarget,
@@ -333,7 +336,7 @@ const CASE_BUDGETS = {
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_BUDGET,
-  companion_proactive_food: COMPANION_PROACTIVE_CASE_BUDGET,
+  companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
   companion_proactive_bed: COMPANION_PROACTIVE_CASE_BUDGET,
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
@@ -362,7 +365,7 @@ const CASE_DEADLINES = {
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
-  companion_proactive_food: COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   companion_proactive_bed: COMPANION_PROACTIVE_CASE_DEADLINE_MS,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
@@ -9961,11 +9964,14 @@ async function prepareRun(): Promise<RunState> {
     incomplete("JAVA_21_NOT_FOUND");
   }
   const configuredRunBudget = runBudgetFromEnvironment();
-  const targetSpecificRunBudget = isCompanionProactiveTarget(targetCase)
-    ? COMPANION_PROACTIVE_RUN_BUDGET
-    : isCompanionHostilePurposeOnly()
-      ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
-      : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
+  const targetSpecificRunBudget =
+    targetCase === "companion_proactive_food"
+      ? COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET
+      : isCompanionProactiveTarget(targetCase)
+        ? COMPANION_PROACTIVE_RUN_BUDGET
+        : isCompanionHostilePurposeOnly()
+          ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
+          : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
   const runBudget =
     targetCase === "companion_intent_collection" ||
     isCompanionProactiveTarget(targetCase)

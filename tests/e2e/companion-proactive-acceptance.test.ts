@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPANION_PROACTIVE_CASE_BUDGET,
+  COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+  COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
+  COMPANION_PROACTIVE_RUN_BUDGET,
   proactiveBedCompletionConfirmed,
   proactiveFoodUseConfirmed,
 } from "./companion-proactive-acceptance.js";
@@ -51,6 +57,25 @@ describe("companion proactive acceptance", () => {
     expect(TARGETABLE_CASES).not.toContain("companion_proactive_threat");
   });
 
+  it("caps the food probe separately while retaining the bed budget", () => {
+    expect(COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET).toEqual({
+      llmCalls: 32,
+      totalTokens: 280_000,
+    });
+    expect(COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS).toBe(8 * 60_000);
+    expect(COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET).toEqual({
+      durationMs: 10 * 60_000,
+      llmCalls: 32,
+      totalTokens: 280_000,
+    });
+    expect(COMPANION_PROACTIVE_CASE_BUDGET).toEqual({
+      llmCalls: 80,
+      totalTokens: 800_000,
+    });
+    expect(COMPANION_PROACTIVE_CASE_DEADLINE_MS).toBe(20 * 60_000);
+    expect(COMPANION_PROACTIVE_RUN_BUDGET.durationMs).toBe(25 * 60_000);
+  });
+
   it("accepts purposeful approach or exact-item collection with inventory delta and hunger recovery", () => {
     const valid = {
       freshPurposeDecision: true,
@@ -62,9 +87,10 @@ describe("companion proactive acceptance", () => {
       serverInventoryIncreaseObserved: true,
       consumeAction: successfulConsume,
       dropCountAfter: 0,
-      foodBefore: 12,
-      foodAfter: 18,
-      bodyFoodAfter: 18,
+      foodBefore: 6,
+      foodAfter: 11,
+      bodyFoodAfter: 11,
+      healthUnchanged: true,
     };
     expect(proactiveFoodUseConfirmed(valid)).toBe(true);
     expect(
@@ -128,6 +154,9 @@ describe("companion proactive acceptance", () => {
     expect(proactiveFoodUseConfirmed({ ...valid, bodyFoodAfter: 17 })).toBe(
       false,
     );
+    expect(
+      proactiveFoodUseConfirmed({ ...valid, healthUnchanged: false }),
+    ).toBe(false);
   });
 
   it("requires one bed request, same-goal work, crafted intermediate, placed bed, and completion", () => {

@@ -26,6 +26,15 @@ export const COMPANION_PROACTIVE_RUN_BUDGET = {
   durationMs: 25 * 60_000,
   ...COMPANION_PROACTIVE_CASE_BUDGET,
 } as const;
+export const COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET = {
+  llmCalls: 32,
+  totalTokens: 280_000,
+} as const;
+export const COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS = 8 * 60_000;
+export const COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET = {
+  durationMs: 10 * 60_000,
+  ...COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+} as const;
 
 export function isCompanionProactiveTarget(
   targetCase: string | undefined,
@@ -125,6 +134,7 @@ export function proactiveFoodUseConfirmed(input: {
   readonly foodBefore: number;
   readonly foodAfter: number;
   readonly bodyFoodAfter: number | null;
+  readonly healthUnchanged: boolean;
 }): boolean {
   const approach = input.approachAction;
   const consume = input.consumeAction;
@@ -141,7 +151,8 @@ export function proactiveFoodUseConfirmed(input: {
     !consume.recoveryRequired &&
     input.dropCountAfter === 0 &&
     input.foodAfter > input.foodBefore &&
-    input.bodyFoodAfter === input.foodAfter
+    input.bodyFoodAfter === input.foodAfter &&
+    input.healthUnchanged
   );
 }
 
@@ -233,6 +244,7 @@ async function runFoodPhase(
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   const capture = port.captureActions();
   const tag = "ai_e2e_proactive_food";
+  const foodItem = "bread";
   let origin: CompanionProactivePosition | undefined;
   let touchedDrop = false;
   const responseBaseline = port.responses().length;
@@ -243,11 +255,11 @@ async function runFoodPhase(
     );
     const hungerDeadline = Date.now() + 45_000;
     let foodBefore = await port.readFoodLevel();
-    while (foodBefore > 15 && Date.now() < hungerDeadline) {
-      await sleep(500);
+    while (foodBefore > 8 && Date.now() < hungerDeadline) {
+      await sleep(200);
       foodBefore = await port.readFoodLevel();
     }
-    if (foodBefore < 12 || foodBefore > 15)
+    if (foodBefore < 6 || foodBefore > 8)
       throw new CompanionProactiveAcceptanceError(
         "PROACTIVE_FOOD_HUNGER_FIXTURE_UNAVAILABLE",
       );
@@ -256,19 +268,19 @@ async function runFoodPhase(
     const healthBefore = await port.readHealth();
     foodBefore = await port.readFoodLevel();
     if (
-      foodBefore < 12 ||
-      foodBefore > 15 ||
+      foodBefore < 6 ||
+      foodBefore > 8 ||
+      healthBefore !== 20 ||
       bodyBefore.self.food !== foodBefore ||
-      bodyBefore.self.health === null ||
-      Math.abs(bodyBefore.self.health - healthBefore) > 1
+      bodyBefore.self.health !== 20
     ) {
       throw new CompanionProactiveAcceptanceError(
         "PROACTIVE_FOOD_BODY_BASELINE_UNCONFIRMED",
       );
     }
-    const serverInventoryBefore = await port.readInventoryCount("golden_apple");
+    const serverInventoryBefore = await port.readInventoryCount(foodItem);
     const bodyInventoryBefore = bodyBefore.self.inventory
-      .filter(({ name }) => name === "golden_apple")
+      .filter(({ name }) => name === foodItem)
       .reduce((total, { count }) => total + count, 0);
     if (serverInventoryBefore !== 0 || bodyInventoryBefore !== 0)
       throw new CompanionProactiveAcceptanceError(
@@ -289,20 +301,16 @@ async function runFoodPhase(
     const fixtureAt = Date.now();
     touchedDrop = true;
     await port.rcon.command(
-      `summon minecraft:item ${fixtureCenter.x + 4} ${fixtureCenter.y} ${fixtureCenter.z + 0.2} {Item:{id:"minecraft:golden_apple",count:1b},Age:-32768s,Tags:["${tag}"]}`,
+      `summon minecraft:item ${fixtureCenter.x + 4} ${fixtureCenter.y} ${fixtureCenter.z + 0.2} {Item:{id:"minecraft:${foodItem}",count:1b},Age:-32768s,Tags:["${tag}"]}`,
     );
-    const dropBefore = await port.countTaggedDrop(
-      tag,
-      "golden_apple",
-      fixtureCenter,
-    );
+    const dropBefore = await port.countTaggedDrop(tag, foodItem, fixtureCenter);
     if (dropBefore !== 1)
       throw new CompanionProactiveAcceptanceError(
         "PROACTIVE_FOOD_DROP_FIXTURE_UNAVAILABLE",
       );
     const dropPosition = await port.readTaggedDropPosition(
       tag,
-      "golden_apple",
+      foodItem,
       fixtureCenter,
     );
     const preObservation = await port.body.observe();
@@ -313,13 +321,13 @@ async function runFoodPhase(
     const visibleDrops = preObservation.perception.entities.filter(
       ({ name, droppedItem, position }) =>
         name === "item" &&
-        droppedItem?.name === "golden_apple" &&
+        droppedItem?.name === foodItem &&
         distance(position, dropPosition) <= 0.75,
     );
     const visibleDrop = visibleDrops[0];
-    const preServerInventory = await port.readInventoryCount("golden_apple");
+    const preServerInventory = await port.readInventoryCount(foodItem);
     const preBodyInventory = preObservation.self.inventory
-      .filter(({ name }) => name === "golden_apple")
+      .filter(({ name }) => name === foodItem)
       .reduce((total, { count }) => total + count, 0);
     const preObservationConfirmed =
       visibleDrops.length === 1 &&
@@ -359,11 +367,11 @@ async function runFoodPhase(
     let serverInventoryIncreaseObserved = false;
     let movementTowardDropObserved = false;
     let distanceAfter = startDistance;
-    const after = await port.observeForPlayer(12 * 60_000, async (player) => {
+    const after = await port.observeForPlayer(3 * 60_000, async (player) => {
       bodyAfter = await port.body.observe();
-      const inventory = await port.readInventoryCount("golden_apple");
+      const inventory = await port.readInventoryCount(foodItem);
       const bodyInventory = bodyAfter.self.inventory
-        .filter(({ name }) => name === "golden_apple")
+        .filter(({ name }) => name === foodItem)
         .reduce((total, { count }) => total + count, 0);
       serverInventoryIncreaseObserved ||= inventory > serverInventoryBefore;
       bodyInventoryIncreaseObserved ||= bodyInventory > bodyInventoryBefore;
@@ -398,9 +406,10 @@ async function runFoodPhase(
       const dropAfter =
         consume === undefined
           ? undefined
-          : await port.countTaggedDrop(tag, "golden_apple", fixtureCenter);
+          : await port.countTaggedDrop(tag, foodItem, fixtureCenter);
       const bodyFoodAfter = bodyAfter.self.food;
       const bodyHealthAfter = bodyAfter.self.health;
+      const healthUnchanged = healthAfter === 20 && bodyHealthAfter === 20;
       port.updateDiagnostic({
         proactivePhase: "food",
         ownerPromptCount: 0,
@@ -424,6 +433,9 @@ async function runFoodPhase(
         healthBefore,
         healthAfter,
         bodyHealthAfter: bodyHealthAfter ?? -1,
+        bodyHealthServerAligned:
+          bodyHealthAfter !== null && bodyHealthAfter === healthAfter,
+        healthUnchanged,
         healthRecoveryVerified: false,
       });
       if (
@@ -445,6 +457,7 @@ async function runFoodPhase(
         foodBefore,
         foodAfter,
         bodyFoodAfter,
+        healthUnchanged,
       });
     });
     if (after === undefined || bodyAfter === undefined)
@@ -481,7 +494,7 @@ async function runFoodPhase(
       serverDropCountBefore: dropBefore,
       serverDropCountAfter: await port.countTaggedDrop(
         tag,
-        "golden_apple",
+        foodItem,
         fixtureCenter,
       ),
       foodBefore,
@@ -491,6 +504,8 @@ async function runFoodPhase(
       healthBefore,
       healthAfter,
       bodyHealthAfter: bodyAfter.self.health ?? -1,
+      bodyHealthServerAligned: bodyAfter.self.health === healthAfter,
+      healthUnchanged: healthAfter === 20 && bodyAfter.self.health === 20,
       healthRecoveryVerified: false,
       ownerReplyCount: port.responses().length - responseBaseline,
       sameLife: capture.actions.some(
@@ -507,7 +522,7 @@ async function runFoodPhase(
         .command(`kill @e[type=minecraft:item,tag=${tag}]`)
         .catch(() => undefined);
       await port.rcon
-        .command(`clear ${port.botName} minecraft:golden_apple`)
+        .command(`clear ${port.botName} minecraft:${foodItem}`)
         .catch(() => undefined);
       await port.rcon
         .command(`effect clear ${port.botName}`)
@@ -516,7 +531,7 @@ async function runFoodPhase(
         fixtureCleanupConfirmed:
           origin !== undefined &&
           (await port
-            .countTaggedDrop(tag, "golden_apple", origin)
+            .countTaggedDrop(tag, foodItem, origin)
             .catch(() => -1)) === 0,
       });
     }
