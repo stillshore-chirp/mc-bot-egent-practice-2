@@ -42,6 +42,7 @@ import {
   type PlayerItemCollectionOutcome,
   type PlayerItemCollectionPathFailureReason,
   type PlayerBodyObservationOptions,
+  type PlayerOperationFailureReason,
 } from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import { playerOperationNames } from "../../src/minecraft/player-body-schema.js";
@@ -91,16 +92,17 @@ import {
   type GatherDropReadbackClass,
 } from "./gather-drop-readback.js";
 import {
-  COMPANION_PROACTIVE_CASE_BUDGET,
-  COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_BED_CASE_BUDGET,
+  COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_BED_RUN_BUDGET,
   COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
   COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
-  COMPANION_PROACTIVE_RUN_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
   CompanionProactiveAcceptanceError,
+  captureProactiveActionDetails,
   companionProactivePhaseForTarget,
   isCompanionProactiveTarget,
   parsePlayerGameModeReadback,
@@ -341,7 +343,7 @@ const CASE_BUDGETS = {
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_BUDGET,
   companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
-  companion_proactive_bed: COMPANION_PROACTIVE_CASE_BUDGET,
+  companion_proactive_bed: COMPANION_PROACTIVE_BED_CASE_BUDGET,
   companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
@@ -371,7 +373,7 @@ const CASE_DEADLINES = {
   food_intent_continuity: 8 * 60_000,
   companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
   companion_proactive_food: COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
-  companion_proactive_bed: COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  companion_proactive_bed: COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS,
   companion_proactive_threat: COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
@@ -9989,10 +9991,10 @@ async function prepareRun(): Promise<RunState> {
   const targetSpecificRunBudget =
     targetCase === "companion_proactive_food"
       ? COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET
-      : targetCase === "companion_proactive_threat"
-        ? COMPANION_PROACTIVE_THREAT_RUN_BUDGET
-        : isCompanionProactiveTarget(targetCase)
-          ? COMPANION_PROACTIVE_RUN_BUDGET
+      : targetCase === "companion_proactive_bed"
+        ? COMPANION_PROACTIVE_BED_RUN_BUDGET
+        : targetCase === "companion_proactive_threat"
+          ? COMPANION_PROACTIVE_THREAT_RUN_BUDGET
           : isCompanionHostilePurposeOnly()
             ? COMPANION_HOSTILE_PURPOSE_RUN_BUDGET
             : COMPANION_INTENT_COLLECTION_RUN_BUDGET;
@@ -12830,6 +12832,11 @@ interface CapturedCompanionHostilePurposeAction {
   readonly operationEntityId?: number;
   readonly observedEffectType?: string;
   readonly observedEffectEntityId?: number;
+  readonly targetRegistry?: string;
+  readonly requestedCount?: number | null;
+  readonly targetItemCountBefore?: number | null;
+  readonly targetItemCountAfter?: number | null;
+  readonly bodyFailureCode?: PlayerOperationFailureReason["code"] | null;
 }
 
 function installCompanionHostilePurposeActionCapture(
@@ -12846,6 +12853,16 @@ function installCompanionHostilePurposeActionCapture(
     signal,
   ) => {
     const result = await originalExecute(operation, signal);
+    const operationItem =
+      result.operation.kind === "craft" || result.operation.kind === "place"
+        ? result.operation.item
+        : undefined;
+    const requestedCount =
+      result.operation.kind === "craft"
+        ? result.operation.count
+        : result.operation.kind === "place"
+          ? 1
+          : undefined;
     actions.push({
       kind: result.operation.kind,
       status: result.status,
@@ -12865,6 +12882,16 @@ function installCompanionHostilePurposeActionCapture(
             observedEffectType: result.observedEffect.type,
             observedEffectEntityId: result.observedEffect.entityId,
           }),
+      ...captureProactiveActionDetails({
+        kind: result.operation.kind,
+        ...(operationItem === undefined ? {} : { item: operationItem }),
+        ...(requestedCount === undefined ? {} : { requestedCount }),
+        ...(result.failureReason === undefined
+          ? {}
+          : { failureCode: result.failureReason.code }),
+        beforeInventory: result.before?.self.inventory ?? null,
+        afterInventory: result.after?.self.inventory ?? null,
+      }),
     });
     return result;
   };

@@ -1,21 +1,24 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  COMPANION_PROACTIVE_CASE_BUDGET,
-  COMPANION_PROACTIVE_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_BED_CASE_BUDGET,
+  COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS,
+  COMPANION_PROACTIVE_BED_RUN_BUDGET,
   COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
   COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET,
-  COMPANION_PROACTIVE_RUN_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_BUDGET,
   COMPANION_PROACTIVE_THREAT_CASE_DEADLINE_MS,
   COMPANION_PROACTIVE_THREAT_RUN_BUDGET,
+  captureProactiveActionDetails,
   evaluateThreatPositioningCandidates,
   isFreshPurposeDecisionForAction,
   parsePlayerGameModeReadback,
+  proactiveBedActionDiagnostics,
   proactiveBedCompletionConfirmed,
   proactiveFoodUseConfirmed,
   proactiveThreatResponseConfirmed,
+  successfulProactiveCraftObserved,
 } from "./companion-proactive-acceptance.js";
 import {
   isCaseSelectedForTarget,
@@ -77,7 +80,7 @@ describe("companion proactive acceptance", () => {
     }
   });
 
-  it("caps the food probe separately while retaining the bed budget", () => {
+  it("caps food, bed, and threat probes independently", () => {
     expect(COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET).toEqual({
       llmCalls: 32,
       totalTokens: 280_000,
@@ -88,12 +91,16 @@ describe("companion proactive acceptance", () => {
       llmCalls: 32,
       totalTokens: 280_000,
     });
-    expect(COMPANION_PROACTIVE_CASE_BUDGET).toEqual({
-      llmCalls: 80,
-      totalTokens: 800_000,
+    expect(COMPANION_PROACTIVE_BED_CASE_BUDGET).toEqual({
+      llmCalls: 40,
+      totalTokens: 400_000,
     });
-    expect(COMPANION_PROACTIVE_CASE_DEADLINE_MS).toBe(20 * 60_000);
-    expect(COMPANION_PROACTIVE_RUN_BUDGET.durationMs).toBe(25 * 60_000);
+    expect(COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS).toBe(12 * 60_000);
+    expect(COMPANION_PROACTIVE_BED_RUN_BUDGET).toEqual({
+      durationMs: 15 * 60_000,
+      llmCalls: 40,
+      totalTokens: 400_000,
+    });
     expect(COMPANION_PROACTIVE_THREAT_CASE_BUDGET).toEqual({
       llmCalls: 32,
       totalTokens: 280_000,
@@ -262,6 +269,83 @@ describe("companion proactive acceptance", () => {
     expect(selection?.candidate).toBe(laterFreshAction);
     expect(selection?.accepted).toBe(true);
     expect(selection?.purposeDecisionLinkedToAction).toBe(true);
+  });
+
+  it("keeps bounded structured craft and placement evidence for bed diagnostics", () => {
+    const details = captureProactiveActionDetails({
+      kind: "craft",
+      item: "white_bed",
+      requestedCount: 80,
+      failureCode: "no_recipe_for_current_inventory_and_surface",
+      beforeInventory: [
+        { name: "oak_log", count: 2 },
+        { name: "white_wool", count: 3 },
+      ],
+      afterInventory: [{ name: "white_bed", count: 1 }],
+    });
+    expect(details).toEqual({
+      targetRegistry: "white_bed",
+      requestedCount: 80,
+      targetItemCountBefore: 0,
+      targetItemCountAfter: 1,
+      bodyFailureCode: "no_recipe_for_current_inventory_and_surface",
+    });
+    const unsafeTarget = captureProactiveActionDetails({
+      kind: "craft",
+      item: "private target phrase",
+      requestedCount: 1,
+      beforeInventory: null,
+      afterInventory: null,
+    });
+    expect(unsafeTarget.targetRegistry).toBe("unclassified");
+
+    const actions = Array.from({ length: 10 }, (_, index) => ({
+      kind: index % 2 === 0 ? "craft" : "place",
+      status: "successful",
+      startedAt: "2026-10-08T12:00:00.000Z",
+      completedAt: "2026-10-08T12:00:01.000Z",
+      sameLife: true,
+      recoveryRequired: false,
+      ...(index === 1 ? unsafeTarget : details),
+    }));
+    const diagnostic = proactiveBedActionDiagnostics(
+      actions,
+      Date.parse("2026-10-08T12:00:02.000Z"),
+    );
+    const summarized = JSON.parse(diagnostic.summary) as {
+      readonly startedBeforeOwnerPrompt: boolean | null;
+      readonly completedBeforeOwnerPrompt: boolean | null;
+    }[];
+
+    expect(diagnostic.count).toBe(10);
+    expect(diagnostic.omittedCount).toBe(2);
+    expect(summarized).toHaveLength(8);
+    expect(summarized[0]).toMatchObject({
+      startedBeforeOwnerPrompt: true,
+      completedBeforeOwnerPrompt: true,
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private target phrase");
+  });
+
+  it("does not count a craft started before the bed request", () => {
+    const sentAt = Date.parse("2026-10-08T12:00:03.000Z");
+    const crossedPromptCraft = {
+      ...successfulMove,
+      kind: "craft",
+      startedAt: "2026-10-08T12:00:02.000Z",
+      completedAt: "2026-10-08T12:00:04.000Z",
+    } as const;
+    const requestedCraft = {
+      ...crossedPromptCraft,
+      startedAt: "2026-10-08T12:00:03.100Z",
+    } as const;
+
+    expect(successfulProactiveCraftObserved([crossedPromptCraft], sentAt)).toBe(
+      false,
+    );
+    expect(successfulProactiveCraftObserved([requestedCraft], sentAt)).toBe(
+      true,
+    );
   });
 
   it("accepts purposeful approach or exact-item collection with inventory delta and hunger recovery", () => {

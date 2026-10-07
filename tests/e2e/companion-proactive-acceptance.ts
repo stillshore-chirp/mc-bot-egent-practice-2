@@ -1,4 +1,7 @@
-import type { MineflayerPlayerBody } from "../../src/minecraft/player-body.js";
+import type {
+  MineflayerPlayerBody,
+  PlayerOperationFailureReason,
+} from "../../src/minecraft/player-body.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body-observation.js";
 import type { PlayerEvidence } from "./ai-player-live.js";
 
@@ -18,15 +21,6 @@ export interface CompanionProactivePosition {
   readonly z: number;
 }
 
-export const COMPANION_PROACTIVE_CASE_BUDGET = {
-  llmCalls: 80,
-  totalTokens: 800_000,
-} as const;
-export const COMPANION_PROACTIVE_CASE_DEADLINE_MS = 20 * 60_000;
-export const COMPANION_PROACTIVE_RUN_BUDGET = {
-  durationMs: 25 * 60_000,
-  ...COMPANION_PROACTIVE_CASE_BUDGET,
-} as const;
 export const COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET = {
   llmCalls: 32,
   totalTokens: 280_000,
@@ -35,6 +29,15 @@ export const COMPANION_PROACTIVE_FOCUSED_CASE_DEADLINE_MS = 8 * 60_000;
 export const COMPANION_PROACTIVE_FOCUSED_RUN_BUDGET = {
   durationMs: 10 * 60_000,
   ...COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET,
+} as const;
+export const COMPANION_PROACTIVE_BED_CASE_BUDGET = {
+  llmCalls: 40,
+  totalTokens: 400_000,
+} as const;
+export const COMPANION_PROACTIVE_BED_CASE_DEADLINE_MS = 12 * 60_000;
+export const COMPANION_PROACTIVE_BED_RUN_BUDGET = {
+  durationMs: 15 * 60_000,
+  ...COMPANION_PROACTIVE_BED_CASE_BUDGET,
 } as const;
 export const COMPANION_PROACTIVE_THREAT_CASE_BUDGET =
   COMPANION_PROACTIVE_FOCUSED_CASE_BUDGET;
@@ -79,6 +82,125 @@ export interface CompanionProactiveAction {
   readonly operationEntityId?: number;
   readonly observedEffectType?: string;
   readonly observedEffectEntityId?: number;
+  readonly targetRegistry?: string;
+  readonly requestedCount?: number | null;
+  readonly targetItemCountBefore?: number | null;
+  readonly targetItemCountAfter?: number | null;
+  readonly bodyFailureCode?: PlayerOperationFailureReason["code"] | null;
+}
+
+const proactiveBedActionSummaryLimit = 8;
+
+export function captureProactiveActionDetails(input: {
+  readonly kind: string;
+  readonly item?: string;
+  readonly requestedCount?: number | null;
+  readonly failureCode?: PlayerOperationFailureReason["code"];
+  readonly beforeInventory:
+    readonly { readonly name: string; readonly count: number }[] | null;
+  readonly afterInventory:
+    readonly { readonly name: string; readonly count: number }[] | null;
+}): Pick<
+  CompanionProactiveAction,
+  | "targetRegistry"
+  | "requestedCount"
+  | "targetItemCountBefore"
+  | "targetItemCountAfter"
+  | "bodyFailureCode"
+> {
+  if (input.kind !== "craft" && input.kind !== "place") return {};
+  const item = input.item;
+  return {
+    ...(input.item === undefined
+      ? {}
+      : { targetRegistry: safeRegistryItem(input.item) }),
+    requestedCount: positiveSafeIntegerOrNull(input.requestedCount),
+    targetItemCountBefore: inventoryItemCount(input.beforeInventory, item),
+    targetItemCountAfter: inventoryItemCount(input.afterInventory, item),
+    bodyFailureCode: input.failureCode ?? null,
+  };
+}
+
+export function proactiveBedActionDiagnostics(
+  actions: readonly CompanionProactiveAction[],
+  ownerPromptSentAt: number | undefined,
+): Readonly<{ count: number; omittedCount: number; summary: string }> {
+  const actionsToSummarize = actions.filter(
+    ({ kind }) => kind === "craft" || kind === "place",
+  );
+  // Whitelist only the bounded, structured evidence needed to diagnose the run.
+  const summary = actionsToSummarize
+    .slice(0, proactiveBedActionSummaryLimit)
+    .map((action) => ({
+      kind: action.kind,
+      status: action.status,
+      startedAt: action.startedAt,
+      completedAt: action.completedAt,
+      startedBeforeOwnerPrompt:
+        ownerPromptSentAt === undefined
+          ? null
+          : Date.parse(action.startedAt) < ownerPromptSentAt,
+      completedBeforeOwnerPrompt:
+        ownerPromptSentAt === undefined
+          ? null
+          : Date.parse(action.completedAt) < ownerPromptSentAt,
+      targetRegistry: action.targetRegistry ?? null,
+      requestedCount: action.requestedCount ?? null,
+      targetItemCountBefore: action.targetItemCountBefore ?? null,
+      targetItemCountAfter: action.targetItemCountAfter ?? null,
+      bodyFailureCode: action.bodyFailureCode ?? null,
+      sameLife: action.sameLife,
+      recoveryRequired: action.recoveryRequired,
+    }));
+  return {
+    count: actionsToSummarize.length,
+    omittedCount: Math.max(
+      0,
+      actionsToSummarize.length - proactiveBedActionSummaryLimit,
+    ),
+    summary: JSON.stringify(summary),
+  };
+}
+
+export function successfulProactiveCraftObserved(
+  actions: readonly CompanionProactiveAction[],
+  ownerPromptSentAt: number,
+): boolean {
+  return actions.some(
+    ({ kind, status, startedAt, completedAt }) =>
+      kind === "craft" &&
+      status === "successful" &&
+      Date.parse(startedAt) >= ownerPromptSentAt &&
+      Date.parse(completedAt) >= ownerPromptSentAt,
+  );
+}
+
+function inventoryItemCount(
+  inventory:
+    readonly { readonly name: string; readonly count: number }[] | null,
+  item: string | undefined,
+): number | null {
+  if (inventory === null || item === undefined) return null;
+  return inventory
+    .filter(({ name }) => name === item)
+    .reduce((total, { count }) => total + count, 0);
+}
+
+function safeRegistryItem(item: string | undefined): string {
+  return item !== undefined && /^[a-z0-9_.:-]{1,128}$/u.test(item)
+    ? item
+    : "unclassified";
+}
+
+function positiveSafeIntegerOrNull(
+  count: number | null | undefined,
+): number | null {
+  return count !== undefined &&
+    count !== null &&
+    Number.isSafeInteger(count) &&
+    count > 0
+    ? count
+    : null;
 }
 
 export function evaluateThreatPositioningCandidates<
@@ -1025,6 +1147,25 @@ async function runBedPhase(
   let tablePosition: CompanionProactivePosition | undefined;
   const bedPositions: CompanionProactivePosition[] = [];
   let cleanupConfirmed = true;
+  let ownerPromptSentAt: number | undefined;
+  const bedActionEvidence = (): Readonly<
+    Record<string, boolean | number | string>
+  > => {
+    const evidence = proactiveBedActionDiagnostics(
+      capture.actions,
+      ownerPromptSentAt,
+    );
+    return {
+      bedActionEvidenceCount: evidence.count,
+      bedActionEvidenceOmittedCount: evidence.omittedCount,
+      bedActionEvidenceSummary: evidence.summary,
+      ...(ownerPromptSentAt === undefined
+        ? {}
+        : {
+            bedOwnerPromptSentAt: new Date(ownerPromptSentAt).toISOString(),
+          }),
+    };
+  };
   try {
     await prepareArena(port);
     await port.rcon.command(`give ${port.botName} minecraft:oak_log 2`);
@@ -1046,6 +1187,7 @@ async function runBedPhase(
     const prompt =
       "手持ちの原木2個と白い羊毛3個でベッドを作り、近くに置いてください。進め方は任せます。途中で確認を求めず、完成まで進めて状態を確かめてください。";
     const sentAt = Date.now();
+    ownerPromptSentAt = sentAt;
     port.sendOwnerChat(prompt);
     let acceptedGoal: PlayerEvidence["goals"][number] | undefined;
     const accepted = await port.observeForPlayer(90_000, (player) => {
@@ -1057,9 +1199,6 @@ async function runBedPhase(
         "PROACTIVE_BED_OWNER_GOAL_NOT_ACCEPTED",
       );
     const goalId = acceptedGoal.id;
-    const outcomeBaseline = new Set(
-      before.recentOutcomes.map(({ operationId }) => operationId),
-    );
     const processedActions = new Set<string>();
     let goalAtWorkCount = 0;
     let successfulCraft = false;
@@ -1078,23 +1217,16 @@ async function runBedPhase(
         );
         completionObserved ||=
           goal?.status === "completed" || goal?.status === "complete";
-        successfulCraft ||= capture.actions.some(
-          ({ kind, status, completedAt }) =>
-            kind === "craft" &&
-            status === "successful" &&
-            Date.parse(completedAt) >= sentAt,
-        );
-        successfulCraft ||= player.recentOutcomes.some(
-          ({ operationId, kind, status }) =>
-            !outcomeBaseline.has(operationId) &&
-            kind === "craft" &&
-            status === "successful",
+        successfulCraft ||= successfulProactiveCraftObserved(
+          capture.actions,
+          sentAt,
         );
         for (const action of capture.actions) {
           const key = `${action.kind}:${action.completedAt}`;
           if (
             action.status !== "successful" ||
             processedActions.has(key) ||
+            Date.parse(action.startedAt) < sentAt ||
             Date.parse(action.completedAt) < sentAt
           )
             continue;
@@ -1142,6 +1274,7 @@ async function runBedPhase(
           ownerReplyCount: port.responses().length - responseBaseline,
           logsRemaining: logsAfter,
           woolRemaining: woolAfter,
+          ...bedActionEvidence(),
         });
         return proactiveBedCompletionConfirmed({
           oneOwnerPrompt: true,
@@ -1175,6 +1308,7 @@ async function runBedPhase(
       woolBefore,
       woolAfter,
       ownerReplyCount: port.responses().length - responseBaseline,
+      ...bedActionEvidence(),
     };
     port.updateDiagnostic(result);
     return result;
@@ -1190,7 +1324,10 @@ async function runBedPhase(
         .isBlock(position, "air")
         .catch(() => false);
     }
-    port.updateDiagnostic({ fixtureCleanupConfirmed: cleanupConfirmed });
+    port.updateDiagnostic({
+      ...bedActionEvidence(),
+      fixtureCleanupConfirmed: cleanupConfirmed,
+    });
   }
 }
 
