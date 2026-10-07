@@ -83,6 +83,7 @@ const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
 const itemCollectionVisibilityGraceMs = 1_000;
 const itemCollectionInventoryObservationGraceMs = 1_000;
+const craftInventoryObservationGraceMs = 1_000;
 // GoalNear evaluates floored block nodes; radius one includes adjacent nodes as goals.
 const itemCollectionGoalRange = 1;
 const itemCollectionPickupDistance = 1.25;
@@ -2544,6 +2545,13 @@ export class MineflayerPlayerBody implements PlayerBody {
             before,
             active,
           );
+        if (operation.kind === "craft")
+          await this.waitForCraftInventoryConfirmation(
+            bot,
+            operation,
+            before,
+            active,
+          );
         if (operation.kind === "dig" && blockEvidence !== undefined)
           await blockEvidence.waitForTargetAirUpdate(
             controller.signal,
@@ -2595,8 +2603,10 @@ export class MineflayerPlayerBody implements PlayerBody {
     const isTravelOperation =
       operation.kind === "move_to" || operation.kind === "move_relative";
     const travelCrossedLife = isTravelOperation && !sameLife;
+    const craftCrossedLife = operation.kind === "craft" && !sameLife;
     const confirmed =
       !travelCrossedLife &&
+      !craftCrossedLife &&
       operationEvidence(bot, operation, before, after, serverUpdates, active);
     const interrupted =
       (controller.signal.aborted && !active.timedOut) || travelCrossedLife;
@@ -2837,6 +2847,46 @@ export class MineflayerPlayerBody implements PlayerBody {
       )
         return;
       if (attempt === finalAttempt) return;
+      await waitForItemCollectionPoll(active.controller.signal);
+    }
+  }
+
+  private async waitForCraftInventoryConfirmation(
+    bot: Bot,
+    operation: Extract<PlayerOperation, { kind: "craft" }>,
+    before: PlayerBodyObservation | null,
+    active: ActiveOperation,
+  ): Promise<void> {
+    if (before === null) return;
+    const finalAttempt = Math.ceil(
+      craftInventoryObservationGraceMs / itemCollectionPollMs,
+    );
+    const serverUpdates = new Map<string, ServerBlockUpdate>();
+    for (let attempt = 0; attempt <= finalAttempt; attempt += 1) {
+      if (
+        active.controller.signal.aborted ||
+        active.botDisconnected ||
+        this.active !== active ||
+        this.lifeGeneration !== active.startedLifeGeneration
+      )
+        return;
+      try {
+        if (this.getBot() !== bot) return;
+      } catch {
+        return;
+      }
+      if (
+        operationEvidence(
+          bot,
+          operation,
+          before,
+          this.safeObserve(bot),
+          serverUpdates,
+          active,
+        )
+      )
+        return;
+      if (attempt === finalAttempt) break;
       await waitForItemCollectionPoll(active.controller.signal);
     }
   }
