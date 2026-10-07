@@ -388,6 +388,8 @@ export interface PlayerOperationResult {
   readonly completedAt: string;
   readonly before: PlayerBodyObservation | null;
   readonly after: PlayerBodyObservation | null;
+  /** Whether the operation began and finished in the same bot life. */
+  readonly sameLife?: boolean | null;
   /** True when cancellation returned boundedly but Mineflayer's underlying action is unresolved. */
   readonly recoveryRequired: boolean;
   /** Server-observed effect; an attack hit and confirmed death remain distinct. */
@@ -748,6 +750,7 @@ function interruptedBeforeSpawnAdmission(
     completedAt: new Date().toISOString(),
     before: null,
     after: null,
+    sameLife: null,
     recoveryRequired: false,
     detail: "Operation was cancelled before Minecraft spawn admission.",
   };
@@ -2564,15 +2567,17 @@ export class MineflayerPlayerBody implements PlayerBody {
     const after = this.safeObserve(bot);
     const serverUpdates =
       blockEvidence?.updates ?? new Map<string, ServerBlockUpdate>();
-    const confirmed = operationEvidence(
-      bot,
-      operation,
-      before,
-      after,
-      serverUpdates,
-      active,
-    );
-    const interrupted = controller.signal.aborted && !active.timedOut;
+    const sameLife =
+      !active.botDisconnected &&
+      this.lifeGeneration === active.startedLifeGeneration;
+    const isTravelOperation =
+      operation.kind === "move_to" || operation.kind === "move_relative";
+    const travelCrossedLife = isTravelOperation && !sameLife;
+    const confirmed =
+      !travelCrossedLife &&
+      operationEvidence(bot, operation, before, after, serverUpdates, active);
+    const interrupted =
+      (controller.signal.aborted && !active.timedOut) || travelCrossedLife;
     const recoveryRequired = !active.actionSettled;
     const observedEffect = confirmed
       ? operation.kind === "attack" && active.targetHitObserved === true
@@ -2610,6 +2615,11 @@ export class MineflayerPlayerBody implements PlayerBody {
             : operation.kind === "consume"
               ? "The requested item count decreased and food increase or this player's eating-completion status was observed; health recovery was not inferred."
               : "Observed post-action state confirms the requested effect.";
+    } else if (travelCrossedLife) {
+      status = "interrupted";
+      detail = recoveryRequired
+        ? "Movement crossed a bot life or connection change; the goal was cancelled, but Mineflayer's native action is still pending. Reconnect before issuing another action."
+        : "Movement was interrupted because the bot life or connection changed before its result could be confirmed.";
     } else if (active.timedOut) {
       status = "unverified";
       detail =
@@ -2651,6 +2661,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       completedAt,
       before,
       after,
+      sameLife,
       recoveryRequired,
       ...(observedEffect === undefined ? {} : { observedEffect }),
       ...(itemCollectionOutcome === undefined ? {} : { itemCollectionOutcome }),
@@ -2936,6 +2947,20 @@ export class MineflayerPlayerBody implements PlayerBody {
     }
   }
 
+  private abortActiveTravelForLifecycleChange(bot: Bot, message: string): void {
+    const active = this.active;
+    if (
+      active === undefined ||
+      active.bot !== bot ||
+      active.runFinished ||
+      (active.operation.kind !== "move_to" &&
+        active.operation.kind !== "move_relative") ||
+      active.controller.signal.aborted
+    )
+      return;
+    active.controller.abort(new Error(message));
+  }
+
   private isCurrentMoveRelativeInputCurrent(
     bot: Bot,
     signal: AbortSignal,
@@ -3107,10 +3132,33 @@ export class MineflayerPlayerBody implements PlayerBody {
           });
         try {
           if (signal.aborted) return;
-          await bot.pathfinder.goto(goal);
+          try {
+            await bot.pathfinder.goto(goal);
+          } catch (error) {
+            if (!signal.aborted && latestPathUpdateStatus === "noPath") {
+              const noPath = new Error("No path to the goal!");
+              if (operation.kind === "move_relative") noPath.name = "NoPath";
+              throw noPath;
+            }
+            if (!signal.aborted && latestPathUpdateStatus === "timeout") {
+              const timeout = new Error(
+                "Pathfinder timed out before confirming the requested goal.",
+              );
+              timeout.name = "Timeout";
+              throw timeout;
+            }
+            throw error;
+          }
           if (latestPathUpdateStatus === "noPath") {
             const error = new Error("No path to the goal!");
             if (operation.kind === "move_relative") error.name = "NoPath";
+            throw error;
+          }
+          if (latestPathUpdateStatus === "timeout") {
+            const error = new Error(
+              "Pathfinder timed out before confirming the requested goal.",
+            );
+            error.name = "Timeout";
             throw error;
           }
         } finally {
@@ -4047,6 +4095,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.disconnectedSinceBind = true;
       if (this.active?.bot === bot) {
         this.active.botDisconnected = true;
+        this.abortActiveTravelForLifecycleChange(
+          bot,
+          "Minecraft connection ended during movement",
+        );
         if (this.active.runFinished) this.active = undefined;
       }
       this.emit({
@@ -4063,6 +4115,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       this.pendingDeathNotice = undefined;
       this.passiveArmorPending = this.damageReflexEnabled;
       this.passiveArmorController?.abort(new Error("Minecraft life changed"));
+      this.abortActiveTravelForLifecycleChange(
+        bot,
+        "Minecraft life changed during movement",
+      );
       this.lifeGeneration += 1;
       this.hostileApproachTargets = new Set<Entity>();
       this.botLifeDead = false;
@@ -4087,6 +4143,10 @@ export class MineflayerPlayerBody implements PlayerBody {
     this.passiveArmorPending = this.damageReflexEnabled;
     this.passiveArmorController?.abort(new Error("Minecraft life ended"));
     this.lifeGeneration += 1;
+    this.abortActiveTravelForLifecycleChange(
+      bot,
+      "Minecraft life ended during movement",
+    );
   }
 
   private bindInventoryEventsWhenReady(bot: Bot): void {
