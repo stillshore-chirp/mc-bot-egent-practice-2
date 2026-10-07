@@ -403,6 +403,58 @@ describe("player owner intent context", () => {
           entityOutputLimit: 16,
           omittedEntityCandidates: 2,
           candidateSearchMayBeTruncated: true,
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            countScope: "client_entity_table_within_max_distance",
+            maxDistance: 16,
+            clientReceivedHostileCount: 100,
+            worldAbsenceEstablished: false,
+            directionFrame: "minecraft_cardinal_from_self_position",
+            relativeOffsetFrame: "entity_position_minus_self_position",
+            relativeOffsetBounds: {
+              min: { x: -10, y: -3, z: -8 },
+              max: { x: 12, y: 4, z: 15 },
+            },
+            byKind: [
+              { name: "zombie", count: 70 },
+              { name: "skeleton", count: 30 },
+            ],
+            omittedKindGroupCount: 0,
+            omittedKindEntityCount: 0,
+            byDirection: ([
+              "north",
+              "northeast",
+              "east",
+              "southeast",
+              "south",
+              "southwest",
+              "west",
+              "northwest",
+              "coincident",
+            ] as const).map((direction) => ({
+              direction,
+              count: direction === "north" ? 60 : 0,
+              nearestDistance: direction === "north" ? 2.2 : null,
+              farthestDistance: direction === "north" ? 15 : null,
+              relativeOffsetBounds:
+                direction === "north"
+                  ? {
+                      min: { x: -4, y: -1, z: -14 },
+                      max: { x: 3, y: 2, z: -1 },
+                    }
+                  : null,
+            })),
+            occlusionCheck: {
+              method: "raycast_entity_body_point",
+              candidateLimit: 16,
+              candidatesChecked: 16,
+              unoccludedCandidates: 10,
+              occludedCandidates: 6,
+              uncheckedCandidates: 84,
+              detailOutputLimit: 16,
+              omittedUnoccludedDetails: 0,
+            },
+          },
           entities: [
             ...entities.slice(9, 10),
             {
@@ -451,10 +503,10 @@ describe("player owner intent context", () => {
 
       const initialRequest = record(fixture.requests[0]);
       expect(String(initialRequest.instructions)).toContain(
-        "敵など現在の周辺情報（種類・距離・方角・装備）を尋ねられたらobserve_bodyを使い",
+        "敵など現在の周辺情報を尋ねられたらobserve_bodyを使います",
       );
       expect(String(initialRequest.instructions)).toContain(
-        "両方の一覧にある同じ敵は一度だけ数え",
+        "aggregate.byKind/byDirection/relativeOffsetBoundsは出力上限前の候補の種類・方角・相対分布",
       );
       expect(JSON.stringify(initialRequest.tools)).toContain(
         '"name":"observe_body"',
@@ -499,6 +551,46 @@ describe("player owner intent context", () => {
         candidateSearchMayBeTruncated: true,
         worldAbsenceEstablished: false,
       });
+      expect(nearbySummary).toMatchObject({
+        aggregate: {
+          source: "client_received_hostile_entity_candidates",
+          countScope: "client_entity_table_within_max_distance",
+          maxDistance: 16,
+          clientReceivedHostileCount: 100,
+          worldAbsenceEstablished: false,
+          directionFrame: "minecraft_cardinal_from_self_position",
+          relativeOffsetFrame: "entity_position_minus_self_position",
+          relativeOffsetBounds: {
+            min: { x: -10, y: -3, z: -8 },
+            max: { x: 12, y: 4, z: 15 },
+          },
+          byKind: [
+            { name: "zombie", count: 70 },
+            { name: "skeleton", count: 30 },
+          ],
+          omittedKindGroupCount: 0,
+          omittedKindEntityCount: 0,
+          byDirection: expect.arrayContaining([
+            expect.objectContaining({
+              direction: "north",
+              count: 60,
+              nearestDistance: 2.2,
+              farthestDistance: 15,
+            }),
+            expect.objectContaining({ direction: "coincident", count: 0 }),
+          ]),
+          occlusionCheck: {
+            method: "raycast_entity_body_point",
+            candidateLimit: 16,
+            candidatesChecked: 16,
+            unoccludedCandidates: 10,
+            occludedCandidates: 6,
+            uncheckedCandidates: 84,
+            detailOutputLimit: 16,
+            omittedUnoccludedDetails: 0,
+          },
+        },
+      });
       const nearbyEntities = record(nearbySummary).entities as Record<
         string,
         unknown
@@ -522,6 +614,126 @@ describe("player owner intent context", () => {
       expect(serializedOutput).not.toContain('"position"');
       expect(serializedOutput).not.toContain('"id"');
       expect(messages).toEqual(["視界内にゾンビがいます。"]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("retries one failed conversation observation with a fresh bounded read", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const observation = bodyObservationFixture();
+    let attempts = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("TRANSIENT_OBSERVATION_FAILURE");
+        return observation;
+      },
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("retry-observation", "observe_body", {}),
+      terminalResponse("I checked again and have a fresh view."),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "近くの状況を見て。",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(attempts).toBe(2);
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      const output = JSON.parse(String(toolOutput?.output)) as unknown;
+      expect(record(output)).toMatchObject({
+        available: true,
+        attempts: 2,
+        freshRetryUsed: true,
+        observedAt: observation.observedAt,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("still wakes Purpose for an actionable request after both fresh observations fail", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let attempts = 0;
+    let proposalWakeups = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      observeBody: async () => {
+        attempts += 1;
+        throw new Error("OBSERVATION_UNAVAILABLE");
+      },
+      say: async () => undefined,
+      onProposal: () => {
+        proposalWakeups += 1;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      functionCallResponse("failed-observation", "observe_body", {}),
+      functionCallResponse("continue-owner-intent", "propose_goal_change", {
+        title: "Gather the wood the owner meant",
+        reason:
+          "The owner asked me to gather the wood discussed earlier; Purpose should take a fresh observation and choose the first step.",
+        priority: 4,
+      }),
+      terminalResponse("観測を再試行しました。木を集める目的は続けて進めます。"),
+    );
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "あの木、ちゃんと集めて。さっき周りを見れてなかったよ。",
+        turn: conversation.nextTurn(),
+      });
+
+      expect(attempts).toBe(2);
+      expect(proposalWakeups).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the wood the owner meant",
+          status: "pending",
+        }),
+      );
+      const initialRequest = record(fixture.requests[0]);
+      expect(String(initialRequest.instructions)).toContain(
+        "観測失敗だけを理由に目的提案を止めず",
+      );
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const observationOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(String(observationOutput?.output)).toContain(
+        '"freshRetryExhausted":true',
+      );
     } finally {
       fixture.close();
     }

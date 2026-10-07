@@ -1686,6 +1686,58 @@ describe("player agent response rounds", () => {
             entityOutputLimit: 16,
             omittedEntityCandidates: 2,
             candidateSearchMayBeTruncated: true,
+            aggregate: {
+              source: "client_received_hostile_entity_candidates",
+              countScope: "client_entity_table_within_max_distance",
+              maxDistance: 16,
+              clientReceivedHostileCount: 100,
+              worldAbsenceEstablished: false,
+              directionFrame: "minecraft_cardinal_from_self_position",
+              relativeOffsetFrame: "entity_position_minus_self_position",
+              relativeOffsetBounds: {
+                min: { x: -12, y: -2, z: -9 },
+                max: { x: 10, y: 4, z: 13 },
+              },
+              byKind: [
+                { name: "zombie", count: 84 },
+                { name: "skeleton", count: 16 },
+              ],
+              omittedKindGroupCount: 0,
+              omittedKindEntityCount: 0,
+              byDirection: ([
+                "north",
+                "northeast",
+                "east",
+                "southeast",
+                "south",
+                "southwest",
+                "west",
+                "northwest",
+                "coincident",
+              ] as const).map((direction) => ({
+                direction,
+                count: direction === "north" ? 62 : 0,
+                nearestDistance: direction === "north" ? 2.2 : null,
+                farthestDistance: direction === "north" ? 15.8 : null,
+                relativeOffsetBounds:
+                  direction === "north"
+                    ? {
+                        min: { x: -3, y: -1, z: -15 },
+                        max: { x: 2, y: 3, z: -1 },
+                      }
+                    : null,
+              })),
+              occlusionCheck: {
+                method: "raycast_entity_body_point",
+                candidateLimit: 16,
+                candidatesChecked: 16,
+                unoccludedCandidates: 11,
+                occludedCandidates: 5,
+                uncheckedCandidates: 84,
+                detailOutputLimit: 16,
+                omittedUnoccludedDetails: 0,
+              },
+            },
             entities: [
               {
                 id: 91,
@@ -1732,11 +1784,13 @@ describe("player agent response rounds", () => {
           .record(z.string(), z.unknown())
           .parse(fixture.requests[0]);
         expect(request.instructions).toContain(
-          "今回のBody観測に見えている落下物は自発的にcollect_itemを試し",
+          "落下物は現在の目的や能力に関係するものをcollect_itemで試し",
         );
-        expect(request.instructions).toContain("武器・防具・道具を優先");
         expect(request.instructions).toContain(
-          "回復に使えると分かる食料も積極的に集めてください",
+          "体力低下や被害があっても生存や退避を固定の最優先にせず",
+        );
+        expect(request.instructions).toContain(
+          "一定距離まで離れる固定条件を使わず",
         );
         expect(request.instructions).toContain(
           "consumeは現在のregistryが食料と認識する所持品だけを使います",
@@ -1744,12 +1798,7 @@ describe("player agent response rounds", () => {
         expect(request.instructions).toContain(
           "food値上昇または同じBot/lifeのentity_status status 9",
         );
-        expect(request.instructions).toContain(
-          "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
-        );
-        expect(request.instructions).toContain(
-          "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
-        );
+        expect(request.instructions).not.toContain("8ブロック");
         const purposeInput = requestUserPayload(request);
         const serializedObservation = z
           .record(z.string(), z.unknown())
@@ -1780,6 +1829,19 @@ describe("player agent response rounds", () => {
           .record(z.string(), z.unknown())
           .parse(perception.nearbyHostiles);
         expect(nearbyHostiles).toMatchObject({
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            clientReceivedHostileCount: 100,
+            byKind: [
+              { name: "zombie", count: 84 },
+              { name: "skeleton", count: 16 },
+            ],
+            byDirection: expect.arrayContaining([
+              expect.objectContaining({ direction: "north", count: 62 }),
+            ]),
+          },
+        });
+        expect(nearbyHostiles).toMatchObject({
           source: "client_received_unoccluded_nearby_hostiles",
           observedAt: base.observedAt,
           maxDistance: 16,
@@ -1787,6 +1849,35 @@ describe("player agent response rounds", () => {
           frontViewOverlapEntityCount: 1,
           omittedEntityCandidates: 2,
           candidateSearchMayBeTruncated: true,
+        });
+        expect(nearbyHostiles).toMatchObject({
+          aggregate: {
+            source: "client_received_hostile_entity_candidates",
+            countScope: "client_entity_table_within_max_distance",
+            maxDistance: 16,
+            clientReceivedHostileCount: 100,
+            worldAbsenceEstablished: false,
+            directionFrame: "minecraft_cardinal_from_self_position",
+            relativeOffsetFrame: "entity_position_minus_self_position",
+            byKind: [
+              { name: "zombie", count: 84 },
+              { name: "skeleton", count: 16 },
+            ],
+            byDirection: expect.arrayContaining([
+              expect.objectContaining({ direction: "north", count: 62 }),
+              expect.objectContaining({ direction: "coincident", count: 0 }),
+            ]),
+            occlusionCheck: {
+              method: "raycast_entity_body_point",
+              candidateLimit: 16,
+              candidatesChecked: 16,
+              unoccludedCandidates: 11,
+              occludedCandidates: 5,
+              uncheckedCandidates: 84,
+              detailOutputLimit: 16,
+              omittedUnoccludedDetails: 0,
+            },
+          },
         });
         const nearbyEntities = z
           .array(z.record(z.string(), z.unknown()))
@@ -2403,11 +2494,12 @@ describe("player agent response rounds", () => {
         "その根拠をproposal resolutionに伝えてください",
       );
       expect(instructions).toContain(
-        "各観測敵から実距離8ブロック以上を目標として離れるmove_relativeを一手commitしてください",
+        "体力低下や被害があっても生存や退避を固定の最優先にせず",
       );
       expect(instructions).toContain(
-        "8ブロック未満の観測敵が残っていればwaitせずさらに離れる操作を選びます",
+        "一定距離まで離れる固定条件を使わず",
       );
+      expect(instructions).not.toContain("8ブロック");
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
       );
@@ -2415,9 +2507,6 @@ describe("player agent response rounds", () => {
         "危険の安全審査や追加観測を行動の前提にせず",
       );
       expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
-      expect(instructions).toContain(
-        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
-      );
       expect(instructions).toContain(
         "その根拠をproposal resolutionに伝えてください",
       );
@@ -2430,9 +2519,6 @@ describe("player agent response rounds", () => {
       expect(instructions).toContain("未知や追加観測だけを理由にwaitせず");
       expect(instructions).toContain(
         "fresh self.healthの上昇を観測した場合だけhealth回復を報告してください",
-      );
-      expect(instructions).toContain(
-        "危険度・安全性・可逆性・損失・安全な代案を審査して実行可否を決めません",
       );
       const payload = requestUserPayload(request);
       expect(payload.observation).toMatchObject({
