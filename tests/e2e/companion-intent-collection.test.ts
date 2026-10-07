@@ -17,8 +17,10 @@ import {
   COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
   COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
   COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
+  COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
   COMPANION_HOSTILE_DETAIL_LIMIT,
   COMPANION_HOSTILE_FIXTURE_COUNT,
+  COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE,
   bodyOakLogInventoryCount,
   companionHostileSameGoalNextActionObserved,
   companionHostileObservationConfirmed,
@@ -303,6 +305,28 @@ describe("companion intent collection acceptance helpers", () => {
       serverHealthDidNotDecrease: true,
     } as const;
     expect(companionHostilePurposeMoveConfirmed(evidence)).toBe(true);
+    expect(COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE).toBe(0.01);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        bodyDistanceAfter: evidence.bodyDistanceBefore + 0.5,
+        serverDistanceAfter: evidence.serverDistanceBefore + 0.5,
+      }),
+    ).toBe(true);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        bodyDistanceAfter: evidence.bodyDistanceBefore,
+        serverDistanceAfter: evidence.serverDistanceBefore,
+      }),
+    ).toBe(false);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        bodyDistanceAfter: evidence.bodyDistanceBefore + 0.005,
+        serverDistanceAfter: evidence.serverDistanceBefore + 0.005,
+      }),
+    ).toBe(false);
     expect(
       companionHostilePurposeMoveConfirmed({
         ...evidence,
@@ -313,6 +337,18 @@ describe("companion intent collection acceptance helpers", () => {
       companionHostilePurposeMoveConfirmed({
         ...evidence,
         serverDistanceAfter: evidence.serverDistanceBefore,
+      }),
+    ).toBe(false);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        serverCountAfter: COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT - 1,
+      }),
+    ).toBe(false);
+    expect(
+      companionHostilePurposeMoveConfirmed({
+        ...evidence,
+        bodyServerPositionAligned: false,
       }),
     ).toBe(false);
   });

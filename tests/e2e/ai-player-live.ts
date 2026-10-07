@@ -69,6 +69,7 @@ import {
   COMPANION_HOSTILE_PURPOSE_CASE_BUDGET,
   COMPANION_HOSTILE_PURPOSE_CASE_DEADLINE_MS,
   COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT,
+  COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE,
   COMPANION_HOSTILE_PURPOSE_RUN_BUDGET,
   COMPANION_HOSTILE_FIXTURE_COUNT,
   bodyOakLogInventoryCount,
@@ -13107,6 +13108,37 @@ async function runCompanionHostilePurposeContinuityCase(
       Math.abs(bodyHealthAfter - serverHealthAfter) <= 1;
     const bodyHealthDidNotDecrease = bodyHealthAfter >= bodyHealthBefore;
     const serverHealthDidNotDecrease = serverHealthAfter >= serverHealthBefore;
+    const bodyDistanceIncrease = bodyDistanceAfter - bodyDistanceBefore;
+    const serverDistanceIncrease = serverDistanceAfter - serverDistanceBefore;
+    const bodyDistanceIncreaseConfirmed =
+      bodyDistanceIncrease >= COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE;
+    const serverDistanceIncreaseConfirmed =
+      serverDistanceIncrease >= COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE;
+    const hostileCountsConfirmed =
+      (bodyAfter.perception.nearbyHostiles?.aggregate
+        ?.clientReceivedHostileCount ?? -1) ===
+        COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
+      serverCountAfter === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT;
+    const moveTimingConfirmed = (() => {
+      const decidedAt = Date.parse(acceptedMoveJudgment.decidedAt ?? "");
+      const startedAt = Date.parse(acceptedMoveAction.startedAt);
+      const completedAt = Date.parse(acceptedMoveAction.completedAt);
+      return (
+        Number.isFinite(followupSentAt) &&
+        Number.isFinite(decidedAt) &&
+        Number.isFinite(startedAt) &&
+        Number.isFinite(completedAt) &&
+        decidedAt >= followupSentAt &&
+        startedAt >= decidedAt &&
+        startedAt >= followupSentAt &&
+        completedAt >= startedAt
+      );
+    })();
+    const moveJudgmentMatchesAction =
+      acceptedMoveJudgment.kind === "act" &&
+      acceptedMoveJudgment.operationKind === acceptedMoveAction.kind &&
+      (acceptedMoveAction.kind === "move_to" ||
+        acceptedMoveAction.kind === "move_relative");
     const moveConfirmed = companionHostilePurposeMoveConfirmed({
       requestSentAt: followupSentAt,
       judgment: acceptedMoveJudgment,
@@ -13127,20 +13159,50 @@ async function runCompanionHostilePurposeContinuityCase(
       bodyHealthDidNotDecrease,
       serverHealthDidNotDecrease,
     });
-    if (!moveConfirmed)
-      incomplete("COMPANION_HOSTILE_PURPOSE_MOVE_NOT_CONFIRMED");
     updateCompanionIntentCollectionDiagnostic(state, {
-      hostilePurposeBodyMoveConfirmed: true,
+      hostilePurposeBodyMoveConfirmed: moveConfirmed,
       hostilePurposeBodyDistanceAfter: Number(bodyDistanceAfter.toFixed(2)),
+      hostilePurposeBodyDistanceIncrease: Number(
+        bodyDistanceIncrease.toFixed(2),
+      ),
+      hostilePurposeBodyDistanceIncreaseConfirmed:
+        bodyDistanceIncreaseConfirmed,
       hostilePurposeServerDistanceAfter: Number(serverDistanceAfter.toFixed(2)),
+      hostilePurposeServerDistanceIncrease: Number(
+        serverDistanceIncrease.toFixed(2),
+      ),
+      hostilePurposeServerDistanceIncreaseConfirmed:
+        serverDistanceIncreaseConfirmed,
+      hostilePurposeBodyCountAfter:
+        bodyAfter.perception.nearbyHostiles?.aggregate
+          ?.clientReceivedHostileCount ?? -1,
+      hostilePurposeServerCountAfter: serverCountAfter,
       hostilePurposeBodyHealthAfter: bodyHealthAfter,
       hostilePurposeServerHealthAfter: serverHealthAfter,
+      hostilePurposeMoveStatus: acceptedMoveAction.status,
+      hostilePurposeMoveSameLife: acceptedMoveAction.sameLife,
+      hostilePurposeMoveRecoveryRequired: acceptedMoveAction.recoveryRequired,
+      hostilePurposeMoveTimingConfirmed: moveTimingConfirmed,
+      hostilePurposeMoveJudgmentMatchesAction: moveJudgmentMatchesAction,
+      hostilePurposeBodyDistanceInputsValid: [
+        bodyDistanceBefore,
+        bodyDistanceAfter,
+      ].every((distance) => Number.isFinite(distance) && distance >= 0),
+      hostilePurposeServerDistanceInputsValid: [
+        serverDistanceBefore,
+        serverDistanceAfter,
+      ].every((distance) => Number.isFinite(distance) && distance >= 0),
+      hostilePurposeBodyDistanceWithinBaselineLimit: bodyDistanceBefore <= 6,
+      hostilePurposeAfterHostileCountsConfirmed: hostileCountsConfirmed,
       hostilePurposeBodyServerDistanceAligned: bodyServerDistanceAligned,
       hostilePurposeBodyServerPositionAligned: bodyServerPositionAligned,
       hostilePurposeBodyServerHealthAligned: bodyServerHealthAligned,
       hostilePurposeBodyHealthDidNotDecrease: bodyHealthDidNotDecrease,
       hostilePurposeServerHealthDidNotDecrease: serverHealthDidNotDecrease,
+      hostilePurposeMovePredicateConfirmed: moveConfirmed,
     });
+    if (!moveConfirmed)
+      incomplete("COMPANION_HOSTILE_PURPOSE_MOVE_NOT_CONFIRMED");
 
     const moveJudgmentRevision = acceptedMoveJudgment.revision;
     if (moveJudgmentRevision === undefined)

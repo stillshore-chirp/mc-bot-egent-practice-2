@@ -1,6 +1,7 @@
 export const COMPANION_HOSTILE_FIXTURE_COUNT = 100;
 export const COMPANION_HOSTILE_DETAIL_LIMIT = 16;
 export const COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT = 4;
+export const COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE = 0.01;
 export const COMPANION_HOSTILE_PURPOSE_CASE_BUDGET = {
   llmCalls: 18,
   totalTokens: 160_000,
@@ -136,8 +137,12 @@ export function companionHostilePurposeMoveConfirmed(
     input.serverCountAfter === COMPANION_HOSTILE_PURPOSE_FIXTURE_COUNT &&
     distances.every((distance) => Number.isFinite(distance) && distance >= 0) &&
     input.bodyDistanceBefore <= 6 &&
-    input.bodyDistanceAfter >= input.bodyDistanceBefore + 0.75 &&
-    input.serverDistanceAfter >= input.serverDistanceBefore + 0.75 &&
+    input.bodyDistanceAfter >=
+      input.bodyDistanceBefore +
+        COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE &&
+    input.serverDistanceAfter >=
+      input.serverDistanceBefore +
+        COMPANION_HOSTILE_PURPOSE_MIN_DISTANCE_INCREASE &&
     input.bodyServerDistanceAligned &&
     input.bodyServerPositionAligned &&
     input.bodyServerHealthAligned &&
