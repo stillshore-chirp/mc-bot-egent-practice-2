@@ -380,6 +380,14 @@ export type PlayerItemCollectionOutcome =
 export type PlayerItemCollectionPathFailureReason =
   "no_path" | "path_timeout" | "goto_rejected" | "unknown";
 
+export type PlayerOperationFailureReason =
+  | { readonly code: "unknown_registry_item"; readonly itemName: string }
+  | { readonly code: "item_not_in_inventory"; readonly itemName: string }
+  | {
+      readonly code: "no_recipe_for_current_inventory_and_surface";
+      readonly itemName: string;
+    };
+
 export interface PlayerOperationResult {
   readonly operationId: string;
   readonly operation: PlayerOperation;
@@ -399,6 +407,7 @@ export interface PlayerOperationResult {
   };
   readonly itemCollectionOutcome?: PlayerItemCollectionOutcome;
   readonly itemCollectionPathFailureReason?: PlayerItemCollectionPathFailureReason;
+  readonly failureReason?: PlayerOperationFailureReason;
   readonly lookSweep?: PlayerBodyLookSweep | undefined;
   readonly detail?: string;
 }
@@ -649,6 +658,15 @@ function errorDetail(error: unknown): string {
   if (error instanceof Error)
     return `${error.name}: ${error.message}`.slice(0, 320);
   return String(error).slice(0, 320);
+}
+
+class PlayerOperationFailure extends Error {
+  constructor(
+    readonly failureReason: PlayerOperationFailureReason,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 function digTimeoutFor(
@@ -2652,6 +2670,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       detail =
         "Mineflayer accepted the request, but the resulting world effect was not observable.";
     }
+    const failureReason =
+      status === "failed" && commandError instanceof PlayerOperationFailure
+        ? commandError.failureReason
+        : undefined;
     if (active.moveRelativeLeadInputAttempted)
       detail +=
         " Pathfinder開始前に、同じ水平目標方向へ短い通常移動入力を一度試しました。入力だけでは到達を成功扱いしません。";
@@ -2675,6 +2697,7 @@ export class MineflayerPlayerBody implements PlayerBody {
             itemCollectionPathFailureReason:
               active.itemCollectionPathFailureReason,
           }),
+      ...(failureReason === undefined ? {} : { failureReason }),
       ...(active.lookSweep === undefined
         ? {}
         : { lookSweep: active.lookSweep }),
@@ -3313,7 +3336,10 @@ export class MineflayerPlayerBody implements PlayerBody {
       case "craft": {
         const item = bot.registry.itemsByName[operation.item];
         if (item === undefined)
-          throw new Error(`Unknown registry item: ${operation.item}`);
+          throw new PlayerOperationFailure(
+            { code: "unknown_registry_item", itemName: operation.item },
+            `Unknown registry item: ${operation.item}`,
+          );
         const tableId = bot.registry.blocksByName.crafting_table?.id;
         const craftingTable =
           tableId === undefined
@@ -3327,7 +3353,11 @@ export class MineflayerPlayerBody implements PlayerBody {
         );
         const recipe = recipes[0];
         if (recipe === undefined)
-          throw new Error(
+          throw new PlayerOperationFailure(
+            {
+              code: "no_recipe_for_current_inventory_and_surface",
+              itemName: operation.item,
+            },
             `No recipe for ${operation.item} can be made from current inventory and available crafting surface`,
           );
         const repetitions = Math.ceil(operation.count / recipe.result.count);
@@ -4340,7 +4370,10 @@ function findInventoryItem(bot: Bot, name: string): Item {
     .items()
     .find((candidate) => candidate.name === name);
   if (item === undefined)
-    throw new Error(`Item not present in inventory: ${name}`);
+    throw new PlayerOperationFailure(
+      { code: "item_not_in_inventory", itemName: name },
+      `Item not present in inventory: ${name}`,
+    );
   return item;
 }
 

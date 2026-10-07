@@ -5,6 +5,7 @@ import minecraftData from "minecraft-data";
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
+import type { Recipe } from "prismarine-recipe";
 import type { Window } from "prismarine-windows";
 import { AppError } from "../../src/domain/errors.js";
 import { MineflayerClient } from "../../src/minecraft/mineflayer-client.js";
@@ -5036,6 +5037,92 @@ describe("player body", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("returns a structured reason when a craft item is absent from the registry", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "unknown_item",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "unknown_registry_item",
+      itemName: "unknown_item",
+    });
+  });
+
+  it("returns a structured reason when a requested item is absent from inventory", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "equip",
+      item: "diamond_sword",
+      destination: "hand",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "item_not_in_inventory",
+      itemName: "diamond_sword",
+    });
+  });
+
+  it("reports no recipe for the current inventory and surface without guessing why", async () => {
+    const fake = makeFakeBot();
+    Object.assign(fake.bot.registry.itemsByName, {
+      chest: { id: 1, name: "chest" },
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "chest",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toEqual({
+      code: "no_recipe_for_current_inventory_and_surface",
+      itemName: "chest",
+    });
+    expect(result.detail).toContain(
+      "current inventory and available crafting surface",
+    );
+  });
+
+  it("does not infer a structured cause from a generic craft rejection", async () => {
+    const fake = makeFakeBot();
+    Object.assign(fake.bot.registry.itemsByName, {
+      chest: { id: 1, name: "chest" },
+    });
+    const recipe = {
+      result: { id: 1, count: 1 },
+      requiresTable: false,
+      ingredients: [],
+    } as Recipe;
+    Object.assign(fake.bot, {
+      recipesFor: vi.fn(() => [recipe]),
+      craft: vi.fn(async () => {
+        throw new Error("server craft rejected");
+      }),
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({
+      kind: "craft",
+      item: "chest",
+      count: 1,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBeUndefined();
+    expect(result.detail).toContain("server craft rejected");
   });
 });
 
