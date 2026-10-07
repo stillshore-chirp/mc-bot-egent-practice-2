@@ -540,6 +540,7 @@ export interface ConversationAgentOptions {
   readonly beforeCall?: () => void;
   readonly say: (text: string) => Promise<void>;
   readonly onProposal: () => void;
+  readonly onPurposeReassessment?: (reason: string) => boolean;
   readonly onStop: () => Promise<void>;
   readonly onResume: () => void;
   readonly onCall?: (metrics: Omit<PlayerAgentCallResult, "text">) => void;
@@ -933,6 +934,7 @@ export class PlayerConversationAgent {
     if (this.#recentOwnerConversation.length > recentOwnerConversationLimit)
       this.#recentOwnerConversation.shift();
     const capturedStopGeneration = initial.stopGeneration;
+    let purposeReassessmentRequested = false;
     const canSendReply = (): boolean => {
       if (
         input.signal?.aborted ||
@@ -1012,6 +1014,46 @@ export class PlayerConversationAgent {
             proposalId: saved.id,
             title: saved.title,
             priorityPreference: proposal.priority,
+          };
+        },
+      }),
+      createPlayerTool({
+        name: "request_current_purpose_reassessment",
+        description:
+          "所有者の発話と会話文脈から、現在の目的・進め方・失敗への明確な見直し要求を読み取った時だけ使う。PurposeをfreshなBody観測で起こすだけで、goal/proposalを変更せず、Body操作を開始・取消しない。通常の質問や雑談には使わない。",
+        schema: reasonInput,
+        execute: ({ reason }) => {
+          if (
+            input.signal?.aborted ||
+            !this.isCurrentTurn(input.turn) ||
+            this.#activeTurn !== input.turn
+          )
+            return { ok: false, code: "STALE_CONVERSATION" };
+          const current = this.options.mind.snapshot();
+          if (
+            current.stopped ||
+            current.stopGeneration !== capturedStopGeneration
+          )
+            return { ok: false, code: "STOPPED_OR_STALE" };
+          if (purposeReassessmentRequested)
+            return {
+              ok: true,
+              requested: true,
+              alreadyRequested: true,
+              goalChanged: false,
+              bodyCancelled: false,
+            };
+          if (this.options.onPurposeReassessment === undefined)
+            return { ok: false, code: "REASSESSMENT_UNAVAILABLE" };
+          if (!this.options.onPurposeReassessment(reason))
+            return { ok: false, code: "STOPPED_OR_SHUTTING_DOWN" };
+          purposeReassessmentRequested = true;
+          return {
+            ok: true,
+            requested: true,
+            alreadyRequested: false,
+            goalChanged: false,
+            bodyCancelled: false,
           };
         },
       }),
@@ -1160,6 +1202,7 @@ export class PlayerConversationAgent {
       memoryContext.persona,
       "あなたはMinecraft世界で暮らす一人のAIプレイヤーです。所有者との会話から意図・感情・共有文脈を理解し、自分の判断、困難、次の一手を自然に伝えます。内部の担当分担、agent名、委任手順を会話の返答として説明せず、会話turnにBody操作toolがないことだけでコンパニオン全体の能力を否定しません。",
       "誤変換、崩れた日本語、比喩、省略、罵倒、苛立ち、強い要求は、今回の発話と直近の会話・目的・直前の結果を合わせて意味を読み取ります。失敗や停滞への不満がありそうなら、短く受け止め、必要な最新情報を確かめ、見落としや手段を見直してください。謝罪や同じ説明だけで終えず、意味を断定できない時だけ要点を一つ確認します。",
+      "今回のowner発話から現行目的や進め方への見直し要求が文脈上明らかなら、request_current_purpose_reassessmentを一度呼びます。これは現在の目的をfreshなBody観測でPurposeに再評価させるだけで、goal/proposal変更やBody操作の開始・取消しはしません。再評価を内部手続きとして説明せず、一人称で困難を受け止め、確認することや次の行動を自然に伝えます。一般的な質問、能力相談、雑談では呼びません。",
       "曖昧な収集依頼では、今回と直近の会話、既存の目的・提案、所持品、装備、周囲の入手源、地形、使える操作を必要に応じて確認し、対象と達成条件、実行可能な短い始め方を整理してください。環境・所持品が関係する時はobserve_body、操作条件が不明な時はdescribe_operationを使います。文脈から重要な値が分かる時は質問で返さず、目的を進めます。対象が判断できず開始できない場合だけ、最も重要な一点を確認します。",
       "敵など現在の周辺情報を尋ねられたらobserve_bodyを使います。正面FOV内のentity detailとnearbyHostiles.aggregateを分け、aggregate.clientReceivedHostileCountはmaxDistance内でクライアントが受信した候補数であり、遮蔽候補を含み、全世界の実数調査ではないと説明します。aggregate.byKind/byDirection/relativeOffsetBoundsは出力上限前の候補の種類・方角・相対分布、occlusionCheckは詳細照会の対象数と遮蔽結果です。nearbyHostiles.entitiesは遮蔽なしで得た詳細だけです。正面FOV外も含み得ますが、未受信・遮蔽済み・全世界の不在や全包囲を断定しません。候補数、詳細件数、方向別分布を混同しません。方角はBot位置から見たMinecraft cardinal directionです。",
       "所有者がゲーム内の具体的な行動・結果を望む時は、会話で目的の意図と完了条件を整理してpropose_goal_changeで渡し、必要な観測が一度失敗してもfresh retryの結果をそのまま正直に伝えます。依頼が行動として明確なら、観測失敗だけを理由に目的提案を止めず、Purposeが次のfresh観測と具体的な一手を選べるようにします。目的の更新は同一意図を継続する形で伝えてください。相談・状態質問・雑談だけなら目的提案を作らず、必要な観測やoperation説明を使って会話で答えます。",
@@ -2268,6 +2311,7 @@ export class PlayerPurposeAgent {
           ]),
       "会話エージェントの所有者提案は入力です。現行目的や保存personaと合わせ、採用・妥協・辞退を理由付きで決められます。提案受付だけで実行中の操作は変わりません。身体操作を変える時はcommit_action_decisionで新しい操作を確定してください。",
       "未解決のowner提案が届いた判断では、その採用・妥協・辞退を先に確定してください。既存目標の整理や操作定義の取得だけを続けて新しい提案をpendingのまま放置しないでください。採否はあなたが状況から判断し、採用や操作開始を自動で強制されるものではありません。",
+      "proposalResolution.resolutionは所有者へそのまま伝わる短い返答です。一人称で判断理由と、採用・妥協なら次にすること、辞退なら今回はしない理由を自然に伝え、agent名や内部手順風の定型prefixを付けないでください。",
       "採用または妥協したowner proposalは、元の意図を示すactive owner goalと結び付き、妥協理由も文脈に残ります。途中のself goalを完了してもowner intentは完了しません。意図の達成・放棄は明示的なgoal更新で判断し、採用を強制された手順として扱わないでください。辞退はowner goalを作りません。",
       "食事を目的とする時は現在観測したfood・inventoryを使い、目的に合う所持食料を選びます。consume対象は現在のregistryが食料と認識する所持品だけです。",
       "食事を求めるowner proposalは、その根拠をproposal resolutionに伝えてください。consume後はPlayerBodyの結果を確認し、食料の所持数減少とfood値上昇または同じBot/lifeのstatus 9が両方確認できた場合だけ食べたと報告し、health回復は実測時のみ報告します。",
@@ -2318,6 +2362,7 @@ export class PlayerPurposeAgent {
                 "新しいpriority 4以上のowner提案を評価し、採用・妥協・辞退を理由付きで解決してください。観測されていない危険は創作せず、現在の目的と視界に沿った小さな一手を選びます。",
                 "保留提案はcommit_action_decision.stateUpdates.goalStateにproposalId・proposalDisposition・resolutionを入れて、行動判断と同じCASで解決してください。",
                 "proposalの採否を確定するproposalIdは、今回の入力runtime.proposalsにstatus=pendingとして載っているものだけを使ってください。goalsやpersona内のownerProposalIdをproposal解決へ再利用しないでください。",
+                "resolutionは所有者にそのまま伝える一人称の短い返答です。判断理由と次の行動または今回はしない理由を書き、agent名や内部手順風の定型prefixを付けないでください。",
               ]
             : []),
           "目的達成を断定せず、Bodyの操作結果を次の判断に使ってください。利用可能なkindとschemaを使い、必要なschemaが無い場合だけdescribe_operationを一度使ってからcommit_action_decisionしてください。",

@@ -422,6 +422,24 @@ export class PlayerRuntime {
     );
   }
 
+  /** Wake Purpose to reconsider an existing plan using its next fresh observation. */
+  public onOwnerFeedbackNeedsReassessment(reason: string): boolean {
+    if (
+      this.#shuttingDown ||
+      this.#lifetime.signal.aborted ||
+      this.options.mind.snapshot().stopped
+    )
+      return false;
+    const detail = sanitizeDetail(reason);
+    if (detail.length === 0) return false;
+    const event = this.options.mind.enqueueEvent(
+      "manual",
+      `Owner feedback asks me to reconsider the current purpose: ${detail}`,
+    );
+    this.#requestThought(event.kind, event.summary, true);
+    return true;
+  }
+
   /** Called only after the stop latch has been persisted. */
   public async stopNow(): Promise<void> {
     this.#stopSampler();
@@ -591,7 +609,7 @@ export class PlayerRuntime {
 
     const resolution = sanitizeDetail(proposal.resolution ?? "");
     if (resolution.length === 0) return;
-    void this.#sayWhileActive(`提案への判断：${resolution}`);
+    void this.#sayWhileActive(resolution);
   }
 
   async #sayWhileActive(message: string): Promise<void> {

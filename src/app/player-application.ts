@@ -401,6 +401,8 @@ export function createPlayerApplication(
     onRoundActivity: (activity) => mind.recordAgentActivity(activity),
     say,
     onProposal: () => runtimeRef.current?.onOwnerProposal(),
+    onPurposeReassessment: (reason) =>
+      runtimeRef.current?.onOwnerFeedbackNeedsReassessment(reason) ?? false,
     onStop: async () => {
       await runtimeRef.current?.stopNow();
     },

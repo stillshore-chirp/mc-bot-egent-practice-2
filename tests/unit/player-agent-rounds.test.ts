@@ -1958,9 +1958,6 @@ describe("player agent response rounds", () => {
               { name: "zombie", count: 84 },
               { name: "skeleton", count: 16 },
             ],
-            byDirection: expect.arrayContaining([
-              expect.objectContaining({ direction: "north", count: 62 }),
-            ]),
           },
         });
         expect(nearbyHostiles).toMatchObject({
@@ -1985,10 +1982,6 @@ describe("player agent response rounds", () => {
               { name: "zombie", count: 84 },
               { name: "skeleton", count: 16 },
             ],
-            byDirection: expect.arrayContaining([
-              expect.objectContaining({ direction: "north", count: 62 }),
-              expect.objectContaining({ direction: "coincident", count: 0 }),
-            ]),
             occlusionCheck: {
               method: "raycast_entity_body_point",
               candidateLimit: 16,
@@ -2001,6 +1994,15 @@ describe("player agent response rounds", () => {
             },
           },
         });
+        const hostileAggregate = z
+          .record(z.string(), z.unknown())
+          .parse(nearbyHostiles.aggregate);
+        assertNearbyDirectionCount(hostileAggregate.byDirection, "north", 62);
+        assertNearbyDirectionCount(
+          hostileAggregate.byDirection,
+          "coincident",
+          0,
+        );
         const nearbyEntities = z
           .array(z.record(z.string(), z.unknown()))
           .parse(nearbyHostiles.entities);
@@ -5237,6 +5239,19 @@ function requestUserPayload(request: unknown): Record<string, unknown> {
   return z
     .record(z.string(), z.unknown())
     .parse(JSON.parse(userMessage.content));
+}
+
+function assertNearbyDirectionCount(
+  value: unknown,
+  direction: string,
+  count: number,
+): void {
+  const bins = z
+    .array(z.object({ direction: z.string(), count: z.number() }))
+    .parse(value);
+  expect(
+    bins.some((bin) => bin.direction === direction && bin.count === count),
+  ).toBe(true);
 }
 
 function actionArguments(

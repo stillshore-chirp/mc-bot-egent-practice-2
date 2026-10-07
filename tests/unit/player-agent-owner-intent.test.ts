@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import type { Response } from "openai/resources/responses/responses.js";
 
 import { McSkillRepository } from "../../src/mc-skills/index.js";
@@ -573,15 +574,6 @@ describe("player owner intent context", () => {
           ],
           omittedKindGroupCount: 0,
           omittedKindEntityCount: 0,
-          byDirection: expect.arrayContaining([
-            expect.objectContaining({
-              direction: "north",
-              count: 60,
-              nearestDistance: 2.2,
-              farthestDistance: 15,
-            }),
-            expect.objectContaining({ direction: "coincident", count: 0 }),
-          ]),
           occlusionCheck: {
             method: "raycast_entity_body_point",
             candidateLimit: 16,
@@ -594,6 +586,31 @@ describe("player owner intent context", () => {
           },
         },
       });
+      const aggregate = record(record(nearbySummary).aggregate);
+      const directionCounts = z
+        .array(
+          z.object({
+            direction: z.string(),
+            count: z.number(),
+            nearestDistance: z.number().nullable(),
+            farthestDistance: z.number().nullable(),
+          }),
+        )
+        .parse(aggregate.byDirection);
+      expect(
+        directionCounts.some(
+          (entry) =>
+            entry.direction === "north" &&
+            entry.count === 60 &&
+            entry.nearestDistance === 2.2 &&
+            entry.farthestDistance === 15,
+        ),
+      ).toBe(true);
+      expect(
+        directionCounts.some(
+          (entry) => entry.direction === "coincident" && entry.count === 0,
+        ),
+      ).toBe(true);
       const nearbyEntities = record(nearbySummary).entities as Record<
         string,
         unknown
@@ -740,6 +757,175 @@ describe("player owner intent context", () => {
         '"freshRetryExhausted":true',
       );
     } finally {
+      fixture.close();
+    }
+  });
+
+  it("routes owner feedback to current-purpose reassessment without making another goal", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const reassessmentReasons: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onPurposeReassessment: (reason) => {
+        reassessmentReasons.push(reason);
+        return true;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    const reason =
+      "The route keeps returning to the blocked entrance; reconsider how to reach the existing collection goal.";
+    fixture.responses.push(
+      functionCallResponse(
+        "reassess-current-plan",
+        "request_current_purpose_reassessment",
+        { reason },
+      ),
+      terminalResponse(
+        "That route is stuck. I will check the area again and try another way.",
+      ),
+    );
+    const turn = conversation.nextTurn();
+
+    try {
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "It keeps looping at that entrance. Rethink the route.",
+        turn,
+      });
+
+      expect(reassessmentReasons).toEqual([reason]);
+      expect(fixture.mind.snapshot().goals).toEqual([]);
+      expect(fixture.mind.snapshot().proposals).toEqual([]);
+      expect(messages).toEqual([
+        "That route is stuck. I will check the area again and try another way.",
+      ]);
+      expect(String(record(fixture.requests[0]).instructions)).toContain(
+        "request_current_purpose_reassessment",
+      );
+      const continuation = record(fixture.requests[1]);
+      if (!Array.isArray(continuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = continuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(toolOutput?.output))).toMatchObject({
+        ok: true,
+        requested: true,
+        alreadyRequested: false,
+        goalChanged: false,
+        bodyCancelled: false,
+      });
+    } finally {
+      conversation.finishTurn(turn);
+      fixture.close();
+    }
+  });
+
+  it("rejects stale and stopped current-purpose reassessment requests", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    let wakeCount = 0;
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+      onProposal: () => undefined,
+      onPurposeReassessment: () => {
+        wakeCount += 1;
+        return true;
+      },
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    let resolveResponse!: (response: Response) => void;
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    });
+    fixture.responses.push(
+      () => {
+        markRequestStarted();
+        return pendingResponse;
+      },
+      terminalResponse("This stale reply should not be sent."),
+      functionCallResponse(
+        "stopped-reassessment",
+        "request_current_purpose_reassessment",
+        { reason: "Owner feedback asks me to reconsider the current route." },
+      ),
+      terminalResponse("I heard you."),
+    );
+    const staleTurn = conversation.nextTurn();
+    const staleRequest = conversation.handleOwnerMessage({
+      username: "owner",
+      message: "Rethink the route.",
+      turn: staleTurn,
+    });
+    let currentTurn: number | undefined;
+
+    try {
+      await requestStarted;
+      currentTurn = conversation.nextTurn();
+      resolveResponse(
+        functionCallResponse(
+          "stale-reassessment",
+          "request_current_purpose_reassessment",
+          { reason: "Owner feedback asks me to reconsider the current route." },
+        ),
+      );
+      await staleRequest;
+      expect(wakeCount).toBe(0);
+      expect(fixture.requests).toHaveLength(2);
+      const staleContinuation = record(fixture.requests[1]);
+      if (!Array.isArray(staleContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const staleOutput = staleContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(staleOutput?.output))).toMatchObject({
+        ok: false,
+        code: "STALE_CONVERSATION",
+      });
+
+      fixture.mind.stop();
+      await conversation.handleOwnerMessage({
+        username: "owner",
+        message: "Rethink the route.",
+        turn: currentTurn,
+      });
+      expect(wakeCount).toBe(0);
+      expect(fixture.requests).toHaveLength(4);
+      const stoppedContinuation = record(fixture.requests[3]);
+      if (!Array.isArray(stoppedContinuation.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const toolOutput = stoppedContinuation.input
+        .map(record)
+        .find(({ type }) => type === "function_call_output");
+      expect(JSON.parse(String(toolOutput?.output))).toMatchObject({
+        ok: false,
+        code: "STOPPED_OR_STALE",
+      });
+    } finally {
+      if (currentTurn !== undefined) conversation.finishTurn(currentTurn);
       fixture.close();
     }
   });

@@ -651,6 +651,116 @@ describe("integrated player runtime", () => {
     }
   });
 
+  it("wakes a fresh purpose reassessment without immediately cancelling its body or changing goals", async () => {
+    const directory = temporaryDirectory();
+    const databasePath = join(directory, "player.sqlite");
+    const mind = PlayerMindStore.open(databasePath);
+    const skills = openSkills(databasePath, directory);
+    const body = new DeferredBody();
+    const initialObservation = observation();
+    body.setObservation(initialObservation);
+    const runtimeRef: { current?: PlayerRuntime } = {};
+    const seenObservations: PlayerBodyObservation[] = [];
+    const seenWakeEvents: PlayerRuntimeSnapshot["pendingEventKinds"][] = [];
+    let thoughtCount = 0;
+    const purpose: PlayerPurposePort = {
+      think: async ({ snapshot, events }) => {
+        thoughtCount += 1;
+        seenWakeEvents.push(events.map(({ kind }) => kind));
+        seenObservations.push(await body.observe());
+        if (thoughtCount > 1) {
+          mind.consumeEvents(events.map(({ id }) => id));
+          return { accepted: true };
+        }
+        const decision = action("owner-plan-current-operation");
+        const saved = mind.commitThought({
+          expectedRevision: snapshot.revision,
+          decision,
+        });
+        if (saved.accepted) {
+          runtimeRef.current?.handleCommittedDecision(saved.snapshot, decision);
+          mind.consumeEvents(events.map(({ id }) => id));
+        }
+        return { accepted: saved.accepted, decision };
+      },
+    };
+    const runtime = new PlayerRuntime({
+      ownerUsername: "owner",
+      playerId: "owner-player",
+      body,
+      mind,
+      memory: createMemoryPort(),
+      skills,
+      conversation: {
+        nextTurn: () => 1,
+        handleOwnerMessage: async () => undefined,
+      },
+      purpose,
+      logger: pino({ level: "silent" }),
+      say: async () => undefined,
+    });
+    runtimeRef.current = runtime;
+    const proposal = mind.addProposal({
+      title: "Collect iron and return to the owner",
+      reason: "Continue the existing collection and return request.",
+      priority: 4,
+    });
+    const ownerGoalCommit = mind.commitGoalState({
+      expectedRevision: mind.snapshot().revision,
+      proposalResolution: {
+        proposalId: proposal.id,
+        disposition: "adopted",
+        resolution: "I will collect the iron, then return to you.",
+      },
+    });
+    if (!ownerGoalCommit.accepted)
+      throw new Error("TEST_OWNER_GOAL_COMMIT_REJECTED");
+    const goalsBefore = ownerGoalCommit.snapshot.goals;
+    const ownerGoalId = goalsBefore.find(
+      ({ ownerProposalId }) => ownerProposalId === proposal.id,
+    )?.id;
+
+    try {
+      await runtime.start();
+      await waitFor(() => body.started.length === 1);
+      const actionRevision = runtime.snapshot.actionRevision;
+      const activeOperationId = runtime.snapshot.activeOperation?.operationId;
+      const reassessmentObservation: PlayerBodyObservation = {
+        ...initialObservation,
+        observedAt: new Date(Date.now() + 1_000).toISOString(),
+        self: { ...initialObservation.self, health: 16 },
+      };
+      body.setObservation(reassessmentObservation);
+
+      expect(
+        runtime.onOwnerFeedbackNeedsReassessment(
+          "The current route keeps looping; choose a different way toward the same goal.",
+        ),
+      ).toBe(true);
+      await waitFor(() => thoughtCount === 2);
+
+      expect(seenWakeEvents[1]).toContain("manual");
+      expect(seenObservations[1]).toMatchObject({
+        observedAt: reassessmentObservation.observedAt,
+        self: { health: 16 },
+      });
+      expect(body.started).toEqual(["look"]);
+      expect(body.stopCalls).toBe(0);
+      expect(body.stopActiveCalls).toBe(0);
+      expect(body.results).toHaveLength(0);
+      expect(runtime.snapshot.actionRevision).toBe(actionRevision);
+      expect(runtime.snapshot.activeOperation?.operationId).toBe(
+        activeOperationId,
+      );
+      expect(runtime.snapshot.goals).toEqual(goalsBefore);
+      expect(ownerGoalId).toBeDefined();
+    } finally {
+      await runtime.shutdown();
+      skills.close();
+      mind.close();
+    }
+  });
+
   it("returns a resolved owner proposal reason without starting a rejected action", async () => {
     const fixture = createRuntimeFixture();
     const proposal = fixture.mind.addProposal({
@@ -665,7 +775,7 @@ describe("integrated player runtime", () => {
       wakeOn: ["state_changed"],
     };
     const resolution =
-      "観測したfood値では食べる必要がなく、可食アイテムも確認できないため今回は実行しません。";
+      "私はfood値から今すぐ食べる必要はないと見て、今回は食べないことにします。";
     const saved = fixture.mind.commitThought({
       expectedRevision: fixture.mind.snapshot().revision,
       decision,
@@ -680,7 +790,7 @@ describe("integrated player runtime", () => {
     try {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+      expect(fixture.messages[0]).toBe(resolution);
       expect(fixture.body.started).toHaveLength(0);
     } finally {
       await fixture.close();
@@ -731,7 +841,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will eat one piece of bread, then check how I feel.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -741,7 +851,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will eat one piece of bread, then check how I feel.",
+      );
       expect(fixture.messages[1]).toContain("food値が13から18へ増えた");
       expect(fixture.messages[1]).toContain("体力回復は確認していません");
       expect(fixture.messages[1]).not.toContain("体力が回復しました");
@@ -820,7 +932,8 @@ describe("integrated player runtime", () => {
       kind: "consume",
       item: "bread",
     });
-    const resolution = "I will eat first, then continue the shelter goal.";
+    const resolution =
+      "I will eat one bread, then continue building the shelter.";
     const saved = fixture.mind.commitThought({
       expectedRevision: fixture.mind.snapshot().revision,
       decision,
@@ -836,7 +949,7 @@ describe("integrated player runtime", () => {
       fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
       await waitFor(() => fixture.body.started.length === 1);
       await waitFor(() => fixture.messages.length === 1);
-      expect(fixture.messages[0]).toBe(`提案への判断：${resolution}`);
+      expect(fixture.messages[0]).toBe(resolution);
 
       fixture.body.completeActive("failed");
       await waitFor(() => fixture.messages.length === 2);
@@ -890,7 +1003,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will try the bread and verify the result.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -900,7 +1013,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("successful");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will try the bread and verify the result.",
+      );
       expect(fixture.messages[1]).toContain(
         "食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした",
       );
@@ -948,7 +1063,7 @@ describe("integrated player runtime", () => {
       proposalResolution: {
         proposalId: proposal.id,
         disposition: "adopted",
-        resolution: "The current observation supports eating bread.",
+        resolution: "I will try eating the bread, then check the result.",
       },
     });
     if (!saved.accepted) throw new Error("TEST_PROPOSAL_COMMIT_REJECTED");
@@ -958,7 +1073,9 @@ describe("integrated player runtime", () => {
       await waitFor(() => fixture.body.started.length === 1);
       fixture.body.completeActive("failed");
       await waitFor(() => fixture.messages.length === 2);
-      expect(fixture.messages[0]).toContain("提案への判断：");
+      expect(fixture.messages[0]).toBe(
+        "I will try eating the bread, then check the result.",
+      );
       expect(fixture.messages[1]).toContain("食事操作は失敗し");
       expect(fixture.messages[1]).toContain("原因は観測から特定できていません");
       expect(fixture.messages[1]).not.toContain("満腹");
@@ -1070,7 +1187,8 @@ describe("integrated player runtime", () => {
                 proposalResolution: {
                   proposalId: ownerProposalRef.current,
                   disposition: "adopted" as const,
-                  resolution: "The owner meal intent is being handled.",
+                  resolution:
+                    "I will keep working on the owner's meal request.",
                 },
               }
             : {}),
@@ -1114,7 +1232,7 @@ describe("integrated player runtime", () => {
       expect(purposeCalls).toBe(1);
       expect(fixture.body.started).toEqual(["consume"]);
       expect(fixture.messages).toEqual([
-        "提案への判断：The owner meal intent is being handled.",
+        "I will keep working on the owner's meal request.",
         "自律行動を停止しました。再開の指示があるまで停止を続けます。",
       ]);
     } finally {
@@ -1549,7 +1667,7 @@ describe("integrated player runtime", () => {
         "observe a changed view",
       );
       expect(followupSnapshot?.lastOutcome?.summary).toContain(
-        "期待したstep=observe a changed view",
+        "expected=observe a changed view",
       );
       expect(followupSnapshot?.lastOutcome?.lookSweep).toEqual(scanEvidence);
       if (followupSnapshot === undefined)
