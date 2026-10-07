@@ -10417,6 +10417,7 @@ async function prepareNoFoodFixtureProbe(
 
 const COMPANION_HOSTILE_FIXTURE_TAG = "ai_e2e_companion_hostile";
 const COMPANION_HOSTILE_COUNT_HOLDER = "#companion_hostile_count";
+const COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT = 4;
 
 async function readWorldDayTime(rcon: LocalRcon): Promise<number> {
   const reply = await rcon.command("time query daytime");
@@ -10453,10 +10454,57 @@ async function countCompanionHostileFixture(
   return count;
 }
 
+async function waitForCompanionHostileAggregate(
+  body: PlayerBody,
+  expectedCount: number,
+  observedAfter: number,
+  failureCode: string,
+): Promise<{
+  readonly observation: PlayerBodyObservation;
+  readonly requestSentAt: number;
+}> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const requestSentAt = Date.now();
+    const observation = await body.observe();
+    const nearbyHostiles = observation.perception.nearbyHostiles;
+    const aggregate = nearbyHostiles?.aggregate;
+    const zombieCount =
+      aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? 0;
+    if (
+      aggregate?.clientReceivedHostileCount === expectedCount &&
+      zombieCount === expectedCount &&
+      Date.parse(observation.observedAt) >= observedAfter &&
+      Date.parse(observation.observedAt) >= requestSentAt &&
+      nearbyHostiles?.observedAt === observation.observedAt
+    ) {
+      return { observation, requestSentAt };
+    }
+    await waitMs(Math.min(200, deadline - Date.now()));
+  }
+  incomplete(failureCode);
+}
+
+function companionHostileNearestDistance(
+  observation: PlayerBodyObservation,
+): number {
+  const distances =
+    observation.perception.nearbyHostiles?.aggregate?.byDirection
+      .map(({ nearestDistance }) => nearestDistance)
+      .filter((distance): distance is number => distance !== null);
+  const nearestDistance = distances?.length
+    ? Math.min(...distances)
+    : Number.NaN;
+  if (!Number.isFinite(nearestDistance) || nearestDistance < 0)
+    incomplete("COMPANION_HOSTILE_NEAREST_DISTANCE_UNAVAILABLE");
+  return nearestDistance;
+}
+
 async function runCompanionHostileObservationProbe(
   rcon: LocalRcon,
   botName: string,
   body: PlayerBody,
+  signal: AbortSignal,
 ): Promise<Readonly<Record<string, boolean | number | string>>> {
   const origin = parsePosition(
     await rcon.command(`data get entity ${botName} Pos`),
@@ -10504,30 +10552,13 @@ async function runCompanionHostileObservationProbe(
       incomplete("COMPANION_HOSTILE_FIXTURE_COUNT_NOT_CONFIRMED");
 
     const fixtureConfiguredAt = Date.now();
-    const observationDeadline = Date.now() + 5_000;
-    let requestSentAt = 0;
-    let observation: PlayerBodyObservation | undefined;
-    while (Date.now() < observationDeadline) {
-      requestSentAt = Date.now();
-      const latest = await body.observe();
-      const aggregate = latest.perception.nearbyHostiles?.aggregate;
-      const zombieCount =
-        aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? -1;
-      if (
-        aggregate?.clientReceivedHostileCount ===
-          COMPANION_HOSTILE_FIXTURE_COUNT &&
-        zombieCount === COMPANION_HOSTILE_FIXTURE_COUNT &&
-        Date.parse(latest.observedAt) >= fixtureConfiguredAt &&
-        Date.parse(latest.observedAt) >= requestSentAt &&
-        latest.perception.nearbyHostiles?.observedAt === latest.observedAt
-      ) {
-        observation = latest;
-        break;
-      }
-      await waitMs(Math.min(200, observationDeadline - Date.now()));
-    }
-    if (observation === undefined)
-      incomplete("COMPANION_HOSTILE_CLIENT_AGGREGATE_TIMEOUT");
+    const { observation, requestSentAt } =
+      await waitForCompanionHostileAggregate(
+        body,
+        COMPANION_HOSTILE_FIXTURE_COUNT,
+        fixtureConfiguredAt,
+        "COMPANION_HOSTILE_CLIENT_AGGREGATE_TIMEOUT",
+      );
     const serverCountAfter = await countCompanionHostileFixture(rcon, origin);
     const nearbyHostiles = observation.perception.nearbyHostiles;
     const aggregate = nearbyHostiles?.aggregate;
@@ -10571,6 +10602,217 @@ async function runCompanionHostileObservationProbe(
       freshObservationConfirmed: true,
       llmCalls: 0,
     };
+
+    await rcon.command(
+      `kill @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG}]`,
+    );
+    const largeFixtureCleanupCount = await countCompanionHostileFixture(
+      rcon,
+      origin,
+    );
+    if (largeFixtureCleanupCount !== 0)
+      incomplete("COMPANION_HOSTILE_LARGE_FIXTURE_CLEANUP_UNVERIFIED");
+    const largeFixtureCleanupAt = Date.now();
+    await waitForCompanionHostileAggregate(
+      body,
+      0,
+      largeFixtureCleanupAt,
+      "COMPANION_HOSTILE_CLIENT_CLEAR_TIMEOUT",
+    );
+
+    const routeX = Math.floor(origin.x) + 0.5;
+    const routeY = Math.floor(origin.y);
+    const routeZ = Math.floor(origin.z);
+    for (const step of [1, 2, 3]) {
+      const routeBlock = { x: routeX, y: routeY, z: routeZ + step };
+      if (
+        !(await isBlock(rcon, routeBlock, "air")) ||
+        !(await isBlock(rcon, { ...routeBlock, y: routeY + 1 }, "air")) ||
+        !(await isBlock(rcon, { ...routeBlock, y: routeY - 1 }, "stone"))
+      )
+        incomplete("COMPANION_HOSTILE_SEPARATION_ROUTE_NOT_CLEAR");
+    }
+    const separationSpawnPositions = [-1.5, -0.5, 0.5, 1.5].map((offsetX) => ({
+      x: routeX + offsetX,
+      y: routeY,
+      z: routeZ - 7.5,
+    }));
+    for (const position of separationSpawnPositions) {
+      const block = {
+        x: Math.floor(position.x),
+        y: routeY,
+        z: Math.floor(position.z),
+      };
+      if (
+        !(await isBlock(rcon, block, "air")) ||
+        !(await isBlock(rcon, { ...block, y: routeY + 1 }, "air")) ||
+        !(await isBlock(rcon, { ...block, y: routeY - 1 }, "stone"))
+      )
+        incomplete("COMPANION_HOSTILE_SEPARATION_FIXTURE_LAYOUT_UNAVAILABLE");
+    }
+    for (const position of separationSpawnPositions) {
+      await rcon.command(
+        `summon minecraft:zombie ${position.x} ${position.y} ${position.z} {NoAI:1b,Silent:1b,PersistenceRequired:1b,Tags:["${COMPANION_HOSTILE_FIXTURE_TAG}"]}`,
+      );
+    }
+    const separationFixtureCount = await countCompanionHostileFixture(
+      rcon,
+      origin,
+    );
+    if (separationFixtureCount !== COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT)
+      incomplete("COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT_NOT_CONFIRMED");
+    const separationFixtureConfiguredAt = Date.now();
+    const { observation: separationBefore } =
+      await waitForCompanionHostileAggregate(
+        body,
+        COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT,
+        separationFixtureConfiguredAt,
+        "COMPANION_HOSTILE_SEPARATION_BEFORE_OBSERVATION_TIMEOUT",
+      );
+    const separationBeforeCount =
+      separationBefore.perception.nearbyHostiles?.aggregate
+        ?.clientReceivedHostileCount ?? -1;
+    const separationBeforeZombieCount =
+      separationBefore.perception.nearbyHostiles?.aggregate?.byKind.find(
+        ({ name }) => name === "zombie",
+      )?.count ?? -1;
+    const separationNearestDistanceBefore =
+      companionHostileNearestDistance(separationBefore);
+    if (separationNearestDistanceBefore < 3.5)
+      incomplete("COMPANION_HOSTILE_SEPARATION_FIXTURE_TOO_CLOSE");
+    if (
+      separationBefore.self.inWater !== false ||
+      separationBefore.self.inLava !== false
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_START_NOT_DRY");
+    const separationHealthBefore = separationBefore.self.health;
+    if (separationHealthBefore === null)
+      incomplete("COMPANION_HOSTILE_SEPARATION_BODY_HEALTH_UNAVAILABLE");
+    const separationRconHealthBefore = await rconEntityHealth(rcon, botName);
+    const beforeMove = parsePosition(
+      await rcon.command(`data get entity ${botName} Pos`),
+    );
+    if (
+      Math.hypot(
+        separationBefore.self.position.x - beforeMove.x,
+        separationBefore.self.position.y - beforeMove.y,
+        separationBefore.self.position.z - beforeMove.z,
+      ) > 0.5
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_START_POSITION_NOT_CURRENT");
+    const move = await body.execute(
+      {
+        kind: "move_relative",
+        offset: { x: 0, y: 0, z: 3 },
+        range: 1,
+      },
+      signal,
+    );
+    const afterMove = parsePosition(
+      await rcon.command(`data get entity ${botName} Pos`),
+    );
+    const rconDisplacement = {
+      x: afterMove.x - beforeMove.x,
+      y: afterMove.y - beforeMove.y,
+      z: afterMove.z - beforeMove.z,
+    };
+    const rconDisplacementDistance = Math.hypot(
+      rconDisplacement.x,
+      rconDisplacement.y,
+      rconDisplacement.z,
+    );
+    const rconDisplacementConfirmed =
+      rconDisplacement.z >= 1.5 &&
+      Math.abs(rconDisplacement.x) <= 1.5 &&
+      Math.abs(rconDisplacement.y) <= 1.5;
+    if (
+      move.status !== "successful" ||
+      move.sameLife !== true ||
+      move.recoveryRequired ||
+      !rconDisplacementConfirmed
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_MOVE_NOT_CONFIRMED");
+    const { observation: separationAfter } =
+      await waitForCompanionHostileAggregate(
+        body,
+        COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT,
+        Date.parse(move.completedAt),
+        "COMPANION_HOSTILE_SEPARATION_AFTER_OBSERVATION_TIMEOUT",
+      );
+    if (
+      Math.hypot(
+        separationAfter.self.position.x - afterMove.x,
+        separationAfter.self.position.y - afterMove.y,
+        separationAfter.self.position.z - afterMove.z,
+      ) > 0.5
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_END_POSITION_NOT_CURRENT");
+    if (
+      separationAfter.self.inWater !== false ||
+      separationAfter.self.inLava !== false
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_END_NOT_DRY");
+    const separationAfterCount =
+      separationAfter.perception.nearbyHostiles?.aggregate
+        ?.clientReceivedHostileCount ?? -1;
+    const separationAfterZombieCount =
+      separationAfter.perception.nearbyHostiles?.aggregate?.byKind.find(
+        ({ name }) => name === "zombie",
+      )?.count ?? -1;
+    const separationNearestDistanceAfter =
+      companionHostileNearestDistance(separationAfter);
+    const separationHealthAfter = separationAfter.self.health;
+    if (separationHealthAfter === null)
+      incomplete("COMPANION_HOSTILE_SEPARATION_BODY_HEALTH_UNAVAILABLE");
+    const separationRconHealthAfter = await rconEntityHealth(rcon, botName);
+    const hostileFixturePersisted =
+      (await countCompanionHostileFixture(rcon, origin)) ===
+      COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT;
+    const hostileSeparationObserved =
+      separationNearestDistanceAfter >= separationNearestDistanceBefore + 1.5;
+    const noHealthLossObserved =
+      separationHealthAfter >= separationHealthBefore &&
+      separationRconHealthAfter >= separationRconHealthBefore;
+    if (
+      separationAfterCount !== COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT ||
+      separationAfterZombieCount !==
+        COMPANION_HOSTILE_SEPARATION_FIXTURE_COUNT ||
+      !hostileFixturePersisted ||
+      !hostileSeparationObserved ||
+      !noHealthLossObserved
+    )
+      incomplete("COMPANION_HOSTILE_SEPARATION_NOT_CONFIRMED");
+    result = {
+      ...result,
+      largeFixtureCleanupServerCount: largeFixtureCleanupCount,
+      largeFixtureClientClearConfirmed: true,
+      separationFixtureCount,
+      separationBeforeCount,
+      separationBeforeZombieCount,
+      separationNearestDistanceBefore: Number(
+        separationNearestDistanceBefore.toFixed(2),
+      ),
+      separationAfterCount,
+      separationAfterZombieCount,
+      separationNearestDistanceAfter: Number(
+        separationNearestDistanceAfter.toFixed(2),
+      ),
+      hostileFixturePersisted,
+      hostileSeparationObserved,
+      bodyMoveStatus: move.status,
+      bodyMoveSameLife: move.sameLife,
+      bodyMoveRecoveryRequired: move.recoveryRequired,
+      rconDisplacementX: Number(rconDisplacement.x.toFixed(2)),
+      rconDisplacementY: Number(rconDisplacement.y.toFixed(2)),
+      rconDisplacementZ: Number(rconDisplacement.z.toFixed(2)),
+      rconDisplacementDistance: Number(rconDisplacementDistance.toFixed(2)),
+      bodyHealthBefore: separationHealthBefore,
+      bodyHealthAfter: separationHealthAfter,
+      rconHealthBefore: separationRconHealthBefore,
+      rconHealthAfter: separationRconHealthAfter,
+      noHealthLossObserved,
+      bodyOnlyNoLlmTacticProof: true,
+    };
   } finally {
     if (fixtureTouched) {
       try {
@@ -10579,16 +10821,43 @@ async function runCompanionHostileObservationProbe(
         );
         if ((await countCompanionHostileFixture(rcon, origin)) !== 0)
           incomplete("COMPANION_HOSTILE_FIXTURE_CLEANUP_UNVERIFIED");
+        await waitForCompanionHostileAggregate(
+          body,
+          0,
+          Date.now(),
+          "COMPANION_HOSTILE_FIXTURE_CLIENT_CLEANUP_UNVERIFIED",
+        );
       } finally {
-        if (originalDayTime !== undefined) {
-          await rcon.command(`time set ${originalDayTime}`);
-          if ((await readWorldDayTime(rcon)) !== originalDayTime)
-            incomplete("COMPANION_HOSTILE_TIME_RESTORE_UNVERIFIED");
+        try {
+          if (originalDayTime !== undefined) {
+            await rcon.command(`time set ${originalDayTime}`);
+            if ((await readWorldDayTime(rcon)) !== originalDayTime)
+              incomplete("COMPANION_HOSTILE_TIME_RESTORE_UNVERIFIED");
+          }
+        } finally {
+          await rcon.command(
+            `tp ${botName} ${origin.x} ${origin.y} ${origin.z}`,
+          );
+          const restoredPosition = parsePosition(
+            await rcon.command(`data get entity ${botName} Pos`),
+          );
+          if (
+            Math.hypot(
+              restoredPosition.x - origin.x,
+              restoredPosition.y - origin.y,
+              restoredPosition.z - origin.z,
+            ) > 0.5
+          )
+            incomplete("COMPANION_HOSTILE_POSITION_RESTORE_UNVERIFIED");
         }
       }
     }
   }
-  return { ...result, fixtureCleanupConfirmed: true };
+  return {
+    ...result,
+    fixtureCleanupConfirmed: true,
+    positionRestoreConfirmed: true,
+  };
 }
 
 async function runOperationSmoke(
@@ -10705,6 +10974,7 @@ async function runOperationSmoke(
             rcon,
             state.botName,
             body,
+            abort.signal,
           );
         }
         if (
