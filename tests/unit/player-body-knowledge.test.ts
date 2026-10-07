@@ -195,9 +195,11 @@ describe("player body knowledge craftability", () => {
     ).toBe(4);
 
     const planksRecipe = recipeFacts("oak_planks", "oak_planks")[0];
+    const oakLog = minecraftData("1.21.11").itemsByName.oak_log;
+    if (oakLog === undefined) throw new Error("oak_log missing from registry");
     expect(planksRecipe?.result.count).toBe(4);
     expect(planksRecipe?.ingredients).toContainEqual({
-      id: minecraftData("1.21.11").itemsByName.oak_log.id,
+      id: oakLog.id,
       name: "oak_log",
       count: 1,
     });
