@@ -66,6 +66,15 @@ import {
   type GatherMultiTargetItemCountReadResult,
 } from "./gather-multi-target-acceptance.js";
 import {
+  COMPANION_HOSTILE_FIXTURE_COUNT,
+  bodyOakLogInventoryCount,
+  companionHostileObservationConfirmed,
+  completionJudgmentObservedAfter,
+  freshResolvedOwnerWoodGoalCount,
+  singleFreshWoodGoalQuantity,
+  successfulCollectionActionObservedAfter,
+} from "./companion-intent-collection.js";
+import {
   classifyGatherDropReadbackFailure,
   classifyGatherDropReadbackReply,
   gatherFixtureCleanupProofConfirmed,
@@ -283,6 +292,11 @@ export const UNDERWATER_ITEM_RECOVERY_CASE_BUDGET = {
   totalTokens: 600_000,
 } as const;
 export const UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS = 12 * 60_000;
+export const COMPANION_INTENT_COLLECTION_CASE_BUDGET = {
+  llmCalls: 32,
+  totalTokens: 280_000,
+} as const;
+export const COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS = 8 * 60_000;
 const CASE_BUDGETS = {
   runtime_contract: { llmCalls: 2, totalTokens: 25_000 },
   owner_return_through_door: OWNER_RETURN_THROUGH_DOOR_CASE_BUDGET,
@@ -298,6 +312,7 @@ const CASE_BUDGETS = {
   skill_exchange: { llmCalls: 40, totalTokens: 380_000 },
   game_action_discretion: { llmCalls: 20, totalTokens: 100_000 },
   food_intent_continuity: { llmCalls: 44, totalTokens: 360_000 },
+  companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_BUDGET,
   gather_multi_target_continuity: { llmCalls: 64, totalTokens: 600_000 },
   death_recovery: { llmCalls: 64, totalTokens: 600_000 },
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_BUDGET,
@@ -324,6 +339,7 @@ const CASE_DEADLINES = {
   skill_exchange: 8 * 60_000,
   game_action_discretion: 6 * 60_000,
   food_intent_continuity: 8 * 60_000,
+  companion_intent_collection: COMPANION_INTENT_COLLECTION_CASE_DEADLINE_MS,
   gather_multi_target_continuity: 12 * 60_000,
   death_recovery: 12 * 60_000,
   underwater_item_recovery: UNDERWATER_ITEM_RECOVERY_CASE_DEADLINE_MS,
@@ -335,6 +351,11 @@ const CASE_DEADLINES = {
   integrated_result: 30_000,
 } as const;
 const UNKNOWN_COMPOSITE_TARGETED_CASE_DEADLINE_MS = 14 * 60_000;
+const COMPANION_INTENT_COLLECTION_RUN_BUDGET = {
+  durationMs: 10 * 60_000,
+  llmCalls: 40,
+  totalTokens: 360_000,
+} as const;
 
 function caseBudgetForRun(
   targetCase: TargetableCase | undefined,
@@ -974,7 +995,14 @@ function isNoGptDiagnosticProbeOnly(): boolean {
     process.env.AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY === "YES" ||
     process.env.AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY === "YES" ||
+    isCompanionHostileOracleProbeOnly() ||
     isDeathRecoveryFixtureProbeOnly()
+  );
+}
+
+function isCompanionHostileOracleProbeOnly(): boolean {
+  return (
+    process.env.AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY === "YES"
   );
 }
 
@@ -3295,6 +3323,8 @@ interface RunState {
   gatherMultiTargetDiagnostic?: SafeEvidence;
   gatherProgressReplyHash?: string;
   gatherProgressReplySidecarRetained?: boolean;
+  companionIntentCollectionDiagnostic?: SafeEvidence;
+  companionIntentDialogueSidecarRetained?: boolean;
   damageResponseCleanupFailureCode?: string;
   damageResponseFailureDiagnostic?: {
     readonly damageResponseFreshPurposeCommitObserved: boolean;
@@ -5169,6 +5199,22 @@ async function main(): Promise<void> {
       if (noFoodReplanResult.status !== "pass")
         state.failureCode ??=
           noFoodReplanResult.reason ?? "NO_FOOD_REPLAN_NOT_CONFIRMED";
+      return;
+    }
+    if (state.targetCase === "companion_intent_collection") {
+      await connectApplication(activeApp, state);
+      const collectionResult = await recordCase(
+        state,
+        "companion_intent_collection",
+        CASE_DEADLINES.companion_intent_collection,
+        requireLiveContext(),
+        async (context) => runCompanionIntentCollectionCase(state, context),
+      );
+      state.status = collectionResult.status;
+      if (collectionResult.status !== "pass")
+        state.failureCode ??=
+          collectionResult.reason ??
+          "COMPANION_INTENT_COLLECTION_NOT_CONFIRMED";
       return;
     }
     const autonomousRegion = state.autonomousRegion;
@@ -9617,6 +9663,11 @@ async function main(): Promise<void> {
         `PRIVATE_ARMOR_CAPABILITY_REPLY ${armorCapabilityReplySidecarPath(state)}\n`,
       );
     }
+    if (state.companionIntentDialogueSidecarRetained === true) {
+      process.stdout.write(
+        `PRIVATE_COMPANION_INTENT_DIALOGUE ${companionIntentDialogueSidecarPath(state)}\n`,
+      );
+    }
     process.exitCode = state.status === "pass" ? 0 : 1;
   }
 }
@@ -9632,6 +9683,7 @@ async function prepareRun(): Promise<RunState> {
     "AI_PLAYER_E2E_NO_FOOD_FIXTURE_PROBE_ONLY",
     "AI_PLAYER_E2E_NO_FOOD_CONTINUITY_PROBE_ONLY",
     "AI_PLAYER_E2E_GATHER_MULTI_TARGET_ORACLE_PROBE_ONLY",
+    "AI_PLAYER_E2E_COMPANION_HOSTILE_ORACLE_PROBE_ONLY",
     "AI_PLAYER_E2E_DEATH_RECOVERY_FIXTURE_PROBE_ONLY",
   ].filter((name) => process.env[name] === "YES").length;
   if (
@@ -9649,6 +9701,12 @@ async function prepareRun(): Promise<RunState> {
     requestedTargetCase !== "gather_multi_target_continuity"
   ) {
     incomplete("GATHER_MULTI_TARGET_ORACLE_PROBE_TARGET_REQUIRED");
+  }
+  if (
+    isCompanionHostileOracleProbeOnly() &&
+    requestedTargetCase !== "companion_intent_collection"
+  ) {
+    incomplete("COMPANION_HOSTILE_ORACLE_PROBE_TARGET_REQUIRED");
   }
   if (
     requestedTargetCase !== undefined &&
@@ -9690,7 +9748,24 @@ async function prepareRun(): Promise<RunState> {
   } catch {
     incomplete("JAVA_21_NOT_FOUND");
   }
-  const runBudget = runBudgetFromEnvironment();
+  const configuredRunBudget = runBudgetFromEnvironment();
+  const runBudget =
+    targetCase === "companion_intent_collection"
+      ? {
+          durationMs: Math.min(
+            configuredRunBudget.durationMs,
+            COMPANION_INTENT_COLLECTION_RUN_BUDGET.durationMs,
+          ),
+          llmCalls: Math.min(
+            configuredRunBudget.llmCalls,
+            COMPANION_INTENT_COLLECTION_RUN_BUDGET.llmCalls,
+          ),
+          totalTokens: Math.min(
+            configuredRunBudget.totalTokens,
+            COMPANION_INTENT_COLLECTION_RUN_BUDGET.totalTokens,
+          ),
+        }
+      : configuredRunBudget;
   const targetCaseBudget =
     targetCase === undefined
       ? undefined
@@ -10328,6 +10403,182 @@ async function prepareNoFoodFixtureProbe(
   }
 }
 
+const COMPANION_HOSTILE_FIXTURE_TAG = "ai_e2e_companion_hostile";
+const COMPANION_HOSTILE_COUNT_HOLDER = "#companion_hostile_count";
+
+async function readWorldDayTime(rcon: LocalRcon): Promise<number> {
+  const reply = await rcon.command("time query daytime");
+  const value = Number(/\b(\d+)\s*$/u.exec(reply.trim())?.[1]);
+  if (!Number.isSafeInteger(value) || value < 0 || value >= 24_000)
+    incomplete("COMPANION_HOSTILE_DAYTIME_READBACK_UNAVAILABLE");
+  return value;
+}
+
+async function countCompanionHostileFixture(
+  rcon: LocalRcon,
+  origin: Position,
+): Promise<number> {
+  const reset = await rcon.command(
+    `scoreboard players set ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 0`,
+  );
+  if (classifyRconReply(reset) !== "success")
+    incomplete("COMPANION_HOSTILE_SERVER_ORACLE_UNAVAILABLE");
+  const countReply = await rcon.command(
+    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG},distance=..16] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
+  );
+  if (
+    !isNoEntitySelectionReply(countReply) &&
+    classifyRconReply(countReply) !== "success"
+  ) {
+    incomplete("COMPANION_HOSTILE_SERVER_ORACLE_UNAVAILABLE");
+  }
+  const score = await rcon.command(
+    `scoreboard players get ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e`,
+  );
+  const count = parseScore(score, COMPANION_HOSTILE_COUNT_HOLDER);
+  if (count === undefined || !Number.isSafeInteger(count) || count < 0)
+    incomplete("COMPANION_HOSTILE_SERVER_ORACLE_UNAVAILABLE");
+  return count;
+}
+
+async function runCompanionHostileObservationProbe(
+  rcon: LocalRcon,
+  botName: string,
+  body: PlayerBody,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  const origin = parsePosition(
+    await rcon.command(`data get entity ${botName} Pos`),
+  );
+  const serverCountBefore = await countCompanionHostileFixture(rcon, origin);
+  if (serverCountBefore !== 0)
+    incomplete("COMPANION_HOSTILE_FIXTURE_BASELINE_NOT_EMPTY");
+
+  const spawnPositions: Position[] = [];
+  for (let offsetX = -6; offsetX <= 5; offsetX += 1) {
+    for (let offsetZ = -6; offsetZ <= 5; offsetZ += 1) {
+      if (offsetX >= -2 && offsetX <= 2 && offsetZ >= -2 && offsetZ <= 2)
+        continue;
+      spawnPositions.push({
+        x: Math.floor(origin.x) + offsetX + 0.5,
+        y: Math.floor(origin.y),
+        z: Math.floor(origin.z) + offsetZ + 0.5,
+      });
+      if (spawnPositions.length === COMPANION_HOSTILE_FIXTURE_COUNT) break;
+    }
+    if (spawnPositions.length === COMPANION_HOSTILE_FIXTURE_COUNT) break;
+  }
+  if (spawnPositions.length !== COMPANION_HOSTILE_FIXTURE_COUNT)
+    incomplete("COMPANION_HOSTILE_FIXTURE_LAYOUT_UNAVAILABLE");
+
+  let fixtureTouched = false;
+  let originalDayTime: number | undefined;
+  let result: Readonly<Record<string, boolean | number | string>> | undefined;
+  try {
+    fixtureTouched = true;
+    originalDayTime = await readWorldDayTime(rcon);
+    await rcon.command("time set 18000");
+    if ((await readWorldDayTime(rcon)) !== 18_000)
+      incomplete("COMPANION_HOSTILE_NIGHT_FIXTURE_NOT_CONFIRMED");
+    for (const position of spawnPositions) {
+      await rcon.command(
+        `summon minecraft:zombie ${position.x} ${position.y} ${position.z} {NoAI:1b,Silent:1b,PersistenceRequired:1b,Tags:["${COMPANION_HOSTILE_FIXTURE_TAG}"]}`,
+      );
+    }
+    const serverCountAfterFixture = await countCompanionHostileFixture(
+      rcon,
+      origin,
+    );
+    if (serverCountAfterFixture !== COMPANION_HOSTILE_FIXTURE_COUNT)
+      incomplete("COMPANION_HOSTILE_FIXTURE_COUNT_NOT_CONFIRMED");
+
+    const fixtureConfiguredAt = Date.now();
+    const observationDeadline = Date.now() + 5_000;
+    let requestSentAt = 0;
+    let observation: PlayerBodyObservation | undefined;
+    while (Date.now() < observationDeadline) {
+      requestSentAt = Date.now();
+      const latest = await body.observe();
+      const aggregate = latest.perception.nearbyHostiles?.aggregate;
+      const zombieCount =
+        aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? -1;
+      if (
+        aggregate?.clientReceivedHostileCount ===
+          COMPANION_HOSTILE_FIXTURE_COUNT &&
+        zombieCount === COMPANION_HOSTILE_FIXTURE_COUNT &&
+        Date.parse(latest.observedAt) >= fixtureConfiguredAt &&
+        Date.parse(latest.observedAt) >= requestSentAt &&
+        latest.perception.nearbyHostiles?.observedAt === latest.observedAt
+      ) {
+        observation = latest;
+        break;
+      }
+      await waitMs(Math.min(200, observationDeadline - Date.now()));
+    }
+    if (observation === undefined)
+      incomplete("COMPANION_HOSTILE_CLIENT_AGGREGATE_TIMEOUT");
+    const serverCountAfter = await countCompanionHostileFixture(rcon, origin);
+    const nearbyHostiles = observation.perception.nearbyHostiles;
+    const aggregate = nearbyHostiles?.aggregate;
+    const confirmed = companionHostileObservationConfirmed({
+      serverCountBefore,
+      serverCountAfter,
+      fixtureConfiguredAt,
+      requestSentAt,
+      observationAt: observation.observedAt,
+      nearbyHostilesObservedAt: nearbyHostiles?.observedAt ?? "",
+      source: nearbyHostiles?.source ?? "",
+      aggregateSource: aggregate?.source ?? "",
+      countScope: aggregate?.countScope ?? "",
+      aggregateCount: aggregate?.clientReceivedHostileCount ?? -1,
+      zombieCount:
+        aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? -1,
+      worldAbsenceEstablished: aggregate?.worldAbsenceEstablished ?? true,
+      candidateLimit: aggregate?.occlusionCheck.candidateLimit ?? 0,
+      detailOutputLimit: aggregate?.occlusionCheck.detailOutputLimit ?? 0,
+      entityOutputLimit: nearbyHostiles?.entityOutputLimit ?? 0,
+      detailCount: nearbyHostiles?.entities.length ?? 0,
+      candidateSearchMayBeTruncated:
+        nearbyHostiles?.candidateSearchMayBeTruncated ?? true,
+    });
+    if (!confirmed)
+      incomplete("COMPANION_HOSTILE_CLIENT_AGGREGATE_NOT_CONFIRMED");
+    result = {
+      fixtureConfigured: true,
+      serverCountBefore,
+      serverCountAfterFixture,
+      serverCountAfterObservation: serverCountAfter,
+      clientAggregateConfirmed: true,
+      clientReceivedHostileCount: aggregate?.clientReceivedHostileCount ?? -1,
+      zombieCount:
+        aggregate?.byKind.find(({ name }) => name === "zombie")?.count ?? -1,
+      worldAbsenceEstablished: aggregate?.worldAbsenceEstablished ?? true,
+      candidateLimit: aggregate?.occlusionCheck.candidateLimit ?? 0,
+      detailOutputLimit: aggregate?.occlusionCheck.detailOutputLimit ?? 0,
+      detailCount: nearbyHostiles?.entities.length ?? 0,
+      nightTimeConfirmed: true,
+      freshObservationConfirmed: true,
+      llmCalls: 0,
+    };
+  } finally {
+    if (fixtureTouched) {
+      try {
+        await rcon.command(
+          `kill @e[type=minecraft:zombie,tag=${COMPANION_HOSTILE_FIXTURE_TAG}]`,
+        );
+        if ((await countCompanionHostileFixture(rcon, origin)) !== 0)
+          incomplete("COMPANION_HOSTILE_FIXTURE_CLEANUP_UNVERIFIED");
+      } finally {
+        if (originalDayTime !== undefined) {
+          await rcon.command(`time set ${originalDayTime}`);
+          if ((await readWorldDayTime(rcon)) !== originalDayTime)
+            incomplete("COMPANION_HOSTILE_TIME_RESTORE_UNVERIFIED");
+        }
+      }
+    }
+  }
+  return { ...result, fixtureCleanupConfirmed: true };
+}
+
 async function runOperationSmoke(
   state: RunState,
   rcon: LocalRcon,
@@ -10336,13 +10587,15 @@ async function runOperationSmoke(
     process.env.AI_PLAYER_E2E_RETURN_PATH_PROBE_ONLY === "YES";
   const progressiveNavigationProbeOnly =
     process.env.AI_PLAYER_E2E_PROGRESSIVE_NAVIGATION_PROBE_ONLY === "YES";
-  const smokeDeadlineMs = progressiveNavigationProbeOnly
-    ? 135_000
-    : returnPathProbeOnly
-      ? 150_000
-      : state.targetCase === "gather_multi_target_continuity"
-        ? 210_000
-        : 90_000;
+  const smokeDeadlineMs = isCompanionHostileOracleProbeOnly()
+    ? 180_000
+    : progressiveNavigationProbeOnly
+      ? 135_000
+      : returnPathProbeOnly
+        ? 150_000
+        : state.targetCase === "gather_multi_target_continuity"
+          ? 210_000
+          : 90_000;
   const result = await runCase(
     state,
     "body_operation_smoke",
@@ -10435,6 +10688,13 @@ async function runOperationSmoke(
         }
         if (!positionMatchesSmokeSpawn(visibleBefore.self.position))
           incomplete("BODY_SMOKE_CLIENT_POSITION_NOT_CONFIRMED");
+        if (isCompanionHostileOracleProbeOnly()) {
+          return await runCompanionHostileObservationProbe(
+            rcon,
+            state.botName,
+            body,
+          );
+        }
         if (
           shouldRunGatherMultiTargetOracleProbe(
             state.targetCase,
@@ -11858,7 +12118,632 @@ interface GatherMultiTargetFixture {
   readonly birchLog: BlockPosition;
 }
 
+interface CompanionIntentCollectionFixture {
+  readonly oakLogs: readonly BlockPosition[];
+}
+
 const GATHER_FIXTURE_JAVA_YAW = 180;
+
+async function findCompanionIntentCollectionFixture(
+  rcon: LocalRcon,
+  origin: Position,
+): Promise<CompanionIntentCollectionFixture> {
+  const layout = [
+    [-3, -4],
+    [-1, -3],
+    [1, -3],
+    [3, -4],
+    [-3, -6],
+    [-1, -6],
+    [1, -6],
+    [3, -6],
+  ] as const;
+  for (const depthOffset of [0, -1, -2]) {
+    const oakLogs = layout.map(([offsetX, offsetZ]) =>
+      fixturePoint(
+        origin,
+        offsetX,
+        offsetZ + depthOffset,
+        Math.floor(origin.y),
+      ),
+    );
+    let sitesAvailable = true;
+    for (const target of oakLogs) {
+      if (
+        !(await isBlock(rcon, target, "air")) ||
+        !(await isBlock(rcon, { ...target, y: target.y + 1 }, "air")) ||
+        !(await isBlock(rcon, { ...target, y: target.y - 1 }, "stone"))
+      ) {
+        sitesAvailable = false;
+        break;
+      }
+    }
+    if (!sitesAvailable) continue;
+    try {
+      for (const target of oakLogs) {
+        await verifyUnknownFixtureSightline(
+          rcon,
+          { x: origin.x, y: origin.y + 1.62, z: origin.z },
+          target,
+          GATHER_FIXTURE_JAVA_YAW,
+          "COMPANION_INTENT_FIXTURE_OUT_OF_VIEW",
+          "COMPANION_INTENT_FIXTURE_OCCLUDED",
+        );
+      }
+      return { oakLogs };
+    } catch (error) {
+      if (
+        error instanceof HarnessError &&
+        (error.code === "COMPANION_INTENT_FIXTURE_OUT_OF_VIEW" ||
+          error.code === "COMPANION_INTENT_FIXTURE_OCCLUDED")
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  incomplete("COMPANION_INTENT_FIXTURE_SITES_UNAVAILABLE");
+}
+
+function updateCompanionIntentCollectionDiagnostic(
+  state: RunState,
+  update: SafeEvidence,
+): void {
+  state.companionIntentCollectionDiagnostic = {
+    fixtureConfigured: false,
+    freshBodyObservationBeforeRequest: false,
+    initialOwnerGoalResolved: false,
+    initialRequestedQuantity: null,
+    followupOwnerGoalUpdated: false,
+    requestedQuantityChanged: false,
+    freshBodyObservationAfterFollowup: false,
+    serverOakLogCountAfterGoal: null,
+    bodyOakLogCountAfterGoal: null,
+    inventoryThresholdObservedAfterGoal: false,
+    successfulBodyCollectionAfterFollowup: false,
+    serverInventoryIncreaseAfterFollowup: false,
+    inventoryIncrease: null,
+    fixtureLogRemovedAfterFollowup: null,
+    goalStatusAfterCollection: "unknown",
+    goalCompletionJudgmentObservedAfterTarget: false,
+    goalCompletionReportStatus: "unconfirmed",
+    fixtureCleanupConfirmed: false,
+    privateDialogueRetained: false,
+    dialogueReplyCount: 0,
+    conversationReviewStatus: "not_sampled",
+    ...state.companionIntentCollectionDiagnostic,
+    ...update,
+  };
+}
+
+function activeWoodGoal(
+  player: PlayerEvidence,
+  updatedAfter: number,
+): PlayerEvidence["goals"][number] | undefined {
+  const acceptedProposalIds = new Set([
+    ...player.proposals
+      .filter(({ status }) => status === "adopted" || status === "compromised")
+      .map(({ id }) => id),
+    ...player.recentJudgments.flatMap(({ proposalId, proposalDisposition }) =>
+      proposalId !== undefined &&
+      (proposalDisposition === "adopted" ||
+        proposalDisposition === "compromised")
+        ? [proposalId]
+        : [],
+    ),
+  ]);
+  const goals = player.goals.filter(
+    ({ id, ownerProposalId, source, status, title, updatedAt }) => {
+      const goalUpdatedAt = Date.parse(updatedAt ?? "");
+      return (
+        id.length > 0 &&
+        ownerProposalId !== undefined &&
+        acceptedProposalIds.has(ownerProposalId) &&
+        source === "owner" &&
+        status === "active" &&
+        /oak|wood|tree|log|オーク|木材|原木|木/iu.test(title ?? "") &&
+        Number.isFinite(goalUpdatedAt) &&
+        goalUpdatedAt >= updatedAfter
+      );
+    },
+  );
+  return goals.length === 1 ? goals[0] : undefined;
+}
+
+async function runCompanionIntentCollectionCase(
+  state: RunState,
+  context: CaseContext,
+): Promise<Readonly<Record<string, boolean | number | string>>> {
+  let fixture: CompanionIntentCollectionFixture | undefined;
+  let origin: Position | undefined;
+  let result: Readonly<Record<string, boolean | number | string>> | undefined;
+  let primaryError: unknown;
+  let primaryFailed = false;
+  let cleanupConfirmed = false;
+  let privateGoalEvidence:
+    | {
+        readonly capturedAt: string;
+        readonly goalId: string;
+        readonly status: string;
+        readonly title: string;
+        readonly changeReason: string;
+        readonly purpose: string;
+        readonly waitReason?: string;
+        readonly completionJudgments: readonly {
+          readonly decidedAt?: string;
+          readonly summary?: string;
+        }[];
+      }
+    | undefined;
+  const conversationTurns: {
+    readonly prompt: string;
+    readonly sentAt: number;
+  }[] = [];
+  updateCompanionIntentCollectionDiagnostic(state, {});
+
+  try {
+    const quiet = await observeForPlayer(
+      context,
+      30_000,
+      (player) => !player.stopped && !isOperationActive(player),
+    );
+    if (quiet === undefined)
+      incomplete("COMPANION_INTENT_PRECONDITION_NOT_QUIET");
+
+    await removeAutonomousResourceFixture(context.rcon);
+    origin = parsePosition(
+      await context.rcon.command(`data get entity ${context.botName} Pos`),
+    );
+    const preparedFixture = await findCompanionIntentCollectionFixture(
+      context.rcon,
+      origin,
+    );
+    fixture = preparedFixture;
+    for (const item of GATHER_MULTI_TARGET_ITEMS) {
+      await context.rcon.command(`clear ${context.botName} minecraft:${item}`);
+    }
+    const inventoryBaseline = await readGatherMultiTargetItemCounts(
+      (item) =>
+        context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+      context.botName,
+    );
+    if (inventoryBaseline.reason !== "parsed")
+      incomplete("COMPANION_INTENT_INVENTORY_BASELINE_UNAVAILABLE");
+    if (inventoryBaseline.counts.oak_log !== 0)
+      incomplete("COMPANION_INTENT_OAK_INVENTORY_NOT_EMPTY");
+
+    await context.rcon.command(
+      `tp ${context.botName} ${origin.x} ${origin.y} ${origin.z} ${GATHER_FIXTURE_JAVA_YAW} ${LEARNING_FIXTURE_PITCH}`,
+    );
+    const rotation = await readLearningFixtureRotation(
+      context.rcon,
+      context.botName,
+    );
+    if (
+      rotation === undefined ||
+      angularDistance(rotation.yaw, GATHER_FIXTURE_JAVA_YAW) > 2 ||
+      Math.abs(rotation.pitch - LEARNING_FIXTURE_PITCH) > 2
+    ) {
+      incomplete("COMPANION_INTENT_FIXTURE_ORIENTATION_NOT_CONFIRMED");
+    }
+    for (const log of preparedFixture.oakLogs) {
+      await context.rcon.command(`setblock ${log.x} ${log.y} ${log.z} oak_log`);
+    }
+    if (
+      !(
+        await Promise.all(
+          preparedFixture.oakLogs.map((log) =>
+            isBlock(context.rcon, log, "oak_log"),
+          ),
+        )
+      ).every(Boolean)
+    ) {
+      incomplete("COMPANION_INTENT_FIXTURE_NOT_CONFIRMED");
+    }
+    const initialFixtureLogCount = preparedFixture.oakLogs.length;
+    const fixtureConfiguredAt = Date.now();
+    updateCompanionIntentCollectionDiagnostic(state, {
+      fixtureConfigured: true,
+    });
+
+    const visible = await observeForPlayer(context, 20_000, (player) => {
+      const observedAt = Date.parse(player.lastObservation?.observedAt ?? "");
+      return (
+        Number.isFinite(observedAt) &&
+        observedAt >= fixtureConfiguredAt &&
+        (player.lastObservation?.visibleBlockNames ?? []).includes("oak_log")
+      );
+    });
+    if (visible === undefined)
+      incomplete("COMPANION_INTENT_FIXTURE_NOT_FRESHLY_OBSERVED");
+    updateCompanionIntentCollectionDiagnostic(state, {
+      freshBodyObservationBeforeRequest: true,
+    });
+
+    const initialPrompt =
+      "木が足りなくて気が遠くなりそう。近くの木を2本くらい集めておいて。";
+    const beforeInitialRequest = playerOf(await collect(context.runtime.app));
+    const previousProposalIds = new Set(
+      beforeInitialRequest.proposals.map(({ id }) => id),
+    );
+    const initialRequestSentAt = Date.now();
+    conversationTurns.push({
+      prompt: initialPrompt,
+      sentAt: initialRequestSentAt,
+    });
+    sendChat(context.owner, initialPrompt);
+    const initialIntent = await observeForPlayer(
+      context,
+      60_000,
+      (player) =>
+        freshResolvedOwnerWoodGoalCount({
+          goals: player.goals,
+          proposals: player.proposals,
+          judgments: player.recentJudgments,
+          updatedAfter: initialRequestSentAt,
+        }) === 1,
+    );
+    if (initialIntent === undefined)
+      incomplete("COMPANION_INTENT_INITIAL_GOAL_NOT_RESOLVED");
+    const initialRequestedQuantity = singleFreshWoodGoalQuantity({
+      goals: initialIntent.goals,
+      proposals: initialIntent.proposals,
+      judgments: initialIntent.recentJudgments,
+      updatedAfter: initialRequestSentAt,
+    });
+    const initialGoal = activeWoodGoal(initialIntent, initialRequestSentAt);
+    if (initialRequestedQuantity !== 2 || initialGoal === undefined)
+      incomplete("COMPANION_INTENT_INITIAL_QUANTITY_NOT_CONFIRMED");
+    if (previousProposalIds.has(initialGoal.ownerProposalId ?? ""))
+      incomplete("COMPANION_INTENT_INITIAL_PROPOSAL_NOT_FRESH");
+    updateCompanionIntentCollectionDiagnostic(state, {
+      initialOwnerGoalResolved: true,
+      initialRequestedQuantity,
+    });
+
+    const inventoryBeforeFollowup = await readGatherMultiTargetItemCounts(
+      (item) =>
+        context.rcon.command(`clear ${context.botName} minecraft:${item} 0`),
+      context.botName,
+    );
+    if (inventoryBeforeFollowup.reason !== "parsed")
+      incomplete("COMPANION_INTENT_FOLLOWUP_INVENTORY_UNAVAILABLE");
+    const beforeFollowup = playerOf(await collect(context.runtime.app));
+    const previousOperationIds = new Set(
+      beforeFollowup.recentOutcomes.map(({ operationId }) => operationId),
+    );
+    if (beforeFollowup.activeOperation !== undefined) {
+      previousOperationIds.add(beforeFollowup.activeOperation.operationId);
+    }
+    const followupPrompt =
+      "おい、目の前に原木が並んでるのに何してるんだ。ちゃんと周りを見て、やっぱり3本まで集めて。話が進まなくてちょっとイラつくよ。";
+    const followupSentAt = Date.now();
+    conversationTurns.push({ prompt: followupPrompt, sentAt: followupSentAt });
+    sendChat(context.owner, followupPrompt);
+
+    let freshOakObservationAfterFollowup = false;
+    let freshBodyObservationAt: number | undefined;
+    const updatedIntent = await observeForPlayer(context, 60_000, (player) => {
+      const observationAt = Date.parse(
+        player.lastObservation?.observedAt ?? "",
+      );
+      if (
+        freshBodyObservationAt === undefined &&
+        Number.isFinite(observationAt) &&
+        observationAt > followupSentAt &&
+        (player.lastObservation?.visibleBlockNames ?? []).includes("oak_log")
+      ) {
+        freshOakObservationAfterFollowup = true;
+        freshBodyObservationAt = observationAt;
+      }
+      const goal = activeWoodGoal(player, followupSentAt);
+      const goalUpdatedAt = Date.parse(goal?.updatedAt ?? "");
+      return (
+        goal?.id === initialGoal.id &&
+        freshBodyObservationAt !== undefined &&
+        Number.isFinite(goalUpdatedAt) &&
+        goalUpdatedAt >= freshBodyObservationAt &&
+        singleFreshWoodGoalQuantity({
+          goals: player.goals,
+          proposals: player.proposals,
+          judgments: player.recentJudgments,
+          updatedAfter: followupSentAt,
+        }) === 3 &&
+        freshOakObservationAfterFollowup
+      );
+    });
+    if (updatedIntent === undefined)
+      incomplete("COMPANION_INTENT_FOLLOWUP_GOAL_NOT_UPDATED");
+    const updatedGoal = activeWoodGoal(updatedIntent, followupSentAt);
+    const updatedGoalAt = Date.parse(updatedGoal?.updatedAt ?? "");
+    if (updatedGoal?.id !== initialGoal.id || !Number.isFinite(updatedGoalAt)) {
+      incomplete("COMPANION_INTENT_UPDATED_GOAL_TIMESTAMP_UNAVAILABLE");
+    }
+    updateCompanionIntentCollectionDiagnostic(state, {
+      followupOwnerGoalUpdated: true,
+      requestedQuantityChanged: true,
+      freshBodyObservationAfterFollowup: freshOakObservationAfterFollowup,
+    });
+
+    let successfulBodyCollectionAfterFollowup = false;
+    let inventoryAfterFollowup: number | undefined;
+    let bodyOakCountAfterGoal: number | undefined;
+    let bodyInventoryObservedAt = Number.NaN;
+    let serverInventoryObservedAt = Number.NaN;
+    let fixtureLogRemovedFromInitial: number | undefined;
+    let inventoryThresholdAchievedAt: number | undefined;
+    let lastOracleReadAt = 0;
+    const body = activeApplicationPlayerBody;
+    if (body === undefined)
+      incomplete("COMPANION_INTENT_APPLICATION_BODY_UNAVAILABLE");
+    const progress = await observeForPlayer(
+      context,
+      150_000,
+      async (player) => {
+        successfulBodyCollectionAfterFollowup ||=
+          successfulCollectionActionObservedAfter({
+            outcomes: player.recentOutcomes,
+            previousOperationIds,
+            requestSentAt: updatedGoalAt,
+          });
+        if (Date.now() - lastOracleReadAt >= 1_500) {
+          lastOracleReadAt = Date.now();
+          const bodyObservation = await body.observe();
+          bodyInventoryObservedAt = Date.parse(bodyObservation.observedAt);
+          bodyOakCountAfterGoal = bodyOakLogInventoryCount(
+            bodyObservation.self.inventory,
+          );
+          const inventory = await readGatherMultiTargetItemCounts(
+            (item) =>
+              context.rcon.command(
+                `clear ${context.botName} minecraft:${item} 0`,
+              ),
+            context.botName,
+          );
+          if (inventory.reason === "parsed") {
+            serverInventoryObservedAt = Date.now();
+            inventoryAfterFollowup = inventory.counts.oak_log;
+            const remainingBlocks = (
+              await Promise.all(
+                preparedFixture.oakLogs.map((log) =>
+                  isBlock(context.rcon, log, "oak_log"),
+                ),
+              )
+            ).filter(Boolean).length;
+            fixtureLogRemovedFromInitial =
+              initialFixtureLogCount - remainingBlocks;
+            const bodyIsFreshForServerRead =
+              Number.isFinite(bodyInventoryObservedAt) &&
+              bodyInventoryObservedAt >= updatedGoalAt &&
+              Math.abs(serverInventoryObservedAt - bodyInventoryObservedAt) <=
+                5_000;
+            const serverBodyInventoryAgrees =
+              bodyIsFreshForServerRead &&
+              bodyOakCountAfterGoal === inventoryAfterFollowup;
+            if (
+              serverBodyInventoryAgrees &&
+              bodyOakCountAfterGoal >= 3 &&
+              inventoryAfterFollowup >= 3 &&
+              inventoryThresholdAchievedAt === undefined
+            ) {
+              inventoryThresholdAchievedAt = Math.max(
+                bodyInventoryObservedAt,
+                serverInventoryObservedAt,
+              );
+            }
+          }
+        }
+        updateCompanionIntentCollectionDiagnostic(state, {
+          successfulBodyCollectionAfterFollowup,
+          bodyOakLogCountAfterGoal: bodyOakCountAfterGoal ?? null,
+          serverOakLogCountAfterGoal: inventoryAfterFollowup ?? null,
+          inventoryThresholdObservedAfterGoal:
+            inventoryThresholdAchievedAt !== undefined,
+          serverInventoryIncreaseAfterFollowup:
+            inventoryAfterFollowup !== undefined &&
+            inventoryAfterFollowup > inventoryBeforeFollowup.counts.oak_log,
+          inventoryIncrease:
+            inventoryAfterFollowup === undefined
+              ? null
+              : inventoryAfterFollowup - inventoryBeforeFollowup.counts.oak_log,
+          fixtureLogRemovedFromInitial: fixtureLogRemovedFromInitial ?? null,
+        });
+        return (
+          successfulBodyCollectionAfterFollowup &&
+          inventoryThresholdAchievedAt !== undefined &&
+          (fixtureLogRemovedFromInitial ?? 0) >= 3
+        );
+      },
+    );
+    if (progress === undefined)
+      incomplete("COMPANION_INTENT_POST_FOLLOWUP_COLLECTION_NOT_CONFIRMED");
+
+    const achievedAt = inventoryThresholdAchievedAt;
+    if (achievedAt === undefined)
+      incomplete("COMPANION_INTENT_INVENTORY_TARGET_TIME_UNAVAILABLE");
+    const goalCompletionSnapshot = await observeForPlayer(
+      context,
+      15_000,
+      (player) =>
+        completionJudgmentObservedAfter({
+          judgments: player.recentJudgments,
+          achievedAt,
+        }) ||
+        player.goals.some((goal) => {
+          const goalUpdatedAt = Date.parse(goal.updatedAt ?? "");
+          return (
+            goal.id === initialGoal.id &&
+            goal.status === "completed" &&
+            Number.isFinite(goalUpdatedAt) &&
+            goalUpdatedAt >= achievedAt
+          );
+        }),
+    );
+    const finalPlayer =
+      goalCompletionSnapshot ?? playerOf(await collect(context.runtime.app));
+    const finalGoal = finalPlayer.goals.find(({ id }) => id === initialGoal.id);
+    const goalCompletionJudgmentObserved = completionJudgmentObservedAfter({
+      judgments: finalPlayer.recentJudgments,
+      achievedAt,
+    });
+    const goalStatusAfterCollection = finalGoal?.status ?? "missing";
+    const goalCompletionReportStatus =
+      goalStatusAfterCollection === "completed" &&
+      goalCompletionJudgmentObserved
+        ? "completed"
+        : goalStatusAfterCollection === "completed"
+          ? "goal_status_only"
+          : goalCompletionJudgmentObserved
+            ? "decision_only"
+            : "unconfirmed";
+    privateGoalEvidence = {
+      capturedAt: new Date().toISOString(),
+      goalId: initialGoal.id,
+      status: goalStatusAfterCollection,
+      title: finalGoal?.title ?? "",
+      changeReason: finalGoal?.changeReason ?? "",
+      purpose: finalPlayer.purpose ?? "",
+      ...(finalPlayer.wait?.reason === undefined
+        ? {}
+        : { waitReason: finalPlayer.wait.reason }),
+      completionJudgments: finalPlayer.recentJudgments
+        .filter(
+          ({ kind, decidedAt }) =>
+            kind === "complete" &&
+            Number.isFinite(Date.parse(decidedAt ?? "")) &&
+            Date.parse(decidedAt ?? "") >= achievedAt,
+        )
+        .map(({ decidedAt, summary }) => ({ decidedAt, summary })),
+    };
+    updateCompanionIntentCollectionDiagnostic(state, {
+      goalStatusAfterCollection,
+      goalCompletionJudgmentObservedAfterTarget: goalCompletionJudgmentObserved,
+      goalCompletionReportStatus,
+    });
+
+    result = {
+      fixtureConfigured: true,
+      freshBodyObservationBeforeRequest: true,
+      initialOwnerGoalResolved: true,
+      initialRequestedQuantity,
+      followupOwnerGoalUpdated: true,
+      requestedQuantityChanged: true,
+      finalRequestedQuantity: 3,
+      freshBodyObservationAfterFollowup: true,
+      successfulBodyCollectionAfterFollowup: true,
+      serverInventoryIncreaseAfterFollowup: true,
+      serverOakLogCountAfterGoal: inventoryAfterFollowup ?? 0,
+      bodyOakLogCountAfterGoal: bodyOakCountAfterGoal ?? 0,
+      inventoryThresholdObservedAfterGoal:
+        inventoryThresholdAchievedAt !== undefined,
+      inventoryIncrease:
+        (inventoryAfterFollowup ??
+          incomplete("COMPANION_INTENT_FINAL_SERVER_INVENTORY_UNAVAILABLE")) -
+        inventoryBeforeFollowup.counts.oak_log,
+      fixtureLogRemovedFromInitial: fixtureLogRemovedFromInitial ?? 0,
+      goalStatusAfterCollection,
+      goalCompletionJudgmentObservedAfterTarget: goalCompletionJudgmentObserved,
+      goalCompletionReportStatus,
+    };
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
+  } finally {
+    if (fixture !== undefined && origin !== undefined) {
+      try {
+        await cleanupCompanionIntentCollectionFixture(
+          context.rcon,
+          origin,
+          fixture,
+        );
+        cleanupConfirmed = true;
+        updateCompanionIntentCollectionDiagnostic(state, {
+          fixtureCleanupConfirmed: true,
+        });
+      } catch (error) {
+        if (!primaryFailed) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
+    }
+    if (conversationTurns.length > 0) {
+      try {
+        const replyCount = await retainCompanionIntentDialogue(
+          state,
+          conversationTurns,
+          privateGoalEvidence,
+        );
+        updateCompanionIntentCollectionDiagnostic(state, {
+          privateDialogueRetained: true,
+          dialogueReplyCount: replyCount,
+          conversationReviewStatus: "pending_private_review",
+        });
+      } catch (error) {
+        if (!primaryFailed) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
+    }
+  }
+
+  if (primaryFailed) throw primaryError;
+  if (result === undefined)
+    incomplete("COMPANION_INTENT_COLLECTION_RESULT_UNAVAILABLE");
+  return {
+    ...result,
+    fixtureCleanupConfirmed: cleanupConfirmed,
+    privateDialogueRetained:
+      state.companionIntentDialogueSidecarRetained === true,
+    dialogueReplyCount:
+      Number(state.companionIntentCollectionDiagnostic?.dialogueReplyCount) ||
+      0,
+    conversationReviewStatus: (() => {
+      const value =
+        state.companionIntentCollectionDiagnostic?.conversationReviewStatus;
+      return typeof value === "string" ? value : "unavailable";
+    })(),
+  };
+}
+
+async function cleanupCompanionIntentCollectionFixture(
+  rcon: LocalRcon,
+  origin: Position,
+  fixture: CompanionIntentCollectionFixture,
+): Promise<void> {
+  for (const log of fixture.oakLogs) {
+    await rcon.command(
+      `fill ${log.x} ${log.y} ${log.z} ${log.x} ${log.y} ${log.z} air replace oak_log`,
+    );
+  }
+  await rcon.command(
+    `execute positioned ${origin.x} ${origin.y} ${origin.z} run kill @e[type=minecraft:item,distance=..16,nbt={Item:{id:"minecraft:oak_log"}}]`,
+  );
+  for (const log of fixture.oakLogs) {
+    if (await isBlock(rcon, log, "oak_log"))
+      incomplete("COMPANION_INTENT_FIXTURE_BLOCK_CLEANUP_UNVERIFIED");
+  }
+  const reset = await rcon.command(
+    `scoreboard players set ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 0`,
+  );
+  if (classifyRconReply(reset) !== "success")
+    incomplete("COMPANION_INTENT_FIXTURE_DROP_CLEANUP_UNVERIFIED");
+  const dropReply = await rcon.command(
+    `execute positioned ${origin.x} ${origin.y} ${origin.z} as @e[type=minecraft:item,distance=..16,nbt={Item:{id:"minecraft:oak_log"}}] run scoreboard players add ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e 1`,
+  );
+  if (
+    !isNoEntitySelectionReply(dropReply) &&
+    classifyRconReply(dropReply) !== "success"
+  ) {
+    incomplete("COMPANION_INTENT_FIXTURE_DROP_CLEANUP_UNVERIFIED");
+  }
+  const score = await rcon.command(
+    `scoreboard players get ${COMPANION_HOSTILE_COUNT_HOLDER} ai_e2e`,
+  );
+  if (parseScore(score, COMPANION_HOSTILE_COUNT_HOLDER) !== 0)
+    incomplete("COMPANION_INTENT_FIXTURE_DROP_CLEANUP_UNVERIFIED");
+}
 
 async function findGatherMultiTargetFixture(
   rcon: LocalRcon,
@@ -19034,6 +19919,76 @@ function gatherProgressReplySidecarPath(state: RunState): string {
   );
 }
 
+function companionIntentDialogueSidecarPath(state: RunState): string {
+  return join(
+    tmpdir(),
+    "ai-player-e2e-private-diagnostics",
+    `${state.id}-companion-intent-dialogue.json`,
+  );
+}
+
+async function retainCompanionIntentDialogue(
+  state: RunState,
+  turns: readonly { readonly prompt: string; readonly sentAt: number }[],
+  goalEvidence:
+    | {
+        readonly capturedAt: string;
+        readonly goalId: string;
+        readonly status: string;
+        readonly title: string;
+        readonly changeReason: string;
+        readonly purpose: string;
+        readonly waitReason?: string;
+        readonly completionJudgments: readonly {
+          readonly decidedAt?: string;
+          readonly summary?: string;
+        }[];
+      }
+    | undefined,
+): Promise<number> {
+  const privateTurns = turns.map((turn, index) => {
+    const nextTurn = turns[index + 1];
+    const replies = state.responses
+      .filter(
+        ({ at }) =>
+          at >= turn.sentAt && (nextTurn === undefined || at < nextTurn.sentAt),
+      )
+      .map(({ at, text }) => ({ at, text }));
+    if (
+      turn.prompt.length > 500 ||
+      replies.some(({ text }) => text.length > 4_000)
+    ) {
+      incomplete("COMPANION_INTENT_PRIVATE_DIALOGUE_SAMPLE_TOO_LARGE");
+    }
+    return { prompt: turn.prompt, replies };
+  });
+  const destination = companionIntentDialogueSidecarPath(state);
+  const diagnosticsDirectory = dirname(destination);
+  try {
+    await mkdir(diagnosticsDirectory, { recursive: true, mode: 0o700 });
+    await chmod(diagnosticsDirectory, 0o700);
+    await writeFile(
+      destination,
+      `${JSON.stringify(
+        {
+          schema: "ai-player-e2e-private-companion-intent-dialogue/v1",
+          turns: privateTurns,
+          ...(goalEvidence === undefined ? {} : { goalEvidence }),
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+    await chmod(destination, 0o600);
+  } catch {
+    state.companionIntentDialogueSidecarRetained = false;
+    incomplete("COMPANION_INTENT_PRIVATE_DIALOGUE_WRITE_FAILED");
+  }
+  state.companionIntentDialogueSidecarRetained = true;
+  return privateTurns.reduce((total, turn) => total + turn.replies.length, 0);
+}
+
 function armorCapabilityReplySidecarPath(state: RunState): string {
   return join(
     tmpdir(),
@@ -19375,6 +20330,8 @@ async function writeArtifact(state: RunState): Promise<void> {
       bodyOperationSmoke: state.bodySmokeDiagnostic ?? null,
       deathRecoveryFixtureProbe: state.deathRecoveryFixtureDiagnostic ?? null,
       deathRecoveryTarget: state.deathRecoveryTargetDiagnostic ?? null,
+      companionIntentCollection:
+        state.companionIntentCollectionDiagnostic ?? null,
       observationBoundary: {
         replyReceived:
           state.observationBoundaryDiagnostic?.replyReceived === true,

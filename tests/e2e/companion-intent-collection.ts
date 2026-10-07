@@ -1,0 +1,212 @@
+export const COMPANION_HOSTILE_FIXTURE_COUNT = 100;
+export const COMPANION_HOSTILE_DETAIL_LIMIT = 16;
+
+export interface CompanionHostileObservationEvidence {
+  readonly serverCountBefore: number;
+  readonly serverCountAfter: number;
+  readonly fixtureConfiguredAt: number;
+  readonly requestSentAt: number;
+  readonly observationAt: string;
+  readonly nearbyHostilesObservedAt: string;
+  readonly source: string;
+  readonly aggregateSource: string;
+  readonly countScope: string;
+  readonly aggregateCount: number;
+  readonly zombieCount: number;
+  readonly worldAbsenceEstablished: boolean;
+  readonly candidateLimit: number;
+  readonly detailOutputLimit: number;
+  readonly entityOutputLimit: number;
+  readonly detailCount: number;
+  readonly candidateSearchMayBeTruncated: boolean;
+}
+
+export function companionHostileObservationConfirmed(
+  input: CompanionHostileObservationEvidence,
+): boolean {
+  const observationAt = Date.parse(input.observationAt);
+  const nearbyObservedAt = Date.parse(input.nearbyHostilesObservedAt);
+  return (
+    input.serverCountBefore === 0 &&
+    input.serverCountAfter === COMPANION_HOSTILE_FIXTURE_COUNT &&
+    Number.isFinite(input.fixtureConfiguredAt) &&
+    Number.isFinite(input.requestSentAt) &&
+    input.requestSentAt >= input.fixtureConfiguredAt &&
+    Number.isFinite(observationAt) &&
+    observationAt >= input.fixtureConfiguredAt &&
+    observationAt >= input.requestSentAt &&
+    nearbyObservedAt === observationAt &&
+    input.source === "client_received_unoccluded_nearby_hostiles" &&
+    input.aggregateSource === "client_received_hostile_entity_candidates" &&
+    input.countScope === "client_entity_table_within_max_distance" &&
+    input.aggregateCount === COMPANION_HOSTILE_FIXTURE_COUNT &&
+    input.zombieCount === COMPANION_HOSTILE_FIXTURE_COUNT &&
+    !input.worldAbsenceEstablished &&
+    input.candidateLimit >= COMPANION_HOSTILE_FIXTURE_COUNT &&
+    input.detailOutputLimit === COMPANION_HOSTILE_DETAIL_LIMIT &&
+    input.entityOutputLimit === COMPANION_HOSTILE_DETAIL_LIMIT &&
+    input.detailCount <= COMPANION_HOSTILE_DETAIL_LIMIT &&
+    !input.candidateSearchMayBeTruncated
+  );
+}
+
+export interface CompanionOwnerGoal {
+  readonly ownerProposalId?: string;
+  readonly title?: string;
+  readonly status?: string;
+  readonly source?: string;
+  readonly updatedAt?: string;
+}
+
+export interface CompanionOwnerProposal {
+  readonly id: string;
+  readonly status?: string;
+}
+
+export interface CompanionOwnerJudgment {
+  readonly proposalId?: string;
+  readonly proposalDisposition?: string;
+}
+
+function resolvedProposalIds(input: {
+  readonly proposals: readonly CompanionOwnerProposal[];
+  readonly judgments: readonly CompanionOwnerJudgment[];
+}): ReadonlySet<string> {
+  return new Set([
+    ...input.proposals
+      .filter(({ status }) => status === "adopted" || status === "compromised")
+      .map(({ id }) => id),
+    ...input.judgments.flatMap(({ proposalId, proposalDisposition }) =>
+      proposalId !== undefined &&
+      (proposalDisposition === "adopted" ||
+        proposalDisposition === "compromised")
+        ? [proposalId]
+        : [],
+    ),
+  ]);
+}
+
+export function freshResolvedOwnerWoodGoalCount(input: {
+  readonly goals: readonly CompanionOwnerGoal[];
+  readonly proposals: readonly CompanionOwnerProposal[];
+  readonly judgments: readonly CompanionOwnerJudgment[];
+  readonly updatedAfter: number;
+}): number {
+  const acceptedProposals = resolvedProposalIds(input);
+  return input.goals.filter(
+    ({ ownerProposalId, source, status, title, updatedAt }) => {
+      const updatedAtMs = Date.parse(updatedAt ?? "");
+      return (
+        ownerProposalId !== undefined &&
+        acceptedProposals.has(ownerProposalId) &&
+        source === "owner" &&
+        status === "active" &&
+        /oak|wood|tree|log|オーク|木材|原木|木/iu.test(title ?? "") &&
+        Number.isFinite(updatedAtMs) &&
+        updatedAtMs >= input.updatedAfter
+      );
+    },
+  ).length;
+}
+
+/** Return a quantity only when one fresh, resolved owner goal describes wood. */
+export function singleFreshWoodGoalQuantity(input: {
+  readonly goals: readonly CompanionOwnerGoal[];
+  readonly proposals: readonly CompanionOwnerProposal[];
+  readonly judgments: readonly CompanionOwnerJudgment[];
+  readonly updatedAfter: number;
+}): number | undefined {
+  const acceptedProposals = resolvedProposalIds(input);
+  const goals = input.goals.filter(
+    ({ ownerProposalId, source, status, title }) =>
+      ownerProposalId !== undefined &&
+      acceptedProposals.has(ownerProposalId) &&
+      source === "owner" &&
+      status === "active" &&
+      /oak|wood|tree|log|オーク|木材|原木|木/iu.test(title ?? ""),
+  );
+  if (goals.length !== 1) return undefined;
+  const goal = goals[0];
+  if (goal === undefined) return undefined;
+  const updatedAt = Date.parse(goal.updatedAt ?? "");
+  if (!Number.isFinite(updatedAt) || updatedAt < input.updatedAfter)
+    return undefined;
+  const title = (goal.title ?? "").normalize("NFKC");
+  const quantities = [
+    ...title.matchAll(
+      /(?:^|[^0-9])([0-9]{1,7})\s*(?:個|つ|本|枚|ブロック)(?=\s|$|[^0-9])/giu,
+    ),
+    ...title.matchAll(
+      /\b([0-9]{1,7})\s+(?:(?:oak|birch)\s+)?(?:wood|logs?|blocks?|items?|trees?)\b/giu,
+    ),
+  ];
+  if (quantities.length !== 1) return undefined;
+  const count = Number(quantities[0]?.[1]);
+  return Number.isSafeInteger(count) && count > 0 ? count : undefined;
+}
+
+export interface CompanionCollectionOutcome {
+  readonly operationId: string;
+  readonly kind?: string;
+  readonly status?: string;
+  readonly observedAt?: string;
+}
+
+export interface CompanionGoalJudgment {
+  readonly kind?: string;
+  readonly decidedAt?: string;
+}
+
+export function bodyOakLogInventoryCount(
+  inventory: readonly { readonly name: string; readonly count: number }[],
+): number {
+  return inventory.reduce(
+    (total, item) =>
+      item.name === "oak_log" &&
+      Number.isSafeInteger(item.count) &&
+      item.count > 0
+        ? total + item.count
+        : total,
+    0,
+  );
+}
+
+export function completionJudgmentObservedAfter(input: {
+  readonly judgments: readonly CompanionGoalJudgment[];
+  readonly achievedAt: number;
+}): boolean {
+  if (!Number.isFinite(input.achievedAt)) return false;
+  return input.judgments.some(({ kind, decidedAt }) => {
+    const timestamp = Date.parse(decidedAt ?? "");
+    return (
+      kind === "complete" &&
+      Number.isFinite(timestamp) &&
+      timestamp >= input.achievedAt
+    );
+  });
+}
+
+export function successfulCollectionActionObservedAfter(input: {
+  readonly outcomes: readonly CompanionCollectionOutcome[];
+  readonly previousOperationIds: ReadonlySet<string>;
+  readonly requestSentAt: number;
+}): boolean {
+  if (!Number.isFinite(input.requestSentAt)) return false;
+  const seen = new Set<string>();
+  return input.outcomes.some((outcome) => {
+    const observedAt = Date.parse(outcome.observedAt ?? "");
+    if (
+      outcome.operationId.trim().length === 0 ||
+      seen.has(outcome.operationId) ||
+      input.previousOperationIds.has(outcome.operationId) ||
+      (outcome.kind !== "dig" && outcome.kind !== "collect_item") ||
+      outcome.status !== "successful" ||
+      !Number.isFinite(observedAt) ||
+      observedAt <= input.requestSentAt
+    ) {
+      return false;
+    }
+    seen.add(outcome.operationId);
+    return true;
+  });
+}
