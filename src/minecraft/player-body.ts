@@ -3289,6 +3289,24 @@ export class MineflayerPlayerBody implements PlayerBody {
         await waitTicks(operation.ticks, signal);
         return;
       case "equip": {
+        const window = bot.currentWindow;
+        if (window !== null) {
+          await bot.closeWindow(window);
+          await waitTicks(2, signal);
+          if (
+            this.getBot() !== bot ||
+            this.boundBot !== bot ||
+            this.boundBotEnded ||
+            this.disconnectedSinceBind ||
+            this.botLifeDead ||
+            !Number.isFinite(bot.health) ||
+            bot.health <= 0 ||
+            this.lifeGeneration !== active.startedLifeGeneration
+          )
+            throw new Error(
+              "Minecraft bot life changed while closing a window before equip",
+            );
+        }
         const item = findInventoryItem(bot, operation.item);
         await bot.equip(item, operation.destination);
         return;

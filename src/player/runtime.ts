@@ -46,6 +46,26 @@ function enabledControlCount(operation: PlayerOperation): number | null {
   return Object.values(operation.controls).filter((enabled) => enabled).length;
 }
 
+function isTravelOperation(operation: PlayerOperation): boolean {
+  return (
+    operation.kind === "move_to" ||
+    operation.kind === "move_relative" ||
+    operation.kind === "control" ||
+    operation.kind === "move_vehicle" ||
+    operation.kind === "elytra_fly"
+  );
+}
+
+function travelProgressed(
+  previous: PlayerBodyObservation["self"]["position"],
+  current: PlayerBodyObservation["self"]["position"],
+): boolean {
+  const dx = current.x - previous.x;
+  const dy = current.y - previous.y;
+  const dz = current.z - previous.z;
+  return dx * dx + dy * dy + dz * dz >= 0.75 * 0.75;
+}
+
 function isUrgentPerceptionWake(kind: PlayerWakeKind): boolean {
   return (
     kind === "bot_damaged" ||
@@ -76,6 +96,7 @@ interface LatestBodyOperationPhase {
   readonly phase: RuntimeBodyOperationPhase["phase"];
   readonly at: string;
   readonly admissionObserved: boolean;
+  readonly progressVersion: number;
   readonly status?: McSkillOutcomeStatus;
   readonly reason?: RuntimeBodyOperationPhase["reason"];
   readonly firstPathStatus?: RuntimeBodyOperationPhase["firstPathStatus"];
@@ -140,6 +161,13 @@ interface PendingThoughtWake {
   readonly deathAware: boolean;
 }
 
+interface OperationStallWake {
+  readonly eventId: string;
+  readonly runtimeOperationId: string;
+  readonly bodyOperationId: string;
+  readonly progressVersion: number;
+}
+
 interface EquipmentOutcomeNotificationState {
   readonly failedSignatures: Set<string>;
   lastSuccessfulSignature: string | undefined;
@@ -169,6 +197,8 @@ export class PlayerRuntime {
   #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
   #ownerProposalSettlementThought: AbortController | undefined;
   #pendingThoughtWake: PendingThoughtWake | undefined;
+  #operationStallWake: OperationStallWake | undefined;
+  #activeThoughtStallWake: OperationStallWake | undefined;
   #replacementTail: Promise<void> = Promise.resolve();
   #retryTimer: NodeJS.Timeout | undefined;
   #revisionRetryUsed = false;
@@ -184,6 +214,13 @@ export class PlayerRuntime {
   #ownerConsumeOperations = new Set<string>();
   #pendingDamageReflexOutcome: PendingDamageReflexOutcome | undefined;
   #latestBodyOperationPhase: LatestBodyOperationPhase | undefined;
+  #lastObservedPosition: PlayerBodyObservation["self"]["position"] | undefined;
+  #operationPositionSample:
+    | {
+        readonly runtimeOperationId: string;
+        readonly position: PlayerBodyObservation["self"]["position"];
+      }
+    | undefined;
   #bodyConnected = true;
   #lastDamageEventAtMs = Number.NEGATIVE_INFINITY;
   #started = false;
@@ -737,6 +774,7 @@ export class PlayerRuntime {
           at,
           firstPathStatus: bodyEvent.status,
         });
+      this.#discardStaleOperationStallWake();
       return;
     }
     if (type === "operation_completed" || type === "operation_failed") {
@@ -744,6 +782,26 @@ export class PlayerRuntime {
       return;
     }
     if (type === "operation_stalled") {
+      const active = this.#activeBody;
+      const latest = this.#latestBodyOperationPhase;
+      const bodyOperationId =
+        typeof bodyEvent.operationId === "string"
+          ? bodyEvent.operationId
+          : undefined;
+      if (
+        active === undefined ||
+        latest === undefined ||
+        bodyOperationId === undefined ||
+        bodyEvent.operation !== active.operation.kind ||
+        latest.runtimeOperationId !== active.operationId ||
+        latest.bodyOperationId !== bodyOperationId ||
+        latest.operation !== active.operation.kind ||
+        latest.phase === "result" ||
+        latest.phase === "guard_rejected"
+      ) {
+        this.#discardStaleOperationStallWake();
+        return;
+      }
       const operation =
         typeof bodyEvent.operation === "string"
           ? bodyEvent.operation
@@ -756,6 +814,16 @@ export class PlayerRuntime {
         "operation_stalled",
         `${operation} が ${elapsed}ms 以上続き、進捗を再評価`,
         at,
+        "operation_stalled",
+        3_000,
+        {
+          invalidateDecision: false,
+          operationStall: {
+            runtimeOperationId: active.operationId,
+            bodyOperationId,
+            progressVersion: latest.progressVersion,
+          },
+        },
       );
       return;
     }
@@ -840,6 +908,7 @@ export class PlayerRuntime {
       readonly deathCause?: PlayerBodyDeathCause;
       readonly damageAware?: boolean;
       readonly deathAware?: boolean;
+      readonly operationStall?: Omit<OperationStallWake, "eventId">;
     } = {},
   ): boolean {
     const now = Date.parse(at);
@@ -871,12 +940,22 @@ export class PlayerRuntime {
             invalidateDecision,
           })
         : this.options.mind.enqueueEvent(kind, summary, { invalidateDecision });
+    const operationStallWake =
+      options.operationStall === undefined
+        ? undefined
+        : { ...options.operationStall, eventId: event.id };
+    if (operationStallWake !== undefined) {
+      if (this.#operationStallWake !== undefined)
+        this.options.mind.consumeEvents([this.#operationStallWake.eventId]);
+      this.#operationStallWake = operationStallWake;
+    }
     this.#requestThought(
       kind,
       event.summary,
       false,
       options.damageAware ?? false,
       options.deathAware ?? false,
+      operationStallWake,
     );
     return true;
   }
@@ -887,6 +966,7 @@ export class PlayerRuntime {
     acceptedPendingWake = false,
     damageAwareWake = false,
     deathAwareWake = false,
+    operationStallWake?: OperationStallWake,
   ): void {
     if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
     if (isUrgentPerceptionWake(kind) && this.#retryTimer !== undefined) {
@@ -912,6 +992,30 @@ export class PlayerRuntime {
       !isUrgentPerceptionWake(kind)
     )
       return;
+    const requestedStallWake =
+      operationStallWake ??
+      (kind === "operation_stalled" ? this.#operationStallWake : undefined);
+    const pendingEvents = this.options.mind.pendingEvents(64);
+    const staleStallEventIds = pendingEvents
+      .filter(
+        ({ id, kind: eventKind }) =>
+          eventKind === "operation_stalled" &&
+          (this.#operationStallWake?.eventId !== id ||
+            !this.#isOperationStallWakeCurrent(this.#operationStallWake)),
+      )
+      .map(({ id }) => id);
+    if (staleStallEventIds.length > 0)
+      this.options.mind.consumeEvents(staleStallEventIds);
+    const launchStallWake =
+      requestedStallWake !== undefined &&
+      requestedStallWake.eventId === this.#operationStallWake?.eventId &&
+      this.#isOperationStallWakeCurrent(requestedStallWake)
+        ? requestedStallWake
+        : undefined;
+    if (kind === "operation_stalled" && launchStallWake === undefined) {
+      this.#discardStaleOperationStallWake();
+      return;
+    }
     const activeThought = this.#activeThought;
     if (activeThought !== undefined) {
       this.#queueThoughtWake(kind, reason, damageAwareWake, deathAwareWake);
@@ -925,6 +1029,7 @@ export class PlayerRuntime {
       } else if (
         !this.#activeThoughtCommitted &&
         kind !== "body_outcome" &&
+        kind !== "operation_stalled" &&
         !isUrgentPerceptionWake(kind) &&
         (kind !== "state_changed" || reason.includes("vitals"))
       ) {
@@ -945,11 +1050,14 @@ export class PlayerRuntime {
       kind === "bot_death_cause_updated" ||
       deathAwareWake;
     this.#activeThoughtDeathInvalidated = false;
+    this.#activeThoughtStallWake =
+      kind === "operation_stalled" ? launchStallWake : undefined;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     const events = this.options.mind.pendingEvents(32);
     let retry = false;
     let immediateRevisionRetry = false;
+    let staleStallStoppedResponse = false;
     void this.#traceCall("autonomous purpose thought", async () => {
       try {
         const result = await this.options.purpose.think({
@@ -968,11 +1076,19 @@ export class PlayerRuntime {
           urgentPerceptionWake:
             isUrgentPerceptionWake(kind) || damageAwareWake || deathAwareWake,
           signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
-          shouldStopAfterResponse: () =>
-            this.#pendingThoughtWake?.kind === "body_outcome" ||
-            this.#pendingThoughtWake?.kind === "owner_proposal" ||
-            this.#activeThoughtDamageInvalidated ||
-            this.#activeThoughtDeathInvalidated,
+          shouldStopAfterResponse: () => {
+            const staleStall =
+              this.#activeThoughtStallWake !== undefined &&
+              !this.#isOperationStallWakeCurrent(this.#activeThoughtStallWake);
+            if (staleStall) staleStallStoppedResponse = true;
+            return (
+              this.#pendingThoughtWake?.kind === "body_outcome" ||
+              this.#pendingThoughtWake?.kind === "owner_proposal" ||
+              this.#activeThoughtDamageInvalidated ||
+              this.#activeThoughtDeathInvalidated ||
+              staleStall
+            );
+          },
           onResponsesRequestState: (active) => {
             if (this.#activeThought === controller) {
               this.#activeResponsesRequest = active;
@@ -983,9 +1099,20 @@ export class PlayerRuntime {
           },
         });
         if (
+          launchStallWake !== undefined &&
+          !this.#isOperationStallWakeCurrent(launchStallWake)
+        )
+          staleStallStoppedResponse = true;
+        if (staleStallStoppedResponse) {
+          if (launchStallWake !== undefined)
+            this.options.mind.consumeEvents([launchStallWake.eventId]);
+          this.#operationStallWake = undefined;
+        }
+        if (
           !result.accepted &&
           !controller.signal.aborted &&
-          !this.options.mind.snapshot().stopped
+          !this.options.mind.snapshot().stopped &&
+          !staleStallStoppedResponse
         ) {
           retry = true;
           if (
@@ -1063,6 +1190,7 @@ export class PlayerRuntime {
     this.#activeThoughtDamageInvalidated = false;
     this.#activeThoughtDeathAware = false;
     this.#activeThoughtDeathInvalidated = false;
+    this.#activeThoughtStallWake = undefined;
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     const reflexWake = this.#persistPendingDamageReflexOutcome();
@@ -1208,9 +1336,18 @@ export class PlayerRuntime {
       phase: "execute_requested",
       at: new Date().toISOString(),
       admissionObserved: false,
+      progressVersion: 0,
       controlEnabledCount: enabledControlCount(run.operation),
     });
     this.#activeBody = run;
+    this.#operationPositionSample =
+      isTravelOperation(run.operation) &&
+      this.#lastObservedPosition !== undefined
+        ? {
+            runtimeOperationId: run.operationId,
+            position: this.#lastObservedPosition,
+          }
+        : undefined;
     run.promise = this.#executeBody(
       run,
       decision.operation,
@@ -1253,6 +1390,7 @@ export class PlayerRuntime {
       phase: "guard_rejected",
       at: new Date().toISOString(),
       admissionObserved: false,
+      progressVersion: 0,
       reason,
       firstPathStatus: null,
       controlEnabledCount: enabledControlCount(decision.operation),
@@ -1261,6 +1399,7 @@ export class PlayerRuntime {
 
   #recordBodyOperationPhase(phase: LatestBodyOperationPhase): void {
     this.#latestBodyOperationPhase = phase;
+    this.#discardStaleOperationStallWake();
     this.options.logger.info(
       {
         category: "player_runtime",
@@ -1288,6 +1427,7 @@ export class PlayerRuntime {
           LatestBodyOperationPhase,
           | "bodyOperationId"
           | "admissionObserved"
+          | "progressVersion"
           | "status"
           | "reason"
           | "firstPathStatus"
@@ -1301,6 +1441,75 @@ export class PlayerRuntime {
     )
       return;
     this.#recordBodyOperationPhase({ ...latest, ...update });
+  }
+
+  #isOperationStallWakeCurrent(wake: OperationStallWake | undefined): boolean {
+    if (wake === undefined) return false;
+    const active = this.#activeBody;
+    const latest = this.#latestBodyOperationPhase;
+    return (
+      !this.options.mind.snapshot().stopped &&
+      active !== undefined &&
+      !active.controller.signal.aborted &&
+      active.operationId === wake.runtimeOperationId &&
+      latest?.runtimeOperationId === wake.runtimeOperationId &&
+      latest.actionRevision === active.actionRevision &&
+      latest.bodyOperationId === wake.bodyOperationId &&
+      latest.progressVersion === wake.progressVersion &&
+      latest.phase !== "result" &&
+      latest.phase !== "guard_rejected"
+    );
+  }
+
+  #discardStaleOperationStallWake(): void {
+    const wake = this.#operationStallWake;
+    if (wake === undefined || this.#isOperationStallWakeCurrent(wake)) return;
+    this.options.mind.consumeEvents([wake.eventId]);
+    if (this.#operationStallWake?.eventId === wake.eventId)
+      this.#operationStallWake = undefined;
+    const pending = this.#pendingThoughtWake;
+    if (pending?.kind === "operation_stalled")
+      this.#pendingThoughtWake = undefined;
+  }
+
+  #recordObservedTravelProgress(observation: PlayerBodyObservation): void {
+    const currentPosition = observation.self.position;
+    const previousPosition = this.#lastObservedPosition;
+    this.#lastObservedPosition = currentPosition;
+    const active = this.#activeBody;
+    if (active === undefined || !isTravelOperation(active.operation)) {
+      this.#operationPositionSample = undefined;
+      return;
+    }
+
+    const sample =
+      this.#operationPositionSample?.runtimeOperationId === active.operationId
+        ? this.#operationPositionSample
+        : {
+            runtimeOperationId: active.operationId,
+            position: previousPosition ?? currentPosition,
+          };
+    if (!travelProgressed(sample.position, currentPosition)) {
+      this.#operationPositionSample = sample;
+      return;
+    }
+
+    this.#operationPositionSample = {
+      runtimeOperationId: active.operationId,
+      position: currentPosition,
+    };
+    const latest = this.#latestBodyOperationPhase;
+    if (latest?.runtimeOperationId !== active.operationId) return;
+    this.#latestBodyOperationPhase = {
+      ...latest,
+      progressVersion: latest.progressVersion + 1,
+    };
+    this.#discardStaleOperationStallWake();
+    if (
+      this.#activeThoughtStallWake?.runtimeOperationId === active.operationId &&
+      !this.#activeThoughtCommitted
+    )
+      this.#activeThought?.abort(new Error("operation_stall_progressed"));
   }
 
   async #executeBody(
@@ -1585,6 +1794,7 @@ export class PlayerRuntime {
     this.#activeResponsesRequest = false;
     this.#activeResponsesRequestStartedAtMs = undefined;
     this.#pendingThoughtWake = undefined;
+    this.#activeThoughtStallWake = undefined;
     this.#activeThoughtCommitted = false;
     this.#activeThoughtDamageAware = false;
     this.#activeThoughtDamageInvalidated = false;
@@ -1635,6 +1845,7 @@ export class PlayerRuntime {
       try {
         const observation = await this.options.body.observe();
         if (this.options.mind.snapshot().stopped || this.#shuttingDown) return;
+        this.#recordObservedTravelProgress(observation);
         this.options.mind.recordObservation(toObservationEvidence(observation));
         const next = semanticSignatures(observation);
         const changed: string[] = [];

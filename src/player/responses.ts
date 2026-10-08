@@ -168,9 +168,23 @@ export interface RunPlayerAgentInput {
   readonly signal?: AbortSignal;
   /** Stop processing a completed response when its Purpose thought is stale. */
   readonly shouldStopAfterResponse?: () => boolean;
+  /** Deliver model-authored text with its tool calls before executing them. */
+  readonly onResponseText?: (
+    text: string,
+    calls: readonly { readonly name: string; readonly arguments: string }[],
+    round: number,
+  ) => void | Promise<void>;
+  /** Deliver model-authored owner text carried by a tool-only response. */
+  readonly onToolOnlyResponse?: (
+    calls: readonly { readonly name: string; readonly arguments: string }[],
+    round: number,
+  ) => void | Promise<void>;
+  /** Defer a positive shouldFinishAfterTool result until this response's calls are processed. */
+  readonly finishAfterToolBatch?: boolean;
   /** Tracks only the provider HTTP wait, excluding tool and observation work. */
   readonly onResponsesRequestState?: (active: boolean) => void;
-  readonly maxRounds?: number;
+  /** Omitted keeps the legacy six-round limit; null lets the flow end naturally. */
+  readonly maxRounds?: number | null;
   /** Restrict a formatting-only request from invoking tools. */
   readonly toolChoice?: "auto" | "none";
   /** Reserve the final bounded round for a response without tool calls. */
@@ -272,7 +286,8 @@ export async function runPlayerAgent(
   const messages: ResponseInputItem[] = [
     { role: "user", content: input.input },
   ];
-  const maxRounds = input.maxRounds ?? 6;
+  const maxRounds =
+    input.maxRounds === null ? undefined : (input.maxRounds ?? 6);
   let calls = 0;
   let toolCalls = 0;
   let inputTokens = 0;
@@ -287,7 +302,11 @@ export async function runPlayerAgent(
     toolCalls,
   });
 
-  for (let round = 0; round < maxRounds; round += 1) {
+  for (
+    let round = 0;
+    maxRounds === undefined || round < maxRounds;
+    round += 1
+  ) {
     if (input.shouldStopAfterResponse?.() === true) return accumulatedResult();
     input.signal?.throwIfAborted();
     input.beforeCall?.();
@@ -305,7 +324,9 @@ export async function runPlayerAgent(
             input: messages,
             tools,
             tool_choice:
-              input.finalRoundToolChoice === "none" && round === maxRounds - 1
+              input.finalRoundToolChoice === "none" &&
+              maxRounds !== undefined &&
+              round === maxRounds - 1
                 ? "none"
                 : (input.toolChoice ?? "auto"),
             parallel_tool_calls: false,
@@ -488,10 +509,42 @@ export async function runPlayerAgent(
     }
     const staleResponseResult = finishIfStale();
     if (staleResponseResult !== undefined) return staleResponseResult;
+    const responseText = response.output_text.trim();
+    if (responseText.length > 0) {
+      await input.onResponseText?.(
+        responseText,
+        functionCalls.map((call) => ({
+          name: call.name,
+          arguments: call.arguments,
+        })),
+        round,
+      );
+      if (input.signal?.aborted) {
+        emitCompletedResponseActivity("interrupted");
+        input.signal.throwIfAborted();
+      }
+      const staleAfterText = finishIfStale();
+      if (staleAfterText !== undefined) return staleAfterText;
+    } else if (functionCalls.length > 0) {
+      await input.onToolOnlyResponse?.(
+        functionCalls.map((call) => ({
+          name: call.name,
+          arguments: call.arguments,
+        })),
+        round,
+      );
+      if (input.signal?.aborted) {
+        emitCompletedResponseActivity("interrupted");
+        input.signal.throwIfAborted();
+      }
+      const staleAfterToolOnlyReply = finishIfStale();
+      if (staleAfterToolOnlyReply !== undefined) return staleAfterToolOnlyReply;
+    }
     if (functionCalls.length === 0) {
       emitCompletedResponseActivity("complete");
       return responseResult();
     }
+    let finishAfterToolBatch = false;
     for (const call of functionCalls) {
       if (input.shouldStopAfterResponse?.() === true) {
         emitCompletedResponseActivity("interrupted");
@@ -557,15 +610,20 @@ export async function runPlayerAgent(
       }
       if (
         tool !== undefined &&
-        input.shouldFinishAfterTool?.(call.name, result) === true
+        input.shouldFinishAfterTool?.(call.name, result)
       ) {
-        emitCompletedResponseActivity("complete");
-        return responseResult();
+        if (input.finishAfterToolBatch === true) {
+          finishAfterToolBatch = true;
+        } else {
+          emitCompletedResponseActivity("complete");
+          return responseResult();
+        }
       }
       const staleToolResult = finishIfStale();
       if (staleToolResult !== undefined) return staleToolResult;
     }
     emitCompletedResponseActivity("complete");
+    if (finishAfterToolBatch) return responseResult();
     // Activity callbacks run synchronously and can enqueue a Body outcome.
     // Recheck at the round boundary before the next request starts.
     if (input.shouldStopAfterResponse?.() === true) return responseResult();

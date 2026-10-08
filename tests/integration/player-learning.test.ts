@@ -594,12 +594,9 @@ describe("player skill learning", () => {
           title: "Review a stored Minecraft skill",
           reason: "I want to inspect and improve one reusable skill.",
           priority: 3,
+          ownerReply:
+            "I will review the current guidance and improve it for future use.",
         }),
-        textResponse("markdown-conversation-final", "I will review that goal."),
-        textResponse(
-          "markdown-conversation-refreshed",
-          "The updated skill is saved for future use.",
-        ),
       ]),
       apiKey: "test-only",
       model: "gpt-6-luna",
@@ -720,7 +717,7 @@ describe("player skill learning", () => {
       );
 
       expect(sayMessages).toEqual([
-        "The updated skill is saved for future use.",
+        "I will review the current guidance and improve it for future use.",
       ]);
       expect(mind.snapshot().proposals[0]?.status).toBe("adopted");
       const searchResults = skills.search({ query: editedTitle, limit: 4 });
