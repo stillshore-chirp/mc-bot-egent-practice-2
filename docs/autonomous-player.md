@@ -134,6 +134,10 @@ sequenceDiagram
 
 `actionPlan` はsnapshotに任意で保存される順序付きの短い操作計画です。対応するowner goalがある場合はその `goalId` を持ち、owner goalに結び付かない自律目的では省略できます。同じ目的を続けて再計画するときはplan id・purpose・goalIdを維持し、実行中の操作と後続stepを同じ計画へ追加します。現在の観測から前提が確かなstepだけを並べ、各Body操作の結果を確かめたい内容も記録します。
 
+planはcommit時点のactive/paused goal状態の非公開signatureを保持し、goalの追加・削除・変更後はqueued stepを自動実行せずLLMで再判断します。signatureのない旧planも再判断へ戻します。
+
+urgent初動は限定されたgoal contextから作られるためplanへsignatureを付けず、次の通常判断で全goalを再評価してからqueued stepを続けます。
+
 `look`、`look_sweep`、`open_window` は情報checkpointです。その後の判断に必要な情報をBody結果とfresh観測から得るまで、後続stepを先に計画しません。たとえば箱を開いて中身を調べた後、役立つ品が見つかれば取得・装備を同じ目的の計画へ続けます。中身を確認した時点で取得と装備の前提が確かなら、その複数stepをまとめて計画でき、既知の次stepは成功結果とfresh観測を確認してからLLMを再度呼ばずに実行できます。失敗、新しい情報checkpoint、危険やowner条件を含む状況変化で前提が崩れたときは未実行stepを無効化し、同じ高位の目的を保って再判断します。
 
 `complete` とowner goalの `completed` 更新は別です。owner intentを完了/放棄するには明示的なgoal更新が必要です。自発的な中間goalを終えてもowner intentを消しません。active/pausedなowner-linked goalとproposalは入力の件数制限でも保持し、paused goalを自動再開しません。

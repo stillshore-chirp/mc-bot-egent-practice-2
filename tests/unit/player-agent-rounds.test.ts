@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
 import pino, { type Logger } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -1675,6 +1676,166 @@ describe("player agent response rounds", () => {
         minimum: 0,
         maximum: 0,
       });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("reassesses queued urgent steps before resuming a plan against all goals", async () => {
+    const urgentMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 1, y: 64, z: 0 },
+      range: 1,
+    };
+    const urgentQueuedMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 2, y: 64, z: 0 },
+      range: 1,
+    };
+    const normalMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 3, y: 64, z: 0 },
+      range: 1,
+    };
+    const normalQueuedMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 4, y: 64, z: 0 },
+      range: 1,
+    };
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "urgent-limited-goal-plan",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: urgentMove,
+          expectedOutcome: "Take one immediate step after damage.",
+          planPurpose: "Respond to the damage and reassess.",
+          planId: "urgent-limited-plan",
+          continuationSteps: [
+            {
+              operation: urgentQueuedMove,
+              expectedOutcome:
+                "Continue the urgent route if still appropriate.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      let omittedOwnerGoalId: string | undefined;
+      for (let index = 0; index < 7; index += 1) {
+        const proposal = fixture.mind.addProposal({
+          title: `Earlier owner goal ${index}`,
+          reason: `Maintain the requested route ${index}.`,
+          priority: 3,
+        });
+        const result = fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          proposalResolution: {
+            proposalId: proposal.id,
+            disposition: "adopted",
+            resolution: "Keep this owner goal active.",
+          },
+        });
+        expect(result.accepted).toBe(true);
+        if (index === 0) {
+          omittedOwnerGoalId = result.snapshot.goals.find(
+            ({ ownerProposalId }) => ownerProposalId === proposal.id,
+          )?.id;
+        }
+      }
+      if (omittedOwnerGoalId === undefined)
+        throw new Error("TEST_OLD_OWNER_GOAL_MISSING");
+      fixture.mind.consumeEvents(
+        fixture.mind.pendingEvents(64).map(({ id }) => id),
+      );
+
+      const urgent = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-goal-projection-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+      expect(urgent.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: urgentMove.position },
+      });
+      const urgentPayload = requestUserPayload(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[0]),
+      );
+      const urgentRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(urgentPayload.runtime);
+      const urgentGoals = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(urgentRuntime.goals);
+      expect(urgentGoals.some(({ id }) => id === omittedOwnerGoalId)).toBe(
+        false,
+      );
+      expect(fixture.mind.snapshot().actionPlan?.goalStateSignature).toBe(
+        undefined,
+      );
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      scripted.push(
+        functionCallResponse(
+          "normal-goal-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: normalMove,
+            expectedOutcome: "Take the route step selected with all goals.",
+            planPurpose: "Continue after reviewing the complete goal state.",
+            planId: "fresh-normal-plan",
+            continuationSteps: [
+              {
+                operation: normalQueuedMove,
+                expectedOutcome: "Continue the reviewed route.",
+              },
+            ],
+          }),
+        ),
+      );
+      const reassessed = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(reassessed.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: normalMove.position },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.goalStateSignature).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      const normalPayload = requestUserPayload(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[1]),
+      );
+      const normalRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(normalPayload.runtime);
+      expect(
+        z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(normalRuntime.goals)
+          .some(({ id }) => id === omittedOwnerGoalId),
+      ).toBe(true);
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(continued.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: normalQueuedMove.position },
+      });
+      expect(fixture.requests).toHaveLength(2);
     } finally {
       fixture.close();
     }
@@ -5518,6 +5679,18 @@ describe("player agent response rounds", () => {
           },
         }).accepted,
       ).toBe(true);
+      const secondOwnerGoal = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: {
+          id: "owner-shelter-goal",
+          title: "Keep the shelter usable.",
+          status: "active",
+          priority: 2,
+          changeReason: "Preserve a safe place to return to.",
+          source: "owner",
+        },
+      });
+      expect(secondOwnerGoal.accepted).toBe(true);
       const first = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
@@ -5540,6 +5713,10 @@ describe("player agent response rounds", () => {
         ],
       });
       expect(typeof initialPlan?.steps[0]?.operationId).toBe("string");
+      expect(typeof initialPlan?.goalStateSignature).toBe("string");
+      expect(JSON.stringify(fixture.requests[0])).not.toContain(
+        "goalStateSignature",
+      );
       const reopenedMind = PlayerMindStore.open(fixture.databasePath);
       expect(reopenedMind.snapshot().actionPlan).toEqual(initialPlan);
       reopenedMind.close();
@@ -6089,6 +6266,208 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each([
+    "new owner goal",
+    "owner goal condition",
+    "self goal condition",
+  ] as const)("replans after an eventless %s change", async (changeKind) => {
+    const goalId = "signature-owner-goal";
+    const purpose = "Reach the storage safely.";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "signature-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the storage safely.",
+          planPurpose: purpose,
+          goalId,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the storage for inspection.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      const plannedGoal = {
+        id: goalId,
+        title:
+          changeKind === "self goal condition"
+            ? "Inspect the storage route."
+            : purpose,
+        status: "active" as const,
+        priority: 3,
+        changeReason:
+          changeKind === "self goal condition"
+            ? "The companion is checking the storage route."
+            : "The owner wants to inspect the storage.",
+        source:
+          changeKind === "self goal condition"
+            ? ("persona" as const)
+            : ("owner" as const),
+      };
+      const created = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: plannedGoal,
+      });
+      expect(created.accepted).toBe(true);
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(first.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to" },
+      });
+      expect(fixture.requests).toHaveLength(1);
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      const eventsBefore = fixture.mind
+        .pendingEvents(32)
+        .map(({ id, kind }) => ({ id, kind }));
+      const stateChange =
+        changeKind === "new owner goal"
+          ? {
+              id: "new-owner-priority-goal",
+              title: "Return to the shelter before night.",
+              status: "active" as const,
+              priority: 5,
+              changeReason: "The owner added a time-sensitive need.",
+              source: "owner" as const,
+            }
+          : {
+              id: goalId,
+              title: plannedGoal.title,
+              status: "active" as const,
+              priority: 4,
+              changeReason:
+                changeKind === "self goal condition"
+                  ? "The companion now avoids the exposed route."
+                  : "The owner now requires extra caution.",
+              source: plannedGoal.source,
+            };
+      const updated = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: stateChange,
+      });
+      expect(updated.accepted).toBe(true);
+      expect(
+        fixture.mind.pendingEvents(32).map(({ id, kind }) => ({ id, kind })),
+      ).toEqual(eventsBefore);
+
+      scripted.push(
+        functionCallResponse(
+          "signature-plan-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Inspect the updated owner-goal context.",
+            planPurpose: "Reassess the storage route with current goals.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("replans legacy stored plans without a goal-state signature", async () => {
+    const goalId = "legacy-plan-goal";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "legacy-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the storage.",
+          planPurpose: "Inspect the storage.",
+          goalId,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the storage.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      expect(
+        fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          goal: {
+            id: goalId,
+            title: "Inspect the storage.",
+            status: "active",
+            priority: 3,
+            changeReason: "The owner wants to inspect the storage.",
+            source: "owner",
+          },
+        }).accepted,
+      ).toBe(true);
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      recordPlannedOperationOutcome(fixture, "successful");
+      removeStoredGoalStateSignature(fixture.databasePath);
+      expect(
+        fixture.mind.snapshot().actionPlan?.goalStateSignature,
+      ).toBeUndefined();
+
+      scripted.push(
+        functionCallResponse(
+          "legacy-plan-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Reassess the old queued step.",
+            planPurpose: "Reassess the storage from current observation.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("keeps owner stop latched while a plan has queued work", async () => {
     const scripted: ScriptedResponse[] = [
       functionCallResponse(
@@ -6404,6 +6783,31 @@ function recordPlannedOperationOutcome(
         : { expectedOutcome: active.expectedOutcome }),
     },
   });
+}
+
+function removeStoredGoalStateSignature(databasePath: string): void {
+  const database = new Database(databasePath);
+  try {
+    const row = database
+      .prepare(
+        "SELECT payload_json FROM player_runtime_state WHERE singleton_id = 1",
+      )
+      .get() as { readonly payload_json: string } | undefined;
+    if (row === undefined) throw new Error("TEST_RUNTIME_STATE_MISSING");
+    const payload = JSON.parse(row.payload_json) as {
+      actionPlan?: Record<string, unknown> | null;
+    };
+    if (payload.actionPlan === undefined || payload.actionPlan === null)
+      throw new Error("TEST_ACTION_PLAN_MISSING");
+    delete payload.actionPlan.goalStateSignature;
+    database
+      .prepare(
+        "UPDATE player_runtime_state SET payload_json = ? WHERE singleton_id = 1",
+      )
+      .run(JSON.stringify(payload));
+  } finally {
+    database.close();
+  }
 }
 
 function recordDeathScenario(
