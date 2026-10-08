@@ -1904,6 +1904,9 @@ describe("player agent response rounds", () => {
         learningRevisionArguments(runId, skillId, 1),
       ),
       terminalResponse("No revision can be proposed for this used version."),
+      terminalResponse(
+        "The evidence supports no skill update; I will continue the current purpose.",
+      ),
     ]);
 
     try {
@@ -1926,7 +1929,22 @@ describe("player agent response rounds", () => {
       });
 
       expect(result.accepted).toBe(false);
-      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.requests).toHaveLength(3);
+      const reviewFollowup = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[1]);
+      expect(JSON.stringify(reviewFollowup.input)).toContain(
+        "SKILL_VERSION_OPERATION_MISMATCH",
+      );
+      const purposeRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[2]);
+      expect(
+        z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(purposeRequest.tools)
+          .map(({ name }) => name),
+      ).toContain("commit_action_decision");
       expect(fixture.mind.snapshot().counters.learningUpdates).toBe(0);
       expect(fixture.mind.snapshot().learningReferences).toHaveLength(0);
       expect(fixture.skills.get(skillId)).toMatchObject({
