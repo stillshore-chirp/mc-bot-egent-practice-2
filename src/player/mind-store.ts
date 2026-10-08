@@ -8,7 +8,10 @@ import {
   playerBodyLookSweepSchema,
   type PlayerBodyLookSweep,
 } from "../minecraft/player-body-observation.js";
-import { playerOperationNames } from "../minecraft/player-body-schema.js";
+import {
+  playerOperationNames,
+  playerOperationSchema,
+} from "../minecraft/player-body-schema.js";
 import {
   playerActionDecisionValidationCodes,
   playerAgentRequestErrorCauses,
@@ -21,6 +24,8 @@ import type {
   OwnerProposal,
   PlayerGoal,
   PlayerGoalChange,
+  PlayerActionPlan,
+  PlayerActionPlanStep,
   PlayerDeathRecoveryStage,
   PlayerProposalResolution,
   PlayerObservationEvidence,
@@ -33,6 +38,7 @@ import type {
 } from "./contracts.js";
 import {
   playerBodyOutcomeEventId,
+  playerActionPlanStepLimit,
   playerThoughtCommitRejectionCodes,
   playerThoughtStaleChangeComponents,
   type PlayerThoughtCommitRejectionCode,
@@ -142,6 +148,35 @@ const outcomeHistorySchema = z
     expectedOutcome: z.string().min(1).max(400).optional(),
     skillId: z.string().min(1).max(80).optional(),
     skillVersion: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const actionPlanStepSchema = z
+  .object({
+    sequence: z.number().int().nonnegative(),
+    operation: playerOperationSchema,
+    expectedOutcome: z.string().min(1).max(400),
+    status: z.enum([
+      "pending",
+      "superseded",
+      "successful",
+      "failed",
+      "interrupted",
+      "cancelled",
+      "unverified",
+    ]),
+    operationId: z.string().min(1).max(80).optional(),
+    resultSummary: z.string().min(1).max(400).optional(),
+    observedAt: z.iso.datetime().optional(),
+  })
+  .strict();
+
+const actionPlanSchema = z
+  .object({
+    id: z.string().min(1).max(80),
+    purpose: z.string().min(1).max(400),
+    goalId: z.string().min(1).max(80).optional(),
+    steps: z.array(actionPlanStepSchema).max(playerActionPlanStepLimit),
   })
   .strict();
 
@@ -331,6 +366,7 @@ const stateSchema = z
     stopped: z.boolean(),
     stopGeneration: z.number().int().nonnegative(),
     purpose: z.string().max(400),
+    actionPlan: actionPlanSchema.optional(),
     goals: z.array(goalSchema).max(60),
     stateFacts: z.array(stateNoteSchema).max(40),
     uncertainties: z.array(stateNoteSchema).max(40),
@@ -408,7 +444,9 @@ const stateSchema = z
   })
   .strict();
 
-type StoredState = z.infer<typeof stateSchema>;
+type StoredState = Omit<z.infer<typeof stateSchema>, "actionPlan"> & {
+  readonly actionPlan?: PlayerActionPlan | undefined;
+};
 
 type CommitThoughtResult =
   | { readonly accepted: true; readonly snapshot: PlayerRuntimeSnapshot }
@@ -458,6 +496,101 @@ function appendPlayerUnderstanding(
   };
 }
 
+function settleActionPlanOutcome(
+  plan: PlayerActionPlan | undefined,
+  outcome: {
+    readonly operationId: string;
+    readonly kind: (typeof playerOperationNames)[number];
+    readonly status: McSkillOutcomeStatus;
+    readonly summary: string;
+    readonly observedAt: string;
+  },
+): PlayerActionPlan | undefined {
+  if (plan === undefined) return undefined;
+  const index = plan.steps.findIndex(
+    ({ operationId }) => operationId === outcome.operationId,
+  );
+  const plannedStep = plan.steps[index];
+  if (
+    index < 0 ||
+    plannedStep?.operation.kind !== outcome.kind ||
+    (plannedStep.status !== "pending" && plannedStep.status !== "superseded")
+  )
+    return plan;
+  const informationCheckpoint =
+    outcome.status === "successful" &&
+    (outcome.kind === "look" ||
+      outcome.kind === "look_sweep" ||
+      outcome.kind === "open_window");
+  const continuationInvalidated =
+    outcome.status !== "successful" || informationCheckpoint;
+  const steps: PlayerActionPlanStep[] = plan.steps.map(
+    (step, stepIndex): PlayerActionPlanStep =>
+      stepIndex === index
+        ? {
+            ...step,
+            status: outcome.status,
+            resultSummary: bounded(
+              outcome.summary.slice(0, 400),
+              400,
+              "plan result summary",
+            ),
+            observedAt: isoDate(outcome.observedAt),
+          }
+        : continuationInvalidated &&
+            stepIndex > index &&
+            step.status === "pending" &&
+            step.operationId === undefined
+          ? {
+              ...step,
+              status: "superseded",
+              resultSummary:
+                outcome.status === "successful"
+                  ? "情報取得後の実観測に基づく再計画が必要"
+                  : `先行操作が${outcome.status}のため再計画が必要`,
+              observedAt: isoDate(outcome.observedAt),
+            }
+          : step,
+  );
+  return { ...plan, steps };
+}
+
+function settleDeferredActionPlanOperation(
+  plan: PlayerActionPlan | undefined,
+  operationId: string,
+  kind: (typeof playerOperationNames)[number],
+  observedAt: string,
+): PlayerActionPlan | undefined {
+  return settleActionPlanOutcome(plan, {
+    operationId,
+    kind,
+    status: "unverified",
+    summary: "切断前のBody操作結果を確認できず、再接続後に再計画が必要",
+    observedAt,
+  });
+}
+
+function supersedeActionPlan(
+  plan: PlayerActionPlan | undefined,
+  summary: string,
+  observedAt: string,
+): PlayerActionPlan | undefined {
+  if (plan === undefined) return undefined;
+  return {
+    ...plan,
+    steps: plan.steps.map((step) =>
+      step.status !== "pending"
+        ? step
+        : {
+            ...step,
+            status: "superseded",
+            resultSummary: bounded(summary, 400, "plan result summary"),
+            observedAt: isoDate(observedAt),
+          },
+    ),
+  };
+}
+
 const initialState: StoredState = {
   revision: 0,
   actionRevision: 0,
@@ -466,6 +599,7 @@ const initialState: StoredState = {
   stopped: false,
   stopGeneration: 0,
   purpose: "",
+  actionPlan: undefined,
   goals: [],
   stateFacts: [],
   uncertainties: [],
@@ -883,6 +1017,11 @@ export class PlayerMindStore {
         stopped: true,
         stopGeneration: current.stopGeneration + 1,
         activeOperation: undefined,
+        actionPlan: supersedeActionPlan(
+          current.actionPlan,
+          "所有者の停止要求により、未完了の行動手順を再計画対象に変更",
+          now,
+        ),
         wait: undefined,
       };
       this.writeStored(next, now);
@@ -929,6 +1068,7 @@ export class PlayerMindStore {
   public commitThought(input: {
     expectedRevision: number;
     decision: PlayerThoughtDecision;
+    actionPlan?: PlayerActionPlan | undefined;
     goal?: PlayerGoalChange;
     proposalResolution?: PlayerProposalResolution;
     understanding?: PlayerUnderstandingUpdate;
@@ -1009,6 +1149,7 @@ export class PlayerMindStore {
         now,
       );
       let purpose = current.purpose;
+      let actionPlan = input.actionPlan ?? current.actionPlan;
       let activeOperation = current.activeOperation;
       let wait = current.wait;
       let actionChanged = false;
@@ -1061,6 +1202,7 @@ export class PlayerMindStore {
           break;
         case "complete":
           purpose = bounded(input.decision.purpose, 400, "purpose");
+          actionPlan = undefined;
           activeOperation = undefined;
           wait = {
             reason: bounded(input.decision.reason, 400, "completion reason"),
@@ -1134,6 +1276,7 @@ export class PlayerMindStore {
           : {}),
         purposeCompletionWakeSequence,
         purpose,
+        actionPlan,
         goals,
         proposals,
         ...(latestDeath === undefined ? {} : { latestDeath }),
@@ -1368,6 +1511,7 @@ export class PlayerMindStore {
               }
             : {}),
           lastOutcome: evidence,
+          actionPlan: settleActionPlanOutcome(current.actionPlan, evidence),
           recentOutcomes: [...current.recentOutcomes, outcomeHistory].slice(
             -24,
           ),
@@ -1407,6 +1551,12 @@ export class PlayerMindStore {
           revision: current.revision + 1,
           actionRevision: current.actionRevision + 1,
           activeOperation: undefined,
+          actionPlan: settleDeferredActionPlanOperation(
+            current.actionPlan,
+            operationId,
+            current.activeOperation.kind,
+            now,
+          ),
           wait: {
             reason:
               "Minecraft body operation requires a new connection before actions can resume",
@@ -1469,28 +1619,31 @@ export class PlayerMindStore {
         trustedResult?.summary ??
         "プロセス再起動後に実行継続を確認できず、結果は未検証";
       const observedAt = trustedResult?.observedAt ?? now;
+      const recoveredOutcome = {
+        operationId: active.operationId,
+        kind: active.kind,
+        status,
+        summary,
+        observedAt,
+        ...(active.expectedOutcome === undefined
+          ? {}
+          : { expectedOutcome: active.expectedOutcome }),
+        ...(active.skillId === undefined ? {} : { skillId: active.skillId }),
+        ...(active.skillVersion === undefined
+          ? {}
+          : { skillVersion: active.skillVersion }),
+      };
       this.writeStored(
         {
           ...current,
           revision: current.revision + 1,
           purposeProgressRevision: current.purposeProgressRevision + 1,
           activeOperation: undefined,
-          lastOutcome: {
-            operationId: active.operationId,
-            kind: active.kind,
-            status,
-            summary,
-            observedAt,
-            ...(active.expectedOutcome === undefined
-              ? {}
-              : { expectedOutcome: active.expectedOutcome }),
-            ...(active.skillId === undefined
-              ? {}
-              : { skillId: active.skillId }),
-            ...(active.skillVersion === undefined
-              ? {}
-              : { skillVersion: active.skillVersion }),
-          },
+          lastOutcome: recoveredOutcome,
+          actionPlan: settleActionPlanOutcome(
+            current.actionPlan,
+            recoveredOutcome,
+          ),
           recentOutcomes: [
             ...current.recentOutcomes,
             {

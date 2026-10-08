@@ -2514,6 +2514,19 @@ function functionCallResponse(
   argumentsValue: unknown,
   usage: NonNullable<Response["usage"]> = responseUsage(1, 1),
 ): Response {
+  const argumentsWithPlan =
+    name === "commit_action_decision" &&
+    typeof argumentsValue === "object" &&
+    argumentsValue !== null &&
+    !Array.isArray(argumentsValue)
+      ? {
+          actionPlanId: "",
+          actionPlanPurpose: "",
+          actionPlanGoalId: "",
+          continuationSteps: [],
+          ...(argumentsValue as Record<string, unknown>),
+        }
+      : argumentsValue;
   return {
     status: "completed",
     output: [
@@ -2521,7 +2534,7 @@ function functionCallResponse(
         type: "function_call",
         call_id: callId,
         name,
-        arguments: JSON.stringify(argumentsValue),
+        arguments: JSON.stringify(argumentsWithPlan),
       },
     ],
     output_text: "",

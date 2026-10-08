@@ -1,4 +1,8 @@
 import type {
+  McSkillOutcomeStatus,
+  McSkillRecord,
+} from "../mc-skills/index.js";
+import type {
   PlayerBodyEvent,
   PlayerBodyDeathCause,
   PlayerBodyLookSweep,
@@ -7,10 +11,6 @@ import type {
   PlayerOperation,
   PlayerOperationResult,
 } from "../minecraft/player-body.js";
-import type {
-  McSkillOutcomeStatus,
-  McSkillRecord,
-} from "../mc-skills/index.js";
 import type {
   PlayerAgentRequestErrorCause,
   PlayerAgentRoundActivity,
@@ -238,6 +238,27 @@ export interface PlayerGoalChange {
   readonly source: PlayerGoal["source"];
 }
 
+export interface PlayerActionPlanStep {
+  readonly sequence: number;
+  readonly operation: PlayerOperation;
+  readonly expectedOutcome: string;
+  /** pending means dispatched or queued; settled values match Body evidence. */
+  readonly status: "pending" | "superseded" | McSkillOutcomeStatus;
+  readonly operationId?: string | undefined;
+  readonly resultSummary?: string | undefined;
+  readonly observedAt?: string | undefined;
+}
+
+export const playerActionPlanStepLimit = 12;
+
+/** Durable high-level need with a bounded, flat history of authored Body steps. */
+export interface PlayerActionPlan {
+  readonly id: string;
+  readonly purpose: string;
+  readonly goalId?: string | undefined;
+  readonly steps: readonly PlayerActionPlanStep[];
+}
+
 export type PlayerThoughtDecision =
   | {
       readonly kind: "act";
@@ -283,6 +304,7 @@ export interface PlayerRuntimeSnapshot {
   readonly stopped: boolean;
   readonly stopGeneration: number;
   readonly purpose: string;
+  readonly actionPlan?: PlayerActionPlan | undefined;
   readonly goals: readonly PlayerGoal[];
   readonly stateFacts: readonly PlayerStateNote[];
   readonly uncertainties: readonly PlayerStateNote[];
