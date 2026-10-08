@@ -15,6 +15,7 @@ Minecraft server、bot接続後の挙動、AIコンパニオン、LLM、記憶�
 - 実環境log、runtime観測、Minecraft内の結果を確認した場合だけ「実環境で観測」と表現します。
 - ゲーム内actionの成功は、command受付やLLM応答でなく、位置、体力、inventory、危険、採掘・建築などの結果で判断します。
 - 調査対象に応じて、server version、接続状態、bot action、記憶storeの整合性、processの状態を証跡候補にします。
+- ローカルprocessの状態確認には `npx tsx scripts/inspect-process.ts <PID>` を使います。出力はPID・親PID・stateだけで、argsや環境変数は含みません。
 - 対象環境、観測時間・条件、実際に確認した状態を記し、code上の仮説と未確認事項を分けます。
 
 ## 製品の安全境界
