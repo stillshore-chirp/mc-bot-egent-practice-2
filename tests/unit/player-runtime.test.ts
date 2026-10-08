@@ -2182,10 +2182,7 @@ describe("integrated player runtime", () => {
       expect(maxActiveThoughts).toBe(1);
       expect(thoughtCount).toBe(2);
       expect(followupEvents.map(({ kind }) => kind)).toEqual(
-        expect.arrayContaining([
-          "state_changed",
-          "body_outcome",
-        ]),
+        expect.arrayContaining(["state_changed", "body_outcome"]),
       );
       expect(followupEvents.map(({ kind }) => kind)).not.toContain(
         "operation_stalled",
