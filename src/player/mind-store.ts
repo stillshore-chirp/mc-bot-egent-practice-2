@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -176,9 +176,44 @@ const actionPlanSchema = z
     id: z.string().min(1).max(80),
     purpose: z.string().min(1).max(400),
     goalId: z.string().min(1).max(80).optional(),
+    goalStateSignature: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     steps: z.array(actionPlanStepSchema).max(playerActionPlanStepLimit),
   })
   .strict();
+
+/** Hashes active and paused goals that can affect whether a reviewed plan stays current. */
+export function playerGoalStateSignature(goals: readonly PlayerGoal[]): string {
+  const relevantGoals = goals
+    .filter(({ status }) => status === "active" || status === "paused")
+    .map(
+      ({
+        id,
+        source,
+        status,
+        title,
+        priority,
+        changeReason,
+        ownerProposalId,
+      }) => ({
+        id,
+        source,
+        status,
+        title,
+        priority,
+        changeReason,
+        ownerProposalId: ownerProposalId ?? null,
+      }),
+    )
+    .sort((left, right) =>
+      left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+    );
+  return createHash("sha256")
+    .update(JSON.stringify(relevantGoals))
+    .digest("hex");
+}
 
 const skillActivitySchema = z
   .object({
@@ -1149,7 +1184,13 @@ export class PlayerMindStore {
         now,
       );
       let purpose = current.purpose;
-      let actionPlan = input.actionPlan ?? current.actionPlan;
+      let actionPlan =
+        input.actionPlan === undefined
+          ? current.actionPlan
+          : {
+              ...input.actionPlan,
+              goalStateSignature: playerGoalStateSignature(goals),
+            };
       let activeOperation = current.activeOperation;
       let wait = current.wait;
       let actionChanged = false;

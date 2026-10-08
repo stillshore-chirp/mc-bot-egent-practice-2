@@ -256,6 +256,8 @@ export interface PlayerActionPlan {
   readonly id: string;
   readonly purpose: string;
   readonly goalId?: string | undefined;
+  /** Internal proof of the active/paused goal state reviewed for this plan. */
+  readonly goalStateSignature?: string | undefined;
   readonly steps: readonly PlayerActionPlanStep[];
 }
 

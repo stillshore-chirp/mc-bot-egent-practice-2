@@ -5,10 +5,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type {
+  PlayerActionPlan,
+  PlayerGoal,
   PlayerGoalChange,
   PlayerThoughtDecision,
 } from "../../src/player/contracts.js";
-import { PlayerMindStore } from "../../src/player/mind-store.js";
+import {
+  playerGoalStateSignature,
+  PlayerMindStore,
+} from "../../src/player/mind-store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -19,6 +24,145 @@ afterEach(() => {
 });
 
 describe("owner proposal goals", () => {
+  it("signs the complete active and paused goal state deterministically", () => {
+    const active: PlayerGoal = {
+      id: "owner-active",
+      ownerProposalId: "proposal-active",
+      title: "Find a safe route",
+      status: "active",
+      priority: 4,
+      changeReason: "Reach the village without entering danger.",
+      source: "owner",
+      updatedAt: "2026-10-09T00:00:00.000Z",
+    };
+    const paused: PlayerGoal = {
+      id: "owner-paused",
+      title: "Repair the shelter",
+      status: "paused",
+      priority: 2,
+      changeReason: "Resume after the route is safe.",
+      source: "owner",
+      updatedAt: "2026-10-09T00:00:01.000Z",
+    };
+    const goals = [active, paused];
+    const signature = playerGoalStateSignature(goals);
+
+    expect(playerGoalStateSignature([...goals].reverse())).toBe(signature);
+    expect(playerGoalStateSignature([active])).not.toBe(signature);
+    expect(
+      playerGoalStateSignature([
+        active,
+        paused,
+        {
+          ...active,
+          id: "owner-new",
+          ownerProposalId: undefined,
+        },
+      ]),
+    ).not.toBe(signature);
+    for (const changed of [
+      { ...active, title: "Take the northern route" },
+      { ...active, status: "paused" as const },
+      { ...active, priority: 5 },
+      { ...active, changeReason: "Conditions changed after sunset." },
+      { ...active, ownerProposalId: "proposal-updated" },
+    ])
+      expect(playerGoalStateSignature([changed, paused])).not.toBe(signature);
+    expect(
+      playerGoalStateSignature([
+        ...goals,
+        {
+          ...active,
+          id: "persona-goal",
+          ownerProposalId: undefined,
+          source: "persona",
+        },
+      ]),
+    ).not.toBe(signature);
+    expect(
+      playerGoalStateSignature([
+        ...goals,
+        {
+          ...active,
+          id: "completed-goal",
+          status: "completed",
+          source: "persona",
+        },
+      ]),
+    ).toBe(signature);
+  });
+
+  it("stamps the plan after atomic goal updates and leaves standalone updates stale", () => {
+    const { mind } = openMind();
+    const plan: PlayerActionPlan = {
+      id: "owner-plan",
+      purpose: "Find a safe route.",
+      goalId: "owner-route",
+      steps: [
+        {
+          sequence: 0,
+          operation: { kind: "look", target: { x: 0, y: 64, z: 1 } },
+          expectedOutcome: "Inspect the route.",
+          status: "pending",
+        },
+      ],
+    };
+    try {
+      const created = mind.commitGoalState({
+        expectedRevision: mind.snapshot().revision,
+        goal: {
+          id: "owner-route",
+          title: "Find a safe route",
+          status: "active",
+          priority: 3,
+          changeReason: "Reach the village safely.",
+          source: "owner",
+        },
+      });
+      expect(created.accepted).toBe(true);
+
+      const committed = mind.commitThought({
+        expectedRevision: created.snapshot.revision,
+        decision: action("owner-plan-step"),
+        actionPlan: plan,
+        goal: {
+          id: "owner-route",
+          title: "Find a safe route before sunset",
+          status: "active",
+          priority: 4,
+          changeReason: "Avoid the exposed road before night.",
+          source: "owner",
+        },
+      });
+      expect(committed.accepted).toBe(true);
+      const savedSignature = committed.snapshot.actionPlan?.goalStateSignature;
+      expect(savedSignature).toBe(
+        playerGoalStateSignature(committed.snapshot.goals),
+      );
+
+      const standaloneUpdate = mind.commitGoalState({
+        expectedRevision: committed.snapshot.revision,
+        goal: {
+          id: "owner-route",
+          title: "Find a safe route before sunset",
+          status: "active",
+          priority: 5,
+          changeReason: "Avoid the exposed road and watch for hostiles.",
+          source: "owner",
+        },
+      });
+      expect(standaloneUpdate.accepted).toBe(true);
+      expect(standaloneUpdate.snapshot.actionPlan?.goalStateSignature).toBe(
+        savedSignature,
+      );
+      expect(savedSignature).not.toBe(
+        playerGoalStateSignature(standaloneUpdate.snapshot.goals),
+      );
+    } finally {
+      mind.close();
+    }
+  });
+
   it.each([
     ["commitThought", "adopted"],
     ["commitGoalState", "compromised"],

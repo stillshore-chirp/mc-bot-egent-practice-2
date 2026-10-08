@@ -44,7 +44,10 @@ import type {
   PlayerThoughtStaleChangeComponent,
   PlayerWakeKind,
 } from "./contracts.js";
-import type { PlayerMindStore } from "./mind-store.js";
+import {
+  playerGoalStateSignature,
+  type PlayerMindStore,
+} from "./mind-store.js";
 import {
   createPlayerTool,
   runPlayerAgent,
@@ -2189,10 +2192,8 @@ function plannedContinuationFor(input: {
       !input.latest.goals.some(
         ({ id, status }) => id === plan.goalId && status === "active",
       )) ||
-    input.latest.goals.some(
-      ({ id, source, status }) =>
-        source === "owner" && status === "active" && id !== plan.goalId,
-    )
+    plan.goalStateSignature === undefined ||
+    plan.goalStateSignature !== playerGoalStateSignature(input.latest.goals)
   )
     return undefined;
 

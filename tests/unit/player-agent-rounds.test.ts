@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
 import pino, { type Logger } from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -5518,6 +5519,18 @@ describe("player agent response rounds", () => {
           },
         }).accepted,
       ).toBe(true);
+      const secondOwnerGoal = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: {
+          id: "owner-shelter-goal",
+          title: "Keep the shelter usable.",
+          status: "active",
+          priority: 2,
+          changeReason: "Preserve a safe place to return to.",
+          source: "owner",
+        },
+      });
+      expect(secondOwnerGoal.accepted).toBe(true);
       const first = await fixture.agent.think({
         snapshot: fixture.mind.snapshot(),
         events: [],
@@ -5540,6 +5553,10 @@ describe("player agent response rounds", () => {
         ],
       });
       expect(typeof initialPlan?.steps[0]?.operationId).toBe("string");
+      expect(typeof initialPlan?.goalStateSignature).toBe("string");
+      expect(JSON.stringify(fixture.requests[0])).not.toContain(
+        "goalStateSignature",
+      );
       const reopenedMind = PlayerMindStore.open(fixture.databasePath);
       expect(reopenedMind.snapshot().actionPlan).toEqual(initialPlan);
       reopenedMind.close();
@@ -6089,6 +6106,208 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it.each([
+    "new owner goal",
+    "owner goal condition",
+    "self goal condition",
+  ] as const)("replans after an eventless %s change", async (changeKind) => {
+    const goalId = "signature-owner-goal";
+    const purpose = "Reach the storage safely.";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "signature-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the storage safely.",
+          planPurpose: purpose,
+          goalId,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the storage for inspection.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      const plannedGoal = {
+        id: goalId,
+        title:
+          changeKind === "self goal condition"
+            ? "Inspect the storage route."
+            : purpose,
+        status: "active" as const,
+        priority: 3,
+        changeReason:
+          changeKind === "self goal condition"
+            ? "The companion is checking the storage route."
+            : "The owner wants to inspect the storage.",
+        source:
+          changeKind === "self goal condition"
+            ? ("persona" as const)
+            : ("owner" as const),
+      };
+      const created = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: plannedGoal,
+      });
+      expect(created.accepted).toBe(true);
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(first.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to" },
+      });
+      expect(fixture.requests).toHaveLength(1);
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      const eventsBefore = fixture.mind
+        .pendingEvents(32)
+        .map(({ id, kind }) => ({ id, kind }));
+      const stateChange =
+        changeKind === "new owner goal"
+          ? {
+              id: "new-owner-priority-goal",
+              title: "Return to the shelter before night.",
+              status: "active" as const,
+              priority: 5,
+              changeReason: "The owner added a time-sensitive need.",
+              source: "owner" as const,
+            }
+          : {
+              id: goalId,
+              title: plannedGoal.title,
+              status: "active" as const,
+              priority: 4,
+              changeReason:
+                changeKind === "self goal condition"
+                  ? "The companion now avoids the exposed route."
+                  : "The owner now requires extra caution.",
+              source: plannedGoal.source,
+            };
+      const updated = fixture.mind.commitGoalState({
+        expectedRevision: fixture.mind.snapshot().revision,
+        goal: stateChange,
+      });
+      expect(updated.accepted).toBe(true);
+      expect(
+        fixture.mind.pendingEvents(32).map(({ id, kind }) => ({ id, kind })),
+      ).toEqual(eventsBefore);
+
+      scripted.push(
+        functionCallResponse(
+          "signature-plan-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Inspect the updated owner-goal context.",
+            planPurpose: "Reassess the storage route with current goals.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("replans legacy stored plans without a goal-state signature", async () => {
+    const goalId = "legacy-plan-goal";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "legacy-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the storage.",
+          planPurpose: "Inspect the storage.",
+          goalId,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the storage.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      expect(
+        fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          goal: {
+            id: goalId,
+            title: "Inspect the storage.",
+            status: "active",
+            priority: 3,
+            changeReason: "The owner wants to inspect the storage.",
+            source: "owner",
+          },
+        }).accepted,
+      ).toBe(true);
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      recordPlannedOperationOutcome(fixture, "successful");
+      removeStoredGoalStateSignature(fixture.databasePath);
+      expect(
+        fixture.mind.snapshot().actionPlan?.goalStateSignature,
+      ).toBeUndefined();
+
+      scripted.push(
+        functionCallResponse(
+          "legacy-plan-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Reassess the old queued step.",
+            planPurpose: "Reassess the storage from current observation.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("keeps owner stop latched while a plan has queued work", async () => {
     const scripted: ScriptedResponse[] = [
       functionCallResponse(
@@ -6404,6 +6623,31 @@ function recordPlannedOperationOutcome(
         : { expectedOutcome: active.expectedOutcome }),
     },
   });
+}
+
+function removeStoredGoalStateSignature(databasePath: string): void {
+  const database = new Database(databasePath);
+  try {
+    const row = database
+      .prepare(
+        "SELECT payload_json FROM player_runtime_state WHERE singleton_id = 1",
+      )
+      .get() as { readonly payload_json: string } | undefined;
+    if (row === undefined) throw new Error("TEST_RUNTIME_STATE_MISSING");
+    const payload = JSON.parse(row.payload_json) as {
+      actionPlan?: Record<string, unknown> | null;
+    };
+    if (payload.actionPlan === undefined || payload.actionPlan === null)
+      throw new Error("TEST_ACTION_PLAN_MISSING");
+    delete payload.actionPlan.goalStateSignature;
+    database
+      .prepare(
+        "UPDATE player_runtime_state SET payload_json = ? WHERE singleton_id = 1",
+      )
+      .run(JSON.stringify(payload));
+  } finally {
+    database.close();
+  }
 }
 
 function recordDeathScenario(
