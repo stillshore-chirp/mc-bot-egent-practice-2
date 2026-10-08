@@ -2164,7 +2164,7 @@ describe("integrated player runtime", () => {
       body.emit({
         type: "operation_stalled",
         operationId: "body-1",
-        operation: "look",
+        operation: "look_sweep",
         elapsedMs: 30_000,
         at: new Date().toISOString(),
       });
@@ -2184,9 +2184,11 @@ describe("integrated player runtime", () => {
       expect(followupEvents.map(({ kind }) => kind)).toEqual(
         expect.arrayContaining([
           "state_changed",
-          "operation_stalled",
           "body_outcome",
         ]),
+      );
+      expect(followupEvents.map(({ kind }) => kind)).not.toContain(
+        "operation_stalled",
       );
       expect(followupSnapshot?.lastOutcome?.status).toBe("successful");
       expect(followupSnapshot?.lastOutcome?.expectedOutcome).toBe(
@@ -3494,6 +3496,7 @@ describe("integrated player runtime", () => {
     let thoughtCount = 0;
     let followupWaitKinds: readonly string[] = [];
     let followupEventKinds: readonly string[] = [];
+    const runtimeRef: { current?: PlayerRuntime } = {};
     const runtime = new PlayerRuntime({
       ownerUsername: "owner",
       playerId: "owner-player",
@@ -3509,8 +3512,19 @@ describe("integrated player runtime", () => {
         think: async ({ snapshot, events }) => {
           thoughtCount += 1;
           if (thoughtCount === 1) {
+            const decision = action("pending-wake-action");
+            const saved = mind.commitThought({
+              expectedRevision: snapshot.revision,
+              decision,
+            });
+            if (!saved.accepted)
+              throw new Error("TEST_INITIAL_ACTION_COMMIT_REJECTED");
+            runtimeRef.current?.handleCommittedDecision(
+              saved.snapshot,
+              decision,
+            );
             await firstThoughtGate;
-            return { accepted: true };
+            return { accepted: saved.accepted, decision };
           }
           followupWaitKinds = snapshot.wait?.wakeOn ?? [];
           followupEventKinds = events.map(({ kind }) => kind);
@@ -3520,10 +3534,12 @@ describe("integrated player runtime", () => {
       logger: pino({ level: "silent" }),
       say: async () => undefined,
     });
+    runtimeRef.current = runtime;
 
     try {
       await runtime.start();
       await waitFor(() => thoughtCount === 1);
+      await waitFor(() => body.started.length === 1);
       body.emit({
         type: "bot_damaged",
         at: new Date().toISOString(),
