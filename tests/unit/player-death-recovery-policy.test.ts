@@ -556,6 +556,10 @@ function actionArguments(): Record<string, unknown> {
   return {
     kind: "act",
     purpose: "Reconsider how to respond to the current state.",
+    actionPlanId: "",
+    actionPlanPurpose: "",
+    actionPlanGoalId: "",
+    continuationSteps: [],
     operationJson: JSON.stringify({
       kind: "look",
       target: { x: 11, y: 64, z: 1 },

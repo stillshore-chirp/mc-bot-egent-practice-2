@@ -1067,6 +1067,10 @@ function waitArguments(): Record<string, unknown> {
   return {
     kind: "wait",
     purpose: "wait for the next meaningful world change",
+    actionPlanId: "",
+    actionPlanPurpose: "",
+    actionPlanGoalId: "",
+    continuationSteps: [],
     operationJson: "",
     expectedOutcome: "",
     skillId: "",
@@ -1081,6 +1085,10 @@ function actionArguments(): Record<string, unknown> {
   return {
     kind: "act",
     purpose: "Explore the visible route to the nearby clearing.",
+    actionPlanId: "",
+    actionPlanPurpose: "",
+    actionPlanGoalId: "",
+    continuationSteps: [],
     operationJson: JSON.stringify({
       kind: "move_to",
       position: { x: 8, y: 64, z: 3 },
