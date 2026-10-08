@@ -3,6 +3,8 @@ import type { Bot } from "mineflayer";
 import minecraftData from "minecraft-data";
 import { describe, expect, it } from "vitest";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
+import { toObservationEvidence } from "../../src/player/observation-evidence.js";
+import type { Item } from "prismarine-item";
 
 interface FixtureEntity {
   readonly id: number;
@@ -89,6 +91,20 @@ function mob(
     health: 18,
     ...extra,
   };
+}
+
+function inventoryItem(name: string, type: number, count = 1): Item {
+  return {
+    type,
+    name,
+    count,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+  } as unknown as Item;
 }
 
 describe("nearby hostile observation", () => {
@@ -327,5 +343,74 @@ describe("nearby hostile observation", () => {
       uncheckedCandidates: 0,
     });
     expect(nearby?.entities.map(({ id }) => id)).toEqual([3]);
+  });
+});
+
+describe("open-window inventory observation", () => {
+  it("projects current player slots without exposing container slots or stale items", () => {
+    const bot = makeObservationBot([]);
+    const inventory = bot.inventory as typeof bot.inventory & {
+      inventoryStart: number;
+      inventoryEnd: number;
+    };
+    Object.assign(inventory, { inventoryStart: 9, inventoryEnd: 45 });
+    inventory.slots[5] = inventoryItem("diamond_helmet", 1);
+    inventory.slots[10] = inventoryItem("stale_apple", 2);
+    inventory.slots[36] = inventoryItem("stale_sword", 3);
+    inventory.slots[45] = inventoryItem("shield", 4);
+
+    const slots = Array.from({ length: 63 }, () => null) as (Item | null)[];
+    slots[0] = inventoryItem("diamond", 5);
+    slots[27] = inventoryItem("iron_shears", 6);
+    slots[54] = inventoryItem("diamond_pickaxe", 7);
+    const window = {
+      id: 7,
+      type: "minecraft:chest",
+      title: "Chest",
+      inventoryStart: 27,
+      inventoryEnd: 63,
+      selectedItem: null,
+      slots,
+    };
+    Object.assign(bot, {
+      currentWindow: window,
+      getEquipmentDestSlot: (destination: string) =>
+        ({ hand: 36, "off-hand": 45, head: 5 })[destination] ?? 0,
+    });
+
+    const observation = observePlayerBody(bot, undefined);
+    const evidence = toObservationEvidence(observation);
+
+    expect(observation.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "iron_shears", count: 1, slot: 9 }),
+    );
+    expect(observation.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "diamond_pickaxe", count: 1, slot: 36 }),
+    );
+    expect(observation.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "diamond_helmet", slot: 5 }),
+    );
+    expect(observation.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "shield", slot: 45 }),
+    );
+    expect(observation.self.inventory.map(({ name }) => name)).not.toContain(
+      "diamond",
+    );
+    expect(observation.self.inventory.map(({ name }) => name)).not.toContain(
+      "stale_apple",
+    );
+    expect(observation.self.equipment.hand).toEqual(
+      expect.objectContaining({ name: "diamond_pickaxe", slot: 36 }),
+    );
+    expect(evidence.inventoryItems ?? []).toContainEqual({
+      name: "iron_shears",
+      count: 1,
+    });
+    expect(
+      (evidence.inventoryItems ?? []).map(({ name }) => name),
+    ).not.toContain("diamond");
+    expect(observation.window?.slots[0]).toEqual(
+      expect.objectContaining({ name: "diamond", slot: 0 }),
+    );
   });
 });

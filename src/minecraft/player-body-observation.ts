@@ -605,6 +605,43 @@ function windowSnapshot(window: Window | null): BodyWindowSnapshot | null {
   };
 }
 
+function observedInventorySlots(bot: Bot): readonly (Item | null)[] {
+  const inventory = bot.inventory;
+  const slots = inventory.slots;
+  const window = bot.currentWindow;
+  if (window === null) return slots;
+
+  const inventoryStart = inventory.inventoryStart;
+  const inventoryEnd = inventory.inventoryEnd;
+  const windowStart = window.inventoryStart;
+  const windowEnd = window.inventoryEnd;
+  if (
+    !Number.isInteger(inventoryStart) ||
+    !Number.isInteger(inventoryEnd) ||
+    !Number.isInteger(windowStart) ||
+    !Number.isInteger(windowEnd) ||
+    inventoryStart < 0 ||
+    inventoryEnd < inventoryStart ||
+    inventoryEnd > slots.length ||
+    windowStart < 0 ||
+    windowEnd < windowStart ||
+    windowEnd > window.slots.length
+  )
+    return slots;
+
+  // Mineflayer copies this player-only window range on close using the same
+  // offset. Project it now so a fresh observation sees transfers immediately.
+  const slotOffset = windowStart - inventoryStart;
+  const projected = [...slots];
+  for (let windowSlot = windowStart; windowSlot < windowEnd; windowSlot++) {
+    const inventorySlot = windowSlot - slotOffset;
+    if (inventorySlot < inventoryStart || inventorySlot >= inventoryEnd)
+      continue;
+    projected[inventorySlot] = window.slots[windowSlot] ?? null;
+  }
+  return projected;
+}
+
 function entityName(entity: Entity): string {
   return entity.name ?? entity.displayName ?? entity.type;
 }
@@ -1304,12 +1341,11 @@ export function observePlayerBody(
     }),
   };
 
-  const inventory: BodyItemStack[] = bot.inventory.slots.flatMap(
-    (item, slot) => {
-      const stack = itemStack(item, slot);
-      return stack === null ? [] : [stack];
-    },
-  );
+  const inventorySlots = observedInventorySlots(bot);
+  const inventory: BodyItemStack[] = inventorySlots.flatMap((item, slot) => {
+    const stack = itemStack(item, slot);
+    return stack === null ? [] : [stack];
+  });
   const destinations = [
     "hand",
     "off-hand",
@@ -1321,7 +1357,7 @@ export function observePlayerBody(
   const equipment = Object.fromEntries(
     destinations.map((destination) => {
       const slot = bot.getEquipmentDestSlot(destination);
-      return [destination, itemStack(bot.inventory.slots[slot], slot)];
+      return [destination, itemStack(inventorySlots[slot], slot)];
     }),
   );
   const feet = bot.blockAt(origin);

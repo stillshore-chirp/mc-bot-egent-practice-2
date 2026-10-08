@@ -1,11 +1,16 @@
+import { EventEmitter } from "node:events";
 import { Vec3 } from "vec3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Bot } from "mineflayer";
+import type { Item } from "prismarine-item";
+import type { Window } from "prismarine-windows";
+import { MineflayerPlayerBody } from "../../src/minecraft/player-body.js";
 import {
   observePlayerBody,
   playerBodyLookSweepSchema,
   summarizeLookSweepView,
 } from "../../src/minecraft/player-body-observation.js";
+import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 
 function makeBot(
   equipment: readonly (string | null | undefined)[],
@@ -40,7 +45,17 @@ function makeBot(
       ? {}
       : { getDroppedItem: options.getDroppedItem }),
   };
-  return {
+  const inventorySlots = Array.from(
+    { length: 46 },
+    () => null,
+  ) as (Item | null)[];
+  const inventory = Object.assign(new EventEmitter(), {
+    slots: inventorySlots,
+    inventoryStart: 9,
+    inventoryEnd: 45,
+    items: () => inventorySlots.filter((item): item is Item => item !== null),
+  });
+  const bot = Object.assign(new EventEmitter(), {
     username: "fixture_bot",
     version: "26.1",
     entity: self,
@@ -54,11 +69,17 @@ function makeBot(
     foodSaturation: 5,
     isSleeping: false,
     experience: { level: 0, points: 0, progress: 0 },
-    inventory: { slots: Array.from({ length: 46 }, () => null) },
-    getEquipmentDestSlot: () => 0,
+    inventory,
+    getEquipmentDestSlot: (destination: string) =>
+      ({ hand: 36, "off-hand": 45, head: 5, torso: 6, legs: 7, feet: 8 })[
+        destination
+      ] ?? 0,
     registry: {
       entitiesByName: { zombie: { category: "Hostile mobs" } },
-      itemsByName: { diamond_sword: {} },
+      itemsByName: {
+        diamond_sword: {},
+        iron_shears: { id: 42, name: "iron_shears" },
+      },
       blocksByStateId: {},
     },
     world: { raycast: () => null },
@@ -66,7 +87,88 @@ function makeBot(
     blockAt: () => null,
     canSeeBlock: () => true,
     currentWindow: null,
-  } as unknown as Bot;
+    clickWindow: vi.fn(async (slot: number) => {
+      const window = bot.currentWindow as Window | null;
+      if (window === null) throw new Error("No open test window");
+      if (window.selectedItem === null) {
+        window.selectedItem = window.slots[slot] ?? null;
+        window.slots[slot] = null;
+      } else {
+        window.slots[slot] = window.selectedItem;
+        window.selectedItem = null;
+      }
+    }),
+    closeWindow: vi.fn(async (window: Window) => {
+      syncWindowToInventory(bot as unknown as Bot, window);
+      Object.assign(bot, { currentWindow: null });
+      bot.emit("windowClose", window);
+    }),
+    equip: vi.fn(async (item: Item, destination: string) => {
+      const slot = bot.getEquipmentDestSlot(destination);
+      if (item.slot !== slot) {
+        inventorySlots[item.slot] = null;
+        inventorySlots[slot] = Object.assign(item, { slot });
+      }
+    }),
+  });
+  return bot as unknown as Bot;
+}
+
+function syncWindowToInventory(bot: Bot, window: Window): void {
+  const offset = window.inventoryStart - bot.inventory.inventoryStart;
+  for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+    const inventorySlot = slot - offset;
+    const item = window.slots[slot] ?? null;
+    if (item !== null) Object.assign(item, { slot: inventorySlot });
+    bot.inventory.slots[inventorySlot] = item;
+  }
+}
+
+function transferWindow(): Window {
+  const slots = Array.from({ length: 63 }, () => null) as (Item | null)[];
+  slots[0] = {
+    type: 42,
+    name: "iron_shears",
+    count: 1,
+    metadata: 0,
+    durabilityUsed: null,
+    maxDurability: null,
+    customName: null,
+    enchants: [],
+    nbt: null,
+    stackSize: 64,
+    slot: 0,
+  } as unknown as Item;
+  const window = Object.assign(new EventEmitter(), {
+    id: 7,
+    type: "minecraft:chest",
+    title: "Chest",
+    inventoryStart: 27,
+    inventoryEnd: 63,
+    selectedItem: null,
+    slots,
+    findItemRange: (
+      start: number,
+      end: number,
+      type: number,
+      metadata: number,
+    ) => {
+      for (let slot = start; slot < end; slot++) {
+        const item = slots[slot];
+        if (item?.type === type && item.metadata === metadata) {
+          Object.assign(item, { slot });
+          return item;
+        }
+      }
+      return null;
+    },
+    firstEmptySlotRange: (start: number, end: number) => {
+      for (let slot = start; slot < end; slot++)
+        if (slots[slot] === null) return slot;
+      return null;
+    },
+  }) as unknown as Window;
+  return window;
 }
 
 function sweepFor(bot: Bot) {
@@ -184,4 +286,125 @@ describe("visible entity equipment observation", () => {
       expect(parsed.success).toBe(true);
     },
   );
+});
+
+function makeTransferPlayer(): { bot: Bot; window: Window } {
+  const bot = makeBot([]);
+  const window = transferWindow();
+  Object.assign(bot, { currentWindow: window });
+  return { bot, window };
+}
+
+describe("equipment after an open-window transfer", () => {
+  it("observes transferred gear and equips it after closing and syncing the window", async () => {
+    const { bot } = makeTransferPlayer();
+    const body = new MineflayerPlayerBody(() => bot);
+    const transferred = await body.execute({
+      kind: "window_transfer",
+      item: "iron_shears",
+      count: 1,
+      direction: "window_to_inventory",
+    });
+    const afterTransfer = await body.observe();
+    const evidence = toObservationEvidence(afterTransfer);
+
+    expect(transferred.status).toBe("successful");
+    expect(afterTransfer.window?.slots[0]).toBeNull();
+    expect(afterTransfer.window?.slots[27]).toEqual(
+      expect.objectContaining({ name: "iron_shears", slot: 27 }),
+    );
+    expect(afterTransfer.self.inventory).toContainEqual(
+      expect.objectContaining({ name: "iron_shears", slot: 9 }),
+    );
+    expect(evidence.inventoryItems ?? []).toContainEqual({
+      name: "iron_shears",
+      count: 1,
+    });
+
+    const equipped = await body.execute({
+      kind: "equip",
+      item: "iron_shears",
+      destination: "hand",
+    });
+
+    expect(vi.mocked(bot.closeWindow)).toHaveBeenCalledOnce();
+    expect(vi.mocked(bot.equip)).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "iron_shears" }),
+      "hand",
+    );
+    expect(bot.currentWindow).toBeNull();
+    expect(equipped.status).toBe("successful");
+    expect(equipped.after?.self.equipment.hand).toEqual(
+      expect.objectContaining({ name: "iron_shears", slot: 36 }),
+    );
+  });
+
+  it("does not equip after caller cancellation while closing transferred gear", async () => {
+    const { bot } = makeTransferPlayer();
+    const body = new MineflayerPlayerBody(() => bot);
+    const transferred = await body.execute({
+      kind: "window_transfer",
+      item: "iron_shears",
+      count: 1,
+      direction: "window_to_inventory",
+    });
+    expect(transferred.status).toBe("successful");
+
+    let announceClose!: () => void;
+    let releaseClose!: () => void;
+    const closeStarted = new Promise<void>((resolve) => {
+      announceClose = resolve;
+    });
+    const closeReleased = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    vi.mocked(bot.closeWindow).mockImplementationOnce(async (window) => {
+      announceClose();
+      await closeReleased;
+      syncWindowToInventory(bot, window);
+      Object.assign(bot, { currentWindow: null });
+      bot.emit("windowClose", window);
+    });
+
+    const controller = new AbortController();
+    const equipping = body.execute(
+      { kind: "equip", item: "iron_shears", destination: "hand" },
+      controller.signal,
+    );
+    await closeStarted;
+    controller.abort(new Error("owner stop"));
+    releaseClose();
+    const result = await equipping;
+
+    expect(result.status).toBe("interrupted");
+    expect(vi.mocked(bot.equip)).not.toHaveBeenCalled();
+  });
+
+  it("does not equip across a death observed while closing transferred gear", async () => {
+    const { bot } = makeTransferPlayer();
+    const body = new MineflayerPlayerBody(() => bot);
+    const transferred = await body.execute({
+      kind: "window_transfer",
+      item: "iron_shears",
+      count: 1,
+      direction: "window_to_inventory",
+    });
+    expect(transferred.status).toBe("successful");
+    vi.mocked(bot.closeWindow).mockImplementationOnce(async (window) => {
+      syncWindowToInventory(bot, window);
+      Object.assign(bot, { currentWindow: null });
+      bot.emit("windowClose", window);
+      bot.emit("death");
+    });
+
+    const result = await body.execute({
+      kind: "equip",
+      item: "iron_shears",
+      destination: "hand",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toContain("life changed while closing a window");
+    expect(vi.mocked(bot.equip)).not.toHaveBeenCalled();
+  });
 });
