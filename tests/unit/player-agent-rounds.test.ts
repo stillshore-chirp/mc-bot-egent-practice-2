@@ -45,6 +45,34 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
+  it("skips a superseded run before sending a request or executing tools", async () => {
+    const requests: unknown[] = [];
+    let toolExecutions = 0;
+    const result = await runPlayerAgent({
+      client: scriptedClient([], requests),
+      model: "test-model",
+      instructions: "test only",
+      input: "superseded test",
+      tools: [
+        createPlayerTool({
+          name: "inspect_runtime",
+          description: "test runtime inspection",
+          schema: z.object({}).strict(),
+          execute: () => {
+            toolExecutions += 1;
+            return { ok: true };
+          },
+        }),
+      ],
+      logger: pino({ level: "silent" }),
+      shouldStopAfterResponse: () => true,
+    });
+
+    expect(requests).toHaveLength(0);
+    expect(toolExecutions).toBe(0);
+    expect(result).toMatchObject({ calls: 0, toolCalls: 0, text: "" });
+  });
+
   it("records fixed tool names and result classes without tool payloads", async () => {
     const traceResults: {
       readonly stage: string;
@@ -292,6 +320,19 @@ describe("player agent response rounds", () => {
         "auto",
         "none",
       ]);
+      expect(requests.map(({ reasoning }) => reasoning)).toEqual(
+        Array.from({ length: 6 }, () => ({ effort: "none" })),
+      );
+      expect(fixture.requestOptions).toHaveLength(6);
+      expect(
+        fixture.requestOptions.every(
+          (options) =>
+            !Object.hasOwn(
+              z.record(z.string(), z.unknown()).parse(options),
+              "timeout",
+            ),
+        ),
+      ).toBe(true);
       const finalInput = z
         .array(z.record(z.string(), z.unknown()))
         .parse(requests[5]?.input);
@@ -325,6 +366,29 @@ describe("player agent response rounds", () => {
       expect(fixture.requests).toHaveLength(1);
       expect(fixture.mind.snapshot().stopped).toBe(false);
       expect(fixture.messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("stops a superseded owner turn before its returned tool call or next round", async () => {
+    const fixture = openConversationFixture();
+    fixture.responses.push(() => {
+      fixture.conversation.nextTurn();
+      return functionCallResponse("superseded-stop", "stop_autonomy", {});
+    }, terminalResponse("古いturnの返答です。"));
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "自律行動を停止してください。",
+        turn,
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().stopped).toBe(false);
+      expect(fixture.messages).toEqual([]);
     } finally {
       fixture.close();
     }
@@ -660,10 +724,7 @@ describe("player agent response rounds", () => {
         model: "gpt-6-luna",
         reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toMatchObject({
-        maxRetries: 0,
-        timeout: 10_000,
-      });
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain("look:");
       expect(request.instructions).not.toContain(
         "死亡回収のexpectedOutcome先頭には",
@@ -1212,10 +1273,7 @@ describe("player agent response rounds", () => {
         model: "gpt-6-luna",
         reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toMatchObject({
-        maxRetries: 0,
-        timeout: 10_000,
-      });
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain(
         "観測されていない危険は創作しません",
       );
@@ -1314,9 +1372,9 @@ describe("player agent response rounds", () => {
         .parse(fixture.requests[0]);
       expect(request).toMatchObject({
         model: "test-model",
-        reasoning: { effort: "medium" },
+        reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toEqual({});
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain(
         "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
       );
@@ -5055,6 +5113,7 @@ interface ConversationFixture {
   readonly messages: string[];
   readonly mind: PlayerMindStore;
   readonly requests: unknown[];
+  readonly requestOptions: unknown[];
   readonly responses: ScriptedResponse[];
   close(): void;
 }
@@ -5070,10 +5129,11 @@ function openConversationFixture(
   const databasePath = join(directory, "player.sqlite");
   const mind = PlayerMindStore.open(databasePath);
   const requests: unknown[] = [];
+  const requestOptions: unknown[] = [];
   const responses: ScriptedResponse[] = [];
   const messages: string[] = [];
   const conversation = new PlayerConversationAgent({
-    client: scriptedClient(responses, requests),
+    client: scriptedClient(responses, requests, requestOptions),
     apiKey: "test-only",
     model: "test-model",
     ownerUsername: "owner",
@@ -5097,6 +5157,7 @@ function openConversationFixture(
     messages,
     mind,
     requests,
+    requestOptions,
     responses,
     close: () => mind.close(),
   };
