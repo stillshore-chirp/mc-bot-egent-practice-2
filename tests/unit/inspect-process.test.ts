@@ -132,6 +132,7 @@ describe("inspect process", () => {
     const result = runCli(["not-a-pid-secret"]);
 
     expect(result).toEqual(CLI_FAILURE);
+    expect(runCli(["4321\n"])).toEqual(CLI_FAILURE);
     expect(spawnSyncMock).not.toHaveBeenCalled();
   });
 });

@@ -12,7 +12,13 @@ interface ProcessInspection {
 }
 
 export function inspectProcess(pidInput: unknown): ProcessInspection | null {
-  if (typeof pidInput !== "string" || !/^\d+$/.test(pidInput)) return null;
+  if (
+    typeof pidInput !== "string" ||
+    pidInput.length === 0 ||
+    /\D/.test(pidInput)
+  ) {
+    return null;
+  }
   const requestedPid = Number(pidInput);
   if (!Number.isSafeInteger(requestedPid) || requestedPid < 1) return null;
 
