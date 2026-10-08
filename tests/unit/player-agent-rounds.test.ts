@@ -45,6 +45,34 @@ afterEach(() => {
 });
 
 describe("player agent response rounds", () => {
+  it("skips a superseded run before sending a request or executing tools", async () => {
+    const requests: unknown[] = [];
+    let toolExecutions = 0;
+    const result = await runPlayerAgent({
+      client: scriptedClient([], requests),
+      model: "test-model",
+      instructions: "test only",
+      input: "superseded test",
+      tools: [
+        createPlayerTool({
+          name: "inspect_runtime",
+          description: "test runtime inspection",
+          schema: z.object({}).strict(),
+          execute: () => {
+            toolExecutions += 1;
+            return { ok: true };
+          },
+        }),
+      ],
+      logger: pino({ level: "silent" }),
+      shouldStopAfterResponse: () => true,
+    });
+
+    expect(requests).toHaveLength(0);
+    expect(toolExecutions).toBe(0);
+    expect(result).toMatchObject({ calls: 0, toolCalls: 0, text: "" });
+  });
+
   it("records fixed tool names and result classes without tool payloads", async () => {
     const traceResults: {
       readonly stage: string;
@@ -292,6 +320,19 @@ describe("player agent response rounds", () => {
         "auto",
         "none",
       ]);
+      expect(requests.map(({ reasoning }) => reasoning)).toEqual(
+        Array.from({ length: 6 }, () => ({ effort: "none" })),
+      );
+      expect(fixture.requestOptions).toHaveLength(6);
+      expect(
+        fixture.requestOptions.every(
+          (options) =>
+            !Object.hasOwn(
+              z.record(z.string(), z.unknown()).parse(options),
+              "timeout",
+            ),
+        ),
+      ).toBe(true);
       const finalInput = z
         .array(z.record(z.string(), z.unknown()))
         .parse(requests[5]?.input);
@@ -325,6 +366,29 @@ describe("player agent response rounds", () => {
       expect(fixture.requests).toHaveLength(1);
       expect(fixture.mind.snapshot().stopped).toBe(false);
       expect(fixture.messages).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("stops a superseded owner turn before its returned tool call or next round", async () => {
+    const fixture = openConversationFixture();
+    fixture.responses.push(() => {
+      fixture.conversation.nextTurn();
+      return functionCallResponse("superseded-stop", "stop_autonomy", {});
+    }, terminalResponse("古いturnの返答です。"));
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "自律行動を停止してください。",
+        turn,
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().stopped).toBe(false);
+      expect(fixture.messages).toEqual([]);
     } finally {
       fixture.close();
     }
@@ -660,10 +724,7 @@ describe("player agent response rounds", () => {
         model: "gpt-6-luna",
         reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toMatchObject({
-        maxRetries: 0,
-        timeout: 10_000,
-      });
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain("look:");
       expect(request.instructions).not.toContain(
         "死亡回収のexpectedOutcome先頭には",
@@ -1212,10 +1273,7 @@ describe("player agent response rounds", () => {
         model: "gpt-6-luna",
         reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toMatchObject({
-        maxRetries: 0,
-        timeout: 10_000,
-      });
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain(
         "観測されていない危険は創作しません",
       );
@@ -1314,9 +1372,9 @@ describe("player agent response rounds", () => {
         .parse(fixture.requests[0]);
       expect(request).toMatchObject({
         model: "test-model",
-        reasoning: { effort: "medium" },
+        reasoning: { effort: "none" },
       });
-      expect(fixture.requestOptions[0]).toEqual({});
+      expect(fixture.requestOptions[0]).toMatchObject({ maxRetries: 0 });
       expect(request.instructions).toContain(
         "実行可能なBody操作がある時はSkill検索・本文確認を先にせず",
       );
@@ -4890,6 +4948,835 @@ describe("player agent response rounds", () => {
       fixture.close();
     }
   });
+
+  it("executes authored steps through an information checkpoint and replans from its fresh contents", async () => {
+    const goalId = "armor-goal";
+    const purpose = "Acquire useful armor from the nearby storage.";
+    const moveToChest: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 1, y: 64, z: 0 },
+      range: 1,
+    };
+    const openChest: PlayerOperation = {
+      kind: "open_window",
+      target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+    };
+    const transferHelmet: PlayerOperation = {
+      kind: "window_transfer",
+      item: "iron_helmet",
+      count: 1,
+      direction: "window_to_inventory",
+    };
+    const equipHelmet: PlayerOperation = {
+      kind: "equip",
+      item: "iron_helmet",
+      destination: "head",
+    };
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "plan-approach",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: moveToChest,
+          expectedOutcome: "Reach the visible chest safely.",
+          planPurpose: purpose,
+          goalId,
+          continuationSteps: [
+            {
+              operation: openChest,
+              expectedOutcome: "Open the nearby chest to inspect its contents.",
+            },
+          ],
+        }),
+      ),
+    ];
+    let observation = bodyObservationFixture();
+    const fixture = openObservedPurposeFixture(
+      scripted,
+      async () => observation,
+    );
+    try {
+      expect(
+        fixture.mind.commitGoalState({
+          expectedRevision: 0,
+          goal: {
+            id: goalId,
+            title: purpose,
+            status: "active",
+            priority: 3,
+            changeReason: "The owner wants useful armor.",
+            source: "owner",
+          },
+        }).accepted,
+      ).toBe(true);
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(first).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "move_to" } },
+      });
+      const initialPlan = fixture.mind.snapshot().actionPlan;
+      expect(initialPlan).toMatchObject({
+        purpose,
+        goalId,
+        steps: [
+          { sequence: 0, status: "pending" },
+          {
+            sequence: 1,
+            status: "pending",
+            operation: { kind: "open_window" },
+          },
+        ],
+      });
+      expect(typeof initialPlan?.steps[0]?.operationId).toBe("string");
+      const reopenedMind = PlayerMindStore.open(fixture.databasePath);
+      expect(reopenedMind.snapshot().actionPlan).toEqual(initialPlan);
+      reopenedMind.close();
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      const second = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(second).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "open_window" } },
+      });
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().actionPlan?.id).toBe(initialPlan?.id);
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      observation = {
+        ...observation,
+        window: {
+          id: 7,
+          type: "chest",
+          title: "Nearby chest",
+          inventoryStart: 0,
+          inventoryEnd: 27,
+          selectedItem: null,
+          slots: [
+            {
+              slot: 0,
+              itemId: 306,
+              name: "iron_helmet",
+              count: 1,
+              metadata: 0,
+              durability: null,
+              maxDurability: null,
+              customName: null,
+              enchantments: [],
+            },
+          ],
+        },
+      };
+      scripted.push(
+        functionCallResponse(
+          "plan-take-helmet",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: transferHelmet,
+            expectedOutcome: "Move the observed useful helmet into inventory.",
+            planPurpose: purpose,
+            ...(initialPlan?.id === undefined
+              ? {}
+              : { planId: initialPlan.id }),
+            goalId,
+            continuationSteps: [
+              {
+                operation: equipHelmet,
+                expectedOutcome: "Equip the helmet now present in inventory.",
+              },
+            ],
+          }),
+        ),
+      );
+      const third = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(third).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "window_transfer" } },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(JSON.stringify(fixture.requests[1])).toContain("iron_helmet");
+      const continuedPlan = fixture.mind.snapshot().actionPlan;
+      expect(continuedPlan?.id).toBe(initialPlan?.id);
+      expect(continuedPlan?.goalId).toBe(goalId);
+      expect(continuedPlan?.steps.map(({ sequence }) => sequence)).toEqual([
+        0, 1, 2, 3,
+      ]);
+      expect(continuedPlan?.steps.map(({ status }) => status)).toEqual([
+        "successful",
+        "successful",
+        "pending",
+        "pending",
+      ]);
+      expect(continuedPlan?.steps[3]?.operation).toEqual(equipHelmet);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("requires a fresh observation before planning beyond an information action", async () => {
+    const fixture = openObservedPurposeFixture([
+      functionCallResponse(
+        "checkpoint-plan",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "open_window",
+            target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+          },
+          expectedOutcome: "Open the chest and inspect its contents.",
+          planPurpose: "Find and equip useful gear.",
+          continuationSteps: [
+            {
+              operation: {
+                kind: "window_transfer",
+                item: "iron_helmet",
+                count: 1,
+                direction: "window_to_inventory",
+              },
+              expectedOutcome: "Take the helmet if it is useful.",
+            },
+          ],
+        }),
+      ),
+      terminalResponse("The contents need a fresh inspection first."),
+    ]);
+    try {
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().activeOperation).toBeUndefined();
+      expect(fixture.mind.snapshot().actionPlan).toBeUndefined();
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("retains a bounded history without resetting sequence or dropping pending steps", async () => {
+    const purpose = "Advance through the authored sequence safely.";
+    const move: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 1, y: 64, z: 0 },
+      range: 1,
+    };
+    const continuationSteps = Array.from({ length: 11 }, (_, index) => ({
+      operation: move,
+      expectedOutcome: `Complete planned movement ${index + 1}.`,
+    }));
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "long-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: move,
+          expectedOutcome: "Complete planned movement 0.",
+          planPurpose: purpose,
+          continuationSteps,
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      const originalPlanId = fixture.mind.snapshot().actionPlan?.id;
+      for (let index = 1; index < 12; index += 1) {
+        recordPlannedOperationOutcome(fixture, "successful");
+        const result = await fixture.agent.think({
+          snapshot: fixture.mind.snapshot(),
+          events: fixture.mind.pendingEvents(32),
+        });
+        expect(result.decision).toMatchObject({
+          kind: "act",
+          operation: { kind: "move_to" },
+        });
+      }
+      expect(fixture.requests).toHaveLength(1);
+      recordPlannedOperationOutcome(fixture, "successful");
+      scripted.push(
+        functionCallResponse(
+          "long-plan-replan",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: move,
+            expectedOutcome: "Continue the same purpose from current state.",
+            planPurpose: purpose,
+            ...(originalPlanId === undefined ? {} : { planId: originalPlanId }),
+          }),
+        ),
+      );
+      const replanned = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(replanned.accepted).toBe(true);
+      expect(fixture.requests).toHaveLength(2);
+      const retained = fixture.mind.snapshot().actionPlan;
+      expect(retained?.id).toBe(originalPlanId);
+      expect(retained?.steps.map(({ sequence }) => sequence)).toEqual(
+        Array.from({ length: 12 }, (_, index) => index + 1),
+      );
+      expect(retained?.steps.at(-1)).toMatchObject({
+        status: "pending",
+        sequence: 12,
+        expectedOutcome: "Continue the same purpose from current state.",
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("replans after an unexpected semantic hazard instead of dispatching the queued step", async () => {
+    const purpose = "Reach the nearby chest and take a useful item.";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "hazard-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the chest safely.",
+          planPurpose: purpose,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the chest for inspection.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      recordPlannedOperationOutcome(fixture, "successful");
+      fixture.mind.enqueueEvent(
+        "state_changed",
+        "観測上の意味のある変化: vitals",
+      );
+      const currentPlanId = fixture.mind.snapshot().actionPlan?.id;
+      scripted.push(
+        functionCallResponse(
+          "hazard-replan",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: {
+              kind: "look",
+              target: { x: 1, y: 64, z: 1 },
+            },
+            expectedOutcome: "Inspect the changed situation before acting.",
+            planPurpose: purpose,
+            ...(currentPlanId === undefined ? {} : { planId: currentPlanId }),
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "look" } },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.steps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sequence: 1, status: "superseded" }),
+        ]),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("redecides from a fresh hostile observation even before the sampler enqueues a wake", async () => {
+    const purpose = "Reach and inspect the nearby chest.";
+    let observation = bodyObservationFixture();
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "hostile-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the chest safely.",
+          planPurpose: purpose,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: {
+                  kind: "block",
+                  position: { x: 1, y: 64, z: 0 },
+                },
+              },
+              expectedOutcome: "Open the chest for inspection.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openPurposeFixture(
+      scripted,
+      undefined,
+      createMemoryPort(),
+      async () => observation,
+    );
+    try {
+      fixture.mind.recordObservation(toObservationEvidence(observation));
+      const first = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      expect(first).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "move_to" } },
+      });
+      recordPlannedOperationOutcome(fixture, "successful");
+
+      observation = {
+        ...observation,
+        perception: {
+          ...observation.perception,
+          nearbyHostiles: {
+            source: "client_received_unoccluded_nearby_hostiles",
+            observedAt: "2026-09-25T00:00:01.000Z",
+            maxDistance: 12,
+            entityOutputLimit: 8,
+            omittedEntityCandidates: 0,
+            candidateSearchMayBeTruncated: false,
+            entities: [
+              {
+                id: 91,
+                name: "zombie",
+                kind: "zombie",
+                category: "Hostile mobs",
+                position: {
+                  x: 2,
+                  y: 64,
+                  z: 0,
+                  dimension: "overworld",
+                },
+                distance: 2,
+                health: 20,
+                isPlayer: false,
+              },
+            ],
+          },
+        },
+      };
+      scripted.push(
+        functionCallResponse(
+          "hostile-plan-redecision",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look", target: { x: 2, y: 64, z: 0 } },
+            expectedOutcome: "Inspect the fresh hostile situation.",
+            planPurpose: purpose,
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+
+      expect(result).toMatchObject({
+        accepted: true,
+        decision: { kind: "act", operation: { kind: "look" } },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.steps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sequence: 1, status: "superseded" }),
+        ]),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("supersedes queued work after a failed precondition and asks for a new decision", async () => {
+    const purpose = "Reach and inspect the nearby chest.";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "failed-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the chest.",
+          planPurpose: purpose,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the chest after reaching it.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      recordPlannedOperationOutcome(fixture, "failed");
+      const planId = fixture.mind.snapshot().actionPlan?.id;
+      expect(fixture.mind.snapshot().actionPlan?.steps[1]?.status).toBe(
+        "superseded",
+      );
+      scripted.push(
+        functionCallResponse(
+          "failed-plan-redecision",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: {
+              kind: "move_relative",
+              offset: { x: -2, y: 0, z: 0 },
+              range: 1,
+            },
+            expectedOutcome: "Try an alternate route to the chest.",
+            planPurpose: purpose,
+            ...(planId === undefined ? {} : { planId }),
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_relative" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.steps.at(-1)).toMatchObject({
+        sequence: 2,
+        status: "pending",
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("does not continue a queued step after the linked goal changes", async () => {
+    const goalId = "changing-goal";
+    const purpose = "Inspect and use the chest contents.";
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "goal-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the chest.",
+          planPurpose: purpose,
+          goalId,
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the chest to inspect it.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      expect(
+        fixture.mind.commitGoalState({
+          expectedRevision: 0,
+          goal: {
+            id: goalId,
+            title: purpose,
+            status: "active",
+            priority: 3,
+            changeReason: "Initial owner goal.",
+            source: "owner",
+          },
+        }).accepted,
+      ).toBe(true);
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      const oldPlanId = fixture.mind.snapshot().actionPlan?.id;
+      recordPlannedOperationOutcome(fixture, "successful");
+      const revision = fixture.mind.snapshot().revision;
+      expect(
+        fixture.mind.commitGoalState({
+          expectedRevision: revision,
+          goal: {
+            id: goalId,
+            title: purpose,
+            status: "paused",
+            priority: 3,
+            changeReason: "A new situation pauses the owner goal.",
+            source: "owner",
+          },
+        }).accepted,
+      ).toBe(true);
+      scripted.push(
+        functionCallResponse(
+          "goal-change-replan",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Review the newly changed situation.",
+            planPurpose: "Review the changed situation.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.id).not.toBe(oldPlanId);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps owner stop latched while a plan has queued work", async () => {
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "stopped-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the chest.",
+          planPurpose: "Inspect the nearby chest.",
+          continuationSteps: [
+            {
+              operation: {
+                kind: "open_window",
+                target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+              },
+              expectedOutcome: "Open the chest.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      const stopped = fixture.mind.stop();
+      if (stopped === undefined) throw new Error("TEST_OWNER_STOP_NOT_SET");
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.accepted).toBe(false);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.mind.snapshot().stopped).toBe(true);
+      expect(fixture.mind.snapshot().actionPlan?.steps[0]).toMatchObject({
+        status: "superseded",
+      });
+      expect(fixture.mind.snapshot().actionPlan?.steps[1]).toMatchObject({
+        operation: { kind: "open_window" },
+        status: "superseded",
+      });
+      expect(fixture.mind.resume(stopped.stopGeneration)).toBeDefined();
+      scripted.push(
+        functionCallResponse(
+          "stopped-plan-reassessed",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look", target: { x: 1, y: 64, z: 0 } },
+            expectedOutcome:
+              "Reassess the chest after the owner resumes autonomy.",
+            planPurpose: "Inspect the nearby chest.",
+          }),
+        ),
+      );
+      const resumed = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(resumed.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("replans queued work after death and reconnect recovery", async () => {
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "recovery-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the intended area.",
+          planPurpose: "Reach the intended area and inspect it.",
+          continuationSteps: [
+            {
+              operation: { kind: "look_sweep" },
+              expectedOutcome: "Inspect the current area.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      const operation = fixture.mind.snapshot().activeOperation;
+      if (operation === undefined)
+        throw new Error("TEST_RECONNECT_OPERATION_NOT_ACTIVE");
+      fixture.mind.deferOperationUntilReconnect(operation.operationId);
+      fixture.mind.enqueueEvent("reconnected", "Minecraftへの再接続を観測");
+      const currentPlanId = fixture.mind.snapshot().actionPlan?.id;
+      scripted.push(
+        functionCallResponse(
+          "recovery-plan-replan",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look_sweep" },
+            expectedOutcome: "Inspect the current area after reconnecting.",
+            planPurpose: "Reach the intended area and inspect it.",
+            ...(currentPlanId === undefined ? {} : { planId: currentPlanId }),
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look_sweep" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.steps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ status: "unverified" }),
+          expect.objectContaining({ status: "superseded" }),
+        ]),
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("replans instead of continuing a plan after a death wake", async () => {
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "death-plan-start",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: {
+            kind: "move_to",
+            position: { x: 1, y: 64, z: 0 },
+            range: 1,
+          },
+          expectedOutcome: "Reach the area.",
+          planPurpose: "Inspect the area and continue the current task.",
+          continuationSteps: [
+            {
+              operation: { kind: "look_sweep" },
+              expectedOutcome: "Inspect the current area.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [],
+      });
+      recordPlannedOperationOutcome(fixture, "successful");
+      fixture.mind.recordDeathEvent(
+        new Date().toISOString(),
+        "Synthetic death wake for the plan invalidation test.",
+      );
+      scripted.push(
+        functionCallResponse(
+          "death-plan-replan",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: { kind: "look", target: { x: 1, y: 64, z: 1 } },
+            expectedOutcome: "Observe current surroundings after the death.",
+            planPurpose: "Reassess the ongoing task after death.",
+          }),
+        ),
+      );
+      const result = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(result.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "look" },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
 });
 
 type ScriptedResponse =
@@ -4967,6 +5854,47 @@ function openPurposeFixture(
       mind.close();
     },
   };
+}
+
+function openObservedPurposeFixture(
+  responses: ScriptedResponse[],
+  observeBody: () => Promise<PlayerBodyObservation> = async () =>
+    bodyObservationFixture(),
+): PurposeFixture {
+  const observedMind: { current?: PlayerMindStore } = {};
+  const fixture = openPurposeFixture(
+    responses,
+    undefined,
+    createMemoryPort(),
+    observeBody,
+    (observation) => {
+      observedMind.current?.recordObservation(
+        toObservationEvidence(observation),
+      );
+    },
+  );
+  observedMind.current = fixture.mind;
+  return fixture;
+}
+
+function recordPlannedOperationOutcome(
+  fixture: PurposeFixture,
+  status: "successful" | "failed" | "interrupted" | "cancelled" | "unverified",
+): void {
+  const active = fixture.mind.snapshot().activeOperation;
+  if (active === undefined) throw new Error("TEST_PLAN_OPERATION_NOT_ACTIVE");
+  fixture.mind.recordOutcome({
+    evidence: {
+      operationId: active.operationId,
+      kind: active.kind,
+      status,
+      summary: `Synthetic ${status} result for ${active.kind}.`,
+      observedAt: new Date().toISOString(),
+      ...(active.expectedOutcome === undefined
+        ? {}
+        : { expectedOutcome: active.expectedOutcome }),
+    },
+  });
 }
 
 function recordDeathScenario(
@@ -5055,6 +5983,7 @@ interface ConversationFixture {
   readonly messages: string[];
   readonly mind: PlayerMindStore;
   readonly requests: unknown[];
+  readonly requestOptions: unknown[];
   readonly responses: ScriptedResponse[];
   close(): void;
 }
@@ -5070,10 +5999,11 @@ function openConversationFixture(
   const databasePath = join(directory, "player.sqlite");
   const mind = PlayerMindStore.open(databasePath);
   const requests: unknown[] = [];
+  const requestOptions: unknown[] = [];
   const responses: ScriptedResponse[] = [];
   const messages: string[] = [];
   const conversation = new PlayerConversationAgent({
-    client: scriptedClient(responses, requests),
+    client: scriptedClient(responses, requests, requestOptions),
     apiKey: "test-only",
     model: "test-model",
     ownerUsername: "owner",
@@ -5097,6 +6027,7 @@ function openConversationFixture(
     messages,
     mind,
     requests,
+    requestOptions,
     responses,
     close: () => mind.close(),
   };
@@ -5128,6 +6059,19 @@ function functionCallResponse(
   name: string,
   argumentsValue: unknown,
 ): Response {
+  const argumentsWithPlan =
+    name === "commit_action_decision" &&
+    typeof argumentsValue === "object" &&
+    argumentsValue !== null &&
+    !Array.isArray(argumentsValue)
+      ? {
+          actionPlanId: "",
+          actionPlanPurpose: "",
+          actionPlanGoalId: "",
+          continuationSteps: [],
+          ...(argumentsValue as Record<string, unknown>),
+        }
+      : argumentsValue;
   return {
     status: "completed",
     output: [
@@ -5135,7 +6079,7 @@ function functionCallResponse(
         type: "function_call",
         call_id: callId,
         name,
-        arguments: JSON.stringify(argumentsValue),
+        arguments: JSON.stringify(argumentsWithPlan),
       },
     ],
     output_text: "",
@@ -5292,6 +6236,32 @@ function actionArguments(
     wakeOn: [],
     wakeAt: "",
     ...(stateUpdates === undefined ? {} : { stateUpdates }),
+  };
+}
+
+function coherentActionArguments(input: {
+  readonly operation: PlayerOperation;
+  readonly expectedOutcome: string;
+  readonly planPurpose: string;
+  readonly planId?: string;
+  readonly goalId?: string;
+  readonly continuationSteps?: readonly {
+    readonly operation: PlayerOperation;
+    readonly expectedOutcome: string;
+  }[];
+}): Record<string, unknown> {
+  return {
+    ...actionArguments(),
+    purpose: input.planPurpose,
+    operationJson: JSON.stringify(input.operation),
+    expectedOutcome: input.expectedOutcome,
+    actionPlanId: input.planId ?? "",
+    actionPlanPurpose: input.planPurpose,
+    actionPlanGoalId: input.goalId ?? "",
+    continuationSteps: (input.continuationSteps ?? []).map((step) => ({
+      operationJson: JSON.stringify(step.operation),
+      expectedOutcome: step.expectedOutcome,
+    })),
   };
 }
 

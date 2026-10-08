@@ -1062,7 +1062,6 @@ describe("player owner intent context", () => {
         markRequestStarted();
         return pendingResponse;
       },
-      terminalResponse("This stale reply should not be sent."),
       functionCallResponse("stopped-reassessment", "reassess_my_current_plan", {
         reason: "Owner feedback asks me to reconsider the current route.",
       }),
@@ -1086,17 +1085,7 @@ describe("player owner intent context", () => {
       );
       await staleRequest;
       expect(wakeCount).toBe(0);
-      expect(fixture.requests).toHaveLength(2);
-      const staleContinuation = record(fixture.requests[1]);
-      if (!Array.isArray(staleContinuation.input))
-        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
-      const staleOutput = staleContinuation.input
-        .map(record)
-        .find(({ type }) => type === "function_call_output");
-      expect(JSON.parse(String(staleOutput?.output))).toMatchObject({
-        ok: false,
-        code: "STALE_CONVERSATION",
-      });
+      expect(fixture.requests).toHaveLength(1);
 
       fixture.mind.stop();
       await conversation.handleOwnerMessage({
@@ -1105,8 +1094,8 @@ describe("player owner intent context", () => {
         turn: currentTurn,
       });
       expect(wakeCount).toBe(0);
-      expect(fixture.requests).toHaveLength(4);
-      const stoppedContinuation = record(fixture.requests[3]);
+      expect(fixture.requests).toHaveLength(3);
+      const stoppedContinuation = record(fixture.requests[2]);
       if (!Array.isArray(stoppedContinuation.input))
         throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
       const toolOutput = stoppedContinuation.input
@@ -1223,16 +1212,16 @@ describe("player owner intent context", () => {
           turn: conversation.nextTurn(),
         });
 
-        expect(fixture.requests).toHaveLength(2);
-        const followup = record(fixture.requests[1]);
-        const followupInput = Array.isArray(followup.input)
-          ? followup.input
-          : [];
-        const toolOutputs = followupInput
-          .map((item) => record(item))
-          .filter(({ type }) => type === "function_call_output");
-        expect(toolOutputs).toHaveLength(1);
+        expect(fixture.requests).toHaveLength(replyAllowed ? 2 : 1);
         if (replyAllowed) {
+          const followup = record(fixture.requests[1]);
+          const followupInput = Array.isArray(followup.input)
+            ? followup.input
+            : [];
+          const toolOutputs = followupInput
+            .map((item) => record(item))
+            .filter(({ type }) => type === "function_call_output");
+          expect(toolOutputs).toHaveLength(1);
           expect(messages.join("")).toBe(draft);
           expect(messages.length).toBeGreaterThan(1);
           expect(messages.every((message) => message.length <= 240)).toBe(true);
@@ -2525,6 +2514,19 @@ function functionCallResponse(
   argumentsValue: unknown,
   usage: NonNullable<Response["usage"]> = responseUsage(1, 1),
 ): Response {
+  const argumentsWithPlan =
+    name === "commit_action_decision" &&
+    typeof argumentsValue === "object" &&
+    argumentsValue !== null &&
+    !Array.isArray(argumentsValue)
+      ? {
+          actionPlanId: "",
+          actionPlanPurpose: "",
+          actionPlanGoalId: "",
+          continuationSteps: [],
+          ...(argumentsValue as Record<string, unknown>),
+        }
+      : argumentsValue;
   return {
     status: "completed",
     output: [
@@ -2532,7 +2534,7 @@ function functionCallResponse(
         type: "function_call",
         call_id: callId,
         name,
-        arguments: JSON.stringify(argumentsValue),
+        arguments: JSON.stringify(argumentsWithPlan),
       },
     ],
     output_text: "",

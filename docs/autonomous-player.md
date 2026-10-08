@@ -10,7 +10,7 @@
 | 目的 `PlayerPurposeAgent`      | 現在観測、目的・提案、記憶、技能、event        | 理由付きの `act / continue / complete`、操作不能時の `wait`、状態更新 | 確定前のBody dispatch    |
 | 実行 `PlayerRuntime`           | 確定判断、Body event、owner chat               | 一つのBody操作の所有、停止、中断、結果保存、次の判断起動              | 独立したゲーム目的の生成 |
 
-会話と目的は同じ設定modelを使う別のResponses呼出しです。別OSプロセスではありません。各目的判断内では `parallel_tool_calls: false`、Runtimeも目的判断を一つずつ進めます。一方、会話turnは長い身体操作の終了を待たずに受け付けられます。
+会話と目的は同じ設定modelを使う別のResponses呼出しです。両roleの通常呼出しでは `reasoning.effort=none`（推論なし）が既定です。別OSプロセスではありません。各目的判断内では `parallel_tool_calls: false`、Runtimeも目的判断を一つずつ進めます。一方、会話turnは長い身体操作の終了を待たずに受け付けられます。
 
 Purposeは危険度・安全性・可逆性・損失・安全な代案を審査して通常操作を止めず、実行可能な候補があれば一手を確定します。不確実性や追加観測だけを理由に `wait` せず、Body接続・操作不能、ownerの永続停止、または通常権限とschemaで操作候補がない時に限り待機します。方針上、短い被害時反応はRuntimeの責務とし、戦略選択や既存操作の置換は行いません。Runtimeが守る固定境界はowner停止、通常権限、CASと接続・世代の整合性、credential非公開、world/persona/memoryの継続性です。
 
@@ -132,6 +132,10 @@ sequenceDiagram
 | `wait`     | 理由・wakeOn・任意wakeAtを保存し操作を解除     | 身体を止め、条件を満たすイベントを待つ           |
 | `complete` | 現在purposeを閉じ、待機条件と完了契機を保存    | 身体を止め、進捗に対応する次の自律判断を一度起動 |
 
+`actionPlan` はsnapshotに任意で保存される順序付きの短い操作計画です。対応するowner goalがある場合はその `goalId` を持ち、owner goalに結び付かない自律目的では省略できます。同じ目的を続けて再計画するときはplan id・purpose・goalIdを維持し、実行中の操作と後続stepを同じ計画へ追加します。現在の観測から前提が確かなstepだけを並べ、各Body操作の結果を確かめたい内容も記録します。
+
+`look`、`look_sweep`、`open_window` は情報checkpointです。その後の判断に必要な情報をBody結果とfresh観測から得るまで、後続stepを先に計画しません。たとえば箱を開いて中身を調べた後、役立つ品が見つかれば取得・装備を同じ目的の計画へ続けます。中身を確認した時点で取得と装備の前提が確かなら、その複数stepをまとめて計画でき、既知の次stepは成功結果とfresh観測を確認してからLLMを再度呼ばずに実行できます。失敗、新しい情報checkpoint、危険やowner条件を含む状況変化で前提が崩れたときは未実行stepを無効化し、同じ高位の目的を保って再判断します。
+
 `complete` とowner goalの `completed` 更新は別です。owner intentを完了/放棄するには明示的なgoal更新が必要です。自発的な中間goalを終えてもowner intentを消しません。active/pausedなowner-linked goalとproposalは入力の件数制限でも保持し、paused goalを自動再開しません。
 
 ### 三つの世代値
@@ -181,7 +185,7 @@ owner proposalの連続到着で30秒期限は延長しません。期限内にH
 
 ## 7. 身体操作・結果・再起動
 
-Runtimeは現在の操作をcancelし、そのpromiseがsettleした後、最新 `actionRevision`・operation ID・停止状態を再確認して次を始めます。`activeOperation.startedAt` はcommit時に設定され、Body開始eventでも互換更新されます。実際にBody開始を観測した時刻は `bodyStartedAt` を使います。
+Runtimeは現在の操作をcancelし、そのpromiseがsettleした後、最新 `actionRevision`・operation ID・停止状態を再確認して次を始めます。`activeOperation.startedAt` はcommit時に設定され、Body開始eventでも互換更新されます。実際にBody開始を観測した時刻は `bodyStartedAt` を使います。計画への記載、commit、dispatch、Body開始だけでは工程の成功や高位の必要の達成を示しません。工程はoperation IDに対応するBody outcomeで照合し、必要の進捗は目的に沿った実際の状態変化とfresh観測で判断します。
 
 `move_to` と `move_relative` の結果は `sameLife` で操作中の死亡・respawn・接続境界を区別します。境界を跨いだ移動はBodyが `interrupted` とし、respawn後の位置が目標に届いていても旧移動の成功として保存しません。現在の状態から再判断し、`recoveryRequired` が返った場合は通常の再接続が終わるまで次の操作を待ちます。
 

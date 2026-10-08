@@ -28,8 +28,6 @@ type PlayerReasoningEffort = Exclude<
   null | undefined
 >;
 
-const instantPurposeRequestTimeoutMs = 10_000;
-
 export const playerAgentRequestErrorCauses = [
   "request_failed",
   "owner_proposal",
@@ -160,7 +158,7 @@ export interface PlayerAgentCallResult {
 export interface RunPlayerAgentInput {
   readonly client: PlayerResponsesClient;
   readonly model: string;
-  /** Explicit effort for a latency-sensitive purpose decision. */
+  /** Optional override; player conversation and Purpose calls default to none. */
   readonly reasoningEffort?: PlayerReasoningEffort;
   readonly instructions: string;
   readonly input: string;
@@ -263,7 +261,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export async function runPlayerAgent(
   input: RunPlayerAgentInput,
 ): Promise<PlayerAgentCallResult> {
-  const reasoningEffort = input.reasoningEffort ?? "medium";
+  const reasoningEffort = input.reasoningEffort ?? "none";
   const runSequence = ++nextRunSequence;
   const role = input.role ?? "purpose";
   const byName = new Map(
@@ -280,8 +278,17 @@ export async function runPlayerAgent(
   let inputTokens = 0;
   let outputTokens = 0;
   let latencyMs = 0;
+  const accumulatedResult = (text = ""): PlayerAgentCallResult => ({
+    text,
+    calls,
+    inputTokens,
+    outputTokens,
+    latencyMs,
+    toolCalls,
+  });
 
   for (let round = 0; round < maxRounds; round += 1) {
+    if (input.shouldStopAfterResponse?.() === true) return accumulatedResult();
     input.signal?.throwIfAborted();
     input.beforeCall?.();
     input.onResponsesRequestState?.(true);
@@ -314,7 +321,7 @@ export async function runPlayerAgent(
           {
             ...(input.signal === undefined ? {} : { signal: input.signal }),
             ...(reasoningEffort === "none"
-              ? { maxRetries: 0, timeout: instantPurposeRequestTimeoutMs }
+              ? { maxRetries: 0 }
               : input.beforeCall === undefined
                 ? {}
                 : { maxRetries: 0 }),
@@ -486,6 +493,10 @@ export async function runPlayerAgent(
       return responseResult();
     }
     for (const call of functionCalls) {
+      if (input.shouldStopAfterResponse?.() === true) {
+        emitCompletedResponseActivity("interrupted");
+        return responseResult();
+      }
       if (input.signal?.aborted) {
         emitCompletedResponseActivity("interrupted");
         input.signal.throwIfAborted();
