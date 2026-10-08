@@ -1681,6 +1681,166 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("reassesses queued urgent steps before resuming a plan against all goals", async () => {
+    const urgentMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 1, y: 64, z: 0 },
+      range: 1,
+    };
+    const urgentQueuedMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 2, y: 64, z: 0 },
+      range: 1,
+    };
+    const normalMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 3, y: 64, z: 0 },
+      range: 1,
+    };
+    const normalQueuedMove: PlayerOperation = {
+      kind: "move_to",
+      position: { x: 4, y: 64, z: 0 },
+      range: 1,
+    };
+    const scripted: ScriptedResponse[] = [
+      functionCallResponse(
+        "urgent-limited-goal-plan",
+        "commit_action_decision",
+        coherentActionArguments({
+          operation: urgentMove,
+          expectedOutcome: "Take one immediate step after damage.",
+          planPurpose: "Respond to the damage and reassess.",
+          planId: "urgent-limited-plan",
+          continuationSteps: [
+            {
+              operation: urgentQueuedMove,
+              expectedOutcome:
+                "Continue the urgent route if still appropriate.",
+            },
+          ],
+        }),
+      ),
+    ];
+    const fixture = openObservedPurposeFixture(scripted);
+    try {
+      let omittedOwnerGoalId: string | undefined;
+      for (let index = 0; index < 7; index += 1) {
+        const proposal = fixture.mind.addProposal({
+          title: `Earlier owner goal ${index}`,
+          reason: `Maintain the requested route ${index}.`,
+          priority: 3,
+        });
+        const result = fixture.mind.commitGoalState({
+          expectedRevision: fixture.mind.snapshot().revision,
+          proposalResolution: {
+            proposalId: proposal.id,
+            disposition: "adopted",
+            resolution: "Keep this owner goal active.",
+          },
+        });
+        expect(result.accepted).toBe(true);
+        if (index === 0) {
+          omittedOwnerGoalId = result.snapshot.goals.find(
+            ({ ownerProposalId }) => ownerProposalId === proposal.id,
+          )?.id;
+        }
+      }
+      if (omittedOwnerGoalId === undefined)
+        throw new Error("TEST_OLD_OWNER_GOAL_MISSING");
+      fixture.mind.consumeEvents(
+        fixture.mind.pendingEvents(64).map(({ id }) => id),
+      );
+
+      const urgent = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: [
+          {
+            id: "urgent-goal-projection-damage",
+            kind: "bot_damaged",
+            summary: "Self damage was observed.",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      });
+      expect(urgent.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: urgentMove.position },
+      });
+      const urgentPayload = requestUserPayload(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[0]),
+      );
+      const urgentRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(urgentPayload.runtime);
+      const urgentGoals = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(urgentRuntime.goals);
+      expect(urgentGoals.some(({ id }) => id === omittedOwnerGoalId)).toBe(
+        false,
+      );
+      expect(fixture.mind.snapshot().actionPlan?.goalStateSignature).toBe(
+        undefined,
+      );
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      scripted.push(
+        functionCallResponse(
+          "normal-goal-reassessment",
+          "commit_action_decision",
+          coherentActionArguments({
+            operation: normalMove,
+            expectedOutcome: "Take the route step selected with all goals.",
+            planPurpose: "Continue after reviewing the complete goal state.",
+            planId: "fresh-normal-plan",
+            continuationSteps: [
+              {
+                operation: normalQueuedMove,
+                expectedOutcome: "Continue the reviewed route.",
+              },
+            ],
+          }),
+        ),
+      );
+      const reassessed = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(reassessed.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: normalMove.position },
+      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.mind.snapshot().actionPlan?.goalStateSignature).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      const normalPayload = requestUserPayload(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[1]),
+      );
+      const normalRuntime = z
+        .record(z.string(), z.unknown())
+        .parse(normalPayload.runtime);
+      expect(
+        z
+          .array(z.record(z.string(), z.unknown()))
+          .parse(normalRuntime.goals)
+          .some(({ id }) => id === omittedOwnerGoalId),
+      ).toBe(true);
+
+      recordPlannedOperationOutcome(fixture, "successful");
+      const continued = await fixture.agent.think({
+        snapshot: fixture.mind.snapshot(),
+        events: fixture.mind.pendingEvents(32),
+      });
+      expect(continued.decision).toMatchObject({
+        kind: "act",
+        operation: { kind: "move_to", position: normalQueuedMove.position },
+      });
+      expect(fixture.requests).toHaveLength(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("uses the instant first-action path for a newly received strong owner proposal", async () => {
     const memory = createMemoryPort();
     const staleProposalId = "resolved-owner-proposal-hidden-from-urgent";

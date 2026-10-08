@@ -2970,6 +2970,7 @@ export class PlayerPurposeAgent {
             expectedRevision,
             decision,
             ...(actionPlan === undefined ? {} : { actionPlan }),
+            allowPlannedContinuation: !urgentFirstAction,
             ...(goal === undefined ? {} : { goal }),
             ...(proposalResolution === undefined ? {} : { proposalResolution }),
             ...(understanding === undefined ? {} : { understanding }),

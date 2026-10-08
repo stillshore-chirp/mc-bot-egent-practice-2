@@ -1104,6 +1104,7 @@ export class PlayerMindStore {
     expectedRevision: number;
     decision: PlayerThoughtDecision;
     actionPlan?: PlayerActionPlan | undefined;
+    allowPlannedContinuation?: boolean | undefined;
     goal?: PlayerGoalChange;
     proposalResolution?: PlayerProposalResolution;
     understanding?: PlayerUnderstandingUpdate;
@@ -1189,7 +1190,10 @@ export class PlayerMindStore {
           ? current.actionPlan
           : {
               ...input.actionPlan,
-              goalStateSignature: playerGoalStateSignature(goals),
+              goalStateSignature:
+                input.allowPlannedContinuation === false
+                  ? undefined
+                  : playerGoalStateSignature(goals),
             };
       let activeOperation = current.activeOperation;
       let wait = current.wait;
