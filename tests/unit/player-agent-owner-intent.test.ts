@@ -2214,6 +2214,98 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("keeps current goals in runtime without repeating the persona goal list", async () => {
+    const baseMemory = createMemoryPort();
+    const baseContext = baseMemory.context();
+    const lifeState = { currentInterests: ["keep exploring"] };
+    const recalled = [{ summary: "A remembered preference." }];
+    let personaGoals: readonly PlayerGoal[] = [];
+    const personaFields = {
+      identity: "A consistent companion",
+      currentInterests: lifeState.currentInterests,
+    };
+    const memory: PlayerMemoryPort = {
+      ...baseMemory,
+      context: () => ({
+        ...baseContext,
+        persona: JSON.stringify({
+          ...personaFields,
+          goals: personaGoals,
+        }),
+        lifeState,
+        recalled,
+      }),
+    };
+    const fixture = openPurposeFixture(memory);
+    const proposal = fixture.mind.addProposal({
+      title: "Gather the requested item",
+      reason: "Continue the owner's current objective.",
+      priority: 4,
+    });
+
+    try {
+      const snapshot = resolveProposal(
+        fixture.mind,
+        fixture.mind.snapshot(),
+        proposal,
+        "adopted",
+      );
+      const ownerGoal = snapshot.goals.find(
+        ({ ownerProposalId }) => ownerProposalId === proposal.id,
+      );
+      if (ownerGoal === undefined)
+        throw new Error("TEST_LINKED_OWNER_GOAL_NOT_CREATED");
+      personaGoals = snapshot.goals;
+      const personaWithGoals = JSON.stringify({
+        ...personaFields,
+        goals: personaGoals,
+      });
+
+      fixture.responses.push(
+        functionCallResponse(
+          "retain-current-purpose",
+          "commit_action_decision",
+          actionArguments(undefined, "wait"),
+        ),
+      );
+      const result = await fixture.agent.think({ snapshot, events: [] });
+      expect(result.accepted).toBe(true);
+
+      const request = record(fixture.requests[0]);
+      const instructions = String(request.instructions);
+      const compactPersona = instructions.split("\n", 1)[0] ?? "";
+      expect(compactPersona).toBe(JSON.stringify(personaFields));
+      expect(compactPersona.length).toBeLessThan(personaWithGoals.length);
+
+      if (!Array.isArray(request.input))
+        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
+      const userInput = record(request.input[0]);
+      const payload = record(JSON.parse(String(userInput.content)) as unknown);
+      const runtime = record(payload.runtime);
+      expect(runtime.goals).toContainEqual(
+        expect.objectContaining({
+          id: ownerGoal.id,
+          ownerProposalId: proposal.id,
+          title: ownerGoal.title,
+          status: "active",
+          priority: ownerGoal.priority,
+          changeReason: ownerGoal.changeReason,
+          source: "owner",
+          updatedAt: ownerGoal.updatedAt,
+        }),
+      );
+      expect(payload.memory).toMatchObject({
+        owner: "owner",
+        relationship: {},
+        lifeState,
+        recalled,
+      });
+      expect(fixture.mind.snapshot().goals).toContainEqual(ownerGoal);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("allows owner-position observation only for pending or active linked intents", async () => {
     const ownerPositionExceptions: boolean[] = [];
     const fixture = openPurposeFixture(
