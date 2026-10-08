@@ -23,6 +23,7 @@ import { playerOperationNames } from "../../src/minecraft/player-body-schema.js"
 import {
   compactSnapshot,
   PlayerConversationAgent,
+  PlayerPurposeAgent,
 } from "../../src/player/agents.js";
 import type {
   PlayerMemoryPort,
@@ -52,6 +53,292 @@ afterEach(() => {
 });
 
 describe("integrated player runtime", () => {
+  it("consumes a stalled wake that progresses while another thought is settling", async () => {
+    let thoughtCount = 0;
+    let releaseManualThought: (() => void) | undefined;
+    const manualThoughtGate = new Promise<void>((resolve) => {
+      releaseManualThought = resolve;
+    });
+    let manualSignal: AbortSignal | undefined;
+    const fixture = createRuntimeFixture({
+      think: async ({ snapshot, signal }) => {
+        thoughtCount += 1;
+        if (thoughtCount === 1) {
+          const decision = action("move-before-settling-wake", {
+            kind: "move_relative",
+            offset: { x: 3, y: 0, z: 0 },
+            range: 1,
+          });
+          const saved = fixture.mind.commitThought({
+            expectedRevision: snapshot.revision,
+            decision,
+          });
+          if (saved.accepted)
+            fixture.runtime.handleCommittedDecision(saved.snapshot, decision);
+          return { accepted: saved.accepted, decision };
+        }
+        if (thoughtCount === 2) {
+          manualSignal = signal;
+          await manualThoughtGate;
+        }
+        return { accepted: true };
+      },
+    });
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+      fixture.runtime.onOwnerFeedbackNeedsReassessment(
+        "check the current plan",
+      );
+      await waitFor(() => thoughtCount === 2);
+
+      fixture.body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "move_relative",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      for (const status of ["noPath", "timeout", "success", "partial"] as const)
+        fixture.body.emit({
+          type: "operation_path_updated",
+          operationId: "body-1",
+          operation: "move_relative",
+          status,
+          pathLength: 4,
+          at: new Date().toISOString(),
+        });
+      expect(
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "operation_stalled"),
+      ).toBe(true);
+
+      const beforeMove = await fixture.body.observe();
+      fixture.body.setObservation({
+        ...beforeMove,
+        self: {
+          ...beforeMove.self,
+          position: {
+            ...beforeMove.self.position,
+            x: beforeMove.self.position.x + 1,
+          },
+        },
+      });
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "position",
+        at: new Date().toISOString(),
+      });
+      await waitFor(
+        () =>
+          !fixture.mind
+            .pendingEvents(64)
+            .some(({ kind }) => kind === "operation_stalled"),
+      );
+      expect(manualSignal?.aborted).toBe(false);
+      releaseManualThought?.();
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(thoughtCount).toBe(2);
+      expect(fixture.body.started).toHaveLength(1);
+      expect(fixture.body.results).toHaveLength(0);
+      expect(
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "operation_stalled"),
+      ).toBe(false);
+    } finally {
+      releaseManualThought?.();
+      await fixture.close();
+    }
+  });
+
+  it("aborts a stale stall response during a local tool wait without interrupting travel", async () => {
+    const response = (
+      calls: readonly { id: string; name: string; args: unknown }[],
+    ): Response =>
+      ({
+        status: "completed",
+        output: calls.map(({ id, name, args }) => ({
+          type: "function_call",
+          call_id: id,
+          name,
+          arguments: JSON.stringify(args),
+        })),
+        output_text: "",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }) as unknown as Response;
+    const commitArgs = (operation: PlayerOperation) => ({
+      kind: "act",
+      purpose: "Continue the current travel action.",
+      operationJson: JSON.stringify(operation),
+      expectedOutcome: "Continue traveling and review the observed result.",
+      skillId: "",
+      skillVersion: 0,
+      reason: "The current route remains active.",
+      wakeOn: [],
+      wakeAt: "",
+      actionPlanId: "",
+      actionPlanPurpose: "Continue the current travel action.",
+      actionPlanGoalId: "",
+      continuationSteps: [],
+      stateUpdates: null,
+    });
+
+    const purposeAgentRef: { current?: PlayerPurposeAgent } = {};
+    let deferredObservation:
+      ReturnType<DeferredBody["deferNextObservation"]> | undefined;
+    let responseCount = 0;
+    let stalledSignal: AbortSignal | undefined;
+    let stalledThoughtSettled = false;
+    const responseChecks: boolean[] = [];
+    const committedToolNames: string[] = [];
+    const fixtureRef: { current?: ReturnType<typeof createRuntimeFixture> } =
+      {};
+    const client = {
+      responses: {
+        create: async () => {
+          responseCount += 1;
+          if (responseCount === 1)
+            return response([
+              {
+                id: "initial-act",
+                name: "commit_action_decision",
+                args: commitArgs({
+                  kind: "move_relative",
+                  offset: { x: 3, y: 0, z: 0 },
+                  range: 1,
+                }),
+              },
+            ]);
+          if (responseCount === 2) {
+            const fixture = fixtureRef.current;
+            if (fixture === undefined)
+              throw new Error("TEST_RUNTIME_NOT_READY");
+            deferredObservation = fixture.body.deferNextObservation();
+            return response([
+              { id: "local-observe", name: "observe_body", args: {} },
+              {
+                id: "stale-act",
+                name: "commit_action_decision",
+                args: commitArgs({
+                  kind: "look",
+                  target: { x: 0, y: 64, z: 1 },
+                }),
+              },
+            ]);
+          }
+          throw new Error("UNEXPECTED_TEST_RESPONSE_REQUEST");
+        },
+      },
+    } as unknown as PlayerResponsesClient;
+    const purposePort: PlayerPurposePort = {
+      think: (input) => {
+        const purposeAgent = purposeAgentRef.current;
+        if (purposeAgent === undefined)
+          throw new Error("TEST_PURPOSE_AGENT_NOT_READY");
+        if (input.events.some(({ kind }) => kind === "operation_stalled")) {
+          stalledSignal = input.signal;
+          const responseCheck = input.shouldStopAfterResponse;
+          return purposeAgent
+            .think({
+              ...input,
+              shouldStopAfterResponse: () => {
+                const stopped = responseCheck?.() ?? false;
+                responseChecks.push(stopped);
+                return stopped;
+              },
+            })
+            .finally(() => {
+              stalledThoughtSettled = true;
+            });
+        }
+        return purposeAgent.think(input);
+      },
+    };
+    const fixture = createRuntimeFixture(purposePort);
+    fixtureRef.current = fixture;
+    purposeAgentRef.current = new PlayerPurposeAgent({
+      client,
+      apiKey: "test-only",
+      model: "test-model",
+      body: fixture.body,
+      skills: fixture.skills,
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      ownerPlayerId: "owner-player",
+      logger: pino({ level: "silent" }),
+      onRoundActivity: (activity) =>
+        committedToolNames.push(...activity.toolCalls.map(({ name }) => name)),
+      onCommitted: (snapshot, decision) =>
+        fixture.runtime.handleCommittedDecision(snapshot, decision),
+    });
+
+    try {
+      await fixture.runtime.start();
+      await waitFor(() => fixture.body.started.length === 1);
+      const actionRevision = fixture.mind.snapshot().actionRevision;
+      const activeOperationId =
+        fixture.mind.snapshot().activeOperation?.operationId;
+      fixture.body.failNextObservation();
+      fixture.body.emit({
+        type: "operation_stalled",
+        operationId: "body-1",
+        operation: "move_relative",
+        elapsedMs: 30_000,
+        at: new Date().toISOString(),
+      });
+      await waitFor(() => deferredObservation !== undefined);
+      const localObservation = deferredObservation;
+      if (localObservation === undefined)
+        throw new Error("TEST_LOCAL_OBSERVATION_NOT_READY");
+      await localObservation.started;
+      expect(responseChecks).toContain(false);
+
+      const beforeMove = await fixture.body.observe();
+      fixture.body.setObservation({
+        ...beforeMove,
+        self: {
+          ...beforeMove.self,
+          position: {
+            ...beforeMove.self.position,
+            x: beforeMove.self.position.x + 1,
+          },
+        },
+      });
+      fixture.body.emit({
+        type: "state_changed",
+        reason: "position",
+        at: new Date().toISOString(),
+      });
+      await waitFor(() => stalledSignal?.aborted === true);
+      localObservation.release();
+      await waitFor(() => stalledThoughtSettled);
+
+      expect(responseCount).toBe(2);
+      expect(
+        committedToolNames.filter((name) => name === "commit_action_decision"),
+      ).toHaveLength(1);
+      expect(fixture.mind.snapshot().actionRevision).toBe(actionRevision);
+      expect(fixture.mind.snapshot().activeOperation?.operationId).toBe(
+        activeOperationId,
+      );
+      expect(fixture.body.started).toHaveLength(1);
+      expect(fixture.body.stopActiveCalls).toBe(0);
+      expect(fixture.body.results).toHaveLength(0);
+      expect(
+        fixture.mind
+          .pendingEvents(64)
+          .some(({ kind }) => kind === "operation_stalled"),
+      ).toBe(false);
+    } finally {
+      deferredObservation?.release();
+      await fixture.close();
+    }
+  });
+
   it("keeps ordinary breathing and water transitions from invalidating a thought", () => {
     const base = observation();
     const signature = (changes: Partial<PlayerBodyObservation["self"]>) =>
@@ -4311,6 +4598,13 @@ class DeferredBody implements PlayerBody {
   #finishActive:
     ((status: PlayerOperationResult["status"]) => void) | undefined;
   #observation = observation();
+  #failNextObserve = false;
+  #nextObserveGate:
+    | {
+        readonly started: () => void;
+        readonly wait: Promise<void>;
+      }
+    | undefined;
   #resultBefore: PlayerBodyObservation | null = null;
   #resultAfter: PlayerBodyObservation | null = null;
   #resultSameLife: boolean | null | undefined;
@@ -4326,7 +4620,40 @@ class DeferredBody implements PlayerBody {
   }
 
   public async observe(): Promise<PlayerBodyObservation> {
+    if (this.#failNextObserve) {
+      this.#failNextObserve = false;
+      throw new Error("TEST_OBSERVATION_UNAVAILABLE");
+    }
+    const gate = this.#nextObserveGate;
+    if (gate !== undefined) {
+      this.#nextObserveGate = undefined;
+      gate.started();
+      await gate.wait;
+    }
     return this.#observation;
+  }
+
+  public failNextObservation(): void {
+    this.#failNextObserve = true;
+  }
+
+  public deferNextObservation(): {
+    readonly started: Promise<void>;
+    readonly release: () => void;
+  } {
+    let resolveStarted: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#nextObserveGate = {
+      started: () => resolveStarted?.(),
+      wait,
+    };
+    return { started, release: () => release?.() };
   }
 
   public setObservation(value: PlayerBodyObservation): void {
@@ -4746,6 +5073,7 @@ function createRuntimeFixture(
   return {
     body,
     mind,
+    skills,
     runtime,
     messages,
     logger,
