@@ -16,6 +16,7 @@ type Outcome = PlayerRuntimeSnapshot["recentOutcomes"][number];
 const at = (seconds: number) =>
   new Date(Date.UTC(2030, 0, 1) + seconds * 1_000).toISOString();
 const chestPos = { x: 0, y: 64, z: 0 };
+const stonePos = { x: 1, y: 64, z: 0 };
 const open: PlayerOperation = {
   kind: "open_window",
   target: { kind: "block", position: chestPos },
@@ -36,7 +37,7 @@ const equip: PlayerOperation = {
   item: "iron_sword",
   destination: "hand",
 };
-const dig: PlayerOperation = { kind: "dig", position: chestPos };
+const dig: PlayerOperation = { kind: "dig", position: stonePos };
 const craft: PlayerOperation = { kind: "craft", item: "oak_planks", count: 1 };
 
 function outcome(
@@ -145,6 +146,7 @@ function observation(
     head?: string;
     hand?: string;
     chest?: boolean;
+    stone?: boolean;
     window?: readonly string[] | null;
   } = {},
 ): PlayerBodyObservation {
@@ -169,7 +171,10 @@ function observation(
       },
     },
     perception: {
-      blocks: options.chest ? [{ name: "chest", position: chestPos }] : [],
+      blocks: [
+        ...(options.chest ? [{ name: "chest", position: chestPos }] : []),
+        ...(options.stone ? [{ name: "stone", position: stonePos }] : []),
+      ],
       entities: [],
     },
     window:
@@ -203,7 +208,11 @@ describe("coherent multi-stage plan acceptance oracle", () => {
       }),
     ];
     expect(
-      evaluateCoherentPlanAcceptance({ captures, observations }),
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations,
+        neededItems: ["iron_sword"],
+      }),
     ).toMatchObject({
       accepted: true,
       reason: "accepted_container_chain",
@@ -222,12 +231,14 @@ describe("coherent multi-stage plan acceptance oracle", () => {
           capture(4, [move, move, move], moves),
         ],
         observations: [],
+        neededItems: ["iron_sword"],
       }).reason,
     ).toBe("movement_only");
     expect(
       evaluateCoherentPlanAcceptance({
         captures: [capture(0.5, [open, transfer])],
         observations: [],
+        neededItems: ["iron_sword"],
       }).reason,
     ).toBe("no_linked_body_outcomes");
   });
@@ -239,7 +250,11 @@ describe("coherent multi-stage plan acceptance oracle", () => {
       capture(2, [open], [failed], { id: "old", currentId: "new" }),
     ];
     expect(
-      evaluateCoherentPlanAcceptance({ captures, observations: [] }).reason,
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations: [],
+        neededItems: ["iron_sword"],
+      }).reason,
     ).toBe("goal_mismatch");
   });
 
@@ -252,7 +267,11 @@ describe("coherent multi-stage plan acceptance oracle", () => {
       capture(4, [open, open], [first, second]),
     ];
     expect(
-      evaluateCoherentPlanAcceptance({ captures, observations: [] }).reason,
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations: [],
+        neededItems: ["iron_sword"],
+      }).reason,
     ).toBe("repeated_unchanged_failure");
   });
 
@@ -260,19 +279,46 @@ describe("coherent multi-stage plan acceptance oracle", () => {
     const opened = outcome("o", open, "successful", 1);
     const gathered = outcome("d", dig, "successful", 3);
     const captures = [
-      capture(0.5, [open, dig]),
-      capture(2.5, [open, dig], [opened]),
+      capture(0.5, [open]),
+      capture(2.5, [open, dig], [opened], {}, [undefined, "d"]),
       capture(5, [open, dig], [opened, gathered]),
     ];
     const observations = [
       observation(0, { chest: true }),
       observation(2, { window: [] }),
-      observation(2.75),
+      observation(2.75, { stone: true }),
       observation(4, { inventory: [{ name: "cobblestone" }] }),
     ];
     expect(
-      evaluateCoherentPlanAcceptance({ captures, observations }).reason,
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations,
+        neededItems: ["cobblestone"],
+      }).reason,
     ).toBe("accepted_replan");
+  });
+
+  it("rejects an unrelated inventory change after an empty container", () => {
+    const opened = outcome("o", open, "successful", 1);
+    const gathered = outcome("d", dig, "successful", 3);
+    const captures = [
+      capture(0.5, [open]),
+      capture(2.5, [open, dig], [opened], {}, [undefined, "d"]),
+      capture(5, [open, dig], [opened, gathered]),
+    ];
+    const observations = [
+      observation(0, { chest: true }),
+      observation(2, { window: [] }),
+      observation(2.75, { stone: true }),
+      observation(4, { inventory: [{ name: "dirt" }] }),
+    ];
+    expect(
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations,
+        neededItems: ["cobblestone"],
+      }).reason,
+    ).toBe("replan_missing");
   });
 
   it("accepts justified adaptation even when both later actions fail", () => {
@@ -281,9 +327,13 @@ describe("coherent multi-stage plan acceptance oracle", () => {
     const failedCraft = outcome("c", craft, "failed", 5);
     const operations = [open, dig, craft];
     const captures = [
-      capture(0.5, operations),
-      capture(2.5, operations, [opened]),
-      capture(4, operations, [opened, failedDig]),
+      capture(0.5, [open]),
+      capture(2.5, operations, [opened], {}, [undefined, "d", "c"]),
+      capture(4, operations, [opened, failedDig], {}, [
+        undefined,
+        undefined,
+        "c",
+      ]),
       capture(7, operations, [opened, failedDig, failedCraft]),
     ];
     const observations = [
@@ -294,7 +344,11 @@ describe("coherent multi-stage plan acceptance oracle", () => {
       observation(5.5),
     ];
     expect(
-      evaluateCoherentPlanAcceptance({ captures, observations }).reason,
+      evaluateCoherentPlanAcceptance({
+        captures,
+        observations,
+        neededItems: ["oak_planks"],
+      }).reason,
     ).toBe("accepted_failed_replan");
   });
 });

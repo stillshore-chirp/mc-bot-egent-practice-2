@@ -50,17 +50,13 @@ const movement = new Set([
   "look_sweep",
   "control",
 ]);
-const uiOnly = new Set([
-  "open_window",
-  "window_click",
-  "window_transfer",
-  "window_close",
-]);
+const uiOnly = new Set(["open_window", "window_click", "window_close"]);
 
 /** Mockable oracle only: plans count when their steps match observed Body outcomes. */
 export function evaluateCoherentPlanAcceptance(input: {
   readonly captures: readonly Capture[];
   readonly observations: readonly PlayerBodyObservation[];
+  readonly neededItems: readonly string[];
 }): CoherentPlanAcceptance {
   const captures = [...input.captures].sort(
     (a, b) => Date.parse(a.sampledAt) - Date.parse(b.sampledAt),
@@ -166,15 +162,26 @@ export function evaluateCoherentPlanAcceptance(input: {
       const slots =
         window.window?.slots.slice(0, window.window.inventoryStart) ?? [];
       return slots.some(
-        (item) => item !== null && gearDestination(item.name) !== undefined,
+        (item) =>
+          item !== null &&
+          input.neededItems.includes(item.name) &&
+          gearDestination(item.name) !== undefined,
       )
-        ? containerChain(open, window, linked, captures, observations)
+        ? containerChain(
+            open,
+            window,
+            linked,
+            captures,
+            observations,
+            input.neededItems,
+          )
         : replan(
             open.sequence,
             window.observedAt,
             linked,
             captures,
             observations,
+            input.neededItems,
           );
     }
   }
@@ -182,7 +189,14 @@ export function evaluateCoherentPlanAcceptance(input: {
     (s) => s.operation.kind === "open_window" && s.status === "failed",
   );
   return failedOpen
-    ? replan(failedOpen.sequence, failedOpen.at, linked, captures, observations)
+    ? replan(
+        failedOpen.sequence,
+        failedOpen.at,
+        linked,
+        captures,
+        observations,
+        input.neededItems,
+      )
     : result(false, "container_chain_incomplete", linked);
 }
 
@@ -192,13 +206,14 @@ function containerChain(
   linked: readonly Linked[],
   captures: readonly Capture[],
   obs: readonly PlayerBodyObservation[],
+  neededItems: readonly string[],
 ): CoherentPlanAcceptance {
   const slots =
     inspected.window?.slots.slice(0, inspected.window.inventoryStart) ?? [];
   for (const [slot, stack] of slots.entries()) {
     if (!stack) continue;
     const destination = gearDestination(stack.name);
-    if (!destination) continue;
+    if (!destination || !neededItems.includes(stack.name)) continue;
     const transfer = linked.find(
       (s) =>
         s.sequence > open.sequence &&
@@ -243,6 +258,7 @@ function replan(
   linked: readonly Linked[],
   captures: readonly Capture[],
   obs: readonly PlayerBodyObservation[],
+  neededItems: readonly string[],
 ): CoherentPlanAcceptance {
   const actions = linked.filter(
     (s) =>
@@ -255,7 +271,11 @@ function replan(
     if (step.status === "successful" && wasPlanned(step, captures, afterAt)) {
       const before = find(obs, step.at, false);
       const after = find(obs, step.at, true);
-      if (before && after && changed(before, after))
+      if (
+        before &&
+        after &&
+        madeNeededProgress(step, before, after, neededItems)
+      )
         return result(true, "accepted_replan", linked);
     }
   for (let i = 1; i < actions.length; i++) {
@@ -336,15 +356,52 @@ function count(o: PlayerBodyObservation, item: string): number {
     .filter((stack) => stack.name === item)
     .reduce((sum, stack) => sum + stack.count, 0);
 }
-function changed(a: PlayerBodyObservation, b: PlayerBodyObservation): boolean {
-  const inv = (o: PlayerBodyObservation) =>
-    o.self.inventory
-      .map(({ name, count }) => `${name}:${count}`)
-      .sort()
-      .join("|");
-  return (
-    inv(a) !== inv(b) ||
-    fingerprint(a.self.equipment) !== fingerprint(b.self.equipment)
+function madeNeededProgress(
+  step: Linked,
+  before: PlayerBodyObservation,
+  after: PlayerBodyObservation,
+  neededItems: readonly string[],
+): boolean {
+  const gainedNeededItem = neededItems.some(
+    (item) => count(after, item) > count(before, item),
+  );
+  const operation = step.operation;
+  if (operation.kind === "dig")
+    return (
+      hasBlockAt(before, operation.position) &&
+      !hasBlockAt(after, operation.position) &&
+      gainedNeededItem
+    );
+  if (operation.kind === "equip")
+    return (
+      neededItems.includes(operation.item) &&
+      before.self.equipment[operation.destination]?.name !== operation.item &&
+      after.self.equipment[operation.destination]?.name === operation.item
+    );
+  if (operation.kind === "craft")
+    return (
+      neededItems.includes(operation.item) &&
+      count(after, operation.item) > count(before, operation.item)
+    );
+  if (operation.kind === "window_transfer")
+    return (
+      operation.direction === "window_to_inventory" &&
+      neededItems.includes(operation.item) &&
+      count(after, operation.item) > count(before, operation.item)
+    );
+  if (operation.kind === "collect_item" || operation.kind === "fish")
+    return gainedNeededItem;
+  return false;
+}
+function hasBlockAt(
+  observation: PlayerBodyObservation,
+  position: Extract<PlayerOperation, { kind: "dig" }>["position"],
+): boolean {
+  return observation.perception.blocks.some(
+    (block) =>
+      block.position.x === position.x &&
+      block.position.y === position.y &&
+      block.position.z === position.z,
   );
 }
 function fingerprint(value: unknown): string {
