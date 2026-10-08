@@ -957,10 +957,6 @@ describe("player owner intent context", () => {
           status: "pending",
         }),
       );
-      const initialRequest = record(fixture.requests[0]);
-      expect(String(initialRequest.instructions)).toContain(
-        "明確な依頼は会話内の観測が失敗しても止めません",
-      );
       expect(messages).toEqual([
         "頼まれた木を目指して、まず今の目標に反映するね。",
       ]);

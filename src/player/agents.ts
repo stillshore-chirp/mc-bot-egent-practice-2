@@ -3803,8 +3803,48 @@ function compactConversationSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
         ? null
         : {
             observedAt: snapshot.latestDeath.observedAt,
+            cause: snapshot.latestDeath.cause ?? null,
+            beforeObservation: compactConversationDeathObservation(
+              snapshot.latestDeath.beforeObservation,
+            ),
+            firstPostDeathObservation: compactConversationDeathObservation(
+              snapshot.latestDeath.firstPostDeathObservation,
+            ),
             recoveryStagesUsed: snapshot.latestDeath.recoveryStagesUsed ?? [],
           },
+  };
+}
+
+function compactConversationDeathObservation(
+  observation: PlayerObservationEvidence | undefined,
+): unknown {
+  if (observation === undefined) return null;
+  return {
+    observedAt: observation.observedAt,
+    dimension: observation.dimension,
+    position:
+      observation.position === undefined
+        ? null
+        : {
+            x: observation.position.x,
+            y: observation.position.y,
+            z: observation.position.z,
+            dimension: observation.position.dimension,
+          },
+    health: observation.health,
+    food: observation.food,
+    oxygen: observation.oxygen,
+    inWater: observation.inWater,
+    inLava: observation.inLava,
+    onFire: observation.onFire,
+    inventoryTotal: observation.inventoryTotal,
+    inventoryItems: observation.inventoryItems?.slice(0, 10) ?? [],
+    omittedInventoryItemCount: Math.max(
+      0,
+      (observation.inventoryItems?.length ?? 0) - 10,
+    ),
+    visibleBlockNames: observation.visibleBlockNames.slice(0, 6),
+    visibleEntityKinds: observation.visibleEntityKinds.slice(0, 6),
   };
 }
 

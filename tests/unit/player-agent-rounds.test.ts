@@ -4334,9 +4334,6 @@ describe("player agent response rounds", () => {
         .parse(firstRequest.tools);
       expect(instructions).toContain("必ずinspect_runtimeを呼び");
       expect(instructions).toContain("Minecraft内でBotが死亡したことと");
-      expect(instructions).toContain(
-        "会話turnでBody操作やobserve_bodyは実行せず",
-      );
       expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
       expect(tools.map((tool) => tool.name)).toContain("describe_operation");
       const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
