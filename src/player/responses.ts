@@ -183,7 +183,8 @@ export interface RunPlayerAgentInput {
   readonly finishAfterToolBatch?: boolean;
   /** Tracks only the provider HTTP wait, excluding tool and observation work. */
   readonly onResponsesRequestState?: (active: boolean) => void;
-  readonly maxRounds?: number;
+  /** Omitted keeps the legacy six-round limit; null lets the flow end naturally. */
+  readonly maxRounds?: number | null;
   /** Restrict a formatting-only request from invoking tools. */
   readonly toolChoice?: "auto" | "none";
   /** Reserve the final bounded round for a response without tool calls. */
@@ -285,7 +286,8 @@ export async function runPlayerAgent(
   const messages: ResponseInputItem[] = [
     { role: "user", content: input.input },
   ];
-  const maxRounds = input.maxRounds ?? 6;
+  const maxRounds =
+    input.maxRounds === null ? undefined : (input.maxRounds ?? 6);
   let calls = 0;
   let toolCalls = 0;
   let inputTokens = 0;
@@ -300,7 +302,11 @@ export async function runPlayerAgent(
     toolCalls,
   });
 
-  for (let round = 0; round < maxRounds; round += 1) {
+  for (
+    let round = 0;
+    maxRounds === undefined || round < maxRounds;
+    round += 1
+  ) {
     if (input.shouldStopAfterResponse?.() === true) return accumulatedResult();
     input.signal?.throwIfAborted();
     input.beforeCall?.();
@@ -318,7 +324,9 @@ export async function runPlayerAgent(
             input: messages,
             tools,
             tool_choice:
-              input.finalRoundToolChoice === "none" && round === maxRounds - 1
+              input.finalRoundToolChoice === "none" &&
+              maxRounds !== undefined &&
+              round === maxRounds - 1
                 ? "none"
                 : (input.toolChoice ?? "auto"),
             parallel_tool_calls: false,

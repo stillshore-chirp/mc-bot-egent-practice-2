@@ -1613,10 +1613,8 @@ export class PlayerConversationAgent {
         tools: request.responseOnly ? [] : tools,
         logger: this.options.logger,
         role: "conversation",
-        maxRounds: request.responseOnly ? 1 : 6,
-        ...(request.responseOnly
-          ? { toolChoice: "none" as const }
-          : { finalRoundToolChoice: "none" as const }),
+        maxRounds: null,
+        ...(request.responseOnly ? { toolChoice: "none" as const } : {}),
         onResponsesRequestState: (active) => {
           if (this.#activeTurn === input.turn)
             this.#activeRequestStartedAtMs = active ? Date.now() : undefined;
@@ -3167,7 +3165,7 @@ export class PlayerPurposeAgent {
             tools: [learningReviewTool],
             logger: this.options.logger,
             role: "purpose",
-            maxRounds: 1,
+            maxRounds: null,
             ...(this.options.beforeCall === undefined
               ? {}
               : { beforeCall: this.options.beforeCall }),
@@ -3187,8 +3185,9 @@ export class PlayerPurposeAgent {
             ...(this.options.onRoundActivity === undefined
               ? {}
               : { onRoundActivity: this.options.onRoundActivity }),
-            shouldFinishAfterTool: (toolName) =>
-              toolName === "propose_skill_learning",
+            shouldFinishAfterTool: (toolName, result) =>
+              toolName === "propose_skill_learning" &&
+              asRecord(result)?.ok === true,
           });
         await runLearningReview(learningInstructions, learningInput);
         if (input.shouldStopAfterResponse?.()) return { accepted: false };
@@ -3381,7 +3380,7 @@ export class PlayerPurposeAgent {
           ? {}
           : { beforeCall: this.options.beforeCall }),
         initialObservationChars: safeSerializedLength(decisionObservation),
-        ...(urgentFirstAction ? { maxRounds: 2 } : {}),
+        maxRounds: null,
         ...(this.options.trace === undefined
           ? {}
           : { trace: this.options.trace }),

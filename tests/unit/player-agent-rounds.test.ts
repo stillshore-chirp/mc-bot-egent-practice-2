@@ -743,6 +743,71 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("keeps a later owner intent reachable after more than six read rounds", async () => {
+    let proposalWakeCount = 0;
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        proposalWakeCount += 1;
+      },
+    );
+    for (let round = 0; round < 6; round += 1) {
+      fixture.responses.push(
+        conversationFunctionCallResponse(
+          `status-round-${round}`,
+          "inspect_player_status",
+          {},
+          round === 0 ? "今の目的を確かめてから進めるね。" : "",
+        ),
+      );
+    }
+    fixture.responses.push(
+      conversationFunctionCallResponse(
+        "intent-after-six-reads",
+        "propose_goal_change",
+        {
+          title: "Gather the requested supplies",
+          reason: "The owner explicitly asked for these supplies.",
+          priority: 4,
+        },
+        "頼まれた材料を目的に反映して進めるね。",
+      ),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "材料を集めて。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(7);
+      expect(
+        fixture.requests.every(
+          (request) =>
+            z.record(z.string(), z.unknown()).parse(request).tool_choice ===
+            "auto",
+        ),
+      ).toBe(true);
+      expect(proposalWakeCount).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the requested supplies",
+          status: "pending",
+        }),
+      );
+      expect(fixture.messages).toEqual([
+        "今の目的を確かめてから進めるね。",
+        "頼まれた材料を目的に反映して進めるね。",
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("honors cancellation before executing a pending conversation tool", async () => {
     const fixture = openConversationFixture();
     const controller = new AbortController();
