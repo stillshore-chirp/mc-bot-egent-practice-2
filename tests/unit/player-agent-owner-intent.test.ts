@@ -2306,6 +2306,102 @@ describe("player owner intent context", () => {
     }
   });
 
+  it("keeps active goals, the current plan goal, and recent terminal history once", () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+
+    try {
+      let snapshot = fixture.mind.snapshot();
+      const addGoal = (
+        id: string,
+        title: string,
+        status: PlayerGoal["status"],
+        source: PlayerGoal["source"],
+      ): PlayerGoal => {
+        const saved = fixture.mind.commitGoalState({
+          expectedRevision: snapshot.revision,
+          goal: {
+            id,
+            title,
+            status,
+            priority: 2,
+            changeReason: "A synthetic goal for compact projection coverage.",
+            source,
+          },
+        });
+        expect(saved.accepted).toBe(true);
+        snapshot = saved.snapshot;
+        const goal = snapshot.goals.find((candidate) => candidate.id === id);
+        if (goal === undefined) throw new Error("TEST_GOAL_NOT_SAVED");
+        return goal;
+      };
+
+      const oldOwnerGoal = addGoal(
+        "old-unlinked-owner",
+        "Continue the owner's request",
+        "active",
+        "owner",
+      );
+      const oldPlanGoal = addGoal(
+        "old-current-plan-self",
+        "Prepare the next step",
+        "active",
+        "self",
+      );
+      const oldPausedGoal = addGoal(
+        "old-paused-self",
+        "Keep the paused investigation",
+        "paused",
+        "self",
+      );
+
+      const recentGoals: PlayerGoal[] = [];
+      for (let index = 0; index < 12; index += 1) {
+        recentGoals.push(
+          addGoal(
+            `recent-goal-${index}`,
+            `Recent goal ${index}`,
+            index === 0 ? "completed" : index === 1 ? "abandoned" : "active",
+            "self",
+          ),
+        );
+      }
+
+      const withCurrentPlan: PlayerRuntimeSnapshot = {
+        ...snapshot,
+        actionPlan: {
+          id: "current-plan",
+          purpose: "Prepare the next step",
+          goalId: oldPlanGoal.id,
+          steps: [],
+        },
+      };
+      const projected = record(compactSnapshot(withCurrentPlan));
+      const projectedGoals = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(projected.goals);
+      const projectedIds = projectedGoals.map((goal) =>
+        z.string().parse(goal.id),
+      );
+      const expectedIds = new Set([
+        ...snapshot.goals
+          .filter(({ status }) => status === "active" || status === "paused")
+          .map(({ id }) => id),
+        ...snapshot.goals.slice(-12).map(({ id }) => id),
+        oldPlanGoal.id,
+      ]);
+
+      expect(new Set(projectedIds).size).toBe(projectedIds.length);
+      for (const id of expectedIds)
+        expect(projectedIds.includes(id)).toBe(true);
+      expect(projectedIds).toContain(oldOwnerGoal.id);
+      expect(projectedIds).toContain(oldPausedGoal.id);
+      expect(projectedIds).toContain(recentGoals[0]?.id);
+      expect(projectedIds).toContain(recentGoals[1]?.id);
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("allows owner-position observation only for pending or active linked intents", async () => {
     const ownerPositionExceptions: boolean[] = [];
     const fixture = openPurposeFixture(

@@ -3622,12 +3622,17 @@ export function compactSnapshot(snapshot: PlayerRuntimeSnapshot): unknown {
   const continuingOwnerGoals = snapshot.goals.filter(
     isContinuingLinkedOwnerGoal,
   );
-  const continuingOwnerGoalIds = new Set(
-    continuingOwnerGoals.map(({ id }) => id),
+  const activeOrPausedGoalIds = new Set(
+    snapshot.goals
+      .filter(({ status }) => status === "active" || status === "paused")
+      .map(({ id }) => id),
   );
   const includedGoalIds = new Set([
-    ...continuingOwnerGoalIds,
+    ...activeOrPausedGoalIds,
     ...snapshot.goals.slice(-12).map(({ id }) => id),
+    ...(snapshot.actionPlan?.goalId === undefined
+      ? []
+      : [snapshot.actionPlan.goalId]),
   ]);
   const continuingOwnerProposalIds = new Set(
     continuingOwnerGoals
