@@ -242,7 +242,12 @@ describe("player agent response rounds", () => {
     const conversation = new PlayerConversationAgent({
       client: scriptedClient(
         [
-          functionCallResponse("trace-failure-tool", "inspect_runtime", {}),
+          conversationFunctionCallResponse(
+            "trace-failure-tool",
+            "inspect_runtime",
+            {},
+            "今の処理状態を調べるね。",
+          ),
           terminalResponse("確認しました。"),
         ],
         requests,
@@ -284,17 +289,66 @@ describe("player agent response rounds", () => {
           );
         }),
       ).toHaveLength(1);
-      expect(sayCalls).toBe(1);
+      expect(sayCalls).toBe(2);
     } finally {
       mind.close();
     }
   });
 
-  it("reserves the last conversation round for a reply and retains tool results", async () => {
+  it.each([
+    ["empty completed response", terminalResponse("")],
+    [
+      "incomplete response",
+      {
+        status: "incomplete",
+        output: [],
+        output_text: "",
+        incomplete_details: { reason: "max_output_tokens" },
+      } as unknown as Response,
+    ],
+    [
+      "provider exception",
+      () => {
+        throw new Error("PROVIDER_UNAVAILABLE");
+      },
+    ],
+  ] as const)(
+    "does not leave the latest owner turn silent after %s",
+    async (_label, response) => {
+      const fixture = openConversationFixture();
+      fixture.responses.push(response);
+
+      try {
+        const turn = fixture.conversation.nextTurn();
+        const handling = fixture.conversation.handleOwnerMessage({
+          username: "owner",
+          message: "周りを見て、どう進めるか考えて。",
+          turn,
+        });
+        if (_label === "empty completed response") await handling;
+        else await expect(handling).rejects.toThrow();
+
+        expect(fixture.requests).toHaveLength(1);
+        expect(fixture.messages).toEqual([
+          "返事が途中で止まってしまった。今は確認できた結果として伝えられることがないので、もう一度頼んで。",
+        ]);
+        expect(fixture.messages.join(" ")).not.toMatch(
+          /完了|保存済み|見つけた/u,
+        );
+      } finally {
+        fixture.close();
+      }
+    },
+  );
+
+  it("returns a read-tool result in one bounded follow-up round", async () => {
     const fixture = openConversationFixture();
     fixture.responses.push(
-      ...Array.from({ length: 5 }, (_, index) =>
-        functionCallResponse(`runtime-${index}`, "inspect_runtime", {}),
+      conversationFunctionCallResponse(
+        "runtime-0",
+        "inspect_runtime",
+        {},
+        "今の動作状態を確かめるね。",
       ),
       terminalResponse("状態を確認しました。"),
     );
@@ -307,23 +361,22 @@ describe("player agent response rounds", () => {
         turn,
       });
 
-      expect(fixture.requests).toHaveLength(6);
-      expect(fixture.messages).toEqual(["状態を確認しました。"]);
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.messages).toEqual([
+        "今の動作状態を確かめるね。",
+        "状態を確認しました。",
+      ]);
       const requests = fixture.requests.map((request) =>
         z.record(z.string(), z.unknown()).parse(request),
       );
       expect(requests.map(({ tool_choice }) => tool_choice)).toEqual([
         "auto",
         "auto",
-        "auto",
-        "auto",
-        "auto",
-        "none",
       ]);
       expect(requests.map(({ reasoning }) => reasoning)).toEqual(
-        Array.from({ length: 6 }, () => ({ effort: "none" })),
+        Array.from({ length: 2 }, () => ({ effort: "none" })),
       );
-      expect(fixture.requestOptions).toHaveLength(6);
+      expect(fixture.requestOptions).toHaveLength(2);
       expect(
         fixture.requestOptions.every(
           (options) =>
@@ -335,10 +388,287 @@ describe("player agent response rounds", () => {
       ).toBe(true);
       const finalInput = z
         .array(z.record(z.string(), z.unknown()))
-        .parse(requests[5]?.input);
+        .parse(requests[1]?.input);
       expect(
         finalInput.filter(({ type }) => type === "function_call_output"),
-      ).toHaveLength(5);
+      ).toHaveLength(1);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("sends a model-authored intent before awaiting its observation tool", async () => {
+    let resolveObservation:
+      ((observation: PlayerBodyObservation) => void) | undefined;
+    let observationStarted = false;
+    const pendingObservation = new Promise<PlayerBodyObservation>((resolve) => {
+      resolveObservation = resolve;
+    });
+    const fixture = openConversationFixture(undefined, () => {
+      observationStarted = true;
+      return pendingObservation;
+    });
+    const firstResponse = conversationFunctionCallResponse(
+      "early-observation",
+      "observe_body",
+      {},
+      "まず周りの状態を確かめるね。",
+    );
+    fixture.responses.push(
+      {
+        ...firstResponse,
+        output_text: "まず周りの状態を確かめるね。",
+      },
+      terminalResponse("観測できた状態を確認したよ。"),
+    );
+
+    try {
+      const turn = fixture.conversation.nextTurn();
+      const handling = fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "周りの状態を見て。",
+        turn,
+      });
+      await vi.waitFor(() => expect(observationStarted).toBe(true));
+      const messagesBeforeObservation = [...fixture.messages];
+      resolveObservation?.(bodyObservationFixture());
+      await handling;
+
+      expect(messagesBeforeObservation).toEqual([
+        "まず周りの状態を確かめるね。",
+      ]);
+      expect(fixture.messages).toEqual([
+        "まず周りの状態を確かめるね。",
+        "観測できた状態を確認したよ。",
+      ]);
+      const firstRequest = z
+        .record(z.string(), z.unknown())
+        .parse(fixture.requests[0]);
+      const tool = z
+        .array(z.record(z.string(), z.unknown()))
+        .parse(firstRequest.tools)
+        .find(({ name }) => name === "observe_body");
+      const parameters = z
+        .record(z.string(), z.unknown())
+        .parse(tool?.parameters);
+      expect(parameters.required).toContain("ownerReply");
+      expect(parameters.properties).toHaveProperty("ownerReply");
+    } finally {
+      resolveObservation?.(bodyObservationFixture());
+      fixture.close();
+    }
+  });
+
+  it("delivers tool-only owner intent before a slow Body observation", async () => {
+    let resolveObservation:
+      ((observation: PlayerBodyObservation) => void) | undefined;
+    let observationStarted = false;
+    const pendingObservation = new Promise<PlayerBodyObservation>((resolve) => {
+      resolveObservation = resolve;
+    });
+    const fixture = openConversationFixture(undefined, () => {
+      observationStarted = true;
+      return pendingObservation;
+    });
+    fixture.responses.push(
+      conversationFunctionCallResponse(
+        "tool-only-observation",
+        "observe_body",
+        {},
+        "今の周りを確かめて、分かったことを伝えるね。",
+      ),
+      terminalResponse("観測できた状態を確認したよ。"),
+    );
+
+    try {
+      const handling = fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "周りの状態を見て。",
+        turn: fixture.conversation.nextTurn(),
+      });
+      await vi.waitFor(() => expect(observationStarted).toBe(true));
+
+      expect(fixture.messages).toEqual([
+        "今の周りを確かめて、分かったことを伝えるね。",
+      ]);
+      resolveObservation?.(bodyObservationFixture());
+      await handling;
+      expect(fixture.requests).toHaveLength(2);
+      expect(fixture.messages).toEqual([
+        "今の周りを確かめて、分かったことを伝えるね。",
+        "観測できた状態を確認したよ。",
+      ]);
+    } finally {
+      resolveObservation?.(bodyObservationFixture());
+      fixture.close();
+    }
+  });
+
+  it("hands an explicit owner goal to Purpose in the same reply response", async () => {
+    let proposalWakeCount = 0;
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        proposalWakeCount += 1;
+      },
+    );
+    fixture.responses.push(
+      conversationFunctionCallResponse(
+        "owner-goal",
+        "propose_goal_change",
+        {
+          title: "Gather the requested materials",
+          reason: "The owner requested the materials for a build.",
+          priority: 4,
+        },
+        "必要な材料を目指して、まず今の目標に反映するね。",
+      ),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "建築に必要な材料を集めて。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.messages).toEqual([
+        "必要な材料を目指して、まず今の目標に反映するね。",
+      ]);
+      expect(proposalWakeCount).toBe(1);
+      expect(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[0])
+          .tool_choice,
+      ).toBe("auto");
+      expect(fixture.mind.snapshot().proposals).toMatchObject([
+        { title: "Gather the requested materials", status: "pending" },
+      ]);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("finishes every intent tool returned in one Conversation response", async () => {
+    let proposalWakeCount = 0;
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        proposalWakeCount += 1;
+      },
+    );
+    fixture.responses.push(
+      multiConversationFunctionCallResponse([
+        {
+          callId: "proposal-in-batch",
+          name: "propose_goal_change",
+          argumentsValue: {
+            title: "Gather the requested supplies",
+            reason: "The owner wants the supplies collected.",
+            priority: 4,
+          },
+          ownerReply:
+            "集める依頼を目的に反映し、次にも役立つ希望を覚えておくね。",
+        },
+        {
+          callId: "fact-in-batch",
+          name: "remember_owner_fact",
+          argumentsValue: { summary: "The owner prefers concise replies" },
+          ownerReply: "短く答える希望も覚えておくね。",
+        },
+      ]),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "材料を集めて。次からは短く答えてね。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(1);
+      expect(proposalWakeCount).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the requested supplies",
+          status: "pending",
+        }),
+      );
+      expect(fixture.mind.snapshot().stateFacts).toContainEqual(
+        expect.objectContaining({
+          kind: "fact",
+          source: "owner",
+          summary: "The owner prefers concise replies",
+        }),
+      );
+      expect(fixture.messages).toEqual([
+        "集める依頼を目的に反映し、次にも役立つ希望を覚えておくね。",
+      ]);
+      expect(fixture.messages.join(" ")).not.toMatch(/保存した|集め終えた/u);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps an owner action available after a first-round status read", async () => {
+    let proposalWakeCount = 0;
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        proposalWakeCount += 1;
+      },
+    );
+    fixture.responses.push(
+      conversationFunctionCallResponse(
+        "status-before-action",
+        "inspect_player_status",
+        {},
+        "まず今の目的を確かめるね。",
+      ),
+      conversationFunctionCallResponse(
+        "action-after-status",
+        "propose_goal_change",
+        {
+          title: "Gather the requested supplies",
+          reason: "The owner explicitly asked for these supplies.",
+          priority: 4,
+        },
+        "頼まれた材料を目指して、今の目的に反映するね。",
+      ),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "材料を集めて。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      expect(fixture.requests).toHaveLength(2);
+      expect(
+        z.record(z.string(), z.unknown()).parse(fixture.requests[1])
+          .tool_choice,
+      ).toBe("auto");
+      expect(proposalWakeCount).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the requested supplies",
+          status: "pending",
+        }),
+      );
+      expect(fixture.messages).toEqual([
+        "まず今の目的を確かめるね。",
+        "頼まれた材料を目指して、今の目的に反映するね。",
+      ]);
     } finally {
       fixture.close();
     }
@@ -398,12 +728,15 @@ describe("player agent response rounds", () => {
     let admittedCalls = 0;
     const fixture = openConversationFixture(() => {
       admittedCalls += 1;
-      if (admittedCalls > 6) throw new Error("CALL_BUDGET_EXHAUSTED");
+      if (admittedCalls > 2) throw new Error("CALL_BUDGET_EXHAUSTED");
     });
     const longReply = "長い回答です。".repeat(40);
     fixture.responses.push(
-      ...Array.from({ length: 5 }, (_, index) =>
-        functionCallResponse(`runtime-long-${index}`, "inspect_runtime", {}),
+      conversationFunctionCallResponse(
+        "runtime-long",
+        "inspect_runtime",
+        {},
+        "詳しく説明するため、今の状態を確かめるね。",
       ),
       terminalResponse(longReply),
     );
@@ -416,14 +749,17 @@ describe("player agent response rounds", () => {
         turn,
       });
 
-      expect(admittedCalls).toBe(6);
-      expect(fixture.requests).toHaveLength(6);
+      expect(admittedCalls).toBe(2);
+      expect(fixture.requests).toHaveLength(2);
       expect(
-        z.record(z.string(), z.unknown()).parse(fixture.requests[5])
+        z.record(z.string(), z.unknown()).parse(fixture.requests[1])
           .tool_choice,
-      ).toBe("none");
-      expect(fixture.messages).toHaveLength(2);
-      expect(fixture.messages.join("")).toBe(longReply);
+      ).toBe("auto");
+      expect(fixture.messages).toHaveLength(3);
+      expect(fixture.messages[0]).toBe(
+        "詳しく説明するため、今の状態を確かめるね。",
+      );
+      expect(fixture.messages.slice(1).join("")).toBe(longReply);
       expect(fixture.messages.every((message) => message.length <= 240)).toBe(
         true,
       );
@@ -3921,7 +4257,12 @@ describe("player agent response rounds", () => {
     const mind = PlayerMindStore.open(join(directory, "player.sqlite"));
     const requests: unknown[] = [];
     const responses = [
-      functionCallResponse("runtime-check", "inspect_runtime", {}),
+      conversationFunctionCallResponse(
+        "runtime-check",
+        "inspect_runtime",
+        {},
+        "今の処理状態を調べるね。",
+      ),
       terminalResponse("現在の処理状態を確認しました。"),
     ];
     const client = scriptedClient(responses, requests);
@@ -3981,7 +4322,10 @@ describe("player agent response rounds", () => {
         turn,
       });
 
-      expect(messages).toEqual(["現在の処理状態を確認しました。"]);
+      expect(messages).toEqual([
+        "今の処理状態を調べるね。",
+        "現在の処理状態を確認しました。",
+      ]);
       expect(requests).toHaveLength(2);
       const firstRequest = z.record(z.string(), z.unknown()).parse(requests[0]);
       const instructions = z.string().parse(firstRequest.instructions);
@@ -3990,7 +4334,9 @@ describe("player agent response rounds", () => {
         .parse(firstRequest.tools);
       expect(instructions).toContain("必ずinspect_runtimeを呼び");
       expect(instructions).toContain("Minecraft内でBotが死亡したことと");
-      expect(instructions).toContain("会話turnでBody操作toolを使わない時も");
+      expect(instructions).toContain(
+        "会話turnでBody操作やobserve_bodyは実行せず",
+      );
       expect(tools.map((tool) => tool.name)).toContain("inspect_runtime");
       expect(tools.map((tool) => tool.name)).toContain("describe_operation");
       const followup = z.record(z.string(), z.unknown()).parse(requests[1]);
@@ -4249,12 +4595,12 @@ describe("player agent response rounds", () => {
     const fixture = openConversationFixture();
     const fact = "合言葉は maple-47";
     fixture.responses.push(
-      functionCallResponse("remember-once", "remember_owner_fact", {
-        summary: fact,
-      }),
-      functionCallResponse("remember-again", "remember_owner_fact", {
-        summary: " 合言葉は   maple-47 ",
-      }),
+      conversationFunctionCallResponse(
+        "remember-once",
+        "remember_owner_fact",
+        { summary: fact },
+        "次にも役立つようにこの内容を覚えておくね。",
+      ),
       terminalResponse("合言葉を記憶しました。"),
     );
     const initialRevision = fixture.mind.snapshot().revision;
@@ -4279,7 +4625,10 @@ describe("player agent response rounds", () => {
         }),
       );
       expect(saved.revision).toBe(initialRevision + 1);
-      expect(fixture.messages).toEqual(["合言葉を記憶しました。"]);
+      expect(fixture.messages).toEqual([
+        "次にも役立つようにこの内容を覚えておくね。",
+        "合言葉を記憶しました。",
+      ]);
 
       const tool = z
         .array(z.record(z.string(), z.unknown()))
@@ -4292,13 +4641,13 @@ describe("player agent response rounds", () => {
         .record(z.string(), z.unknown())
         .parse(fixture.requests[0]);
       expect(request.instructions).toContain(
-        "返答を作る前にremember_owner_factを必ず呼び",
+        "tool前のownerReplyでは覚える意向だけを伝え",
       );
       expect(request.instructions).toContain(
         "toolを呼ばなかった、または成功を確認できなかった場合は、保存した・覚えたと表現しない",
       );
       expect(JSON.stringify(tool?.parameters)).toContain(
-        '"required":["summary"]',
+        '"required":["summary","ownerReply"]',
       );
       expect(JSON.stringify(tool?.parameters)).not.toContain('"source"');
 
@@ -4368,9 +4717,12 @@ describe("player agent response rounds", () => {
     const fixture = openConversationFixture();
     const message = "次回覚えてください。合言葉は maple-47 です。";
     fixture.responses.push(
-      functionCallResponse("verbatim-fact", "remember_owner_fact", {
-        summary: message,
-      }),
+      conversationFunctionCallResponse(
+        "verbatim-fact",
+        "remember_owner_fact",
+        { summary: message },
+        "内容を短くして記録できるか確かめるね。",
+      ),
     );
 
     try {
@@ -4382,6 +4734,7 @@ describe("player agent response rounds", () => {
       });
       expect(fixture.mind.snapshot().stateFacts).toHaveLength(0);
       expect(fixture.messages).toEqual([
+        "内容を短くして記録できるか確かめるね。",
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
       ]);
     } finally {
@@ -4397,17 +4750,23 @@ describe("player agent response rounds", () => {
         failure === "stopped"
           ? () => {
               fixture.mind.stop();
-              return functionCallResponse(
+              return conversationFunctionCallResponse(
                 "rejected-fact",
                 "remember_owner_fact",
                 {
                   summary: `rejected ${failure} fact`,
                 },
+                "次にも役立つように記憶できるか確認するね。",
               );
             }
-          : functionCallResponse("rejected-fact", "remember_owner_fact", {
-              summary: `rejected ${failure} fact`,
-            }),
+          : conversationFunctionCallResponse(
+              "rejected-fact",
+              "remember_owner_fact",
+              {
+                summary: `rejected ${failure} fact`,
+              },
+              "次にも役立つように記憶できるか確認するね。",
+            ),
       );
       if (failure === "stale CAS") {
         const commitUnderstanding = fixture.mind.commitUnderstanding.bind(
@@ -4431,6 +4790,7 @@ describe("player agent response rounds", () => {
           failure === "stopped"
             ? []
             : [
+                "次にも役立つように記憶できるか確認するね。",
                 "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
               ],
         );
@@ -5993,6 +6353,7 @@ function openConversationFixture(
   observeBody?: () => Promise<PlayerBodyObservation>,
   onSay?: (text: string) => void | Promise<void>,
   trace?: TraceService,
+  onProposal?: () => void,
 ): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
@@ -6017,7 +6378,7 @@ function openConversationFixture(
       messages.push(text);
       await onSay?.(text);
     },
-    onProposal: () => undefined,
+    onProposal: onProposal ?? (() => undefined),
     onStop: async () => undefined,
     onResume: () => undefined,
   });
@@ -6082,6 +6443,39 @@ function functionCallResponse(
         arguments: JSON.stringify(argumentsWithPlan),
       },
     ],
+    output_text: "",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  } as unknown as Response;
+}
+
+function conversationFunctionCallResponse(
+  callId: string,
+  name: string,
+  argumentsValue: Record<string, unknown>,
+  ownerReply: string,
+): Response {
+  return functionCallResponse(callId, name, {
+    ...argumentsValue,
+    ownerReply,
+  });
+}
+
+function multiConversationFunctionCallResponse(
+  calls: readonly {
+    readonly callId: string;
+    readonly name: string;
+    readonly argumentsValue: Record<string, unknown>;
+    readonly ownerReply: string;
+  }[],
+): Response {
+  return {
+    status: "completed",
+    output: calls.map(({ callId, name, argumentsValue, ownerReply }) => ({
+      type: "function_call",
+      call_id: callId,
+      name,
+      arguments: JSON.stringify({ ...argumentsValue, ownerReply }),
+    })),
     output_text: "",
     usage: { input_tokens: 1, output_tokens: 1 },
   } as unknown as Response;

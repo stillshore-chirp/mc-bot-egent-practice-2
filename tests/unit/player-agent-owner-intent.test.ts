@@ -689,7 +689,12 @@ describe("player owner intent context", () => {
       onResume: () => undefined,
     });
     fixture.responses.push(
-      functionCallResponse("observe-enemies", "observe_body", {}),
+      conversationFunctionCallResponse(
+        "observe-enemies",
+        "observe_body",
+        {},
+        "周りの候補を確かめるね。",
+      ),
       terminalResponse("視界内にゾンビがいます。"),
     );
 
@@ -829,7 +834,10 @@ describe("player owner intent context", () => {
       expect(serializedOutput).not.toContain("private-player-name");
       expect(serializedOutput).not.toContain('"position"');
       expect(serializedOutput).not.toContain('"id"');
-      expect(messages).toEqual(["視界内にゾンビがいます。"]);
+      expect(messages).toEqual([
+        "周りの候補を確かめるね。",
+        "視界内にゾンビがいます。",
+      ]);
     } finally {
       fixture.close();
     }
@@ -858,7 +866,12 @@ describe("player owner intent context", () => {
       onResume: () => undefined,
     });
     fixture.responses.push(
-      functionCallResponse("retry-observation", "observe_body", {}),
+      conversationFunctionCallResponse(
+        "retry-observation",
+        "observe_body",
+        {},
+        "周りの状態を確認するね。",
+      ),
       terminalResponse("I checked again and have a fresh view."),
     );
 
@@ -888,8 +901,9 @@ describe("player owner intent context", () => {
     }
   });
 
-  it("still wakes Purpose for an actionable request after both fresh observations fail", async () => {
+  it("routes an actionable request to Purpose without spending Conversation rounds on observations", async () => {
     const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
     let attempts = 0;
     let proposalWakeups = 0;
     const conversation = new PlayerConversationAgent({
@@ -904,7 +918,9 @@ describe("player owner intent context", () => {
         attempts += 1;
         throw new Error("OBSERVATION_UNAVAILABLE");
       },
-      say: async () => undefined,
+      say: async (message) => {
+        messages.push(message);
+      },
       onProposal: () => {
         proposalWakeups += 1;
       },
@@ -912,15 +928,16 @@ describe("player owner intent context", () => {
       onResume: () => undefined,
     });
     fixture.responses.push(
-      functionCallResponse("failed-observation", "observe_body", {}),
-      functionCallResponse("continue-owner-intent", "propose_goal_change", {
-        title: "Gather the wood the owner meant",
-        reason:
-          "The owner asked me to gather the wood discussed earlier; I should use a fresh observation and choose the first step.",
-        priority: 4,
-      }),
-      terminalResponse(
-        "観測を再試行しました。木を集める目的は続けて進めます。",
+      conversationFunctionCallResponse(
+        "continue-owner-intent",
+        "propose_goal_change",
+        {
+          title: "Gather the wood the owner meant",
+          reason:
+            "The owner asked me to gather the wood discussed earlier; Purpose can use a fresh observation and choose the first step.",
+          priority: 4,
+        },
+        "頼まれた木を目指して、まず今の目標に反映するね。",
       ),
     );
 
@@ -931,8 +948,9 @@ describe("player owner intent context", () => {
         turn: conversation.nextTurn(),
       });
 
-      expect(attempts).toBe(2);
+      expect(attempts).toBe(0);
       expect(proposalWakeups).toBe(1);
+      expect(fixture.requests).toHaveLength(1);
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({
           title: "Gather the wood the owner meant",
@@ -941,17 +959,11 @@ describe("player owner intent context", () => {
       );
       const initialRequest = record(fixture.requests[0]);
       expect(String(initialRequest.instructions)).toContain(
-        "明確な依頼は観測失敗だけを理由に放置しません",
+        "明確な依頼は会話内の観測が失敗しても止めません",
       );
-      const continuation = record(fixture.requests[1]);
-      if (!Array.isArray(continuation.input))
-        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
-      const observationOutput = continuation.input
-        .map(record)
-        .find(({ type }) => type === "function_call_output");
-      expect(String(observationOutput?.output)).toContain(
-        '"freshRetryExhausted":true',
-      );
+      expect(messages).toEqual([
+        "頼まれた木を目指して、まず今の目標に反映するね。",
+      ]);
     } finally {
       fixture.close();
     }
@@ -983,10 +995,11 @@ describe("player owner intent context", () => {
     const reason =
       "The route keeps returning to the blocked entrance; reconsider how to reach the existing collection goal.";
     fixture.responses.push(
-      functionCallResponse(
+      conversationFunctionCallResponse(
         "reassess-current-plan",
         "reassess_my_current_plan",
         { reason },
+        "同じ行き止まりを避ける方法を見直すね。",
       ),
       terminalResponse(
         "That route is stuck. I will check the area again and try another way.",
@@ -1004,25 +1017,11 @@ describe("player owner intent context", () => {
       expect(reassessmentReasons).toEqual([reason]);
       expect(fixture.mind.snapshot().goals).toEqual([]);
       expect(fixture.mind.snapshot().proposals).toEqual([]);
-      expect(messages).toEqual([
-        "That route is stuck. I will check the area again and try another way.",
-      ]);
+      expect(messages).toEqual(["同じ行き止まりを避ける方法を見直すね。"]);
+      expect(fixture.requests).toHaveLength(1);
       expect(String(record(fixture.requests[0]).instructions)).toContain(
         "reassess_my_current_plan",
       );
-      const continuation = record(fixture.requests[1]);
-      if (!Array.isArray(continuation.input))
-        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
-      const toolOutput = continuation.input
-        .map(record)
-        .find(({ type }) => type === "function_call_output");
-      expect(JSON.parse(String(toolOutput?.output))).toMatchObject({
-        ok: true,
-        requested: true,
-        alreadyRequested: false,
-        goalChanged: false,
-        bodyCancelled: false,
-      });
     } finally {
       conversation.finishTurn(turn);
       fixture.close();
@@ -1062,9 +1061,12 @@ describe("player owner intent context", () => {
         markRequestStarted();
         return pendingResponse;
       },
-      functionCallResponse("stopped-reassessment", "reassess_my_current_plan", {
-        reason: "Owner feedback asks me to reconsider the current route.",
-      }),
+      conversationFunctionCallResponse(
+        "stopped-reassessment",
+        "reassess_my_current_plan",
+        { reason: "Owner feedback asks me to reconsider the current route." },
+        "今の進め方を見直すね。",
+      ),
       terminalResponse("I heard you."),
     );
     const staleTurn = conversation.nextTurn();
@@ -1159,32 +1161,46 @@ describe("player owner intent context", () => {
     {
       name: "a committed owner proposal",
       ownerMessage: "近くの木を集めてください。",
-      response: functionCallResponse("gather-proposal", "propose_goal_change", {
-        title: "Gather nearby wood",
-        reason: "The owner asked me to gather wood.",
-        priority: 3,
-      }),
-      replyAllowed: true,
+      response: conversationFunctionCallResponse(
+        "gather-proposal",
+        "propose_goal_change",
+        {
+          title: "Gather nearby wood",
+          reason: "The owner asked me to gather wood.",
+          priority: 3,
+        },
+        "近くの木を集める目的に反映するね。",
+      ),
+      expectedRequests: 1,
+      expectedReply: "近くの木を集める目的に反映するね。",
     },
     {
       name: "a saved owner fact",
       ownerMessage: "次回から短い文章で答えてください。",
-      response: functionCallResponse("save-owner-fact", "remember_owner_fact", {
-        summary: "The owner prefers concise replies",
-      }),
-      replyAllowed: true,
+      response: conversationFunctionCallResponse(
+        "save-owner-fact",
+        "remember_owner_fact",
+        { summary: "The owner prefers concise replies" },
+        "次から読みやすく答えられるよう覚えておくね。",
+      ),
+      expectedRequests: 2,
+      expectedReply: "次から読みやすく答えられるよう覚えておくね。",
     },
     {
       name: "a committed stop request",
       ownerMessage: "自律行動を止めてください。",
-      response: functionCallResponse("stop-autonomy", "stop_autonomy", {
-        reason: "The owner requested a pause.",
-      }),
-      replyAllowed: false,
+      response: conversationFunctionCallResponse(
+        "stop-autonomy",
+        "stop_autonomy",
+        { reason: "The owner requested a pause." },
+        "自律行動を止めるね。",
+      ),
+      expectedRequests: 1,
+      expectedReply: "自律行動を止めるね。",
     },
   ])(
-    "delivers existing tool results without another call and respects $name stop boundary",
-    async ({ ownerMessage, response, replyAllowed }) => {
+    "delivers intent before tool work and limits follow-up to $name",
+    async ({ ownerMessage, response, expectedRequests, expectedReply }) => {
       const fixture = openPurposeFixture(createMemoryPort());
       const messages: string[] = [];
       const conversation = new PlayerConversationAgent({
@@ -1212,9 +1228,13 @@ describe("player owner intent context", () => {
           turn: conversation.nextTurn(),
         });
 
-        expect(fixture.requests).toHaveLength(replyAllowed ? 2 : 1);
-        if (replyAllowed) {
+        expect(fixture.requests).toHaveLength(expectedRequests);
+        expect(messages[0]).toBe(expectedReply);
+        const initialRequest = record(fixture.requests[0]);
+        expect(initialRequest.tool_choice).toBe("auto");
+        if (expectedRequests === 2) {
           const followup = record(fixture.requests[1]);
+          expect(followup.tool_choice).toBe("auto");
           const followupInput = Array.isArray(followup.input)
             ? followup.input
             : [];
@@ -1222,12 +1242,13 @@ describe("player owner intent context", () => {
             .map((item) => record(item))
             .filter(({ type }) => type === "function_call_output");
           expect(toolOutputs).toHaveLength(1);
-          expect(messages.join("")).toBe(draft);
-          expect(messages.length).toBeGreaterThan(1);
+          expect(messages.slice(1).join("")).toBe(draft);
+          expect(messages.length).toBeGreaterThan(2);
           expect(messages.every((message) => message.length <= 240)).toBe(true);
         } else {
-          expect(fixture.mind.snapshot().stopped).toBe(true);
-          expect(messages).toEqual([]);
+          if (ownerMessage === "自律行動を止めてください。")
+            expect(fixture.mind.snapshot().stopped).toBe(true);
+          expect(messages).toEqual([expectedReply]);
         }
       } finally {
         fixture.close();
@@ -1269,13 +1290,15 @@ describe("player owner intent context", () => {
       });
 
       fixture.responses.push(
-        functionCallResponse("meal-proposal", "propose_goal_change", {
-          title: "Eat one of the foods the owner mentioned",
-          reason:
-            "The owner is now asking me to eat one of the foods from the recent conversation.",
-          priority: 3,
-        }),
-        terminalResponse(
+        conversationFunctionCallResponse(
+          "meal-proposal",
+          "propose_goal_change",
+          {
+            title: "Eat one of the foods the owner mentioned",
+            reason:
+              "The owner is now asking me to eat one of the foods from the recent conversation.",
+            priority: 3,
+          },
           "I understand you want me to eat one now. I will check what is available before deciding how to proceed.",
         ),
       );
@@ -1306,20 +1329,11 @@ describe("player owner intent context", () => {
       expect(String(secondRequest.instructions)).toContain(
         "owner向け進捗では内部案の提出・共有ではなく、理解した具体的な条件と自分がまず試すことを一人称の未来の意向として伝えます",
       );
-      expect(String(secondRequest.instructions)).not.toContain("Purposeが");
-      expect(String(secondRequest.instructions)).not.toContain("Purposeへ");
+      expect(messages[1]).not.toContain("Purposeが");
+      expect(messages[1]).not.toContain("Purposeへ");
       expect(proposalWakeups).toBe(1);
-      const proposalContinuation = record(fixture.requests[2]);
-      if (!Array.isArray(proposalContinuation.input))
-        throw new Error("TEST_EXPECTED_RESPONSES_INPUT_ITEMS");
-      const proposalOutput = proposalContinuation.input
-        .map(record)
-        .find(({ type }) => type === "function_call_output");
-      expect(JSON.parse(String(proposalOutput?.output))).toMatchObject({
-        ok: true,
-        proposalStatus: "pending",
-        title: "Eat one of the foods the owner mentioned",
-      });
+      expect(fixture.requests).toHaveLength(2);
+      expect(secondRequest.tool_choice).toBe("auto");
       expect(fixture.mind.snapshot().goals).toEqual([]);
       expect(fixture.mind.snapshot().proposals).toContainEqual(
         expect.objectContaining({
@@ -1431,7 +1445,12 @@ describe("player owner intent context", () => {
       onResume: () => undefined,
     });
     fixture.responses.push(
-      functionCallResponse("refresh-observe", "observe_body", {}),
+      conversationFunctionCallResponse(
+        "refresh-observe",
+        "observe_body",
+        {},
+        "まず周囲を確認してから考えるね。",
+      ),
       async () => {
         const current = fixture.mind.snapshot();
         const changed = fixture.mind.commitGoalState({
@@ -1464,6 +1483,7 @@ describe("player owner intent context", () => {
 
       expect(fixture.requests).toHaveLength(3);
       expect(messages).toEqual([
+        "まず周囲を確認してから考えるね。",
         "I have taken the shelter logs as my active goal.",
       ]);
       const refreshedRequest = record(fixture.requests[2]);
@@ -1482,7 +1502,7 @@ describe("player owner intent context", () => {
         "『何が欲しい』『何をしたい』",
       );
       expect(String(initialRequest.instructions)).toContain(
-        "inspect_player_statusやobserve_bodyを使い",
+        "状態質問には必要ならinspect_player_statusやobserve_body",
       );
       expect(refreshedInputText).toContain("Gather a few logs for the shelter");
       expect(refreshedInputText).toContain(observedAt);
@@ -1496,6 +1516,64 @@ describe("player owner intent context", () => {
       expect(String(refreshedRequest.instructions)).toContain(
         "snapshot以降の実行状況が不明なら",
       );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("sends an honest fallback when a changed-state reply refresh fails", async () => {
+    const fixture = openPurposeFixture(createMemoryPort());
+    const messages: string[] = [];
+    const conversation = new PlayerConversationAgent({
+      client: scriptedClient(fixture.responses, fixture.requests),
+      apiKey: "test-only",
+      model: "test-model",
+      ownerUsername: "owner",
+      mind: fixture.mind,
+      memory: createMemoryPort(),
+      logger: pino({ level: "silent" }),
+      say: async (message) => {
+        messages.push(message);
+      },
+      onProposal: () => undefined,
+      onStop: async () => undefined,
+      onResume: () => undefined,
+    });
+    fixture.responses.push(
+      async () => {
+        const current = fixture.mind.snapshot();
+        const changed = fixture.mind.commitGoalState({
+          expectedRevision: current.revision,
+          goal: {
+            title: "Find shelter wood",
+            status: "active",
+            priority: 2,
+            changeReason: "The current goal changed while I was replying.",
+            source: "owner",
+          },
+        });
+        expect(changed.accepted).toBe(true);
+        return terminalResponse("The previous goal is still active.");
+      },
+      () => {
+        throw new Error("REFRESH_PROVIDER_UNAVAILABLE");
+      },
+    );
+
+    try {
+      await expect(
+        conversation.handleOwnerMessage({
+          username: "owner",
+          message: "What goal are you working on?",
+          turn: conversation.nextTurn(),
+        }),
+      ).rejects.toThrow("REFRESH_PROVIDER_UNAVAILABLE");
+
+      expect(fixture.requests).toHaveLength(2);
+      expect(messages).toEqual([
+        "返事が途中で止まってしまった。今は確認できた結果として伝えられることがないので、もう一度頼んで。",
+      ]);
+      expect(messages).not.toContain("The previous goal is still active.");
     } finally {
       fixture.close();
     }
@@ -1532,10 +1610,11 @@ describe("player owner intent context", () => {
         },
       });
       expect(changed.accepted).toBe(true);
-      return functionCallResponse(
+      return conversationFunctionCallResponse(
         "inspect-current-status",
         "inspect_player_status",
         {},
+        "今の目標を確認するね。",
       );
     }, terminalResponse("I am working toward finding shelter wood."));
 
@@ -1547,7 +1626,10 @@ describe("player owner intent context", () => {
       });
 
       expect(fixture.requests).toHaveLength(2);
-      expect(messages).toEqual(["I am working toward finding shelter wood."]);
+      expect(messages).toEqual([
+        "今の目標を確認するね。",
+        "I am working toward finding shelter wood.",
+      ]);
     } finally {
       fixture.close();
     }
@@ -1645,10 +1727,11 @@ describe("player owner intent context", () => {
     {
       name: "an owner-fact refusal whose send fails",
       ownerMessage: "Remember this for next time",
-      response: functionCallResponse(
+      response: conversationFunctionCallResponse(
         "verbatim-fact-summary",
         "remember_owner_fact",
         { summary: "Remember this for next time" },
+        "次にも役立つように、内容を短くして覚えるね。",
       ),
       reply:
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
@@ -1658,10 +1741,11 @@ describe("player owner intent context", () => {
     {
       name: "an owner-fact refusal whose send succeeds",
       ownerMessage: "Remember this for next time",
-      response: functionCallResponse(
+      response: conversationFunctionCallResponse(
         "verbatim-fact-summary",
         "remember_owner_fact",
         { summary: "Remember this for next time" },
+        "次にも役立つように、内容を短くして覚えるね。",
       ),
       reply:
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
@@ -2540,6 +2624,18 @@ function functionCallResponse(
     output_text: "",
     usage,
   } as unknown as Response;
+}
+
+function conversationFunctionCallResponse(
+  callId: string,
+  name: string,
+  argumentsValue: Record<string, unknown>,
+  ownerReply: string,
+): Response {
+  return functionCallResponse(callId, name, {
+    ...argumentsValue,
+    ownerReply,
+  });
 }
 
 function responseUsage(
