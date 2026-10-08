@@ -94,7 +94,7 @@ describe("Responses server-side compaction", () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
-  it("disables SDK retries only for admission-budgeted requests", async () => {
+  it("disables SDK retries for none and admission-budgeted requests", async () => {
     const budgetedOptions: unknown[] = [];
     const budgetedClient = {
       responses: {
@@ -132,7 +132,7 @@ describe("Responses server-side compaction", () => {
       tools: [],
       logger: silentLogger(),
     });
-    expect(ordinaryOptions[0]).not.toHaveProperty("maxRetries");
+    expect(ordinaryOptions[0]).toMatchObject({ maxRetries: 0 });
   });
 
   it("persists requests whose token usage was not returned", async () => {
