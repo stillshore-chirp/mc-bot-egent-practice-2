@@ -552,6 +552,75 @@ describe("player agent response rounds", () => {
     }
   });
 
+  it("continues a proposal after prelude delivery rejects without retrying the same text", async () => {
+    let proposalWakeCount = 0;
+    const warningRecords: unknown[][] = [];
+    const logger = {
+      fatal: () => undefined,
+      error: () => undefined,
+      warn: (...values: unknown[]) => warningRecords.push(values),
+      info: () => undefined,
+      debug: () => undefined,
+      trace: () => undefined,
+      child: () => logger,
+    } as unknown as Logger;
+    const fixture = openConversationFixture(
+      undefined,
+      undefined,
+      () => {
+        throw new Error("PRIVATE_CHAT_SEND_FAILURE");
+      },
+      undefined,
+      () => {
+        proposalWakeCount += 1;
+      },
+      logger,
+    );
+    const reply = "この依頼を今の目的に反映するね。";
+    const response = functionCallResponse(
+      "proposal-after-say",
+      "propose_goal_change",
+      {
+        title: "Gather the requested supplies",
+        reason: "The owner explicitly requested these supplies.",
+        priority: 4,
+        ownerReply: reply,
+      },
+    );
+    fixture.responses.push(
+      { ...response, output_text: reply },
+      terminalResponse(reply),
+    );
+
+    try {
+      await fixture.conversation.handleOwnerMessage({
+        username: "owner",
+        message: "材料を集めて。",
+        turn: fixture.conversation.nextTurn(),
+      });
+
+      expect(fixture.requests.length).toBeGreaterThanOrEqual(1);
+      expect(fixture.requests.length).toBeLessThanOrEqual(2);
+      expect(proposalWakeCount).toBe(1);
+      expect(fixture.mind.snapshot().proposals).toContainEqual(
+        expect.objectContaining({
+          title: "Gather the requested supplies",
+          status: "pending",
+        }),
+      );
+      expect(fixture.messages).toEqual([reply]);
+      expect(warningRecords).toContainEqual([
+        { code: "OWNER_REPLY_PRELUDE_DELIVERY_FAILED" },
+        "owner reply prelude delivery failed",
+      ]);
+      expect(JSON.stringify(warningRecords)).not.toContain(
+        "PRIVATE_CHAT_SEND_FAILURE",
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("finishes every intent tool returned in one Conversation response", async () => {
     let proposalWakeCount = 0;
     const fixture = openConversationFixture(
@@ -6351,6 +6420,7 @@ function openConversationFixture(
   onSay?: (text: string) => void | Promise<void>,
   trace?: TraceService,
   onProposal?: () => void,
+  logger?: Logger,
 ): ConversationFixture {
   const directory = mkdtempSync(join(tmpdir(), "player-conversation-facts-"));
   temporaryDirectories.push(directory);
@@ -6367,7 +6437,7 @@ function openConversationFixture(
     ownerUsername: "owner",
     mind,
     memory: createMemoryPort(),
-    logger: pino({ level: "silent" }),
+    logger: logger ?? pino({ level: "silent" }),
     ...(beforeCall === undefined ? {} : { beforeCall }),
     ...(observeBody === undefined ? {} : { observeBody }),
     ...(trace === undefined ? {} : { trace }),

@@ -1710,6 +1710,7 @@ describe("player owner intent context", () => {
       response: terminalResponse("This answer was not delivered."),
       reply: "This answer was not delivered.",
       rejectFirstSend: true,
+      rejectEverySend: false,
       retainReply: false,
     },
     {
@@ -1718,6 +1719,7 @@ describe("player owner intent context", () => {
       response: terminalResponse("This answer reached the owner."),
       reply: "This answer reached the owner.",
       rejectFirstSend: false,
+      rejectEverySend: false,
       retainReply: true,
     },
     {
@@ -1732,6 +1734,7 @@ describe("player owner intent context", () => {
       reply:
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
       rejectFirstSend: true,
+      rejectEverySend: true,
       retainReply: false,
     },
     {
@@ -1746,14 +1749,23 @@ describe("player owner intent context", () => {
       reply:
         "記憶の保存を確認できませんでした。必要ならもう一度頼んでください。",
       rejectFirstSend: false,
+      rejectEverySend: false,
       retainReply: true,
     },
   ])(
     "records $name in owner context only after successful delivery",
-    async ({ ownerMessage, response, reply, rejectFirstSend, retainReply }) => {
+    async ({
+      ownerMessage,
+      response,
+      reply,
+      rejectFirstSend,
+      rejectEverySend,
+      retainReply,
+    }) => {
       const fixture = openPurposeFixture(createMemoryPort());
       const sentMessages: string[] = [];
       let firstSend = true;
+      let sendAttempts = 0;
       const conversation = new PlayerConversationAgent({
         client: scriptedClient(fixture.responses, fixture.requests),
         apiKey: "test-only",
@@ -1763,10 +1775,12 @@ describe("player owner intent context", () => {
         memory: createMemoryPort(),
         logger: pino({ level: "silent" }),
         say: async (message) => {
-          if (firstSend) {
-            firstSend = false;
-            if (rejectFirstSend) throw new Error("TEST_CHAT_SEND_FAILED");
-          }
+          const shouldReject =
+            (rejectEverySend && sendAttempts < 2) ||
+            (firstSend && rejectFirstSend);
+          sendAttempts += 1;
+          firstSend = false;
+          if (shouldReject) throw new Error("TEST_CHAT_SEND_FAILED");
           sentMessages.push(message);
         },
         onProposal: () => undefined,

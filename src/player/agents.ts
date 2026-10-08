@@ -1201,18 +1201,22 @@ export class PlayerConversationAgent {
     };
     let deliveredConversationReply: string | undefined;
     let conversationReplyAttempted = false;
+    const failedPreludeReplies = new Set<string>();
+    const normalizeConversationReply = (value: string): string =>
+      splitConversationReply(value).text.replace(/\s+/gu, " ").trim();
     const sendConversationReply = async (
       reply: string,
     ): Promise<string | undefined> => {
       if (!canSendReply() || reply.trim().length === 0) return undefined;
-      const normalized = (value: string): string =>
-        splitConversationReply(value).text.replace(/\s+/gu, " ").trim();
+      const normalizedReply = normalizeConversationReply(reply);
       if (
         deliveredConversationReply !== undefined &&
-        normalized(deliveredConversationReply) === normalized(reply)
+        normalizeConversationReply(deliveredConversationReply) ===
+          normalizedReply
       ) {
         return deliveredConversationReply;
       }
+      if (failedPreludeReplies.has(normalizedReply)) return undefined;
       conversationReplyAttempted = true;
       const delivered = await sayConversationReply(
         this.options.trace,
@@ -1229,6 +1233,18 @@ export class PlayerConversationAgent {
         deliveredConversationReply = delivered;
       }
       return delivered;
+    };
+    const sendConversationPrelude = async (reply: string): Promise<void> => {
+      try {
+        await sendConversationReply(reply);
+      } catch {
+        if (!canSendReply()) return;
+        failedPreludeReplies.add(normalizeConversationReply(reply));
+        this.options.logger.warn(
+          { code: "OWNER_REPLY_PRELUDE_DELIVERY_FAILED" },
+          "owner reply prelude delivery failed",
+        );
+      }
     };
     const noReplyFallback =
       "返事が途中で止まってしまった。今は確認できた結果として伝えられることがないので、もう一度頼んで。";
@@ -1640,7 +1656,7 @@ export class PlayerConversationAgent {
                         conversationIntentToolNames.has(name),
                       )))
                 )
-                  await sendConversationReply(text);
+                  await sendConversationPrelude(text);
               },
               onToolOnlyResponse: async (
                 calls: readonly {
@@ -1670,7 +1686,7 @@ export class PlayerConversationAgent {
                     }
                   })
                   .find((reply) => reply.length > 0);
-                await sendConversationReply(ownerReply ?? noReplyFallback);
+                await sendConversationPrelude(ownerReply ?? noReplyFallback);
               },
             }),
         ...(request.responseOnly
