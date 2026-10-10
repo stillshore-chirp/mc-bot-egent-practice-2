@@ -173,6 +173,59 @@ describe("deterministic equipment upkeep", () => {
     expect(result).toBeNull();
   });
 
+  it("can equip a standard armor stack selected in the main hand", () => {
+    const held = item("iron_chestplate", 36);
+    expect(
+      findInventoryEquipmentUpgrade(
+        observation({
+          inventory: [held],
+          equipment: { hand: held },
+        }),
+      ),
+    ).toEqual({ item: held, destination: "torso" });
+  });
+
+  it("can choose a chest sword when a standard armor item is held", () => {
+    const worn = item("iron_chestplate", 6);
+    const held = item("iron_chestplate", 36);
+    const sword = item("iron_sword", 3);
+    expect(
+      findChestEquipmentWithdrawal(
+        observation({
+          inventory: [held],
+          equipment: { hand: held, torso: worn },
+          window: chestWindow([null, null, null, sword]),
+        }),
+      ),
+    ).toEqual({ item: sword, destination: "hand", count: 1 });
+  });
+
+  it("keeps unrankable held armor and custom or enchanted swords unchanged", () => {
+    const candidate = item("netherite_sword", 9);
+    const heldItems = [
+      item("iron_chestplate", 36, { durability: 0 }),
+      item("iron_chestplate", 36, { customName: "記念品" }),
+      item("iron_chestplate", 36, {
+        enchantments: [{ name: "protection", level: 1 }],
+      }),
+      item("iron_sword", 36, { customName: "記念品" }),
+      item("iron_sword", 36, {
+        enchantments: [{ name: "sharpness", level: 1 }],
+      }),
+    ];
+
+    for (const held of heldItems) {
+      expect(
+        findInventoryEquipmentUpgrade(
+          observation({
+            inventory: [held, candidate],
+            equipment: { hand: held },
+          }),
+        ),
+      ).toBeNull();
+    }
+  });
+
   it("uses only the first operable stack because Body addresses items by name", () => {
     const current = item("iron_helmet", 5, { durability: 40 });
     const first = item("diamond_helmet", 12, { durability: 0 });

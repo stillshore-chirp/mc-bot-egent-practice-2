@@ -120,6 +120,7 @@ const destinations: readonly EquipmentDestination[] = [
   "feet",
   "hand",
 ];
+const armorDestinations = ["head", "torso", "legs", "feet"] as const;
 const playerInventorySlotStart = 9;
 const playerInventorySlotEnd = 45;
 
@@ -223,14 +224,15 @@ function bestItem(
   return best;
 }
 
-function equippedSlots(
+function equippedArmorSlots(
   equipment: Readonly<Record<string, BodyItemStack | null>>,
 ): ReadonlySet<number> {
-  return new Set(
-    Object.values(equipment)
-      .filter((item): item is BodyItemStack => item !== null)
-      .map((item) => item.slot),
-  );
+  const slots = new Set<number>();
+  for (const destination of armorDestinations) {
+    const item = equipment[destination];
+    if (item !== null && item !== undefined) slots.add(item.slot);
+  }
+  return slots;
 }
 
 function currentRank(
@@ -240,20 +242,35 @@ function currentRank(
   const current = observation.self.equipment[destination];
   if (current === undefined) return undefined;
   if (current === null) return null;
-  return rank(current, destination);
+  const currentRank = rank(current, destination);
+  if (
+    currentRank === undefined &&
+    destination === "hand" &&
+    isRankableArmor(current)
+  )
+    return null;
+  return currentRank;
 }
 
 function handIsPreservedTool(observation: PlayerBodyObservation): boolean {
   const hand = observation.self.equipment.hand;
   return (
-    hand !== null && hand !== undefined && gearSpec(hand, "hand") === undefined
+    hand !== null &&
+    hand !== undefined &&
+    gearSpec(hand, "hand") === undefined &&
+    !isRankableArmor(hand)
   );
+}
+
+function isRankableArmor(item: BodyItemStack): boolean {
+  const spec = armorSpecs[item.name];
+  return spec !== undefined && rank(item, spec.destination) !== undefined;
 }
 
 export function findInventoryEquipmentUpgrade(
   observation: PlayerBodyObservation,
 ): EquipmentUpgradeCandidate | null {
-  const excludedSlots = equippedSlots(observation.self.equipment);
+  const excludedSlots = equippedArmorSlots(observation.self.equipment);
   const playerInventory = observation.self.inventory.filter(
     (item) =>
       item.slot >= playerInventorySlotStart &&
@@ -280,7 +297,7 @@ export function findChestEquipmentWithdrawal(
   const window = observation.window;
   if (!isChestEquipmentWindow(window)) return null;
 
-  const excludedSlots = equippedSlots(observation.self.equipment);
+  const excludedSlots = equippedArmorSlots(observation.self.equipment);
   const chestSlots = window.slots.slice(0, window.inventoryStart);
   const playerInventory = observation.self.inventory.filter(
     (item) =>
