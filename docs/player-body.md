@@ -4,19 +4,20 @@
 
 ## 対応操作
 
-操作名の正本はschemaにある31種類です。
+操作名の正本はschemaにある32種類です。通常の31操作をLLMへ公開し、`follow_owner` は認証済みownerの追従指示専用です。
 
 - 移動・視線: `move_to`、`move_relative`、`look`、`look_sweep`、`control`
 - 装備・interaction: `equip`、`use`、`attack`
 - ワールド変更: `dig`、`place`、`craft`
 - 画面・inventory: `open_window`、`window_click`、`window_transfer`、`window_close`、`consume`、`toss`、`transfer`
 - 収集・活動: `collect_item`、`fish`、`sleep`、`wake`、`mount`、`dismount`、`move_vehicle`、`elytra_fly`、`trade`、`enchant`、`anvil`、`write_book`、`update_sign`
+- owner指示専用: `follow_owner`
 
 いずれも通常プレイヤーの能力であり、対象の可視性、所持品、protocol対応、Minecraftの物理挙動、server権限に従います。任意command、shell、server管理、credential、権限迂回は公開しません。旧Bot専用の木材・建築・action-ledger制限も適用しません。
 
 ## 結果と停止
 
-`execute()`は入力を検証し、実行前の観測を記録して、上限付きの操作を実行します。結果`PlayerOperationResult`にはoperation ID、時刻、実行前後の観測、状態が含まれます。
+`execute()`は入力を検証し、実行前の観測を記録して、上限付きの操作を実行します。継続する `follow_owner` は通常のaction timeoutとstall monitorを適用せず、中断まで動的な移動目標と目視を更新します。結果`PlayerOperationResult`にはoperation ID、時刻、実行前後の観測、状態が含まれます。
 
 - `successful`: 観測したワールド状態、または必要な状態変化と一致するserver eventで効果を確認した。
 - `failed`: 操作を実行できなかった。一部の既知のinventory・registry上の失敗には安定した`failureReason`が付く。
@@ -29,6 +30,6 @@ Mineflayerの呼び出しが受理されたことだけでは成功としませ�
 
 ## 観測の範囲
 
-観測はMineflayerが受信した情報と、Bodyが返す上限付きの可視subsetを表します。blockやentityが含まれないことは、存在しない証拠にはなりません。近くの敵対entityの集計も、clientが受信した範囲内の値であり、world全体の不在を示しません。不明な値は`null`で返し、ownerの座標は呼び出し元が明示的にowner-position例外を指定した場合だけ含めます。`knowledge(query)`はversion付きregistryの事実と推論を分けて返し、server内部の一括取得には使えません。
+観測はMineflayerが受信した情報と、Bodyが返す64ブロック以内の上限付き可視subsetを表します。blockやentityが含まれないことは、存在しない証拠にはなりません。近くの敵対entityの集計も、clientが受信した範囲内の値であり、world全体の不在を示しません。不明な値は`null`で返します。ownerの座標はowner-position例外を指定した場合だけ含め、通常runtimeはこの指定を有効にします。受信位置と現在の目視を区別し、未受信の遠方座標は取得しません。`knowledge(query)`はversion付きregistryの事実と推論を分けて返し、server内部の一括取得には使えません。
 
 操作対応は、任意のserverやprotocolで成功する保証ではありません。runtimeはBodyの結果と再観測をもとに次の判断を行います。local testはコード契約を確認し、Minecraft内での受け入れは要求した効果を別途観測して判断します。

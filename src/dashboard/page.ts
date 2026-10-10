@@ -257,6 +257,7 @@ const page = `<!doctype html>
           sleep: "眠る",
           trade: "取引",
           fish: "釣り",
+          follow_owner: "ownerに追従",
         };
         const outcomeLabels = {
           successful: "確認済み",

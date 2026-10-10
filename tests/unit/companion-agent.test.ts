@@ -3,6 +3,7 @@ import type { Response } from "openai/resources/responses/responses.js";
 
 import {
   CompanionAgent,
+  companionDecisionSchema,
   type CompanionDecisionInput,
   type CompanionResponsesClient,
 } from "../../src/player/agent.js";
@@ -65,7 +66,7 @@ const observation: PlayerBodyObservation = {
   perception: {
     horizontalFieldOfViewDegrees: 110,
     verticalFieldOfViewDegrees: 70,
-    maxDistance: 16,
+    maxDistance: 64,
     coverage: "visible_subset",
     blockCountLimit: 32,
     entityCountLimit: 20,
@@ -240,6 +241,9 @@ describe("CompanionAgent", () => {
     expect(options.maxRetries).toBe(0);
     expect("max_output_tokens" in request).toBe(false);
     assertStrictObjects(request.text.format.schema);
+    expect(JSON.stringify(request.text.format.schema)).not.toContain(
+      "follow_owner",
+    );
     expect(
       hasRequiredNullableProperty(request.text.format.schema, "item"),
     ).toBe(true);
@@ -276,6 +280,28 @@ describe("CompanionAgent", () => {
       outputTokens: 17,
       cachedInputTokens: 8,
     });
+  });
+
+  it("rejects the internal owner-follow operation from model decisions", () => {
+    const decision = companionDecisionSchema.safeParse({
+      speech: null,
+      goal: null,
+      plan: {
+        purpose: "Follow the owner.",
+        steps: [
+          {
+            operation: { kind: "follow_owner" },
+            expectedOutcome: "Stay near the owner.",
+          },
+        ],
+      },
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 10_000,
+      knowledgeQuery: null,
+    });
+
+    expect(decision.success).toBe(false);
   });
 
   it("accepts a concise relationship update and rejects an empty one", async () => {

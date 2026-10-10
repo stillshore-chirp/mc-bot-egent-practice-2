@@ -419,7 +419,7 @@ export interface PlayerBodyObservationOptions {
 
 const horizontalFovDegrees = 110;
 const verticalFovDegrees = 80;
-const maxVisibleDistance = 16;
+const maxVisibleDistance = 64;
 const blockCandidateLimit = 192;
 const blockCandidateSearchPassLimit = 3;
 const nearbyDoorCandidateLimit = 8;

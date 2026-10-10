@@ -175,6 +175,7 @@ describe("nearby hostile observation", () => {
         mob(6, "player", new Vec3(0, 64, 5), { username: "other" }),
         mob(7, "zombie", new Vec3(0, 64, 17)),
         mob(8, "zombie", new Vec3(0, 64, 6), { type: "player" }),
+        mob(9, "zombie", new Vec3(0, 64, 65)),
       ]),
       undefined,
     );
@@ -182,8 +183,8 @@ describe("nearby hostile observation", () => {
     expect(nearby).toBeDefined();
     expect(nearby?.observedAt).toBe(observation.observedAt);
     expect(nearby?.source).toBe("client_received_unoccluded_nearby_hostiles");
-    expect(nearby?.maxDistance).toBe(16);
-    expect(nearby?.entities.map(({ id }) => id)).toEqual([2, 3]);
+    expect(nearby?.maxDistance).toBe(64);
+    expect(nearby?.entities.map(({ id }) => id)).toEqual([2, 3, 7]);
     expect(observation.perception.entities.map(({ id }) => id)).toContain(2);
     expect(nearby?.entities[1]?.equipment).toEqual({
       mainHand: "iron_sword",
@@ -257,7 +258,7 @@ describe("nearby hostile observation", () => {
 
     expect(nearby?.entities).toHaveLength(16);
     expect(aggregate?.clientReceivedHostileCount).toBe(100);
-    expect(aggregate?.maxDistance).toBe(16);
+    expect(aggregate?.maxDistance).toBe(64);
     expect(aggregate?.worldAbsenceEstablished).toBe(false);
     expect(aggregate?.countScope).toBe(
       "client_entity_table_within_max_distance",
@@ -342,6 +343,45 @@ describe("nearby hostile observation", () => {
       uncheckedCandidates: 0,
     });
     expect(nearby?.entities.map(({ id }) => id)).toEqual([3]);
+  });
+});
+
+describe("owner position and observation range", () => {
+  it("reports only the configured owner's received position and distinguishes visibility", () => {
+    const owner = mob(9, "player", new Vec3(0, 64, -40), {
+      type: "player",
+      username: "Builder",
+    });
+    const bot = makeObservationBot([owner]);
+    Object.assign(bot, { players: { builder: { entity: owner } } });
+
+    const observation = observePlayerBody(bot, "Builder", {
+      ownerPositionException: true,
+    });
+
+    expect(observation.perception.maxDistance).toBe(64);
+    expect(observation.perception.ownerPositionException).toEqual({
+      username: "Builder",
+      position: { x: 0, y: 64, z: -40, dimension: "overworld" },
+      source: "owner_position_exception",
+      currentlyVisible: true,
+    });
+  });
+
+  it("includes a visible entity within 64 blocks and excludes one beyond it", () => {
+    const observation = observePlayerBody(
+      makeObservationBot([
+        mob(2, "cow", new Vec3(0, 64, -40)),
+        mob(3, "cow", new Vec3(0, 64, -65)),
+      ]),
+      undefined,
+    );
+
+    expect(observation.perception.maxDistance).toBe(64);
+    expect(observation.perception.entities.map(({ id }) => id)).toContain(2);
+    expect(observation.perception.entities.map(({ id }) => id)).not.toContain(
+      3,
+    );
   });
 });
 

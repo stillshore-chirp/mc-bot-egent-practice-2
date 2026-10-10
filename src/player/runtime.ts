@@ -35,6 +35,7 @@ const defaultMemoryContextLimit = 12;
 
 interface PendingWake {
   readonly reason: string;
+  readonly mode?: "follow_owner" | undefined;
   readonly ownerMessage?: string | undefined;
 }
 
@@ -121,6 +122,7 @@ export class CompanionRuntime {
   #worldChangeTimer: NodeJS.Timeout | undefined;
   #failureCount = 0;
   #worldChangedDuringDecision = false;
+  #ownerFollowRequested = false;
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -224,6 +226,22 @@ export class CompanionRuntime {
       return;
     }
 
+    if (isOwnerFollowCommand(message)) {
+      if (this.#ownerFollowRequested) return;
+      this.#store.recordMessage("owner", message);
+      this.#ownerFollowRequested = true;
+      await this.#requestWake({
+        reason: "authenticated owner requested following",
+        mode: "follow_owner",
+      });
+      if (this.#isStopped()) {
+        this.#ownerFollowRequested = false;
+        return;
+      }
+      await this.#speakControlMessage("わかった。近くまでついていくね。");
+      return;
+    }
+
     this.#store.recordMessage("owner", message);
     await this.#requestWake({
       reason: "owner message",
@@ -244,6 +262,7 @@ export class CompanionRuntime {
       this.#logError(error, "Owner stop state could not be read");
     }
     this.#runtimeStopLatched = true;
+    this.#ownerFollowRequested = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearTimers();
@@ -296,6 +315,7 @@ export class CompanionRuntime {
   public async shutdown(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#ownerFollowRequested = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearTimers();
@@ -308,6 +328,7 @@ export class CompanionRuntime {
 
   async #requestWake(wake: PendingWake): Promise<void> {
     if (this.#disposed || this.#isStopped()) return;
+    if (wake.mode !== "follow_owner") this.#ownerFollowRequested = false;
     if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
     if (this.#worldChangeTimer !== undefined)
       clearTimeout(this.#worldChangeTimer);
@@ -321,7 +342,14 @@ export class CompanionRuntime {
     if (this.#activeBody !== undefined) {
       this.#activeBody.controller.abort(new Error("Companion intent changed"));
     }
-    await this.#ensureDrain();
+    const drain = this.#ensureDrain();
+    if (wake.mode === "follow_owner") {
+      void drain.catch((error: unknown) =>
+        this.#logError(error, "Companion wake failed"),
+      );
+      return;
+    }
+    await drain;
   }
 
   #activate(): boolean {
@@ -355,7 +383,9 @@ export class CompanionRuntime {
       const wake = this.#pendingWake;
       this.#pendingWake = undefined;
       if (this.#isStopped()) return;
-      await this.#think(wake, this.#generation);
+      const generation = this.#generation;
+      if (wake.mode === "follow_owner") await this.#followOwner(generation);
+      else await this.#think(wake, generation);
     }
   }
 
@@ -366,7 +396,9 @@ export class CompanionRuntime {
     try {
       const snapshot = this.#store.snapshot();
       if (this.#isStopped() || !this.#isCurrent(generation)) return;
-      const observation = await this.#body.observe();
+      const observation = await this.#body.observe({
+        ownerPositionException: true,
+      });
       if (!this.#isCurrent(generation)) return;
       const query =
         wake.ownerMessage ??
@@ -426,7 +458,9 @@ export class CompanionRuntime {
       if (this.#didWorldChangeDuringDecision() && decision.plan !== null) {
         let freshObservation: PlayerBodyObservation;
         try {
-          freshObservation = await this.#body.observe();
+          freshObservation = await this.#body.observe({
+            ownerPositionException: true,
+          });
         } catch {
           decision = { ...decision, plan: null };
           refreshAfterDecision = true;
@@ -476,7 +510,11 @@ export class CompanionRuntime {
       // The model request is complete; later world events are handled after
       // the Body result rather than invalidating an already validated action.
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
-      if (decision.speech !== null && decision.speech.length > 0)
+      if (
+        wake.ownerMessage !== undefined &&
+        decision.speech !== null &&
+        decision.speech.length > 0
+      )
         await this.#speakDecision(decision.speech, generation);
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
 
@@ -520,6 +558,81 @@ export class CompanionRuntime {
     }
   }
 
+  async #followOwner(generation: number): Promise<void> {
+    const operation = playerOperationSchema.parse({ kind: "follow_owner" });
+    const operationId = randomUUID();
+    const expectedOutcome =
+      "The configured owner remains nearby until following is interrupted.";
+    const activeOperation = {
+      operationId,
+      operation,
+      expectedOutcome,
+    } as const;
+
+    try {
+      this.#store.save({
+        goal: {
+          title: "オーナーに追従する",
+          successCondition: "オーナーの近くを保つ。",
+          source: "owner",
+        },
+        plan: {
+          purpose: "明示された指示に従ってオーナーの近くまで移動する。",
+          steps: [{ operation, expectedOutcome }],
+        },
+        waitUntil: null,
+        activeOperation,
+      });
+    } catch (error) {
+      this.#ownerFollowRequested = false;
+      if (!this.#isStopped())
+        this.#logError(error, "Owner-follow state could not be saved");
+      return;
+    }
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
+
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() =>
+      this.#body.execute(operation, controller.signal),
+    );
+    const run: ActiveBodyRun = {
+      operationId,
+      operation,
+      startedAt: new Date().toISOString(),
+      controller,
+      promise,
+    };
+    this.#activeBody = run;
+
+    let result: PlayerOperationResult;
+    try {
+      result = await promise;
+    } catch {
+      result = failedBodyResult(operation, operationId);
+    } finally {
+      if (this.#activeBody === run) this.#activeBody = undefined;
+    }
+
+    let updated: CompanionSnapshot;
+    try {
+      updated = this.#store.recordOutcome(
+        outcomeFromResult(result, operation, operationId, expectedOutcome),
+      );
+    } catch (error) {
+      if (this.#isCurrent(generation)) this.#ownerFollowRequested = false;
+      this.#logError(error, "Body outcome could not be persisted");
+      return;
+    }
+    if (this.#isCurrent(generation)) this.#ownerFollowRequested = false;
+    if (
+      !this.#isCurrent(generation) ||
+      updated.stopped ||
+      this.#runtimeStopLatched
+    )
+      return;
+    this.#store.save({ goal: null });
+  }
+
   async #executePlan(
     decision: CompanionDecision,
     generation: number,
@@ -541,6 +654,13 @@ export class CompanionRuntime {
         return;
       }
       const operation = playerOperationSchema.parse(step.operation);
+      if (operation.kind === "follow_owner") {
+        this.#requestReplan(
+          "Agent cannot issue the internal owner-follow operation",
+          generation,
+        );
+        return;
+      }
       const operationId = randomUUID();
       const activeOperation = {
         operationId,
@@ -598,7 +718,9 @@ export class CompanionRuntime {
 
       let freshObservation: PlayerBodyObservation;
       try {
-        freshObservation = await this.#body.observe();
+        freshObservation = await this.#body.observe({
+          ownerPositionException: true,
+        });
       } catch (error) {
         this.#logError(error, "Fresh Body observation failed");
         this.#scheduleRetry({
@@ -643,6 +765,13 @@ export class CompanionRuntime {
       return;
     }
     if (event.type === "disconnected") {
+      if (this.#activeBody?.operation.kind === "follow_owner") {
+        this.#ownerFollowRequested = false;
+        this.#activeBody.controller.abort(
+          new Error("Minecraft disconnected during owner follow"),
+        );
+        return;
+      }
       this.#fireWake({ reason: "Body disconnected; recheck after reconnect" });
       return;
     }
@@ -917,6 +1046,12 @@ function nextOperationTargetIsAvailable(
 
 function isExplicitResumeCommand(message: string): boolean {
   return /^(?:再開|再開して|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
+    message.trim(),
+  );
+}
+
+function isOwnerFollowCommand(message: string): boolean {
+  return /^(?:こっち(?:に)?来て|ついてきて|ついて来て)[。！!]*$/u.test(
     message.trim(),
   );
 }

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CompanionRuntime,
@@ -21,6 +21,7 @@ import type {
   PlayerBody,
   PlayerBodyEvent,
   PlayerBodyObservation,
+  PlayerBodyObservationOptions,
   PlayerKnowledge,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
@@ -94,7 +95,7 @@ function makeObservation(
     perception: {
       horizontalFieldOfViewDegrees: 110,
       verticalFieldOfViewDegrees: 70,
-      maxDistance: 16,
+      maxDistance: 64,
       coverage: "visible_subset",
       blockCountLimit: 32,
       entityCountLimit: 20,
@@ -223,6 +224,7 @@ class FakeBody implements PlayerBody {
   readonly bodyResultIds: string[] = [];
   readonly runtimeMarkerIds: string[] = [];
   readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
+  readonly observeOptions: (PlayerBodyObservationOptions | undefined)[] = [];
   observation = makeObservation();
   executeHandler: ExecuteHandler | undefined;
   stopActiveCalls = 0;
@@ -230,7 +232,10 @@ class FakeBody implements PlayerBody {
 
   public constructor(private readonly store: CompanionStore) {}
 
-  public async observe(): Promise<PlayerBodyObservation> {
+  public async observe(
+    options?: PlayerBodyObservationOptions,
+  ): Promise<PlayerBodyObservation> {
+    this.observeOptions.push(options);
     return this.observation;
   }
 
@@ -304,13 +309,14 @@ function createRuntime(
   store: CompanionStore,
   body: FakeBody,
   agent: FakeAgent,
+  say: (text: string) => Promise<void> = async () => undefined,
 ): CompanionRuntime {
   const runtime = new CompanionRuntime({
     ownerUsername: "Builder",
     body,
     store,
     agent,
-    say: async () => undefined,
+    say,
     minWaitMs: 1_000,
     memoryContextLimit: 7,
   });
@@ -321,6 +327,132 @@ function createRuntime(
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
 
 describe("CompanionRuntime", () => {
+  it("suppresses routine status speech while preserving replies to owner chat", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({
+        ...emptyDecision(),
+        speech: "周りを見ながら歩いているよ。",
+      }),
+      companionDecisionSchema.parse({
+        ...emptyDecision(),
+        speech: "うん、今の状況を確認するね。",
+      }),
+    ]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.start();
+    await eventually(() => store.snapshot().waitUntil !== null);
+    expect(say).not.toHaveBeenCalled();
+
+    await runtime.receiveChat("Builder", "状況を教えて");
+
+    expect(say).toHaveBeenCalledTimes(1);
+    expect(say).toHaveBeenCalledWith("うん、今の状況を確認するね。");
+    expect(body.observeOptions.length).toBeGreaterThan(0);
+    expect(
+      body.observeOptions.every(
+        (options) => options?.ownerPositionException === true,
+      ),
+    ).toBe(true);
+  });
+
+  it("runs owner follow directly, ignores movement wakes, and keeps stop authenticated", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent, say);
+    const followSignals: AbortSignal[] = [];
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind !== "follow_owner")
+        return fakeBody.result(
+          operation,
+          `body-${fakeBody.executed.length}`,
+          "successful",
+          fakeBody.observation,
+        );
+      if (signal !== undefined) followSignals.push(signal);
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        const finish = (): void =>
+          resolve(
+            fakeBody.result(
+              operation,
+              `body-follow-${fakeBody.executed.length}`,
+              "interrupted",
+              null,
+            ),
+          );
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+
+    await runtime.receiveChat("Builder", "こっち来て");
+    await eventually(() => body.executed.length === 1);
+    expect(body.executed[0]).toEqual({ kind: "follow_owner" });
+    expect(runtime.status().currentOperation?.kind).toBe("follow_owner");
+    expect(agent.inputs).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "ついてきて");
+    expect(body.executed).toHaveLength(1);
+    expect(say).toHaveBeenCalledTimes(1);
+
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "position",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    expect(agent.inputs).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "状況を教えて");
+    expect(followSignals[0]?.aborted).toBe(true);
+    expect(agent.inputs).toHaveLength(1);
+
+    await runtime.receiveChat("Builder", "ついてきて");
+    await eventually(() => body.executed.length === 2);
+    await runtime.receiveChat("Impostor", "止まって");
+    expect(followSignals[1]?.aborted).toBe(false);
+    await runtime.receiveChat("Builder", "止まって");
+
+    expect(followSignals[1]?.aborted).toBe(true);
+    expect(store.snapshot().stopped).toBe(true);
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed.map(({ kind }) => kind)).toEqual([
+      "follow_owner",
+      "follow_owner",
+    ]);
+  });
+
+  it("keeps an internal follow operation from a nonconforming Agent port out of Body", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const injected = {
+      ...emptyDecision(),
+      plan: {
+        purpose: "Attempt to follow the owner.",
+        steps: [
+          {
+            operation: playerOperationSchema.parse({ kind: "follow_owner" }),
+            expectedOutcome: "The owner remains nearby.",
+          },
+        ],
+      },
+    } as unknown as CompanionDecision;
+    const agent = new FakeAgent([injected]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+
+    expect(body.executed).toHaveLength(0);
+    expect(store.snapshot().plan).toBeNull();
+    expect(runtime.status().recentErrors).toHaveLength(0);
+  });
+
   it("continues a verified two-step plan with one model call and correlates Body outcomes to runtime markers", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

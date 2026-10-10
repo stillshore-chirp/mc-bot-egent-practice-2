@@ -68,6 +68,7 @@ export const playerOperationNames = [
   "anvil",
   "write_book",
   "update_sign",
+  "follow_owner",
 ] as const;
 
 export type PlayerOperationName = (typeof playerOperationNames)[number];
@@ -112,6 +113,8 @@ export const playerOperationDescriptions = {
   anvil: "Combine or rename inventory items using a reachable anvil.",
   write_book: "Write the supplied pages into a writable book in inventory.",
   update_sign: "Write text to the front or back of a reachable sign.",
+  follow_owner:
+    "Follow the configured owner with a dynamic pathfinding goal until cancelled.",
 } satisfies Record<PlayerOperationName, string>;
 
 const playerOperationBaseSchema = z.discriminatedUnion("kind", [
@@ -316,34 +319,49 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 
-export const playerOperationSchema = playerOperationBaseSchema.superRefine(
-  (operation, context) => {
-    if (
-      operation.kind === "move_relative" &&
-      Math.hypot(operation.offset.x, operation.offset.y, operation.offset.z) <=
-        operation.range
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["offset"],
-        message: "move_relative offset must exceed the arrival range",
-      });
-    }
-    if (operation.kind !== "anvil") return;
-    if (operation.operation === "combine" && operation.secondItem === undefined)
-      context.addIssue({
-        code: "custom",
-        path: ["secondItem"],
-        message: "combine requires secondItem",
-      });
-    if (operation.operation === "rename" && operation.name === undefined)
-      context.addIssue({
-        code: "custom",
-        path: ["name"],
-        message: "rename requires a non-empty name",
-      });
-  },
-);
+const refinePlayerOperation = (
+  operation: z.output<typeof playerOperationBaseSchema>,
+  context: z.RefinementCtx,
+): void => {
+  if (
+    operation.kind === "move_relative" &&
+    Math.hypot(operation.offset.x, operation.offset.y, operation.offset.z) <=
+      operation.range
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["offset"],
+      message: "move_relative offset must exceed the arrival range",
+    });
+  }
+  if (operation.kind !== "anvil") return;
+  if (operation.operation === "combine" && operation.secondItem === undefined)
+    context.addIssue({
+      code: "custom",
+      path: ["secondItem"],
+      message: "combine requires secondItem",
+    });
+  if (operation.operation === "rename" && operation.name === undefined)
+    context.addIssue({
+      code: "custom",
+      path: ["name"],
+      message: "rename requires a non-empty name",
+    });
+};
+
+const followOwnerOperationSchema = z
+  .object({ kind: z.literal("follow_owner") })
+  .strict();
+
+/** Operations an LLM decision is allowed to select. */
+export const playerDecisionOperationSchema =
+  playerOperationBaseSchema.superRefine(refinePlayerOperation);
+
+/** Internal Body operations also include the authenticated owner follow command. */
+export const playerOperationSchema = z.union([
+  playerDecisionOperationSchema,
+  followOwnerOperationSchema,
+]);
 
 export type PlayerOperation = z.output<typeof playerOperationSchema>;
 

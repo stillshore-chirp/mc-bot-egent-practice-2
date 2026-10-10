@@ -21,7 +21,7 @@
 
 ## 実装後の静的集計
 
-2026-10-10の作業ツリーを基準と同じ拡張子別 `splitlines()` で数えました。生成物・vendorは除外しています。これはコード量の比較であり、機能・品質・実利用の証明ではありません。
+2026-10-10の初回簡素化完了時点（`55f89a4`）を基準と同じ拡張子別 `splitlines()` で数えました。生成物・vendorは除外しています。これはコード量の比較であり、機能・品質・実利用の証明ではありません。後続の小改修はこの集計に含めません。
 
 | 範囲                     | ファイル数 |    LOC |
 | ------------------------ | ---------: | -----: |
@@ -51,11 +51,17 @@ CompanionStoreは単一writerの小さな永続状態とし、意味記憶・メ
 | 会話から自律行動まで一つの直列経路 | 同一runtimeの会話・判断・Body実行をlocal / fake testsで確認。Vitest 209 / 18 files合格。                                                                                                                     | local確認       |
 | 1〜3手計画と割込み                 | 各手の観測、message・damage・mismatchによる中断と再判断をtestsで確認。実serverでは未確認。                                                                                                                   | local確認       |
 | persona・記憶・停止・認証の継続    | backup copy: 39 tables / 309,025 rows unchanged; 55,970 memories（active 54,528、quarantine 0、credential flags 0）; 2回目openで重複なし、quick_check・owner stop・relationship/interests fingerprints安定。 | copy確認        |
-| world結果とBody知識                | Body観測結果の分類とregistry質問の経路をtestsで確認。隔離Minecraftは起動できず、server readbackを未実施（`SERVER_INPUT_REQUIRED`）。                                                                         | 一部確認        |
+| world結果とBody知識                | Body観測結果の分類とregistry質問の経路をtestsで確認。後続の稼働確認でserver側Bot参加、runtime接続、LOOK_SWEEPのBody成功を観測。全操作のserver readbackは未実施。                                             | 限定稼働確認    |
 | 管理画面                           | 認証付きread-only画面。HTTP 8 tests、config 5 tests合格。非loopback bindを拒否する。ブラウザーでの描画は検証ツール制約により未確認。                                                                         | HTTP確認        |
 | API利用に累積上限なし              | 製品コードに累積call・token・費用quotaなし。実APIは合成入力で2 calls、input 6,279 / output 488 tokens。これは上限なしの運用保証や価格評価ではない。                                                          | 実API限定確認   |
 | 簡素化と通常操作維持               | src 99→27 files / 50,377→13,105 LOC、tests 151→24 / 87,994→11,292 LOC、scripts 7→8 / 1,361→1,551 LOC、docs 34→22 / 2,769→539 LOC。npm runtime/dev 12/21→9/10。通常操作はlocal regression testsで確認。       | 静的・local確認 |
 
-実APIの2 callsは限定した合成入力の観測値で、費用・token上限の検証ではありません。Minecraft実worldの受入れは未達・未検証であり、local testsやBody内の観測をserver側の独立確認として扱いません。ブラウザー描画も未確認です。Issue #149の実world受入れ完了は主張しません。
+実APIの2 callsは限定した合成入力の観測値で、費用・token上限の検証ではありません。後続の起動診断と通常稼働でもAPI通信が発生しており、2 callsを作業全体の利用総数とは扱いません。MinecraftではBot参加とLOOK_SWEEPを限定して観測しました。local testsやBody内の観測を全ゲーム操作のserver側の独立確認として扱いません。全操作・長期稼働・追従の実ゲームでの評価、ブラウザー描画は未確認です。
 
 copy datasetにはactive operationがなかったため、再起動時の中断操作回復はsynthetic store testsでのみ確認しています。
+
+## 後続の小改修
+
+ownerの評価に基づき、周期的な状況報告の抑制、視認距離64ブロック、受信済みowner位置の入力、LLMなしの継続追従を追加しました。新しい判断frameworkや状態storeは設けず、既存のRuntimeとBodyに限定しています。詳細な利用方法は[自律判断と停止](autonomous-player.md)を参照してください。
+
+この小改修のローカル検証はagent/runtime/observation 26 testsとBodyの操作catalog・追従2 testsに限定し、型検査・build・対象lint・format・diff checkを実施しました。実APIの反復テストは追加していません。追従の実ゲームでの評価は未確認です。

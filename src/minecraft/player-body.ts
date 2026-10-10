@@ -864,6 +864,7 @@ function isTravelOperation(operation: PlayerOperation): boolean {
   return (
     operation.kind === "move_to" ||
     operation.kind === "move_relative" ||
+    operation.kind === "follow_owner" ||
     operation.kind === "control" ||
     operation.kind === "move_vehicle" ||
     operation.kind === "elytra_fly"
@@ -1103,6 +1104,7 @@ function operationEvidence(
   serverBlockUpdates: ReadonlyMap<string, ServerBlockUpdate>,
   active: ActiveOperation,
 ): boolean {
+  if (operation.kind === "follow_owner") return false;
   if (operation.kind === "attack") return active.targetHitObserved === true;
   if (operation.kind === "collect_item") {
     const collectedItem = active.itemCollectionItem;
@@ -1882,7 +1884,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     active.lastProgressSignature =
       before === null ? "" : stableSignature(before);
     active.lastTravelPosition = before?.self.position;
-    this.startStallMonitor(active);
+    const continuousFollow = operation.kind === "follow_owner";
+    if (!continuousFollow) this.startStallMonitor(active);
     const blockTarget =
       operation.kind === "dig" || operation.kind === "place"
         ? blockPosition(operation.position)
@@ -1901,10 +1904,12 @@ export class MineflayerPlayerBody implements PlayerBody {
     );
     let commandError: unknown;
     const timeoutMs = timeoutFor(operation, bot);
-    const timer = setTimeout(() => {
-      active.timedOut = true;
-      controller.abort(new ActionTimeoutError(timeoutMs));
-    }, timeoutMs);
+    const timer = continuousFollow
+      ? undefined
+      : setTimeout(() => {
+          active.timedOut = true;
+          controller.abort(new ActionTimeoutError(timeoutMs));
+        }, timeoutMs);
     try {
       if (operation.kind === "dig" && blockTarget !== undefined) {
         const target = requireReachableBlock(bot, operation.position, false);
@@ -1974,7 +1979,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           active.itemCollectionPathFailureReason = error.pathFailureReason;
       }
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       blockEvidence?.dispose();
       attackEvidence?.();
       itemCollectionEvidence?.();
@@ -1996,7 +2001,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       !active.botDisconnected &&
       this.lifeGeneration === active.startedLifeGeneration;
     const isTravelOperation =
-      operation.kind === "move_to" || operation.kind === "move_relative";
+      operation.kind === "move_to" ||
+      operation.kind === "move_relative" ||
+      operation.kind === "follow_owner";
     const travelCrossedLife = isTravelOperation && !sameLife;
     const craftCrossedLife = operation.kind === "craft" && !sameLife;
     const confirmed =
@@ -2386,6 +2393,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (
         operation.kind === "move_to" ||
         operation.kind === "move_relative" ||
+        operation.kind === "follow_owner" ||
         operation.kind === "collect_item"
       )
         bot.pathfinder.setGoal(null);
@@ -2425,7 +2433,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       active?.bot !== bot ||
       active.runFinished ||
       (active.operation.kind !== "move_to" &&
-        active.operation.kind !== "move_relative") ||
+        active.operation.kind !== "move_relative" &&
+        active.operation.kind !== "follow_owner") ||
       active.controller.signal.aborted
     )
       return;
@@ -2643,6 +2652,9 @@ export class MineflayerPlayerBody implements PlayerBody {
         }
         return;
       }
+      case "follow_owner":
+        await this.followOwner(bot, signal);
+        return;
       case "look":
         await bot.lookAt(positionVector(operation.target), true);
         return;
@@ -3076,6 +3088,45 @@ export class MineflayerPlayerBody implements PlayerBody {
         return;
       }
     }
+  }
+
+  private async followOwner(bot: Bot, signal: AbortSignal): Promise<void> {
+    const ownerUsername = this.ownerUsername;
+    if (ownerUsername === undefined)
+      throw new Error("Owner identity is not configured for following.");
+
+    const findOwnerEntity = (): Entity | undefined => {
+      const player = Object.entries(bot.players).find(([username]) =>
+        sameMinecraftIdentity(username, ownerUsername),
+      )?.[1];
+      const entity = player?.entity;
+      return entity !== undefined && bot.entities[entity.id] === entity
+        ? entity
+        : undefined;
+    };
+
+    let owner = findOwnerEntity();
+    if (owner === undefined)
+      throw new Error(
+        "Configured owner is not currently tracked by Mineflayer.",
+      );
+    bot.pathfinder.setGoal(new goals.GoalFollow(owner, 3), true);
+
+    while (!signal.aborted) {
+      const currentOwner = findOwnerEntity();
+      if (currentOwner === undefined)
+        throw new Error("Configured owner is no longer tracked by Mineflayer.");
+      if (currentOwner !== owner) {
+        owner = currentOwner;
+        bot.pathfinder.setGoal(new goals.GoalFollow(owner, 3), true);
+      }
+      await bot.lookAt(
+        owner.position.offset(0, Math.max(0.1, owner.height * 0.55), 0),
+        true,
+      );
+      await waitTicks(4, signal);
+    }
+    throwIfAborted(signal);
   }
 
   private async collectItem(

@@ -659,7 +659,7 @@ function emitEatingCompletion(
 
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
-    expect(playerOperationNames).toHaveLength(31);
+    expect(playerOperationNames).toHaveLength(32);
     expect(Object.keys(playerOperationDescriptions).sort()).toEqual(
       [...playerOperationNames].sort(),
     );
@@ -669,6 +669,10 @@ describe("player body", () => {
     expect(playerOperationNames).toContain("window_transfer");
     expect(playerOperationNames).toContain("elytra_fly");
     expect(playerOperationNames).toContain("collect_item");
+    expect(playerOperationNames).toContain("follow_owner");
+    expect(playerOperationSchema.parse({ kind: "follow_owner" })).toEqual({
+      kind: "follow_owner",
+    });
     expect(playerOperationSchema.parse({ kind: "look_sweep" })).toEqual({
       kind: "look_sweep",
     });
@@ -752,6 +756,75 @@ describe("player body", () => {
     expect(() =>
       playerOperationSchema.parse({ kind: "collect_item", entityId: 0 }),
     ).toThrow();
+  });
+
+  it("follows only the configured owner with a dynamic goal and no action deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const owner = {
+        id: 7,
+        name: "Builder",
+        type: "player",
+        position: new Vec3(12, 64, -4),
+        velocity: new Vec3(0, 0, 0),
+        yaw: 0,
+        pitch: 0,
+        height: 1.8,
+        eyeHeight: 1.62,
+      } as unknown as Entity;
+      const otherPlayer = {
+        id: 8,
+        name: "Impostor",
+        type: "player",
+        position: new Vec3(-4, 64, -4),
+        velocity: new Vec3(0, 0, 0),
+        yaw: 0,
+        pitch: 0,
+        height: 1.8,
+        eyeHeight: 1.62,
+      } as unknown as Entity;
+      Object.assign(fake.bot, {
+        entities: {
+          [fake.bot.entity.id]: fake.bot.entity,
+          7: owner,
+          8: otherPlayer,
+        },
+        players: {
+          Builder: { entity: owner },
+          Impostor: { entity: otherPlayer },
+        },
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot, "builder");
+      const controller = new AbortController();
+      const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
+      const lookAt = vi.spyOn(fake.bot, "lookAt");
+      const resultPromise = body.execute(
+        { kind: "follow_owner" },
+        controller.signal,
+      );
+      let settled = false;
+      void resultPromise.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(settled).toBe(false);
+      const followGoal = setGoal.mock.calls.find(
+        ([goal]) => goal !== null,
+      )?.[0];
+      expect(followGoal).toMatchObject({ entity: owner, rangeSq: 9 });
+      expect(setGoal).toHaveBeenCalledWith(followGoal, true);
+      expect(followGoal).not.toMatchObject({ entity: otherPlayer });
+      expect(lookAt).toHaveBeenCalled();
+
+      controller.abort(new Error("owner changed intent"));
+      const result = await resultPromise;
+      expect(result.status).toBe("interrupted");
+      expect(setGoal).toHaveBeenLastCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for delayed server food and inventory updates after consume", async () => {
