@@ -391,6 +391,7 @@ export class CompanionRuntime {
     if (this.#disposed || this.#isStopped()) return;
     if (wake.mode !== "damage_reflex") {
       this.#damageReflexPending = false;
+      this.#waterRecoveryActive = false;
       this.#damageReflexContext = undefined;
     }
     if (wake.mode !== "damage_reflex" && wake.mode !== "equipment_upkeep")
@@ -757,7 +758,7 @@ export class CompanionRuntime {
         this.#scheduleRetry(wake);
       }
     } finally {
-      if (wake.mode === "damage_reflex") {
+      if (wake.mode === "damage_reflex" && this.#isCurrent(generation)) {
         this.#damageReflexPending = false;
         this.#waterRecoveryActive = false;
         this.#damageReflexContext = undefined;
@@ -1722,7 +1723,7 @@ export class CompanionRuntime {
                 ticks: 40,
               },
               expectedOutcome:
-                "Use a bounded jump to rise; confirm the result with a fresh Body observation.",
+                "Finish a bounded 40 physics-tick jump input only; this does not establish surfacing. Use fresh observation and treat continued water or low oxygen as unresolved.",
             },
           ],
         },
@@ -1880,19 +1881,9 @@ function waterRecoveryMemoryContent(
 ): string | null {
   const bounded = (value: string | null, maximum: number): string => {
     if (value === null) return "未記録";
-    const trimmed = value.trim();
-    if (
-      /(?:api[_ -]?key|authorization|bearer|password|private[_ -]?key|secret)/iu.test(
-        trimmed,
-      ) ||
-      /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/u.test(
-        trimmed,
-      )
-    )
-      return "未記録";
-    return trimmed.slice(0, maximum) || "未記録";
+    return value.trim().slice(0, maximum) || "未記録";
   };
-  const content = `水の中で酸素5以下の被ダメージ反応。中断直前の保存goal title=${bounded(context.goalTitle, 56)}; success=${bounded(context.goalSuccessCondition, 44)}; plan.purpose=${bounded(context.planPurpose, 92)}。回復判断は2秒jump浮上。水に入った当初の理由は未記録。`;
+  const content = `水の中で酸素5以下の被ダメージ反応。中断直前の保存goal title=${bounded(context.goalTitle, 56)}; success=${bounded(context.goalSuccessCondition, 44)}; plan.purpose=${bounded(context.planPurpose, 92)}。回復判断は40tickのjump入力。水に入った当初の理由は未記録。`;
   return content.length <= 320 ? content : content.slice(0, 320);
 }
 
