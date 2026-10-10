@@ -259,7 +259,7 @@ function buildInstructions(persona: PersonaCore): string {
 
 function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
   const observation = input.observation;
-  const recentMessages = input.messages.slice(-12);
+  const recentMessages = input.messages.slice(-24);
   const lastMessage = recentMessages.at(-1);
   if (
     input.ownerMessage !== undefined &&
