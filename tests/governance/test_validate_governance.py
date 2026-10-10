@@ -350,5 +350,5 @@ from scripts.validate_governance import validate_repository
 
 def test_repository_governance_surface_is_valid() -> None:
     canonical, adapters, routers = validate_repository(ROOT)
-    assert canonical == adapters == 3
+    assert canonical == adapters == 4
     assert routers >= 1
