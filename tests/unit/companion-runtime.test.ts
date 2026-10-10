@@ -498,6 +498,11 @@ function createRuntime(
 }
 
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
+const jump = playerOperationSchema.parse({
+  kind: "control",
+  controls: { jump: true },
+  ticks: 40,
+});
 
 describe("CompanionRuntime", () => {
   it("passes the latest 24 chronological owner and companion messages to judgment", async () => {
@@ -2357,6 +2362,352 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(1);
     expect(body.executed[0]).toEqual({ kind: "look_sweep" });
     expect(store.snapshot().lastOutcome?.status).toBe("successful");
+  });
+
+  it("uses bounded jump recovery after low-oxygen damage and remembers the interrupted goal", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const move: Extract<PlayerOperation, { kind: "move_to" }> = {
+      kind: "move_to",
+      position: { x: 8, y: 64, z: 8 },
+      range: 2,
+    };
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    const initial: CompanionDecision = {
+      ...makeDecision([move]),
+      goal: {
+        title: "Collect wood for the cabin",
+        successCondition: "Gather enough wood to continue building.",
+        source: "owner" as const,
+      },
+      plan: {
+        purpose: "Reach the trees and collect wood for the cabin.",
+        steps: [
+          {
+            operation: move,
+            expectedOutcome: "Reach the work area before collecting wood.",
+          },
+        ],
+      },
+    };
+    const agent = new FakeAgent([initial]);
+    let moveSignal: AbortSignal | undefined;
+    let recoverySignal: AbortSignal | undefined;
+    let finishRecovery: (() => void) | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "move_to") {
+        moveSignal = signal;
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "move-interrupted",
+                  "interrupted",
+                  null,
+                ),
+              ),
+            { once: true },
+          );
+        });
+      }
+      if (operation.kind === "control") {
+        recoverySignal = signal;
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          finishRecovery = () => {
+            const before = fakeBody.observation;
+            const after = {
+              ...before,
+              self: { ...before.self, inWater: false, oxygen: 20 },
+            };
+            fakeBody.observation = after;
+            resolve(
+              fakeBody.result(
+                operation,
+                "water-recovery",
+                "successful",
+                after,
+                before,
+              ),
+            );
+          };
+          signal?.addEventListener(
+            "abort",
+            () =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "recovery-interrupted",
+                  "interrupted",
+                  null,
+                ),
+              ),
+            { once: true },
+          );
+        });
+      }
+      return fakeBody.result(
+        operation,
+        "damage-reflex",
+        "successful",
+        fakeBody.observation,
+      );
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 2);
+    expect(moveSignal?.aborted).toBe(true);
+    expect(body.executed).toEqual([move, jump]);
+    expect(recoverySignal?.aborted).toBe(false);
+
+    for (let index = 0; index < 3; index += 1) {
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+    }
+    expect(recoverySignal?.aborted).toBe(false);
+    expect(body.executed).toHaveLength(2);
+    finishRecovery?.();
+    await eventually(
+      () =>
+        store.snapshot().lastOutcome?.operation.kind === "control" &&
+        store.snapshot().lastOutcome?.status === "successful",
+    );
+
+    await runtime.receiveChat("Builder", "水の中に行った理由は？");
+
+    const recalled = agent.inputs[1]?.memories ?? [];
+    expect(
+      recalled.some(
+        (memory) =>
+          memory.source === "bot_inferred" &&
+          memory.kind === "episode" &&
+          memory.content.includes("Collect wood for the cabin") &&
+          memory.content.includes("Reach the trees and collect wood"),
+      ),
+    ).toBe(true);
+    expect(body.executed).toEqual([move, jump]);
+  });
+
+  it("keeps owner stop immediate during bounded water recovery", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    const agent = new FakeAgent([emptyDecision()]);
+    let recoverySignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      recoverySignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "recovery-stopped",
+                "interrupted",
+                null,
+              ),
+            ),
+          { once: true },
+        );
+      });
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 1);
+
+    await runtime.stop("Builder");
+
+    expect(recoverySignal?.aborted).toBe(true);
+    expect(body.executed).toEqual([jump]);
+    expect(runtime.status().stopped).toBe(true);
+  });
+
+  it("preserves queued damage context when an older reflex is superseded", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const move: Extract<PlayerOperation, { kind: "move_to" }> = {
+      kind: "move_to",
+      position: { x: 8, y: 64, z: 8 },
+      range: 2,
+    };
+    const agent = new FakeAgent([makeDecision([move])]);
+    let finishOldReflex: (() => void) | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "move_to") {
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "move-interrupted",
+                  "interrupted",
+                  null,
+                ),
+              ),
+            { once: true },
+          );
+        });
+      }
+      if (operation.kind === "look_sweep") {
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          finishOldReflex = () =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "old-reflex-interrupted",
+                "interrupted",
+                null,
+              ),
+            );
+        });
+      }
+      return fakeBody.result(
+        operation,
+        "queued-water-recovery",
+        "successful",
+        fakeBody.observation,
+      );
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(
+      () => body.executed.length === 2 && finishOldReflex !== undefined,
+    );
+
+    body.emit({ type: "bot_death", at: new Date().toISOString() });
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    finishOldReflex?.();
+
+    await eventually(() => body.executed.length === 3);
+    await eventually(
+      () =>
+        store.snapshot().lastOutcome?.operation.kind === "control" &&
+        store.snapshot().lastOutcome?.status === "successful",
+    );
+    const recalled = store.recall("水の中に行った理由は？", 7);
+
+    expect(body.executed).toEqual([move, look, jump]);
+    expect(
+      recalled.some((memory) =>
+        memory.content.includes(
+          "plan.purpose=React once to damage using fresh Body-visible information.",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    { label: "oxygen unknown", inWater: true, oxygen: null },
+    { label: "not in water", inWater: false, oxygen: 4 },
+  ] as const)(
+    "keeps the existing damage reflex when recovery evidence is incomplete ($label)",
+    async ({ inWater, oxygen }) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      body.observation = {
+        ...body.observation,
+        self: { ...body.observation.self, inWater, oxygen },
+      };
+      const agent = new FakeAgent([emptyDecision()]);
+      const runtime = createRuntime(store, body, agent);
+
+      await runtime.start();
+      await eventually(() => runtime.status().nextWakeAt !== null);
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+      await eventually(() => store.snapshot().lastOutcome !== null);
+
+      expect(body.executed).toEqual([look]);
+    },
+  );
+
+  it("reobserves after bounded jump and does not claim surfacing or restart a sweep", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "control",
+    );
+    await runtime.receiveChat("Builder", "状況を教えて");
+
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.observation.self).toMatchObject({
+      inWater: true,
+      oxygen: 4,
+    });
+    expect(body.executed).toEqual([jump]);
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+      "does not establish surfacing",
+    );
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+      "continued water or low oxygen as unresolved",
+    );
   });
 
   it("attacks one nearby unoccluded hostile from a fresh observation when damage source is unknown", async () => {
