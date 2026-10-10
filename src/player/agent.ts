@@ -63,7 +63,7 @@ const memoryUpdateSchema = z
 
 export const companionDecisionSchema = z
   .object({
-    speech: z.string().trim().max(600).nullable(),
+    speech: z.string().trim().max(2_000).nullable(),
     goal: goalSchema.nullable(),
     plan: z
       .object({

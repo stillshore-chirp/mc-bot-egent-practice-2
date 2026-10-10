@@ -8,7 +8,10 @@ import {
   type DashboardSnapshot,
 } from "../dashboard/http-server.js";
 import { ConnectionManager } from "../minecraft/connection-manager.js";
-import { MineflayerClient } from "../minecraft/mineflayer-client.js";
+import {
+  MAX_MINECRAFT_CHAT_TEXT_LENGTH,
+  MineflayerClient,
+} from "../minecraft/mineflayer-client.js";
 import { createLogger } from "../observability/logger.js";
 import { loadPersona } from "../persona/persona.js";
 import { CompanionAgent } from "../player/agent.js";
@@ -17,6 +20,21 @@ import { CompanionRuntime } from "../player/runtime.js";
 import type { AppConfig } from "../config/schema.js";
 
 const CHAT_COMMAND_GUARD = "\u200B";
+
+function truncateMinecraftChatText(text: string): string {
+  let end = Math.min(text.length, MAX_MINECRAFT_CHAT_TEXT_LENGTH);
+  if (
+    end < text.length &&
+    end > 0 &&
+    text.charCodeAt(end - 1) >= 0xd800 &&
+    text.charCodeAt(end - 1) <= 0xdbff &&
+    text.charCodeAt(end) >= 0xdc00 &&
+    text.charCodeAt(end) <= 0xdfff
+  ) {
+    end -= 1;
+  }
+  return text.slice(0, end);
+}
 
 /** Normalize outgoing chat while ensuring no line can become a slash command. */
 export function sanitizeMinecraftChatText(text: string): string {
@@ -27,7 +45,9 @@ export function sanitizeMinecraftChatText(text: string): string {
       ? `${leadingWhitespace}${CHAT_COMMAND_GUARD}${content}`
       : line;
   });
-  return protectedLines.join(" ").replace(/\s+/gu, " ").trim().slice(0, 240);
+  return truncateMinecraftChatText(
+    protectedLines.join(" ").replace(/\s+/gu, " ").trim(),
+  );
 }
 
 export interface CompanionApplication {

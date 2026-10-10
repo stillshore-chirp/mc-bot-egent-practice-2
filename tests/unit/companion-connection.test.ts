@@ -18,6 +18,7 @@ function createFakeBot(
     readonly playerLoaded?: boolean;
     readonly tickEnd?: boolean;
     readonly namedMetadata?: boolean;
+    readonly lessCharsInChat?: boolean;
     readonly waitForChunks?: () => Promise<void>;
   } = {},
 ) {
@@ -42,13 +43,15 @@ function createFakeBot(
           return options.tickEnd ?? false;
         case "mcDataHasEntityMetadata":
           return options.namedMetadata ?? false;
+        case "lessCharsInChat":
+          return options.lessCharsInChat ?? false;
         default:
           return false;
       }
     }),
     waitForChunksToLoad:
       options.waitForChunks ?? vi.fn().mockResolvedValue(undefined),
-    chat: vi.fn(),
+    chat: vi.fn<(message: string) => void>(),
     end: vi.fn(function (this: EventEmitter, reason: string) {
       this.emit("end", reason);
     }),
@@ -56,9 +59,17 @@ function createFakeBot(
   return { bot, client };
 }
 
-function clientFor(username = "Companion", ownerUsername = "Owner") {
+function clientFor(
+  username = "Companion",
+  ownerUsername = "Owner",
+  chatLengthLimit?: number,
+) {
   return new MineflayerClient({
-    bot: { username, version: "26.3" },
+    bot: {
+      username,
+      version: "26.3",
+      ...(chatLengthLimit === undefined ? {} : { chatLengthLimit }),
+    },
     ownerUsername,
   });
 }
@@ -69,6 +80,21 @@ function mockCreateBots(...bots: ReturnType<typeof createFakeBot>["bot"][]) {
     .mockImplementation(
       () => bots.shift() as unknown as ReturnType<typeof mineflayer.createBot>,
     );
+}
+
+function hasUnpairedSurrogate(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const codeUnit = text.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (index + 1 >= text.length || next < 0xdc00 || next > 0xdfff)
+        return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
 }
 
 describe("Minecraft companion connection", () => {
@@ -122,6 +148,111 @@ describe("Minecraft companion connection", () => {
       bot.emit("end", "connection lost");
       expect(minecraft.isConnected).toBe(false);
       expect(disconnected).toEqual(["connection lost"]);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("sends up to 2000 characters in ordered packet-sized chunks", async () => {
+    const { bot } = createFakeBot();
+    const createBot = mockCreateBots(bot);
+    const minecraft = clientFor();
+
+    try {
+      const connecting = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await connecting;
+
+      const commandAtBoundary = `${"a".repeat(256)}/cmd${"b".repeat(1_740)}`;
+      await minecraft.say(commandAtBoundary);
+      let packets = bot.chat.mock.calls.map(([packet]) => packet);
+
+      expect(packets.length).toBeGreaterThan(1);
+      expect(packets.every((packet) => packet.length <= 256)).toBe(true);
+      expect(packets.every((packet) => !packet.startsWith("/"))).toBe(true);
+      expect(
+        packets.map((packet) => packet.replaceAll("\u200B", "")).join(""),
+      ).toBe(commandAtBoundary);
+      expect(packets[0]).toBe("a".repeat(256));
+      expect(packets[1]?.startsWith("\u200B/cmd")).toBe(true);
+
+      bot.chat.mockClear();
+      const unicodeAtBoundary = `${"a".repeat(255)}🙂${"b".repeat(1_743)}`;
+      await minecraft.say(unicodeAtBoundary);
+      packets = bot.chat.mock.calls.map(([packet]) => packet);
+
+      expect(
+        packets.map((packet) => packet.replaceAll("\u200B", "")).join(""),
+      ).toBe(unicodeAtBoundary);
+      expect(packets.every((packet) => !hasUnpairedSurrogate(packet))).toBe(
+        true,
+      );
+      expect(packets.every((packet) => packet.length <= 256)).toBe(true);
+      await expect(minecraft.say("x".repeat(2_001))).rejects.toMatchObject({
+        detail: { code: "INVALID_CHAT_MESSAGE" },
+      });
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("honors smaller configured chunks and caps larger ones at the feature limit", async () => {
+    const scenarios: {
+      configuredLimit?: number;
+      lessCharsInChat?: boolean;
+      expectedLimit: number;
+    }[] = [
+      { configuredLimit: 100, expectedLimit: 100 },
+      { configuredLimit: 512, expectedLimit: 256 },
+      { lessCharsInChat: true, expectedLimit: 100 },
+    ];
+    for (const scenario of scenarios) {
+      const { bot } = createFakeBot(
+        scenario.lessCharsInChat === undefined
+          ? {}
+          : { lessCharsInChat: scenario.lessCharsInChat },
+      );
+      const createBot = mockCreateBots(bot);
+      const minecraft = clientFor(
+        "Companion",
+        "Owner",
+        scenario.configuredLimit,
+      );
+
+      try {
+        const connecting = minecraft.connect();
+        await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+        bot.emit("spawn");
+        await connecting;
+
+        await minecraft.say("x".repeat(300));
+        const packets = bot.chat.mock.calls.map(([packet]) => packet);
+        expect(
+          packets.every((packet) => packet.length <= scenario.expectedLimit),
+        ).toBe(true);
+        expect(packets.join("")).toBe("x".repeat(300));
+      } finally {
+        createBot.mockRestore();
+      }
+    }
+  });
+
+  it("rejects an invalid configured chat chunk limit before sending", async () => {
+    const { bot } = createFakeBot();
+    const createBot = mockCreateBots(bot);
+    const minecraft = clientFor("Companion", "Owner", 1);
+
+    try {
+      const connecting = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      bot.emit("spawn");
+      await connecting;
+
+      await expect(minecraft.say("/command")).rejects.toMatchObject({
+        detail: { code: "INVALID_CHAT_LENGTH_LIMIT" },
+      });
+      expect(bot.chat).not.toHaveBeenCalled();
     } finally {
       createBot.mockRestore();
     }

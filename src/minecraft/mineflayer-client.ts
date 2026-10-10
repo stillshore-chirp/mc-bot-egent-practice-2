@@ -10,6 +10,55 @@ export interface MineflayerClientOptions {
   readonly ownerUsername: string;
 }
 
+export const MAX_MINECRAFT_CHAT_TEXT_LENGTH = 2_000;
+
+const CHAT_COMMAND_GUARD = "\u200B";
+
+/** Split below Mineflayer's per-packet limit and guard any slash-leading chunk. */
+function splitMinecraftChatText(
+  message: string,
+  maxChunkLength: number,
+): string[] {
+  const chunks: string[] = [];
+  for (let start = 0; start < message.length;) {
+    const startsWithSlash = message[start] === "/";
+    const guard = startsWithSlash ? CHAT_COMMAND_GUARD : "";
+    let end = Math.min(message.length, start + maxChunkLength - guard.length);
+    if (
+      end < message.length &&
+      end > start &&
+      isHighSurrogate(message.charCodeAt(end - 1)) &&
+      isLowSurrogate(message.charCodeAt(end))
+    ) {
+      end -= 1;
+    }
+    chunks.push(`${guard}${message.slice(start, end)}`);
+    start = end;
+  }
+  return chunks;
+}
+
+function protectSlashLeadingLines(message: string): string {
+  return message
+    .split(/\r\n|\r|\n/u)
+    .map((line) => {
+      const leadingWhitespace = /^\s*/u.exec(line)?.[0] ?? "";
+      const content = line.slice(leadingWhitespace.length);
+      return content.startsWith("/")
+        ? `${leadingWhitespace}${CHAT_COMMAND_GUARD}${content}`
+        : line;
+    })
+    .join("\n");
+}
+
+function isHighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function isLowSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
 interface ConnectionLogger {
   warn(fields: Readonly<Record<string, unknown>>, message: string): void;
 }
@@ -478,15 +527,41 @@ export class MineflayerClient {
   }
 
   public async say(message: string): Promise<void> {
-    if (message.length === 0 || message.length > 240) {
+    const safeMessage = protectSlashLeadingLines(message);
+    if (
+      safeMessage.length === 0 ||
+      safeMessage.length > MAX_MINECRAFT_CHAT_TEXT_LENGTH
+    ) {
       throw new AppError({
         category: "validation",
         code: "INVALID_CHAT_MESSAGE",
-        message: "Minecraft chat message must contain 1-240 characters",
+        message: `Minecraft chat message must contain 1-${MAX_MINECRAFT_CHAT_TEXT_LENGTH} characters`,
         retryable: false,
       });
     }
-    this.requireBot().chat(message);
+    const bot = this.requireBot();
+    const supportedChunkLength = bot.supportFeature("lessCharsInChat")
+      ? 100
+      : 256;
+    const configuredChunkLength = this.options.bot.chatLengthLimit;
+    if (
+      configuredChunkLength !== undefined &&
+      (!Number.isInteger(configuredChunkLength) || configuredChunkLength < 2)
+    ) {
+      throw new AppError({
+        category: "validation",
+        code: "INVALID_CHAT_LENGTH_LIMIT",
+        message: "Minecraft chat chunk limit must be an integer of at least 2",
+        retryable: false,
+      });
+    }
+    const maxChunkLength =
+      configuredChunkLength !== undefined && configuredChunkLength >= 2
+        ? Math.min(configuredChunkLength, supportedChunkLength)
+        : supportedChunkLength;
+    for (const chunk of splitMinecraftChatText(safeMessage, maxChunkLength)) {
+      bot.chat(chunk);
+    }
   }
 
   private requireBot(): Bot {
