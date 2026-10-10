@@ -39,6 +39,45 @@ const MAX_RECALL_FALLBACKS = 128;
 const MAX_OWNER_QUOTE_LENGTH = 400;
 const MAX_TEXT_LENGTH = 2_000;
 const MAX_MEMORY_UPDATE_LENGTH = 1_000;
+const CHEST_CONTENT_TTL_MS = 60 * 60 * 1_000;
+const chestDimensionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(128)
+  .regex(/^[a-z0-9_.:/-]+$/iu);
+const chestPositionSchema = z
+  .object({
+    x: z.number().int().refine(Number.isSafeInteger),
+    y: z.number().int().refine(Number.isSafeInteger),
+    z: z.number().int().refine(Number.isSafeInteger),
+  })
+  .strict();
+const chestContentItemSchema = z
+  .object({
+    slot: z.number().int().min(0).max(53),
+    name: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[a-z0-9_.:/-]+$/iu),
+    count: z.number().int().min(1).max(64),
+  })
+  .strict();
+const chestMemoryObservationSchema = z
+  .object({
+    dimension: chestDimensionSchema,
+    position: chestPositionSchema,
+    observedAt: z.iso.datetime(),
+    contents: z.array(chestContentItemSchema).max(54).optional(),
+  })
+  .strict()
+  .refine(
+    ({ contents }) =>
+      contents === undefined ||
+      new Set(contents.map(({ slot }) => slot)).size === contents.length,
+    "Chest content slots must be unique.",
+  );
 const SECRET_LABEL =
   /(?:^|[\s_:=,."'`])(api[_ -]?key|authorization|bearer|password|private[_ -]?key|secret)(?:$|[\s_:=,."'`])/iu;
 const SECRET_VALUE =
@@ -462,6 +501,128 @@ export class CompanionStore {
       .immediate();
   }
 
+  /** Saves only Body-confirmed chest locations and, when present, open-window contents. */
+  public rememberObservedChest(input: {
+    readonly dimension: string;
+    readonly position: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+    readonly observedAt: string;
+    readonly contents?: readonly {
+      readonly slot: number;
+      readonly name: string;
+      readonly count: number;
+    }[];
+  }): CompanionMemory[] {
+    const parsed = chestMemoryObservationSchema.safeParse(input);
+    if (!parsed.success) throw invalidInput("Invalid observed chest memory.");
+    const { dimension, position, observedAt, contents } = parsed.data;
+    const locationKey = JSON.stringify([
+      dimension,
+      position.x,
+      position.y,
+      position.z,
+    ]);
+    const locationContent = `確認済みチェストの場所: ${dimension} (${position.x}, ${position.y}, ${position.z})`;
+
+    return this.#database
+      .transaction(() => {
+        const memories = [
+          this.insertMemory({
+            kind: "world",
+            content: locationContent,
+            source: "minecraft_observed",
+            status: "active",
+            importance: 5,
+            metadata: {
+              chestMemory: {
+                version: 1,
+                kind: "location",
+                locationKey,
+                dimension,
+                position,
+                observedAt,
+              },
+            },
+            createdAt: observedAt,
+            updatedAt: observedAt,
+          }),
+        ];
+        if (contents === undefined) return memories;
+
+        const contentText =
+          contents.length === 0
+            ? "空"
+            : contents
+                .map(({ slot, name, count }) => `${slot}:${name} x${count}`)
+                .join(", ");
+        const memoryContent = `チェスト中身の過去観測 (${dimension} ${position.x},${position.y},${position.z}; ${observedAt}): ${contentText}`;
+        const previous = this.#database
+          .prepare<[string], MemoryRow>(
+            `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+             FROM companion_memories
+             WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
+               AND json_extract(metadata_json, '$.chestMemory.kind') = 'contents'
+               AND json_extract(metadata_json, '$.chestMemory.locationKey') = ?`,
+          )
+          .all(locationKey);
+        for (const row of previous) {
+          if (row.content === memoryContent) continue;
+          this.#database
+            .prepare(
+              "UPDATE companion_memories SET status = 'superseded' WHERE memory_id = ? AND status = 'active'",
+            )
+            .run(row.memory_id);
+        }
+
+        const expiresAt = new Date(
+          Date.parse(observedAt) + CHEST_CONTENT_TTL_MS,
+        ).toISOString();
+        memories.push(
+          this.insertMemory({
+            kind: "world",
+            content: memoryContent,
+            source: "minecraft_observed",
+            status: "active",
+            importance: 5,
+            metadata: {
+              chestMemory: {
+                version: 1,
+                kind: "contents",
+                locationKey,
+                dimension,
+                position,
+                observedAt,
+                expiresAt,
+                contents,
+              },
+            },
+            createdAt: observedAt,
+            updatedAt: observedAt,
+          }),
+        );
+        return memories;
+      })
+      .immediate();
+  }
+
+  /** Returns the latest last-seen chest location for autonomous goal context. */
+  public latestObservedChestLocation(): CompanionMemory | null {
+    const row = this.#database
+      .prepare<[], MemoryRow>(
+        `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+         FROM companion_memories
+         WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
+           AND json_extract(metadata_json, '$.chestMemory.kind') = 'location'
+         ORDER BY updated_at DESC, memory_id DESC
+         LIMIT 1`,
+      )
+      .get();
+    return row === undefined ? null : memoryFromRow(row);
+  }
+
   /** Deterministic lexical recall with salience and recency fallback. */
   public recall(query: string, limit = 8): CompanionMemory[] {
     if (typeof query !== "string" || query.length > MAX_TEXT_LENGTH) {
@@ -474,19 +635,22 @@ export class CompanionStore {
         `Recall limit must be between 1 and ${MAX_RECALL_LIMIT}.`,
       );
     }
+    const now = this.#now();
     const queryTerms = new Set(selectRecallTerms(query));
-    const matchedRows = this.readRecallCandidates([...queryTerms]);
+    const matchedRows = this.readRecallCandidates([...queryTerms], now);
     const fallbackRows = this.#database
-      .prepare<[], MemoryRecallRow>(
+      .prepare<[string], MemoryRecallRow>(
         `
         SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, 0 AS match_score
         FROM companion_memories
         WHERE status = 'active'
+          AND (json_extract(metadata_json, '$.chestMemory.kind') IS NOT 'contents'
+            OR json_extract(metadata_json, '$.chestMemory.expiresAt') > ?)
         ORDER BY importance DESC, updated_at DESC
         LIMIT ${MAX_RECALL_FALLBACKS}
       `,
       )
-      .all();
+      .all(now);
     const rowById = new Map<string, MemoryRecallRow>();
     for (const row of [...matchedRows, ...fallbackRows]) {
       if (!rowById.has(row.memory_id)) rowById.set(row.memory_id, row);
@@ -499,7 +663,7 @@ export class CompanionStore {
         documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
       }
     }
-    const now = Date.parse(this.#now());
+    const nowMs = Date.parse(now);
     const ranked = rows.map((row) => {
       const terms = searchTerms(row.content);
       const termSet = new Set(terms);
@@ -516,7 +680,7 @@ export class CompanionStore {
           .includes(query.trim().toLocaleLowerCase("ja-JP"));
       const ageDays = Math.max(
         0,
-        (now - Date.parse(row.updated_at)) / 86_400_000,
+        (nowMs - Date.parse(row.updated_at)) / 86_400_000,
       );
       const recency = Number.isFinite(ageDays) ? 1 / (1 + ageDays / 30) : 0;
       const salience = row.importance * 0.35 + recency;
@@ -555,7 +719,10 @@ export class CompanionStore {
     });
   }
 
-  private readRecallCandidates(terms: readonly string[]): MemoryRecallRow[] {
+  private readRecallCandidates(
+    terms: readonly string[],
+    now: string,
+  ): MemoryRecallRow[] {
     if (terms.length === 0) return [];
     const matchExpression = terms
       .map(() => "CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
@@ -571,6 +738,8 @@ export class CompanionStore {
             (${matchExpression}) AS match_score
           FROM companion_memories
           WHERE status = 'active' AND (${conditions})
+            AND (json_extract(metadata_json, '$.chestMemory.kind') IS NOT 'contents'
+              OR json_extract(metadata_json, '$.chestMemory.expiresAt') > ?)
         )
         SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, match_score
         FROM candidates
@@ -582,6 +751,7 @@ export class CompanionStore {
       .all(
         ...terms.map((term) => `%${escapeLikePattern(term)}%`),
         ...terms.map((term) => `%${escapeLikePattern(term)}%`),
+        now,
       );
   }
 

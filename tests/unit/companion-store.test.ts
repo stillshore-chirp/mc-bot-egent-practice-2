@@ -215,6 +215,113 @@ describe("CompanionStore", () => {
     store.close();
   });
 
+  it("keeps chest locations across restart and expires or refreshes only observed contents", () => {
+    const { path } = freshDatabase();
+    let now = "2026-10-10T00:00:00.000Z";
+    let store = CompanionStore.open(path, { now: () => now });
+    const observation = {
+      dimension: "overworld",
+      position: { x: 12, y: 64, z: -3 },
+      observedAt: now,
+    };
+    const initial = store.rememberObservedChest({
+      ...observation,
+      contents: [{ slot: 0, name: "diamond", count: 3 }],
+    });
+    const locationId = initial[0]?.id;
+    expect(initial[0]).toMatchObject({
+      source: "minecraft_observed",
+      metadata: {
+        chestMemory: {
+          kind: "location",
+          observedAt: now,
+        },
+      },
+    });
+    expect(initial[1]).toMatchObject({
+      source: "minecraft_observed",
+      metadata: {
+        chestMemory: {
+          kind: "contents",
+          expiresAt: "2026-10-10T01:00:00.000Z",
+          contents: [{ slot: 0, name: "diamond", count: 3 }],
+        },
+      },
+    });
+
+    now = "2026-10-10T00:59:00.000Z";
+    const recalledBeforeExpiry = store.recall("diamond", 8);
+    const activeContents = recalledBeforeExpiry.find(
+      (memory) => memory.id === initial[1]?.id,
+    );
+    expect(activeContents?.metadata).toMatchObject({
+      chestMemory: {
+        kind: "contents",
+        observedAt: "2026-10-10T00:00:00.000Z",
+        contents: [{ slot: 0, name: "diamond", count: 3 }],
+      },
+    });
+    store.close();
+
+    now = "2026-10-10T01:00:00.000Z";
+    store = CompanionStore.open(path, { now: () => now });
+    expect(
+      store.recall("diamond", 8).some((memory) => memory.id === initial[1]?.id),
+    ).toBe(false);
+    expect(store.latestObservedChestLocation()?.id).toBe(locationId);
+
+    now = "2026-10-10T01:01:00.000Z";
+    const refreshed = store.rememberObservedChest({
+      ...observation,
+      observedAt: now,
+      contents: [],
+    });
+    expect(refreshed[0]?.id).toBe(locationId);
+    expect(refreshed[0]?.metadata).toMatchObject({
+      chestMemory: { kind: "location", observedAt: now },
+    });
+    expect(refreshed[1]?.metadata).toMatchObject({
+      chestMemory: {
+        kind: "contents",
+        observedAt: now,
+        expiresAt: "2026-10-10T02:01:00.000Z",
+        contents: [],
+      },
+    });
+    expect(
+      store.recall("diamond", 8).some((memory) => memory.id === initial[1]?.id),
+    ).toBe(false);
+    expect(
+      store
+        .recall("チェスト中身", 8)
+        .some((memory) => memory.content.includes("空")),
+    ).toBe(true);
+    store.close();
+
+    now = "2026-10-10T02:01:00.000Z";
+    store = CompanionStore.open(path, { now: () => now });
+    expect(
+      store
+        .recall("チェスト", 8)
+        .some((memory) => memory.id === refreshed[1]?.id),
+    ).toBe(false);
+    expect(store.latestObservedChestLocation()?.id).toBe(locationId);
+    store.close();
+
+    const database = new Database(path, { readonly: true });
+    try {
+      expect(
+        database
+          .prepare<[], { readonly status: string; readonly content: string }>(
+            "SELECT status, content FROM companion_memories WHERE content LIKE '%diamond%'",
+          )
+          .get(),
+      ).toMatchObject({ status: "superseded" });
+    } finally {
+      database.close();
+    }
+  });
+
   it("finds a rare old memory among a large recent set with a bounded recall pool", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });
