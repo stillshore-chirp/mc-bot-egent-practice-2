@@ -297,6 +297,43 @@ export function findInventoryEquipmentUpgrade(
   return null;
 }
 
+/** Select a better owned melee weapon for an immediate damage response. */
+export function findRetaliationWeaponUpgrade(
+  observation: PlayerBodyObservation,
+): EquipmentUpgradeCandidate | null {
+  const hand = observation.self.equipment.hand;
+  const handSpec =
+    hand === null || hand === undefined ? undefined : gearSpec(hand, "hand");
+  const before =
+    handSpec === undefined || hand === null || hand === undefined
+      ? null
+      : rank(hand, "hand");
+
+  // Keep a recognized, usable weapon that the upkeep ranker cannot safely
+  // compare, such as a custom or enchanted item. A non-weapon tool or a broken
+  // weapon is replaceable here because the player is responding to damage.
+  if (handSpec !== undefined && before === undefined && hand?.durability !== 0)
+    return null;
+  const currentRank = before ?? null;
+
+  const playerInventory = observation.self.inventory.filter(
+    (item) =>
+      item.slot >= playerInventorySlotStart &&
+      item.slot < playerInventorySlotEnd,
+  );
+  const best = bestItem(
+    playerInventory,
+    "hand",
+    equippedArmorSlots(observation.self.equipment),
+  );
+  if (
+    best === undefined ||
+    (currentRank !== null && compareRanks(best.rank, currentRank) <= 0)
+  )
+    return null;
+  return { item: best.item, destination: "hand" };
+}
+
 export function findChestEquipmentWithdrawal(
   observation: PlayerBodyObservation,
 ): ChestEquipmentWithdrawalCandidate | null {

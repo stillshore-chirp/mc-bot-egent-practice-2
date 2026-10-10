@@ -34,6 +34,7 @@ import {
   type EquipmentUpgradeCandidate,
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
+  findRetaliationWeaponUpgrade,
   equipmentDestinationForName,
   isChestEquipmentWindow,
 } from "./equipment-upkeep.js";
@@ -79,6 +80,10 @@ interface DamageReflexContext {
   readonly goalSuccessCondition: string | null;
   readonly planPurpose: string | null;
 }
+
+type DamageReflexPlanStep = NonNullable<
+  CompanionDecision["plan"]
+>["steps"][number];
 
 export interface CompanionRuntimeStatus {
   readonly running: boolean;
@@ -1756,24 +1761,37 @@ export class CompanionRuntime {
           entity.distance <= 3.2,
       )
       .sort((left, right) => left.distance - right.distance)[0];
-    const operation =
+    const weaponUpgrade =
+      target === undefined ? null : findRetaliationWeaponUpgrade(observation);
+    const steps: DamageReflexPlanStep[] = [];
+    if (weaponUpgrade !== null) {
+      steps.push({
+        operation: {
+          kind: "equip",
+          item: weaponUpgrade.item.name,
+          destination: "hand",
+        },
+        expectedOutcome:
+          "Equip and observe the best available owned melee weapon before retaliation.",
+      });
+    }
+    const operation: DamageReflexPlanStep["operation"] =
       target === undefined
-        ? { kind: "look_sweep" as const }
-        : { kind: "attack" as const, entityId: target.id };
+        ? { kind: "look_sweep" }
+        : { kind: "attack", entityId: target.id };
+    steps.push({
+      operation,
+      expectedOutcome:
+        target === undefined
+          ? "Complete one bounded look sweep; consider threats on a later wake."
+          : "Attempt one nearby hostile attack and rely on Body for confirmation.",
+    });
     return {
       speech: null,
       goal: snapshot.goal,
       plan: {
         purpose: "React once to damage using fresh Body-visible information.",
-        steps: [
-          {
-            operation,
-            expectedOutcome:
-              target === undefined
-                ? "Complete one bounded look sweep; consider threats on a later wake."
-                : "Attempt one nearby hostile attack and rely on Body for confirmation.",
-          },
-        ],
+        steps,
       },
       memoryUpdates: [],
       relationshipSummary: null,

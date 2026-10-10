@@ -8,6 +8,7 @@ import type {
 import {
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
+  findRetaliationWeaponUpgrade,
   isChestEquipmentWindow,
 } from "../../src/player/equipment-upkeep.js";
 
@@ -119,6 +120,52 @@ describe("deterministic equipment upkeep", () => {
     );
 
     expect(result).toEqual({ item: candidate, destination: "hand" });
+  });
+
+  it("chooses the highest ranked owned weapon over a held work tool for retaliation", () => {
+    const workTool = item("diamond_pickaxe", 36);
+    const stoneSword = item("stone_sword", 9);
+    const ironSword = item("iron_sword", 10);
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [ironSword, workTool, stoneSword],
+          equipment: { hand: workTool },
+        }),
+      ),
+    ).toEqual({ item: ironSword, destination: "hand" });
+  });
+
+  it("does not replace the best held weapon and does not invent a weapon", () => {
+    const held = item("netherite_sword", 36);
+    const weaker = item("iron_sword", 9);
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [weaker, held],
+          equipment: { hand: held },
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({ inventory: [item("apple", 9)] }),
+      ),
+    ).toBeNull();
+  });
+
+  it("preserves an unrankable recognized weapon already in hand", () => {
+    const held = item("iron_sword", 36, {
+      enchantments: [{ name: "sharpness", level: 1 }],
+    });
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [item("netherite_sword", 9), held],
+          equipment: { hand: held },
+        }),
+      ),
+    ).toBeNull();
   });
 
   it("does not exchange equal, unknown, broken, or enchanted equipment", () => {
