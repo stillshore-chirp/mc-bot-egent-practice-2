@@ -230,6 +230,31 @@ function bestItem(
   return best;
 }
 
+function firstOperableNamedWeapon(
+  items: readonly BodyItemStack[],
+  excludedSlots: ReadonlySet<number>,
+): BodyItemStack | undefined {
+  const seenNames = new Set<string>();
+  for (const item of [...items].sort((left, right) => left.slot - right.slot)) {
+    if (seenNames.has(item.name)) continue;
+    seenNames.add(item.name);
+    if (
+      !Object.hasOwn(weaponSpecs, item.name) ||
+      excludedSlots.has(item.slot) ||
+      item.count !== 1 ||
+      item.metadata !== 0 ||
+      item.maxDurability === null ||
+      item.durability === null ||
+      item.maxDurability <= 0 ||
+      item.durability <= 0 ||
+      item.durability > item.maxDurability
+    )
+      continue;
+    return item;
+  }
+  return undefined;
+}
+
 function equippedArmorSlots(
   equipment: Readonly<Record<string, BodyItemStack | null>>,
 ): ReadonlySet<number> {
@@ -295,6 +320,56 @@ export function findInventoryEquipmentUpgrade(
     }
   }
   return null;
+}
+
+/** Select a better owned melee weapon for an immediate damage response. */
+export function findRetaliationWeaponUpgrade(
+  observation: PlayerBodyObservation,
+): EquipmentUpgradeCandidate | null {
+  const hand = observation.self.equipment.hand;
+  const handSpec =
+    hand === null || hand === undefined ? undefined : gearSpec(hand, "hand");
+  const before =
+    handSpec === undefined || hand === null || hand === undefined
+      ? null
+      : rank(hand, "hand");
+
+  // Keep a recognized, usable weapon that the upkeep ranker cannot safely
+  // compare, such as a custom or enchanted item. A non-weapon tool or a broken
+  // weapon is replaceable here because the player is responding to damage.
+  if (handSpec !== undefined && before === undefined && hand?.durability !== 0)
+    return null;
+  const currentRank = before ?? null;
+
+  const playerInventory = observation.self.inventory.filter(
+    (item) =>
+      item.slot >= playerInventorySlotStart &&
+      item.slot < playerInventorySlotEnd,
+  );
+  const best = bestItem(
+    playerInventory,
+    "hand",
+    equippedArmorSlots(observation.self.equipment),
+  );
+  if (best !== undefined) {
+    if (currentRank !== null && compareRanks(best.rank, currentRank) <= 0)
+      return null;
+    return { item: best.item, destination: "hand" };
+  }
+
+  // The ranker deliberately excludes enchanted and custom-named items. When
+  // there is no rankable candidate, still use a known, operable sword or axe
+  // if the hand is empty, a tool, or a broken weapon. Keep an unrankable usable
+  // weapon already in hand, and keep Body's first-name source-order behavior.
+  const handNeedsFallback = handSpec === undefined || hand?.durability === 0;
+  if (!handNeedsFallback) return null;
+  const fallback = firstOperableNamedWeapon(
+    playerInventory,
+    equippedArmorSlots(observation.self.equipment),
+  );
+  return fallback === undefined
+    ? null
+    : { item: fallback, destination: "hand" };
 }
 
 export function findChestEquipmentWithdrawal(

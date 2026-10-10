@@ -34,6 +34,7 @@ import {
   type EquipmentUpgradeCandidate,
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
+  findRetaliationWeaponUpgrade,
   equipmentDestinationForName,
   isChestEquipmentWindow,
 } from "./equipment-upkeep.js";
@@ -53,6 +54,9 @@ const equipmentChestMoveRange = 2.5;
 const equipmentChestSearchLimit = 4;
 const equipmentChestSuppressionLimit = 64;
 const equipmentUpkeepStepLimit = 5;
+const damageReflexAttackRange = 3.2;
+const damageReflexPlanPurpose =
+  "React once to damage using fresh Body-visible information.";
 
 interface PendingWake {
   readonly reason: string;
@@ -79,6 +83,10 @@ interface DamageReflexContext {
   readonly goalSuccessCondition: string | null;
   readonly planPurpose: string | null;
 }
+
+type DamageReflexPlanStep = NonNullable<
+  CompanionDecision["plan"]
+>["steps"][number];
 
 export interface CompanionRuntimeStatus {
   readonly running: boolean;
@@ -751,7 +759,12 @@ export class CompanionRuntime {
         });
         return;
       }
-      await this.#executePlan(decision, generation);
+      await this.#executePlan(
+        decision,
+        generation,
+        undefined,
+        wake.mode === "damage_reflex",
+      );
     } catch (error) {
       if (!controller.signal.aborted && this.#isCurrent(generation)) {
         this.#logError(error, "Companion judgment failed");
@@ -1502,6 +1515,7 @@ export class CompanionRuntime {
     decision: CompanionDecision,
     generation: number,
     onPlanConfirmed?: (observation: PlayerBodyObservation) => void,
+    damageReflex = false,
   ): Promise<void> {
     const plannedSteps = decision.plan?.steps ?? [];
     for (const plannedStep of plannedSteps) {
@@ -1595,15 +1609,31 @@ export class CompanionRuntime {
         return;
       }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
-      if (
-        result.after === null ||
-        result.sameLife !== true ||
-        !canContinuePlan(
-          result.after,
-          freshObservation,
-          updated.plan?.steps[0]?.operation,
-        )
-      ) {
+      const nextStep = updated.plan?.steps[0];
+      const damageReflexAttackTargetId =
+        damageReflex &&
+        updated.plan?.purpose === damageReflexPlanPurpose &&
+        operation.kind === "equip" &&
+        operation.destination === "hand" &&
+        updated.plan.steps.length === 1 &&
+        nextStep?.operation.kind === "attack"
+          ? nextStep.operation.entityId
+          : undefined;
+      const canContinue =
+        result.after !== null &&
+        (damageReflexAttackTargetId !== undefined
+          ? canContinueDamageReflexRetaliation(
+              result.after,
+              freshObservation,
+              damageReflexAttackTargetId,
+              this.#ownerUsername,
+            )
+          : canContinuePlan(
+              result.after,
+              freshObservation,
+              nextStep?.operation,
+            ));
+      if (result.after === null || result.sameLife !== true || !canContinue) {
         this.#store.save({ plan: null });
         this.#scheduleRetry({
           reason: "Body result or next-step prerequisites changed",
@@ -1753,27 +1783,40 @@ export class CompanionRuntime {
             this.#ownerUsername,
           ) &&
           Number.isFinite(entity.distance) &&
-          entity.distance <= 3.2,
+          entity.distance <= damageReflexAttackRange,
       )
       .sort((left, right) => left.distance - right.distance)[0];
-    const operation =
+    const weaponUpgrade =
+      target === undefined ? null : findRetaliationWeaponUpgrade(observation);
+    const steps: DamageReflexPlanStep[] = [];
+    if (weaponUpgrade !== null) {
+      steps.push({
+        operation: {
+          kind: "equip",
+          item: weaponUpgrade.item.name,
+          destination: "hand",
+        },
+        expectedOutcome:
+          "Equip and observe the best available owned melee weapon before retaliation.",
+      });
+    }
+    const operation: DamageReflexPlanStep["operation"] =
       target === undefined
-        ? { kind: "look_sweep" as const }
-        : { kind: "attack" as const, entityId: target.id };
+        ? { kind: "look_sweep" }
+        : { kind: "attack", entityId: target.id };
+    steps.push({
+      operation,
+      expectedOutcome:
+        target === undefined
+          ? "Complete one bounded look sweep; consider threats on a later wake."
+          : "Attempt one nearby hostile attack and rely on Body for confirmation.",
+    });
     return {
       speech: null,
       goal: snapshot.goal,
       plan: {
-        purpose: "React once to damage using fresh Body-visible information.",
-        steps: [
-          {
-            operation,
-            expectedOutcome:
-              target === undefined
-                ? "Complete one bounded look sweep; consider threats on a later wake."
-                : "Attempt one nearby hostile attack and rely on Body for confirmation.",
-          },
-        ],
+        purpose: damageReflexPlanPurpose,
+        steps,
       },
       memoryUpdates: [],
       relationshipSummary: null,
@@ -2125,6 +2168,29 @@ function canContinuePlan(
   return (
     nextOperation === undefined ||
     nextOperationTargetIsAvailable(nextOperation, fresh)
+  );
+}
+
+function canContinueDamageReflexRetaliation(
+  after: PlayerBodyObservation,
+  fresh: PlayerBodyObservation,
+  targetEntityId: number,
+  ownerUsername: string,
+): boolean {
+  if (!canContinuePlan(after, fresh, undefined)) return false;
+  const nearbyHostiles = fresh.perception.nearbyHostiles;
+  return (
+    nearbyHostiles?.source === "client_received_unoccluded_nearby_hostiles" &&
+    nearbyHostiles.entities.some(
+      (entity) =>
+        entity.id === targetEntityId &&
+        !entity.isPlayer &&
+        entity.kind !== "player" &&
+        !sameMinecraftIdentity(entity.username ?? entity.name, ownerUsername) &&
+        Number.isFinite(entity.distance) &&
+        entity.distance >= 0 &&
+        entity.distance <= damageReflexAttackRange,
+    )
   );
 }
 
