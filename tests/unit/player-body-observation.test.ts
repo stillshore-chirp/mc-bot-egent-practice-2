@@ -15,6 +15,7 @@ interface FixtureEntity {
   readonly health?: number;
   readonly username?: string;
   readonly equipment?: readonly (null | { readonly name: string })[];
+  readonly getDroppedItem?: () => Item | null;
 }
 
 function makeObservationBot(
@@ -58,7 +59,7 @@ function makeObservationBot(
         cow: { category: "Passive mobs" },
         player: { category: "Hostile mobs" },
       },
-      itemsByName: {},
+      itemsByName: { oak_log: {} },
     },
     findBlocks: () => [],
     blockAt: () => null,
@@ -106,7 +107,69 @@ function inventoryItem(name: string, type: number, count = 1): Item {
   } as unknown as Item;
 }
 
+function droppedItem(
+  id: number,
+  position: Vec3,
+  name = "oak_log",
+): FixtureEntity {
+  return {
+    id,
+    name: "item",
+    type: "object",
+    position,
+    velocity: new Vec3(0, 0, 0),
+    height: 0.25,
+    getDroppedItem: () => inventoryItem(name, 1),
+  };
+}
+
 describe("nearby hostile observation", () => {
+  it("reports client-received drops underfoot and behind without changing visibility", () => {
+    const bot = makeObservationBot([
+      droppedItem(2, new Vec3(0, 63.8, 0)),
+      droppedItem(3, new Vec3(0, 64, 4)),
+    ]);
+
+    const observation = observePlayerBody(bot, undefined);
+
+    expect(observation.perception.nearbyDroppedItems).toMatchObject({
+      source: "client_received_dropped_items",
+      observedAt: observation.observedAt,
+      maxDistance: 64,
+      entityOutputLimit: 64,
+      candidateSearchMayBeTruncated: false,
+    });
+    expect(
+      observation.perception.nearbyDroppedItems?.entities.map(({ id }) => id),
+    ).toEqual([2, 3]);
+    expect(observation.perception.entities.map(({ id }) => id)).not.toContain(
+      2,
+    );
+    expect(observation.perception.entities.map(({ id }) => id)).not.toContain(
+      3,
+    );
+  });
+
+  it("bounds dropped-item sensing by the shared observation range", () => {
+    const observation = observePlayerBody(
+      makeObservationBot([
+        droppedItem(2, new Vec3(0, 64, 64)),
+        droppedItem(3, new Vec3(0, 64, 65)),
+      ]),
+      undefined,
+    );
+
+    expect(observation.perception.nearbyDroppedItems?.maxDistance).toBe(
+      observation.perception.maxDistance,
+    );
+    expect(
+      observation.perception.nearbyDroppedItems?.entities.map(({ id }) => id),
+    ).toEqual([2]);
+    expect(observation.perception.entities.map(({ id }) => id)).not.toContain(
+      3,
+    );
+  });
+
   it("uses the 26.1 registry category for native hostile entity types", () => {
     const registry = minecraftData("26.1");
     const fromRegistry = (

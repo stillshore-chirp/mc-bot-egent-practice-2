@@ -923,6 +923,13 @@ function semanticSignature(
         nearbyHostiles: semanticEntities(
           observation.perception.nearbyHostiles?.entities ?? [],
         ),
+        nearbyDroppedItems: (
+          observation.perception.nearbyDroppedItems?.entities ?? []
+        ).map((entity) => [
+          entity.id,
+          entity.droppedItem?.name,
+          entity.droppedItem?.count,
+        ]),
       });
     }
     case "blocks":
@@ -3141,8 +3148,8 @@ export class MineflayerPlayerBody implements PlayerBody {
     let settledTargetSince: number | undefined;
     let pathFailurePromise: Promise<never> | undefined;
     let rejectPathFailure: ((error: ItemCollectionError) => void) | undefined;
-    let lastVisibleTarget: Entity | undefined;
-    let lastVisibleAimPoint: Vec3 | undefined;
+    let lastObservedTarget: Entity | undefined;
+    let lastObservedAimPoint: Vec3 | undefined;
     const onPathUpdate = (results: {
       readonly status: string;
       readonly path?: readonly unknown[];
@@ -3151,7 +3158,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         rejectPathFailure?.(
           new ItemCollectionError(
             "path_failed",
-            "The normal pathfinder could not reach the visible item target.",
+            "The normal pathfinder could not reach the observed item target.",
             results.status === "noPath" ? "no_path" : "path_timeout",
           ),
         );
@@ -3175,7 +3182,7 @@ export class MineflayerPlayerBody implements PlayerBody {
 
     const pickupObserved = (): boolean =>
       active.itemCollectionOutcome === "collected";
-    const observeVisibleTarget = async (
+    const observeDroppedItemTarget = async (
       firstObservation: PlayerBodyObservation | null,
       deadline = Date.now() + itemCollectionVisibilityGraceMs,
       attemptedViewRecovery = false,
@@ -3190,14 +3197,28 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (pickupObserved()) return undefined;
 
       if (firstObservation !== null) {
-        const target = firstObservation.perception.entities.find(
-          (entity) => entity.id === entityId,
-        );
+        const maxDistance =
+          firstObservation.perception.nearbyDroppedItems?.maxDistance ??
+          firstObservation.perception.maxDistance;
+        const target =
+          firstObservation.perception.nearbyDroppedItems?.entities.find(
+            (entity) =>
+              entity.id === entityId &&
+              entity.droppedItem !== undefined &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= maxDistance,
+          ) ??
+          firstObservation.perception.entities.find(
+            (entity) =>
+              entity.id === entityId &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= maxDistance,
+          );
         if (target !== undefined) {
           if (target.name !== "item")
             throw new ItemCollectionError(
               "invalid_target",
-              "The requested visible entity is not an item entity.",
+              "The requested observed entity is not an item entity.",
             );
           const currentTarget = bot.entities[entityId];
           if (currentTarget === undefined)
@@ -3206,16 +3227,16 @@ export class MineflayerPlayerBody implements PlayerBody {
               "The requested item entity left the client entity table.",
             );
           if (
-            lastVisibleTarget !== undefined &&
-            currentTarget !== lastVisibleTarget
+            lastObservedTarget !== undefined &&
+            currentTarget !== lastObservedTarget
           )
             throw new ItemCollectionError(
               "entity_removed",
               "The requested item entity changed while it was being collected.",
             );
-          lastVisibleTarget = currentTarget;
+          lastObservedTarget = currentTarget;
           if (Number.isFinite(currentTarget.height) && currentTarget.height > 0)
-            lastVisibleAimPoint = new Vec3(
+            lastObservedAimPoint = new Vec3(
               target.position.x,
               target.position.y + Math.max(0.1, currentTarget.height * 0.55),
               target.position.z,
@@ -3229,7 +3250,8 @@ export class MineflayerPlayerBody implements PlayerBody {
       const currentTarget = bot.entities[entityId];
       if (
         currentTarget === undefined ||
-        (lastVisibleTarget !== undefined && currentTarget !== lastVisibleTarget)
+        (lastObservedTarget !== undefined &&
+          currentTarget !== lastObservedTarget)
       )
         throw new ItemCollectionError(
           "entity_removed",
@@ -3238,15 +3260,15 @@ export class MineflayerPlayerBody implements PlayerBody {
       if (currentTarget.name !== "item")
         throw new ItemCollectionError(
           "invalid_target",
-          "The requested visible entity is not an item entity.",
+          "The requested observed entity is not an item entity.",
         );
       if (Date.now() >= deadline)
         throw new ItemCollectionError(
           "target_unobservable",
-          "The requested item did not return to the current visible view.",
+          "The requested item did not return to the current client observation.",
         );
 
-      if (!attemptedViewRecovery && lastVisibleAimPoint !== undefined) {
+      if (!attemptedViewRecovery && lastObservedAimPoint !== undefined) {
         const recoveryEntity = bot.entity;
         const recoveryLifeGeneration = this.lifeGeneration;
         attemptedViewRecovery = true;
@@ -3257,7 +3279,7 @@ export class MineflayerPlayerBody implements PlayerBody {
             this.disconnectedSinceBind ||
             this.lifeGeneration !== recoveryLifeGeneration ||
             bot.entity !== recoveryEntity ||
-            bot.entities[entityId] !== lastVisibleTarget
+            bot.entities[entityId] !== lastObservedTarget
           )
             return false;
           try {
@@ -3269,13 +3291,13 @@ export class MineflayerPlayerBody implements PlayerBody {
         try {
           throwIfAborted(signal);
           if (!isCurrentLife()) return undefined;
-          await waitForAction(bot.lookAt(lastVisibleAimPoint, true), signal);
+          await waitForAction(bot.lookAt(lastObservedAimPoint, true), signal);
           if (pickupObserved()) return undefined;
           if (!isCurrentLife()) return undefined;
           await waitForPhysicsTick(bot, signal);
           if (pickupObserved()) return undefined;
           if (!isCurrentLife()) return undefined;
-          return await observeVisibleTarget(
+          return await observeDroppedItemTarget(
             this.safeObserve(bot),
             deadline,
             true,
@@ -3288,7 +3310,7 @@ export class MineflayerPlayerBody implements PlayerBody {
 
       await waitForItemCollectionPoll(signal);
       if (pickupObserved()) return undefined;
-      return observeVisibleTarget(
+      return observeDroppedItemTarget(
         this.safeObserve(bot),
         deadline,
         attemptedViewRecovery,
@@ -3296,15 +3318,19 @@ export class MineflayerPlayerBody implements PlayerBody {
     };
 
     try {
-      const initialTarget = await observeVisibleTarget(this.safeObserve(bot));
+      const initialTarget = await observeDroppedItemTarget(
+        this.safeObserve(bot),
+      );
       if (initialTarget === undefined || pickupObserved()) return;
 
       while (active.itemCollectionOutcome !== "collected") {
         throwIfAborted(signal);
 
-        const visibleTarget = await observeVisibleTarget(this.safeObserve(bot));
-        if (visibleTarget === undefined || pickupObserved()) break;
-        const { observation, target } = visibleTarget;
+        const observedTarget = await observeDroppedItemTarget(
+          this.safeObserve(bot),
+        );
+        if (observedTarget === undefined || pickupObserved()) break;
+        const { observation, target } = observedTarget;
 
         const playerPosition = observation.self.position;
         const targetPosition = target.position;
@@ -3335,7 +3361,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           }
           throw new ItemCollectionError(
             "pickup_out_of_range",
-            "The pathfinder reached a nearby block, but the visible item remained outside pickup range.",
+            "The pathfinder reached a nearby block, but the observed item remained outside pickup range.",
           );
         }
 
@@ -3364,7 +3390,7 @@ export class MineflayerPlayerBody implements PlayerBody {
           (error: unknown) => {
             throw new ItemCollectionError(
               "path_failed",
-              "Normal pathfinding to the visible item target failed.",
+              "Normal pathfinding to the observed item target failed.",
               classifyItemCollectionPathFailure(error),
             );
           },

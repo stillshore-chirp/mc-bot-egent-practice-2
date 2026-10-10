@@ -74,6 +74,7 @@ function makeObservation(
     readonly blocks?: readonly BodyVisibleBlock[];
     readonly entities?: PlayerBodyObservation["perception"]["entities"];
     readonly nearbyHostiles?: PlayerBodyObservation["perception"]["nearbyHostiles"];
+    readonly nearbyDroppedItems?: PlayerBodyObservation["perception"]["nearbyDroppedItems"];
     readonly window?: BodyWindowSnapshot | null;
   } = {},
 ): PlayerBodyObservation {
@@ -135,6 +136,9 @@ function makeObservation(
       ...(options.nearbyHostiles === undefined
         ? {}
         : { nearbyHostiles: options.nearbyHostiles }),
+      ...(options.nearbyDroppedItems === undefined
+        ? {}
+        : { nearbyDroppedItems: options.nearbyDroppedItems }),
     },
     window: options.window ?? null,
   };
@@ -198,6 +202,21 @@ function droppedItemEntity(
     name: "item",
     kind: "object",
     droppedItem: { name, count },
+  };
+}
+
+function makeNearbyDroppedItems(
+  entities: PlayerBodyObservation["perception"]["entities"],
+  maxDistance = 64,
+): NonNullable<PlayerBodyObservation["perception"]["nearbyDroppedItems"]> {
+  return {
+    source: "client_received_dropped_items",
+    observedAt: new Date().toISOString(),
+    maxDistance,
+    entityOutputLimit: 64,
+    omittedEntityCandidates: 0,
+    candidateSearchMayBeTruncated: false,
+    entities,
   };
 }
 
@@ -1071,11 +1090,129 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(0);
   });
 
-  it("continues ordinary judgment when no nearby dropped item is visible", async () => {
+  it("collects a received drop outside the view and then equips its armor", async () => {
+    const { store } = freshStore();
+    const current = gearItem("iron_helmet", 5, 60);
+    const candidate = gearItem("diamond_helmet", 9);
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      equipment: {
+        hand: null,
+        "off-hand": null,
+        head: current,
+        torso: null,
+        legs: null,
+        feet: null,
+      },
+      entities: [],
+      nearbyDroppedItems: makeNearbyDroppedItems([
+        droppedItemEntity(41, 12, "diamond_helmet", 1),
+      ]),
+    });
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind === "collect_item") {
+        const after = {
+          ...before,
+          self: { ...before.self, inventory: [candidate] },
+          perception: {
+            ...before.perception,
+            nearbyDroppedItems: makeNearbyDroppedItems([]),
+          },
+        };
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          "received-drop-collected",
+          "successful",
+          after,
+          before,
+        );
+      }
+      if (operation.kind === "equip") {
+        const owned = before.self.inventory.find(
+          (item) => item.name === operation.item,
+        );
+        if (owned === undefined)
+          throw new Error("Expected collected armor in inventory");
+        const after = {
+          ...before,
+          self: {
+            ...before.self,
+            inventory: before.self.inventory.filter(
+              (item) => item.name !== operation.item,
+            ),
+            equipment: {
+              ...before.self.equipment,
+              [operation.destination]: { ...owned, slot: 5 },
+            },
+          },
+        };
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          "collected-armor-equipped",
+          "successful",
+          after,
+          before,
+        );
+      }
+      throw new Error(`Unexpected operation: ${operation.kind}`);
+    };
+
+    await runtime.start();
+    await eventually(
+      () => body.executed.length === 1 && !runtime.status().thinking,
+      4_000,
+    );
+
+    expect(body.executed).toEqual([{ kind: "collect_item", entityId: 41 }]);
+    expect(agent.inputs).toHaveLength(0);
+    expect(body.observation.self.inventory).toEqual([candidate]);
+
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+    await eventually(() => body.executed.length === 2, 4_000);
+
+    expect(body.executed[1]).toEqual({
+      kind: "equip",
+      item: "diamond_helmet",
+      destination: "head",
+    });
+    expect(body.observation.self.inventory).toHaveLength(0);
+    expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("does not collect a candidate beyond the observation range", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     body.observation = makeObservation({
-      entities: [droppedItemEntity(32, 7, "oak_log", 1)],
+      entities: [],
+      nearbyDroppedItems: makeNearbyDroppedItems(
+        [droppedItemEntity(42, 65, "oak_log", 1)],
+        64,
+      ),
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    expect(body.executed).toHaveLength(0);
+  });
+
+  it("continues ordinary judgment when no client-received drop is in range", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(32, 65, "oak_log", 1)],
     });
     const agent = new FakeAgent([emptyDecision()]);
     const runtime = createRuntime(store, body, agent);
@@ -1490,6 +1627,90 @@ describe("CompanionRuntime", () => {
       body.runtimeMarkerIds[1],
     );
     expect(runtime.status().lastOutcome?.status).toBe("successful");
+  });
+
+  it("continues a plan to collect a received drop outside the visible entity list", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const drop = droppedItemEntity(43, 12, "oak_log", 1);
+    body.observation = makeObservation({
+      entities: [],
+      nearbyDroppedItems: makeNearbyDroppedItems([drop]),
+    });
+    const collect = playerOperationSchema.parse({
+      kind: "collect_item",
+      entityId: drop.id,
+    });
+    store.save({
+      plan: {
+        purpose: "Protect the received drop while choosing the next action.",
+        steps: [
+          {
+            operation: look,
+            expectedOutcome: "The current observation is refreshed.",
+          },
+          {
+            operation: collect,
+            expectedOutcome: "The received drop is collected.",
+          },
+        ],
+      },
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind === "collect_item") {
+        const after = {
+          ...before,
+          self: {
+            ...before.self,
+            inventory: [
+              {
+                slot: 36,
+                itemId: 17,
+                name: "oak_log",
+                count: 1,
+                metadata: 0,
+                durability: null,
+                maxDurability: null,
+                customName: null,
+                enchantments: [],
+              },
+            ],
+          },
+          perception: {
+            ...before.perception,
+            nearbyDroppedItems: makeNearbyDroppedItems([]),
+          },
+        };
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          "planned-drop-collected",
+          "successful",
+          after,
+          before,
+        );
+      }
+      return fakeBody.result(
+        operation,
+        "plan-observation-refreshed",
+        "successful",
+        before,
+        before,
+      );
+    };
+    const agent = new FakeAgent([makeDecision([look, collect])]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 2);
+
+    expect(body.executed).toEqual([
+      look,
+      { kind: "collect_item", entityId: drop.id },
+    ]);
+    expect(agent.inputs).toHaveLength(1);
+    expect(store.snapshot().plan).toBeNull();
   });
 
   it("preserves the relationship summary on null and persists a meaningful update", async () => {

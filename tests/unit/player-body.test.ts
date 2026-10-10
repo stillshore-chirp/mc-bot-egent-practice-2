@@ -52,6 +52,9 @@ function addItemEntity(
     count: 1,
   },
 ): Entity {
+  const itemName = droppedItem?.name;
+  if (itemName !== undefined)
+    (bot.registry.itemsByName as Record<string, unknown>)[itemName] = {};
   const item = {
     id,
     name: "item",
@@ -1086,6 +1089,44 @@ describe("player body", () => {
     );
   });
 
+  it("collects a client-received item behind the player without turning to see it", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot, 2, new Vec3(0, 64, 5));
+    const initialObservation = observePlayerBody(fake.bot, undefined);
+    expect(initialObservation.perception.entities).not.toContain(
+      expect.objectContaining({ id: item.id }),
+    );
+    expect(
+      initialObservation.perception.nearbyDroppedItems?.entities,
+    ).toContainEqual(expect.objectContaining({ id: item.id }));
+
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const goto = vi
+      .spyOn(fake.bot.pathfinder, "goto")
+      .mockImplementation(async () => {
+        fake.bot.entity.position = new Vec3(0, 64, 4);
+        emitItemPickup(fake, item);
+        removeItemEntity(fake.bot, item.id);
+      });
+    const lookAt = vi.spyOn(fake.bot, "lookAt");
+
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
+
+    expect(result.status).toBe("successful");
+    expect(result.observedEffect).toEqual({
+      type: "item_collected",
+      entityId: item.id,
+    });
+    expect(result.before?.perception.entities).not.toContain(
+      expect.objectContaining({ id: item.id }),
+    );
+    expect(
+      result.before?.perception.nearbyDroppedItems?.entities,
+    ).toContainEqual(expect.objectContaining({ id: item.id }));
+    expect(goto).toHaveBeenCalledTimes(1);
+    expect(lookAt).not.toHaveBeenCalled();
+  });
+
   it("waits briefly for the matching inventory count after a pickup event", async () => {
     vi.useFakeTimers();
     try {
@@ -1198,77 +1239,54 @@ describe("player body", () => {
     );
   });
 
-  it("waits briefly for the same initially hidden item ID to become visible", async () => {
-    vi.useFakeTimers();
-    try {
-      const fake = makeFakeBot();
-      const item = addItemEntity(fake.bot, 2);
-      fake.bot.entity.yaw = Math.PI / 2;
-      const body = new MineflayerPlayerBody(() => fake.bot);
-      const goto = vi
-        .spyOn(fake.bot.pathfinder, "goto")
-        .mockImplementation(async () => {
-          fake.bot.entity.position = new Vec3(0, 64, -4);
-          emitItemPickup(fake, item);
-          removeItemEntity(fake.bot, item.id);
-        });
-      setTimeout(() => {
-        fake.bot.entity.yaw = 0;
-      }, 300);
+  it("does not pursue an item ID the client has not received", async () => {
+    const fake = makeFakeBot();
+    const item = addItemEntity(fake.bot, 2);
+    removeItemEntity(fake.bot, item.id);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const goto = vi.spyOn(fake.bot.pathfinder, "goto");
 
-      const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
-      await vi.advanceTimersByTimeAsync(500);
-      const result = await resultPromise;
+    const result = await body.execute({ kind: "collect_item", entityId: 2 });
 
-      expect(result.status).toBe("successful");
-      expect(result.itemCollectionOutcome).toBe("collected");
-      expect(result.observedEffect).toEqual({
-        type: "item_collected",
-        entityId: 2,
-      });
-      expect(goto).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(result.status).toBe("failed");
+    expect(result.itemCollectionOutcome).toBe("entity_removed");
+    expect(result.observedEffect).toBeUndefined();
+    expect(goto).not.toHaveBeenCalled();
   });
 
-  it("stops a stale path and resumes the same item after brief tracking visibility loss", async () => {
+  it("continues tracking a received item after it leaves the view cone", async () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
       const item = addItemEntity(fake.bot, 2);
       const body = new MineflayerPlayerBody(() => fake.bot);
-      let cancelFirstPath: (() => void) | undefined;
       const goto = vi
         .spyOn(fake.bot.pathfinder, "goto")
-        .mockImplementationOnce(
-          () =>
-            new Promise<void>((_resolve, reject) => {
-              cancelFirstPath = () => reject(new Error("Goal cancelled"));
-              fake.bot.entity.yaw = Math.PI / 2;
-            }),
-        )
-        .mockImplementationOnce(async () => {
-          fake.bot.entity.position = new Vec3(0, 64, -4);
-          emitItemPickup(fake, item);
-          removeItemEntity(fake.bot, item.id);
+        .mockImplementationOnce(() => {
+          fake.bot.entity.yaw = Math.PI / 2;
+          const observation = observePlayerBody(fake.bot, undefined);
+          expect(observation.perception.entities).not.toContain(
+            expect.objectContaining({ id: item.id }),
+          );
+          expect(
+            observation.perception.nearbyDroppedItems?.entities,
+          ).toContainEqual(expect.objectContaining({ id: item.id }));
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              fake.bot.entity.position = new Vec3(0, 64, -4);
+              emitItemPickup(fake, item);
+              removeItemEntity(fake.bot, item.id);
+              resolve();
+            }, 500);
+          });
         });
-      const setGoal = vi.spyOn(fake.bot.pathfinder, "setGoal");
-      setGoal.mockImplementation((goal) => {
-        if (goal === null) cancelFirstPath?.();
-      });
-      setTimeout(() => {
-        fake.bot.entity.yaw = 0;
-      }, 500);
-
       const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(800);
       const result = await resultPromise;
 
       expect(result.status).toBe("successful");
       expect(result.itemCollectionOutcome).toBe("collected");
-      expect(goto).toHaveBeenCalledTimes(2);
-      expect(setGoal).toHaveBeenCalledWith(null);
+      expect(goto).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1387,7 +1405,7 @@ describe("player body", () => {
     }
   });
 
-  it("re-aims once at the last visible item point and confirms the later pickup", async () => {
+  it("re-aims once at the last observed item point after leaving detection range", async () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
@@ -1404,7 +1422,7 @@ describe("player body", () => {
           () =>
             new Promise<void>((_resolve, reject) => {
               cancelFirstPath = () => reject(new Error("Path stopped"));
-              fake.bot.entity.yaw = Math.PI / 2;
+              item.position = new Vec3(0, 64, -65);
             }),
         )
         .mockImplementationOnce(async () => {
@@ -1416,7 +1434,12 @@ describe("player body", () => {
       vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
         if (goal === null) cancelFirstPath?.();
       });
-      const lookAt = vi.spyOn(fake.bot, "lookAt");
+      const lookAt = vi
+        .spyOn(fake.bot, "lookAt")
+        .mockImplementation(async () => {
+          item.position = new Vec3(0, 64, -5);
+          (fake.bot as unknown as EventEmitter).emit("physicsTick");
+        });
 
       const resultPromise = body.execute({ kind: "collect_item", entityId: 2 });
       await vi.advanceTimersByTimeAsync(1_000);
@@ -1439,31 +1462,16 @@ describe("player body", () => {
     }
   });
 
-  it("stops pursuit when the target becomes unobservable without returning its hidden position", async () => {
+  it("stops pursuit when the item leaves client range without exposing its distant position", async () => {
     const fake = makeFakeBot();
     const item = addItemEntity(fake.bot);
     const body = new MineflayerPlayerBody(() => fake.bot);
     let cancelPath: (() => void) | undefined;
-    let obstructed = false;
-    const originalRaycast = fake.bot.world.raycast.bind(fake.bot.world);
-    vi.spyOn(fake.bot.world, "raycast").mockImplementation(
-      (origin, direction, range, matching) => {
-        if (obstructed && matching !== undefined)
-          return makeBlock(
-            "stone",
-            1,
-            new Vec3(0, 64, -3),
-          ) as unknown as ReturnType<typeof fake.bot.world.raycast>;
-        return originalRaycast(origin, direction, range, matching);
-      },
-    );
     vi.spyOn(fake.bot.pathfinder, "goto").mockImplementation(
       () =>
         new Promise<void>((_resolve, reject) => {
           cancelPath = () => reject(new Error("Path stopped"));
-          fake.bot.entity.yaw = Math.PI / 2;
-          item.position = new Vec3(1, 64, -5);
-          obstructed = true;
+          item.position = new Vec3(0, 64, -65);
         }),
     );
     vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
@@ -1479,7 +1487,7 @@ describe("player body", () => {
       expect.objectContaining({ id: 2 }),
     );
     expect(result.detail).toContain(
-      "did not return to the current visible view",
+      "did not return to the current client observation",
     );
     expect(result.observedEffect).toBeUndefined();
     expect(lookAt).toHaveBeenCalledTimes(1);
@@ -1489,7 +1497,7 @@ describe("player body", () => {
     );
   });
 
-  it("does not resume collection after owner stop during the recovery physics tick", async () => {
+  it("stops item pursuit when the owner cancels the operation", async () => {
     const fake = makeFakeBot();
     addItemEntity(fake.bot);
     const body = new MineflayerPlayerBody(() => fake.bot);
@@ -1505,18 +1513,12 @@ describe("player body", () => {
     vi.spyOn(fake.bot.pathfinder, "setGoal").mockImplementation((goal) => {
       if (goal === null) cancelPath?.();
     });
-    const lookAt = vi
-      .spyOn(fake.bot, "lookAt")
-      .mockImplementation(async () => undefined);
     const resultPromise = body.execute(
       { kind: "collect_item", entityId: 2 },
       controller.signal,
     );
 
-    await vi.waitFor(() => expect(lookAt).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() =>
-      expect(fake.bot.listenerCount("physicsTick")).toBe(1),
-    );
+    await vi.waitFor(() => expect(goto).toHaveBeenCalledTimes(1));
     controller.abort(new Error("Owner stopped collection"));
     const result = await resultPromise;
 
@@ -1527,11 +1529,11 @@ describe("player body", () => {
     expect(pathUpdateListenerCount(fake.bot)).toBe(0);
   });
 
-  it("aborts the visibility grace wait without starting an item path", async () => {
+  it("aborts the received-range wait without starting an item path", async () => {
     vi.useFakeTimers();
     try {
       const fake = makeFakeBot();
-      addItemEntity(fake.bot);
+      addItemEntity(fake.bot, 2, new Vec3(0, 64, -65));
       fake.bot.entity.yaw = Math.PI / 2;
       const body = new MineflayerPlayerBody(() => fake.bot);
       const controller = new AbortController();
@@ -1945,6 +1947,45 @@ describe("player body", () => {
     expect(attack).not.toHaveBeenCalled();
     expect(equip).not.toHaveBeenCalled();
     await body.stop();
+  });
+
+  it("wakes once for a newly received off-view drop and ignores its movement noise", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const item = addItemEntity(fake.bot, 2, new Vec3(0, 64, 5));
+      const body = new MineflayerPlayerBody(() => fake.bot);
+      const events: PlayerBodyEvent[] = [];
+      body.onEvent((event) => events.push(event));
+      const botEvents = fake.bot as unknown as EventEmitter;
+
+      botEvents.emit("entitySpawn", item);
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(1);
+      expect(
+        observePlayerBody(fake.bot, undefined).perception.entities,
+      ).not.toContain(expect.objectContaining({ id: item.id }));
+
+      (item as unknown as { position: Vec3 }).position = new Vec3(0.25, 64, 5);
+      botEvents.emit("entityMoved", item);
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "state_changed" && event.reason === "entities",
+        ),
+      ).toHaveLength(1);
+      await body.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retains damage attribution through a positive health packet before death", () => {
