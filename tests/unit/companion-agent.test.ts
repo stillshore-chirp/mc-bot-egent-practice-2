@@ -441,6 +441,9 @@ describe("CompanionAgent", () => {
     expect(request.instructions).toContain(
       "現在のblocks一覧にないだけで不存在とせず",
     );
+    expect(request.instructions).toContain(
+      "現在のblocksにない既知チェストへはmove_toだけを計画し、到着後に新しいBody観測を受けて再判断し、chest/trapped_chestを確認してから開いてください。",
+    );
     expect(request.instructions).toContain("observedAt時点の過去の中身");
     expect(request.instructions).toContain(
       "新しいBody観測で対象チェストとwindowを確認",
