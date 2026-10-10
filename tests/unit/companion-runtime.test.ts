@@ -159,7 +159,7 @@ function chestWindow(
     type: "minecraft:generic_9x3",
     title: "Chest",
     inventoryStart: 27,
-    inventoryEnd: 62,
+    inventoryEnd: 63,
     selectedItem: null,
     slots: [
       chestItem,

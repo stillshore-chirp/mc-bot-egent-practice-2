@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import type {
   BodyItemStack,
@@ -7,7 +8,24 @@ import type {
 import {
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
+  isChestEquipmentWindow,
 } from "../../src/player/equipment-upkeep.js";
+
+interface NativeWindow {
+  readonly type: string;
+  readonly title: string;
+  readonly inventoryStart: number;
+  readonly inventoryEnd: number;
+  readonly slots: readonly unknown[];
+}
+
+interface PrismarineWindows {
+  createWindow(id: number, type: string, title: string): NativeWindow | null;
+}
+
+const prismarineWindows = createRequire(import.meta.url)(
+  "prismarine-windows",
+) as (version: string) => PrismarineWindows;
 
 function item(
   name: string,
@@ -70,7 +88,7 @@ function chestWindow(
     type: "minecraft:generic_9x3",
     title: "Chest",
     inventoryStart,
-    inventoryEnd: inventoryStart + 35,
+    inventoryEnd: inventoryStart + 36,
     selectedItem: null,
     slots,
   };
@@ -223,7 +241,7 @@ describe("deterministic equipment upkeep", () => {
       ...singleChest,
       type: "minecraft:generic_9x6",
       inventoryStart: 54,
-      inventoryEnd: 89,
+      inventoryEnd: 90,
       slots: [
         ...singleChest.slots.slice(0, 27),
         ...Array<BodyItemStack | null>(27).fill(null),
@@ -256,6 +274,47 @@ describe("deterministic equipment upkeep", () => {
         }),
       ),
     ).toBeNull();
+  });
+
+  it("matches window geometry produced by prismarine-windows", () => {
+    const windows = prismarineWindows("1.21.4");
+    const current = item("iron_helmet", 5);
+    const candidate = item("diamond_helmet", 0);
+
+    for (const [type, inventoryStart, inventoryEnd] of [
+      ["minecraft:generic_9x3", 27, 63],
+      ["minecraft:generic_9x6", 54, 90],
+    ] as const) {
+      const nativeWindow = windows.createWindow(7, type, "Chest");
+      expect(nativeWindow).not.toBeNull();
+      if (nativeWindow === null) throw new Error("Expected native window");
+      const window: BodyWindowSnapshot = {
+        id: 7,
+        type: nativeWindow.type,
+        title: nativeWindow.title,
+        inventoryStart: nativeWindow.inventoryStart,
+        inventoryEnd: nativeWindow.inventoryEnd,
+        selectedItem: null,
+        slots: nativeWindow.slots.map((_, index) =>
+          index === 0 ? candidate : null,
+        ),
+      };
+
+      expect([
+        window.inventoryStart,
+        window.inventoryEnd,
+        window.slots.length,
+      ]).toEqual([inventoryStart, inventoryEnd, inventoryEnd]);
+      expect(isChestEquipmentWindow(window)).toBe(true);
+      expect(
+        findChestEquipmentWithdrawal(
+          observation({
+            equipment: { head: current },
+            window,
+          }),
+        )?.item,
+      ).toEqual(candidate);
+    }
   });
 
   it("does not withdraw an equal or already-owned upgrade", () => {

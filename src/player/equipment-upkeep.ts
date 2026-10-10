@@ -135,7 +135,7 @@ export function isChestEquipmentWindow(
       (window.inventoryStart === 27 || window.inventoryStart === 54));
   return (
     isChestType &&
-    window.inventoryEnd === window.inventoryStart + 35 &&
+    window.inventoryEnd === window.inventoryStart + 36 &&
     window.slots.length === window.inventoryStart + 36
   );
 }
