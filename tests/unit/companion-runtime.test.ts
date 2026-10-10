@@ -1314,65 +1314,159 @@ describe("CompanionRuntime", () => {
     },
   );
 
-  it("approaches a nearby chest and verifies it before searching ahead of distant equipment", async () => {
+  it.each([20, 32])(
+    "approaches a nearby chest at %i blocks and verifies it before searching ahead of distant equipment",
+    async (chestDistance) => {
+      const { store } = freshStore();
+      const candidate = gearItem("diamond_helmet", 0);
+      const distantDrop = droppedItemEntity(73, -50, "netherite_sword", 1);
+      const body = new FakeBody(store);
+      body.observation = makeObservation({
+        equipment: {
+          ...body.observation.self.equipment,
+          head: gearItem("iron_helmet", 5, 60),
+        },
+        blocks: [equipmentChestBlock(chestDistance)],
+        nearbyDroppedItems: makeNearbyDroppedItems([distantDrop]),
+      });
+      const runtime = createRuntime(store, body, new FakeAgent([]));
+      let openPositionX: number | undefined;
+      let openChestDistance: number | undefined;
+      body.executeHandler = async (operation, _signal, fakeBody) => {
+        const before = fakeBody.observation;
+        let after: PlayerBodyObservation;
+        switch (operation.kind) {
+          case "move_to":
+            after = {
+              ...before,
+              self: {
+                ...before.self,
+                position: {
+                  x: chestDistance - 2,
+                  y: 64,
+                  z: 0,
+                  dimension: "overworld",
+                },
+              },
+              perception: {
+                ...before.perception,
+                blocks: [equipmentChestBlock(chestDistance, 2)],
+                nearbyDroppedItems: makeNearbyDroppedItems([
+                  { ...distantDrop, distance: chestDistance + 48 },
+                ]),
+              },
+            };
+            break;
+          case "open_window":
+            openPositionX = before.self.position.x;
+            openChestDistance = before.perception.blocks[0]?.distance;
+            after = { ...before, window: chestWindow(candidate) };
+            break;
+          case "window_transfer": {
+            const owned = gearItem(candidate.name, 9);
+            after = {
+              ...before,
+              self: { ...before.self, inventory: [owned] },
+              window: chestWindow(null, owned),
+            };
+            break;
+          }
+          case "window_close":
+            after = { ...before, window: null };
+            break;
+          case "equip": {
+            const owned = before.self.inventory.find(
+              (item) => item.name === operation.item,
+            );
+            if (owned === undefined)
+              throw new Error("Expected chest equipment in inventory");
+            after = {
+              ...before,
+              self: {
+                ...before.self,
+                inventory: [],
+                equipment: {
+                  ...before.self.equipment,
+                  [operation.destination]: { ...owned, slot: 5 },
+                },
+              },
+            };
+            break;
+          }
+          default:
+            throw new Error(`Unexpected operation: ${operation.kind}`);
+        }
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          `chest-priority-${fakeBody.executed.length}`,
+          "successful",
+          after,
+          before,
+        );
+      };
+
+      await runtime.start();
+      await eventually(() => body.executed.length === 5, 4_000);
+
+      expect(body.executed).toEqual([
+        {
+          kind: "move_to",
+          position: { x: chestDistance, y: 64, z: 0 },
+          range: 2.5,
+        },
+        {
+          kind: "open_window",
+          target: {
+            kind: "block",
+            position: { x: chestDistance, y: 64, z: 0 },
+          },
+        },
+        {
+          kind: "window_transfer",
+          item: "diamond_helmet",
+          count: 1,
+          direction: "window_to_inventory",
+        },
+        { kind: "window_close" },
+        { kind: "equip", item: "diamond_helmet", destination: "head" },
+      ]);
+      expect(openPositionX).toBe(chestDistance - 2);
+      expect(openChestDistance).toBe(2);
+      expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+    },
+  );
+
+  it("collects equipment at 50 blocks before a chest beyond the 32-block priority range", async () => {
     const { store } = freshStore();
-    const candidate = gearItem("diamond_helmet", 0);
-    const distantDrop = droppedItemEntity(73, -50, "netherite_sword", 1);
+    const candidate = gearItem("diamond_helmet", 9);
     const body = new FakeBody(store);
     body.observation = makeObservation({
       equipment: {
         ...body.observation.self.equipment,
         head: gearItem("iron_helmet", 5, 60),
       },
-      blocks: [equipmentChestBlock(20)],
-      nearbyDroppedItems: makeNearbyDroppedItems([distantDrop]),
+      blocks: [equipmentChestBlock(33)],
+      nearbyDroppedItems: makeNearbyDroppedItems([
+        droppedItemEntity(74, 50, "diamond_helmet", 1),
+      ]),
     });
     const runtime = createRuntime(store, body, new FakeAgent([]));
-    let openPositionX: number | undefined;
-    let openChestDistance: number | undefined;
     body.executeHandler = async (operation, _signal, fakeBody) => {
       const before = fakeBody.observation;
       let after: PlayerBodyObservation;
       switch (operation.kind) {
-        case "move_to":
+        case "collect_item":
           after = {
             ...before,
-            self: {
-              ...before.self,
-              position: { x: 18, y: 64, z: 0, dimension: "overworld" },
-            },
+            self: { ...before.self, inventory: [candidate] },
             perception: {
               ...before.perception,
-              blocks: [equipmentChestBlock(20, 2)],
-              nearbyDroppedItems: makeNearbyDroppedItems([
-                { ...distantDrop, distance: 68 },
-              ]),
+              nearbyDroppedItems: makeNearbyDroppedItems([]),
             },
           };
           break;
-        case "open_window":
-          openPositionX = before.self.position.x;
-          openChestDistance = before.perception.blocks[0]?.distance;
-          after = { ...before, window: chestWindow(candidate) };
-          break;
-        case "window_transfer": {
-          const owned = gearItem(candidate.name, 9);
-          after = {
-            ...before,
-            self: { ...before.self, inventory: [owned] },
-            window: chestWindow(null, owned),
-          };
-          break;
-        }
-        case "window_close":
-          after = { ...before, window: null };
-          break;
-        case "equip": {
-          const owned = before.self.inventory.find(
-            (item) => item.name === operation.item,
-          );
-          if (owned === undefined)
-            throw new Error("Expected chest equipment in inventory");
+        case "equip":
           after = {
             ...before,
             self: {
@@ -1380,19 +1474,18 @@ describe("CompanionRuntime", () => {
               inventory: [],
               equipment: {
                 ...before.self.equipment,
-                [operation.destination]: { ...owned, slot: 5 },
+                [operation.destination]: { ...candidate, slot: 5 },
               },
             },
           };
           break;
-        }
         default:
           throw new Error(`Unexpected operation: ${operation.kind}`);
       }
       fakeBody.observation = after;
       return fakeBody.result(
         operation,
-        `chest-priority-${fakeBody.executed.length}`,
+        `far-equipment-priority-${fakeBody.executed.length}`,
         "successful",
         after,
         before,
@@ -1400,32 +1493,15 @@ describe("CompanionRuntime", () => {
     };
 
     await runtime.start();
-    await eventually(() => body.executed.length === 5, 4_000);
+    await eventually(
+      () => body.executed.length === 2 && !runtime.status().thinking,
+      4_000,
+    );
 
     expect(body.executed).toEqual([
-      {
-        kind: "move_to",
-        position: { x: 20, y: 64, z: 0 },
-        range: 2.5,
-      },
-      {
-        kind: "open_window",
-        target: {
-          kind: "block",
-          position: { x: 20, y: 64, z: 0 },
-        },
-      },
-      {
-        kind: "window_transfer",
-        item: "diamond_helmet",
-        count: 1,
-        direction: "window_to_inventory",
-      },
-      { kind: "window_close" },
+      { kind: "collect_item", entityId: 74 },
       { kind: "equip", item: "diamond_helmet", destination: "head" },
     ]);
-    expect(openPositionX).toBe(18);
-    expect(openChestDistance).toBe(2);
     expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
   });
 
