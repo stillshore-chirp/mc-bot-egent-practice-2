@@ -25,6 +25,11 @@ import type {
   PlayerKnowledge,
   PlayerOperationResult,
 } from "../../src/minecraft/player-body.js";
+import type {
+  BodyItemStack,
+  BodyVisibleBlock,
+  BodyWindowSnapshot,
+} from "../../src/minecraft/player-body-observation.js";
 import { CompanionStore } from "../../src/player/store.js";
 import { isImmediateStopCommand } from "../../src/player/stop-command.js";
 
@@ -61,8 +66,12 @@ function failStopPersistence(store: CompanionStore): void {
 function makeObservation(
   options: {
     readonly health?: number | null;
+    readonly inventory?: readonly BodyItemStack[];
+    readonly equipment?: PlayerBodyObservation["self"]["equipment"];
+    readonly blocks?: readonly BodyVisibleBlock[];
     readonly entities?: PlayerBodyObservation["perception"]["entities"];
     readonly nearbyHostiles?: PlayerBodyObservation["perception"]["nearbyHostiles"];
+    readonly window?: BodyWindowSnapshot | null;
   } = {},
 ): PlayerBodyObservation {
   const health = options.health === undefined ? 20 : options.health;
@@ -91,8 +100,15 @@ function makeObservation(
       mountedEntityId: null,
       gameMode: "survival",
       experience: { level: 0, points: 0, progress: 0 },
-      inventory: [],
-      equipment: {},
+      inventory: options.inventory ?? [],
+      equipment: options.equipment ?? {
+        hand: null,
+        "off-hand": null,
+        head: null,
+        torso: null,
+        legs: null,
+        feet: null,
+      },
     },
     perception: {
       horizontalFieldOfViewDegrees: 110,
@@ -106,7 +122,7 @@ function makeObservation(
       omittedBlockCandidates: 0,
       omittedEntityCandidates: 0,
       candidateSearchMayBeTruncated: false,
-      blocks: [],
+      blocks: options.blocks ?? [],
       placementCandidateLimit: 24,
       omittedPlacementCandidates: 0,
       placementCandidatesMayBeTruncated: false,
@@ -116,7 +132,41 @@ function makeObservation(
         ? {}
         : { nearbyHostiles: options.nearbyHostiles }),
     },
-    window: null,
+    window: options.window ?? null,
+  };
+}
+
+function gearItem(name: string, slot: number, durability = 100): BodyItemStack {
+  return {
+    slot,
+    itemId: 1,
+    name,
+    count: 1,
+    metadata: 0,
+    durability,
+    maxDurability: 100,
+    customName: null,
+    enchantments: [],
+  };
+}
+
+function chestWindow(
+  chestItem: BodyItemStack | null,
+  inventoryItem: BodyItemStack | null = null,
+): BodyWindowSnapshot {
+  return {
+    id: 7,
+    type: "minecraft:generic_9x3",
+    title: "Chest",
+    inventoryStart: 27,
+    inventoryEnd: 62,
+    selectedItem: null,
+    slots: [
+      chestItem,
+      ...Array<BodyItemStack | null>(26).fill(null),
+      inventoryItem,
+      ...Array<BodyItemStack | null>(35).fill(null),
+    ],
   };
 }
 
@@ -302,12 +352,14 @@ type ExecuteHandler = (
 
 class FakeBody implements PlayerBody {
   readonly executed: PlayerOperation[] = [];
+  readonly results: PlayerOperationResult[] = [];
   readonly bodyResultIds: string[] = [];
   readonly runtimeMarkerIds: string[] = [];
   readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   readonly observeOptions: (PlayerBodyObservationOptions | undefined)[] = [];
   observation = makeObservation();
   executeHandler: ExecuteHandler | undefined;
+  observeHandler: ((body: FakeBody) => Promise<void> | void) | undefined;
   stopActiveCalls = 0;
   knowledgeCalls: string[] = [];
 
@@ -317,6 +369,7 @@ class FakeBody implements PlayerBody {
     options?: PlayerBodyObservationOptions,
   ): Promise<PlayerBodyObservation> {
     this.observeOptions.push(options);
+    await this.observeHandler?.(this);
     return this.observation;
   }
 
@@ -370,19 +423,22 @@ class FakeBody implements PlayerBody {
     operationId: string,
     status: PlayerOperationResult["status"],
     after: PlayerBodyObservation | null,
+    before: PlayerBodyObservation = this.observation,
   ): PlayerOperationResult {
     const now = new Date().toISOString();
-    return {
+    const result = {
       operationId,
       operation,
       status,
       startedAt: now,
       completedAt: now,
-      before: this.observation,
+      before,
       after,
       sameLife: true,
       recoveryRequired: false,
     };
+    this.results.push(result);
+    return result;
   }
 }
 
@@ -408,6 +464,336 @@ function createRuntime(
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
 
 describe("CompanionRuntime", () => {
+  it("autonomously equips a better item after an inventory observation changes", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const equipped = gearItem("iron_helmet", 5, 60);
+    const candidate = gearItem("diamond_helmet", 9);
+
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          inventory: [],
+          equipment: {
+            ...before.self.equipment,
+            head: { ...candidate, slot: 5 },
+          },
+        },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "automatic-equipment-upgrade",
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.observation = makeObservation({
+      inventory: [candidate],
+      equipment: { ...body.observation.self.equipment, head: equipped },
+    });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+
+    await eventually(() => body.executed.length === 1, 4_000);
+    expect(body.executed).toEqual([
+      { kind: "equip", item: "diamond_helmet", destination: "head" },
+    ]);
+    expect(body.results[0]?.before?.self.equipment.head?.name).toBe(
+      "iron_helmet",
+    );
+    expect(body.results[0]?.after?.self.equipment.head?.name).toBe(
+      "diamond_helmet",
+    );
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("searches a visible chest, withdraws one upgrade, closes it, then equips without the agent", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const candidate = gearItem("diamond_helmet", 0);
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const messages: string[] = [];
+    const runtime = createRuntime(store, body, agent, async (message) => {
+      messages.push(message);
+    });
+    body.observation = makeObservation({ blocks: [block] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after: PlayerBodyObservation;
+      switch (operation.kind) {
+        case "open_window":
+          after = { ...before, window: chestWindow(candidate) };
+          break;
+        case "window_transfer": {
+          const owned = gearItem(candidate.name, 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          after = { ...before, window: null };
+          break;
+        case "equip": {
+          const owned = before.self.inventory.find(
+            (item) => item.name === operation.item,
+          );
+          if (owned === undefined)
+            throw new Error("Expected chest item in inventory");
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              inventory: before.self.inventory.filter(
+                (item) => item.name !== operation.item,
+              ),
+              equipment: {
+                ...before.self.equipment,
+                [operation.destination]: { ...owned, slot: 5 },
+              },
+            },
+          };
+          break;
+        }
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `equipment-operation-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.receiveChat("Builder", "装備を自分で探して");
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "equip",
+    ]);
+    expect(body.executed[1]).toMatchObject({
+      item: "diamond_helmet",
+      count: 1,
+      direction: "window_to_inventory",
+    });
+    expect(body.results.every((result) => result.status === "successful")).toBe(
+      true,
+    );
+    expect(
+      body.results.find((result) => result.operation.kind === "equip")?.after
+        ?.self.equipment.head?.name,
+    ).toBe("diamond_helmet");
+    expect(body.observation.window).toBeNull();
+    expect(agent.inputs).toHaveLength(0);
+    expect(messages.some((message) => message.includes("diamond_helmet"))).toBe(
+      true,
+    );
+  });
+
+  it("does not treat an equipment question or negation as a direct command", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.receiveChat("Builder", "装備を探してもいい？");
+    await runtime.receiveChat("Builder", "装備を探さないで");
+
+    expect(body.executed).toHaveLength(0);
+    expect(agent.inputs).toHaveLength(2);
+  });
+
+  it("closes a chest after an owner stop changes the generation without writing a new plan", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const candidate = gearItem("diamond_helmet", 0);
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const messages: string[] = [];
+    const runtime = createRuntime(store, body, agent, async (message) => {
+      messages.push(message);
+    });
+    let stopping: Promise<boolean> | undefined;
+    body.observation = makeObservation({ blocks: [block] });
+    body.observeHandler = (fakeBody) => {
+      if (fakeBody.observation.window !== null && stopping === undefined)
+        stopping = runtime.stop("Builder");
+    };
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after =
+        operation.kind === "open_window"
+          ? { ...before, window: chestWindow(candidate) }
+          : operation.kind === "window_close"
+            ? { ...before, window: null }
+            : before;
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `cleanup-operation-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.receiveChat("Builder", "装備を探して");
+    await stopping;
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_close",
+    ]);
+    expect(body.observation.window).toBeNull();
+    expect(store.snapshot().stopped).toBe(true);
+    expect(store.snapshot().plan).toBeNull();
+    expect(
+      messages.some((message) => message.startsWith("装備を更新したよ")),
+    ).toBe(false);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("does not reopen an inspected empty chest after it leaves and re-enters view", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({ blocks: [block] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after =
+        operation.kind === "open_window"
+          ? { ...before, window: chestWindow(null) }
+          : operation.kind === "window_close"
+            ? { ...before, window: null }
+            : before;
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `empty-chest-operation-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 2);
+    body.observation = makeObservation();
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "blocks",
+    });
+    await eventually(() => agent.inputs.length === 1);
+    body.observation = makeObservation({ blocks: [block] });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "blocks",
+    });
+    await eventually(() => agent.inputs.length === 2);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_close",
+    ]);
+  });
+
+  it("does not report an unobserved transfer as success when chest cleanup also fails", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const candidate = gearItem("diamond_helmet", 0);
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const messages: string[] = [];
+    const runtime = createRuntime(store, body, agent, async (message) => {
+      messages.push(message);
+    });
+    body.observation = makeObservation({ blocks: [block] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after =
+        operation.kind === "open_window"
+          ? { ...before, window: chestWindow(candidate) }
+          : before;
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `unconfirmed-operation-${fakeBody.executed.length}`,
+        operation.kind === "window_close" ? "failed" : "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.receiveChat("Builder", "装備を探して");
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "window_close",
+    ]);
+    expect(body.observation.window).not.toBeNull();
+    expect(
+      messages.some((message) => message.includes("成功とは言えない")),
+    ).toBe(false);
+    expect(
+      messages.some((message) => message.includes("成功は報告できない")),
+    ).toBe(true);
+    expect(
+      messages.some((message) => message.startsWith("装備を更新したよ")),
+    ).toBe(false);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
   it("collects one nearby visible drop without a fresh owner instruction", async () => {
     const { store } = freshStore();
     store.save({
