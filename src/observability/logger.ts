@@ -1,7 +1,6 @@
 import pino, { type Logger } from "pino";
 
 import type { AppConfig } from "../config/schema.js";
-import { currentCorrelationId } from "./correlation.js";
 
 const REDACTED_PATHS = [
   "apiKey",
@@ -25,10 +24,6 @@ export function createLogger(config: Pick<AppConfig, "logLevel">): Logger {
   return pino({
     level: config.logLevel,
     base: null,
-    mixin: () => {
-      const correlationId = currentCorrelationId();
-      return correlationId === undefined ? {} : { correlationId };
-    },
     redact: {
       paths: [...REDACTED_PATHS],
       censor: "[REDACTED]",
@@ -37,8 +32,4 @@ export function createLogger(config: Pick<AppConfig, "logLevel">): Logger {
       err: pino.stdSerializers.err,
     },
   });
-}
-
-export function childLogger(logger: Logger, correlationId: string): Logger {
-  return logger.child({ correlationId });
 }

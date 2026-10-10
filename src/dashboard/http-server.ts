@@ -1,531 +1,561 @@
-import { createHash, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync, statSync } from "node:fs";
 import {
   createServer,
   type IncomingMessage,
+  type Server,
   type ServerResponse,
 } from "node:http";
-import { extname, resolve, sep } from "node:path";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { isIP } from "node:net";
+import type { AddressInfo } from "node:net";
+import { timingSafeEqual, randomBytes } from "node:crypto";
 
-import type { Logger } from "pino";
+import { renderDashboardPage } from "./page.js";
 
-import type { CognitiveTraceEvent } from "../trace/contracts.js";
-import type { TraceService } from "../trace/service.js";
-import { TraceStoreError } from "../trace/store.js";
+export type DashboardConnectionState =
+  "idle" | "connecting" | "connected" | "reconnecting" | "failed" | "stopped";
 
-import { z } from "zod";
-
-const TRACE_ID = z.uuid();
-const SPAN_ID = z.uuid();
-const MAX_REQUEST_BYTES = 5 * 1024 * 1024;
-const SSE_KEEPALIVE_MS = 15_000;
-const SSE_BACKFILL_PAGE = 2_000;
-const SSE_MAX_BUFFER_BYTES = 1024 * 1024;
-
-export interface DashboardBotHealth {
-  readonly botState: "active" | "unavailable" | "unknown";
-  readonly connectionState: string;
-  readonly aiState: "active" | "idle";
-  readonly memoryState: "available";
-  readonly reflexState: string;
-  readonly health?: number | undefined;
-  readonly food?: number | undefined;
-  readonly positionState: "available_redacted" | "unavailable";
-  readonly taskStatus?: string | undefined;
-  readonly taskPhase?: string | undefined;
+export interface DashboardUsageSnapshot {
+  readonly requests: number;
+  readonly usageResponses: number;
+  readonly missingUsageRequests: number;
+  readonly errors: number;
+  readonly inputTokens: number | null;
+  readonly outputTokens: number | null;
+  readonly cachedInputTokens: number | null;
+  readonly lastErrorCode: string | null;
 }
 
-export interface DashboardServerOptions {
-  readonly enabled: boolean;
+export interface DashboardRuntimeSnapshot {
+  readonly running: boolean;
+  readonly stopped: boolean;
+  readonly thinking: boolean;
+  readonly goal: {
+    readonly title: string;
+    readonly successCondition: string;
+  } | null;
+  readonly currentOperation: {
+    readonly kind: string;
+    readonly startedAt: string;
+  } | null;
+  readonly nextWakeAt: string | null;
+  readonly lastOutcome: {
+    readonly status: string;
+    readonly operationKind: string;
+    readonly summary: string;
+    readonly observedAt: string;
+  } | null;
+  readonly recentErrors?:
+    | readonly {
+        readonly code: string;
+        readonly at: string;
+      }[]
+    | undefined;
+  readonly usage: DashboardUsageSnapshot;
+}
+
+export interface DashboardSnapshot {
+  readonly generatedAt: string;
+  readonly connectionState: DashboardConnectionState;
+  readonly runtime: DashboardRuntimeSnapshot;
+  readonly plan: {
+    readonly purpose: string;
+    readonly firstStep: {
+      readonly kind: string;
+      readonly expectedOutcome: string;
+    } | null;
+  } | null;
+  readonly activeOperation: {
+    readonly kind: string;
+    readonly expectedOutcome: string;
+  } | null;
+  readonly memories: readonly {
+    readonly content: string;
+    readonly source: string;
+    readonly updatedAt: string;
+  }[];
+}
+
+export interface DashboardHttpServerOptions {
   readonly host: string;
   readonly port: number;
   readonly authToken?: string | undefined;
-  readonly staticDirectory: string;
-  readonly maxAgeDays: number;
-  readonly maxTraces: number;
-  readonly getBotHealth?: (() => Promise<DashboardBotHealth>) | undefined;
+  readonly getSnapshot: (
+    query: string,
+  ) => DashboardSnapshot | Promise<DashboardSnapshot>;
 }
 
+const connectionStates = new Set<DashboardConnectionState>([
+  "idle",
+  "connecting",
+  "connected",
+  "reconnecting",
+  "failed",
+  "stopped",
+]);
+const memorySources = new Set([
+  "player_stated",
+  "minecraft_observed",
+  "bot_inferred",
+  "system",
+]);
+const outcomeStatuses = new Set([
+  "successful",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "unverified",
+]);
+const maximumQueryLength = 2_000;
+const maximumMemoryCount = 30;
+const maximumMemoryLength = 4_000;
+
+/**
+ * Small, read-only companion operations page. The provider is called only for
+ * an authenticated GET and its result is copied through a strict display-field
+ * allowlist before it leaves this process.
+ */
 export class DashboardHttpServer {
-  readonly #service: TraceService;
-  readonly #options: DashboardServerOptions;
-  readonly #logger: Logger;
-  readonly #streams = new Set<ServerResponse>();
-  readonly #server = createServer((request, response) => {
-    void this.#handle(request, response).catch((error: unknown) => {
-      const status = statusForError(error);
-      const log =
-        status >= 500
-          ? this.#logger.error.bind(this.#logger)
-          : this.#logger.warn.bind(this.#logger);
-      log(
-        {
-          category: "observability",
-          code: "DASHBOARD_REQUEST_FAILED",
-          errorType: error instanceof Error ? error.name : "UnknownError",
-        },
-        "dashboard request failed",
-      );
-      if (!response.headersSent) {
-        this.#json(response, status, {
-          code:
-            error instanceof TraceStoreError
-              ? error.code
-              : "DASHBOARD_REQUEST_FAILED",
-        });
-      } else {
-        response.end();
-      }
-    });
-  });
-  #started = false;
+  readonly #host: string;
+  readonly #port: number;
+  readonly #authToken: string | undefined;
+  readonly #getSnapshot: DashboardHttpServerOptions["getSnapshot"];
+  #server: Server | undefined;
 
-  public constructor(
-    service: TraceService,
-    options: DashboardServerOptions,
-    logger: Logger,
-  ) {
-    if (options.authToken !== undefined && !hasStrongToken(options.authToken)) {
-      throw new Error("DASHBOARD_AUTH_TOKEN_WEAK");
-    }
+  public constructor(options: DashboardHttpServerOptions) {
     if (
-      options.enabled &&
-      !isLoopbackHost(options.host) &&
-      !hasStrongToken(options.authToken)
+      options.host.trim().length === 0 ||
+      !Number.isInteger(options.port) ||
+      options.port < 0 ||
+      options.port > 65_535
     ) {
-      throw new Error("DASHBOARD_NON_LOOPBACK_AUTH_REQUIRED");
+      throw new Error("Invalid dashboard bind address.");
     }
-    this.#service = service;
-    this.#options = options;
-    this.#logger = logger;
+    if (options.authToken !== undefined && options.authToken.length < 32) {
+      throw new Error("Dashboard authentication token is too short.");
+    }
+    if (!isLoopbackHost(options.host)) {
+      throw new Error("Dashboard server only supports loopback binding.");
+    }
+    this.#host = normalizeBindHost(options.host);
+    this.#port = options.port;
+    this.#authToken = options.authToken;
+    this.#getSnapshot = options.getSnapshot;
   }
 
-  public async start(): Promise<void> {
-    if (!this.#options.enabled || this.#started) return;
-    const removed = this.#service.store.enforceRetention({
-      maxAgeDays: this.#options.maxAgeDays,
-      maxTraces: this.#options.maxTraces,
+  public start(): Promise<void> {
+    if (this.#server !== undefined) {
+      return Promise.reject(new Error("Dashboard server is already started."));
+    }
+    const server = createServer((request, response) => {
+      void this.#handle(request, response);
     });
-    await new Promise<void>((resolveStart, rejectStart) => {
-      const onError = (error: Error): void => rejectStart(error);
-      this.#server.once("error", onError);
-      this.#server.listen(this.#options.port, this.#options.host, () => {
-        this.#server.off("error", onError);
-        this.#started = true;
-        resolveStart();
+    this.#server = server;
+    return new Promise((resolve, reject) => {
+      const onError = (error: Error) => {
+        this.#server = undefined;
+        reject(
+          new Error("Dashboard server could not start.", { cause: error }),
+        );
+      };
+      server.once("error", onError);
+      server.listen(this.#port, this.#host, () => {
+        server.off("error", onError);
+        resolve();
       });
     });
-    this.#logger.info(
-      {
-        category: "observability",
-        host: this.#options.host,
-        port: this.#options.port,
-        retentionRemoved: removed,
-      },
-      "trace dashboard started",
-    );
   }
 
-  public get address(): string | undefined {
-    const address = this.#server.address();
-    if (address === null || typeof address === "string") return undefined;
-    const host =
-      address.family === "IPv6" ? `[${address.address}]` : address.address;
-    return `http://${host}:${String(address.port)}`;
-  }
-
-  public async stop(): Promise<void> {
-    if (!this.#started) return;
-    for (const response of this.#streams) response.end();
-    await new Promise<void>((resolveStop, rejectStop) => {
-      this.#server.close((error) => {
-        if (error === undefined) resolveStop();
-        else rejectStop(error);
+  public close(): Promise<void> {
+    const server = this.#server;
+    if (server === undefined) return Promise.resolve();
+    this.#server = undefined;
+    return new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error !== undefined)
+          reject(new Error("Dashboard server could not close."));
+        else resolve();
       });
     });
-    this.#started = false;
+  }
+
+  /** Exposes the bound address for lifecycle wiring and port-0 tests. */
+  public address(): AddressInfo | null {
+    const address = this.#server?.address();
+    return address !== undefined &&
+      address !== null &&
+      typeof address !== "string"
+      ? address
+      : null;
   }
 
   async #handle(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    this.#securityHeaders(response);
-    if (!this.#authorized(request)) {
+    setSecurityHeaders(response);
+    if (!this.#validHost(request)) {
+      sendJson(response, 421, { error: "host_not_allowed" });
+      return;
+    }
+    if (!this.#sameOrigin(request)) {
+      sendJson(response, 403, { error: "origin_not_allowed" });
+      return;
+    }
+    if (request.method !== "GET") {
+      response.setHeader("Allow", "GET");
+      sendJson(response, 405, { error: "method_not_allowed" });
+      return;
+    }
+    if (hasRequestBody(request)) {
+      response.setHeader("Connection", "close");
+      sendJson(response, 400, { error: "request_body_not_allowed" });
+      return;
+    }
+
+    const requestUrl = parseOriginForm(request.url);
+    if (requestUrl === null) {
+      sendJson(response, 400, { error: "invalid_request_target" });
+      return;
+    }
+    if (requestUrl.pathname === "/") {
+      if (requestUrl.search.length > 0) {
+        sendJson(response, 404, { error: "not_found" });
+        return;
+      }
+      const nonce = randomBytes(18).toString("base64");
+      response.statusCode = 200;
+      response.setHeader("Content-Type", "text/html; charset=utf-8");
+      response.setHeader(
+        "Content-Security-Policy",
+        [
+          "default-src 'none'",
+          "base-uri 'none'",
+          "connect-src 'self'",
+          "form-action 'self'",
+          "frame-ancestors 'none'",
+          "img-src 'none'",
+          "object-src 'none'",
+          "script-src 'nonce-" + nonce + "'",
+          "style-src 'nonce-" + nonce + "'",
+        ].join("; "),
+      );
+      response.end(renderDashboardPage(nonce));
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith("/api/") && !this.#authorized(request)) {
       response.setHeader(
         "WWW-Authenticate",
-        'Basic realm="companion-trace-dashboard", charset="UTF-8"',
+        'Bearer realm="companion-dashboard"',
       );
-      this.#json(response, 401, { code: "DASHBOARD_UNAUTHORIZED" });
+      sendJson(response, 401, { error: "authentication_required" });
       return;
     }
-    const requestUrl = new URL(request.url ?? "/", "http://dashboard.local");
-    const path = requestUrl.pathname;
-
-    if (request.method === "GET" && path === "/api/dashboard/health") {
-      const bot = await this.#options.getBotHealth?.().catch(() => undefined);
-      this.#json(response, 200, {
-        observability: this.#service.health,
-        ...(bot === undefined ? {} : { bot }),
-      });
+    if (requestUrl.pathname !== "/api/snapshot") {
+      sendJson(response, 404, { error: "not_found" });
       return;
     }
-    if (request.method === "GET" && path === "/api/traces") {
-      const requestedLimit = Number(requestUrl.searchParams.get("limit") ?? 50);
-      const limit = Number.isInteger(requestedLimit) ? requestedLimit : 50;
-      this.#json(response, 200, {
-        traces: this.#service.store.listTraces(limit),
-      });
-      return;
-    }
-    if (request.method === "GET" && path === "/api/stream") {
-      await this.#stream(request, response);
-      return;
-    }
-    if (request.method === "POST" && path === "/api/traces/import") {
-      const input = await readJson(request);
-      this.#json(response, 201, {
-        trace: this.#service.store.importDemoBundle(input),
-      });
-      return;
-    }
-    const spanId = spanRoute(path);
-    if (request.method === "GET" && spanId !== undefined) {
-      const span = this.#service.store.getSpan(spanId);
-      if (span === undefined) {
-        this.#json(response, 404, { code: "TRACE_SPAN_NOT_FOUND" });
-      } else {
-        this.#json(response, 200, span);
-      }
+    const query = readQuery(requestUrl);
+    if (query === null) {
+      sendJson(response, 400, { error: "invalid_query" });
       return;
     }
 
-    const route = traceRoute(path);
-    if (route !== undefined) {
-      const { traceId, action } = route;
-      if (request.method === "GET" && action === "detail") {
-        const trace = this.#service.store.getTrace(traceId);
-        if (trace === undefined) {
-          this.#json(response, 404, { code: "TRACE_NOT_FOUND" });
-        } else {
-          this.#json(response, 200, trace);
-        }
-        return;
-      }
-      if (request.method === "GET" && action === "events") {
-        const requestedAfter = Number(
-          requestUrl.searchParams.get("after") ?? 0,
-        );
-        const after = Number.isInteger(requestedAfter) ? requestedAfter : 0;
-        this.#json(response, 200, {
-          events: this.#service.store.listEvents(traceId, after),
-        });
-        return;
-      }
-      if (request.method === "POST" && action === "demo-safe") {
-        this.#json(response, 200, this.#service.store.markDemoSafe(traceId));
-        return;
-      }
-      if (request.method === "GET" && action === "export") {
-        response.setHeader(
-          "Content-Disposition",
-          `attachment; filename="trace-${traceId}.json"`,
-        );
-        this.#json(
-          response,
-          200,
-          this.#service.store.exportDemoBundle(traceId),
-        );
-        return;
-      }
-    }
-
-    if (
-      !path.startsWith("/api/") &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
-      if (this.#serveStatic(path, request.method === "HEAD", response)) return;
-    }
-    this.#json(response, 404, { code: "DASHBOARD_ROUTE_NOT_FOUND" });
-  }
-
-  async #stream(
-    request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<void> {
-    response.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    response.flushHeaders();
-    this.#streams.add(response);
-    const lastEventHeader = request.headers["last-event-id"];
-    let lastSent = parseLastEventId(
-      Array.isArray(lastEventHeader) ? lastEventHeader[0] : lastEventHeader,
-    );
-    let closed = false;
-    const isClosed = (): boolean => closed;
-    let unsubscribe = (): void => undefined;
-    let keepalive: ReturnType<typeof setInterval> | undefined;
-    const close = (): void => {
-      if (closed) return;
-      closed = true;
-      clearInterval(keepalive);
-      unsubscribe();
-      this.#streams.delete(response);
-      request.off("close", close);
-      response.off("close", close);
-      if (!response.writableEnded) response.end();
-    };
-    // 履歴の送信中に終了しても必ず解放できるよう、先にcloseを登録する。
-    request.once("close", close);
-    response.once("close", close);
-    const send = (event: CognitiveTraceEvent): boolean => {
-      if (
-        closed ||
-        response.destroyed ||
-        response.writableEnded ||
-        response.writableLength > SSE_MAX_BUFFER_BYTES
-      ) {
-        close();
-        return false;
-      }
-      if (event.streamId === undefined || event.streamId <= lastSent)
-        return true;
-      response.write(
-        `id: ${String(event.streamId)}\nevent: trace\ndata: ${JSON.stringify(event)}\n\n`,
-      );
-      lastSent = event.streamId;
-      return true;
-    };
-    let catchingUp = true;
-    const pending: CognitiveTraceEvent[] = [];
-    unsubscribe = this.#service.subscribe((event) => {
-      if (closed) return;
-      if (catchingUp) {
-        if (pending.length >= SSE_BACKFILL_PAGE) close();
-        else pending.push(event);
-      } else send(event);
-    });
     try {
-      while (!isClosed()) {
-        const before = lastSent;
-        const backfill = this.#service.store.listStreamEventsAfter(lastSent);
-        for (const event of backfill) if (!send(event)) return;
-        if (backfill.length < SSE_BACKFILL_PAGE) break;
-        if (lastSent <= before) {
-          close();
-          return;
-        }
-        // ゲーム接続、HTTP、切断通知を履歴のページ間でも処理できるようにする。
-        await yieldToEventLoop();
-      }
-      if (isClosed()) return;
-      pending.sort(
-        (left, right) => (left.streamId ?? 0) - (right.streamId ?? 0),
-      );
-      for (const event of pending) if (!send(event)) return;
-      catchingUp = false;
-      response.write(": connected\n\n");
-      keepalive = setInterval(() => {
-        if (
-          response.writableEnded ||
-          response.destroyed ||
-          response.writableLength > SSE_MAX_BUFFER_BYTES
-        )
-          close();
-        else response.write(": keepalive\n\n");
-      }, SSE_KEEPALIVE_MS);
-    } catch (error) {
-      close();
-      throw error;
+      const snapshot = await this.#getSnapshot(query);
+      sendJson(response, 200, sanitizeSnapshot(snapshot));
+    } catch {
+      sendJson(response, 503, { error: "dashboard_snapshot_unavailable" });
     }
-  }
-
-  #serveStatic(
-    path: string,
-    headOnly: boolean,
-    response: ServerResponse,
-  ): boolean {
-    const root = resolve(this.#options.staticDirectory);
-    const requested = path === "/" ? "/index.html" : path;
-    const candidate = resolve(root, `.${requested}`);
-    const safeCandidate =
-      candidate === root || candidate.startsWith(`${root}${sep}`);
-    const file =
-      safeCandidate && existsSync(candidate) && statSync(candidate).isFile()
-        ? candidate
-        : resolve(root, "index.html");
-    if (!existsSync(file) || !statSync(file).isFile()) return false;
-    if (!file.startsWith(`${root}${sep}`)) return false;
-    response.statusCode = 200;
-    response.setHeader("Content-Type", contentType(file));
-    response.setHeader(
-      "Cache-Control",
-      file.endsWith("index.html")
-        ? "no-store"
-        : "public, max-age=31536000, immutable",
-    );
-    if (headOnly) response.end();
-    else createReadStream(file).pipe(response);
-    return true;
   }
 
   #authorized(request: IncomingMessage): boolean {
-    const expected = this.#options.authToken;
-    if (expected === undefined) return isLoopbackHost(this.#options.host);
-    const authorization = request.headers.authorization;
-    const bearer = authorization?.match(/^Bearer\s+(.+)$/iu)?.[1];
-    const supplied = bearer ?? basicPassword(authorization);
-    if (supplied === undefined) return false;
-    return safeEqual(supplied, expected);
-  }
-
-  #securityHeaders(response: ServerResponse): void {
-    response.setHeader("X-Content-Type-Options", "nosniff");
-    response.setHeader("Referrer-Policy", "no-referrer");
-    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-    response.setHeader(
-      "Content-Security-Policy",
-      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    if (this.#authToken === undefined) return true;
+    const header = request.headers.authorization;
+    if (typeof header !== "string" || !header.startsWith("Bearer "))
+      return false;
+    const provided = Buffer.from(header.slice(7), "utf8");
+    const expected = Buffer.from(this.#authToken, "utf8");
+    return (
+      provided.length === expected.length && timingSafeEqual(provided, expected)
     );
   }
 
-  #json(response: ServerResponse, status: number, value: unknown): void {
-    response.statusCode = status;
-    response.setHeader("Content-Type", "application/json; charset=utf-8");
-    response.setHeader("Cache-Control", "no-store");
-    response.end(JSON.stringify(value));
+  #validHost(request: IncomingMessage): boolean {
+    const rawAuthority = request.headers.host;
+    if (typeof rawAuthority !== "string") return false;
+    const authority = parseAuthority(rawAuthority);
+    if (authority === null || authority.port !== request.socket.localPort)
+      return false;
+    const localAddress = normalizeAddress(request.socket.localAddress ?? "");
+    if (authority.hostname === localAddress) return true;
+    if (authority.hostname === "localhost" && isLoopbackHost(localAddress))
+      return true;
+    return authority.hostname === normalizeConfiguredHost(this.#host);
   }
-}
 
-function spanRoute(path: string): string | undefined {
-  const match = /^\/api\/spans\/([^/]+)$/u.exec(path);
-  if (match === null) return undefined;
-  const parsed = SPAN_ID.safeParse(match[1]);
-  return parsed.success ? parsed.data : undefined;
-}
-
-function traceRoute(path: string):
-  | {
-      readonly traceId: string;
-      readonly action: "detail" | "events" | "demo-safe" | "export";
-    }
-  | undefined {
-  const match =
-    /^\/api\/traces\/([^/]+)(?:\/(events|demo-safe|export))?$/u.exec(path);
-  if (match === null) return undefined;
-  const parsed = TRACE_ID.safeParse(match[1]);
-  if (!parsed.success) return undefined;
-  const rawAction = match[2];
-  return {
-    traceId: parsed.data,
-    action:
-      rawAction === "events" ||
-      rawAction === "demo-safe" ||
-      rawAction === "export"
-        ? rawAction
-        : "detail",
-  };
-}
-
-async function readJson(request: IncomingMessage): Promise<unknown> {
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buffer.byteLength;
-    if (size > MAX_REQUEST_BYTES) {
-      throw new TraceStoreError(
-        "TRACE_IMPORT_TOO_LARGE",
-        "Trace bundle exceeds the request limit",
+  #sameOrigin(request: IncomingMessage): boolean {
+    const fetchSite = request.headers["sec-fetch-site"];
+    if (typeof fetchSite === "string" && fetchSite !== "same-origin")
+      return false;
+    const originHeader = request.headers.origin;
+    if (originHeader === undefined) return true;
+    if (typeof originHeader !== "string" || originHeader === "null")
+      return false;
+    try {
+      const origin = new URL(originHeader);
+      const authority = request.headers.host?.toLowerCase();
+      return (
+        origin.protocol === "http:" &&
+        origin.username.length === 0 &&
+        origin.password.length === 0 &&
+        origin.pathname === "/" &&
+        origin.search.length === 0 &&
+        origin.hash.length === 0 &&
+        authority !== undefined &&
+        origin.host.toLowerCase() === authority
       );
+    } catch {
+      return false;
     }
-    chunks.push(new Uint8Array(buffer));
-  }
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    throw new TraceStoreError(
-      "TRACE_IMPORT_JSON_INVALID",
-      "Trace bundle JSON is invalid",
-    );
   }
 }
 
-function parseLastEventId(value: string | undefined): number {
-  if (value === undefined || !/^\d+$/u.test(value)) return 0;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
-}
-
-function hasStrongToken(value: string | undefined): value is string {
-  return value !== undefined && value.length >= 32;
-}
-
-function isLoopbackHost(host: string): boolean {
-  return host === "127.0.0.1" || host === "::1" || host === "localhost";
-}
-
-function safeEqual(left: string, right: string): boolean {
-  const leftHash = createHash("sha256").update(left).digest();
-  const rightHash = createHash("sha256").update(right).digest();
-  return timingSafeEqual(leftHash, rightHash);
-}
-
-function basicPassword(authorization: string | undefined): string | undefined {
-  if (!authorization?.startsWith("Basic ")) {
-    return undefined;
-  }
-  try {
-    const decoded = Buffer.from(authorization.slice(6), "base64").toString(
-      "utf8",
-    );
-    const separator = decoded.indexOf(":");
-    return separator < 0 ? undefined : decoded.slice(separator + 1);
-  } catch {
-    return undefined;
-  }
-}
-
-function contentType(path: string): string {
-  return (
-    {
-      ".css": "text/css; charset=utf-8",
-      ".html": "text/html; charset=utf-8",
-      ".js": "text/javascript; charset=utf-8",
-      ".json": "application/json; charset=utf-8",
-      ".map": "application/json; charset=utf-8",
-      ".svg": "image/svg+xml",
-      ".woff2": "font/woff2",
-    }[extname(path)] ?? "application/octet-stream"
+function setSecurityHeaders(response: ServerResponse): void {
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("X-Frame-Options", "DENY");
+  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  response.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()",
   );
 }
 
-function statusForError(error: unknown): number {
-  if (error instanceof z.ZodError) return 400;
-  if (!(error instanceof TraceStoreError)) return 500;
-  if (error.code === "TRACE_NOT_FOUND") return 404;
+function sendJson(
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+): void {
+  response.statusCode = status;
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(value));
+}
+
+function hasRequestBody(request: IncomingMessage): boolean {
+  const contentLength = request.headers["content-length"];
   if (
-    error.code === "TRACE_NOT_DEMO_SAFE" ||
-    error.code === "TRACE_NOT_COMPLETE" ||
-    error.code === "TRACE_IMPORT_NOT_DEMO_SAFE" ||
-    error.code === "TRACE_EVENT_ID_CONFLICT"
+    contentLength !== undefined &&
+    (Array.isArray(contentLength) ||
+      !/^(?:0|[1-9][0-9]*)$/u.test(contentLength) ||
+      Number(contentLength) > 0)
   ) {
-    return 409;
+    return true;
   }
+  return request.headers["transfer-encoding"] !== undefined;
+}
+
+function parseOriginForm(target: string | undefined): URL | null {
   if (
-    error.code.includes("INVALID") ||
-    error.code.includes("UNSUPPORTED") ||
-    error.code.includes("TOO_LARGE") ||
-    error.code.includes("MISSING") ||
-    error.code.includes("GAP") ||
-    error.code.includes("MISMATCH")
+    target === undefined ||
+    !target.startsWith("/") ||
+    target.startsWith("//") ||
+    target.length > 8_192
   ) {
-    return 400;
+    return null;
   }
-  return 500;
+  try {
+    const parsed = new URL(target, "http://dashboard.local");
+    if (parsed.origin !== "http://dashboard.local" || parsed.hash.length > 0)
+      return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function parseAuthority(
+  authority: string,
+): { hostname: string; port: number } | null {
+  if (authority.length > 300 || /[\s/@?#]/u.test(authority)) return null;
+  try {
+    const parsed = new URL("http://" + authority);
+    if (
+      parsed.username.length > 0 ||
+      parsed.password.length > 0 ||
+      parsed.pathname !== "/" ||
+      parsed.search.length > 0 ||
+      parsed.hash.length > 0 ||
+      parsed.port.length === 0
+    ) {
+      return null;
+    }
+    return {
+      hostname: normalizeAddress(parsed.hostname),
+      port: Number(parsed.port),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readQuery(url: URL): string | null {
+  const keys = [...url.searchParams.keys()];
+  if (keys.some((key) => key !== "q")) return null;
+  const values = url.searchParams.getAll("q");
+  if (values.length > 1) return null;
+  const query = values[0] ?? "";
+  return query.length <= maximumQueryLength ? query : null;
+}
+
+function sanitizeSnapshot(snapshot: DashboardSnapshot): DashboardSnapshot {
+  const runtime = snapshot.runtime;
+  const usage = runtime.usage;
+  const lastOutcome = runtime.lastOutcome;
+  const currentOperation = runtime.currentOperation;
+  const goal = runtime.goal;
+  const plan = snapshot.plan;
+  const activeOperation = snapshot.activeOperation;
+  return {
+    generatedAt: safeText(snapshot.generatedAt, 64) ?? new Date().toISOString(),
+    connectionState: connectionStates.has(snapshot.connectionState)
+      ? snapshot.connectionState
+      : "failed",
+    runtime: {
+      running: runtime.running,
+      stopped: runtime.stopped,
+      thinking: runtime.thinking,
+      goal:
+        goal === null
+          ? null
+          : {
+              title: safeText(goal.title, 160) ?? "",
+              successCondition: safeText(goal.successCondition, 320) ?? "",
+            },
+      currentOperation:
+        currentOperation === null
+          ? null
+          : {
+              kind: safeCode(currentOperation.kind) ?? "UNKNOWN",
+              startedAt: safeText(currentOperation.startedAt, 64) ?? "",
+            },
+      nextWakeAt: safeText(runtime.nextWakeAt, 64),
+      lastOutcome:
+        lastOutcome === null
+          ? null
+          : {
+              status: outcomeStatuses.has(lastOutcome.status)
+                ? lastOutcome.status
+                : "unverified",
+              operationKind: safeCode(lastOutcome.operationKind) ?? "UNKNOWN",
+              summary: safeText(lastOutcome.summary, 240) ?? "",
+              observedAt: safeText(lastOutcome.observedAt, 64) ?? "",
+            },
+      recentErrors: (runtime.recentErrors ?? [])
+        .slice(0, 5)
+        .flatMap((error) => {
+          const code = safeCode(error.code);
+          return code === null
+            ? []
+            : [{ code, at: safeText(error.at, 64) ?? "" }];
+        }),
+      usage: {
+        requests: safeCount(usage.requests),
+        usageResponses: safeCount(usage.usageResponses),
+        missingUsageRequests: safeCount(usage.missingUsageRequests),
+        errors: safeCount(usage.errors),
+        inputTokens: safeOptionalCount(usage.inputTokens),
+        outputTokens: safeOptionalCount(usage.outputTokens),
+        cachedInputTokens: safeOptionalCount(usage.cachedInputTokens),
+        lastErrorCode:
+          usage.lastErrorCode === null ? null : safeCode(usage.lastErrorCode),
+      },
+    },
+    plan:
+      plan === null
+        ? null
+        : {
+            purpose: safeText(plan.purpose, 240) ?? "",
+            firstStep:
+              plan.firstStep === null
+                ? null
+                : {
+                    kind: safeCode(plan.firstStep.kind) ?? "UNKNOWN",
+                    expectedOutcome:
+                      safeText(plan.firstStep.expectedOutcome, 240) ?? "",
+                  },
+          },
+    activeOperation:
+      activeOperation === null
+        ? null
+        : {
+            kind: safeCode(activeOperation.kind) ?? "UNKNOWN",
+            expectedOutcome:
+              safeText(activeOperation.expectedOutcome, 240) ?? "",
+          },
+    memories: snapshot.memories
+      .slice(0, maximumMemoryCount)
+      .flatMap((memory) => {
+        const source = safeMemorySource(memory.source);
+        const content = safeText(memory.content, maximumMemoryLength);
+        if (source === null || content === null) return [];
+        return [
+          {
+            content,
+            source,
+            updatedAt: safeText(memory.updatedAt, 64) ?? "",
+          },
+        ];
+      }),
+  };
+}
+
+function safeText(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const controlBytes = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu; // eslint-disable-line no-control-regex -- Strip non-printing bytes from display text.
+  const printable = value.replace(controlBytes, "");
+  return printable.slice(0, limit);
+}
+
+function safeCode(value: unknown): string | null {
+  if (typeof value !== "string" || !/^[a-z][a-z0-9_]{0,47}$/iu.test(value)) {
+    return null;
+  }
+  return value.toUpperCase();
+}
+
+function safeCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0;
+}
+
+function safeOptionalCount(value: unknown): number | null {
+  return typeof value === "number" ? safeCount(value) : null;
+}
+
+function safeMemorySource(value: unknown): string | null {
+  return typeof value === "string" && memorySources.has(value) ? value : null;
+}
+
+function normalizeConfiguredHost(host: string): string {
+  return normalizeAddress(host.toLowerCase().replace(/^\[|\]$/gu, ""));
+}
+
+function normalizeBindHost(host: string): string {
+  const normalized = normalizeConfiguredHost(host);
+  return normalized === "localhost" ? "127.0.0.1" : normalized;
+}
+
+function normalizeAddress(address: string): string {
+  const lower = address.toLowerCase().replace(/^\[|\]$/gu, "");
+  if (lower.startsWith("::ffff:")) return lower.slice("::ffff:".length);
+  return lower;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = normalizeConfiguredHost(host);
+  if (normalized === "localhost" || normalized === "::1") return true;
+  if (isIP(normalized) === 4) return normalized.startsWith("127.");
+  return false;
 }

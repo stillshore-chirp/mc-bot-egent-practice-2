@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { z } from "zod";
 
-import type { JsonValue } from "../memory/types.js";
+import type { JsonValue } from "../player/contracts.js";
 
 const MAX_PERSONA_TEXT = 1_000;
 const SECRET_LABEL =

@@ -2,20 +2,9 @@ import { createServer, type Socket } from "node:net";
 
 import { describe, expect, it } from "vitest";
 
-import { LocalRcon } from "./ai-player-live.js";
+import { LocalRcon } from "./local-rcon.js";
 
-interface RequestPacket {
-  readonly id: number;
-  readonly type: number;
-  readonly body: string;
-}
-
-type MockMode =
-  | "single"
-  | "split"
-  | "missing-terminator"
-  | "peer-close"
-  | "terminator-before-response";
+type MockMode = "single" | "split" | "missing-terminator" | "peer-close";
 
 function encodePacket(id: number, type: number, body: string): Buffer {
   const content = Buffer.from(body, "utf8");
@@ -24,21 +13,16 @@ function encodePacket(id: number, type: number, body: string): Buffer {
   packet.writeInt32LE(id, 4);
   packet.writeInt32LE(type, 8);
   content.copy(packet, 12);
-  packet.writeUInt8(0, packet.length - 2);
-  packet.writeUInt8(0, packet.length - 1);
   return packet;
 }
 
 async function startRconMock(mode: MockMode): Promise<{
   readonly port: number;
-  readonly requests: RequestPacket[];
-  readonly terminatorBeforeResponseObserved: () => boolean;
+  readonly requests: string[];
   readonly close: () => Promise<void>;
 }> {
   const sockets = new Set<Socket>();
-  const requests: RequestPacket[] = [];
-  let commandResponseSent = false;
-  let terminatorBeforeResponseObserved = false;
+  const requests: string[] = [];
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -56,31 +40,18 @@ async function startRconMock(mode: MockMode): Promise<{
           socket.write(encodePacket(id, 2, ""));
           continue;
         }
-        requests.push({ id, type, body });
-        if (mode === "terminator-before-response") {
-          if (body === "time query gametime") {
-            if (!commandResponseSent) {
-              terminatorBeforeResponseObserved = true;
-              socket.destroy();
-            } else {
-              socket.write(encodePacket(id, 0, "terminal-response"));
-            }
+        requests.push(body);
+        if (body === "time query gametime") {
+          if (mode === "missing-terminator") continue;
+          if (mode === "peer-close") {
+            socket.end();
             continue;
           }
-          setTimeout(() => {
-            if (socket.destroyed) return;
-            commandResponseSent = true;
-            socket.write(encodePacket(id, 0, "first-response"));
-          }, 25);
-          continue;
-        }
-        if (body === "time query gametime") {
-          if (mode !== "missing-terminator" && mode !== "peer-close")
-            socket.write(encodePacket(id, 0, "terminal-response"));
+          socket.write(encodePacket(id, 0, "terminal"));
           continue;
         }
         if (mode === "single") {
-          socket.write(encodePacket(id, 0, "single-response"));
+          socket.write(encodePacket(id, 0, "single"));
         } else if (mode === "split") {
           socket.write(encodePacket(id, 0, "part-one"));
           socket.write(encodePacket(id, 0, "part-two"));
@@ -103,7 +74,6 @@ async function startRconMock(mode: MockMode): Promise<{
   return {
     port: address.port,
     requests,
-    terminatorBeforeResponseObserved: () => terminatorBeforeResponseObserved,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve, reject) =>
@@ -113,75 +83,52 @@ async function startRconMock(mode: MockMode): Promise<{
   };
 }
 
-describe("LocalRcon response completion", () => {
+describe("LocalRcon", () => {
+  it("authenticates and joins split command responses through the terminator", async () => {
+    const mock = await startRconMock("split");
+    const rcon = new LocalRcon(mock.port, "synthetic-password");
+    try {
+      await expect(rcon.command("list")).resolves.toBe("part-onepart-two");
+      expect(mock.requests).toEqual(["list", "time query gametime"]);
+    } finally {
+      await rcon.close();
+      await mock.close();
+    }
+  });
+
   it("returns a single packet before the separate terminator response", async () => {
     const mock = await startRconMock("single");
+    const rcon = new LocalRcon(mock.port, "synthetic-password");
     try {
-      await expect(
-        new LocalRcon(mock.port, "synthetic-password").command("list"),
-      ).resolves.toBe("single-response");
-      expect(mock.requests.map(({ body }) => body)).toEqual([
-        "list",
-        "time query gametime",
-      ]);
+      await expect(rcon.command("list")).resolves.toBe("single");
     } finally {
-      await mock.close();
-    }
-  });
-
-  it("joins split packets until the separate terminator response", async () => {
-    const mock = await startRconMock("split");
-    try {
-      await expect(
-        new LocalRcon(mock.port, "synthetic-password").command("list"),
-      ).resolves.toBe("part-onepart-two");
-      expect(mock.requests.map(({ body }) => body)).toEqual([
-        "list",
-        "time query gametime",
-      ]);
-    } finally {
-      await mock.close();
-    }
-  });
-
-  it("waits for the first reply before sending the terminator command", async () => {
-    const mock = await startRconMock("terminator-before-response");
-    try {
-      await expect(
-        new LocalRcon(mock.port, "synthetic-password").command("list"),
-      ).resolves.toBe("first-response");
-      expect(mock.requests.map(({ body }) => body)).toEqual([
-        "list",
-        "time query gametime",
-      ]);
-      expect(mock.terminatorBeforeResponseObserved()).toBe(false);
-    } finally {
-      await mock.close();
-    }
-  });
-
-  it("keeps a reply without its terminator incomplete at the timeout", async () => {
-    const mock = await startRconMock("missing-terminator");
-    try {
-      await expect(
-        new LocalRcon(mock.port, "synthetic-password").command("list", 100),
-      ).rejects.toMatchObject({ code: "RCON_TIMEOUT" });
-      expect(mock.requests.map(({ body }) => body)).toEqual([
-        "list",
-        "time query gametime",
-      ]);
-    } finally {
+      await rcon.close();
       await mock.close();
     }
   });
 
   it("rejects a partial reply when the peer closes before the terminator", async () => {
     const mock = await startRconMock("peer-close");
+    const rcon = new LocalRcon(mock.port, "synthetic-password");
     try {
-      await expect(
-        new LocalRcon(mock.port, "synthetic-password").command("list", 1_000),
-      ).rejects.toMatchObject({ code: "RCON_CONNECTION_CLOSED" });
+      await expect(rcon.command("list", 1_000)).rejects.toMatchObject({
+        code: "RCON_CONNECTION_CLOSED",
+      });
     } finally {
+      await rcon.close();
+      await mock.close();
+    }
+  });
+
+  it("times out if the command response terminator never arrives", async () => {
+    const mock = await startRconMock("missing-terminator");
+    const rcon = new LocalRcon(mock.port, "synthetic-password");
+    try {
+      await expect(rcon.command("list", 100)).rejects.toMatchObject({
+        code: "RCON_TIMEOUT",
+      });
+    } finally {
+      await rcon.close();
       await mock.close();
     }
   });

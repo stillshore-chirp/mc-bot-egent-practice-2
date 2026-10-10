@@ -7,7 +7,7 @@
 - Minecraftで継続する一人のAIプレイヤーとして、人格、関係、出来事、場所、約束の記憶を一貫させます。
 - 人格、会話、記憶と、世界の観測、行動実行、外部接続を区別し、各情報の由来と確度を保ちます。
 - 既定のAIプレイヤー／行動系GPTがゲーム内の危険、死亡、建築変更を含む行動を判断し、強いowner要求に応じて選択を変えられます。PlayerBodyは判断結果のゲーム操作を実行します。
-- AIプレイヤーの既定経路はsrc/playerとsrc/app/player-application.ts、判断知識を担うMC Bot Skillsはsrc/mc-skillsに置きます。旧src/skills、src/decision、src/reflexes、tool executionはhelperとして扱い、共通の行動禁止規則を定めません。詳細は[自律プレイヤー](autonomous-player.md)と[PlayerBody](player-body.md)を参照します。
+- 既定経路は`src/app/application.ts`が`src/player/agent.ts`、`src/player/runtime.ts`、`src/player/store.ts`と`PlayerBody`を組み立てます。旧tool、skill、reflex、trace実装を別runtimeとして並行稼働させません。詳細は[自律プレイヤー](autonomous-player.md)と[PlayerBody](player-body.md)を参照します。
 - 長時間または複数工程の行動は中断可能にし、失敗、再開、取消、重複実行を扱える境界を設計します。
 - sessionをまたぐ同一性を、会話履歴だけに依存させず、明示的で検証可能な状態として設計します。
 

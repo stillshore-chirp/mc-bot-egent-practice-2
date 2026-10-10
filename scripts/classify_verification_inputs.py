@@ -13,7 +13,7 @@ import sys
 from typing import Iterable
 
 
-GATES = ("product", "browser", "governance", "workflow_contract")
+GATES = ("product", "governance", "workflow_contract")
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -49,7 +49,7 @@ GOVERNANCE_PATTERNS = (
     "tests/governance/**",
 )
 
-BROWSER_PATTERNS = (
+RETIRED_DASHBOARD_PATTERNS = (
     "dashboard/**",
     "src/dashboard/**",
     "src/trace/**",
@@ -72,6 +72,7 @@ PRODUCT_PATTERNS = (
     "tests/support/**",
     "tests/integration/**",
     "tests/e2e/**",
+    "tests/browser/**",
     "README.md",
     ".env.example",
     ".gitignore",
@@ -88,14 +89,19 @@ PRODUCT_PATTERNS = (
     "docs/player-body.md",
     "docs/autonomous-player.md",
     "docs/ai-player-e2e.md",
+    "docs/simplification.md",
     "docs/operations.md",
     "docs/testing.md",
     "package.json",
     "package-lock.json",
+    "dashboard/**",
+    "src/dashboard/**",
+    "src/trace/**",
     "eslint.config.js",
     "playwright.config.ts",
     "tsconfig.json",
     "tsconfig.*.json",
+    "vitest.config.ts",
     "vite.config.ts",
 )
 
@@ -116,9 +122,8 @@ def classify_paths(paths: Iterable[str], *, full: bool = False) -> dict[str, obj
         if _matches(path, PRODUCT_PATTERNS):
             selected["product"] = True
             known = True
-        if _matches(path, BROWSER_PATTERNS):
+        if _matches(path, RETIRED_DASHBOARD_PATTERNS):
             selected["product"] = True
-            selected["browser"] = True
             known = True
         if not known:
             unknown.append(path)

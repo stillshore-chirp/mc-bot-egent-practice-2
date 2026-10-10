@@ -3,7 +3,6 @@ import type { Bot } from "mineflayer";
 import minecraftData from "minecraft-data";
 import { describe, expect, it } from "vitest";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
-import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 import type { Item } from "prismarine-item";
 
 interface FixtureEntity {
@@ -379,7 +378,6 @@ describe("open-window inventory observation", () => {
     });
 
     const observation = observePlayerBody(bot, undefined);
-    const evidence = toObservationEvidence(observation);
 
     expect(observation.self.inventory).toContainEqual(
       expect.objectContaining({ name: "iron_shears", count: 1, slot: 9 }),
@@ -402,13 +400,6 @@ describe("open-window inventory observation", () => {
     expect(observation.self.equipment.hand).toEqual(
       expect.objectContaining({ name: "diamond_pickaxe", slot: 36 }),
     );
-    expect(evidence.inventoryItems ?? []).toContainEqual({
-      name: "iron_shears",
-      count: 1,
-    });
-    expect(
-      (evidence.inventoryItems ?? []).map(({ name }) => name),
-    ).not.toContain("diamond");
     expect(observation.window?.slots[0]).toEqual(
       expect.objectContaining({ name: "diamond", slot: 0 }),
     );
