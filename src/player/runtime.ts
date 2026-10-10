@@ -30,6 +30,7 @@ import type {
 import type { CompanionStore } from "./store.js";
 import {
   type ChestEquipmentWithdrawalCandidate,
+  type EquipmentUpgradeCandidate,
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
   isChestEquipmentWindow,
@@ -150,6 +151,7 @@ export class CompanionRuntime {
   #equipmentUpkeepQueued = false;
   #automaticPickupSuppressed = new Map<string, true>();
   #equipmentChestSuppressed = new Set<string>();
+  #failedEquipmentCandidateFingerprint: string | undefined;
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -760,6 +762,7 @@ export class CompanionRuntime {
 
     // A new explicit request is a deliberate retry of previously inspected chests.
     this.#equipmentChestSuppressed.clear();
+    this.#failedEquipmentCandidateFingerprint = undefined;
     try {
       await this.#runEquipmentUpkeep(observation, generation, true);
     } finally {
@@ -797,6 +800,16 @@ export class CompanionRuntime {
         ) {
           const upgrade = findInventoryEquipmentUpgrade(observation);
           if (upgrade === null) break;
+          const candidateFingerprint = equipmentCandidateFingerprint(
+            observation,
+            upgrade,
+          );
+          if (
+            this.#failedEquipmentCandidateFingerprint === candidateFingerprint
+          ) {
+            uncertain = true;
+            break;
+          }
           attemptedGearWork = true;
           const before = observation;
           const step = await this.#executeEquipmentAction(
@@ -816,14 +829,22 @@ export class CompanionRuntime {
               upgrade.item,
             )
           ) {
+            this.#failedEquipmentCandidateFingerprint =
+              equipmentCandidateFingerprint(
+                step.observation ?? before,
+                upgrade,
+              );
             uncertain = true;
             break;
           }
           if (!canContinuePlan(before, step.observation, undefined)) {
+            this.#failedEquipmentCandidateFingerprint =
+              equipmentCandidateFingerprint(step.observation, upgrade);
             uncertain = true;
             break;
           }
           observation = step.observation;
+          this.#failedEquipmentCandidateFingerprint = undefined;
           confirmedItems.push(upgrade.item.name);
           equipmentChanges += 1;
         }
@@ -991,6 +1012,17 @@ export class CompanionRuntime {
                 uncertain = true;
                 break;
               }
+              const candidateFingerprint = equipmentCandidateFingerprint(
+                observation,
+                upgrade,
+              );
+              if (
+                this.#failedEquipmentCandidateFingerprint ===
+                candidateFingerprint
+              ) {
+                uncertain = true;
+                break;
+              }
               const before = observation;
               const step = await this.#executeEquipmentAction(
                 {
@@ -1010,10 +1042,16 @@ export class CompanionRuntime {
                 ) ||
                 !canContinuePlan(before, step.observation, undefined)
               ) {
+                this.#failedEquipmentCandidateFingerprint =
+                  equipmentCandidateFingerprint(
+                    step.observation ?? before,
+                    upgrade,
+                  );
                 uncertain = true;
                 break;
               }
               observation = step.observation;
+              this.#failedEquipmentCandidateFingerprint = undefined;
               confirmedItems.push(upgrade.item.name);
               equipmentChanges += 1;
             }
@@ -1665,6 +1703,17 @@ function equipmentChestFingerprint(
     Math.floor(block.position.x),
     Math.floor(block.position.y),
     Math.floor(block.position.z),
+  ]);
+}
+
+function equipmentCandidateFingerprint(
+  observation: PlayerBodyObservation,
+  candidate: EquipmentUpgradeCandidate,
+): string {
+  return JSON.stringify([
+    candidate.destination,
+    candidate.item,
+    observation.self.equipment[candidate.destination] ?? null,
   ]);
 }
 

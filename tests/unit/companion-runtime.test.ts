@@ -640,6 +640,74 @@ describe("CompanionRuntime", () => {
     expect(body.executed).toHaveLength(0);
   });
 
+  it("suppresses an unconfirmed gear candidate until equipment state changes", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const firstCandidate = gearItem("diamond_helmet", 9);
+    const improvedCandidate = gearItem("netherite_helmet", 10);
+    body.observation = makeObservation({
+      inventory: [firstCandidate],
+      equipment: {
+        hand: null,
+        "off-hand": null,
+        head: gearItem("iron_helmet", 5),
+        torso: null,
+        legs: null,
+        feet: null,
+      },
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind !== "equip")
+        throw new Error("Expected equipment candidate");
+      const after = {
+        ...before,
+        self: { ...before.self, health: 19 },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `failed-gear-${fakeBody.executed.length}`,
+        "failed",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 1);
+
+    expect(body.executed).toHaveLength(1);
+    expect(body.executed[0]).toMatchObject({
+      kind: "equip",
+      item: "diamond_helmet",
+    });
+    expect(agent.inputs[0]?.observation.self.inventory).toContainEqual(
+      firstCandidate,
+    );
+    expect(agent.inputs[0]?.observation.self.health).toBe(19);
+
+    body.observation = makeObservation({
+      inventory: [improvedCandidate],
+      equipment: body.observation.self.equipment,
+    });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+    await eventuallyWithFakeTimers(() => body.executed.length === 2);
+
+    expect(body.executed[1]).toMatchObject({
+      kind: "equip",
+      item: "netherite_helmet",
+    });
+    expect(agent.inputs).toHaveLength(1);
+  });
+
   it("keeps an owner-latched stop effective after inventory changes and gear requests", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
