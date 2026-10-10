@@ -61,6 +61,7 @@ function makeObservation(
   options: {
     readonly health?: number | null;
     readonly entities?: PlayerBodyObservation["perception"]["entities"];
+    readonly nearbyHostiles?: PlayerBodyObservation["perception"]["nearbyHostiles"];
   } = {},
 ): PlayerBodyObservation {
   const health = options.health === undefined ? 20 : options.health;
@@ -110,6 +111,9 @@ function makeObservation(
       placementCandidatesMayBeTruncated: false,
       placementCandidates: [],
       entities: options.entities ?? [],
+      ...(options.nearbyHostiles === undefined
+        ? {}
+        : { nearbyHostiles: options.nearbyHostiles }),
     },
     window: null,
   };
@@ -126,6 +130,55 @@ function visibleEntity(id: number, x: number) {
     health: 10,
     isPlayer: false,
   } as const;
+}
+
+function hostileEntity(id: number, x: number) {
+  return {
+    ...visibleEntity(id, x),
+    name: "zombie",
+    category: "Hostile mobs",
+  } as const;
+}
+
+function makeNearbyHostiles(
+  entities: PlayerBodyObservation["perception"]["entities"],
+  occludedCount = 0,
+): NonNullable<PlayerBodyObservation["perception"]["nearbyHostiles"]> {
+  const candidateCount = entities.length + occludedCount;
+  return {
+    source: "client_received_unoccluded_nearby_hostiles",
+    observedAt: new Date().toISOString(),
+    maxDistance: 16,
+    entityOutputLimit: 8,
+    omittedEntityCandidates: 0,
+    candidateSearchMayBeTruncated: false,
+    entities,
+    aggregate: {
+      source: "client_received_hostile_entity_candidates",
+      countScope: "client_entity_table_within_max_distance",
+      maxDistance: 16,
+      clientReceivedHostileCount: candidateCount,
+      worldAbsenceEstablished: false,
+      directionFrame: "minecraft_cardinal_from_self_position",
+      relativeOffsetFrame: "entity_position_minus_self_position",
+      relativeOffsetBounds: null,
+      byKind:
+        candidateCount === 0 ? [] : [{ name: "zombie", count: candidateCount }],
+      omittedKindGroupCount: 0,
+      omittedKindEntityCount: 0,
+      byDirection: [],
+      occlusionCheck: {
+        method: "raycast_entity_body_point",
+        candidateLimit: 8,
+        candidatesChecked: candidateCount,
+        unoccludedCandidates: entities.length,
+        occludedCandidates: occludedCount,
+        uncheckedCandidates: 0,
+        detailOutputLimit: 8,
+        omittedUnoccludedDetails: 0,
+      },
+    },
+  };
 }
 
 function makeDecision(
@@ -732,7 +785,7 @@ describe("CompanionRuntime", () => {
     expect(body.executed[1]).toMatchObject({ kind: "attack", entityId: 17 });
   });
 
-  it("rejudges after observed danger instead of executing a stale plan", async () => {
+  it("reacts to damage from fresh Body information without a model rejudgment", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const pending = deferred<CompanionDecision>();
@@ -760,10 +813,233 @@ describe("CompanionRuntime", () => {
       source: null,
       confidence: "unknown",
     });
-    await eventually(() => agent.inputs.length === 2);
+    await eventually(() => body.executed.length === 1);
 
-    expect(agent.inputs[1]?.observation.self.health).toBe(10);
-    expect(body.executed).toHaveLength(0);
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed[0]).toEqual({ kind: "look_sweep" });
+    expect(store.snapshot().lastOutcome?.status).toBe("successful");
+  });
+
+  it("attacks one nearby unoccluded hostile from a fresh observation when damage source is unknown", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const nearest = hostileEntity(17, 2);
+    const farther = hostileEntity(18, 3);
+    body.observation = makeObservation({
+      entities: [nearest, farther],
+      nearbyHostiles: makeNearbyHostiles([nearest, farther]),
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "attack",
+    );
+
+    expect(body.executed).toEqual([
+      playerOperationSchema.parse({ kind: "attack", entityId: 17 }),
+    ]);
+    expect(agent.inputs).toHaveLength(1);
+    expect(store.snapshot().lastOutcome?.status).toBe("successful");
+  });
+
+  it("uses one bounded sweep when only occluded or non-hostile nearby information is available", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [visibleEntity(17, 1)],
+      nearbyHostiles: makeNearbyHostiles([], 1),
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) =>
+      fakeBody.result(operation, "reflex-unverified", "unverified", null);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => store.snapshot().lastOutcome !== null);
+
+    expect(body.executed).toEqual([{ kind: "look_sweep" }]);
+    expect(store.snapshot().lastOutcome?.status).toBe("unverified");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("lets owner stop and ordinary authenticated owner input supersede a damage reflex", async () => {
+    const stopped = freshStore();
+    const stoppedBody = new FakeBody(stopped.store);
+    const stoppedAgent = new FakeAgent([emptyDecision()]);
+    const stoppedRuntime = createRuntime(
+      stopped.store,
+      stoppedBody,
+      stoppedAgent,
+    );
+    await stoppedRuntime.start();
+    await eventually(() => stoppedRuntime.status().nextWakeAt !== null);
+    await stoppedRuntime.stop("Builder");
+    stoppedBody.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    expect(stoppedBody.executed).toHaveLength(0);
+    expect(stoppedAgent.inputs).toHaveLength(1);
+
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const attackTarget = hostileEntity(19, 2);
+    body.observation = makeObservation({
+      entities: [attackTarget],
+      nearbyHostiles: makeNearbyHostiles([attackTarget]),
+    });
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    let attackSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      attackSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "reflex-cancelled",
+                "interrupted",
+                null,
+              ),
+            ),
+          { once: true },
+        );
+      });
+    };
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 1);
+    await runtime.receiveChat("Builder", "状況を教えて");
+
+    expect(attackSignal?.aborted).toBe(true);
+    expect(agent.inputs).toHaveLength(2);
+    expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+  });
+
+  it("coalesces repeated damage while an attack is already running", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const target = hostileEntity(23, 2);
+    body.observation = makeObservation({
+      entities: [target],
+      nearbyHostiles: makeNearbyHostiles([target]),
+    });
+    const agent = new FakeAgent([
+      makeDecision([
+        playerOperationSchema.parse({ kind: "attack", entityId: 23 }),
+      ]),
+    ]);
+    let attackSignal: AbortSignal | undefined;
+    let finishAttack: (() => void) | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      attackSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        finishAttack = () =>
+          resolve(
+            fakeBody.result(
+              operation,
+              "planned-attack",
+              "successful",
+              fakeBody.observation,
+            ),
+          );
+      });
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    for (let index = 0; index < 3; index += 1)
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+
+    expect(attackSignal?.aborted).toBe(false);
+    expect(agent.inputs).toHaveLength(1);
+    finishAttack?.();
+    await eventually(
+      () => store.snapshot().lastOutcome?.status === "successful",
+    );
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("preserves queued owner chat when a damage burst arrives as a reflex is cancelled", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    let reflexSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      reflexSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            for (let index = 0; index < 3; index += 1)
+              body.emit({
+                type: "bot_damaged",
+                at: new Date().toISOString(),
+                source: null,
+                confidence: "unknown",
+              });
+            resolve(
+              fakeBody.result(operation, "old-reflex", "interrupted", null),
+            );
+          },
+          { once: true },
+        );
+      });
+    };
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 1);
+    await runtime.receiveChat("Builder", "状況を教えて");
+
+    expect(reflexSignal?.aborted).toBe(true);
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.ownerMessage).toBe("状況を教えて");
+    expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+    expect(body.executed).toHaveLength(1);
   });
 });
 

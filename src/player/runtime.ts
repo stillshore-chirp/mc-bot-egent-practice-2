@@ -35,7 +35,7 @@ const defaultMemoryContextLimit = 12;
 
 interface PendingWake {
   readonly reason: string;
-  readonly mode?: "follow_owner" | undefined;
+  readonly mode?: "follow_owner" | "damage_reflex" | undefined;
   readonly ownerMessage?: string | undefined;
 }
 
@@ -123,6 +123,7 @@ export class CompanionRuntime {
   #failureCount = 0;
   #worldChangedDuringDecision = false;
   #ownerFollowRequested = false;
+  #damageReflexPending = false;
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -263,6 +264,7 @@ export class CompanionRuntime {
     }
     this.#runtimeStopLatched = true;
     this.#ownerFollowRequested = false;
+    this.#damageReflexPending = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearTimers();
@@ -316,6 +318,7 @@ export class CompanionRuntime {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#ownerFollowRequested = false;
+    this.#damageReflexPending = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearTimers();
@@ -328,6 +331,7 @@ export class CompanionRuntime {
 
   async #requestWake(wake: PendingWake): Promise<void> {
     if (this.#disposed || this.#isStopped()) return;
+    if (wake.mode !== "damage_reflex") this.#damageReflexPending = false;
     if (wake.mode !== "follow_owner") this.#ownerFollowRequested = false;
     if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
     if (this.#worldChangeTimer !== undefined)
@@ -400,62 +404,71 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
-      const query =
-        wake.ownerMessage ??
-        snapshot.goal?.title ??
-        snapshot.interests[0] ??
-        "Minecraftで共有した経験と現在の状況";
-      const memories = this.#store.recall(query, this.#memoryContextLimit);
-      const messages = this.#store.recentMessages(12);
-      const input = {
-        snapshot,
-        observation,
-        wakeReason: wake.reason,
-        messages,
-        memories,
-        ...(wake.ownerMessage === undefined
-          ? {}
-          : { ownerMessage: wake.ownerMessage }),
-        ...(this.#cachedKnowledge === undefined
-          ? {}
-          : { knowledge: this.#cachedKnowledge }),
-      };
-
-      let decision = await this.#agent.decide(input, controller.signal);
-      if (!this.#isCurrent(generation)) return;
       let repeatedKnowledgeRequest = false;
-      if (decision.knowledgeQuery !== null) {
-        if (
-          this.#cachedKnowledge !== undefined &&
-          normalizeKnowledgeQuery(decision.knowledgeQuery) ===
-            normalizeKnowledgeQuery(this.#cachedKnowledge.query)
-        ) {
-          // The prior answer is already in this judgment's input. Do not query
-          // the registry or spend another model call asking the same question.
-          repeatedKnowledgeRequest = true;
-          decision = { ...decision, plan: null, knowledgeQuery: null };
-        } else {
-          const knowledge = this.#body.knowledge(decision.knowledgeQuery);
-          this.#cachedKnowledge = knowledge;
-          if (!this.#isCurrent(generation)) return;
-          decision = await this.#agent.decide(
-            {
-              ...input,
-              wakeReason: `${wake.reason}; registry answer available`,
-              knowledge,
-            },
-            controller.signal,
-          );
-          if (!this.#isCurrent(generation)) return;
-          // Only one registry inspection is allowed per wake. A different
-          // follow-up query waits for the next meaningful wake.
-          if (decision.knowledgeQuery !== null)
-            decision = { ...decision, plan: null };
+      let decision: CompanionDecision;
+      if (wake.mode === "damage_reflex") {
+        decision = this.#damageReflexDecision(snapshot, observation);
+      } else {
+        const query =
+          wake.ownerMessage ??
+          snapshot.goal?.title ??
+          snapshot.interests[0] ??
+          "Minecraftで共有した経験と現在の状況";
+        const memories = this.#store.recall(query, this.#memoryContextLimit);
+        const messages = this.#store.recentMessages(12);
+        const input = {
+          snapshot,
+          observation,
+          wakeReason: wake.reason,
+          messages,
+          memories,
+          ...(wake.ownerMessage === undefined
+            ? {}
+            : { ownerMessage: wake.ownerMessage }),
+          ...(this.#cachedKnowledge === undefined
+            ? {}
+            : { knowledge: this.#cachedKnowledge }),
+        };
+
+        decision = await this.#agent.decide(input, controller.signal);
+        if (!this.#isCurrent(generation)) return;
+        if (decision.knowledgeQuery !== null) {
+          if (
+            this.#cachedKnowledge !== undefined &&
+            normalizeKnowledgeQuery(decision.knowledgeQuery) ===
+              normalizeKnowledgeQuery(this.#cachedKnowledge.query)
+          ) {
+            // The prior answer is already in this judgment's input. Do not query
+            // the registry or spend another model call asking the same question.
+            repeatedKnowledgeRequest = true;
+            decision = { ...decision, plan: null, knowledgeQuery: null };
+          } else {
+            const knowledge = this.#body.knowledge(decision.knowledgeQuery);
+            this.#cachedKnowledge = knowledge;
+            if (!this.#isCurrent(generation)) return;
+            decision = await this.#agent.decide(
+              {
+                ...input,
+                wakeReason: `${wake.reason}; registry answer available`,
+                knowledge,
+              },
+              controller.signal,
+            );
+            if (!this.#isCurrent(generation)) return;
+            // Only one registry inspection is allowed per wake. A different
+            // follow-up query waits for the next meaningful wake.
+            if (decision.knowledgeQuery !== null)
+              decision = { ...decision, plan: null };
+          }
         }
       }
 
       let refreshAfterDecision = false;
-      if (this.#didWorldChangeDuringDecision() && decision.plan !== null) {
+      if (
+        wake.mode !== "damage_reflex" &&
+        this.#didWorldChangeDuringDecision() &&
+        decision.plan !== null
+      ) {
         let freshObservation: PlayerBodyObservation;
         try {
           freshObservation = await this.#body.observe({
@@ -554,6 +567,8 @@ export class CompanionRuntime {
         this.#scheduleRetry(wake);
       }
     } finally {
+      if (wake.mode === "damage_reflex" && this.#isCurrent(generation))
+        this.#damageReflexPending = false;
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
     }
   }
@@ -756,8 +771,23 @@ export class CompanionRuntime {
 
   #onBodyEvent(event: PlayerBodyEvent): void {
     if (this.#disposed || !this.#started) return;
+    if (event.type === "bot_damaged") {
+      if (
+        this.#activeBody?.operation.kind === "attack" ||
+        this.#damageReflexPending ||
+        this.#pendingWake?.ownerMessage !== undefined ||
+        this.#pendingWake?.mode === "follow_owner" ||
+        this.#isStopped()
+      )
+        return;
+      this.#damageReflexPending = true;
+      this.#fireWake({
+        reason: "damage received; react from a fresh Body observation",
+        mode: "damage_reflex",
+      });
+      return;
+    }
     if (
-      event.type === "bot_damaged" ||
       event.type === "bot_death" ||
       event.type === "bot_death_cause_updated"
     ) {
@@ -801,6 +831,49 @@ export class CompanionRuntime {
     if (!this.#isCurrent(generation)) return;
     this.#store.save({ plan: null });
     this.#scheduleRetry({ reason });
+  }
+
+  #damageReflexDecision(
+    snapshot: CompanionSnapshot,
+    observation: PlayerBodyObservation,
+  ): CompanionDecision {
+    const target = (observation.perception.nearbyHostiles?.entities ?? [])
+      .filter(
+        (entity) =>
+          !entity.isPlayer &&
+          entity.kind !== "player" &&
+          !sameMinecraftIdentity(
+            entity.username ?? entity.name,
+            this.#ownerUsername,
+          ) &&
+          Number.isFinite(entity.distance) &&
+          entity.distance <= 3.2,
+      )
+      .sort((left, right) => left.distance - right.distance)[0];
+    const operation =
+      target === undefined
+        ? { kind: "look_sweep" as const }
+        : { kind: "attack" as const, entityId: target.id };
+    return {
+      speech: null,
+      goal: snapshot.goal,
+      plan: {
+        purpose: "React once to damage using fresh Body-visible information.",
+        steps: [
+          {
+            operation,
+            expectedOutcome:
+              target === undefined
+                ? "Complete one bounded look sweep; consider threats on a later wake."
+                : "Attempt one nearby hostile attack and rely on Body for confirmation.",
+          },
+        ],
+      },
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: Math.max(minimumWaitMs, this.#minWaitMs),
+      knowledgeQuery: null,
+    };
   }
 
   #scheduleRetry(wake: PendingWake): void {
