@@ -487,6 +487,29 @@ function createRuntime(
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
 
 describe("CompanionRuntime", () => {
+  it("passes the latest 24 chronological owner and companion messages to judgment", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 === 0 ? "owner" : "companion",
+      text: `synthetic-message-${index + 1}`,
+    }));
+    for (const message of messages) {
+      store.recordMessage(message.role, message.text);
+    }
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    const recentMessages = agent.inputs[0]?.messages ?? [];
+    expect(recentMessages).toHaveLength(24);
+    expect(recentMessages.map(({ role, text }) => ({ role, text }))).toEqual(
+      messages.slice(6),
+    );
+  });
+
   it("autonomously equips a better item after an inventory observation changes", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

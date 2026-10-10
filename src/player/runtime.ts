@@ -588,7 +588,7 @@ export class CompanionRuntime {
           snapshot.interests[0] ??
           "Minecraftで共有した経験と現在の状況";
         const memories = this.#store.recall(query, this.#memoryContextLimit);
-        const messages = this.#store.recentMessages(12);
+        const messages = this.#store.recentMessages(24);
         const input = {
           snapshot,
           observation,

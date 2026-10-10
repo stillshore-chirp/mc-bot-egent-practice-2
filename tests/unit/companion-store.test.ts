@@ -85,6 +85,25 @@ describe("CompanionStore", () => {
     store.close();
   });
 
+  it("returns the latest 24 messages in chronological order by default", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, { now: fixedNow });
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 === 0 ? "owner" : "companion",
+      text: `synthetic-message-${index + 1}`,
+    }));
+
+    for (const message of messages) {
+      store.recordMessage(message.role, message.text);
+    }
+
+    expect(store.recentMessages()).toHaveLength(24);
+    expect(
+      store.recentMessages().map(({ role, text }) => ({ role, text })),
+    ).toEqual(messages.slice(6));
+    store.close();
+  });
+
   it("advances only the successful matching plan head and clears a failed plan", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });

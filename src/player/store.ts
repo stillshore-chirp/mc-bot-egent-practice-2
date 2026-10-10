@@ -604,7 +604,7 @@ export class CompanionStore {
       .immediate();
   }
 
-  public recentMessages(limit = 12): CompanionMessage[] {
+  public recentMessages(limit = 24): CompanionMessage[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw invalidInput("Message history limit must be between 1 and 100.");
     }

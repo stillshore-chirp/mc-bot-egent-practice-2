@@ -302,6 +302,54 @@ describe("CompanionAgent", () => {
     });
   });
 
+  it("sends exactly the newest 24 mixed-role messages to the provider", async () => {
+    const output = {
+      speech: null,
+      goal: null,
+      plan: null,
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 10_000,
+      knowledgeQuery: null,
+    };
+    const create = vi.fn().mockResolvedValue(response(output));
+    const agent = new CompanionAgent({
+      client: {
+        responses: { create },
+      } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      sequence: index + 1,
+      role:
+        index % 2 === 0 || index === 29
+          ? ("owner" as const)
+          : ("companion" as const),
+      text: `synthetic-message-${index + 1}`,
+      recordedAt: `2026-10-10T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }));
+    const currentOwnerMessage = "synthetic-message-30";
+
+    await agent.decide({
+      ...createInput(),
+      ownerMessage: currentOwnerMessage,
+      messages,
+    });
+
+    const [request] = create.mock.calls[0] as unknown as [{ input: string }];
+    const providerInput = JSON.parse(request.input) as {
+      ownerMessage: string;
+      recentMessages: { role: string; text: string }[];
+    };
+    expect(providerInput.ownerMessage).toBe(currentOwnerMessage);
+    expect(providerInput.recentMessages).toHaveLength(23);
+    expect(providerInput.recentMessages.length + 1).toBe(24);
+    expect(
+      providerInput.recentMessages.map(({ role, text }) => ({ role, text })),
+    ).toEqual(messages.slice(6, 29).map(({ role, text }) => ({ role, text })));
+  });
+
   it("rejects the internal owner-follow operation from model decisions", () => {
     const decision = companionDecisionSchema.safeParse({
       speech: null,
