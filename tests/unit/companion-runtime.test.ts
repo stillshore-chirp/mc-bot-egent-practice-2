@@ -132,6 +132,20 @@ function visibleEntity(id: number, x: number) {
   } as const;
 }
 
+function droppedItemEntity(
+  id: number,
+  x: number,
+  name = "oak_log",
+  count = 1,
+): PlayerBodyObservation["perception"]["entities"][number] {
+  return {
+    ...visibleEntity(id, x),
+    name: "item",
+    kind: "object",
+    droppedItem: { name, count },
+  };
+}
+
 function hostileEntity(id: number, x: number) {
   return {
     ...visibleEntity(id, x),
@@ -380,6 +394,267 @@ function createRuntime(
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
 
 describe("CompanionRuntime", () => {
+  it("collects one nearby visible drop without a fresh owner instruction", async () => {
+    const { store } = freshStore();
+    store.save({
+      goal: {
+        title: "Gather nearby supplies",
+        successCondition: "Pick up useful nearby items.",
+        source: "owner",
+      },
+    });
+    const body = new FakeBody(store);
+    const item = droppedItemEntity(31, 2, "oak_log", 1);
+    body.observation = makeObservation({ entities: [item] });
+    const agent = new FakeAgent([emptyDecision()]);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          inventory: [
+            {
+              slot: 36,
+              itemId: 17,
+              name: "oak_log",
+              count: 1,
+              metadata: 0,
+              durability: null,
+              maxDurability: null,
+              customName: null,
+              enchantments: [],
+            },
+          ],
+        },
+        perception: { ...before.perception, entities: [] },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "automatic-pickup",
+        "successful",
+        after,
+      );
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "collect_item",
+    );
+
+    expect(body.executed).toEqual([{ kind: "collect_item", entityId: 31 }]);
+    expect(body.observation.self.inventory).toHaveLength(1);
+    expect(body.observation.perception.entities).toHaveLength(0);
+    expect(store.snapshot().lastOutcome).toMatchObject({
+      status: "successful",
+      summary: "Body observed the requested world effect.",
+      operation: { kind: "collect_item", entityId: 31 },
+    });
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("continues ordinary judgment when no nearby dropped item is visible", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(32, 7, "oak_log", 1)],
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    expect(body.executed).toHaveLength(0);
+  });
+
+  it("suppresses an unavailable drop on later wakes while collecting a new nearby drop", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const unavailable = droppedItemEntity(33, 1, "oak_log", 1);
+    body.observation = makeObservation({ entities: [unavailable] });
+    const agent = new FakeAgent([emptyDecision()]);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      if (operation.kind === "collect_item" && operation.entityId === 33)
+        return fakeBody.result(operation, "unavailable-drop", "failed", null);
+      const after = makeObservation({ entities: [unavailable] });
+      fakeBody.observation = after;
+      return fakeBody.result(operation, "new-drop", "successful", after);
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => store.snapshot().lastOutcome?.status === "failed");
+    await eventually(() => !runtime.status().thinking);
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await eventually(() => agent.inputs.length === 1, 4_000);
+    expect(body.executed).toEqual([{ kind: "collect_item", entityId: 33 }]);
+
+    const newItem = droppedItemEntity(34, 2, "apple", 1);
+    body.observation = makeObservation({ entities: [unavailable, newItem] });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await eventually(() => body.executed.length === 2, 4_000);
+
+    expect(body.executed[1]).toEqual({ kind: "collect_item", entityId: 34 });
+  });
+
+  it("lets authenticated owner input supersede an automatic pickup", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(35, 2, "apple", 1)],
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    let pickupSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      pickupSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        const finish = (): void =>
+          resolve(
+            fakeBody.result(
+              operation,
+              "pickup-interrupted",
+              "interrupted",
+              null,
+            ),
+          );
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    await runtime.receiveChat("Builder", "少し待って");
+
+    expect(pickupSignal?.aborted).toBe(true);
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(1);
+    expect(agent.inputs[0]?.ownerMessage).toBe("少し待って");
+    expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+  });
+
+  it("lets owner stop cancel an automatic pickup before it can continue", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(36, 2, "apple", 1)],
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    let pickupSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      pickupSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        const finish = (): void =>
+          resolve(
+            fakeBody.result(operation, "pickup-stopped", "interrupted", null),
+          );
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    await runtime.stop("Builder");
+
+    expect(pickupSignal?.aborted).toBe(true);
+    expect(store.snapshot().stopped).toBe(true);
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("gives a damage reflex priority over an automatic pickup", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const target = hostileEntity(38, 2);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(37, 1, "apple", 1), target],
+      nearbyHostiles: makeNearbyHostiles([target]),
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "collect_item")
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          const finish = (): void =>
+            resolve(
+              fakeBody.result(operation, "pickup-damaged", "interrupted", null),
+            );
+          if (signal?.aborted) finish();
+          else signal?.addEventListener("abort", finish, { once: true });
+        });
+      return fakeBody.result(
+        operation,
+        "damage-reflex",
+        "successful",
+        fakeBody.observation,
+      );
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    body.observation = makeObservation({
+      health: 10,
+      entities: [droppedItemEntity(37, 1, "apple", 1), target],
+      nearbyHostiles: makeNearbyHostiles([target]),
+    });
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 2);
+
+    expect(body.executed[0]).toEqual({ kind: "collect_item", entityId: 37 });
+    expect(body.executed[1]).toEqual({ kind: "attack", entityId: 38 });
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("does not preempt a persisted plan with automatic item pickup", async () => {
+    const { store } = freshStore();
+    store.save({
+      goal: {
+        title: "Follow the current task",
+        successCondition: "Complete the planned step.",
+        source: "owner",
+      },
+      plan: {
+        purpose: "Continue the explicit owner task after a fresh judgment.",
+        steps: [
+          {
+            operation: look,
+            expectedOutcome: "The current area is observed.",
+          },
+        ],
+      },
+    });
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      entities: [droppedItemEntity(39, 1, "apple", 1)],
+    });
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    expect(body.executed).toHaveLength(0);
+  });
+
   it("suppresses routine status speech while preserving replies to owner chat", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

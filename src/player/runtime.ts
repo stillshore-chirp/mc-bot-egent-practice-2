@@ -32,6 +32,8 @@ const defaultRetryMs = 5_000;
 const worldChangeCoalesceMs = 1_500;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
+const automaticPickupDistance = 6;
+const automaticPickupSuppressionLimit = 32;
 
 interface PendingWake {
   readonly reason: string;
@@ -124,6 +126,7 @@ export class CompanionRuntime {
   #worldChangedDuringDecision = false;
   #ownerFollowRequested = false;
   #damageReflexPending = false;
+  #automaticPickupSuppressed = new Map<string, true>();
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -404,6 +407,80 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
+      if (
+        wake.mode === undefined &&
+        wake.ownerMessage === undefined &&
+        snapshot.plan === null &&
+        snapshot.activeOperation === null &&
+        observation.self.health !== null &&
+        observation.self.health > 0
+      ) {
+        const target = observation.perception.entities
+          .filter(
+            (entity) =>
+              entity.droppedItem !== undefined &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= automaticPickupDistance,
+          )
+          .sort((left, right) => left.distance - right.distance)
+          .find((entity) => {
+            const item = entity.droppedItem;
+            return (
+              item !== undefined &&
+              !this.#automaticPickupSuppressed.has(
+                [observation.dimension, entity.id, item.name, item.count].join(
+                  ":",
+                ),
+              )
+            );
+          });
+        if (target?.droppedItem !== undefined) {
+          const item = target.droppedItem;
+          const targetKey = [
+            observation.dimension,
+            target.id,
+            item.name,
+            item.count,
+          ].join(":");
+          const operation = {
+            kind: "collect_item" as const,
+            entityId: target.id,
+          };
+          const automaticPlan = {
+            purpose: "Collect one nearby visible dropped item autonomously.",
+            steps: [
+              {
+                operation,
+                expectedOutcome:
+                  "PlayerBody confirms the pickup from the observed inventory change and item entity result.",
+              },
+            ],
+          };
+          this.#store.save({ plan: automaticPlan });
+          this.#automaticPickupSuppressed.set(targetKey, true);
+          while (
+            this.#automaticPickupSuppressed.size >
+            automaticPickupSuppressionLimit
+          ) {
+            const oldest = this.#automaticPickupSuppressed.keys().next().value;
+            if (oldest === undefined) break;
+            this.#automaticPickupSuppressed.delete(oldest);
+          }
+          await this.#executePlan(
+            {
+              speech: null,
+              goal: snapshot.goal,
+              plan: automaticPlan,
+              memoryUpdates: [],
+              relationshipSummary: null,
+              waitMs: this.#minWaitMs,
+              knowledgeQuery: null,
+            },
+            generation,
+          );
+          return;
+        }
+      }
       let repeatedKnowledgeRequest = false;
       let decision: CompanionDecision;
       if (wake.mode === "damage_reflex") {
