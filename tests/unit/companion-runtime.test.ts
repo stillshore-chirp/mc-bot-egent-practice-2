@@ -505,6 +505,116 @@ const jump = playerOperationSchema.parse({
 });
 
 describe("CompanionRuntime", () => {
+  it("saves only a successful chest window's container slots as past observation", async () => {
+    const { store } = freshStore();
+    const chest: BodyVisibleBlock = {
+      name: "minecraft:trapped_chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const chestItem = gearItem("diamond", 0);
+    const playerSlotItem = gearItem("gold_ingot", 27);
+    const openedAt = new Date().toISOString();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([
+      makeDecision([
+        playerOperationSchema.parse({
+          kind: "open_window",
+          target: { kind: "block", position: { x: 1, y: 64, z: 0 } },
+        }),
+      ]),
+    ]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({ blocks: [chest] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        observedAt: openedAt,
+        window: chestWindow(chestItem, playerSlotItem),
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "observed-chest-open",
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.receiveChat("Builder", "チェストの中身を確認して");
+
+    expect(body.executed).toHaveLength(1);
+    const location = store.latestObservedChestLocation();
+    expect(location).toMatchObject({
+      source: "minecraft_observed",
+      metadata: {
+        chestMemory: {
+          kind: "location",
+          dimension: "overworld",
+          position: { x: 1, y: 64, z: 0 },
+        },
+      },
+    });
+    const contentMemories = store
+      .recall("diamond", 8)
+      .filter(
+        (memory) =>
+          memory.source === "minecraft_observed" &&
+          typeof memory.metadata === "object" &&
+          memory.metadata !== null &&
+          "chestMemory" in memory.metadata &&
+          typeof memory.metadata.chestMemory === "object" &&
+          memory.metadata.chestMemory !== null &&
+          "kind" in memory.metadata.chestMemory &&
+          memory.metadata.chestMemory.kind === "contents",
+      );
+    expect(contentMemories).toHaveLength(1);
+    expect(contentMemories[0]?.metadata).toMatchObject({
+      chestMemory: {
+        observedAt: openedAt,
+        contents: [{ slot: 0, name: "diamond", count: 1 }],
+      },
+    });
+    expect(JSON.stringify(contentMemories[0]?.metadata)).not.toContain(
+      "gold_ingot",
+    );
+  });
+
+  it("passes a remembered chest location into an ownerless autonomous move decision", async () => {
+    const { store } = freshStore();
+    const position = { x: 12, y: 64, z: -3 };
+    store.rememberObservedChest({
+      dimension: "overworld",
+      position,
+      observedAt: "2026-10-10T00:00:00.000Z",
+    });
+    const move = playerOperationSchema.parse({
+      kind: "move_to",
+      position,
+      range: 2.5,
+    });
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([makeDecision([move])]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+
+    expect(agent.inputs[0]?.ownerMessage).toBeUndefined();
+    expect(agent.inputs[0]?.observation.perception.blocks).toEqual([]);
+    const rememberedLocation = agent.inputs[0]?.memories.find(
+      (memory) => memory.source === "minecraft_observed",
+    );
+    expect(rememberedLocation?.metadata).toMatchObject({
+      chestMemory: { kind: "location", position },
+    });
+    expect(body.executed[0]).toEqual(move);
+  });
+
   it("passes the latest 24 chronological owner and companion messages to judgment", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

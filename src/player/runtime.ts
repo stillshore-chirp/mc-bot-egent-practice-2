@@ -490,6 +490,7 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
+      this.#rememberVisibleChests(observation);
       const nearbyDroppedItems =
         observation.perception.nearbyDroppedItems?.entities ??
         observation.perception.entities.filter(
@@ -613,7 +614,20 @@ export class CompanionRuntime {
           snapshot.goal?.title ??
           snapshot.interests[0] ??
           "Minecraftで共有した経験と現在の状況";
-        const memories = this.#store.recall(query, this.#memoryContextLimit);
+        const recalledMemories = this.#store.recall(
+          query,
+          this.#memoryContextLimit,
+        );
+        const latestChestLocation = this.#store.latestObservedChestLocation();
+        const memories =
+          latestChestLocation === null
+            ? recalledMemories
+            : [
+                latestChestLocation,
+                ...recalledMemories.filter(
+                  (memory) => memory.id !== latestChestLocation.id,
+                ),
+              ].slice(0, this.#memoryContextLimit);
         const messages = this.#store.recentMessages(24);
         const input = {
           snapshot,
@@ -797,6 +811,7 @@ export class CompanionRuntime {
       return;
     }
     if (!this.#isCurrent(generation) || this.#isStopped()) return;
+    this.#rememberVisibleChests(observation);
     if (!isSafeForEquipmentUpkeep(observation)) {
       this.#equipmentUpkeepQueued = false;
       await this.#speakControlMessage(
@@ -1585,6 +1600,8 @@ export class CompanionRuntime {
         this.#runtimeStopLatched
       )
         return;
+      this.#rememberChestObservations(result);
+      this.#rememberChestContents(operation, result);
       if (updated.activeOperation !== null) {
         this.#scheduleRetry({
           reason: "Body outcome did not match the persisted active operation",
@@ -1908,6 +1925,123 @@ export class CompanionRuntime {
     );
   }
 
+  #rememberVisibleChests(
+    observation: PlayerBodyObservation | null | undefined,
+  ): void {
+    if (!observation) return;
+    const recorded = new Set<string>();
+    for (const block of observation.perception.blocks) {
+      if (!isChestBlockName(block.name)) continue;
+      const position = {
+        x: Math.floor(block.position.x),
+        y: Math.floor(block.position.y),
+        z: Math.floor(block.position.z),
+      };
+      const key = JSON.stringify([
+        observation.dimension,
+        ...Object.values(position),
+      ]);
+      if (recorded.has(key)) continue;
+      recorded.add(key);
+      this.#rememberChest({
+        dimension: observation.dimension,
+        position,
+        observedAt: observation.observedAt,
+      });
+    }
+  }
+
+  #rememberChestObservations(result: PlayerOperationResult): void {
+    this.#rememberVisibleChests(result.before);
+    this.#rememberVisibleChests(result.after);
+    const sweep = result.lookSweep;
+    if (sweep === undefined) return;
+    for (const view of [sweep.current, ...sweep.directions]) {
+      for (const block of view.visibleBlocks) {
+        if (!isChestBlockName(block.name)) continue;
+        this.#rememberChest({
+          dimension: view.dimension,
+          position: {
+            x: Math.floor(block.position.x),
+            y: Math.floor(block.position.y),
+            z: Math.floor(block.position.z),
+          },
+          observedAt: result.completedAt,
+        });
+      }
+    }
+  }
+
+  #rememberChestContents(
+    operation: PlayerOperation,
+    result: PlayerOperationResult,
+  ): void {
+    const before = result.before;
+    const after = result.after;
+    if (
+      operation.kind !== "open_window" ||
+      operation.target.kind !== "block" ||
+      !sameOperation(operation, result.operation) ||
+      result.status !== "successful" ||
+      result.sameLife !== true ||
+      !before ||
+      !after
+    )
+      return;
+    if (before.dimension !== after.dimension) return;
+    const targetPosition = operation.target.position;
+    const targetBlock = before.perception.blocks.find(
+      (block) =>
+        isChestBlockName(block.name) &&
+        sameBlockAtPosition(block, targetPosition),
+    );
+    const window = after.window;
+    if (
+      targetBlock === undefined ||
+      !isChestEquipmentWindow(window) ||
+      !Number.isSafeInteger(window.inventoryStart) ||
+      window.inventoryStart < 0 ||
+      window.inventoryStart > window.slots.length
+    )
+      return;
+    const contents = window.slots
+      .slice(0, window.inventoryStart)
+      .flatMap((item, slot) =>
+        item === null ? [] : [{ slot, name: item.name, count: item.count }],
+      );
+    this.#rememberChest({
+      dimension: before.dimension,
+      position: {
+        x: Math.floor(targetPosition.x),
+        y: Math.floor(targetPosition.y),
+        z: Math.floor(targetPosition.z),
+      },
+      observedAt: after.observedAt,
+      contents,
+    });
+  }
+
+  #rememberChest(input: {
+    readonly dimension: string;
+    readonly position: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+    readonly observedAt: string;
+    readonly contents?: readonly {
+      readonly slot: number;
+      readonly name: string;
+      readonly count: number;
+    }[];
+  }): void {
+    try {
+      this.#store.rememberObservedChest(input);
+    } catch (error) {
+      this.#logError(error, "Observed chest memory could not be saved");
+    }
+  }
+
   #clearTimers(): void {
     if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
     if (this.#worldChangeTimer !== undefined)
@@ -1990,6 +2124,21 @@ function visibleEquipmentChests(
         block.distance <= equipmentSearchRange,
     )
     .sort((left, right) => left.distance - right.distance);
+}
+
+function isChestBlockName(name: string): boolean {
+  return /(?:^|:)(?:trapped_)?chest$/u.test(name);
+}
+
+function sameBlockAtPosition(
+  block: BodyVisibleBlock,
+  position: { readonly x: number; readonly y: number; readonly z: number },
+): boolean {
+  return (
+    Math.floor(block.position.x) === Math.floor(position.x) &&
+    Math.floor(block.position.y) === Math.floor(position.y) &&
+    Math.floor(block.position.z) === Math.floor(position.z)
+  );
 }
 
 function visibleDroppedItems(

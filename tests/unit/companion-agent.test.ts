@@ -350,6 +350,130 @@ describe("CompanionAgent", () => {
     ).toEqual(messages.slice(6, 29).map(({ role, text }) => ({ role, text })));
   });
 
+  it("sends historical chest contents beside the current observation with explicit time boundaries", async () => {
+    const create = vi.fn().mockResolvedValue(
+      response({
+        speech: null,
+        goal: null,
+        plan: null,
+        memoryUpdates: [],
+        relationshipSummary: null,
+        waitMs: 10_000,
+        knowledgeQuery: null,
+      }),
+    );
+    const agent = new CompanionAgent({
+      client: { responses: { create } } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+    const memories: CompanionMemory[] = [
+      {
+        id: "chest-location",
+        kind: "world",
+        content: "確認済みチェストの場所: overworld (12, 64, -3)",
+        source: "minecraft_observed",
+        status: "active",
+        importance: 5,
+        createdAt: "2026-10-10T00:00:00.000Z",
+        updatedAt: "2026-10-10T00:00:00.000Z",
+        metadata: {
+          chestMemory: {
+            version: 1,
+            kind: "location",
+            locationKey: "overworld:12:64:-3",
+            dimension: "overworld",
+            position: { x: 12, y: 64, z: -3 },
+            observedAt: "2026-10-10T00:00:00.000Z",
+            privateInternalField: "not-forwarded",
+          },
+        },
+      },
+      {
+        id: "chest-contents",
+        kind: "world",
+        content:
+          "チェスト中身の過去観測 (overworld 12,64,-3; 2026-10-10T00:00:00.000Z): 0:diamond x3",
+        source: "minecraft_observed",
+        status: "active",
+        importance: 5,
+        createdAt: "2026-10-10T00:00:00.000Z",
+        updatedAt: "2026-10-10T00:00:00.000Z",
+        metadata: {
+          chestMemory: {
+            version: 1,
+            kind: "contents",
+            locationKey: "overworld:12:64:-3",
+            dimension: "overworld",
+            position: { x: 12, y: 64, z: -3 },
+            observedAt: "2026-10-10T00:00:00.000Z",
+            expiresAt: "2026-10-10T01:00:00.000Z",
+            contents: [{ slot: 0, name: "diamond", count: 3 }],
+            privateInternalField: "not-forwarded",
+          },
+        },
+      },
+    ];
+
+    await agent.decide({
+      ...createInput(),
+      observation: {
+        ...observation,
+        observedAt: "2026-10-10T00:59:00.000Z",
+        perception: { ...observation.perception, blocks: [] },
+        window: null,
+      },
+      memories,
+    });
+
+    const [request] = create.mock.calls[0] as unknown as [
+      { readonly input: string; readonly instructions: string },
+    ];
+    const providerInput = JSON.parse(request.input) as {
+      observation: {
+        observedAt: string;
+        perception: { blocks: unknown[] };
+        window: unknown;
+      };
+      memories: { chestObservation?: Record<string, unknown> }[];
+    };
+    expect(request.instructions).toContain("過去に視認した最終位置");
+    expect(request.instructions).toContain(
+      "現在のblocks一覧にないだけで不存在とせず",
+    );
+    expect(request.instructions).toContain(
+      "現在のblocksにない既知チェストへはmove_toだけを計画し、到着後に新しいBody観測を受けて再判断し、chest/trapped_chestを確認してから開いてください。",
+    );
+    expect(request.instructions).toContain("observedAt時点の過去の中身");
+    expect(request.instructions).toContain(
+      "新しいBody観測で対象チェストとwindowを確認",
+    );
+    expect(providerInput.observation).toMatchObject({
+      observedAt: "2026-10-10T00:59:00.000Z",
+      perception: { blocks: [] },
+      window: null,
+    });
+    expect(
+      providerInput.memories.map(({ chestObservation }) => chestObservation),
+    ).toEqual([
+      {
+        kind: "location",
+        dimension: "overworld",
+        position: { x: 12, y: 64, z: -3 },
+        observedAt: "2026-10-10T00:00:00.000Z",
+      },
+      {
+        kind: "contents",
+        dimension: "overworld",
+        position: { x: 12, y: 64, z: -3 },
+        observedAt: "2026-10-10T00:00:00.000Z",
+        expiresAt: "2026-10-10T01:00:00.000Z",
+        contents: [{ slot: 0, name: "diamond", count: 3 }],
+      },
+    ]);
+    expect(request.input).not.toContain("privateInternalField");
+  });
+
   it("rejects the internal owner-follow operation from model decisions", () => {
     const decision = companionDecisionSchema.safeParse({
       speech: null,
