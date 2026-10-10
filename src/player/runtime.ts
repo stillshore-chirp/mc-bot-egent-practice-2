@@ -3,2680 +3,1096 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
-import { oxygenObservationState } from "../domain/snapshot.js";
-import type {
-  McSkillRepository,
-  McSkillOutcomeStatus,
-} from "../mc-skills/index.js";
 import type {
   PlayerBody,
-  PlayerBodyDamageSource,
-  PlayerBodyDeathCause,
   PlayerBodyEvent,
   PlayerBodyObservation,
+  PlayerKnowledge,
   PlayerOperation,
   PlayerOperationResult,
 } from "../minecraft/player-body.js";
-import type { BodyNearbyHostileDirection } from "../minecraft/player-body-observation.js";
-import { isImmediateStopCommand } from "../agent/chat-coordinator.js";
-import type { TraceService, TraceSession } from "../trace/service.js";
+import { playerOperationSchema } from "../minecraft/player-body-schema.js";
 import type {
-  PlayerMemoryPort,
-  PlayerObservationEvidence,
-  PlayerObservedDisplacement,
-  PlayerRuntimeInspection,
-  PlayerRuntimeEvent,
-  PlayerRuntimeSnapshot,
-  PlayerThoughtDecision,
-  PlayerWakeKind,
+  CompanionOutcomeInput,
+  CompanionSnapshot,
+  CompanionStatePatch,
 } from "./contracts.js";
-import type { PlayerMindStore } from "./mind-store.js";
-import {
-  toObservationEvidence,
-  trustedConditions,
-} from "./observation-evidence.js";
+import type {
+  CompanionDecision,
+  CompanionDecisionInput,
+  CompanionAgentStatus,
+} from "./agent.js";
+import type { CompanionStore } from "./store.js";
+import { isImmediateStopCommand } from "./stop-command.js";
 
-// Keep owner changes responsive while giving an accepted HTTP one
-// bounded drain window.
-const ownerProposalSettlementTimeoutMs = 30_000;
-const damageObservationCoalesceMs = 3_000;
+const maximumWaitMs = 30 * 60_000;
+const minimumWaitMs = 10_000;
+const maximumRetryMs = 5 * 60_000;
+const defaultRetryMs = 5_000;
+const worldChangeCoalesceMs = 1_500;
+const messageLimit = 2_000;
+const defaultMemoryContextLimit = 12;
 
-function enabledControlCount(operation: PlayerOperation): number | null {
-  if (operation.kind !== "control") return null;
-  return Object.values(operation.controls).filter((enabled) => enabled).length;
-}
-
-function isTravelOperation(operation: PlayerOperation): boolean {
-  return (
-    operation.kind === "move_to" ||
-    operation.kind === "move_relative" ||
-    operation.kind === "control" ||
-    operation.kind === "move_vehicle" ||
-    operation.kind === "elytra_fly"
-  );
-}
-
-function travelProgressed(
-  previous: PlayerBodyObservation["self"]["position"],
-  current: PlayerBodyObservation["self"]["position"],
-): boolean {
-  const dx = current.x - previous.x;
-  const dy = current.y - previous.y;
-  const dz = current.z - previous.z;
-  return dx * dx + dy * dy + dz * dz >= 0.75 * 0.75;
-}
-
-function isUrgentPerceptionWake(kind: PlayerWakeKind): boolean {
-  return (
-    kind === "bot_damaged" ||
-    kind === "bot_death" ||
-    kind === "bot_death_cause_updated"
-  );
+interface PendingWake {
+  readonly reason: string;
+  readonly mode?: "follow_owner" | undefined;
+  readonly ownerMessage?: string | undefined;
 }
 
 interface ActiveBodyRun {
   readonly operationId: string;
-  readonly actionRevision: number;
   readonly operation: PlayerOperation;
-  readonly skillId?: string;
-  readonly skillVersion?: number;
+  readonly startedAt: string;
   readonly controller: AbortController;
-  promise: Promise<void>;
+  readonly promise: Promise<PlayerOperationResult>;
 }
 
-type RuntimeBodyOperationPhase = NonNullable<
-  PlayerRuntimeInspection["body"]["latestOperationPhase"]
->;
-
-interface LatestBodyOperationPhase {
-  readonly runtimeOperationId: string;
-  readonly actionRevision: number;
-  readonly bodyOperationId?: string;
-  readonly operation: PlayerOperation["kind"];
-  readonly phase: RuntimeBodyOperationPhase["phase"];
-  readonly at: string;
-  readonly admissionObserved: boolean;
-  readonly progressVersion: number;
-  readonly status?: McSkillOutcomeStatus;
-  readonly reason?: RuntimeBodyOperationPhase["reason"];
-  readonly firstPathStatus?: RuntimeBodyOperationPhase["firstPathStatus"];
-  readonly controlEnabledCount: number | null;
+export interface CompanionRuntimeStatus {
+  readonly running: boolean;
+  readonly stopped: boolean;
+  readonly thinking: boolean;
+  readonly goal: CompanionSnapshot["goal"];
+  readonly relationshipSummary: string;
+  readonly interests: readonly string[];
+  readonly currentOperation: {
+    readonly kind: string;
+    readonly startedAt: string;
+  } | null;
+  readonly nextWakeAt: string | null;
+  readonly wakeReason: string | null;
+  readonly lastOutcome: {
+    readonly status: string;
+    readonly operationKind: string;
+    readonly summary: string;
+    readonly observedAt: string;
+  } | null;
+  readonly recentErrors: readonly {
+    readonly code: string;
+    readonly at: string;
+  }[];
+  readonly usage: CompanionAgentStatus | null;
 }
 
-type DamageReflexCompletedEvent = Extract<
-  PlayerBodyEvent,
-  { readonly type: "damage_reflex_completed" }
->;
-
-interface PendingDamageReflexOutcome {
-  readonly latest: DamageReflexCompletedEvent;
-  readonly confirmed?: DamageReflexCompletedEvent;
-  readonly count: number;
-}
-
-export interface PlayerConversationPort {
-  nextTurn(): number;
-  handleOwnerMessage(input: {
-    readonly username: string;
-    readonly message: string;
-    readonly turn: number;
-    readonly signal?: AbortSignal;
-  }): Promise<void>;
-  finishTurn?(turn: number): void;
-}
-
-export interface PlayerPurposePort {
-  think(input: {
-    readonly snapshot: PlayerRuntimeSnapshot;
-    readonly events: readonly PlayerRuntimeEvent[];
-    readonly urgentPerceptionWake?: boolean;
-    readonly signal?: AbortSignal;
-    readonly shouldStopAfterResponse?: () => boolean;
-    readonly onResponsesRequestState?: (active: boolean) => void;
-  }): Promise<{
-    readonly accepted: boolean;
-    readonly decision?: PlayerThoughtDecision;
-  }>;
-}
-
-export interface PlayerRuntimeOptions {
+export interface CompanionRuntimeOptions {
   readonly ownerUsername: string;
-  readonly playerId: string;
   readonly body: PlayerBody;
-  readonly mind: PlayerMindStore;
-  readonly memory: PlayerMemoryPort;
-  readonly skills: McSkillRepository;
-  readonly conversation: PlayerConversationPort;
-  readonly purpose: PlayerPurposePort;
-  readonly logger: Logger;
-  readonly trace?: TraceService;
+  readonly store: CompanionStore;
+  readonly agent: CompanionDecisionPort;
   readonly say: (text: string) => Promise<void>;
-  readonly requestReconnect?: (reason: string) => Promise<void> | void;
+  readonly logger?: Pick<Logger, "error" | "warn"> | undefined;
+  readonly minWaitMs?: number | undefined;
+  readonly memoryContextLimit?: number | undefined;
 }
 
-interface PendingThoughtWake {
-  readonly kind: PlayerWakeKind;
-  readonly reason: string;
-  readonly damageAware: boolean;
-  readonly deathAware: boolean;
+/** Narrow seam for deterministic runtime tests; production uses CompanionAgent. */
+export interface CompanionDecisionPort {
+  decide(
+    input: CompanionDecisionInput,
+    signal?: AbortSignal,
+  ): Promise<CompanionDecision>;
+  status?(): CompanionAgentStatus;
 }
 
-interface OperationStallWake {
-  readonly eventId: string;
-  readonly runtimeOperationId: string;
-  readonly bodyOperationId: string;
-  readonly progressVersion: number;
-}
+/**
+ * Serializes all model judgments and Body operations. Durable stop is written
+ * before cancellation; successful multi-step plans continue only after Body
+ * confirms the operation and a fresh observation still matches its result.
+ */
+export class CompanionRuntime {
+  readonly #ownerUsername: string;
+  readonly #body: PlayerBody;
+  readonly #store: CompanionStore;
+  readonly #agent: CompanionDecisionPort;
+  readonly #say: (text: string) => Promise<void>;
+  readonly #logger: Pick<Logger, "error" | "warn"> | undefined;
+  readonly #minWaitMs: number;
+  readonly #memoryContextLimit: number;
 
-interface EquipmentOutcomeNotificationState {
-  readonly failedSignatures: Set<string>;
-  lastSuccessfulSignature: string | undefined;
-}
-
-/** Event-driven coordinator. Only this class owns calls into PlayerBody.execute. */
-export class PlayerRuntime {
-  readonly #eventTimes = new Map<string, number>();
-  readonly #semanticSignatures = new Map<string, string>();
-  readonly #pendingSemanticChanges = new Set<string>();
-  readonly #equipmentOutcomeNotifications = new Map<
-    Extract<PlayerOperation, { kind: "equip" }>["destination"],
-    EquipmentOutcomeNotificationState
-  >();
-  readonly #lifetime = new AbortController();
-  #unsubscribeBody: (() => void) | undefined;
-  #activeBody: ActiveBodyRun | undefined;
-  #activeThought: AbortController | undefined;
-  #activeThoughtStartedAtMs: number | undefined;
-  #activeThoughtCommitted = false;
-  #activeThoughtDamageAware = false;
-  #activeThoughtDamageInvalidated = false;
-  #activeThoughtDeathAware = false;
-  #activeThoughtDeathInvalidated = false;
-  #activeResponsesRequest = false;
-  #activeResponsesRequestStartedAtMs: number | undefined;
-  #ownerProposalSettlementTimer: NodeJS.Timeout | undefined;
-  #ownerProposalSettlementThought: AbortController | undefined;
-  #pendingThoughtWake: PendingThoughtWake | undefined;
-  #operationStallWake: OperationStallWake | undefined;
-  #activeThoughtStallWake: OperationStallWake | undefined;
-  #replacementTail: Promise<void> = Promise.resolve();
-  #retryTimer: NodeJS.Timeout | undefined;
-  #revisionRetryUsed = false;
-  #deadlineTimer: NodeJS.Timeout | undefined;
-  #sampleTimer: NodeJS.Timeout | undefined;
-  #semanticWakeTimer: NodeJS.Timeout | undefined;
-  #vitalsWakeTimer: NodeJS.Timeout | undefined;
-  #samplePromise: Promise<void> | undefined;
-  #retryDelayMs = 5_000;
-  #bodyNeedsRecovery = false;
-  #recoveryRequestedOperationIds = new Set<string>();
-  #ownerProposalsAwaitingResolution = new Set<string>();
-  #ownerConsumeOperations = new Set<string>();
-  #pendingDamageReflexOutcome: PendingDamageReflexOutcome | undefined;
-  #latestBodyOperationPhase: LatestBodyOperationPhase | undefined;
-  #lastObservedPosition: PlayerBodyObservation["self"]["position"] | undefined;
-  #operationPositionSample:
-    | {
-        readonly runtimeOperationId: string;
-        readonly position: PlayerBodyObservation["self"]["position"];
-      }
-    | undefined;
-  #bodyConnected = true;
-  #lastDamageEventAtMs = Number.NEGATIVE_INFINITY;
   #started = false;
-  #shuttingDown = false;
-  #handledPurposeCompletionWakeSequence = 0;
+  #disposed = false;
+  #runtimeStopLatched = false;
+  #stopPersistenceFailed = false;
+  #unsubscribeBody: (() => void) | undefined;
+  #generation = 0;
+  #activeDecision: AbortController | undefined;
+  #activeBody: ActiveBodyRun | undefined;
+  #pendingWake: PendingWake | undefined;
+  #drainPromise: Promise<void> | undefined;
+  #waitTimer: NodeJS.Timeout | undefined;
+  #worldChangeTimer: NodeJS.Timeout | undefined;
+  #failureCount = 0;
+  #worldChangedDuringDecision = false;
+  #ownerFollowRequested = false;
+  #cachedKnowledge: PlayerKnowledge | undefined;
+  #wakeAt: string | null = null;
+  #wakeReason: string | null = null;
+  #recentErrors: { code: string; at: string }[] = [];
 
-  public constructor(private readonly options: PlayerRuntimeOptions) {}
-
-  public get snapshot(): PlayerRuntimeSnapshot {
-    return this.options.mind.snapshot();
+  public constructor(options: CompanionRuntimeOptions) {
+    this.#ownerUsername = options.ownerUsername;
+    this.#body = options.body;
+    this.#store = options.store;
+    this.#agent = options.agent;
+    this.#say = options.say;
+    this.#logger = options.logger;
+    this.#minWaitMs = Math.max(
+      1_000,
+      Math.min(maximumWaitMs, options.minWaitMs ?? minimumWaitMs),
+    );
+    this.#memoryContextLimit = Math.max(
+      1,
+      Math.min(
+        50,
+        Math.trunc(options.memoryContextLimit ?? defaultMemoryContextLimit),
+      ),
+    );
   }
 
-  public get busy(): boolean {
-    return this.#activeThought !== undefined || this.#activeBody !== undefined;
-  }
-
-  /** Safe, bounded current-process diagnostics for an authenticated owner question. */
-  public inspectRuntime(): PlayerRuntimeInspection {
-    const now = Date.now();
-    const snapshot = this.options.mind.snapshot();
-    const recentDecisionFailures = snapshot.recentAgentActivity
-      .slice(-8)
-      .flatMap((activity) => {
-        const rejectionCodes = activity.toolCalls
-          .filter((call) => call.resultClass !== "ok")
-          .flatMap((call) =>
-            call.resultCode === undefined ? [] : [call.resultCode],
-          );
-        if (
-          rejectionCodes.length === 0 &&
-          activity.responseStatus !== "failed" &&
-          activity.responseStatus !== "request_error" &&
-          activity.responseStatus !== "incomplete"
-        )
-          return [];
-        return [
-          {
-            role: activity.role,
-            responseStatus: activity.responseStatus,
-            ...(activity.requestErrorCause === undefined
-              ? {}
-              : { requestErrorCause: activity.requestErrorCause }),
-            rejectionCodes,
-            ageKnown: false as const,
-          },
-        ];
-      })
-      .slice(-4);
+  /** Returns a local, read-only status projection without observing or waking Body. */
+  public status(): CompanionRuntimeStatus {
+    const snapshot = this.#store.snapshot();
+    const stopped = snapshot.stopped || this.#runtimeStopLatched;
+    const outcome = snapshot.lastOutcome;
     return {
-      sampledAt: new Date(now).toISOString(),
-      process: { started: this.#started, shuttingDown: this.#shuttingDown },
-      purpose: {
-        active: this.#activeThought !== undefined,
-        activeForMs:
-          this.#activeThoughtStartedAtMs === undefined
-            ? null
-            : Math.max(0, now - this.#activeThoughtStartedAtMs),
-        awaitingResponse: this.#activeResponsesRequest,
-        responseWaitForMs:
-          !this.#activeResponsesRequest ||
-          this.#activeResponsesRequestStartedAtMs === undefined
-            ? null
-            : Math.max(0, now - this.#activeResponsesRequestStartedAtMs),
-        retryScheduled: this.#retryTimer !== undefined,
-      },
-      body: {
-        connectionState: !this.#started
-          ? "not_started"
-          : this.#bodyConnected
-            ? "connected"
-            : "disconnected",
-        activeOperation:
-          snapshot.activeOperation === undefined
-            ? null
-            : {
-                operation: snapshot.activeOperation.kind,
-                startedAt:
-                  snapshot.activeOperation.bodyStartedAt ??
-                  snapshot.activeOperation.startedAt,
-              },
-        latestOperationPhase:
-          this.#latestBodyOperationPhase === undefined
-            ? null
-            : {
-                operation: this.#latestBodyOperationPhase.operation,
-                phase: this.#latestBodyOperationPhase.phase,
-                at: this.#latestBodyOperationPhase.at,
-                ageMs: Math.max(
-                  0,
-                  now - Date.parse(this.#latestBodyOperationPhase.at),
-                ),
-                inFlight:
-                  this.#activeBody?.operationId ===
-                    this.#latestBodyOperationPhase.runtimeOperationId &&
-                  this.#latestBodyOperationPhase.phase !== "result" &&
-                  this.#latestBodyOperationPhase.phase !== "guard_rejected",
-                admissionObserved:
-                  this.#latestBodyOperationPhase.admissionObserved,
-                status: this.#latestBodyOperationPhase.status ?? null,
-                reason: this.#latestBodyOperationPhase.reason ?? null,
-                firstPathStatus:
-                  this.#latestBodyOperationPhase.firstPathStatus ?? null,
-                controlEnabledCount:
-                  this.#latestBodyOperationPhase.controlEnabledCount,
-              },
-        latestObservation:
-          snapshot.lastObservation === undefined
-            ? null
-            : {
-                observedAt: snapshot.lastObservation.observedAt,
-                ageMs: Math.max(
-                  0,
-                  now - Date.parse(snapshot.lastObservation.observedAt),
-                ),
-                health: snapshot.lastObservation.health,
-              },
-        lastResult:
-          snapshot.lastOutcome === undefined
-            ? null
-            : {
-                operation: snapshot.lastOutcome.kind,
-                status: snapshot.lastOutcome.status,
-                observedAt: snapshot.lastOutcome.observedAt,
-              },
-      },
-      pendingOwnerProposalCount: snapshot.proposals.filter(
-        ({ status }) => status === "pending",
-      ).length,
-      recentDecisionFailures,
+      running: this.#started && !this.#disposed && !stopped,
+      stopped,
+      thinking: this.#activeDecision !== undefined,
+      goal: snapshot.goal,
+      relationshipSummary: snapshot.relationshipSummary,
+      interests: snapshot.interests,
+      currentOperation:
+        this.#activeBody === undefined
+          ? null
+          : {
+              kind: this.#activeBody.operation.kind,
+              startedAt: this.#activeBody.startedAt,
+            },
+      nextWakeAt: this.#wakeAt,
+      wakeReason: this.#wakeReason,
+      lastOutcome:
+        outcome === null
+          ? null
+          : {
+              status: outcome.status,
+              operationKind: outcome.operation.kind,
+              summary: safeSummary(outcome.summary),
+              observedAt: outcome.observedAt,
+            },
+      recentErrors: this.#recentErrors.map((error) => ({ ...error })),
+      usage: this.#agent.status?.() ?? null,
     };
   }
 
+  /** Starts one fresh judgment; persisted plans are context, never replay instructions. */
   public async start(): Promise<void> {
-    if (this.#started) return;
-    this.#started = true;
-    this.#unsubscribeBody = this.options.body.onEvent((event) =>
-      this.onBodyEvent(event),
-    );
-    const activeBeforeRecovery = this.options.mind.snapshot().activeOperation;
-    const priorReceipt =
-      activeBeforeRecovery === undefined
-        ? undefined
-        : this.options.skills.getEvidence(activeBeforeRecovery.operationId);
-    const trustedRecovery =
-      priorReceipt === undefined || activeBeforeRecovery === undefined
-        ? undefined
-        : priorReceipt.operationName === activeBeforeRecovery.kind &&
-            priorReceipt.skillIdAtUse === activeBeforeRecovery.skillId &&
-            priorReceipt.skillVersionAtUse === activeBeforeRecovery.skillVersion
-          ? {
-              status: priorReceipt.observedOutcome,
-              summary: priorReceipt.observationSummary,
-              observedAt: priorReceipt.observedAt,
-            }
-          : undefined;
-    const recovered =
-      this.options.mind.recoverInterruptedOperation(trustedRecovery);
-    if (recovered !== undefined) {
-      this.#recordRecoveryEvidence(recovered);
-      this.options.memory.recordEpisode({
-        summary: `再起動をまたいだ${recovered.kind}の観測結果を${recovered.status}として保存`,
-        status: recovered.status,
-        operationKind: recovered.kind,
-      });
-    }
-    const snapshot = this.options.mind.snapshot();
-    this.#rememberPendingOwnerProposals(snapshot);
-    this.#handledPurposeCompletionWakeSequence =
-      this.options.mind.purposeCompletionWakeState().sequence;
-    this.#scheduleDeadline(snapshot.wait?.wakeAt);
-    if (!snapshot.stopped) {
-      this.#setDamageReflexEnabled(true);
-      await this.#sampleSemanticState();
-      this.#startSampler();
-      const completionWake = this.options.mind.purposeCompletionWakeState();
-      this.#handledPurposeCompletionWakeSequence = completionWake.sequence;
-      if (completionWake.pendingEvent !== undefined) {
-        this.#requestThought(
-          completionWake.pendingEvent.kind,
-          completionWake.pendingEvent.summary,
-          true,
+    if (!this.#activate()) return;
+    if (this.#isStopped()) return;
+    this.#fireWake({ reason: "startup; re-observe before continuing" });
+  }
+
+  /** Only the authenticated owner can affect the companion through chat. */
+  public async receiveChat(
+    username: string,
+    rawMessage: string,
+  ): Promise<void> {
+    if (!sameMinecraftIdentity(username, this.#ownerUsername)) return;
+    if (this.#disposed) return;
+    const message = rawMessage.trim().slice(0, messageLimit);
+    if (message.length === 0) return;
+
+    if (isImmediateStopCommand(message)) {
+      const stopped = await this.stop(username);
+      if (stopped) {
+        try {
+          this.#store.recordMessage("owner", message);
+        } catch (error) {
+          this.#logError(error, "Owner stop message could not be recorded");
+        }
+        await this.#speakControlMessage(
+          this.#stopPersistenceFailed
+            ? "自律行動をこの実行中は停止しました。停止状態の永続保存に失敗したため、Botを再起動しないでください。"
+            : "自律行動を停止しました。再開の明示的な指示があるまで、操作を実行しません。",
         );
-      } else {
-        const kind: PlayerWakeKind =
-          snapshot.wait?.wakeOn.includes("reconnected") === true
-            ? "reconnected"
-            : "startup";
-        const summary =
-          kind === "reconnected"
-            ? "接続済みの新しいMinecraft sessionでランタイムを起動"
-            : "接続後に自律目的と現在状態を評価";
-        const event = this.options.mind.enqueueEvent(kind, summary);
-        this.#requestThought(event.kind, event.summary);
       }
-    }
-  }
-
-  /** Mineflayer entry point; identity is checked before either agent sees chat. */
-  public receiveChat(username: string, message: string): void {
-    if (
-      this.#shuttingDown ||
-      !sameMinecraftIdentity(username, this.options.ownerUsername)
-    )
-      return;
-    const normalized = message.trim();
-    if (normalized.length === 0 || normalized.length > 1_000) return;
-    const turn = this.options.conversation.nextTurn();
-    if (isImmediateStopCommand(normalized)) {
-      this.options.mind.stop();
-      this.#stopSampler();
-      this.#cancelThought("owner_stop");
-      void this.#stopBody("owner_stop")
-        .then(async () => {
-          if (!this.#shuttingDown)
-            await this.#safeSay(
-              "自律行動を停止しました。再開の指示があるまで停止を続けます。",
-            );
-        })
-        .catch((error: unknown) =>
-          this.#logFailure("PLAYER_STOP_FAILED", error),
-        );
       return;
     }
-    void this.#traceCall("owner conversation turn", () =>
-      this.options.conversation.handleOwnerMessage({
-        username,
-        message: normalized,
-        turn,
-        signal: this.#lifetime.signal,
-      }),
-    )
-      .catch((error: unknown) =>
-        this.#logFailure("PLAYER_CONVERSATION_FAILED", error),
-      )
-      .finally(() => this.options.conversation.finishTurn?.(turn));
+
+    if (!this.#started) this.#activate();
+    if (this.#isStopped()) {
+      if (isExplicitResumeCommand(message)) {
+        this.#store.recordMessage("owner", message);
+        await this.resume(username, message);
+      }
+      return;
+    }
+
+    if (isOwnerFollowCommand(message)) {
+      if (this.#ownerFollowRequested) return;
+      this.#store.recordMessage("owner", message);
+      this.#ownerFollowRequested = true;
+      await this.#requestWake({
+        reason: "authenticated owner requested following",
+        mode: "follow_owner",
+      });
+      if (this.#isStopped()) {
+        this.#ownerFollowRequested = false;
+        return;
+      }
+      await this.#speakControlMessage("わかった。近くまでついていくね。");
+      return;
+    }
+
+    this.#store.recordMessage("owner", message);
+    await this.#requestWake({
+      reason: "owner message",
+      ownerMessage: message,
+    });
   }
 
-  /** Called after a durable owner proposal was recorded; this leaves the body running. */
-  public onOwnerProposal(): void {
-    this.#rememberPendingOwnerProposals(this.options.mind.snapshot());
-    const event = this.options.mind
-      .pendingEvents(12)
-      .findLast(({ kind }) => kind === "owner_proposal");
-    this.#requestThought(
-      "owner_proposal",
-      event?.summary ?? "所有者の目的提案を評価",
-    );
-  }
-
-  /** Wake Purpose to reconsider an existing plan using its next fresh observation. */
-  public onOwnerFeedbackNeedsReassessment(reason: string): boolean {
-    if (
-      this.#shuttingDown ||
-      this.#lifetime.signal.aborted ||
-      this.options.mind.snapshot().stopped
-    )
+  /** Latch and cancel local work before attempting durable owner stop. */
+  public async stop(actorUsername: string): Promise<boolean> {
+    if (!sameMinecraftIdentity(actorUsername, this.#ownerUsername))
       return false;
-    const detail = sanitizeDetail(reason);
-    if (detail.length === 0) return false;
-    const event = this.options.mind.enqueueEvent(
-      "manual",
-      `Owner feedback asks me to reconsider the current purpose: ${detail}`,
-    );
-    this.#requestThought(event.kind, event.summary, true);
+    if (this.#disposed) return false;
+    let alreadyPersistedStopped = false;
+    try {
+      alreadyPersistedStopped = this.#store.snapshot().stopped;
+    } catch (error) {
+      this.#stopPersistenceFailed = true;
+      this.#logError(error, "Owner stop state could not be read");
+    }
+    this.#runtimeStopLatched = true;
+    this.#ownerFollowRequested = false;
+    this.#generation += 1;
+    this.#pendingWake = undefined;
+    this.#clearTimers();
+    this.#activeDecision?.abort(new Error("Owner stopped companion"));
+    this.#activeBody?.controller.abort(new Error("Owner stopped companion"));
+    if (!alreadyPersistedStopped) {
+      try {
+        this.#store.stop();
+        this.#stopPersistenceFailed = false;
+      } catch (error) {
+        this.#stopPersistenceFailed = true;
+        this.#logError(error, "Owner stop persistence failed");
+      }
+    } else {
+      this.#stopPersistenceFailed = false;
+    }
+    try {
+      await this.#body.stopActiveOperation?.();
+    } catch {
+      this.#logger?.warn({ errorType: "BodyStopError" }, "Body stop failed");
+    }
+    await this.#drainPromise;
     return true;
   }
 
-  /** Called only after the stop latch has been persisted. */
-  public async stopNow(): Promise<void> {
-    this.#stopSampler();
-    this.#cancelThought("autonomy_stopped");
-    await this.#stopBody("autonomy_stopped");
+  /** Resume requires a separately authenticated owner identity. */
+  public async resume(
+    actorUsername: string,
+    ownerMessage?: string,
+  ): Promise<boolean> {
+    if (!sameMinecraftIdentity(actorUsername, this.#ownerUsername))
+      return false;
+    if (this.#disposed) return false;
+    if (!this.#started) this.#activate();
+    const snapshot = this.#store.snapshot();
+    if (!snapshot.stopped) return false;
+    this.#store.resume(snapshot.stopGeneration);
+    this.#runtimeStopLatched = false;
+    this.#stopPersistenceFailed = false;
+    await this.#requestWake({
+      reason: "owner explicitly resumed autonomy",
+      ...(ownerMessage === undefined
+        ? {}
+        : { ownerMessage: ownerMessage.slice(0, messageLimit) }),
+    });
+    return true;
   }
 
-  /** A fresh, owner-authenticated resume wakes the purpose agent. */
-  public onResume(): void {
-    if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
-    this.#setDamageReflexEnabled(true);
-    void this.#sampleSemanticState();
-    this.#startSampler();
-    const completionWake = this.options.mind.purposeCompletionWakeState();
-    this.#handledPurposeCompletionWakeSequence = completionWake.sequence;
-    if (completionWake.pendingEvent !== undefined) {
-      this.#requestThought(
-        completionWake.pendingEvent.kind,
-        completionWake.pendingEvent.summary,
-        true,
-      );
-    } else {
-      this.#requestThought("manual", "所有者が自律行動を再開");
-    }
-  }
-
-  public async shutdown(reason = "shutdown"): Promise<void> {
-    if (this.#shuttingDown) return;
-    this.#shuttingDown = true;
-    this.#lifetime.abort(new Error("player runtime shutdown"));
-    this.#cancelThought(reason);
-    if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
-    if (this.#deadlineTimer !== undefined) clearTimeout(this.#deadlineTimer);
-    this.#stopSampler();
+  /** Stop local work while preserving the durable owner stop state as-is. */
+  public async shutdown(): Promise<void> {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#ownerFollowRequested = false;
+    this.#generation += 1;
+    this.#pendingWake = undefined;
+    this.#clearTimers();
     this.#unsubscribeBody?.();
     this.#unsubscribeBody = undefined;
-    await this.#stopBody(reason);
+    this.#activeDecision?.abort(new Error("Companion runtime shutdown"));
+    this.#activeBody?.controller.abort(new Error("Companion runtime shutdown"));
+    await this.#drainPromise;
   }
 
-  public evidence(): PlayerRuntimeSnapshot {
-    const snapshot = this.options.mind.snapshot();
-    return {
-      ...snapshot,
-      ...(snapshot.lastObservation === undefined
-        ? {}
-        : {
-            lastObservation: withoutPrivateObservationDetails(
-              snapshot.lastObservation,
-            ),
-          }),
-      ...(snapshot.latestDeath === undefined
-        ? {}
-        : {
-            latestDeath: {
-              observedAt: snapshot.latestDeath.observedAt,
-              ...(snapshot.latestDeath.cause === undefined
-                ? {}
-                : { cause: snapshot.latestDeath.cause }),
-              ...(snapshot.latestDeath.beforeObservation === undefined
-                ? {}
-                : {
-                    beforeObservation: withoutPrivateObservationDetails(
-                      snapshot.latestDeath.beforeObservation,
-                    ),
-                  }),
-              ...(snapshot.latestDeath.firstPostDeathObservation === undefined
-                ? {}
-                : {
-                    firstPostDeathObservation: withoutPrivateObservationDetails(
-                      snapshot.latestDeath.firstPostDeathObservation,
-                    ),
-                  }),
-            },
-          }),
-    };
-  }
-
-  public handleCommittedDecision(
-    snapshot: PlayerRuntimeSnapshot,
-    decision: PlayerThoughtDecision,
-  ): void {
-    if (this.#activeThought !== undefined) this.#activeThoughtCommitted = true;
-    this.#retryDelayMs = 5_000;
-    this.#revisionRetryUsed = false;
-    if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
-    this.#retryTimer = undefined;
-    this.#scheduleDeadline(snapshot.wait?.wakeAt);
-    this.#handleOwnerProposalResolution(snapshot, decision);
-    if (decision.kind === "complete") this.#dispatchNewPurposeCompletionWake();
-    if (decision.kind === "act") {
-      this.#abortActiveBody("action_revision_changed");
-      this.#replacementTail = this.#replacementTail
-        .catch(() => undefined)
-        .then(() => this.#replaceBodyOperation(snapshot, decision));
-      return;
+  async #requestWake(wake: PendingWake): Promise<void> {
+    if (this.#disposed || this.#isStopped()) return;
+    if (wake.mode !== "follow_owner") this.#ownerFollowRequested = false;
+    if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
+    if (this.#worldChangeTimer !== undefined)
+      clearTimeout(this.#worldChangeTimer);
+    this.#waitTimer = undefined;
+    this.#worldChangeTimer = undefined;
+    this.#wakeAt = null;
+    this.#wakeReason = wake.reason;
+    this.#generation += 1;
+    this.#activeDecision?.abort(new Error("Companion judgment superseded"));
+    this.#pendingWake = wake;
+    if (this.#activeBody !== undefined) {
+      this.#activeBody.controller.abort(new Error("Companion intent changed"));
     }
-    if (decision.kind === "wait" || decision.kind === "complete") {
-      this.#abortActiveBody("action_revision_changed");
-      this.#replacementTail = this.#replacementTail
-        .catch(() => undefined)
-        .then(() => this.#stopPrimaryOperation("action_revision_changed"));
-    }
-  }
-
-  #dispatchNewPurposeCompletionWake(): void {
-    const state = this.options.mind.purposeCompletionWakeState();
-    if (state.sequence <= this.#handledPurposeCompletionWakeSequence) return;
-    this.#handledPurposeCompletionWakeSequence = state.sequence;
-    if (state.pendingEvent === undefined) return;
-    this.#requestThought(
-      state.pendingEvent.kind,
-      state.pendingEvent.summary,
-      true,
-    );
-  }
-
-  #rememberPendingOwnerProposals(snapshot: PlayerRuntimeSnapshot): void {
-    for (const proposal of snapshot.proposals) {
-      if (proposal.status === "pending")
-        this.#ownerProposalsAwaitingResolution.add(proposal.id);
-    }
-    while (this.#ownerProposalsAwaitingResolution.size > 16) {
-      const oldest = this.#ownerProposalsAwaitingResolution
-        .values()
-        .next().value;
-      if (oldest === undefined) break;
-      this.#ownerProposalsAwaitingResolution.delete(oldest);
-    }
-  }
-
-  #handleOwnerProposalResolution(
-    snapshot: PlayerRuntimeSnapshot,
-    decision: PlayerThoughtDecision,
-  ): void {
-    if (
-      this.#shuttingDown ||
-      snapshot.stopped ||
-      this.options.mind.snapshot().stopped
-    )
-      return;
-    const latestJudgment = snapshot.recentJudgments.at(-1);
-    const directlyResolvedId =
-      latestJudgment?.kind === decision.kind
-        ? latestJudgment.proposalId
-        : undefined;
-    const resolved = snapshot.proposals.filter(
-      ({ id, status, resolution }) =>
-        status !== "pending" &&
-        resolution !== undefined &&
-        (this.#ownerProposalsAwaitingResolution.has(id) ||
-          id === directlyResolvedId),
-    );
-    const proposal =
-      resolved.find(({ id }) => id === directlyResolvedId) ??
-      (resolved.length === 1 ? resolved[0] : undefined);
-    if (proposal === undefined) return;
-    this.#ownerProposalsAwaitingResolution.delete(proposal.id);
-
-    if (decision.kind === "act" && decision.operation.kind === "consume") {
-      this.#ownerConsumeOperations.add(decision.operationId);
-      while (this.#ownerConsumeOperations.size > 16) {
-        const oldest = this.#ownerConsumeOperations.values().next().value;
-        if (oldest === undefined) break;
-        this.#ownerConsumeOperations.delete(oldest);
-      }
-    }
-
-    const resolution = sanitizeDetail(proposal.resolution ?? "");
-    if (resolution.length === 0) return;
-    void this.#sayWhileActive(resolution);
-  }
-
-  async #sayWhileActive(message: string): Promise<void> {
-    if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
-    await this.#safeSay(message);
-  }
-
-  private onBodyEvent(event: PlayerBodyEvent): void {
-    if (this.#shuttingDown) return;
-    const bodyEvent = event as unknown as Record<string, unknown>;
-    const type =
-      typeof bodyEvent.type === "string" ? bodyEvent.type : "unknown";
-    const at =
-      typeof bodyEvent.at === "string"
-        ? bodyEvent.at
-        : new Date().toISOString();
-    if (event.type === "damage_reflex_started") return;
-    if (event.type === "damage_reflex_completed") {
-      this.#queueDamageReflexOutcome(event);
-      return;
-    }
-    if (event.type === "bot_damaged") {
-      const damageAt = Date.parse(event.at);
-      this.#lastDamageEventAtMs = Number.isFinite(damageAt)
-        ? damageAt
-        : Date.now();
-      const invalidateDecision =
-        this.#activeThought !== undefined &&
-        !this.#activeThoughtCommitted &&
-        !this.#activeThoughtDamageAware &&
-        !this.#activeThoughtDeathAware &&
-        !this.#activeThoughtDamageInvalidated;
-      if (invalidateDecision) this.#activeThoughtDamageInvalidated = true;
-      this.enqueueAndWake(
-        "bot_damaged",
-        damageEventSummary(event.source, event.confidence),
-        event.at,
-        "bot_damaged",
-        damageObservationCoalesceMs,
-        { invalidateDecision, damageAware: true },
+    const drain = this.#ensureDrain();
+    if (wake.mode === "follow_owner") {
+      void drain.catch((error: unknown) =>
+        this.#logError(error, "Companion wake failed"),
       );
       return;
     }
-    if (event.type === "bot_death_cause_updated") {
-      const updated = this.options.mind.recordDeathCauseUpdate(
-        event.deathAt,
-        event.cause,
-        deathCauseUpdateSummary(event.cause),
-        event.at,
-      );
-      if (updated !== undefined)
-        this.#requestThought(updated.kind, updated.summary, false, false, true);
-      return;
-    }
-    if (type === "operation_started") {
-      const active = this.#activeBody;
-      if (
-        active !== undefined &&
-        bodyEvent.operation === active.operation.kind
-      ) {
-        const bodyOperationId =
-          typeof bodyEvent.operationId === "string"
-            ? bodyEvent.operationId
-            : undefined;
-        this.#advanceBodyOperationPhase(active, {
-          phase: "admitted",
-          at,
-          admissionObserved: true,
-          ...(bodyOperationId === undefined ? {} : { bodyOperationId }),
-        });
-        // The adapter generates its own operationId; the runtime's durable ID is the action identity.
-        this.options.mind.markOperationStarted(active.operationId, at);
-      }
-      return;
-    }
-    if (type === "operation_admission_waiting") {
-      const active = this.#activeBody;
-      if (active !== undefined && bodyEvent.operation === active.operation.kind)
-        this.#advanceBodyOperationPhase(active, {
-          phase: "admission_waiting",
-          at,
-        });
-      return;
-    }
-    if (type === "operation_dispatched") {
-      const active = this.#activeBody;
-      if (
-        active !== undefined &&
-        bodyEvent.operation === active.operation.kind &&
-        bodyEvent.operationId ===
-          this.#latestBodyOperationPhase?.bodyOperationId
-      )
-        this.#advanceBodyOperationPhase(active, {
-          phase: "dispatch_entered",
-          at,
-        });
-      return;
-    }
-    if (type === "operation_path_updated") {
-      const active = this.#activeBody;
-      const latest = this.#latestBodyOperationPhase;
-      if (
-        active !== undefined &&
-        latest?.firstPathStatus === undefined &&
-        bodyEvent.operation === active.operation.kind &&
-        bodyEvent.operationId === latest?.bodyOperationId &&
-        (bodyEvent.status === "noPath" ||
-          bodyEvent.status === "timeout" ||
-          bodyEvent.status === "success" ||
-          bodyEvent.status === "partial")
-      )
-        this.#advanceBodyOperationPhase(active, {
-          phase: "path_progress",
-          at,
-          firstPathStatus: bodyEvent.status,
-        });
-      this.#discardStaleOperationStallWake();
-      return;
-    }
-    if (type === "operation_completed" || type === "operation_failed") {
-      // The execute promise carries before/after observations and creates the trusted receipt.
-      return;
-    }
-    if (type === "operation_stalled") {
-      const active = this.#activeBody;
-      const latest = this.#latestBodyOperationPhase;
-      const bodyOperationId =
-        typeof bodyEvent.operationId === "string"
-          ? bodyEvent.operationId
-          : undefined;
-      if (
-        active === undefined ||
-        latest === undefined ||
-        bodyOperationId === undefined ||
-        bodyEvent.operation !== active.operation.kind ||
-        latest.runtimeOperationId !== active.operationId ||
-        latest.bodyOperationId !== bodyOperationId ||
-        latest.operation !== active.operation.kind ||
-        latest.phase === "result" ||
-        latest.phase === "guard_rejected"
-      ) {
-        this.#discardStaleOperationStallWake();
-        return;
-      }
-      const operation =
-        typeof bodyEvent.operation === "string"
-          ? bodyEvent.operation
-          : "operation";
-      const elapsed =
-        typeof bodyEvent.elapsedMs === "number"
-          ? Math.max(0, Math.floor(bodyEvent.elapsedMs))
-          : 0;
-      this.enqueueAndWake(
-        "operation_stalled",
-        `${operation} が ${elapsed}ms 以上続き、進捗を再評価`,
-        at,
-        "operation_stalled",
-        3_000,
-        {
-          invalidateDecision: false,
-          operationStall: {
-            runtimeOperationId: active.operationId,
-            bodyOperationId,
-            progressVersion: latest.progressVersion,
-          },
-        },
-      );
-      return;
-    }
-    if (type === "bot_death") {
-      if (event.type !== "bot_death") return;
-      const deathWakeAlreadyAware =
-        this.#activeThoughtDeathAware ||
-        this.#activeThoughtDeathInvalidated ||
-        this.#pendingThoughtWake?.deathAware === true;
-      const invalidateDecision = !deathWakeAlreadyAware;
-      if (invalidateDecision && this.#activeThought !== undefined)
-        this.#activeThoughtDeathInvalidated = true;
-      this.options.memory.recordEpisode({
-        summary: "Bot自身がMinecraft内で死亡したことを観測",
-        status: "observed",
-        operationKind: "bot_death",
-      });
-      this.enqueueAndWake(
-        "bot_death",
-        deathEventSummary(event.cause),
-        at,
-        "bot_death",
-        0,
-        {
-          invalidateDecision,
-          deathAware: true,
-          ...(event.cause === undefined ? {} : { deathCause: event.cause }),
-        },
-      );
-      return;
-    }
-    if (type === "reconnected") {
-      this.#bodyConnected = true;
-      this.#bodyNeedsRecovery = false;
-      void this.#sampleSemanticState();
-      this.#startSampler();
-      this.enqueueAndWake("reconnected", "Minecraftへの再接続を観測", at);
-      return;
-    }
-    if (type === "operation_recovery_required") {
-      const operation =
-        typeof bodyEvent.operation === "string"
-          ? bodyEvent.operation
-          : "operation";
-      const operationId =
-        typeof bodyEvent.operationId === "string"
-          ? bodyEvent.operationId
-          : "unknown-operation";
-      this.#requestBodyRecovery(operationId, operation);
-      this.options.logger.warn(
-        {
-          category: "player_runtime",
-          code: "BODY_RECOVERY_REQUIRED",
-          operation,
-        },
-        "body operation awaits Minecraft reconnect",
-      );
-      return;
-    }
-    if (type === "disconnected") {
-      this.#bodyConnected = false;
-      this.#stopSampler();
-      this.options.mind.enqueueEvent(
-        "state_changed",
-        "Minecraft接続が切断され、再接続を待機",
-      );
-      return;
-    }
-    if (type === "state_changed") {
-      void this.#sampleSemanticState();
-    }
+    await drain;
   }
 
-  private enqueueAndWake(
-    kind: PlayerWakeKind,
-    summary: string,
-    at: string,
-    key: string = kind,
-    minimumGapMs = 3_000,
-    options: {
-      readonly invalidateDecision?: boolean;
-      readonly deathCause?: PlayerBodyDeathCause;
-      readonly damageAware?: boolean;
-      readonly deathAware?: boolean;
-      readonly operationStall?: Omit<OperationStallWake, "eventId">;
-    } = {},
-  ): boolean {
-    const now = Date.parse(at);
-    const previous = this.#eventTimes.get(key) ?? 0;
-    if (Number.isFinite(now) && now - previous < minimumGapMs) {
-      if (kind === "bot_damaged" && options.invalidateDecision === true) {
-        const event = this.options.mind.enqueueEvent(kind, summary, {
-          invalidateDecision: true,
-        });
-        this.#requestThought(kind, event.summary, false, true);
-        return true;
-      }
-      if (kind === "state_changed" && summary.includes("vitals")) {
-        this.options.mind.enqueueEvent(kind, summary);
-        this.#scheduleVitalsWake(Math.max(1, minimumGapMs - (now - previous)));
-        return true;
-      }
-      return false;
-    }
-    this.#eventTimes.set(key, Number.isFinite(now) ? now : Date.now());
-    const deferObservation =
-      kind === "state_changed" &&
-      !summary.includes("vitals") &&
-      this.#activeThought !== undefined;
-    const invalidateDecision = options.invalidateDecision ?? !deferObservation;
-    const event =
-      kind === "bot_death"
-        ? this.options.mind.recordDeathEvent(at, summary, options.deathCause, {
-            invalidateDecision,
-          })
-        : this.options.mind.enqueueEvent(kind, summary, { invalidateDecision });
-    const operationStallWake =
-      options.operationStall === undefined
-        ? undefined
-        : { ...options.operationStall, eventId: event.id };
-    if (operationStallWake !== undefined) {
-      if (this.#operationStallWake !== undefined)
-        this.options.mind.consumeEvents([this.#operationStallWake.eventId]);
-      this.#operationStallWake = operationStallWake;
-    }
-    this.#requestThought(
-      kind,
-      event.summary,
-      false,
-      options.damageAware ?? false,
-      options.deathAware ?? false,
-      operationStallWake,
+  #activate(): boolean {
+    if (this.#disposed || this.#started) return false;
+    this.#started = true;
+    this.#unsubscribeBody = this.#body.onEvent((event) =>
+      this.#onBodyEvent(event),
     );
     return true;
   }
 
-  #requestThought(
-    kind: PlayerWakeKind,
-    reason: string,
-    acceptedPendingWake = false,
-    damageAwareWake = false,
-    deathAwareWake = false,
-    operationStallWake?: OperationStallWake,
-  ): void {
-    if (this.#shuttingDown || this.options.mind.snapshot().stopped) return;
-    if (isUrgentPerceptionWake(kind) && this.#retryTimer !== undefined) {
-      this.#queueThoughtWake(kind, reason, damageAwareWake, deathAwareWake);
-      return;
+  #fireWake(wake: PendingWake): void {
+    void this.#requestWake(wake).catch((error: unknown) =>
+      this.#logError(error, "Companion wake failed"),
+    );
+  }
+
+  #ensureDrain(): Promise<void> {
+    if (this.#drainPromise !== undefined) return this.#drainPromise;
+    const drain = this.#drain().finally(() => {
+      if (this.#drainPromise === drain) this.#drainPromise = undefined;
+      if (this.#pendingWake !== undefined && !this.#disposed)
+        void this.#ensureDrain();
+    });
+    this.#drainPromise = drain;
+    return drain;
+  }
+
+  async #drain(): Promise<void> {
+    while (this.#pendingWake !== undefined && !this.#disposed) {
+      const wake = this.#pendingWake;
+      this.#pendingWake = undefined;
+      if (this.#isStopped()) return;
+      const generation = this.#generation;
+      if (wake.mode === "follow_owner") await this.#followOwner(generation);
+      else await this.#think(wake, generation);
     }
-    const current = this.options.mind.snapshot();
-    if (
-      !acceptedPendingWake &&
-      current.wait !== undefined &&
-      !current.wait.wakeOn.includes(kind) &&
-      kind !== "deadline" &&
-      kind !== "owner_proposal" &&
-      !isUrgentPerceptionWake(kind)
-    )
-      return;
-    if (
-      !acceptedPendingWake &&
-      current.wait?.wakeAt !== undefined &&
-      Date.parse(current.wait.wakeAt) > Date.now() &&
-      kind !== "owner_proposal" &&
-      kind !== "manual" &&
-      !isUrgentPerceptionWake(kind)
-    )
-      return;
-    const requestedStallWake =
-      operationStallWake ??
-      (kind === "operation_stalled" ? this.#operationStallWake : undefined);
-    const pendingEvents = this.options.mind.pendingEvents(64);
-    const staleStallEventIds = pendingEvents
-      .filter(
-        ({ id, kind: eventKind }) =>
-          eventKind === "operation_stalled" &&
-          (this.#operationStallWake?.eventId !== id ||
-            !this.#isOperationStallWakeCurrent(this.#operationStallWake)),
-      )
-      .map(({ id }) => id);
-    if (staleStallEventIds.length > 0)
-      this.options.mind.consumeEvents(staleStallEventIds);
-    const launchStallWake =
-      requestedStallWake !== undefined &&
-      requestedStallWake.eventId === this.#operationStallWake?.eventId &&
-      this.#isOperationStallWakeCurrent(requestedStallWake)
-        ? requestedStallWake
-        : undefined;
-    if (kind === "operation_stalled" && launchStallWake === undefined) {
-      this.#discardStaleOperationStallWake();
-      return;
-    }
-    const activeThought = this.#activeThought;
-    if (activeThought !== undefined) {
-      this.#queueThoughtWake(kind, reason, damageAwareWake, deathAwareWake);
-      if (kind === "owner_proposal") {
-        if (this.#activeResponsesRequest) {
-          this.#boundOwnerProposalSettlement(activeThought);
-        } else {
-          this.#clearOwnerProposalSettlement(activeThought);
-          activeThought.abort(new Error("owner_proposal_preempted_thought"));
-        }
-      } else if (
-        !this.#activeThoughtCommitted &&
-        kind !== "body_outcome" &&
-        kind !== "operation_stalled" &&
-        !isUrgentPerceptionWake(kind) &&
-        (kind !== "state_changed" || reason.includes("vitals"))
-      ) {
-        // Body outcomes advance CAS but let the in-flight request settle; its
-        // stale commit will be rejected before the queued outcome is retried.
-        activeThought.abort(new Error(`new_event_preempted_thought:${kind}`));
-      }
-      return;
-    }
+  }
+
+  async #think(wake: PendingWake, generation: number): Promise<void> {
     const controller = new AbortController();
-    this.#activeThought = controller;
-    this.#activeThoughtStartedAtMs = Date.now();
-    this.#activeThoughtCommitted = false;
-    this.#activeThoughtDamageAware = kind === "bot_damaged" || damageAwareWake;
-    this.#activeThoughtDamageInvalidated = false;
-    this.#activeThoughtDeathAware =
-      kind === "bot_death" ||
-      kind === "bot_death_cause_updated" ||
-      deathAwareWake;
-    this.#activeThoughtDeathInvalidated = false;
-    this.#activeThoughtStallWake =
-      kind === "operation_stalled" ? launchStallWake : undefined;
-    this.#activeResponsesRequest = false;
-    this.#activeResponsesRequestStartedAtMs = undefined;
-    const events = this.options.mind.pendingEvents(32);
-    let retry = false;
-    let immediateRevisionRetry = false;
-    let staleStallStoppedResponse = false;
-    void this.#traceCall("autonomous purpose thought", async () => {
-      try {
-        const result = await this.options.purpose.think({
-          snapshot: current,
-          events:
-            events.length === 0
-              ? [
-                  {
-                    id: randomUUID(),
-                    kind,
-                    summary: reason,
-                    createdAt: new Date().toISOString(),
-                  },
-                ]
-              : events,
-          urgentPerceptionWake:
-            isUrgentPerceptionWake(kind) || damageAwareWake || deathAwareWake,
-          signal: AbortSignal.any([controller.signal, this.#lifetime.signal]),
-          shouldStopAfterResponse: () => {
-            const staleStall =
-              this.#activeThoughtStallWake !== undefined &&
-              !this.#isOperationStallWakeCurrent(this.#activeThoughtStallWake);
-            if (staleStall) staleStallStoppedResponse = true;
-            return (
-              this.#pendingThoughtWake?.kind === "body_outcome" ||
-              this.#pendingThoughtWake?.kind === "owner_proposal" ||
-              this.#activeThoughtDamageInvalidated ||
-              this.#activeThoughtDeathInvalidated ||
-              staleStall
-            );
-          },
-          onResponsesRequestState: (active) => {
-            if (this.#activeThought === controller) {
-              this.#activeResponsesRequest = active;
-              this.#activeResponsesRequestStartedAtMs = active
-                ? Date.now()
-                : undefined;
-            }
-          },
-        });
-        if (
-          launchStallWake !== undefined &&
-          !this.#isOperationStallWakeCurrent(launchStallWake)
-        )
-          staleStallStoppedResponse = true;
-        if (staleStallStoppedResponse) {
-          if (launchStallWake !== undefined)
-            this.options.mind.consumeEvents([launchStallWake.eventId]);
-          this.#operationStallWake = undefined;
-        }
-        if (
-          !result.accepted &&
-          !controller.signal.aborted &&
-          !this.options.mind.snapshot().stopped &&
-          !staleStallStoppedResponse
-        ) {
-          retry = true;
-          if (
-            this.options.mind.snapshot().revision !== current.revision &&
-            !this.#revisionRetryUsed
-          ) {
-            this.#revisionRetryUsed = true;
-            immediateRevisionRetry = true;
-          }
-        }
-      } catch (error) {
-        if (
-          !controller.signal.aborted &&
-          !this.#lifetime.signal.aborted &&
-          !this.options.mind.snapshot().stopped
-        ) {
-          this.#logFailure("PLAYER_PURPOSE_THOUGHT_FAILED", error);
-          retry = true;
-        }
-      }
-    })
-      .catch((error: unknown) => {
-        this.#logFailure("PLAYER_THOUGHT_TRACE_FAILED", error);
-        retry =
-          !controller.signal.aborted && !this.options.mind.snapshot().stopped;
-      })
-      .finally(() =>
-        this.#finishThought(controller, retry, immediateRevisionRetry),
-      );
-  }
-
-  #queueThoughtWake(
-    kind: PlayerWakeKind,
-    reason: string,
-    damageAware = false,
-    deathAware = false,
-  ): void {
-    const pending = this.#pendingThoughtWake;
-    const priority = (wake: PlayerWakeKind): number =>
-      wake === "owner_proposal"
-        ? 5
-        : wake === "body_outcome"
-          ? 4
-          : isUrgentPerceptionWake(wake)
-            ? 3
-            : wake === "operation_stalled"
-              ? 2
-              : 1;
-    const mergedAwareness = {
-      damageAware: damageAware || pending?.damageAware === true,
-      deathAware: deathAware || pending?.deathAware === true,
-    };
-    if (pending !== undefined && priority(pending.kind) > priority(kind)) {
-      this.#pendingThoughtWake = { ...pending, ...mergedAwareness };
-      return;
-    }
-    this.#pendingThoughtWake = {
-      kind,
-      reason,
-      ...mergedAwareness,
-    };
-  }
-
-  #finishThought(
-    controller: AbortController,
-    retry: boolean,
-    immediateRevisionRetry = false,
-  ): void {
-    if (this.#activeThought !== controller) return;
-    this.#clearOwnerProposalSettlement(controller);
-    this.#activeThought = undefined;
-    this.#activeThoughtStartedAtMs = undefined;
-    this.#activeThoughtCommitted = false;
-    this.#activeThoughtDamageAware = false;
-    this.#activeThoughtDamageInvalidated = false;
-    this.#activeThoughtDeathAware = false;
-    this.#activeThoughtDeathInvalidated = false;
-    this.#activeThoughtStallWake = undefined;
-    this.#activeResponsesRequest = false;
-    this.#activeResponsesRequestStartedAtMs = undefined;
-    const reflexWake = this.#persistPendingDamageReflexOutcome();
-    if (reflexWake !== undefined)
-      this.#queueThoughtWake("body_outcome", reflexWake, true, true);
-    if (this.#shuttingDown || this.options.mind.snapshot().stopped) {
-      this.#pendingThoughtWake = undefined;
-      return;
-    }
-    if (
-      this.#pendingThoughtWake?.kind === "body_outcome" ||
-      this.#pendingThoughtWake?.kind === "owner_proposal"
-    ) {
-      this.#dispatchPendingThought();
-      return;
-    }
-    if (retry) {
-      this.#retryThought(immediateRevisionRetry);
-      return;
-    }
-    this.#dispatchPendingThought();
-  }
-
-  #dispatchPendingThought(): void {
-    const pending = this.#pendingThoughtWake;
-    if (pending === undefined) return;
-    this.#pendingThoughtWake = undefined;
-    // The event already passed its wait/deadline gate when queued. A newer
-    // thought may have committed a different wait since then; honor this
-    // accepted wake once against the latest snapshot without widening gates.
-    this.#requestThought(
-      pending.kind,
-      pending.reason,
-      true,
-      pending.damageAware,
-      pending.deathAware,
-    );
-  }
-
-  #queueDamageReflexOutcome(event: DamageReflexCompletedEvent): void {
-    const pending = this.#pendingDamageReflexOutcome;
-    const confirmed =
-      event.status === "successful" &&
-      event.sameLife === true &&
-      event.serverConfirmedAt !== null
-        ? event
-        : pending?.confirmed;
-    this.#pendingDamageReflexOutcome = {
-      latest: event,
-      ...(confirmed === undefined ? {} : { confirmed }),
-      count: (pending?.count ?? 0) + 1,
-    };
-    if (this.#activeThought !== undefined) return;
-    const summary = this.#persistPendingDamageReflexOutcome();
-    if (summary !== undefined)
-      this.#requestThought("body_outcome", summary, true, true);
-  }
-
-  #persistPendingDamageReflexOutcome(): string | undefined {
-    const pending = this.#pendingDamageReflexOutcome;
-    if (pending === undefined) return undefined;
-    const results = [pending.confirmed, pending.latest].filter(
-      (event, index, all): event is DamageReflexCompletedEvent =>
-        event !== undefined && all.indexOf(event) === index,
-    );
-    const summary = `damage-reflex events=${pending.count}; ${results
-      .map(damageReflexEvidenceSummary)
-      .join("; ")}`;
-    for (const [index, event] of results.entries()) {
-      const evidenceSummary = `damage-reflex ${damageReflexEvidenceSummary(event)}`;
-      if (event.operationKind !== null) {
-        this.options.mind.recordOutcome({
-          evidence: {
-            operationId: `damage-reflex:${event.startedAt}:${index}`,
-            kind: event.operationKind,
-            status: event.status,
-            summary: evidenceSummary,
-            observedAt: event.at,
-          },
-        });
-      }
-      this.options.memory.recordEpisode({
-        summary: `身体反射の結果: ${evidenceSummary}`,
-        status: event.status,
-        operationKind: event.operationKind ?? "damage_reflex",
+    this.#activeDecision = controller;
+    this.#worldChangedDuringDecision = false;
+    try {
+      const snapshot = this.#store.snapshot();
+      if (this.#isStopped() || !this.#isCurrent(generation)) return;
+      const observation = await this.#body.observe({
+        ownerPositionException: true,
       });
-    }
-    this.options.mind.enqueueEvent("body_outcome", summary, {
-      invalidateDecision: false,
-    });
-    this.#pendingDamageReflexOutcome = undefined;
-    return summary;
-  }
-
-  async #replaceBodyOperation(
-    snapshot: PlayerRuntimeSnapshot,
-    decision: Extract<PlayerThoughtDecision, { kind: "act" }>,
-  ): Promise<void> {
-    const running = this.#activeBody;
-    if (running !== undefined)
-      await this.#settleBody(running, "body_operation_replaced");
-    const latest = this.options.mind.snapshot();
-    const guardReason = this.#bodyOperationGuardReason(
-      latest,
-      snapshot.actionRevision,
-      decision.operationId,
-    );
-    if (guardReason !== undefined) {
-      this.#recordBodyOperationGuardRejection(
-        decision,
-        snapshot.actionRevision,
-        guardReason,
-      );
-      return;
-    }
-    if (this.#bodyNeedsRecovery || !this.#bodyConnected) {
-      this.#recordBodyOperationGuardRejection(
-        decision,
-        snapshot.actionRevision,
-        this.#bodyNeedsRecovery
-          ? "body_recovery_required"
-          : "body_disconnected",
-      );
-      this.options.mind.deferOperationUntilReconnect(decision.operationId);
-      return;
-    }
-    const controller = new AbortController();
-    const run: ActiveBodyRun = {
-      operationId: decision.operationId,
-      actionRevision: snapshot.actionRevision,
-      operation: decision.operation,
-      ...(decision.skillId === undefined ? {} : { skillId: decision.skillId }),
-      ...(decision.skillVersion === undefined
-        ? {}
-        : { skillVersion: decision.skillVersion }),
-      controller,
-      promise: Promise.resolve(),
-    };
-    this.#recordBodyOperationPhase({
-      runtimeOperationId: run.operationId,
-      actionRevision: run.actionRevision,
-      operation: run.operation.kind,
-      phase: "execute_requested",
-      at: new Date().toISOString(),
-      admissionObserved: false,
-      progressVersion: 0,
-      controlEnabledCount: enabledControlCount(run.operation),
-    });
-    this.#activeBody = run;
-    this.#operationPositionSample =
-      isTravelOperation(run.operation) &&
-      this.#lastObservedPosition !== undefined
-        ? {
-            runtimeOperationId: run.operationId,
-            position: this.#lastObservedPosition,
-          }
-        : undefined;
-    run.promise = this.#executeBody(
-      run,
-      decision.operation,
-      decision.expectedOutcome,
-    );
-    await run.promise;
-  }
-
-  #bodyOperationGuardReason(
-    latest: PlayerRuntimeSnapshot,
-    expectedActionRevision: number,
-    operationId: string,
-  ):
-    | Exclude<
-        RuntimeBodyOperationPhase["reason"],
-        null | "execution_returned_without_admission"
-      >
-    | undefined {
-    if (this.#shuttingDown) return "runtime_shutting_down";
-    if (latest.stopped) return "owner_stopped";
-    if (latest.actionRevision !== expectedActionRevision)
-      return "action_revision_changed";
-    if (latest.activeOperation?.operationId !== operationId)
-      return "operation_replaced";
-    return undefined;
-  }
-
-  #recordBodyOperationGuardRejection(
-    decision: Extract<PlayerThoughtDecision, { kind: "act" }>,
-    actionRevision: number,
-    reason: Exclude<
-      RuntimeBodyOperationPhase["reason"],
-      null | "execution_returned_without_admission"
-    >,
-  ): void {
-    this.#recordBodyOperationPhase({
-      runtimeOperationId: decision.operationId,
-      actionRevision,
-      operation: decision.operation.kind,
-      phase: "guard_rejected",
-      at: new Date().toISOString(),
-      admissionObserved: false,
-      progressVersion: 0,
-      reason,
-      firstPathStatus: null,
-      controlEnabledCount: enabledControlCount(decision.operation),
-    });
-  }
-
-  #recordBodyOperationPhase(phase: LatestBodyOperationPhase): void {
-    this.#latestBodyOperationPhase = phase;
-    this.#discardStaleOperationStallWake();
-    this.options.logger.info(
-      {
-        category: "player_runtime",
-        code: "BODY_OPERATION_PHASE",
-        operationId: phase.runtimeOperationId,
-        actionRevision: phase.actionRevision,
-        operation: phase.operation,
-        phase: phase.phase,
-        at: phase.at,
-        admissionObserved: phase.admissionObserved,
-        status: phase.status ?? null,
-        reason: phase.reason ?? null,
-        firstPathStatus: phase.firstPathStatus ?? null,
-        controlEnabledCount: phase.controlEnabledCount,
-      },
-      "player body operation phase",
-    );
-  }
-
-  #advanceBodyOperationPhase(
-    run: ActiveBodyRun,
-    update: Pick<LatestBodyOperationPhase, "phase" | "at"> &
-      Partial<
-        Pick<
-          LatestBodyOperationPhase,
-          | "bodyOperationId"
-          | "admissionObserved"
-          | "progressVersion"
-          | "status"
-          | "reason"
-          | "firstPathStatus"
-        >
-      >,
-  ): void {
-    const latest = this.#latestBodyOperationPhase;
-    if (
-      latest?.runtimeOperationId !== run.operationId ||
-      latest.actionRevision !== run.actionRevision
-    )
-      return;
-    this.#recordBodyOperationPhase({ ...latest, ...update });
-  }
-
-  #isOperationStallWakeCurrent(wake: OperationStallWake | undefined): boolean {
-    if (wake === undefined) return false;
-    const active = this.#activeBody;
-    const latest = this.#latestBodyOperationPhase;
-    return (
-      !this.options.mind.snapshot().stopped &&
-      active !== undefined &&
-      !active.controller.signal.aborted &&
-      active.operationId === wake.runtimeOperationId &&
-      latest?.runtimeOperationId === wake.runtimeOperationId &&
-      latest.actionRevision === active.actionRevision &&
-      latest.bodyOperationId === wake.bodyOperationId &&
-      latest.progressVersion === wake.progressVersion &&
-      latest.phase !== "result" &&
-      latest.phase !== "guard_rejected"
-    );
-  }
-
-  #discardStaleOperationStallWake(): void {
-    const wake = this.#operationStallWake;
-    if (wake === undefined || this.#isOperationStallWakeCurrent(wake)) return;
-    this.options.mind.consumeEvents([wake.eventId]);
-    if (this.#operationStallWake?.eventId === wake.eventId)
-      this.#operationStallWake = undefined;
-    const pending = this.#pendingThoughtWake;
-    if (pending?.kind === "operation_stalled")
-      this.#pendingThoughtWake = undefined;
-  }
-
-  #recordObservedTravelProgress(observation: PlayerBodyObservation): void {
-    const currentPosition = observation.self.position;
-    const previousPosition = this.#lastObservedPosition;
-    this.#lastObservedPosition = currentPosition;
-    const active = this.#activeBody;
-    if (active === undefined || !isTravelOperation(active.operation)) {
-      this.#operationPositionSample = undefined;
-      return;
-    }
-
-    const sample =
-      this.#operationPositionSample?.runtimeOperationId === active.operationId
-        ? this.#operationPositionSample
-        : {
-            runtimeOperationId: active.operationId,
-            position: previousPosition ?? currentPosition,
-          };
-    if (!travelProgressed(sample.position, currentPosition)) {
-      this.#operationPositionSample = sample;
-      return;
-    }
-
-    this.#operationPositionSample = {
-      runtimeOperationId: active.operationId,
-      position: currentPosition,
-    };
-    const latest = this.#latestBodyOperationPhase;
-    if (latest?.runtimeOperationId !== active.operationId) return;
-    this.#latestBodyOperationPhase = {
-      ...latest,
-      progressVersion: latest.progressVersion + 1,
-    };
-    this.#discardStaleOperationStallWake();
-    if (
-      this.#activeThoughtStallWake?.runtimeOperationId === active.operationId &&
-      !this.#activeThoughtCommitted
-    )
-      this.#activeThought?.abort(new Error("operation_stall_progressed"));
-  }
-
-  async #executeBody(
-    run: ActiveBodyRun,
-    operation: Parameters<PlayerBody["execute"]>[0],
-    expectedOutcome: string,
-  ): Promise<void> {
-    const reportOwnerConsume = this.#ownerConsumeOperations.delete(
-      run.operationId,
-    );
-    const reportEquip = operation.kind === "equip" ? operation : undefined;
-    let result: PlayerOperationResult | undefined;
-    try {
-      result = await this.options.body.execute(
-        operation,
-        run.controller.signal,
-      );
-    } catch (error) {
-      this.#logFailure("PLAYER_BODY_OPERATION_FAILED", error);
-    }
-    if (result?.recoveryRequired)
-      this.#requestBodyRecovery(result.operationId, operation.kind);
-    const outcome: McSkillOutcomeStatus =
-      result?.status ??
-      (run.controller.signal.aborted ? "interrupted" : "unverified");
-    const summary =
-      result === undefined
-        ? run.controller.signal.aborted
-          ? "操作を中断し、実行終了を確認"
-          : "操作toolが結果を返さず、ゲーム内結果は未検証"
-        : groundedOperationSummary(result, expectedOutcome);
-    const observedAt = result?.completedAt ?? new Date().toISOString();
-    const movementDelta =
-      result === undefined ? undefined : observedMovementDelta(result);
-    if (result?.after != null)
-      this.options.mind.recordObservation(toObservationEvidence(result.after));
-    const evidenceInput = {
-      runId: run.operationId,
-      operationName: operation.kind,
-      inputSummary: `operation=${operation.kind}`,
-      conditions: trustedConditions(result?.before ?? null),
-      expectedOutcome: expectedOutcome.trim() || "目的に沿うゲーム内変化を観測",
-      observedOutcome: outcome,
-      observationSummary: summary,
-      observedAt,
-      ...(run.skillId === undefined ? {} : { skillIdAtUse: run.skillId }),
-      ...(run.skillVersion === undefined
-        ? {}
-        : { skillVersionAtUse: run.skillVersion }),
-    };
-    let skillId = run.skillId;
-    let skillVersion = run.skillVersion;
-    try {
-      const receipt = this.options.skills.recordTrustedEvidence(evidenceInput);
-      skillId = receipt.skillIdAtUse;
-      skillVersion = receipt.skillVersionAtUse;
-      if (skillId !== undefined) {
-        this.options.skills.recordOutcome({
-          skillId,
-          runId: run.operationId,
-          proposedOutcome: outcome,
-          summary,
-        });
-      }
-    } catch (error) {
-      this.#logFailure("PLAYER_SKILL_EVIDENCE_FAILED", error);
-    }
-    this.options.memory.recordEpisode({
-      summary: `${operation.kind} の観測結果: ${outcome}`,
-      status: outcome,
-      operationKind: operation.kind,
-    });
-    const recoveryRequired = result?.recoveryRequired === true;
-    const saved = this.options.mind.recordOutcome({
-      evidence: {
-        operationId: run.operationId,
-        kind: operation.kind,
-        status: outcome,
-        summary,
-        observedAt,
-        ...(movementDelta === undefined ? {} : { movementDelta }),
-        ...(result?.lookSweep === undefined
+      if (!this.#isCurrent(generation)) return;
+      const query =
+        wake.ownerMessage ??
+        snapshot.goal?.title ??
+        snapshot.interests[0] ??
+        "Minecraftで共有した経験と現在の状況";
+      const memories = this.#store.recall(query, this.#memoryContextLimit);
+      const messages = this.#store.recentMessages(12);
+      const input = {
+        snapshot,
+        observation,
+        wakeReason: wake.reason,
+        messages,
+        memories,
+        ...(wake.ownerMessage === undefined
           ? {}
-          : { lookSweep: result.lookSweep }),
-        expectedOutcome,
-        ...(skillId === undefined ? {} : { skillId }),
-        ...(skillVersion === undefined ? {} : { skillVersion }),
-      },
-      recoveryRequired,
-    });
-    this.#advanceBodyOperationPhase(run, {
-      phase: "result",
-      at: observedAt,
-      status: outcome,
-      reason:
-        this.#latestBodyOperationPhase?.runtimeOperationId ===
-          run.operationId && !this.#latestBodyOperationPhase.admissionObserved
-          ? "execution_returned_without_admission"
-          : null,
-    });
-    if (this.#activeBody === run) this.#activeBody = undefined;
-    if (reportOwnerConsume && !saved.stopped && !this.#shuttingDown)
-      await this.#sayWhileActive(ownerConsumeOutcomeMessage(result, outcome));
-    if (
-      reportEquip !== undefined &&
-      !saved.stopped &&
-      !this.#shuttingDown &&
-      this.#shouldReportEquipmentOutcome(reportEquip, result, outcome)
-    )
-      await this.#sayWhileActive(
-        equipmentOutcomeMessage(reportEquip, result, outcome),
-      );
-    if (
-      !recoveryRequired &&
-      !saved.stopped &&
-      saved.activeOperation === undefined &&
-      saved.lastOutcome?.operationId === run.operationId
-    ) {
-      // recordOutcome has already inserted the body_outcome event and revision.
-      this.#requestThought("body_outcome", summary);
-    } else if (recoveryRequired && this.#bodyConnected && !saved.stopped) {
-      // A very fast reconnect may precede the bounded execute result; wake after its durable wait is recorded.
-      const event = this.options.mind.enqueueEvent(
-        "reconnected",
-        "Minecraftの新しい接続で中断操作の復旧を確認",
-      );
-      this.#requestThought(event.kind, event.summary);
-    }
-  }
+          : { ownerMessage: wake.ownerMessage }),
+        ...(this.#cachedKnowledge === undefined
+          ? {}
+          : { knowledge: this.#cachedKnowledge }),
+      };
 
-  #shouldReportEquipmentOutcome(
-    operation: Extract<PlayerOperation, { kind: "equip" }>,
-    result: PlayerOperationResult | undefined,
-    outcome: McSkillOutcomeStatus,
-  ): boolean {
-    const resultMatches =
-      result?.operation.kind === "equip" &&
-      result.operation.item === operation.item &&
-      result.operation.destination === operation.destination;
-    const before = equipmentSlotObservation(
-      resultMatches ? result.before : null,
-      operation.destination,
-    );
-    const after = equipmentSlotObservation(
-      resultMatches ? result.after : null,
-      operation.destination,
-    );
-    const equipmentChanged =
-      before.state !== "unobserved" &&
-      after.state !== "unobserved" &&
-      JSON.stringify(before) !== JSON.stringify(after);
-    const successful =
-      outcome === "successful" &&
-      after.state === "item" &&
-      after.itemName === operation.item;
-    const signature = JSON.stringify({
-      item: operation.item,
-      destination: operation.destination,
-      outcome,
-      detail:
-        result?.detail === undefined ? null : sanitizeDetail(result.detail),
-      failureReason: result?.failureReason ?? null,
-      sameLife: result?.sameLife ?? null,
-      recoveryRequired: result?.recoveryRequired ?? false,
-      before,
-      after,
-    });
-    const state = this.#equipmentOutcomeNotifications.get(
-      operation.destination,
-    ) ?? {
-      failedSignatures: new Set<string>(),
-      lastSuccessfulSignature: undefined,
-    };
-
-    if (equipmentChanged) {
-      state.failedSignatures.clear();
-      state.lastSuccessfulSignature = undefined;
-    }
-    if (successful) {
-      if (state.lastSuccessfulSignature === signature) return false;
-      state.failedSignatures.clear();
-      state.lastSuccessfulSignature = signature;
-      this.#equipmentOutcomeNotifications.set(operation.destination, state);
-      return true;
-    }
-
-    state.lastSuccessfulSignature = undefined;
-    if (state.failedSignatures.has(signature)) return false;
-    state.failedSignatures.add(signature);
-    while (state.failedSignatures.size > 12) {
-      const oldest = state.failedSignatures.values().next().value;
-      if (oldest === undefined) break;
-      state.failedSignatures.delete(oldest);
-    }
-    this.#equipmentOutcomeNotifications.set(operation.destination, state);
-    return true;
-  }
-
-  async #stopBody(reason: string): Promise<void> {
-    this.#setDamageReflexEnabled(false);
-    const running = this.#activeBody;
-    if (running !== undefined) await this.#settleBody(running, reason);
-    try {
-      await this.options.body.stop();
-    } catch (error) {
-      this.#logFailure("PLAYER_BODY_STOP_FAILED", error);
-    }
-  }
-
-  async #stopPrimaryOperation(reason: string): Promise<void> {
-    const running = this.#activeBody;
-    if (running !== undefined) await this.#settleBody(running, reason);
-  }
-
-  async #settleBody(run: ActiveBodyRun, reason: string): Promise<void> {
-    run.controller.abort(new Error(reason));
-    try {
-      if (this.options.body.stopActiveOperation !== undefined)
-        await this.options.body.stopActiveOperation();
-      else await this.options.body.stop();
-    } catch (error) {
-      this.#logFailure("PLAYER_BODY_CANCEL_FAILED", error);
-    }
-    try {
-      await run.promise;
-    } catch {
-      /* Operation result persistence is handled inside the body owner. */
-    }
-    if (this.#activeBody === run) this.#activeBody = undefined;
-  }
-
-  #setDamageReflexEnabled(enabled: boolean): void {
-    try {
-      this.options.body.setDamageReflexEnabled?.(enabled);
-    } catch (error) {
-      this.#logFailure(
-        enabled
-          ? "PLAYER_DAMAGE_REFLEX_ENABLE_FAILED"
-          : "PLAYER_DAMAGE_REFLEX_DISABLE_FAILED",
-        error,
-      );
-    }
-  }
-
-  #abortActiveBody(reason: string): void {
-    const active = this.#activeBody;
-    if (active !== undefined) active.controller.abort(new Error(reason));
-  }
-
-  #requestBodyRecovery(operationId: string, operation: string): void {
-    if (this.#recoveryRequestedOperationIds.has(operationId)) return;
-    this.#recoveryRequestedOperationIds.add(operationId);
-    if (this.#recoveryRequestedOperationIds.size > 16) {
-      const oldest = this.#recoveryRequestedOperationIds.values().next().value;
-      if (oldest !== undefined)
-        this.#recoveryRequestedOperationIds.delete(oldest);
-    }
-    this.#bodyNeedsRecovery = true;
-    if (this.options.requestReconnect === undefined) return;
-    try {
-      void Promise.resolve(
-        this.options.requestReconnect("player-operation-recovery"),
-      ).catch((error: unknown) =>
-        this.#logFailure("PLAYER_RECONNECT_REQUEST_FAILED", error),
-      );
-    } catch (error) {
-      this.#logFailure("PLAYER_RECONNECT_REQUEST_FAILED", error);
-    }
-    this.options.logger.info(
-      {
-        category: "player_runtime",
-        code: "BODY_RECONNECT_REQUESTED",
-        operation,
-      },
-      "requesting recovery through the connection manager",
-    );
-  }
-
-  #cancelThought(reason: string): void {
-    const thought = this.#activeThought;
-    this.#clearOwnerProposalSettlement(thought);
-    this.#activeResponsesRequest = false;
-    this.#activeResponsesRequestStartedAtMs = undefined;
-    this.#pendingThoughtWake = undefined;
-    this.#activeThoughtStallWake = undefined;
-    this.#activeThoughtCommitted = false;
-    this.#activeThoughtDamageAware = false;
-    this.#activeThoughtDamageInvalidated = false;
-    thought?.abort(new Error(reason));
-  }
-
-  #boundOwnerProposalSettlement(controller: AbortController): void {
-    if (
-      controller.signal.aborted ||
-      this.#ownerProposalSettlementTimer !== undefined
-    )
-      return;
-    this.#ownerProposalSettlementThought = controller;
-    this.#ownerProposalSettlementTimer = setTimeout(() => {
-      this.#ownerProposalSettlementTimer = undefined;
-      this.#ownerProposalSettlementThought = undefined;
-      if (
-        this.#activeThought === controller &&
-        this.#pendingThoughtWake?.kind === "owner_proposal" &&
-        !controller.signal.aborted
-      )
-        controller.abort(new Error("owner_proposal_settlement_timeout"));
-    }, ownerProposalSettlementTimeoutMs);
-    this.#ownerProposalSettlementTimer.unref();
-  }
-
-  #clearOwnerProposalSettlement(controller?: AbortController): void {
-    if (
-      controller !== undefined &&
-      this.#ownerProposalSettlementThought !== controller
-    )
-      return;
-    if (this.#ownerProposalSettlementTimer !== undefined)
-      clearTimeout(this.#ownerProposalSettlementTimer);
-    this.#ownerProposalSettlementTimer = undefined;
-    this.#ownerProposalSettlementThought = undefined;
-  }
-
-  async #sampleSemanticState(): Promise<void> {
-    if (
-      this.options.mind.snapshot().stopped ||
-      this.#shuttingDown ||
-      !this.#bodyConnected
-    )
-      return;
-    if (this.#samplePromise !== undefined) return this.#samplePromise;
-    const sampling = (async () => {
-      try {
-        const observation = await this.options.body.observe();
-        if (this.options.mind.snapshot().stopped || this.#shuttingDown) return;
-        this.#recordObservedTravelProgress(observation);
-        this.options.mind.recordObservation(toObservationEvidence(observation));
-        const next = semanticSignatures(observation);
-        const changed: string[] = [];
-        for (const [kind, signature] of Object.entries(next)) {
-          const previous = this.#semanticSignatures.get(kind);
-          this.#semanticSignatures.set(kind, signature);
-          if (previous !== undefined && previous !== signature)
-            changed.push(kind);
-        }
-        if (changed.length > 0) {
-          const active = this.options.mind.snapshot().activeOperation;
-          const meaningful = changed.filter(
-            (kind) => kind !== "position" || active === undefined,
+      let decision = await this.#agent.decide(input, controller.signal);
+      if (!this.#isCurrent(generation)) return;
+      let repeatedKnowledgeRequest = false;
+      if (decision.knowledgeQuery !== null) {
+        if (
+          this.#cachedKnowledge !== undefined &&
+          normalizeKnowledgeQuery(decision.knowledgeQuery) ===
+            normalizeKnowledgeQuery(this.#cachedKnowledge.query)
+        ) {
+          // The prior answer is already in this judgment's input. Do not query
+          // the registry or spend another model call asking the same question.
+          repeatedKnowledgeRequest = true;
+          decision = { ...decision, plan: null, knowledgeQuery: null };
+        } else {
+          const knowledge = this.#body.knowledge(decision.knowledgeQuery);
+          this.#cachedKnowledge = knowledge;
+          if (!this.#isCurrent(generation)) return;
+          decision = await this.#agent.decide(
+            {
+              ...input,
+              wakeReason: `${wake.reason}; registry answer available`,
+              knowledge,
+            },
+            controller.signal,
           );
-          if (meaningful.length > 0) {
-            const criticalVitals = meaningful.includes("vitals");
-            const damageAlreadyReported =
-              criticalVitals &&
-              Date.now() - this.#lastDamageEventAtMs <
-                damageObservationCoalesceMs;
-            if (damageAlreadyReported)
-              this.#pendingSemanticChanges.delete("vitals");
-            for (const kind of meaningful) {
-              if (!(kind === "vitals" && damageAlreadyReported))
-                this.#pendingSemanticChanges.add(kind);
-            }
-          }
-        }
-        this.#scheduleSemanticOpportunity();
-      } catch (error) {
-        // Disconnects and transient observation errors are handled by body/reconnect events.
-        this.#logFailure("PLAYER_OBSERVATION_FAILED", error);
-      }
-    })();
-    this.#samplePromise = sampling;
-    try {
-      await sampling;
-    } finally {
-      if (this.#samplePromise === sampling) this.#samplePromise = undefined;
-    }
-  }
-
-  #startSampler(): void {
-    if (
-      this.#sampleTimer !== undefined ||
-      this.#shuttingDown ||
-      this.options.mind.snapshot().stopped ||
-      !this.#bodyConnected
-    )
-      return;
-    // Native events provide the fast path; this bounded cadence detects missed day/entity/world deltas.
-    this.#sampleTimer = setInterval(() => {
-      void this.#sampleSemanticState();
-    }, 15_000);
-    this.#sampleTimer.unref();
-  }
-
-  #stopSampler(): void {
-    if (this.#sampleTimer !== undefined) clearInterval(this.#sampleTimer);
-    this.#sampleTimer = undefined;
-    if (this.#semanticWakeTimer !== undefined)
-      clearTimeout(this.#semanticWakeTimer);
-    this.#semanticWakeTimer = undefined;
-    if (this.#vitalsWakeTimer !== undefined)
-      clearTimeout(this.#vitalsWakeTimer);
-    this.#vitalsWakeTimer = undefined;
-  }
-
-  #scheduleSemanticOpportunity(): void {
-    if (this.#semanticWakeTimer !== undefined)
-      clearTimeout(this.#semanticWakeTimer);
-    this.#semanticWakeTimer = undefined;
-    if (this.#pendingSemanticChanges.size === 0) return;
-    if (
-      this.#shuttingDown ||
-      !this.#bodyConnected ||
-      this.options.mind.snapshot().stopped
-    )
-      return;
-
-    const now = Date.now();
-    const kinds = [...this.#pendingSemanticChanges].sort();
-    const eligible: string[] = [];
-    let nextDelayMs = Number.POSITIVE_INFINITY;
-    for (const kind of kinds) {
-      const minimumGapMs =
-        kind === "vitals" ? 3_000 : kind === "time" ? 60_000 : 12_000;
-      const previous = this.#eventTimes.get(`semantic-kind:${kind}`) ?? 0;
-      const delayMs = previous + minimumGapMs - now;
-      if (delayMs <= 0) eligible.push(kind);
-      else nextDelayMs = Math.min(nextDelayMs, delayMs);
-    }
-    if (eligible.length > 0) {
-      const at = new Date(now).toISOString();
-      const queued = this.enqueueAndWake(
-        "state_changed",
-        `観測上の意味のある変化: ${eligible.join(", ")}`,
-        at,
-        "semantic-opportunity",
-        0,
-      );
-      if (queued) {
-        const deliveredAt = Date.now();
-        for (const kind of eligible) {
-          this.#pendingSemanticChanges.delete(kind);
-          this.#eventTimes.set(`semantic-kind:${kind}`, deliveredAt);
+          if (!this.#isCurrent(generation)) return;
+          // Only one registry inspection is allowed per wake. A different
+          // follow-up query waits for the next meaningful wake.
+          if (decision.knowledgeQuery !== null)
+            decision = { ...decision, plan: null };
         }
       }
-      if (this.#pendingSemanticChanges.size === 0) return;
-      nextDelayMs = Math.min(
-        nextDelayMs,
-        queued ? Number.POSITIVE_INFINITY : 1,
-      );
-    }
-    this.#semanticWakeTimer = setTimeout(
-      () => {
-        this.#semanticWakeTimer = undefined;
-        this.#scheduleSemanticOpportunity();
-      },
-      Math.max(1, nextDelayMs),
-    );
-    this.#semanticWakeTimer.unref();
-  }
 
-  #scheduleVitalsWake(delayMs: number): void {
-    if (this.#vitalsWakeTimer !== undefined || this.#shuttingDown) return;
-    this.#vitalsWakeTimer = setTimeout(() => {
-      this.#vitalsWakeTimer = undefined;
-      if (this.options.mind.snapshot().stopped || !this.#bodyConnected) return;
-      const event = this.options.mind
-        .pendingEvents(64)
-        .findLast(
-          ({ kind, summary }) =>
-            kind === "state_changed" && summary.includes("vitals"),
-        );
-      if (event !== undefined) this.#requestThought(event.kind, event.summary);
-    }, delayMs);
-    this.#vitalsWakeTimer.unref();
-  }
+      let refreshAfterDecision = false;
+      if (this.#didWorldChangeDuringDecision() && decision.plan !== null) {
+        let freshObservation: PlayerBodyObservation;
+        try {
+          freshObservation = await this.#body.observe({
+            ownerPositionException: true,
+          });
+        } catch {
+          decision = { ...decision, plan: null };
+          refreshAfterDecision = true;
+          freshObservation = observation;
+        }
+        if (
+          !canContinuePlan(
+            observation,
+            freshObservation,
+            decision.plan?.steps[0]?.operation,
+          )
+        ) {
+          decision = { ...decision, plan: null };
+          refreshAfterDecision = true;
+        }
+      }
 
-  #retryThought(immediateRevisionRetry = false): void {
-    if (
-      this.#retryTimer !== undefined ||
-      this.#shuttingDown ||
-      this.options.mind.snapshot().stopped
-    )
-      return;
-    const delay = immediateRevisionRetry ? 0 : this.#retryDelayMs;
-    if (!immediateRevisionRetry)
-      this.#retryDelayMs = Math.min(60_000, Math.round(this.#retryDelayMs * 2));
-    this.#retryTimer = setTimeout(() => {
-      this.#retryTimer = undefined;
-      if (!immediateRevisionRetry) this.#revisionRetryUsed = false;
-      if (this.#pendingThoughtWake !== undefined) {
-        this.#dispatchPendingThought();
+      const currentSnapshot = this.#store.snapshot();
+      if (
+        currentSnapshot.stopped ||
+        this.#runtimeStopLatched ||
+        !this.#isCurrent(generation)
+      )
+        return;
+      this.#failureCount = 0;
+      if (decision.memoryUpdates.length > 0) {
+        this.#store.remember(decision.memoryUpdates, {
+          ...(wake.ownerMessage === undefined
+            ? {}
+            : { ownerMessage: wake.ownerMessage }),
+        });
+      }
+      const waitMs = this.#clampWaitMs(decision.waitMs);
+      const waitUntil = new Date(Date.now() + waitMs).toISOString();
+      const patch: CompanionStatePatch = {
+        goal: decision.goal,
+        plan: decision.knowledgeQuery === null ? decision.plan : null,
+        waitUntil,
+        activeOperation: null,
+        ...(decision.relationshipSummary === null
+          ? {}
+          : { relationshipSummary: decision.relationshipSummary }),
+      };
+      this.#store.save(patch);
+      if (!this.#isCurrent(generation) || this.#isStopped()) return;
+
+      // The model request is complete; later world events are handled after
+      // the Body result rather than invalidating an already validated action.
+      if (this.#activeDecision === controller) this.#activeDecision = undefined;
+      if (
+        wake.ownerMessage !== undefined &&
+        decision.speech !== null &&
+        decision.speech.length > 0
+      )
+        await this.#speakDecision(decision.speech, generation);
+      if (!this.#isCurrent(generation) || this.#isStopped()) return;
+
+      if (refreshAfterDecision) {
+        this.#setWakeTimer(worldChangeCoalesceMs, {
+          reason: "world changed during judgment; re-observe before acting",
+        });
         return;
       }
-      const event = this.options.mind.enqueueEvent(
-        "manual",
-        "自律判断の一時失敗をbackoff後に再試行",
-      );
-      this.#requestThought(event.kind, event.summary);
-    }, delay);
-    this.#retryTimer.unref();
+      if (repeatedKnowledgeRequest) {
+        this.#setWakeTimer(waitMs, {
+          reason:
+            "registry answer was already available; wait for a meaningful wake",
+        });
+        return;
+      }
+      if (decision.knowledgeQuery !== null) {
+        this.#setWakeTimer(waitMs, {
+          reason:
+            "registry knowledge request was repeated; wait for a new wake",
+          ...(wake.ownerMessage === undefined
+            ? {}
+            : { ownerMessage: wake.ownerMessage }),
+        });
+        return;
+      }
+      if (decision.plan === null) {
+        this.#setWakeTimer(waitMs, {
+          reason: "model-selected companion wait ended",
+        });
+        return;
+      }
+      await this.#executePlan(decision, generation);
+    } catch (error) {
+      if (!controller.signal.aborted && this.#isCurrent(generation)) {
+        this.#logError(error, "Companion judgment failed");
+        this.#scheduleRetry(wake);
+      }
+    } finally {
+      if (this.#activeDecision === controller) this.#activeDecision = undefined;
+    }
   }
 
-  #scheduleDeadline(wakeAt: string | undefined): void {
-    if (this.#deadlineTimer !== undefined) clearTimeout(this.#deadlineTimer);
-    this.#deadlineTimer = undefined;
+  async #followOwner(generation: number): Promise<void> {
+    const operation = playerOperationSchema.parse({ kind: "follow_owner" });
+    const operationId = randomUUID();
+    const expectedOutcome =
+      "The configured owner remains nearby until following is interrupted.";
+    const activeOperation = {
+      operationId,
+      operation,
+      expectedOutcome,
+    } as const;
+
+    try {
+      this.#store.save({
+        goal: {
+          title: "オーナーに追従する",
+          successCondition: "オーナーの近くを保つ。",
+          source: "owner",
+        },
+        plan: {
+          purpose: "明示された指示に従ってオーナーの近くまで移動する。",
+          steps: [{ operation, expectedOutcome }],
+        },
+        waitUntil: null,
+        activeOperation,
+      });
+    } catch (error) {
+      this.#ownerFollowRequested = false;
+      if (!this.#isStopped())
+        this.#logError(error, "Owner-follow state could not be saved");
+      return;
+    }
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
+
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() =>
+      this.#body.execute(operation, controller.signal),
+    );
+    const run: ActiveBodyRun = {
+      operationId,
+      operation,
+      startedAt: new Date().toISOString(),
+      controller,
+      promise,
+    };
+    this.#activeBody = run;
+
+    let result: PlayerOperationResult;
+    try {
+      result = await promise;
+    } catch {
+      result = failedBodyResult(operation, operationId);
+    } finally {
+      if (this.#activeBody === run) this.#activeBody = undefined;
+    }
+
+    let updated: CompanionSnapshot;
+    try {
+      updated = this.#store.recordOutcome(
+        outcomeFromResult(result, operation, operationId, expectedOutcome),
+      );
+    } catch (error) {
+      if (this.#isCurrent(generation)) this.#ownerFollowRequested = false;
+      this.#logError(error, "Body outcome could not be persisted");
+      return;
+    }
+    if (this.#isCurrent(generation)) this.#ownerFollowRequested = false;
     if (
-      wakeAt === undefined ||
-      this.#shuttingDown ||
-      this.options.mind.snapshot().stopped
+      !this.#isCurrent(generation) ||
+      updated.stopped ||
+      this.#runtimeStopLatched
     )
       return;
-    const deadline = Date.parse(wakeAt);
-    if (!Number.isFinite(deadline)) return;
-    const delay = Math.max(0, Math.min(2_147_000_000, deadline - Date.now()));
-    this.#deadlineTimer = setTimeout(() => {
-      this.#deadlineTimer = undefined;
-      const current = this.options.mind.snapshot();
-      if (current.wait?.wakeAt !== wakeAt || current.stopped) return;
-      const event = this.options.mind.enqueueEvent(
-        "deadline",
-        "目的判断で指定した待機期限に到達",
-      );
-      this.#requestThought(event.kind, event.summary);
-    }, delay);
-    this.#deadlineTimer.unref();
+    this.#store.save({ goal: null });
   }
 
-  async #traceCall<T>(label: string, operation: () => Promise<T>): Promise<T> {
-    const trace = this.options.trace;
-    if (trace === undefined) return operation();
-    let session: TraceSession | undefined;
-    try {
-      session = await trace.startTrace(label, {
-        attributes: { lane: "player_runtime" },
-      });
-      const result = await trace.withTrace(session, () =>
-        trace.withSpan(
-          "deliberation",
-          label,
-          { summary: label, sensitivity: "sensitive" },
-          operation,
-        ),
-      );
-      await session.complete("succeeded", { summary: label });
-      return result;
-    } catch (error) {
+  async #executePlan(
+    decision: CompanionDecision,
+    generation: number,
+  ): Promise<void> {
+    const plannedSteps = decision.plan?.steps ?? [];
+    for (const plannedStep of plannedSteps) {
+      if (!this.#isCurrent(generation) || this.#isStopped()) return;
+      const snapshot = this.#store.snapshot();
+      const step = snapshot.plan?.steps[0];
+      if (
+        step === undefined ||
+        !sameOperation(step.operation, plannedStep.operation) ||
+        step.expectedOutcome !== plannedStep.expectedOutcome
+      ) {
+        this.#requestReplan(
+          "persisted plan no longer matches next action",
+          generation,
+        );
+        return;
+      }
+      const operation = playerOperationSchema.parse(step.operation);
+      if (operation.kind === "follow_owner") {
+        this.#requestReplan(
+          "Agent cannot issue the internal owner-follow operation",
+          generation,
+        );
+        return;
+      }
+      const operationId = randomUUID();
+      const activeOperation = {
+        operationId,
+        operation,
+        expectedOutcome: step.expectedOutcome,
+      } as const;
+      this.#store.save({ activeOperation });
+      const controller = new AbortController();
+      const run: ActiveBodyRun = {
+        operationId,
+        operation,
+        startedAt: new Date().toISOString(),
+        controller,
+        promise: this.#body.execute(operation, controller.signal),
+      };
+      this.#activeBody = run;
+      let result: PlayerOperationResult;
       try {
-        await session?.complete("failed", { summary: `${label} failed` });
+        result = await run.promise;
       } catch {
-        /* tracing is best effort */
+        result = failedBodyResult(operation, operationId);
+      } finally {
+        if (this.#activeBody === run) this.#activeBody = undefined;
       }
-      throw error;
-    }
-  }
-
-  async #safeSay(message: string): Promise<void> {
-    try {
-      await this.options.say(message.slice(0, 240));
-    } catch (error) {
-      this.#logFailure("PLAYER_CHAT_DELIVERY_FAILED", error);
-    }
-  }
-
-  #recordRecoveryEvidence(input: {
-    operationId: string;
-    kind: string;
-    expectedOutcome?: string;
-    skillId?: string;
-    skillVersion?: number;
-  }): void {
-    try {
-      const receipt =
-        this.options.skills.getEvidence(input.operationId) ??
-        this.options.skills.recordTrustedEvidence({
-          runId: input.operationId,
-          operationName: input.kind,
-          inputSummary: `operation=${input.kind}`,
-          conditions: [],
-          expectedOutcome: input.expectedOutcome ?? "再起動後に操作結果を確認",
-          observedOutcome: "unverified",
-          observationSummary: "再起動後に実行継続を確認できず、未検証",
-          ...(input.skillId === undefined
-            ? {}
-            : { skillIdAtUse: input.skillId }),
-          ...(input.skillVersion === undefined
-            ? {}
-            : { skillVersionAtUse: input.skillVersion }),
-        });
-      if (receipt.skillIdAtUse !== undefined) {
-        this.options.skills.recordOutcome({
-          skillId: receipt.skillIdAtUse,
-          runId: input.operationId,
-          proposedOutcome: receipt.observedOutcome,
-          summary: receipt.observationSummary,
-        });
+      const outcome = outcomeFromResult(
+        result,
+        step.operation,
+        operationId,
+        step.expectedOutcome,
+      );
+      let updated: CompanionSnapshot;
+      try {
+        updated = this.#store.recordOutcome(outcome);
+      } catch (error) {
+        this.#logError(error, "Body outcome could not be persisted");
+        this.#scheduleRetry({ reason: "Body outcome persistence failed" });
+        return;
       }
-    } catch (error) {
-      this.#logFailure("PLAYER_RECOVERY_EVIDENCE_FAILED", error);
+      if (
+        !this.#isCurrent(generation) ||
+        updated.stopped ||
+        this.#runtimeStopLatched
+      )
+        return;
+      if (updated.activeOperation !== null) {
+        this.#scheduleRetry({
+          reason: "Body outcome did not match the persisted active operation",
+        });
+        return;
+      }
+      if (result.status !== "successful") {
+        this.#scheduleRetry({ reason: "Body outcome was not confirmed" });
+        return;
+      }
+
+      let freshObservation: PlayerBodyObservation;
+      try {
+        freshObservation = await this.#body.observe({
+          ownerPositionException: true,
+        });
+      } catch (error) {
+        this.#logError(error, "Fresh Body observation failed");
+        this.#scheduleRetry({
+          reason: "fresh observation after Body action failed",
+        });
+        return;
+      }
+      if (!this.#isCurrent(generation) || this.#isStopped()) return;
+      if (
+        result.after === null ||
+        result.sameLife !== true ||
+        !canContinuePlan(
+          result.after,
+          freshObservation,
+          updated.plan?.steps[0]?.operation,
+        )
+      ) {
+        this.#store.save({ plan: null });
+        this.#scheduleRetry({
+          reason: "Body result or next-step prerequisites changed",
+        });
+        return;
+      }
+      const next = updated.plan?.steps[0];
+      if (next === undefined) {
+        this.#setWakeTimer(this.#waitFromSnapshot(updated), {
+          reason: "current companion plan completed with observed outcomes",
+        });
+        return;
+      }
     }
   }
 
-  #logFailure(code: string, error: unknown): void {
-    this.options.logger.warn(
+  #onBodyEvent(event: PlayerBodyEvent): void {
+    if (this.#disposed || !this.#started) return;
+    if (
+      event.type === "bot_damaged" ||
+      event.type === "bot_death" ||
+      event.type === "bot_death_cause_updated"
+    ) {
+      this.#fireWake({ reason: `urgent Body event: ${event.type}` });
+      return;
+    }
+    if (event.type === "disconnected") {
+      if (this.#activeBody?.operation.kind === "follow_owner") {
+        this.#ownerFollowRequested = false;
+        this.#activeBody.controller.abort(
+          new Error("Minecraft disconnected during owner follow"),
+        );
+        return;
+      }
+      this.#fireWake({ reason: "Body disconnected; recheck after reconnect" });
+      return;
+    }
+    if (event.type === "reconnected") {
+      this.#fireWake({ reason: "Body reconnected; observe before acting" });
+      return;
+    }
+    if (
+      event.type !== "state_changed" ||
+      event.reason === "time" ||
+      this.#activeBody !== undefined ||
+      this.#worldChangeTimer !== undefined
+    )
+      return;
+    if (this.#activeDecision !== undefined) {
+      this.#worldChangedDuringDecision = true;
+      return;
+    }
+    this.#worldChangeTimer = setTimeout(() => {
+      this.#worldChangeTimer = undefined;
+      this.#fireWake({ reason: `world changed: ${event.reason}` });
+    }, worldChangeCoalesceMs);
+    this.#worldChangeTimer.unref();
+  }
+
+  #requestReplan(reason: string, generation: number): void {
+    if (!this.#isCurrent(generation)) return;
+    this.#store.save({ plan: null });
+    this.#scheduleRetry({ reason });
+  }
+
+  #scheduleRetry(wake: PendingWake): void {
+    this.#failureCount += 1;
+    const delay = Math.min(
+      maximumRetryMs,
+      defaultRetryMs * 2 ** Math.min(this.#failureCount - 1, 6),
+    );
+    this.#setWakeTimer(delay, wake);
+  }
+
+  #setWakeTimer(delayMs: number, wake: PendingWake): void {
+    if (this.#disposed || this.#isStopped()) return;
+    if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
+    const delay = Math.max(this.#minWaitMs, Math.min(maximumWaitMs, delayMs));
+    this.#wakeAt = new Date(Date.now() + delay).toISOString();
+    this.#wakeReason = wake.reason;
+    this.#waitTimer = setTimeout(() => {
+      this.#waitTimer = undefined;
+      this.#wakeAt = null;
+      this.#wakeReason = null;
+      this.#fireWake(wake);
+    }, delay);
+    this.#waitTimer.unref();
+  }
+
+  #waitFromSnapshot(snapshot: CompanionSnapshot): number {
+    if (snapshot.waitUntil === null) return this.#minWaitMs;
+    const remaining = Date.parse(snapshot.waitUntil) - Date.now();
+    return Number.isFinite(remaining)
+      ? Math.max(this.#minWaitMs, remaining)
+      : this.#minWaitMs;
+  }
+
+  #didWorldChangeDuringDecision(): boolean {
+    return this.#worldChangedDuringDecision;
+  }
+
+  #clampWaitMs(waitMs: number): number {
+    return Math.max(
+      this.#minWaitMs,
+      Math.min(maximumWaitMs, Math.trunc(waitMs)),
+    );
+  }
+
+  #isCurrent(generation: number): boolean {
+    return !this.#disposed && generation === this.#generation;
+  }
+
+  #isStopped(): boolean {
+    return this.#runtimeStopLatched || this.#store.snapshot().stopped;
+  }
+
+  async #speakDecision(text: string, generation: number): Promise<void> {
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
+    try {
+      await this.#say(text);
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        this.#store.recordMessage("companion", text);
+    } catch (error) {
+      this.#logError(error, "Companion speech delivery failed");
+    }
+  }
+
+  async #speakControlMessage(text: string): Promise<void> {
+    try {
+      await this.#say(text);
+      this.#store.recordMessage("companion", text);
+    } catch (error) {
+      this.#logError(error, "Control message delivery failed");
+    }
+  }
+
+  #logError(error: unknown, message: string): void {
+    const code = runtimeErrorCode(message);
+    this.#recentErrors.unshift({ code, at: new Date().toISOString() });
+    this.#recentErrors = this.#recentErrors.slice(0, 5);
+    this.#logger?.error(
       {
-        category: "player_runtime",
-        code,
         errorType: error instanceof Error ? error.name : "UnknownError",
       },
-      "player runtime operation failed",
+      message,
     );
+  }
+
+  #clearTimers(): void {
+    if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
+    if (this.#worldChangeTimer !== undefined)
+      clearTimeout(this.#worldChangeTimer);
+    this.#waitTimer = undefined;
+    this.#worldChangeTimer = undefined;
+    this.#wakeAt = null;
+    this.#wakeReason = null;
   }
 }
 
-function withoutPrivateObservationDetails(
-  observation: PlayerObservationEvidence,
-): PlayerObservationEvidence {
-  const {
-    position: _position,
-    inventoryItems: _inventoryItems,
-    ...visibleEvidence
-  } = observation;
-  return visibleEvidence;
-}
-
-function groundedOperationSummary(
+function outcomeFromResult(
   result: PlayerOperationResult,
+  plannedOperation: PlayerOperation,
+  operationId: string,
   expectedOutcome: string,
-): string {
-  const before = compactHostileProjection("pre", result.before);
-  const after = compactHostileProjection("post", result.after);
-  const sameLife =
-    result.sameLife === false
-      ? "sameLife=false/no-cross-life-delta"
-      : result.sameLife === true
-        ? "sameLife=true"
-        : "sameLife=unknown";
-  const parts = [
-    ...(result.failureReason === undefined
-      ? []
-      : [groundedFailureReasonSummary(result.failureReason)]),
-    before.core,
-    after.core,
-    sameLife,
-    "client-table only; not a world census; zero or unavailable is not absence; dirs are Minecraft cardinal",
-    before.directions,
-    after.directions,
-    before.occlusion,
-    after.occlusion,
-    `${result.operation.kind}=${result.status}`,
-    ...(result.observedEffect === undefined
-      ? []
-      : [`effect=${result.observedEffect.type}`]),
-    ...(result.detail === undefined
-      ? []
-      : [`detail=${sanitizeDetail(result.detail).slice(0, 40)}`]),
-    observedMovementSummary(result),
-    `expected=${sanitizeDetail(expectedOutcome).slice(0, 60)}`,
-    "次の判断は実観測で見直す。",
-  ];
-  let summary = "";
-  for (const part of parts) {
-    if (part.length === 0) continue;
-    const next = summary.length === 0 ? part : `${summary}; ${part}`;
-    if (next.length > 680) break;
-    summary = next;
-  }
-  return summary;
-}
-
-function groundedFailureReasonSummary(
-  failureReason: NonNullable<PlayerOperationResult["failureReason"]>,
-): string {
-  const itemName = safeDamageToken(failureReason.itemName, 80);
-  switch (failureReason.code) {
-    case "unknown_registry_item":
-      return `failure=unknown_registry_item; registryに${itemName}がありません`;
-    case "item_not_in_inventory":
-      return `failure=item_not_in_inventory; 所持品に${itemName}がありません`;
-    case "no_recipe_for_current_inventory_and_surface":
-      return `failure=no_recipe_for_current_inventory_and_surface; 現在の所持品と利用可能な作業面で${itemName}のrecipeなし`;
-  }
-}
-
-interface CompactHostileProjection {
-  readonly core: string;
-  readonly directions: string;
-  readonly occlusion: string;
-}
-
-function compactHostileProjection(
-  phase: "pre" | "post",
-  observation: PlayerBodyObservation | null,
-): CompactHostileProjection {
-  if (observation === null)
-    return {
-      core: `${phase}=unavailable,hp=unknown`,
-      directions: `${phase}Dirs=unknown`,
-      occlusion: `${phase}Ray=unknown`,
-    };
-  const health = compactObservedNumber(observation.self.health);
-  const nearbyHostiles = observation.perception.nearbyHostiles;
-  if (nearbyHostiles === undefined)
-    return {
-      core: `${phase}=unavailable,hp=${health}`,
-      directions: `${phase}Dirs=unknown`,
-      occlusion: `${phase}Ray=unknown`,
-    };
-  const aggregate = nearbyHostiles.aggregate;
-  if (aggregate === undefined) {
-    const nearestVisible = nearbyHostiles.entities.reduce<number | undefined>(
-      (nearest, entity) =>
-        nearest === undefined || entity.distance < nearest
-          ? entity.distance
-          : nearest,
-      undefined,
-    );
-    return {
-      core: `${phase}=visible:${compactObservedCount(nearbyHostiles.entities.length)},min=${nearestVisible === undefined ? "unknown" : formatObservedDistance(nearestVisible)},hp=${health}`,
-      directions: `${phase}Dirs=unknown`,
-      occlusion: `${phase}Ray=unknown`,
-    };
-  }
-  const occupied = aggregate.byDirection
-    .filter(({ count }) => count > 0)
-    .sort(
-      (left, right) =>
-        right.count - left.count ||
-        left.direction.localeCompare(right.direction),
-    );
-  const topDirections = occupied
-    .slice(0, 2)
-    .map(
-      ({ direction, count, nearestDistance }) =>
-        `${hostileDirectionLabel(direction)}:${compactObservedCount(count)}${nearestDistance === null ? "" : `@${formatObservedDistance(nearestDistance)}`}`,
-    )
-    .join(",");
-  const nearestDistance = occupied.reduce<number | undefined>(
-    (nearest, { nearestDistance: candidate }) =>
-      candidate === null
-        ? nearest
-        : nearest === undefined || candidate < nearest
-          ? candidate
-          : nearest,
-    undefined,
-  );
-  const check = aggregate.occlusionCheck;
+): CompanionOutcomeInput {
+  const operationMatches = sameOperation(result.operation, plannedOperation);
   return {
-    core: `${phase}=client:${compactObservedCount(aggregate.clientReceivedHostileCount)}/${formatObservedDistance(aggregate.maxDistance)},min=${nearestDistance === undefined ? "unknown" : formatObservedDistance(nearestDistance)},hp=${health}`,
-    directions: `${phase}Dirs=${topDirections || "none"}${occupied.length > 2 ? `+${occupied.length - 2}` : ""}`,
-    occlusion: `${phase}Ray=check${compactObservedCount(check.candidatesChecked)}/${compactObservedCount(check.candidateLimit)},unocc${compactObservedCount(check.unoccludedCandidates)},occ${compactObservedCount(check.occludedCandidates)},skip${compactObservedCount(check.uncheckedCandidates)},visible${compactObservedCount(nearbyHostiles.entities.length)}`,
+    // Body has an internal UUID; the runtime marker is the durable correlation ID.
+    operationId,
+    operation: plannedOperation,
+    status: operationMatches ? result.status : "failed",
+    summary:
+      operationMatches && result.status === "successful"
+        ? "Body observed the requested world effect."
+        : operationMatches
+          ? `Body did not confirm the requested world effect (${result.status}).`
+          : "Body returned a result for a different operation.",
+    expectedOutcome,
+    observedAt: result.completedAt,
   };
 }
 
-function hostileDirectionLabel(direction: BodyNearbyHostileDirection): string {
-  const labels = {
-    north: "N",
-    northeast: "NE",
-    east: "E",
-    southeast: "SE",
-    south: "S",
-    southwest: "SW",
-    west: "W",
-    northwest: "NW",
-    coincident: "C",
-  } as const;
-  return labels[direction];
-}
-
-function formatObservedDistance(distance: number): string {
-  return `${compactObservedNumber(Math.max(0, distance))}m`;
-}
-
-function compactObservedNumber(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value))
-    return "unknown";
-  const formatted = String(Number(value.toFixed(1)));
-  return formatted.length <= 8 ? formatted : "large";
-}
-
-function compactObservedCount(value: number): string {
-  if (!Number.isFinite(value) || value < 0) return "unknown";
-  const formatted = String(Math.trunc(value));
-  return formatted.length <= 4 ? formatted : "many";
-}
-
-function damageReflexEvidenceSummary(
-  event: DamageReflexCompletedEvent,
-): string {
-  const trigger =
-    "trigger" in event && event.trigger === "hostile_approach"
-      ? "hostile_approach"
-      : "damage";
-  return `${event.summary}; operation=${event.operationKind ?? "none"}; status=${event.status}; startedAt=${event.startedAt}; serverConfirmedAt=${event.serverConfirmedAt ?? "unknown"}; trigger=${trigger}; sameLife=${event.sameLife ?? "unknown"}`;
-}
-
-function ownerConsumeOutcomeMessage(
-  result: PlayerOperationResult | undefined,
-  outcome: McSkillOutcomeStatus,
-): string {
-  const beforeFood = result?.before?.self.food;
-  const afterFood = result?.after?.self.food;
-  const foodChange =
-    beforeFood == null || afterFood == null
-      ? ""
-      : `実行前food=${beforeFood}、実行後food=${afterFood}。`;
-  if (
-    result?.operation.kind === "consume" &&
-    result.status === "successful" &&
-    beforeFood != null &&
-    afterFood != null &&
-    afterFood > beforeFood &&
-    consumeItemCountDecreased(result)
-  )
-    return `食事操作が成功し、food値が${beforeFood}から${afterFood}へ増えたことを観測しました。体力回復は確認していません。`;
-
-  const statusMessage: Record<McSkillOutcomeStatus, string> = {
-    successful:
-      "PlayerBodyは成功扱いでしたが、食料アイテムの所持数減少とfood値上昇を揃って確認できませんでした。",
-    failed: "食事操作は失敗し、食べられたことを確認できませんでした。",
-    interrupted: "食事操作は中断され、成功を確認できませんでした。",
-    cancelled: "食事操作は取り消され、成功を確認できませんでした。",
-    unverified: "食事操作の結果を検証できず、成功を確認できませんでした。",
-  };
-  return `${statusMessage[outcome]}${foodChange}原因は観測から特定できていません。`;
-}
-
-function equipmentOutcomeMessage(
-  operation: Extract<PlayerOperation, { kind: "equip" }>,
-  result: PlayerOperationResult | undefined,
-  outcome: McSkillOutcomeStatus,
-): string {
-  const operationMatches =
-    result?.operation.kind === "equip" &&
-    result.operation.item === operation.item &&
-    result.operation.destination === operation.destination;
-  const observedEquipment =
-    operationMatches && result.after != null
-      ? result.after.self.equipment
-      : undefined;
-  const slotObserved =
-    observedEquipment !== undefined &&
-    Object.prototype.hasOwnProperty.call(
-      observedEquipment,
-      operation.destination,
-    );
-  const equipment = slotObserved
-    ? observedEquipment[operation.destination]
-    : undefined;
-  const equipmentArea = `${equipmentDestinationLabel[operation.destination]}の装備欄`;
-  const statusMessage: Record<McSkillOutcomeStatus, string> = {
-    successful: "装備操作は成功と判定されました。",
-    failed: "装備操作は失敗しました。",
-    interrupted: "装備操作は中断されました。",
-    cancelled: "装備操作は取り消されました。",
-    unverified: "装備操作の結果を確認できていません。",
-  };
-  const observedMessage = !slotObserved
-    ? `実行後の${equipmentArea}は観測できませんでした。`
-    : equipment === null
-      ? `実行後の${equipmentArea}は空で、${operation.item}は確認できませんでした。`
-      : equipment?.name === operation.item
-        ? `実行後、${equipmentArea}に${operation.item}があることを観測しました。`
-        : equipment === undefined
-          ? `実行後の${equipmentArea}は観測できませんでした。`
-          : `実行後、${equipmentArea}には${equipment.name}があり、${operation.item}は確認できませんでした。`;
-  if (outcome === "successful" && equipment?.name === operation.item)
-    return `${statusMessage[outcome]}${observedMessage}`;
-  const failureReason = operationMatches ? result.failureReason : undefined;
-  const itemMissingFromInventory =
-    failureReason?.code === "item_not_in_inventory" &&
-    failureReason.itemName === operation.item;
-  const reasonMessage = itemMissingFromInventory
-    ? `所持品に${operation.item}がありません。`
-    : "原因は観測から特定できていません。";
-  return `${statusMessage[outcome]}${observedMessage}${reasonMessage}`;
-}
-
-function equipmentSlotObservation(
-  observation: PlayerBodyObservation | null | undefined,
-  destination: Extract<PlayerOperation, { kind: "equip" }>["destination"],
-):
-  | { readonly state: "unobserved" }
-  | { readonly state: "empty" }
-  | {
-      readonly state: "item";
-      readonly itemName: string;
-      readonly count: number;
-    } {
-  if (
-    observation === null ||
-    observation === undefined ||
-    !Object.prototype.hasOwnProperty.call(
-      observation.self.equipment,
-      destination,
-    )
-  )
-    return { state: "unobserved" };
-  const equipment = observation.self.equipment[destination];
-  if (equipment === null) return { state: "empty" };
-  if (equipment === undefined) return { state: "unobserved" };
+function failedBodyResult(
+  operation: PlayerOperation,
+  operationId: string,
+): PlayerOperationResult {
+  const now = new Date().toISOString();
   return {
-    state: "item",
-    itemName: equipment.name,
-    count: equipment.count,
+    operationId,
+    operation,
+    status: "failed",
+    startedAt: now,
+    completedAt: now,
+    before: null,
+    after: null,
+    recoveryRequired: false,
+    detail: "Body execution failed before an observed result was returned.",
   };
 }
 
-const equipmentDestinationLabel: Record<
-  Extract<PlayerOperation, { kind: "equip" }>["destination"],
-  string
-> = {
-  hand: "手",
-  head: "頭",
-  torso: "胴体",
-  legs: "脚",
-  feet: "足",
-  "off-hand": "利き手と反対側の手",
-};
+function sameOperation(left: PlayerOperation, right: PlayerOperation): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
 
-function consumeItemCountDecreased(result: PlayerOperationResult): boolean {
+function canContinuePlan(
+  after: PlayerBodyObservation,
+  fresh: PlayerBodyObservation,
+  nextOperation: PlayerOperation | undefined,
+): boolean {
+  if (after.dimension !== fresh.dimension) return false;
   if (
-    result.operation.kind !== "consume" ||
-    result.before === null ||
-    result.after === null
+    after.self.health !== null &&
+    fresh.self.health !== null &&
+    fresh.self.health < after.self.health
   )
     return false;
-  const itemName = result.operation.item;
-  const itemNames =
-    itemName === undefined
-      ? new Set(result.before.self.inventory.map((item) => item.name))
-      : new Set([itemName]);
-  const count = (
-    observation: PlayerOperationResult["before"],
-    name: string,
-  ): number =>
-    observation?.self.inventory
-      .filter((item) => item.name === name)
-      .reduce((total, item) => total + item.count, 0) ?? 0;
-  return [...itemNames].some(
-    (name) => count(result.before, name) > count(result.after, name),
+  if (
+    after.self.oxygen !== null &&
+    fresh.self.oxygen !== null &&
+    fresh.self.oxygen < after.self.oxygen
+  )
+    return false;
+  if (
+    (fresh.self.inLava === true && after.self.inLava !== true) ||
+    (fresh.self.onFire === true && after.self.onFire !== true) ||
+    (fresh.self.suffocating === true && after.self.suffocating !== true)
+  )
+    return false;
+  return (
+    nextOperation === undefined ||
+    nextOperationTargetIsAvailable(nextOperation, fresh)
   );
 }
 
-function observedMovementSummary(result: PlayerOperationResult): string {
-  if (
-    result.sameLife === false &&
-    (result.operation.kind === "move_to" ||
-      result.operation.kind === "move_relative" ||
-      result.operation.kind === "control")
-  )
-    return "移動差分はライフ変更をまたぐため記録しない。";
-  const movement = observedMovementDelta(result);
-  if (movement === undefined) return "";
-  const { x, y, z } = movement;
-  return `観測した移動差分=Δx:${compactObservedNumber(x)},Δy:${compactObservedNumber(y)},Δz:${compactObservedNumber(z)},距離:${compactObservedNumber(Math.hypot(x, y, z))}。`;
-}
-
-function observedMovementDelta(
-  result: PlayerOperationResult,
-): PlayerObservedDisplacement | undefined {
-  if (
-    result.operation.kind !== "move_to" &&
-    result.operation.kind !== "move_relative" &&
-    result.operation.kind !== "control"
-  )
-    return undefined;
-  if (result.sameLife === false) return undefined;
-  const { before, after } = result;
-  if (before === null || after === null) return undefined;
-  if (before.dimension !== after.dimension) return undefined;
-  const beforePosition = before.self.position;
-  const afterPosition = after.self.position;
-  const dx = afterPosition.x - beforePosition.x;
-  const dy = afterPosition.y - beforePosition.y;
-  const dz = afterPosition.z - beforePosition.z;
-  if (![dx, dy, dz].every(Number.isFinite)) return undefined;
-  return {
-    x: Number(dx.toFixed(1)),
-    y: Number(dy.toFixed(1)),
-    z: Number(dz.toFixed(1)),
-  };
-}
-
-function sanitizeDetail(value: string): string {
-  let sanitized = "";
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    sanitized +=
-      codePoint !== undefined && (codePoint < 32 || codePoint === 127)
-        ? " "
-        : character;
-    if (sanitized.length >= 180) break;
-  }
-  return sanitized.replace(/\s+/gu, " ").trim().slice(0, 180);
-}
-
-function safeDamageToken(value: string, maximumLength: number): string {
-  return /^[a-z0-9_.:-]+$/iu.test(value) && value.length <= maximumLength
-    ? value
-    : "unknown";
-}
-
-function damageEventSummary(
-  source: PlayerBodyDamageSource | null,
-  confidence: "observed" | "unknown",
-): string {
-  if (source === null || confidence !== "observed")
-    return "Bot自身への被害を観測。原因はunknown。新しいBody観測でhealthと可視脅威を確認。";
-  const kind = safeDamageToken(source.kind, 48);
-  const name = safeDamageToken(source.name, 80);
-  const category =
-    source.category !== null &&
-    source.category.length <= 80 &&
-    /^[\p{L}\p{N} _.-]+$/u.test(source.category)
-      ? source.category
-      : "unknown";
-  return `Bot自身への被害を観測。攻撃元source=${kind}:${name}; category=${category}; confidence=observed。新しいBody観測でhealthと可視脅威を確認。`;
-}
-
-function causeSourceSummary(cause: PlayerBodyDeathCause): string {
-  if (cause.confidence !== "observed" || cause.source === null)
-    return "unknown";
-  const kind = safeDamageToken(cause.source.kind, 48);
-  const name = safeDamageToken(cause.source.name, 80);
-  return `${kind}:${name}`;
-}
-
-function deathEventSummary(cause: PlayerBodyDeathCause | undefined): string {
-  if (cause === undefined)
-    return "Bot自身の死亡を観測。観測された死因はunknown。復帰後に現状を再評価。";
-  const causeKey =
-    cause.causeKey !== undefined &&
-    /^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(cause.causeKey)
-      ? `; causeKey=${cause.causeKey}`
-      : "";
-  return `Bot自身の死亡を観測。cause=${causeSourceSummary(cause)}; confidence=${cause.confidence}; provenance=${cause.provenance}${causeKey}。復帰後に現状を再評価。`;
-}
-
-function deathCauseUpdateSummary(cause: PlayerBodyDeathCause): string {
-  const causeKey =
-    cause.causeKey !== undefined &&
-    /^death\.(?:attack|fell)\.[a-z0-9_.]{1,96}$/u.test(cause.causeKey)
-      ? `; causeKey=${cause.causeKey}`
-      : "";
-  return `既存のBot死亡記録へcause=${causeSourceSummary(cause)}; confidence=${cause.confidence}; provenance=${cause.provenance}${causeKey}を追加。死亡件数は増やさない。`;
-}
-
-export function semanticSignatures(
-  observation: Awaited<ReturnType<PlayerBody["observe"]>>,
-): Record<string, string> {
-  const timeOfDay = observation.time.timeOfDay;
-  const timeBand =
-    timeOfDay === null
-      ? "unknown"
-      : timeOfDay >= 11_000 && timeOfDay <= 13_000
-        ? "twilight"
-        : timeOfDay < 12_000
-          ? "day"
-          : "night";
-  const inWater = observation.self.inWater === true;
-  const oxygenState = oxygenObservationState(observation.self.oxygen, inWater);
-  const vitals = [
-    observation.self.health,
-    observation.self.food,
-    inWater && oxygenState === "low" ? "low_oxygen" : "oxygen_not_low",
-    observation.self.inLava === true,
-    observation.self.onFire === true,
-    observation.self.suffocating === true,
-  ].join("|");
-  const environment = [inWater, inWater ? oxygenState : "not_applicable"].join(
-    "|",
-  );
-  const inventory = observation.self.inventory
-    .map(({ name, count }) => `${name}:${count}`)
-    .sort()
-    .join(",");
-  const entities = observation.perception.entities
-    .map(
-      ({ kind, category, distance }) =>
-        `${kind}:${category ?? "unknown"}:${distanceBand(distance)}`,
-    )
-    .sort()
-    .slice(0, 32)
-    .join(",");
-  const droppedItemCounts = new Map<string, number>();
-  for (const { droppedItem } of observation.perception.entities) {
-    if (droppedItem === undefined) continue;
-    const name = droppedItem.name.slice(0, 80);
-    droppedItemCounts.set(
-      name,
-      (droppedItemCounts.get(name) ?? 0) + droppedItem.count,
+function nextOperationTargetIsAvailable(
+  operation: PlayerOperation,
+  observation: PlayerBodyObservation,
+): boolean {
+  const visibleBlockAt = (position: { x: number; y: number; z: number }) =>
+    observation.perception.blocks.some(
+      (block) =>
+        Math.floor(block.position.x) === Math.floor(position.x) &&
+        Math.floor(block.position.y) === Math.floor(position.y) &&
+        Math.floor(block.position.z) === Math.floor(position.z),
     );
+  const visibleEntity = (entityId: number) =>
+    observation.perception.entities.some((entity) => entity.id === entityId);
+  const visibleNamedBlock = (
+    position: { x: number; y: number; z: number },
+    name: RegExp,
+  ) =>
+    observation.perception.blocks.some(
+      (block) =>
+        name.test(block.name) &&
+        Math.floor(block.position.x) === Math.floor(position.x) &&
+        Math.floor(block.position.y) === Math.floor(position.y) &&
+        Math.floor(block.position.z) === Math.floor(position.z),
+    );
+
+  switch (operation.kind) {
+    case "attack":
+    case "collect_item":
+    case "mount":
+    case "trade":
+      return visibleEntity(operation.entityId);
+    case "dig":
+      return visibleBlockAt(operation.position);
+    case "place":
+      return observation.perception.placementCandidates.some(
+        ({ position }) =>
+          Math.floor(position.x) === Math.floor(operation.position.x) &&
+          Math.floor(position.y) === Math.floor(operation.position.y) &&
+          Math.floor(position.z) === Math.floor(operation.position.z),
+      );
+    case "use":
+    case "open_window": {
+      const target = operation.target;
+      return target.kind === "entity"
+        ? visibleEntity(target.entityId)
+        : target.kind === "block"
+          ? visibleBlockAt(target.position)
+          : true;
+    }
+    case "sleep":
+      return visibleNamedBlock(operation.position, /bed/u);
+    case "enchant":
+      return visibleNamedBlock(operation.position, /enchanting_table/u);
+    case "anvil":
+      return visibleNamedBlock(operation.position, /anvil/u);
+    case "update_sign":
+      return visibleNamedBlock(operation.position, /sign/u);
+    case "window_click":
+    case "window_transfer":
+    case "window_close":
+      return observation.window !== null;
+    case "move_vehicle":
+      return observation.self.mountedEntityId !== null;
+    case "dismount":
+      return observation.self.mountedEntityId !== null;
+    case "wake":
+      return observation.self.sleeping;
+    default:
+      return true;
   }
-  const drops = [...droppedItemCounts]
-    .map(([name, count]) => `${name}:${count}`)
-    .sort()
-    .join(",");
-  const hostileMap = hostileMapSignature(observation);
-  const nearestRelevantBlocks = new Map<string, number>();
-  for (const { name, distance } of observation.perception.blocks) {
-    if (
-      !/chest|barrel|shulker|ore|log|crafting_table|furnace|bed|door|portal|water|lava/u.test(
-        name,
-      )
+}
+
+function isExplicitResumeCommand(message: string): boolean {
+  return /^(?:再開|再開して|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
+    message.trim(),
+  );
+}
+
+function isOwnerFollowCommand(message: string): boolean {
+  return /^(?:こっち(?:に)?来て|ついてきて|ついて来て)[。！!]*$/u.test(
+    message.trim(),
+  );
+}
+
+function normalizeKnowledgeQuery(query: string): string {
+  return query.trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US");
+}
+
+function safeSummary(summary: string): string {
+  return summary
+    .replace(
+      /\b(?:sk-(?:proj-)?|gh[pousr]_)[A-Za-z0-9_-]{12,}\b/gu,
+      "[redacted]",
     )
-      continue;
-    const previous = nearestRelevantBlocks.get(name);
-    if (previous === undefined || distance < previous)
-      nearestRelevantBlocks.set(name, distance);
+    .replace(/[\r\n\t]+/gu, " ")
+    .slice(0, 240);
+}
+
+function runtimeErrorCode(message: string): string {
+  switch (message) {
+    case "Companion wake failed":
+      return "runtime_wake_failed";
+    case "Body stop failed":
+      return "body_stop_failed";
+    case "Companion judgment failed":
+      return "judgment_failed";
+    case "Body outcome could not be persisted":
+      return "body_outcome_persist_failed";
+    case "Fresh Body observation failed":
+      return "body_observation_failed";
+    case "Companion speech delivery failed":
+      return "speech_delivery_failed";
+    case "Control message delivery failed":
+      return "control_message_delivery_failed";
+    case "Owner stop state could not be read":
+      return "owner_stop_state_read_failed";
+    case "Owner stop persistence failed":
+      return "owner_stop_persistence_failed";
+    case "Owner stop message could not be recorded":
+      return "owner_stop_message_persist_failed";
+    default:
+      return "runtime_error";
   }
-  const relevantBlocks = [...nearestRelevantBlocks]
-    .map(([name, distance]) => `${name}:${distanceBand(distance)}`)
-    .sort()
-    .slice(0, 48)
-    .join(",");
-  const window =
-    observation.window === null
-      ? "closed"
-      : `${observation.window.type}:${observation.window.slots.map((item) => (item === null ? "-" : `${item.name}:${item.count}`)).join(",")}`;
-  const { x, y, z } = observation.self.position;
-  return {
-    vitals,
-    environment,
-    inventory,
-    entities,
-    drops,
-    hostileMap,
-    blocks: relevantBlocks,
-    time: `${observation.time.day ?? "unknown"}:${timeBand}:${observation.time.raining ?? "unknown"}`,
-    position: `${observation.dimension}:${Math.floor(x / 8)}:${Math.floor(y / 8)}:${Math.floor(z / 8)}`,
-    window,
-  };
-}
-
-function hostileMapSignature(observation: PlayerBodyObservation): string {
-  const nearbyHostiles = observation.perception.nearbyHostiles;
-  if (nearbyHostiles === undefined) return "unavailable";
-  const aggregate = nearbyHostiles.aggregate;
-  if (aggregate === undefined)
-    return nearbyHostiles.entities
-      .map(({ kind, distance }) => `${kind}:${threatDistanceBand(distance)}`)
-      .sort()
-      .slice(0, 32)
-      .join(",");
-  const kinds = aggregate.byKind
-    .map(({ name, count }) => `${name}:${count}`)
-    .sort()
-    .slice(0, 32)
-    .join(",");
-  const directions = aggregate.byDirection
-    .map(
-      ({ direction, count, nearestDistance }) =>
-        `${direction}:${count}:${nearestDistance === null ? "none" : threatDistanceBand(nearestDistance)}`,
-    )
-    .join(",");
-  return `${aggregate.countScope}:${aggregate.clientReceivedHostileCount}:${kinds}:${aggregate.omittedKindGroupCount}:${aggregate.omittedKindEntityCount}:${directions}`;
-}
-
-function threatDistanceBand(distance: number): string {
-  if (distance < 3) return "close";
-  if (distance < 6) return "near";
-  if (distance < 10) return "medium";
-  return "far";
-}
-
-function distanceBand(distance: number): string {
-  if (distance < 3) return "near";
-  if (distance < 8) return "medium";
-  return "far";
 }

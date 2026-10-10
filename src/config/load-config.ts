@@ -36,20 +36,13 @@ export function loadConfig(
     databasePath: env.DATABASE_PATH,
     personaPath: env.PERSONA_PATH,
     logLevel: env.LOG_LEVEL,
-    limits: {
-      maxMoveDistance: env.MAX_MOVE_DISTANCE,
-      maxGatherCount: env.MAX_GATHER_COUNT,
-      taskTimeoutMs: env.TASK_TIMEOUT_MS,
-      skillRetryLimit: env.SKILL_RETRY_LIMIT,
-      followDistance: env.FOLLOW_DISTANCE,
-      hungerThreshold: env.HUNGER_THRESHOLD,
-      memoryContextLimit: env.MEMORY_CONTEXT_LIMIT,
+    connection: {
+      timeoutMs: env.CONNECT_TIMEOUT_MS,
+      reconnectEnabled: env.RECONNECT_ENABLED,
+      reconnectMaxAttempts: env.RECONNECT_MAX_ATTEMPTS,
+      reconnectDelayMs: env.RECONNECT_DELAY_MS,
     },
-    reconnect: {
-      enabled: env.RECONNECT_ENABLED,
-      maxAttempts: env.RECONNECT_MAX_ATTEMPTS,
-      delayMs: env.RECONNECT_DELAY_MS,
-    },
+    memoryContextLimit: env.MEMORY_CONTEXT_LIMIT,
     dashboard: {
       enabled: env.DASHBOARD_ENABLED,
       host: env.DASHBOARD_HOST,
@@ -57,9 +50,6 @@ export function loadConfig(
       ...(env.DASHBOARD_AUTH_TOKEN === undefined
         ? {}
         : { authToken: env.DASHBOARD_AUTH_TOKEN }),
-      staticDirectory: env.DASHBOARD_STATIC_DIR,
-      maxAgeDays: env.TRACE_RETENTION_DAYS,
-      maxTraces: env.TRACE_MAX_RUNS,
     },
   };
 }

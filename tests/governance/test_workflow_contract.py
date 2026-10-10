@@ -33,7 +33,6 @@ def test_workflow_uses_classifier_selected_jobs_and_aggregate_gate() -> None:
     assert set(jobs) == {
         "verification_scope",
         "product",
-        "dashboard_browser",
         "governance",
         "workflow_contract",
         "quality_gate",
@@ -43,7 +42,6 @@ def test_workflow_uses_classifier_selected_jobs_and_aggregate_gate() -> None:
     assert set(jobs["quality_gate"]["needs"]) == {
         "verification_scope",
         "product",
-        "dashboard_browser",
         "governance",
         "workflow_contract",
     }
@@ -64,7 +62,7 @@ def test_every_step_level_external_action_is_immutably_pinned() -> None:
         ), line
 
 
-def test_workflow_preserves_product_browser_and_governance_commands() -> None:
+def test_workflow_preserves_product_and_governance_commands() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
 
     for command in (
@@ -74,13 +72,12 @@ def test_workflow_preserves_product_browser_and_governance_commands() -> None:
         "npm test",
         "npm run build",
         "npm run audit:high",
-        "npm run test:browser",
         "python scripts/validate_governance.py",
         "python scripts/verify_task_skills.py",
     ):
         assert command in source
-    assert "if: failure()" in source
-    assert "retention-days: 7" in source
+    assert "if: always()" in source
+    assert "classification_ok" in source
 
 
 def test_node_22_compatibility_lane_avoids_duplicate_static_checks() -> None:
@@ -99,11 +96,3 @@ def test_node_22_compatibility_lane_avoids_duplicate_static_checks() -> None:
 
     assert guarded
     assert set(guarded.values()) == {"matrix.node-version == '24.x'"}
-
-
-def test_tree_guard_uses_java_21_and_maven_verification() -> None:
-    steps = load_workflow()["jobs"]["product"]["steps"]
-    helper = next(step for step in steps if step["name"] == "Build and test tree protection helper")
-    assert helper["if"] == "matrix.node-version == '24.x'"
-    assert 'JAVA_HOME="$JAVA_HOME_21_X64"' in helper["run"]
-    assert "server/tree-guard/pom.xml verify" in helper["run"]

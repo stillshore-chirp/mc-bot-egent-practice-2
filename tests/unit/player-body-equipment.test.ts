@@ -10,7 +10,6 @@ import {
   playerBodyLookSweepSchema,
   summarizeLookSweepView,
 } from "../../src/minecraft/player-body-observation.js";
-import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 
 function makeBot(
   equipment: readonly (string | null | undefined)[],
@@ -306,7 +305,6 @@ describe("equipment after an open-window transfer", () => {
       direction: "window_to_inventory",
     });
     const afterTransfer = await body.observe();
-    const evidence = toObservationEvidence(afterTransfer);
 
     expect(transferred.status).toBe("successful");
     expect(afterTransfer.window?.slots[0]).toBeNull();
@@ -314,12 +312,8 @@ describe("equipment after an open-window transfer", () => {
       expect.objectContaining({ name: "iron_shears", slot: 27 }),
     );
     expect(afterTransfer.self.inventory).toContainEqual(
-      expect.objectContaining({ name: "iron_shears", slot: 9 }),
+      expect.objectContaining({ name: "iron_shears", count: 1, slot: 9 }),
     );
-    expect(evidence.inventoryItems ?? []).toContainEqual({
-      name: "iron_shears",
-      count: 1,
-    });
 
     const equipped = await body.execute({
       kind: "equip",

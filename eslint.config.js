@@ -5,7 +5,7 @@ import tseslint from "typescript-eslint";
 
 export default defineConfig(
   {
-    ignores: ["dist/**", "dashboard/dist/**", "coverage/**", "node_modules/**"],
+    ignores: ["**/dist/**", "coverage/**", "node_modules/**"],
   },
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
@@ -14,7 +14,7 @@ export default defineConfig(
   {
     languageOptions: {
       parserOptions: {
-        project: ["./tsconfig.json", "./tsconfig.dashboard.json"],
+        project: ["./tsconfig.json"],
         tsconfigRootDir: import.meta.dirname,
       },
     },

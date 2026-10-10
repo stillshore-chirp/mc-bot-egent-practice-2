@@ -1,447 +1,147 @@
-import type {
-  McSkillOutcomeStatus,
-  McSkillRecord,
-} from "../mc-skills/index.js";
-import type {
-  PlayerBodyEvent,
-  PlayerBodyDeathCause,
-  PlayerBodyLookSweep,
-  PlayerBodyObservation,
-  PlayerKnowledge,
-  PlayerOperation,
-  PlayerOperationResult,
-} from "../minecraft/player-body.js";
-import type {
-  PlayerAgentRequestErrorCause,
-  PlayerAgentRoundActivity,
-  PlayerAgentToolRoundActivity,
-} from "./responses.js";
+import type { PlayerOperation } from "../minecraft/player-body-schema.js";
 
-export type PlayerWakeKind =
-  | "startup"
-  | "owner_proposal"
-  | "body_outcome"
-  | "state_changed"
-  | "operation_stalled"
-  | "bot_damaged"
-  | "bot_death"
-  | "bot_death_cause_updated"
-  | "reconnected"
-  | "deadline"
-  | "manual";
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject;
+export interface JsonObject {
+  readonly [key: string]: JsonValue;
+}
 
-export const playerThoughtCommitRejectionCodes = [
-  "CAS_STALE",
-  "STOPPED",
-  "NO_ACTIVE_OPERATION",
-  "PROPOSAL_NOT_PENDING",
-  "GOAL_CAPACITY",
+export const companionMemoryKinds = [
+  "fact",
+  "preference",
+  "interest",
+  "episode",
+  "world",
+  "relationship",
+  "life",
+  "behavior",
+  "skill_lesson",
+  "goal",
+  "commitment",
+  "task",
+  "other",
 ] as const;
+export type CompanionMemoryKind = (typeof companionMemoryKinds)[number];
 
-export type PlayerThoughtCommitRejectionCode =
-  (typeof playerThoughtCommitRejectionCodes)[number];
-
-/** Content-free state components observed to differ after a stale CAS. */
-export const playerThoughtStaleChangeComponents = [
-  "stop_state",
-  "action_revision",
-  "outcomes",
-  "proposal_state",
-  "purpose_state",
-  "knowledge_state",
-  "pending_event_kinds",
-  "unknown",
+export const companionMemorySources = [
+  "player_stated",
+  "minecraft_observed",
+  "bot_inferred",
+  "system",
 ] as const;
+export type CompanionMemorySource = (typeof companionMemorySources)[number];
 
-export type PlayerThoughtStaleChangeComponent =
-  (typeof playerThoughtStaleChangeComponents)[number];
+export const companionMemoryStatuses = [
+  "active",
+  "superseded",
+  "retracted",
+  "archived",
+] as const;
+export type CompanionMemoryStatus = (typeof companionMemoryStatuses)[number];
 
-export interface PlayerGoal {
-  readonly id: string;
-  readonly ownerProposalId?: string | undefined;
+export type CompanionGoalSource = "owner" | "persona" | "self";
+export interface CompanionGoal {
   readonly title: string;
-  readonly status: "active" | "paused" | "completed" | "abandoned";
-  readonly priority: number;
-  readonly changeReason: string;
-  readonly source: "owner" | "persona" | "self";
-  readonly updatedAt: string;
+  readonly successCondition: string;
+  readonly source: CompanionGoalSource;
 }
 
-export interface OwnerProposal {
-  readonly id: string;
-  readonly title: string;
-  readonly reason: string;
-  readonly createdAt: string;
-  readonly priorityPreference: number;
-  readonly status: "pending" | "adopted" | "compromised" | "declined";
-  readonly resolution?: string | undefined;
-}
-
-export interface PlayerWaitState {
-  readonly reason: string;
-  readonly wakeOn: readonly PlayerWakeKind[];
-  readonly wakeAt?: string | undefined;
-}
-
-export interface ActivePlayerOperation {
-  readonly operationId: string;
-  readonly kind: PlayerOperation["kind"];
-  readonly actionRevision: number;
-  readonly startedAt: string;
-  readonly bodyStartedAt?: string | undefined;
-  readonly expectedOutcome?: string | undefined;
-  readonly skillId?: string | undefined;
-  readonly skillVersion?: number | undefined;
-}
-
-export interface PlayerOutcomeEvidence {
-  readonly operationId: string;
-  readonly kind: PlayerOperation["kind"];
-  readonly status: McSkillOutcomeStatus;
-  readonly summary: string;
-  readonly observedAt: string;
-  readonly movementDelta?: PlayerObservedDisplacement | undefined;
-  readonly lookSweep?: PlayerBodyLookSweep | undefined;
-  readonly expectedOutcome?: string | undefined;
-  readonly skillId?: string | undefined;
-  readonly skillVersion?: number | undefined;
-}
-
-export interface PlayerObservedDisplacement {
-  readonly x: number;
-  readonly y: number;
-  readonly z: number;
-}
-
-export interface PlayerProposalResolution {
-  readonly proposalId: string;
-  readonly disposition: "adopted" | "compromised" | "declined";
-  readonly resolution: string;
-}
-
-export interface PlayerJudgmentEvidence {
-  readonly revision: number;
-  readonly decidedAt: string;
-  readonly kind: PlayerThoughtDecision["kind"];
-  readonly summary: string;
-  readonly operationKind?: PlayerOperation["kind"] | undefined;
-  readonly proposalId?: string | undefined;
-  readonly proposalDisposition?:
-    PlayerProposalResolution["disposition"] | undefined;
-  readonly skillId?: string | undefined;
-  readonly skillVersion?: number | undefined;
-}
-
-export interface PlayerLearningEvidence {
-  readonly runId: string;
-  readonly skillId: string;
-  readonly version: number;
-  readonly changeKind: "create" | "revise" | "merge" | "weaken";
-  readonly observedOutcome: McSkillOutcomeStatus;
-  readonly summary: string;
-  readonly updatedAt: string;
-}
-
-export interface PlayerTrustedOutcomeEvidence {
-  readonly runId: string;
-  readonly operationId: string;
-  readonly kind: PlayerOperation["kind"];
-  readonly status: McSkillOutcomeStatus;
-  readonly summary: string;
-  readonly observedAt: string;
-  readonly movementDelta?: PlayerObservedDisplacement | undefined;
-  readonly lookSweep?: PlayerBodyLookSweep | undefined;
-  readonly expectedOutcome?: string | undefined;
-  readonly skillId?: string | undefined;
-  readonly skillVersion?: number | undefined;
-}
-
-export interface PlayerSkillActivityEvidence {
-  readonly kind: "consulted" | "created" | "revised" | "imported" | "exported";
-  readonly skillId: string;
-  readonly version: number;
-  readonly summary: string;
-  readonly at: string;
-  /** Local-only exchange path; never included in model context or public logs. */
-  readonly filePath?: string | undefined;
-}
-
-export interface PlayerStateNote {
-  readonly id: string;
-  readonly kind: "fact" | "uncertainty";
-  readonly summary: string;
-  readonly source: "owner" | "observed" | "inferred";
-  readonly updatedAt: string;
-}
-
-/** Small, visibility-bounded receipt used to correlate a judgment with what was seen. */
-export interface PlayerObservationEvidence {
-  readonly observedAt: string;
-  readonly dimension: string;
-  readonly position?:
-    | {
-        readonly x: number;
-        readonly y: number;
-        readonly z: number;
-        readonly dimension: string;
-      }
-    | undefined;
-  readonly inventoryItems?:
-    | readonly {
-        readonly name: string;
-        readonly count: number;
-      }[]
-    | undefined;
-  readonly day: number | null;
-  readonly timeOfDay: number | null;
-  readonly isDay: boolean | null;
-  readonly health: number | null;
-  readonly food: number | null;
-  readonly oxygen: number | null;
-  readonly inWater: boolean | null;
-  readonly inLava: boolean | null;
-  readonly onFire: boolean | null;
-  readonly inventoryTotal: number;
-  readonly inventoryNames: readonly string[];
-  readonly visibleBlockNames: readonly string[];
-  readonly visibleContainers: readonly {
-    readonly name: string;
-    readonly position: {
-      readonly x: number;
-      readonly y: number;
-      readonly z: number;
-      readonly dimension: string;
-    };
-    readonly distance: number;
-  }[];
-  readonly visibleEntityKinds: readonly string[];
-  readonly candidateSearchMayBeTruncated: boolean;
-  readonly ownerPositionExceptionUsed: boolean;
-}
-
-export interface PlayerDeathMemory {
-  readonly observedAt: string;
-  readonly cause?: PlayerBodyDeathCause | undefined;
-  readonly beforeObservation?: PlayerObservationEvidence | undefined;
-  readonly firstPostDeathObservation?: PlayerObservationEvidence | undefined;
-  readonly recoveryStagesUsed?: readonly PlayerDeathRecoveryStage[] | undefined;
-}
-
-export type PlayerDeathRecoveryStage = "approach" | "sweep" | "collect";
-
-export interface PlayerGoalChange {
-  readonly id?: string;
-  readonly title: string;
-  readonly status: PlayerGoal["status"];
-  readonly priority: number;
-  readonly changeReason: string;
-  readonly source: PlayerGoal["source"];
-}
-
-export interface PlayerActionPlanStep {
-  readonly sequence: number;
+export interface CompanionPlanStep {
   readonly operation: PlayerOperation;
   readonly expectedOutcome: string;
-  /** pending means dispatched or queued; settled values match Body evidence. */
-  readonly status: "pending" | "superseded" | McSkillOutcomeStatus;
-  readonly operationId?: string | undefined;
-  readonly resultSummary?: string | undefined;
-  readonly observedAt?: string | undefined;
 }
 
-export const playerActionPlanStepLimit = 12;
-
-/** Durable high-level need with a bounded, flat history of authored Body steps. */
-export interface PlayerActionPlan {
-  readonly id: string;
+export interface CompanionPlan {
   readonly purpose: string;
-  readonly goalId?: string | undefined;
-  /** Internal proof of the active/paused goal state reviewed for this plan. */
-  readonly goalStateSignature?: string | undefined;
-  readonly steps: readonly PlayerActionPlanStep[];
+  readonly steps: readonly CompanionPlanStep[];
 }
 
-export type PlayerThoughtDecision =
-  | {
-      readonly kind: "act";
-      readonly purpose: string;
-      readonly operation: PlayerOperation;
-      readonly operationId: string;
-      readonly expectedOutcome: string;
-      readonly reason?: string;
-      readonly skillId?: string;
-      readonly skillVersion?: number;
-      readonly wakeOn: readonly PlayerWakeKind[];
-    }
-  | {
-      readonly kind: "wait";
-      readonly purpose: string;
-      readonly reason: string;
-      readonly wakeOn: readonly PlayerWakeKind[];
-      readonly wakeAt?: string;
-    }
-  | { readonly kind: "continue"; readonly reason: string }
-  | {
-      readonly kind: "complete";
-      readonly purpose: string;
-      readonly reason: string;
-      readonly wakeOn: readonly PlayerWakeKind[];
-    };
+export const companionPlanStepLimit = 3;
 
-export interface PlayerRuntimeEvent {
-  readonly id: string;
-  readonly kind: PlayerWakeKind;
+export interface CompanionActiveOperation {
+  readonly operationId: string;
+  readonly operation: PlayerOperation;
+  readonly expectedOutcome: string;
+}
+
+export const companionOutcomeStatuses = [
+  "successful",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "unverified",
+] as const;
+export type CompanionOutcomeStatus = (typeof companionOutcomeStatuses)[number];
+
+export interface CompanionOutcome {
+  readonly operationId: string;
+  readonly operation: PlayerOperation;
+  readonly status: CompanionOutcomeStatus;
   readonly summary: string;
-  readonly createdAt: string;
+  readonly expectedOutcome?: string | undefined;
+  readonly observedAt: string;
 }
 
-/** Stable event key that binds a body outcome wake to its operation run. */
-export function playerBodyOutcomeEventId(operationId: string): string {
-  return `body_outcome:${operationId}`;
-}
+export type CompanionOutcomeInput = Omit<CompanionOutcome, "observedAt"> & {
+  readonly observedAt?: string | undefined;
+};
 
-export interface PlayerRuntimeSnapshot {
-  readonly revision: number;
-  readonly actionRevision: number;
+export interface CompanionSnapshot {
   readonly stopped: boolean;
   readonly stopGeneration: number;
-  readonly purpose: string;
-  readonly actionPlan?: PlayerActionPlan | undefined;
-  readonly goals: readonly PlayerGoal[];
-  readonly stateFacts: readonly PlayerStateNote[];
-  readonly uncertainties: readonly PlayerStateNote[];
-  readonly proposals: readonly OwnerProposal[];
-  readonly activeOperation?: ActivePlayerOperation | undefined;
-  readonly wait?: PlayerWaitState | undefined;
-  readonly lastOutcome?: PlayerOutcomeEvidence | undefined;
-  readonly pendingEventKinds: readonly PlayerWakeKind[];
-  readonly recentJudgments: readonly PlayerJudgmentEvidence[];
-  readonly recentOutcomes: readonly PlayerTrustedOutcomeEvidence[];
-  readonly learningReferences: readonly PlayerLearningEvidence[];
-  readonly skillActivity: readonly PlayerSkillActivityEvidence[];
-  readonly lastObservation?: PlayerObservationEvidence | undefined;
-  readonly latestDeath?: PlayerDeathMemory | undefined;
-  readonly recentAgentActivity: readonly PlayerAgentRoundActivity[];
-  readonly counters: {
-    readonly llmCalls: number;
-    readonly usageUnknownCalls: number;
-    readonly usageUnknownRequestErrorCalls: number;
-    readonly usageUnknownResponseUsageMissingCalls: number;
-    readonly inputTokens: number;
-    readonly outputTokens: number;
-    readonly latencyMs: number;
-    readonly thoughts: number;
-    readonly learningUpdates: number;
-  };
+  readonly goal: CompanionGoal | null;
+  readonly plan: CompanionPlan | null;
+  readonly waitUntil: string | null;
+  readonly activeOperation: CompanionActiveOperation | null;
+  readonly lastOutcome: CompanionOutcome | null;
+  readonly relationshipSummary: string;
+  readonly interests: readonly string[];
 }
 
-/** Bounded, content-free view of the current in-process player runtime. */
-export interface PlayerRuntimeInspection {
-  readonly sampledAt: string;
-  readonly process: {
-    readonly started: boolean;
-    readonly shuttingDown: boolean;
-  };
-  readonly purpose: {
-    readonly active: boolean;
-    readonly activeForMs: number | null;
-    readonly awaitingResponse: boolean;
-    readonly responseWaitForMs: number | null;
-    readonly retryScheduled: boolean;
-  };
-  readonly body: {
-    readonly connectionState: "not_started" | "connected" | "disconnected";
-    readonly activeOperation: {
-      readonly operation: PlayerOperation["kind"];
-      readonly startedAt: string;
-    } | null;
-    readonly latestOperationPhase: {
-      readonly operation: PlayerOperation["kind"];
-      readonly phase:
-        | "guard_rejected"
-        | "execute_requested"
-        | "admission_waiting"
-        | "admitted"
-        | "dispatch_entered"
-        | "path_progress"
-        | "result";
-      readonly at: string;
-      readonly ageMs: number;
-      readonly inFlight: boolean;
-      readonly admissionObserved: boolean;
-      readonly status: McSkillOutcomeStatus | null;
-      readonly reason:
-        | "runtime_shutting_down"
-        | "owner_stopped"
-        | "action_revision_changed"
-        | "operation_replaced"
-        | "body_recovery_required"
-        | "body_disconnected"
-        | "execution_returned_without_admission"
-        | null;
-      readonly firstPathStatus:
-        "noPath" | "timeout" | "success" | "partial" | null;
-      readonly controlEnabledCount: number | null;
-    } | null;
-    readonly latestObservation: {
-      readonly observedAt: string;
-      readonly ageMs: number;
-      readonly health: number | null;
-    } | null;
-    readonly lastResult: {
-      readonly operation: PlayerOperation["kind"];
-      readonly status: McSkillOutcomeStatus;
-      readonly observedAt: string;
-    } | null;
-  };
-  readonly pendingOwnerProposalCount: number;
-  readonly recentDecisionFailures: readonly {
-    readonly role: "purpose" | "conversation";
-    readonly responseStatus: PlayerAgentRoundActivity["responseStatus"];
-    readonly requestErrorCause?: PlayerAgentRequestErrorCause;
-    readonly rejectionCodes: readonly NonNullable<
-      PlayerAgentToolRoundActivity["resultCode"]
-    >[];
-    readonly ageKnown: false;
-  }[];
+export interface CompanionStatePatch {
+  readonly goal?: CompanionGoal | null | undefined;
+  readonly plan?: CompanionPlan | null | undefined;
+  readonly waitUntil?: string | null | undefined;
+  readonly activeOperation?: CompanionActiveOperation | null | undefined;
+  readonly relationshipSummary?: string | undefined;
+  readonly interests?: readonly string[] | undefined;
 }
 
-export interface PlayerBodyPort {
-  observe(options?: {
-    ownerPositionException?: boolean;
-  }): Promise<PlayerBodyObservation>;
-  execute(
-    operation: PlayerOperation,
-    signal?: AbortSignal,
-  ): Promise<PlayerOperationResult>;
-  stop(): Promise<void>;
-  setDamageReflexEnabled?(enabled: boolean): void;
-  stopActiveOperation?(): Promise<void>;
-  knowledge(query: string): PlayerKnowledge;
-  onEvent(listener: (event: PlayerBodyEvent) => void): () => void;
+/** Model-proposed memories carry no provenance authority. The store verifies ownerQuote. */
+export interface MemoryUpdate {
+  readonly kind: "fact" | "preference" | "interest" | "episode";
+  readonly content: string;
+  readonly importance: number;
+  readonly ownerQuote: string | null;
 }
 
-export interface PlayerMemoryContext {
-  readonly persona: string;
-  readonly ownerUsername: string;
-  readonly relationship: unknown;
-  readonly lifeState: unknown;
-  readonly recalled: readonly unknown[];
+export interface CompanionMemory {
+  readonly id: string;
+  readonly kind: CompanionMemoryKind;
+  readonly content: string;
+  readonly source: CompanionMemorySource;
+  readonly status: CompanionMemoryStatus;
+  readonly importance: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly metadata: JsonValue;
 }
 
-export interface PlayerMemoryPort {
-  context(): PlayerMemoryContext;
-  recall(query: string): readonly unknown[];
-  persistGoals(goals: readonly PlayerGoal[]): void;
-  recordEpisode(input: {
-    readonly summary: string;
-    readonly status: string;
-    readonly operationKind?: string;
-  }): void;
+export interface CompanionRememberOptions {
+  /** Authenticated owner message used only to verify literal ownerQuote evidence. */
+  readonly ownerMessage?: string | undefined;
 }
 
-export interface PlayerSkillReference {
-  readonly skillId: string;
-  readonly version: number;
-  readonly skill: McSkillRecord;
+export type CompanionMessageRole = "owner" | "companion";
+export interface CompanionMessage {
+  readonly sequence: number;
+  readonly role: CompanionMessageRole;
+  readonly text: string;
+  readonly recordedAt: string;
+}
+
+export interface CompanionStoreOptions {
+  readonly ownerUsername?: string | undefined;
+  readonly now?: (() => string) | undefined;
+  readonly maxJournalEntries?: number | undefined;
 }

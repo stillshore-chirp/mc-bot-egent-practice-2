@@ -17,21 +17,19 @@ SPEC.loader.exec_module(MODULE)
 
 
 def test_product_change_selects_only_product_gate() -> None:
-    result = MODULE.classify_paths(["src/runtime/task-service.ts"])
+    result = MODULE.classify_paths(["src/player/runtime.ts"])
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
 
-def test_runtime_summary_script_selects_product_gate() -> None:
-    result = MODULE.classify_paths(["scripts/summarize-runtime-reassessments.ts"])
+def test_clean_build_script_selects_product_gate() -> None:
+    result = MODULE.classify_paths(["scripts/clean-dist.ts"])
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
@@ -41,7 +39,6 @@ def test_format_configuration_selects_product_gate() -> None:
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
@@ -51,7 +48,6 @@ def test_minecraft_version_guide_selects_product_gate() -> None:
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
@@ -62,7 +58,19 @@ def test_minecraft_26_3_migration_guide_selects_only_product_gate() -> None:
     assert result["classification_ok"] is True
     assert result["product"] is True
     assert result["unknown_paths"] == []
-    assert result["browser"] is False
+    assert result["governance"] is False
+    assert result["workflow_contract"] is False
+
+
+@pytest.mark.parametrize("path", ("docs/simplification.md", "vitest.config.ts"))
+def test_simplification_and_test_runner_config_select_product_gate(
+    path: str,
+) -> None:
+    result = MODULE.classify_paths([path])
+
+    assert result["classification_ok"] is True
+    assert result["product"] is True
+    assert result["unknown_paths"] == []
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
@@ -72,7 +80,6 @@ def test_behavior_memory_e2e_guide_selects_product_gate() -> None:
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
@@ -94,17 +101,16 @@ def test_player_architecture_and_acceptance_docs_select_only_product_gate(
     assert result["classification_ok"] is True
     assert result["product"] is True
     assert result["unknown_paths"] == []
-    assert result["browser"] is False
     assert result["governance"] is False
     assert result["workflow_contract"] is False
 
 
-def test_dashboard_change_selects_product_and_browser() -> None:
+def test_dashboard_retirement_change_selects_product_only() -> None:
     result = MODULE.classify_paths(["src/trace/service.ts"])
 
     assert result["classification_ok"] is True
     assert result["product"] is True
-    assert result["browser"] is True
+    assert result["unknown_paths"] == []
 
 
 def test_governance_change_does_not_run_product_gates() -> None:
@@ -113,7 +119,6 @@ def test_governance_change_does_not_run_product_gates() -> None:
     assert result["classification_ok"] is True
     assert result["governance"] is True
     assert result["product"] is False
-    assert result["browser"] is False
 
 
 def test_workflow_change_selects_every_gate() -> None:
@@ -174,7 +179,6 @@ def test_base_construction_contract_selects_product_gate() -> None:
     assert result["classification_ok"] is True
     assert result["product"] is True
     assert result["unknown_paths"] == []
-    assert result["browser"] is False
 
 
 def test_shared_minecraft_fixture_selects_product_gate() -> None:
@@ -183,4 +187,3 @@ def test_shared_minecraft_fixture_selects_product_gate() -> None:
     assert result["classification_ok"] is True
     assert result["product"] is True
     assert result["unknown_paths"] == []
-    assert result["browser"] is False

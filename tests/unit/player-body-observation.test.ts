@@ -3,7 +3,6 @@ import type { Bot } from "mineflayer";
 import minecraftData from "minecraft-data";
 import { describe, expect, it } from "vitest";
 import { observePlayerBody } from "../../src/minecraft/player-body-observation.js";
-import { toObservationEvidence } from "../../src/player/observation-evidence.js";
 import type { Item } from "prismarine-item";
 
 interface FixtureEntity {
@@ -176,6 +175,7 @@ describe("nearby hostile observation", () => {
         mob(6, "player", new Vec3(0, 64, 5), { username: "other" }),
         mob(7, "zombie", new Vec3(0, 64, 17)),
         mob(8, "zombie", new Vec3(0, 64, 6), { type: "player" }),
+        mob(9, "zombie", new Vec3(0, 64, 65)),
       ]),
       undefined,
     );
@@ -183,8 +183,8 @@ describe("nearby hostile observation", () => {
     expect(nearby).toBeDefined();
     expect(nearby?.observedAt).toBe(observation.observedAt);
     expect(nearby?.source).toBe("client_received_unoccluded_nearby_hostiles");
-    expect(nearby?.maxDistance).toBe(16);
-    expect(nearby?.entities.map(({ id }) => id)).toEqual([2, 3]);
+    expect(nearby?.maxDistance).toBe(64);
+    expect(nearby?.entities.map(({ id }) => id)).toEqual([2, 3, 7]);
     expect(observation.perception.entities.map(({ id }) => id)).toContain(2);
     expect(nearby?.entities[1]?.equipment).toEqual({
       mainHand: "iron_sword",
@@ -258,7 +258,7 @@ describe("nearby hostile observation", () => {
 
     expect(nearby?.entities).toHaveLength(16);
     expect(aggregate?.clientReceivedHostileCount).toBe(100);
-    expect(aggregate?.maxDistance).toBe(16);
+    expect(aggregate?.maxDistance).toBe(64);
     expect(aggregate?.worldAbsenceEstablished).toBe(false);
     expect(aggregate?.countScope).toBe(
       "client_entity_table_within_max_distance",
@@ -346,6 +346,45 @@ describe("nearby hostile observation", () => {
   });
 });
 
+describe("owner position and observation range", () => {
+  it("reports only the configured owner's received position and distinguishes visibility", () => {
+    const owner = mob(9, "player", new Vec3(0, 64, -40), {
+      type: "player",
+      username: "Builder",
+    });
+    const bot = makeObservationBot([owner]);
+    Object.assign(bot, { players: { builder: { entity: owner } } });
+
+    const observation = observePlayerBody(bot, "Builder", {
+      ownerPositionException: true,
+    });
+
+    expect(observation.perception.maxDistance).toBe(64);
+    expect(observation.perception.ownerPositionException).toEqual({
+      username: "Builder",
+      position: { x: 0, y: 64, z: -40, dimension: "overworld" },
+      source: "owner_position_exception",
+      currentlyVisible: true,
+    });
+  });
+
+  it("includes a visible entity within 64 blocks and excludes one beyond it", () => {
+    const observation = observePlayerBody(
+      makeObservationBot([
+        mob(2, "cow", new Vec3(0, 64, -40)),
+        mob(3, "cow", new Vec3(0, 64, -65)),
+      ]),
+      undefined,
+    );
+
+    expect(observation.perception.maxDistance).toBe(64);
+    expect(observation.perception.entities.map(({ id }) => id)).toContain(2);
+    expect(observation.perception.entities.map(({ id }) => id)).not.toContain(
+      3,
+    );
+  });
+});
+
 describe("open-window inventory observation", () => {
   it("projects current player slots without exposing container slots or stale items", () => {
     const bot = makeObservationBot([]);
@@ -379,7 +418,6 @@ describe("open-window inventory observation", () => {
     });
 
     const observation = observePlayerBody(bot, undefined);
-    const evidence = toObservationEvidence(observation);
 
     expect(observation.self.inventory).toContainEqual(
       expect.objectContaining({ name: "iron_shears", count: 1, slot: 9 }),
@@ -402,13 +440,6 @@ describe("open-window inventory observation", () => {
     expect(observation.self.equipment.hand).toEqual(
       expect.objectContaining({ name: "diamond_pickaxe", slot: 36 }),
     );
-    expect(evidence.inventoryItems ?? []).toContainEqual({
-      name: "iron_shears",
-      count: 1,
-    });
-    expect(
-      (evidence.inventoryItems ?? []).map(({ name }) => name),
-    ).not.toContain("diamond");
     expect(observation.window?.slots[0]).toEqual(
       expect.objectContaining({ name: "diamond", slot: 0 }),
     );

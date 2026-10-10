@@ -1,4 +1,5 @@
 import { z } from "zod";
+
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 
 const integerFromEnvironment = (minimum: number, maximum: number) =>
@@ -29,23 +30,15 @@ export const environmentSchema = z
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default("info"),
-    MAX_MOVE_DISTANCE: integerFromEnvironment(1, 1_024).default(128),
-    MAX_GATHER_COUNT: integerFromEnvironment(1, 64).default(64),
-    TASK_TIMEOUT_MS: integerFromEnvironment(1_000, 3_600_000).default(900_000),
-    SKILL_RETRY_LIMIT: integerFromEnvironment(0, 10).default(2),
-    FOLLOW_DISTANCE: z.coerce.number().min(2).max(16).default(3),
-    HUNGER_THRESHOLD: integerFromEnvironment(1, 19).default(14),
-    RECONNECT_ENABLED: booleanFromEnvironment.default(true),
-    RECONNECT_MAX_ATTEMPTS: integerFromEnvironment(0, 20).default(5),
-    RECONNECT_DELAY_MS: integerFromEnvironment(250, 60_000).default(5_000),
+    CONNECT_TIMEOUT_MS: integerFromEnvironment(1_000, 300_000).default(60_000),
     MEMORY_CONTEXT_LIMIT: integerFromEnvironment(1, 50).default(12),
     DASHBOARD_ENABLED: booleanFromEnvironment.default(true),
     DASHBOARD_HOST: z.string().trim().default("127.0.0.1"),
     DASHBOARD_PORT: integerFromEnvironment(1, 65_535).default(4_310),
     DASHBOARD_AUTH_TOKEN: optionalTrimmedEnvironment,
-    DASHBOARD_STATIC_DIR: z.string().trim().default("dashboard/dist"),
-    TRACE_RETENTION_DAYS: integerFromEnvironment(1, 3_650).default(30),
-    TRACE_MAX_RUNS: integerFromEnvironment(1, 100_000).default(500),
+    RECONNECT_ENABLED: booleanFromEnvironment.default(true),
+    RECONNECT_MAX_ATTEMPTS: integerFromEnvironment(0, 20).default(5),
+    RECONNECT_DELAY_MS: integerFromEnvironment(250, 60_000).default(5_000),
   })
   .superRefine((environment, context) => {
     if (
@@ -60,10 +53,9 @@ export const environmentSchema = z
         message: "owner and Bot must use different Minecraft identities",
       });
     }
-    const loopback =
-      environment.DASHBOARD_HOST === "127.0.0.1" ||
-      environment.DASHBOARD_HOST === "::1" ||
-      environment.DASHBOARD_HOST === "localhost";
+    const loopback = ["127.0.0.1", "::1", "localhost"].includes(
+      environment.DASHBOARD_HOST,
+    );
     if (
       environment.DASHBOARD_AUTH_TOKEN !== undefined &&
       environment.DASHBOARD_AUTH_TOKEN.length < 32
@@ -74,16 +66,11 @@ export const environmentSchema = z
         message: "dashboard token must contain at least 32 characters",
       });
     }
-    if (
-      environment.DASHBOARD_ENABLED &&
-      !loopback &&
-      environment.DASHBOARD_AUTH_TOKEN === undefined
-    ) {
+    if (!loopback) {
       context.addIssue({
         code: "custom",
-        path: ["DASHBOARD_AUTH_TOKEN"],
-        message:
-          "non-loopback dashboard binding requires an authentication token",
+        path: ["DASHBOARD_HOST"],
+        message: "dashboard only supports loopback binding",
       });
     }
   });
@@ -91,42 +78,32 @@ export const environmentSchema = z
 export type Environment = z.infer<typeof environmentSchema>;
 
 export interface AppConfig {
-  minecraft: {
-    host: string;
-    port: number;
-    username: string;
-    auth: "microsoft" | "offline";
-    version: string;
+  readonly minecraft: {
+    readonly host: string;
+    readonly port: number;
+    readonly username: string;
+    readonly auth: "microsoft" | "offline";
+    readonly version: string;
   };
-  ownerUsername: string;
-  openai: {
-    apiKey: string;
-    model: string;
+  readonly ownerUsername: string;
+  readonly openai: {
+    readonly apiKey: string;
+    readonly model: string;
   };
-  databasePath: string;
-  personaPath: string;
-  logLevel: Environment["LOG_LEVEL"];
-  limits: {
-    maxMoveDistance: number;
-    maxGatherCount: number;
-    taskTimeoutMs: number;
-    skillRetryLimit: number;
-    followDistance: number;
-    hungerThreshold: number;
-    memoryContextLimit: number;
+  readonly databasePath: string;
+  readonly personaPath: string;
+  readonly logLevel: Environment["LOG_LEVEL"];
+  readonly connection: {
+    readonly timeoutMs: number;
+    readonly reconnectEnabled: boolean;
+    readonly reconnectMaxAttempts: number;
+    readonly reconnectDelayMs: number;
   };
-  reconnect: {
-    enabled: boolean;
-    maxAttempts: number;
-    delayMs: number;
-  };
-  dashboard: {
-    enabled: boolean;
-    host: string;
-    port: number;
-    authToken?: string | undefined;
-    staticDirectory: string;
-    maxAgeDays: number;
-    maxTraces: number;
+  readonly memoryContextLimit: number;
+  readonly dashboard: {
+    readonly enabled: boolean;
+    readonly host: string;
+    readonly port: number;
+    readonly authToken?: string | undefined;
   };
 }

@@ -1,58 +1,76 @@
 import { AppError } from "../domain/errors.js";
 import { retry, type RetryPolicy } from "../runtime/retry.js";
-import { createTraceRetryObserver } from "../trace/retry-observer.js";
-import type { TraceService } from "../trace/service.js";
 import { withTimeout } from "../runtime/timeout.js";
-import type { MinecraftPort } from "./port.js";
+
+export interface MinecraftConnectionLifecycle {
+  connect(signal?: AbortSignal): Promise<void>;
+  disconnect(reason?: string): Promise<void>;
+  onDisconnected(listener: (reason: string) => void): () => void;
+}
+
+type ConnectionState =
+  "idle" | "connecting" | "connected" | "reconnecting" | "failed" | "stopped";
 
 export class ConnectionManager {
   private readonly lifetime = new AbortController();
   private unsubscribe: (() => void) | undefined;
+  private connecting: Promise<void> | undefined;
   private reconnecting: Promise<void> | undefined;
   private reconnectFailure: unknown;
-  private connectionState:
-    | "idle"
-    | "connecting"
-    | "connected"
-    | "reconnecting"
-    | "failed"
-    | "stopped" = "idle";
+  private connectionState: ConnectionState = "idle";
 
   public constructor(
-    private readonly minecraft: MinecraftPort,
+    private readonly minecraft: MinecraftConnectionLifecycle,
     private readonly retryPolicy: RetryPolicy,
     private readonly connectTimeoutMs: number,
     private readonly reconnectEnabled = true,
-    private readonly traceService?: TraceService,
   ) {}
 
   public async connect(signal?: AbortSignal): Promise<void> {
+    if (this.connectionState === "stopped") {
+      const reason: unknown = this.lifetime.signal.reason;
+      throw reason instanceof Error
+        ? reason
+        : new Error("Connection manager stopped");
+    }
+    if (this.connectionState === "connected") return Promise.resolve();
+    if (this.connecting !== undefined) return this.connecting;
+
     this.connectionState = "connecting";
     const effectiveSignal =
       signal === undefined
         ? this.lifetime.signal
         : AbortSignal.any([signal, this.lifetime.signal]);
-    try {
-      await this.connectWithRetry(effectiveSignal);
-    } catch (error) {
-      this.connectionState = "failed";
-      throw error;
-    }
-    this.connectionState = "connected";
-    this.armDisconnectListener();
+    const connecting = this.connectWithRetry(effectiveSignal)
+      .then(() => {
+        if (this.lifetime.signal.aborted) return;
+        this.connectionState = "connected";
+        this.armDisconnectListener();
+      })
+      .catch((error: unknown) => {
+        if (!this.lifetime.signal.aborted) this.connectionState = "failed";
+        throw error;
+      })
+      .finally(() => {
+        if (this.connecting === connecting) this.connecting = undefined;
+      });
+    this.connecting = connecting;
+    return connecting;
   }
 
   public get lastReconnectFailure(): unknown {
     return this.reconnectFailure;
   }
 
-  public get state(): typeof this.connectionState {
+  public get state(): ConnectionState {
     return this.connectionState;
   }
 
   public async shutdown(reason = "shutdown"): Promise<void> {
-    this.connectionState = "stopped";
-    this.lifetime.abort(new Error(reason));
+    if (!this.lifetime.signal.aborted) {
+      this.connectionState = "stopped";
+      this.lifetime.abort(new Error(reason));
+    }
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await this.minecraft.disconnect(reason);
@@ -70,7 +88,6 @@ export class ConnectionManager {
       this.retryPolicy,
       (error) => error instanceof AppError && error.detail.retryable,
       signal,
-      createTraceRetryObserver(this.traceService, "minecraft_connection"),
     );
   }
 
@@ -88,25 +105,28 @@ export class ConnectionManager {
         this.reconnectFailure = new AppError({
           category: "connection",
           code: "RECONNECT_DISABLED",
-          message: "The Minecraft connection ended and reconnect is disabled",
+          message: "Minecraft disconnected and reconnect is disabled",
           retryable: false,
         });
         return;
       }
       this.connectionState = "reconnecting";
-      this.reconnecting = this.connectWithRetry(this.lifetime.signal)
+      const reconnecting = this.connectWithRetry(this.lifetime.signal)
         .then(() => {
+          if (this.lifetime.signal.aborted) return;
           this.reconnectFailure = undefined;
           this.connectionState = "connected";
           this.armDisconnectListener();
         })
         .catch((error: unknown) => {
+          if (this.lifetime.signal.aborted) return;
           this.reconnectFailure = error;
           this.connectionState = "failed";
         })
         .finally(() => {
-          this.reconnecting = undefined;
+          if (this.reconnecting === reconnecting) this.reconnecting = undefined;
         });
+      this.reconnecting = reconnecting;
     });
   }
 }
