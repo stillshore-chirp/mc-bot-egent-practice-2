@@ -427,6 +427,78 @@ describe("Minecraft companion connection", () => {
     ).toBeNull();
   });
 
+  it("normalizes bounded drowning air to zero oxygen and rejects invalid bounds", () => {
+    const metadataKeys = ["", "", "", "", "air_supply"];
+    for (const airSupply of [-20, -19, -16, -15, -1, 0]) {
+      expect(
+        oxygenFromEntityMetadata(
+          { entityId: 7, metadata: [{ key: 4, value: airSupply }] },
+          7,
+          metadataKeys,
+        ),
+      ).toBe(0);
+    }
+
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 7, metadata: [{ key: 4, value: 300 }] },
+        7,
+        metadataKeys,
+      ),
+    ).toBe(20);
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 7, metadata: [{ key: 4, value: 285 }] },
+        7,
+        metadataKeys,
+      ),
+    ).toBe(19);
+    for (const airSupply of [-21, 301, 400, Number.NaN, "-16"]) {
+      expect(
+        oxygenFromEntityMetadata(
+          { entityId: 7, metadata: [{ key: 4, value: airSupply }] },
+          7,
+          metadataKeys,
+        ),
+      ).toBeNull();
+    }
+    expect(
+      oxygenFromEntityMetadata(
+        { entityId: 8, metadata: [{ key: 4, value: -16 }] },
+        7,
+        metadataKeys,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("stores zero oxygen from the bot's negative air-supply packet", async () => {
+    const { bot, client: protocolClient } = createFakeBot({
+      namedMetadata: true,
+    });
+    Object.assign(bot.registry.entitiesByName, {
+      player: { metadataKeys: ["", "", "", "", "air_supply"] },
+    });
+    const createBot = mockCreateBots(bot);
+    const minecraft = clientFor();
+    const clientCache = minecraft as unknown as {
+      authoritativeOxygen: number | null | undefined;
+    };
+
+    try {
+      const connecting = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      protocolClient.emit("entity_metadata", {
+        entityId: 1,
+        metadata: [{ key: 4, value: -16 }],
+      });
+      expect(clientCache.authoritativeOxygen).toBe(0);
+      bot.emit("spawn");
+      await connecting;
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
   it("retries retryable connects and reconnects after a disconnect", async () => {
     let disconnectListener: ((reason: string) => void) | undefined;
     const connect = vi

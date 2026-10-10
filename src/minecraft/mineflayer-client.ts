@@ -193,8 +193,9 @@ export function oxygenFromEntityMetadata(
   ) {
     return null;
   }
-  const oxygen = Math.ceil(airSupply.value / 15);
-  return Number.isFinite(oxygen) && oxygen >= 0 && oxygen <= 20 ? oxygen : null;
+  if (airSupply.value < -20 || airSupply.value > 300) return null;
+  const oxygen = Math.max(0, Math.ceil(airSupply.value / 15));
+  return Number.isFinite(oxygen) && oxygen <= 20 ? oxygen : null;
 }
 
 export class MineflayerClient {
