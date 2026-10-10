@@ -2757,7 +2757,7 @@ describe("CompanionRuntime", () => {
     body.observation = makeObservation({
       inventory: [weapon, heldTool],
       equipment: { ...body.observation.self.equipment, hand: heldTool },
-      entities: [target],
+      entities: [],
       nearbyHostiles: makeNearbyHostiles([target]),
     });
     body.executeHandler = async (operation, _signal, fakeBody) => {
@@ -2858,6 +2858,74 @@ describe("CompanionRuntime", () => {
     }
   });
 
+  it("equips an owned enchanted sword through the bounded fallback before retaliation", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const heldTool = gearItem("stick", 36);
+    const enchantedWeapon = {
+      ...gearItem("diamond_sword", 9),
+      enchantments: [{ name: "sharpness", level: 2 }],
+    };
+    const target = hostileEntity(17, 2);
+    body.observation = makeObservation({
+      inventory: [enchantedWeapon, heldTool],
+      equipment: { ...body.observation.self.equipment, hand: heldTool },
+      entities: [],
+      nearbyHostiles: makeNearbyHostiles([target]),
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      if (operation.kind !== "equip")
+        return fakeBody.result(
+          operation,
+          "enchanted-retaliation-attack",
+          "successful",
+          fakeBody.observation,
+        );
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          equipment: {
+            ...before.self.equipment,
+            hand: enchantedWeapon,
+          },
+        },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "enchanted-retaliation-equip",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "attack",
+    );
+
+    expect(body.executed).toEqual([
+      { kind: "equip", item: "diamond_sword", destination: "hand" },
+      { kind: "attack", entityId: target.id },
+    ]);
+    expect(body.results[0]?.after?.self.equipment.hand?.enchantments).toEqual([
+      { name: "sharpness", level: 2 },
+    ]);
+    expect(agent.inputs).toHaveLength(1);
+  });
+
   it("keeps the owner stop authoritative while retaliation weapon equip is in flight", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
@@ -2867,7 +2935,7 @@ describe("CompanionRuntime", () => {
     body.observation = makeObservation({
       inventory: [weapon, heldTool],
       equipment: { ...body.observation.self.equipment, hand: heldTool },
-      entities: [target],
+      entities: [],
       nearbyHostiles: makeNearbyHostiles([target]),
     });
     const agent = new FakeAgent([emptyDecision()]);
@@ -2909,8 +2977,13 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(1);
   });
 
-  it("does not attack after weapon equip fails or the target disappears", async () => {
-    for (const outcome of ["failed", "target-disappeared"] as const) {
+  it("does not attack after weapon equip fails or the hostile is no longer attackable", async () => {
+    for (const outcome of [
+      "failed",
+      "target-disappeared",
+      "target-occluded",
+      "target-far",
+    ] as const) {
       const { store } = freshStore();
       const body = new FakeBody(store);
       const heldTool = gearItem("diamond_pickaxe", 36);
@@ -2919,7 +2992,7 @@ describe("CompanionRuntime", () => {
       body.observation = makeObservation({
         inventory: [weapon, heldTool],
         equipment: { ...body.observation.self.equipment, hand: heldTool },
-        entities: [target],
+        entities: [],
         nearbyHostiles: makeNearbyHostiles([target]),
       });
       body.executeHandler = async (operation, _signal, fakeBody) => {
@@ -2937,9 +3010,23 @@ describe("CompanionRuntime", () => {
             "failed",
             null,
           );
+        const updatedTarget = hostileEntity(
+          target.id,
+          outcome === "target-far" ? 4 : 2,
+        );
         const after = makeObservation({
           inventory: [weapon, heldTool],
-          equipment: { ...fakeBody.observation.self.equipment, hand: weapon },
+          equipment: {
+            ...fakeBody.observation.self.equipment,
+            hand: weapon,
+          },
+          entities: outcome === "target-disappeared" ? [] : [updatedTarget],
+          nearbyHostiles:
+            outcome === "target-disappeared"
+              ? makeNearbyHostiles([])
+              : outcome === "target-occluded"
+                ? makeNearbyHostiles([], 1)
+                : makeNearbyHostiles([updatedTarget]),
         });
         fakeBody.observation = after;
         return fakeBody.result(
@@ -2961,7 +3048,7 @@ describe("CompanionRuntime", () => {
         confidence: "unknown",
       });
       await eventually(() => body.executed.length === 1);
-      if (outcome === "target-disappeared")
+      if (outcome !== "failed")
         await eventually(() => runtime.status().nextWakeAt !== null);
 
       expect(body.executed).toEqual([
