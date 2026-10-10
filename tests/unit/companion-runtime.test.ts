@@ -996,45 +996,31 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(1);
   });
 
-  it("keeps a newer damage burst coalesced when an older reflex is superseded", async () => {
+  it("preserves queued owner chat when a damage burst arrives as a reflex is cancelled", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const agent = new FakeAgent([emptyDecision()]);
     const runtime = createRuntime(store, body, agent);
-    const signals: AbortSignal[] = [];
-    let finishNewReflex: (() => void) | undefined;
+    let reflexSignal: AbortSignal | undefined;
     body.executeHandler = async (operation, signal, fakeBody) => {
-      if (signal !== undefined) signals.push(signal);
-      const attempt = fakeBody.executed.length;
-      if (attempt === 1) {
-        return await new Promise<PlayerOperationResult>((resolve) => {
-          signal?.addEventListener(
-            "abort",
-            () => {
+      reflexSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            for (let index = 0; index < 3; index += 1)
               body.emit({
                 type: "bot_damaged",
                 at: new Date().toISOString(),
                 source: null,
                 confidence: "unknown",
               });
-              resolve(
-                fakeBody.result(operation, "old-reflex", "interrupted", null),
-              );
-            },
-            { once: true },
-          );
-        });
-      }
-      return await new Promise<PlayerOperationResult>((resolve) => {
-        finishNewReflex = () =>
-          resolve(
-            fakeBody.result(
-              operation,
-              "new-reflex",
-              "successful",
-              fakeBody.observation,
-            ),
-          );
+            resolve(
+              fakeBody.result(operation, "old-reflex", "interrupted", null),
+            );
+          },
+          { once: true },
+        );
       });
     };
 
@@ -1047,22 +1033,13 @@ describe("CompanionRuntime", () => {
       confidence: "unknown",
     });
     await eventually(() => body.executed.length === 1);
-    const ownerRequest = runtime.receiveChat("Builder", "状況を教えて");
-    await eventually(() => body.executed.length === 2);
-    body.emit({
-      type: "bot_damaged",
-      at: new Date().toISOString(),
-      source: null,
-      confidence: "unknown",
-    });
+    await runtime.receiveChat("Builder", "状況を教えて");
 
-    expect(signals[0]?.aborted).toBe(true);
-    expect(signals[1]?.aborted).toBe(false);
-    expect(body.executed).toHaveLength(2);
-    finishNewReflex?.();
-    await ownerRequest;
-    expect(store.snapshot().lastOutcome?.status).toBe("successful");
-    expect(body.executed).toHaveLength(2);
+    expect(reflexSignal?.aborted).toBe(true);
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.ownerMessage).toBe("状況を教えて");
+    expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+    expect(body.executed).toHaveLength(1);
   });
 });
 

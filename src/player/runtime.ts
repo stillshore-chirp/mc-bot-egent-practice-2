@@ -775,6 +775,8 @@ export class CompanionRuntime {
       if (
         this.#activeBody?.operation.kind === "attack" ||
         this.#damageReflexPending ||
+        this.#pendingWake?.ownerMessage !== undefined ||
+        this.#pendingWake?.mode === "follow_owner" ||
         this.#isStopped()
       )
         return;
