@@ -37,6 +37,7 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.close();
   for (const directory of temporaryDirectories.splice(0))
     rmSync(directory, { recursive: true, force: true });
+  vi.useRealTimers();
 });
 
 function freshStore(): {
@@ -253,6 +254,19 @@ async function eventually(
       throw new Error("Condition did not become true.");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+async function eventuallyWithFakeTimers(
+  predicate: () => boolean,
+  maxTimerAdvances = 512,
+): Promise<void> {
+  for (let attempt = 0; attempt < maxTimerAdvances; attempt += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+    if (vi.getTimerCount() === 0) await vi.advanceTimersByTimeAsync(1);
+    else await vi.advanceTimersToNextTimerAsync();
+  }
+  if (!predicate()) throw new Error("Condition did not become true.");
 }
 
 type DecisionReply =
@@ -506,6 +520,81 @@ describe("CompanionRuntime", () => {
     await eventually(() => body.executed.length === 2, 4_000);
 
     expect(body.executed[1]).toEqual({ kind: "collect_item", entityId: 34 });
+  });
+
+  it("caps visible failed targets and reuses a cleared slot for a new drop", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const visibleDrops = Array.from({ length: 33 }, (_, index) =>
+      droppedItemEntity(100 + index, (index + 1) / 10, "oak_log", 1),
+    );
+    body.observation = makeObservation({ entities: visibleDrops });
+    const agent = new FakeAgent([]);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      if (operation.kind === "collect_item" && operation.entityId === 133) {
+        const after = {
+          ...fakeBody.observation,
+          self: {
+            ...fakeBody.observation.self,
+            inventory: [
+              {
+                slot: 36,
+                itemId: 17,
+                name: "apple",
+                count: 1,
+                metadata: 0,
+                durability: null,
+                maxDurability: null,
+                customName: null,
+                enchantments: [],
+              },
+            ],
+          },
+          perception: {
+            ...fakeBody.observation.perception,
+            entities: fakeBody.observation.perception.entities.filter(
+              (entity) => entity.id !== 133,
+            ),
+          },
+        };
+        fakeBody.observation = after;
+        return fakeBody.result(operation, "new-drop", "successful", after);
+      }
+      return fakeBody.result(operation, "unavailable-drop", "failed", null);
+    };
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () =>
+        body.executed.length === 32 &&
+        agent.inputs.length >= 32 &&
+        !runtime.status().thinking,
+    );
+    const attemptedItemIds = body.executed.flatMap((operation) =>
+      operation.kind === "collect_item" ? [operation.entityId] : [],
+    );
+    expect(attemptedItemIds).toHaveLength(32);
+    expect(new Set(attemptedItemIds).size).toBe(32);
+
+    const newDrop = droppedItemEntity(133, 0.1, "apple", 1);
+    body.observation = makeObservation({
+      entities: [...visibleDrops.slice(1), newDrop],
+    });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await eventuallyWithFakeTimers(() => body.executed.length === 33);
+
+    expect(body.executed[32]).toEqual({ kind: "collect_item", entityId: 133 });
+    expect(store.snapshot().lastOutcome).toMatchObject({
+      status: "successful",
+      operation: { kind: "collect_item", entityId: 133 },
+    });
+    expect(agent.inputs).toHaveLength(32);
   });
 
   it("lets authenticated owner input supersede an automatic pickup", async () => {

@@ -407,11 +407,30 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
+      const visibleAutomaticPickupTargets = new Set<string>();
+      for (const entity of observation.perception.entities) {
+        const item = entity.droppedItem;
+        if (item !== undefined)
+          visibleAutomaticPickupTargets.add(
+            automaticPickupFingerprint(
+              observation.dimension,
+              entity.id,
+              item.name,
+              item.count,
+            ),
+          );
+      }
+      for (const fingerprint of this.#automaticPickupSuppressed.keys()) {
+        if (!visibleAutomaticPickupTargets.has(fingerprint))
+          this.#automaticPickupSuppressed.delete(fingerprint);
+      }
       if (
         wake.mode === undefined &&
         wake.ownerMessage === undefined &&
         snapshot.plan === null &&
         snapshot.activeOperation === null &&
+        this.#automaticPickupSuppressed.size <
+          automaticPickupSuppressionLimit &&
         observation.self.health !== null &&
         observation.self.health > 0
       ) {
@@ -428,20 +447,23 @@ export class CompanionRuntime {
             return (
               item !== undefined &&
               !this.#automaticPickupSuppressed.has(
-                [observation.dimension, entity.id, item.name, item.count].join(
-                  ":",
+                automaticPickupFingerprint(
+                  observation.dimension,
+                  entity.id,
+                  item.name,
+                  item.count,
                 ),
               )
             );
           });
         if (target?.droppedItem !== undefined) {
           const item = target.droppedItem;
-          const targetKey = [
+          const targetKey = automaticPickupFingerprint(
             observation.dimension,
             target.id,
             item.name,
             item.count,
-          ].join(":");
+          );
           const operation = {
             kind: "collect_item" as const,
             entityId: target.id,
@@ -458,14 +480,6 @@ export class CompanionRuntime {
           };
           this.#store.save({ plan: automaticPlan });
           this.#automaticPickupSuppressed.set(targetKey, true);
-          while (
-            this.#automaticPickupSuppressed.size >
-            automaticPickupSuppressionLimit
-          ) {
-            const oldest = this.#automaticPickupSuppressed.keys().next().value;
-            if (oldest === undefined) break;
-            this.#automaticPickupSuppressed.delete(oldest);
-          }
           await this.#executePlan(
             {
               speech: null,
@@ -1068,6 +1082,15 @@ function outcomeFromResult(
     expectedOutcome,
     observedAt: result.completedAt,
   };
+}
+
+function automaticPickupFingerprint(
+  dimension: string,
+  entityId: number,
+  itemName: string,
+  count: number,
+): string {
+  return JSON.stringify([dimension, entityId, itemName, count]);
 }
 
 function failedBodyResult(
