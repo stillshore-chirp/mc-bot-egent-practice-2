@@ -167,6 +167,121 @@ describe("companion acceptance without paid services", () => {
       store.close();
     }
   });
+
+  it("acts under uncertain visibility for the explicit owner priority and stops before the next move", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "companion-risk-priority-"));
+    temporaryDirectories.push(directory);
+    const store = CompanionStore.open(join(directory, "companion.sqlite3"), {
+      ownerUsername,
+    });
+    const calls: { instructions: string; input: string }[] = [];
+    const spoken: string[] = [];
+    const priorityMessage =
+      "今回は無謀に動くことを最優先して。危険が分からなくても棒立ちせず、見える範囲で探索を始めて。";
+    const body = new FixtureBody();
+    body.blockOperationNumber = 2;
+    const client = {
+      responses: {
+        create: async (request: { instructions: string; input: string }) => {
+          calls.push({
+            instructions: request.instructions,
+            input: request.input,
+          });
+          const input = JSON.parse(request.input) as {
+            ownerMessage?: string | null;
+            observation: {
+              perception: { coverage: string; maxDistance: number };
+            };
+          };
+          const policyApplied =
+            request.instructions.includes(
+              "既定のゲームプレイ方針は、ゲーム内のリスクや失敗を引き受けて能動的に動くことを最優先にすることです。",
+            ) &&
+            request.instructions.includes(
+              "その優先度を慎重さへ読み替えず実行可能な行動に反映してください。",
+            );
+          const requestPreserved =
+            input.ownerMessage === priorityMessage &&
+            input.observation.perception.coverage === "visible_subset" &&
+            input.observation.perception.maxDistance === 24;
+          const output =
+            policyApplied && requestPreserved
+              ? decision({
+                  speech: "了解。まず近くを探索するね。",
+                  goal: {
+                    title: "見える範囲を探索する",
+                    successCondition: "近くへ移動して周囲を調べる",
+                    source: "owner",
+                  },
+                  plan: {
+                    purpose: "不確実な危険だけで立ち止まらず、探索を始める。",
+                    steps: [
+                      {
+                        operation: {
+                          kind: "move_to",
+                          position: { x: 4, y: 64, z: 0 },
+                          range: 1,
+                        },
+                        expectedOutcome:
+                          "近くへ移動したことをBody結果で確認する。",
+                      },
+                      {
+                        operation: {
+                          kind: "move_to",
+                          position: { x: 8, y: 64, z: 0 },
+                          range: 1,
+                        },
+                        expectedOutcome: "次の探索地点へ移動する。",
+                      },
+                    ],
+                  },
+                })
+              : decision({
+                  speech: "周囲の危険が分からないので、ここで待つね。",
+                });
+          return {
+            status: "completed",
+            output_text: JSON.stringify(output),
+          };
+        },
+      },
+    } as unknown as Pick<OpenAI, "responses">;
+    const runtime = createRuntime(store, body, client, spoken);
+
+    try {
+      const ownerTurn = runtime.receiveChat(ownerUsername, priorityMessage);
+      await waitUntil(() => body.operations.length === 2 || calls.length > 0);
+      expect(calls).toHaveLength(1);
+      expect(body.operations).toEqual(["move_to", "move_to"]);
+      expect(body.currentPosition).toEqual({ x: 4, y: 64, z: 0 });
+      expect(store.snapshot().lastOutcome?.status).toBe("successful");
+
+      const request = callAt(calls, 0);
+      const sentInput = parseProviderInput(request.input);
+      expect(sentInput.ownerMessage).toBe(priorityMessage);
+      expect(request.instructions).toContain(
+        "既定のゲームプレイ方針は、ゲーム内のリスクや失敗を引き受けて能動的に動くことを最優先にすることです。",
+      );
+      expect(request.instructions).toContain(
+        "その優先度を慎重さへ読み替えず実行可能な行動に反映してください。",
+      );
+      expect(spoken).not.toContain(
+        "周囲の危険が分からないので、ここで待つね。",
+      );
+
+      await runtime.receiveChat(ownerUsername, "自律行動を止めて");
+      await ownerTurn;
+
+      expect(store.snapshot().stopped).toBe(true);
+      expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+      expect(body.operations).toHaveLength(2);
+      expect(calls).toHaveLength(1);
+    } finally {
+      await runtime.shutdown();
+      await body.stop();
+      store.close();
+    }
+  });
 });
 
 function decision(overrides: Partial<CompanionDecision>): CompanionDecision {
@@ -260,6 +375,7 @@ class FixtureBody implements PlayerBody {
   public currentPosition = { x: 0, y: 64, z: 0 };
   public oakLogCount = 0;
   public oakPlankCount = 0;
+  public blockOperationNumber: number | undefined;
   #itemVisible = true;
   #listener: ((event: PlayerBodyEvent) => void) | undefined;
   #observationSequence = 0;
@@ -345,6 +461,26 @@ class FixtureBody implements PlayerBody {
     signal?.throwIfAborted();
     const before = await this.observe();
     this.operations.push(operation.kind);
+    if (this.blockOperationNumber === this.operations.length) {
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        const interrupt = (): void => {
+          const at = new Date().toISOString();
+          resolve({
+            operationId: `fixture-${this.operations.length}`,
+            operation,
+            status: "interrupted",
+            startedAt: at,
+            completedAt: at,
+            before,
+            after: null,
+            sameLife: true,
+            recoveryRequired: false,
+          });
+        };
+        if (signal?.aborted) interrupt();
+        else signal?.addEventListener("abort", interrupt, { once: true });
+      });
+    }
     switch (operation.kind) {
       case "move_to":
         this.currentPosition = {
@@ -409,6 +545,18 @@ class FixtureBody implements PlayerBody {
     return () => {
       if (this.#listener === listener) this.#listener = undefined;
     };
+  }
+}
+
+async function waitUntil(
+  predicate: () => boolean,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline)
+      throw new Error("Expected fixture state was not reached.");
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
