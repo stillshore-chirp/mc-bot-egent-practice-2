@@ -101,6 +101,17 @@ export interface PlayerBodyNearbyHostiles {
   readonly aggregate?: PlayerBodyNearbyHostileAggregate | undefined;
 }
 
+export interface PlayerBodyNearbyDroppedItems {
+  /** Client-received dropped items, independent of FOV and block occlusion. */
+  readonly source: "client_received_dropped_items";
+  readonly observedAt: string;
+  readonly maxDistance: number;
+  readonly entityOutputLimit: number;
+  readonly omittedEntityCandidates: number;
+  readonly candidateSearchMayBeTruncated: boolean;
+  readonly entities: readonly BodyVisibleEntity[];
+}
+
 export type BodyNearbyHostileDirection =
   | "north"
   | "northeast"
@@ -236,6 +247,8 @@ export interface PlayerBodyObservation {
     readonly entities: readonly BodyVisibleEntity[];
     /** Current client-received nearby hostiles, a visible subset rather than a world census. */
     readonly nearbyHostiles?: PlayerBodyNearbyHostiles | undefined;
+    /** Current client-received drops, independent of FOV and occlusion. */
+    readonly nearbyDroppedItems?: PlayerBodyNearbyDroppedItems | undefined;
     readonly ownerPositionException?: {
       readonly username: string;
       readonly position: BodyPosition;
@@ -1341,6 +1354,29 @@ export function observePlayerBody(
     }),
   };
 
+  const nearbyDroppedItemCandidates = entityCandidates.filter(
+    ({ entity }) => entityName(entity) === "item",
+  );
+  const nearbyDroppedItemDetails = nearbyDroppedItemCandidates
+    .slice(0, entityCandidateLimit)
+    .flatMap(({ entity, distance }) => {
+      const candidate = bodyVisibleEntity(bot, entity, distance, dimension);
+      return candidate.droppedItem === undefined ? [] : [candidate];
+    });
+  const nearbyDroppedItems: PlayerBodyNearbyDroppedItems = {
+    source: "client_received_dropped_items",
+    observedAt,
+    maxDistance: maxVisibleDistance,
+    entityOutputLimit: entityOutputLimit,
+    omittedEntityCandidates: Math.max(
+      0,
+      nearbyDroppedItemDetails.length - entityOutputLimit,
+    ),
+    candidateSearchMayBeTruncated:
+      nearbyDroppedItemCandidates.length > entityCandidateLimit,
+    entities: nearbyDroppedItemDetails.slice(0, entityOutputLimit),
+  };
+
   const inventorySlots = observedInventorySlots(bot);
   const inventory: BodyItemStack[] = inventorySlots.flatMap((item, slot) => {
     const stack = itemStack(item, slot);
@@ -1478,6 +1514,7 @@ export function observePlayerBody(
       placementCandidates: placementObservation.candidates,
       entities: visibleEntities.slice(0, entityOutputLimit),
       nearbyHostiles,
+      nearbyDroppedItems,
       ...(ownerPositionException === undefined
         ? {}
         : { ownerPositionException }),

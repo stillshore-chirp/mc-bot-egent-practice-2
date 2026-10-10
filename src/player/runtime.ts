@@ -44,7 +44,6 @@ const defaultRetryMs = 5_000;
 const worldChangeCoalesceMs = 1_500;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
-const automaticPickupDistance = 6;
 const automaticPickupSuppressionLimit = 32;
 const equipmentChestReach = 4.5;
 const equipmentChestSearchLimit = 4;
@@ -465,11 +464,23 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
-      const visibleAutomaticPickupTargets = new Set<string>();
-      for (const entity of observation.perception.entities) {
+      const nearbyDroppedItems =
+        observation.perception.nearbyDroppedItems?.entities ??
+        observation.perception.entities.filter(
+          (entity) => entity.droppedItem !== undefined,
+        );
+      const automaticPickupRange =
+        observation.perception.nearbyDroppedItems?.maxDistance ??
+        observation.perception.maxDistance;
+      const observedAutomaticPickupTargets = new Set<string>();
+      for (const entity of nearbyDroppedItems) {
         const item = entity.droppedItem;
-        if (item !== undefined)
-          visibleAutomaticPickupTargets.add(
+        if (
+          item !== undefined &&
+          Number.isFinite(entity.distance) &&
+          entity.distance <= automaticPickupRange
+        )
+          observedAutomaticPickupTargets.add(
             automaticPickupFingerprint(
               observation.dimension,
               entity.id,
@@ -479,7 +490,7 @@ export class CompanionRuntime {
           );
       }
       for (const fingerprint of this.#automaticPickupSuppressed.keys()) {
-        if (!visibleAutomaticPickupTargets.has(fingerprint))
+        if (!observedAutomaticPickupTargets.has(fingerprint))
           this.#automaticPickupSuppressed.delete(fingerprint);
       }
       const automaticEquipmentEligible =
@@ -505,12 +516,12 @@ export class CompanionRuntime {
         observation.self.health !== null &&
         observation.self.health > 0
       ) {
-        const target = observation.perception.entities
+        const target = nearbyDroppedItems
           .filter(
             (entity) =>
               entity.droppedItem !== undefined &&
               Number.isFinite(entity.distance) &&
-              entity.distance <= automaticPickupDistance,
+              entity.distance <= automaticPickupRange,
           )
           .sort((left, right) => left.distance - right.distance)
           .find((entity) => {
@@ -1838,6 +1849,21 @@ function nextOperationTargetIsAvailable(
     );
   const visibleEntity = (entityId: number) =>
     observation.perception.entities.some((entity) => entity.id === entityId);
+  const nearbyDroppedItem = (entityId: number) => {
+    const maxDistance =
+      observation.perception.nearbyDroppedItems?.maxDistance ??
+      observation.perception.maxDistance;
+    const candidates =
+      observation.perception.nearbyDroppedItems?.entities ??
+      observation.perception.entities;
+    return candidates.some(
+      (entity) =>
+        entity.id === entityId &&
+        entity.droppedItem !== undefined &&
+        Number.isFinite(entity.distance) &&
+        entity.distance <= maxDistance,
+    );
+  };
   const visibleNamedBlock = (
     position: { x: number; y: number; z: number },
     name: RegExp,
@@ -1852,10 +1878,14 @@ function nextOperationTargetIsAvailable(
 
   switch (operation.kind) {
     case "attack":
-    case "collect_item":
     case "mount":
     case "trade":
       return visibleEntity(operation.entityId);
+    case "collect_item":
+      return (
+        nearbyDroppedItem(operation.entityId) ||
+        visibleEntity(operation.entityId)
+      );
     case "dig":
       return visibleBlockAt(operation.position);
     case "place":
