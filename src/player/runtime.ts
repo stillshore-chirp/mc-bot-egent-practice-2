@@ -74,6 +74,12 @@ interface EquipmentStepResult {
   readonly confirmed: boolean;
 }
 
+interface DamageReflexContext {
+  readonly goalTitle: string | null;
+  readonly goalSuccessCondition: string | null;
+  readonly planPurpose: string | null;
+}
+
 export interface CompanionRuntimeStatus {
   readonly running: boolean;
   readonly stopped: boolean;
@@ -151,6 +157,8 @@ export class CompanionRuntime {
   #worldChangedDuringDecision = false;
   #ownerFollowRequested = false;
   #damageReflexPending = false;
+  #waterRecoveryActive = false;
+  #damageReflexContext: DamageReflexContext | undefined;
   #equipmentUpkeepQueued = false;
   #automaticPickupSuppressed = new Map<string, true>();
   #equipmentChestSuppressed = new Set<string>();
@@ -311,6 +319,8 @@ export class CompanionRuntime {
     this.#runtimeStopLatched = true;
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
+    this.#waterRecoveryActive = false;
+    this.#damageReflexContext = undefined;
     this.#equipmentUpkeepQueued = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
@@ -379,7 +389,10 @@ export class CompanionRuntime {
 
   async #requestWake(wake: PendingWake): Promise<void> {
     if (this.#disposed || this.#isStopped()) return;
-    if (wake.mode !== "damage_reflex") this.#damageReflexPending = false;
+    if (wake.mode !== "damage_reflex") {
+      this.#damageReflexPending = false;
+      this.#damageReflexContext = undefined;
+    }
     if (wake.mode !== "damage_reflex" && wake.mode !== "equipment_upkeep")
       this.#equipmentUpkeepQueued = false;
     if (wake.mode !== "follow_owner") this.#ownerFollowRequested = false;
@@ -744,8 +757,11 @@ export class CompanionRuntime {
         this.#scheduleRetry(wake);
       }
     } finally {
-      if (wake.mode === "damage_reflex" && this.#isCurrent(generation))
+      if (wake.mode === "damage_reflex") {
         this.#damageReflexPending = false;
+        this.#waterRecoveryActive = false;
+        this.#damageReflexContext = undefined;
+      }
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
     }
   }
@@ -1608,6 +1624,7 @@ export class CompanionRuntime {
     if (this.#disposed || !this.#started) return;
     if (event.type === "bot_damaged") {
       if (
+        this.#waterRecoveryActive ||
         this.#activeBody?.operation.kind === "attack" ||
         this.#damageReflexPending ||
         this.#pendingWake?.ownerMessage !== undefined ||
@@ -1615,6 +1632,16 @@ export class CompanionRuntime {
         this.#isStopped()
       )
         return;
+      try {
+        const snapshot = this.#store.snapshot();
+        this.#damageReflexContext = {
+          goalTitle: snapshot.goal?.title ?? null,
+          goalSuccessCondition: snapshot.goal?.successCondition ?? null,
+          planPurpose: snapshot.plan?.purpose ?? null,
+        };
+      } catch {
+        this.#damageReflexContext = undefined;
+      }
       this.#damageReflexPending = true;
       this.#fireWake({
         reason: "damage received; react from a fresh Body observation",
@@ -1672,6 +1699,49 @@ export class CompanionRuntime {
     snapshot: CompanionSnapshot,
     observation: PlayerBodyObservation,
   ): CompanionDecision {
+    const lowOxygenWater =
+      observation.self.inWater === true &&
+      observation.self.oxygen !== null &&
+      observation.self.oxygen <= 5;
+    if (lowOxygenWater) {
+      this.#waterRecoveryActive = true;
+      const context = this.#damageReflexContext;
+      const memoryContent = context
+        ? waterRecoveryMemoryContent(context)
+        : null;
+      return {
+        speech: null,
+        goal: snapshot.goal,
+        plan: {
+          purpose: "Rise toward the surface after damage with low oxygen.",
+          steps: [
+            {
+              operation: {
+                kind: "control",
+                controls: { jump: true },
+                ticks: 40,
+              },
+              expectedOutcome:
+                "Use a bounded jump to rise; confirm the result with a fresh Body observation.",
+            },
+          ],
+        },
+        memoryUpdates:
+          memoryContent === null
+            ? []
+            : [
+                {
+                  kind: "episode",
+                  content: memoryContent,
+                  importance: 4,
+                  ownerQuote: null,
+                },
+              ],
+        relationshipSummary: null,
+        waitMs: Math.max(minimumWaitMs, this.#minWaitMs),
+        knowledgeQuery: null,
+      };
+    }
     const target = (observation.perception.nearbyHostiles?.entities ?? [])
       .filter(
         (entity) =>
@@ -1803,6 +1873,27 @@ export class CompanionRuntime {
     this.#wakeAt = null;
     this.#wakeReason = null;
   }
+}
+
+function waterRecoveryMemoryContent(
+  context: DamageReflexContext,
+): string | null {
+  const bounded = (value: string | null, maximum: number): string => {
+    if (value === null) return "未記録";
+    const trimmed = value.trim();
+    if (
+      /(?:api[_ -]?key|authorization|bearer|password|private[_ -]?key|secret)/iu.test(
+        trimmed,
+      ) ||
+      /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/u.test(
+        trimmed,
+      )
+    )
+      return "未記録";
+    return trimmed.slice(0, maximum) || "未記録";
+  };
+  const content = `水の中で酸素5以下の被ダメージ反応。中断直前の保存goal title=${bounded(context.goalTitle, 56)}; success=${bounded(context.goalSuccessCondition, 44)}; plan.purpose=${bounded(context.planPurpose, 92)}。回復判断は2秒jump浮上。水に入った当初の理由は未記録。`;
+  return content.length <= 320 ? content : content.slice(0, 320);
 }
 
 function outcomeFromResult(
