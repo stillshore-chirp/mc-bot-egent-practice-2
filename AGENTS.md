@@ -16,6 +16,7 @@
 | 製品の設計heuristic | [docs/agent-principles.md](docs/agent-principles.md) |
 | ルール配置、evidence、task-state、instruction budget | [docs/agent-harness.md](docs/agent-harness.md) |
 | 実環境のMinecraft・bot・LLM・記憶 | [.agents/skills/production-investigation/SKILL.md](.agents/skills/production-investigation/SKILL.md) |
+| ユーザーやBotの発言内容の確認 | [.agents/skills/companion-conversation-inspection/SKILL.md](.agents/skills/companion-conversation-inspection/SKILL.md) |
 | GitHub上のIssue・PRに記載する製品根拠 | [.agents/skills/github-delivery/SKILL.md](.agents/skills/github-delivery/SKILL.md) |
 | gitへ入る文書や証跡の公開安全性 | [.agents/skills/security-publication/SKILL.md](.agents/skills/security-publication/SKILL.md) |
 | rule・Skill・adapter・validator | [docs/ai-governance/13-maintenance-policy.md](docs/ai-governance/13-maintenance-policy.md) |

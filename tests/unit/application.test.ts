@@ -12,14 +12,22 @@ import {
 } from "../../src/app/application.js";
 
 describe("outgoing Minecraft chat normalization", () => {
-  it("prevents slash-leading commands on every line and keeps text bounded", () => {
+  it("prevents slash-leading commands and keeps up to 2000 characters", () => {
     const guard = "\u200B";
     expect(sanitizeMinecraftChatText("/cmd")).toBe(`${guard}/cmd`);
     expect(sanitizeMinecraftChatText("\n/cmd")).toBe(`${guard}/cmd`);
     expect(sanitizeMinecraftChatText("first\r\n/cmd")).toBe(
       `first ${guard}/cmd`,
     );
-    expect(sanitizeMinecraftChatText("a".repeat(241))).toHaveLength(240);
+    expect(sanitizeMinecraftChatText("a".repeat(240))).toHaveLength(240);
+    expect(sanitizeMinecraftChatText("a".repeat(2_000))).toHaveLength(2_000);
+    expect(sanitizeMinecraftChatText("a".repeat(2_001))).toHaveLength(2_000);
+    expect(sanitizeMinecraftChatText(`${"a".repeat(1_998)}🙂`)).toHaveLength(
+      2_000,
+    );
+    expect(sanitizeMinecraftChatText(`${"a".repeat(1_999)}🙂`)).toBe(
+      "a".repeat(1_999),
+    );
     expect(sanitizeMinecraftChatText("Hello there.")).toBe("Hello there.");
   });
 });

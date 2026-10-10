@@ -187,6 +187,26 @@ function hasRequiredNullableProperty(
 }
 
 describe("CompanionAgent", () => {
+  it("accepts speech up to 2000 characters and rejects longer speech", () => {
+    const validOutput = {
+      speech: "a".repeat(2_000),
+      goal: null,
+      plan: null,
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 10_000,
+      knowledgeQuery: null,
+    };
+
+    expect(companionDecisionSchema.safeParse(validOutput).success).toBe(true);
+    expect(
+      companionDecisionSchema.safeParse({
+        ...validOutput,
+        speech: "a".repeat(2_001),
+      }).success,
+    ).toBe(false);
+  });
+
   it("uses one strict response, keeps prior context, and restores omitted optional operation fields", async () => {
     const output = {
       speech: null,
