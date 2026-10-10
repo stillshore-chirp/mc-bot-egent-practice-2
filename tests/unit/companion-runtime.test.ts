@@ -66,6 +66,9 @@ function failStopPersistence(store: CompanionStore): void {
 function makeObservation(
   options: {
     readonly health?: number | null;
+    readonly inLava?: boolean | null;
+    readonly onFire?: boolean | null;
+    readonly suffocating?: boolean | null;
     readonly inventory?: readonly BodyItemStack[];
     readonly equipment?: PlayerBodyObservation["self"]["equipment"];
     readonly blocks?: readonly BodyVisibleBlock[];
@@ -93,9 +96,10 @@ function makeObservation(
       foodSaturation: 5,
       oxygen: 20,
       inWater: false,
-      inLava: false,
-      onFire: false,
-      suffocating: false,
+      inLava: options.inLava === undefined ? false : options.inLava,
+      onFire: options.onFire === undefined ? false : options.onFire,
+      suffocating:
+        options.suffocating === undefined ? false : options.suffocating,
       sleeping: false,
       mountedEntityId: null,
       gameMode: "survival",
@@ -517,6 +521,150 @@ describe("CompanionRuntime", () => {
     expect(body.results[0]?.after?.self.equipment.head?.name).toBe(
       "diamond_helmet",
     );
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("autonomously retrieves and equips armor when surrounding danger is unknown", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const current = gearItem("iron_chestplate", 5, 60);
+    const candidate = gearItem("diamond_chestplate", 0);
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({
+      inLava: null,
+      onFire: null,
+      suffocating: null,
+      blocks: [block],
+      equipment: { torso: current },
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after: PlayerBodyObservation;
+      switch (operation.kind) {
+        case "open_window":
+          after = { ...before, window: chestWindow(candidate) };
+          break;
+        case "window_transfer": {
+          const owned = gearItem(candidate.name, 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          after = { ...before, window: null };
+          break;
+        case "equip": {
+          const owned = before.self.inventory.find(
+            (item) => item.name === operation.item,
+          );
+          if (owned === undefined)
+            throw new Error("Expected chest armor in inventory");
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              inventory: before.self.inventory.filter(
+                (item) => item.name !== operation.item,
+              ),
+              equipment: {
+                ...before.self.equipment,
+                [operation.destination]: { ...owned, slot: 5 },
+              },
+            },
+          };
+          break;
+        }
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `unknown-hazard-equipment-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 4, 4_000);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "equip",
+    ]);
+    expect(body.results[0]?.before?.self).toMatchObject({
+      health: 20,
+      inLava: null,
+      onFire: null,
+      suffocating: null,
+    });
+    expect(body.results[0]?.before?.perception.nearbyHostiles).toBeUndefined();
+    expect(body.results[3]?.after?.self.equipment.torso?.name).toBe(
+      "diamond_chestplate",
+    );
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("does not start autonomous equipment upkeep when self health is unknown", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({ health: null, blocks: [block] });
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    expect(body.executed).toHaveLength(0);
+  });
+
+  it("keeps an owner-latched stop effective after inventory changes and gear requests", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const equipped = gearItem("iron_helmet", 5);
+    const candidate = gearItem("diamond_helmet", 9);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    await runtime.stop("Builder");
+    body.observation = makeObservation({
+      inventory: [candidate],
+      equipment: { head: equipped },
+    });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+    await runtime.receiveChat("Builder", "装備を探して");
+
+    expect(store.snapshot().stopped).toBe(true);
+    expect(runtime.status().stopped).toBe(true);
+    expect(body.executed).toHaveLength(0);
     expect(agent.inputs).toHaveLength(1);
   });
 
