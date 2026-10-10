@@ -230,6 +230,31 @@ function bestItem(
   return best;
 }
 
+function firstOperableNamedWeapon(
+  items: readonly BodyItemStack[],
+  excludedSlots: ReadonlySet<number>,
+): BodyItemStack | undefined {
+  const seenNames = new Set<string>();
+  for (const item of [...items].sort((left, right) => left.slot - right.slot)) {
+    if (seenNames.has(item.name)) continue;
+    seenNames.add(item.name);
+    if (
+      !Object.hasOwn(weaponSpecs, item.name) ||
+      excludedSlots.has(item.slot) ||
+      item.count !== 1 ||
+      item.metadata !== 0 ||
+      item.maxDurability === null ||
+      item.durability === null ||
+      item.maxDurability <= 0 ||
+      item.durability <= 0 ||
+      item.durability > item.maxDurability
+    )
+      continue;
+    return item;
+  }
+  return undefined;
+}
+
 function equippedArmorSlots(
   equipment: Readonly<Record<string, BodyItemStack | null>>,
 ): ReadonlySet<number> {
@@ -326,12 +351,25 @@ export function findRetaliationWeaponUpgrade(
     "hand",
     equippedArmorSlots(observation.self.equipment),
   );
-  if (
-    best === undefined ||
-    (currentRank !== null && compareRanks(best.rank, currentRank) <= 0)
-  )
-    return null;
-  return { item: best.item, destination: "hand" };
+  if (best !== undefined) {
+    if (currentRank !== null && compareRanks(best.rank, currentRank) <= 0)
+      return null;
+    return { item: best.item, destination: "hand" };
+  }
+
+  // The ranker deliberately excludes enchanted and custom-named items. When
+  // there is no rankable candidate, still use a known, operable sword or axe
+  // if the hand is empty, a tool, or a broken weapon. Keep an unrankable usable
+  // weapon already in hand, and keep Body's first-name source-order behavior.
+  const handNeedsFallback = handSpec === undefined || hand?.durability === 0;
+  if (!handNeedsFallback) return null;
+  const fallback = firstOperableNamedWeapon(
+    playerInventory,
+    equippedArmorSlots(observation.self.equipment),
+  );
+  return fallback === undefined
+    ? null
+    : { item: fallback, destination: "hand" };
 }
 
 export function findChestEquipmentWithdrawal(

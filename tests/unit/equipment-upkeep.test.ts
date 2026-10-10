@@ -168,6 +168,42 @@ describe("deterministic equipment upkeep", () => {
     ).toBeNull();
   });
 
+  it("uses the first owned known enchanted weapon only when the hand needs a fallback", () => {
+    const enchanted = item("diamond_sword", 9, {
+      enchantments: [{ name: "sharpness", level: 2 }],
+    });
+    const laterDuplicate = item("diamond_sword", 10);
+    const heldTool = item("stick", 36);
+    const brokenSword = item("iron_sword", 36, { durability: 0 });
+    const heldEnchantedSword = item("iron_sword", 36, {
+      enchantments: [{ name: "unbreaking", level: 1 }],
+    });
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [enchanted, laterDuplicate],
+          equipment: { hand: heldTool },
+        }),
+      ),
+    ).toEqual({ item: enchanted, destination: "hand" });
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [enchanted, brokenSword],
+          equipment: { hand: brokenSword },
+        }),
+      ),
+    ).toEqual({ item: enchanted, destination: "hand" });
+    expect(
+      findRetaliationWeaponUpgrade(
+        observation({
+          inventory: [enchanted, heldEnchantedSword],
+          equipment: { hand: heldEnchantedSword },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("does not exchange equal, unknown, broken, or enchanted equipment", () => {
     const cases = [
       {
