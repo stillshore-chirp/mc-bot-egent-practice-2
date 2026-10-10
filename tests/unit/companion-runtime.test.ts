@@ -228,6 +228,19 @@ function hostileEntity(id: number, x: number) {
   } as const;
 }
 
+function equipmentChestBlock(
+  x: number,
+  distance = Math.abs(x),
+): BodyVisibleBlock {
+  return {
+    name: "minecraft:chest",
+    stateId: 1,
+    position: { x, y: 64, z: 0, dimension: "overworld" },
+    distance,
+    properties: {},
+  };
+}
+
 function makeNearbyHostiles(
   entities: PlayerBodyObservation["perception"]["entities"],
   occludedCount = 0,
@@ -1187,29 +1200,269 @@ describe("CompanionRuntime", () => {
 
     await runtime.start();
     await eventually(
-      () => body.executed.length === 1 && !runtime.status().thinking,
+      () => body.executed.length === 2 && !runtime.status().thinking,
       4_000,
     );
 
-    expect(body.executed).toEqual([{ kind: "collect_item", entityId: 41 }]);
+    expect(body.executed).toEqual([
+      { kind: "collect_item", entityId: 41 },
+      { kind: "equip", item: "diamond_helmet", destination: "head" },
+    ]);
     expect(agent.inputs).toHaveLength(0);
-    expect(body.observation.self.inventory).toEqual([candidate]);
-
-    body.emit({
-      type: "state_changed",
-      at: new Date().toISOString(),
-      reason: "inventory",
-    });
-    await eventually(() => body.executed.length === 2, 4_000);
-
-    expect(body.executed[1]).toEqual({
-      kind: "equip",
-      item: "diamond_helmet",
-      destination: "head",
-    });
     expect(body.observation.self.inventory).toHaveLength(0);
     expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
-    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it.each([25, 32])(
+    "prioritizes a nearby equipment drop at %i blocks over a chest and ordinary drops",
+    async (dropDistance) => {
+      const { store } = freshStore();
+      const candidate = gearItem("diamond_helmet", 9);
+      const body = new FakeBody(store);
+      body.observation = makeObservation({
+        equipment: {
+          ...body.observation.self.equipment,
+          head: gearItem("iron_helmet", 5, 60),
+        },
+        blocks: [equipmentChestBlock(20)],
+        nearbyDroppedItems: makeNearbyDroppedItems([
+          droppedItemEntity(71, dropDistance, "diamond_helmet", 1),
+          droppedItemEntity(72, 1, "oak_log", 1),
+        ]),
+      });
+      const runtime = createRuntime(store, body, new FakeAgent([]));
+      body.executeHandler = async (operation, _signal, fakeBody) => {
+        const before = fakeBody.observation;
+        let after: PlayerBodyObservation;
+        switch (operation.kind) {
+          case "collect_item":
+            after = {
+              ...before,
+              self: { ...before.self, inventory: [candidate] },
+              perception: {
+                ...before.perception,
+                nearbyDroppedItems: makeNearbyDroppedItems(
+                  before.perception.nearbyDroppedItems?.entities.filter(
+                    (entity) => entity.id !== operation.entityId,
+                  ) ?? [],
+                ),
+              },
+            };
+            break;
+          case "equip":
+            after = {
+              ...before,
+              self: {
+                ...before.self,
+                inventory: [],
+                equipment: {
+                  ...before.self.equipment,
+                  [operation.destination]: { ...candidate, slot: 5 },
+                },
+              },
+            };
+            break;
+          case "move_to":
+            after = {
+              ...before,
+              self: {
+                ...before.self,
+                position: { x: 18, y: 64, z: 0, dimension: "overworld" },
+              },
+              perception: {
+                ...before.perception,
+                blocks: [equipmentChestBlock(20, 2)],
+              },
+            };
+            break;
+          case "open_window":
+            after = { ...before, window: chestWindow(null) };
+            break;
+          case "window_close":
+            after = { ...before, window: null };
+            break;
+          default:
+            throw new Error(`Unexpected operation: ${operation.kind}`);
+        }
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          `equipment-priority-${fakeBody.executed.length}`,
+          "successful",
+          after,
+          before,
+        );
+      };
+
+      await runtime.start();
+      await eventually(() => body.executed.length >= 4, 4_000);
+
+      expect(body.executed.slice(0, 2)).toEqual([
+        { kind: "collect_item", entityId: 71 },
+        { kind: "equip", item: "diamond_helmet", destination: "head" },
+      ]);
+      expect(
+        body.executed.some(
+          (operation) =>
+            operation.kind === "collect_item" && operation.entityId === 72,
+        ),
+      ).toBe(false);
+      expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+      expect(body.results[1]?.after?.self.equipment.head?.name).toBe(
+        "diamond_helmet",
+      );
+    },
+  );
+
+  it("approaches a nearby chest and verifies it before searching ahead of distant equipment", async () => {
+    const { store } = freshStore();
+    const candidate = gearItem("diamond_helmet", 0);
+    const distantDrop = droppedItemEntity(73, -50, "netherite_sword", 1);
+    const body = new FakeBody(store);
+    body.observation = makeObservation({
+      equipment: {
+        ...body.observation.self.equipment,
+        head: gearItem("iron_helmet", 5, 60),
+      },
+      blocks: [equipmentChestBlock(20)],
+      nearbyDroppedItems: makeNearbyDroppedItems([distantDrop]),
+    });
+    const runtime = createRuntime(store, body, new FakeAgent([]));
+    let openPositionX: number | undefined;
+    let openChestDistance: number | undefined;
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after: PlayerBodyObservation;
+      switch (operation.kind) {
+        case "move_to":
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              position: { x: 18, y: 64, z: 0, dimension: "overworld" },
+            },
+            perception: {
+              ...before.perception,
+              blocks: [equipmentChestBlock(20, 2)],
+              nearbyDroppedItems: makeNearbyDroppedItems([
+                { ...distantDrop, distance: 68 },
+              ]),
+            },
+          };
+          break;
+        case "open_window":
+          openPositionX = before.self.position.x;
+          openChestDistance = before.perception.blocks[0]?.distance;
+          after = { ...before, window: chestWindow(candidate) };
+          break;
+        case "window_transfer": {
+          const owned = gearItem(candidate.name, 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          after = { ...before, window: null };
+          break;
+        case "equip": {
+          const owned = before.self.inventory.find(
+            (item) => item.name === operation.item,
+          );
+          if (owned === undefined)
+            throw new Error("Expected chest equipment in inventory");
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              inventory: [],
+              equipment: {
+                ...before.self.equipment,
+                [operation.destination]: { ...owned, slot: 5 },
+              },
+            },
+          };
+          break;
+        }
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `chest-priority-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 5, 4_000);
+
+    expect(body.executed).toEqual([
+      {
+        kind: "move_to",
+        position: { x: 20, y: 64, z: 0 },
+        range: 2.5,
+      },
+      {
+        kind: "open_window",
+        target: {
+          kind: "block",
+          position: { x: 20, y: 64, z: 0 },
+        },
+      },
+      {
+        kind: "window_transfer",
+        item: "diamond_helmet",
+        count: 1,
+        direction: "window_to_inventory",
+      },
+      { kind: "window_close" },
+      { kind: "equip", item: "diamond_helmet", destination: "head" },
+    ]);
+    expect(openPositionX).toBe(18);
+    expect(openChestDistance).toBe(2);
+    expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+  });
+
+  it("does not open a chest when the owner stops during its approach", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = makeObservation({ blocks: [equipmentChestBlock(20)] });
+    const runtime = createRuntime(store, body, new FakeAgent([]));
+    let moveSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind !== "move_to")
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      moveSignal = signal;
+      return await new Promise<PlayerOperationResult>((resolve) => {
+        const finish = (): void =>
+          resolve(
+            fakeBody.result(
+              operation,
+              "chest-approach-stopped",
+              "interrupted",
+              null,
+            ),
+          );
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    await runtime.stop("Builder");
+
+    expect(moveSignal?.aborted).toBe(true);
+    expect(body.executed).toEqual([
+      { kind: "move_to", position: { x: 20, y: 64, z: 0 }, range: 2.5 },
+    ]);
+    expect(store.snapshot().stopped).toBe(true);
   });
 
   it("does not collect a candidate beyond the observation range", async () => {

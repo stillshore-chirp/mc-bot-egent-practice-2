@@ -5,6 +5,7 @@ import type { Logger } from "pino";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
 import type {
   BodyItemStack,
+  BodyVisibleEntity,
   BodyVisibleBlock,
   BodyWindowSnapshot,
 } from "../minecraft/player-body-observation.js";
@@ -33,6 +34,7 @@ import {
   type EquipmentUpgradeCandidate,
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
+  equipmentDestinationForName,
   isChestEquipmentWindow,
 } from "./equipment-upkeep.js";
 import { isImmediateStopCommand } from "./stop-command.js";
@@ -46,6 +48,8 @@ const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
 const automaticPickupSuppressionLimit = 32;
 const equipmentChestReach = 4.5;
+const equipmentSearchRange = 32;
+const equipmentChestMoveRange = 2.5;
 const equipmentChestSearchLimit = 4;
 const equipmentChestSuppressionLimit = 64;
 const equipmentUpkeepStepLimit = 5;
@@ -793,6 +797,7 @@ export class CompanionRuntime {
     let windowMayBeOpen = false;
     let swept = false;
     let equipmentChanges = 0;
+    let equipmentDropsCollected = 0;
     const confirmedItems: string[] = [];
 
     try {
@@ -803,66 +808,142 @@ export class CompanionRuntime {
       ) {
         uncertain = explicit;
       } else {
+        const equipInventoryUpgrades = async (): Promise<boolean> => {
+          while (
+            equipmentChanges + equipmentDropsCollected <
+              equipmentUpkeepStepLimit &&
+            this.#isCurrent(generation) &&
+            !this.#isStopped() &&
+            isSafeForEquipmentUpkeep(observation)
+          ) {
+            const upgrade = findInventoryEquipmentUpgrade(observation);
+            if (upgrade === null) return true;
+            const candidateFingerprint = equipmentCandidateFingerprint(
+              observation,
+              upgrade,
+            );
+            if (
+              this.#failedEquipmentCandidateFingerprint === candidateFingerprint
+            ) {
+              uncertain = true;
+              return false;
+            }
+            attemptedGearWork = true;
+            const before = observation;
+            const step = await this.#executeEquipmentAction(
+              {
+                kind: "equip",
+                item: upgrade.item.name,
+                destination: upgrade.destination,
+              },
+              "Equip a strictly better observed armor or combat weapon item.",
+              generation,
+            );
+            if (
+              !step.confirmed ||
+              step.observation === null ||
+              !sameItemQuality(
+                step.observation.self.equipment[upgrade.destination] ?? null,
+                upgrade.item,
+              )
+            ) {
+              this.#failedEquipmentCandidateFingerprint =
+                equipmentCandidateFingerprint(
+                  step.observation ?? before,
+                  upgrade,
+                );
+              uncertain = true;
+              return false;
+            }
+            if (!canContinuePlan(before, step.observation, undefined)) {
+              this.#failedEquipmentCandidateFingerprint =
+                equipmentCandidateFingerprint(step.observation, upgrade);
+              uncertain = true;
+              return false;
+            }
+            observation = step.observation;
+            this.#failedEquipmentCandidateFingerprint = undefined;
+            confirmedItems.push(upgrade.item.name);
+            equipmentChanges += 1;
+          }
+          return this.#isCurrent(generation) && !this.#isStopped();
+        };
+
+        const collectEquipmentDrop = async (
+          candidates: readonly BodyVisibleEntity[],
+        ): Promise<boolean> => {
+          if (
+            equipmentChanges + equipmentDropsCollected >=
+              equipmentUpkeepStepLimit ||
+            !this.#isCurrent(generation) ||
+            this.#isStopped() ||
+            !isSafeForEquipmentUpkeep(observation) ||
+            this.#automaticPickupSuppressed.size >=
+              automaticPickupSuppressionLimit
+          )
+            return false;
+          const currentDrops = visibleDroppedItems(observation);
+          for (const candidate of candidates) {
+            const item = candidate.droppedItem;
+            if (item === undefined) continue;
+            const target = currentDrops.find(
+              (current) =>
+                current.id === candidate.id &&
+                current.droppedItem?.name === item.name &&
+                current.droppedItem.count === item.count &&
+                Number.isFinite(current.distance) &&
+                current.distance <=
+                  (observation.perception.nearbyDroppedItems?.maxDistance ??
+                    observation.perception.maxDistance),
+            );
+            if (target === undefined) continue;
+            const targetKey = automaticPickupFingerprint(
+              observation.dimension,
+              target.id,
+              item.name,
+              item.count,
+            );
+            if (this.#automaticPickupSuppressed.has(targetKey)) continue;
+            this.#automaticPickupSuppressed.set(targetKey, true);
+            attemptedGearWork = true;
+            const before = observation;
+            const step = await this.#executeEquipmentAction(
+              { kind: "collect_item", entityId: target.id },
+              "Collect one observed equipment item, then confirm it in inventory before equipping.",
+              generation,
+            );
+            if (
+              !step.confirmed ||
+              step.observation === null ||
+              !hasInventoryItemName(step.observation, item.name) ||
+              !canContinuePlan(before, step.observation, undefined)
+            ) {
+              uncertain = true;
+              return false;
+            }
+            observation = step.observation;
+            equipmentDropsCollected += 1;
+            return true;
+          }
+          return false;
+        };
+
+        let equipmentUpgradesConfirmed = await equipInventoryUpgrades();
         while (
-          equipmentChanges < equipmentUpkeepStepLimit &&
-          this.#isCurrent(generation) &&
-          !this.#isStopped() &&
-          isSafeForEquipmentUpkeep(observation)
+          equipmentUpgradesConfirmed &&
+          equipmentChanges + equipmentDropsCollected < equipmentUpkeepStepLimit
         ) {
-          const upgrade = findInventoryEquipmentUpgrade(observation);
-          if (upgrade === null) break;
-          const candidateFingerprint = equipmentCandidateFingerprint(
+          const nearbyEquipmentDrops = equipmentDropCandidates(
             observation,
-            upgrade,
-          );
-          if (
-            this.#failedEquipmentCandidateFingerprint === candidateFingerprint
-          ) {
-            uncertain = true;
-            break;
-          }
-          attemptedGearWork = true;
-          const before = observation;
-          const step = await this.#executeEquipmentAction(
-            {
-              kind: "equip",
-              item: upgrade.item.name,
-              destination: upgrade.destination,
-            },
-            "Equip a strictly better observed armor or combat weapon item.",
-            generation,
-          );
-          if (
-            !step.confirmed ||
-            step.observation === null ||
-            !sameItemQuality(
-              step.observation.self.equipment[upgrade.destination] ?? null,
-              upgrade.item,
-            )
-          ) {
-            this.#failedEquipmentCandidateFingerprint =
-              equipmentCandidateFingerprint(
-                step.observation ?? before,
-                upgrade,
-              );
-            uncertain = true;
-            break;
-          }
-          if (!canContinuePlan(before, step.observation, undefined)) {
-            this.#failedEquipmentCandidateFingerprint =
-              equipmentCandidateFingerprint(step.observation, upgrade);
-            uncertain = true;
-            break;
-          }
-          observation = step.observation;
-          this.#failedEquipmentCandidateFingerprint = undefined;
-          confirmedItems.push(upgrade.item.name);
-          equipmentChanges += 1;
+          ).filter((entity) => entity.distance <= equipmentSearchRange);
+          if (!(await collectEquipmentDrop(nearbyEquipmentDrops))) break;
+          equipmentUpgradesConfirmed = await equipInventoryUpgrades();
         }
 
         if (
           explicit &&
-          equipmentChanges < equipmentUpkeepStepLimit &&
+          equipmentChanges + equipmentDropsCollected <
+            equipmentUpkeepStepLimit &&
           visibleEquipmentChests(observation).length === 0 &&
           this.#isCurrent(generation) &&
           !this.#isStopped()
@@ -880,23 +961,37 @@ export class CompanionRuntime {
           }
         }
 
-        if (!uncertain && equipmentChanges < equipmentUpkeepStepLimit) {
-          const chests = visibleEquipmentChests(observation).filter(
-            (block) =>
-              !this.#equipmentChestSuppressed.has(
-                equipmentChestFingerprint(observation.dimension, block),
-              ),
-          );
+        if (
+          !uncertain &&
+          equipmentChanges + equipmentDropsCollected < equipmentUpkeepStepLimit
+        ) {
           let inspected = 0;
-          for (const block of chests) {
+          while (
+            inspected < equipmentChestSearchLimit &&
+            this.#isCurrent(generation) &&
+            !this.#isStopped() &&
+            isSafeForEquipmentUpkeep(observation) &&
+            equipmentChanges + equipmentDropsCollected <
+              equipmentUpkeepStepLimit
+          ) {
+            const nearbyEquipmentDrops = equipmentDropCandidates(
+              observation,
+            ).filter((entity) => entity.distance <= equipmentSearchRange);
             if (
-              inspected >= equipmentChestSearchLimit ||
-              !this.#isCurrent(generation) ||
-              this.#isStopped() ||
-              !isSafeForEquipmentUpkeep(observation) ||
-              equipmentChanges >= equipmentUpkeepStepLimit
-            )
-              break;
+              nearbyEquipmentDrops.length > 0 &&
+              (await collectEquipmentDrop(nearbyEquipmentDrops))
+            ) {
+              if (!(await equipInventoryUpgrades())) break;
+              continue;
+            }
+            if (uncertain) break;
+            let block = visibleEquipmentChests(observation).find(
+              (candidate) =>
+                !this.#equipmentChestSuppressed.has(
+                  equipmentChestFingerprint(observation.dimension, candidate),
+                ),
+            );
+            if (block === undefined) break;
             inspected += 1;
             const chestKey = equipmentChestFingerprint(
               observation.dimension,
@@ -907,14 +1002,58 @@ export class CompanionRuntime {
               equipmentChestSuppressionLimit
             )
               break;
-            // Keep an attempted chest suppressed even if it later leaves the
-            // view or the operation is interrupted before its contents settle.
+            // Suppress before travel so a failed or interrupted approach is bounded.
             this.#equipmentChestSuppressed.add(chestKey);
             const withdrawn: ChestEquipmentWithdrawalCandidate[] = [];
             let chestFailed = false;
             attemptedGearWork = true;
-            windowMayBeOpen = true;
             try {
+              if (block.distance > equipmentChestReach) {
+                const targetBlock = block;
+                const moved = await this.#executeEquipmentAction(
+                  {
+                    kind: "move_to",
+                    position: {
+                      x: block.position.x,
+                      y: block.position.y,
+                      z: block.position.z,
+                    },
+                    range: equipmentChestMoveRange,
+                  },
+                  "Move within reach of the observed chest, then verify the same chest before opening it.",
+                  generation,
+                );
+                if (
+                  !moved.confirmed ||
+                  moved.observation === null ||
+                  !canContinuePlan(observation, moved.observation, undefined) ||
+                  !isSafeForEquipmentUpkeep(moved.observation)
+                ) {
+                  chestFailed = true;
+                } else {
+                  observation = moved.observation;
+                  const reachable = visibleEquipmentChests(observation).find(
+                    (candidate) =>
+                      sameBlockPosition(candidate, targetBlock) &&
+                      candidate.distance <= equipmentChestReach,
+                  );
+                  if (reachable === undefined) chestFailed = true;
+                  else block = reachable;
+                }
+              }
+              if (chestFailed) {
+                uncertain = true;
+                break;
+              }
+              if (
+                !this.#isCurrent(generation) ||
+                this.#isStopped() ||
+                !isSafeForEquipmentUpkeep(observation)
+              ) {
+                uncertain = true;
+                break;
+              }
+              windowMayBeOpen = true;
               const opened = await this.#executeEquipmentAction(
                 {
                   kind: "open_window",
@@ -927,7 +1066,7 @@ export class CompanionRuntime {
                     },
                   },
                 },
-                "Open one currently visible reachable chest to inspect its observed contents.",
+                "Open the freshly observed reachable chest to inspect its contents.",
                 generation,
               );
               if (
@@ -940,8 +1079,10 @@ export class CompanionRuntime {
                 observation = opened.observation;
                 let transfers = 0;
                 while (
-                  transfers < equipmentUpkeepStepLimit &&
-                  equipmentChanges + transfers < equipmentUpkeepStepLimit &&
+                  transfers + equipmentDropsCollected <
+                    equipmentUpkeepStepLimit &&
+                  equipmentChanges + transfers + equipmentDropsCollected <
+                    equipmentUpkeepStepLimit &&
                   this.#isCurrent(generation) &&
                   !this.#isStopped() &&
                   isSafeForEquipmentUpkeep(observation)
@@ -983,13 +1124,15 @@ export class CompanionRuntime {
               this.#logError(error, "Equipment chest inspection failed");
               chestFailed = true;
             } finally {
-              const closed = await this.#closeEquipmentWindow(generation);
-              windowMayBeOpen = false;
-              if (!closed.confirmed || closed.observation === null) {
-                cleanupConfirmed = false;
-                chestFailed = true;
-              } else {
-                observation = closed.observation;
+              if (windowMayBeOpen) {
+                const closed = await this.#closeEquipmentWindow(generation);
+                windowMayBeOpen = false;
+                if (!closed.confirmed || closed.observation === null) {
+                  cleanupConfirmed = false;
+                  chestFailed = true;
+                } else {
+                  observation = closed.observation;
+                }
               }
             }
 
@@ -1006,7 +1149,8 @@ export class CompanionRuntime {
 
             this.#equipmentChestSuppressed.add(chestKey);
             while (
-              equipmentChanges < equipmentUpkeepStepLimit &&
+              equipmentChanges + equipmentDropsCollected <
+                equipmentUpkeepStepLimit &&
               this.#isCurrent(generation) &&
               !this.#isStopped() &&
               isSafeForEquipmentUpkeep(observation)
@@ -1068,6 +1212,24 @@ export class CompanionRuntime {
             }
             if (uncertain) break;
           }
+        }
+
+        if (
+          !uncertain &&
+          equipmentChanges + equipmentDropsCollected <
+            equipmentUpkeepStepLimit &&
+          !visibleEquipmentChests(observation).some(
+            (block) =>
+              !this.#equipmentChestSuppressed.has(
+                equipmentChestFingerprint(observation.dimension, block),
+              ),
+          )
+        ) {
+          const distantEquipmentDrops = equipmentDropCandidates(
+            observation,
+          ).filter((entity) => entity.distance > equipmentSearchRange);
+          if (await collectEquipmentDrop(distantEquipmentDrops))
+            await equipInventoryUpgrades();
         }
       }
     } catch (error) {
@@ -1700,9 +1862,57 @@ function visibleEquipmentChests(
       (block) =>
         /(?:^|:)(?:trapped_)?chest$/u.test(block.name) &&
         Number.isFinite(block.distance) &&
-        block.distance <= equipmentChestReach,
+        block.distance <= equipmentSearchRange,
     )
     .sort((left, right) => left.distance - right.distance);
+}
+
+function visibleDroppedItems(
+  observation: PlayerBodyObservation,
+): readonly BodyVisibleEntity[] {
+  return (
+    observation.perception.nearbyDroppedItems?.entities ??
+    observation.perception.entities.filter(
+      (entity) => entity.droppedItem !== undefined,
+    )
+  );
+}
+
+function equipmentDropCandidates(
+  observation: PlayerBodyObservation,
+): BodyVisibleEntity[] {
+  const maxDistance =
+    observation.perception.nearbyDroppedItems?.maxDistance ??
+    observation.perception.maxDistance;
+  return visibleDroppedItems(observation)
+    .filter(
+      (entity) =>
+        entity.droppedItem?.count === 1 &&
+        equipmentDestinationForName(entity.droppedItem.name) !== undefined &&
+        Number.isFinite(entity.distance) &&
+        entity.distance <= maxDistance,
+    )
+    .sort((left, right) => left.distance - right.distance);
+}
+
+function sameBlockPosition(
+  left: BodyVisibleBlock,
+  right: BodyVisibleBlock,
+): boolean {
+  return (
+    Math.floor(left.position.x) === Math.floor(right.position.x) &&
+    Math.floor(left.position.y) === Math.floor(right.position.y) &&
+    Math.floor(left.position.z) === Math.floor(right.position.z)
+  );
+}
+
+function hasInventoryItemName(
+  observation: PlayerBodyObservation,
+  name: string,
+): boolean {
+  return observation.self.inventory.some(
+    (item) => item.slot >= 9 && item.slot < 45 && item.name === name,
+  );
 }
 
 function equipmentChestFingerprint(

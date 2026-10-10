@@ -149,6 +149,12 @@ function gearSpec(
   return spec?.destination === destination ? spec : undefined;
 }
 
+export function equipmentDestinationForName(
+  name: string,
+): EquipmentDestination | undefined {
+  return (armorSpecs[name] ?? weaponSpecs[name])?.destination;
+}
+
 function rank(
   item: BodyItemStack,
   destination: EquipmentDestination,
