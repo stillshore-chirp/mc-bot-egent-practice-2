@@ -32,6 +32,8 @@ const defaultRetryMs = 5_000;
 const worldChangeCoalesceMs = 1_500;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
+const automaticPickupDistance = 6;
+const automaticPickupSuppressionLimit = 32;
 
 interface PendingWake {
   readonly reason: string;
@@ -124,6 +126,7 @@ export class CompanionRuntime {
   #worldChangedDuringDecision = false;
   #ownerFollowRequested = false;
   #damageReflexPending = false;
+  #automaticPickupSuppressed = new Map<string, true>();
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -404,6 +407,94 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
+      const visibleAutomaticPickupTargets = new Set<string>();
+      for (const entity of observation.perception.entities) {
+        const item = entity.droppedItem;
+        if (item !== undefined)
+          visibleAutomaticPickupTargets.add(
+            automaticPickupFingerprint(
+              observation.dimension,
+              entity.id,
+              item.name,
+              item.count,
+            ),
+          );
+      }
+      for (const fingerprint of this.#automaticPickupSuppressed.keys()) {
+        if (!visibleAutomaticPickupTargets.has(fingerprint))
+          this.#automaticPickupSuppressed.delete(fingerprint);
+      }
+      if (
+        wake.mode === undefined &&
+        wake.ownerMessage === undefined &&
+        snapshot.plan === null &&
+        snapshot.activeOperation === null &&
+        this.#automaticPickupSuppressed.size <
+          automaticPickupSuppressionLimit &&
+        observation.self.health !== null &&
+        observation.self.health > 0
+      ) {
+        const target = observation.perception.entities
+          .filter(
+            (entity) =>
+              entity.droppedItem !== undefined &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= automaticPickupDistance,
+          )
+          .sort((left, right) => left.distance - right.distance)
+          .find((entity) => {
+            const item = entity.droppedItem;
+            return (
+              item !== undefined &&
+              !this.#automaticPickupSuppressed.has(
+                automaticPickupFingerprint(
+                  observation.dimension,
+                  entity.id,
+                  item.name,
+                  item.count,
+                ),
+              )
+            );
+          });
+        if (target?.droppedItem !== undefined) {
+          const item = target.droppedItem;
+          const targetKey = automaticPickupFingerprint(
+            observation.dimension,
+            target.id,
+            item.name,
+            item.count,
+          );
+          const operation = {
+            kind: "collect_item" as const,
+            entityId: target.id,
+          };
+          const automaticPlan = {
+            purpose: "Collect one nearby visible dropped item autonomously.",
+            steps: [
+              {
+                operation,
+                expectedOutcome:
+                  "PlayerBody confirms the pickup from the observed inventory change and item entity result.",
+              },
+            ],
+          };
+          this.#store.save({ plan: automaticPlan });
+          this.#automaticPickupSuppressed.set(targetKey, true);
+          await this.#executePlan(
+            {
+              speech: null,
+              goal: snapshot.goal,
+              plan: automaticPlan,
+              memoryUpdates: [],
+              relationshipSummary: null,
+              waitMs: this.#minWaitMs,
+              knowledgeQuery: null,
+            },
+            generation,
+          );
+          return;
+        }
+      }
       let repeatedKnowledgeRequest = false;
       let decision: CompanionDecision;
       if (wake.mode === "damage_reflex") {
@@ -991,6 +1082,15 @@ function outcomeFromResult(
     expectedOutcome,
     observedAt: result.completedAt,
   };
+}
+
+function automaticPickupFingerprint(
+  dimension: string,
+  entityId: number,
+  itemName: string,
+  count: number,
+): string {
+  return JSON.stringify([dimension, entityId, itemName, count]);
 }
 
 function failedBodyResult(
