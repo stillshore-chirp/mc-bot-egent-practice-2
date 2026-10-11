@@ -250,6 +250,7 @@ describe("CompanionAgent", () => {
     const [request, options] = create.mock.calls[0] as unknown as [
       {
         input: string;
+        instructions: string;
         text: { format: { strict: boolean; schema: unknown } };
         store: boolean;
         model: string;
@@ -257,6 +258,9 @@ describe("CompanionAgent", () => {
       { maxRetries: number },
     ];
     expect(request.model).toBe("gpt-6-luna");
+    expect(request.instructions).toContain(
+      "ownerMessageがある時は、その発言の意味・対象・直前の出来事を優先して自然に返答してください。話題が切り替わったら古い別件を代わりに説明せず、感情を決めつけずにペルソナと会話の流れに沿ってください。",
+    );
     expect(request.store).toBe(false);
     expect(options.maxRetries).toBe(0);
     expect("max_output_tokens" in request).toBe(false);
