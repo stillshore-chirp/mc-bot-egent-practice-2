@@ -867,6 +867,97 @@ describe("player body", () => {
     }
   });
 
+  it("prefers ordinary food over rotten flesh when consume item is omitted", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const bread = prepareConsumeFixture(fake);
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      const rotten = { ...bread, type: 6, name: "rotten_flesh" };
+      inventory.slots[37] = rotten;
+      const registry = fake.bot.registry as unknown as {
+        foodsByName: Record<string, { effectiveQuality: number }>;
+      };
+      registry.foodsByName.rotten_flesh = { effectiveQuality: 10.4 };
+      const equipped: string[] = [];
+      Object.assign(fake.bot, {
+        equip: vi.fn(async (item: unknown) => {
+          const name = (item as { name: string }).name;
+          equipped.push(name);
+          Object.assign(fake.bot, { heldItem: item });
+        }),
+        consume: vi.fn(async () => {
+          const name = equipped.at(-1);
+          const slot = name === "bread" ? 36 : 37;
+          const consumed = inventory.slots[slot];
+          setTimeout(() => {
+            fake.bot.food = 20;
+            inventory.slots[slot] = null;
+            fake.inventory.emit("updateSlot", slot, consumed, null);
+            emitEatingCompletion(fake);
+          }, 200);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({ kind: "consume" });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(equipped).toEqual(["bread"]);
+      expect(result.before?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "rotten_flesh", count: 1 }),
+      );
+      expect(result.after?.self.inventory).toContainEqual(
+        expect.objectContaining({ name: "rotten_flesh", count: 1 }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an explicit rotten flesh consume request", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = makeFakeBot();
+      const rotten = prepareConsumeFixture(fake, 19, "rotten_flesh");
+      const inventory = fake.bot.inventory as unknown as {
+        slots: (Record<string, unknown> | null)[];
+      };
+      const equipped: string[] = [];
+      Object.assign(fake.bot, {
+        equip: vi.fn(async (item: unknown) => {
+          equipped.push((item as { name: string }).name);
+          Object.assign(fake.bot, { heldItem: item });
+        }),
+        consume: vi.fn(async () => {
+          setTimeout(() => {
+            fake.bot.food = 20;
+            inventory.slots[36] = null;
+            fake.inventory.emit("updateSlot", 36, rotten, null);
+            emitEatingCompletion(fake);
+          }, 200);
+        }),
+      });
+      const body = new MineflayerPlayerBody(() => fake.bot);
+
+      const resultPromise = body.execute({
+        kind: "consume",
+        item: "rotten_flesh",
+      });
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("successful");
+      expect(equipped).toEqual(["rotten_flesh"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("confirms full-food golden-apple consumption from own eating status and item decrease", async () => {
     vi.useFakeTimers();
     try {
