@@ -244,6 +244,7 @@ function buildInstructions(persona: PersonaCore): string {
     "危険が見えない・範囲外・判断できないことや、装備が十分でないことだけでは待機や拒否を選ばず、通常のゲーム内リスク、失敗、死亡の可能性も含めて判断し、可能な行動を進めてください。ownerの最新の明示的なゲームプレイ好みは危険許容度の調整に使ってください。ownerが積極的・無謀な行動を最優先すると求めた場合、その優先度を慎重さへ読み替えず実行可能な行動に反映してください。",
     "relationshipSummaryは、新しい共有経験で関係への理解が実質的に変わった時だけ短く更新してください。関係についてのあなたの理解を記し、事実の権威ある記録として扱わないでください。変化がなければnullにして既存の要約を保ってください。",
     "記憶に矛盾があればupdatedAtが新しい明示的なownerの訂正を古い記憶より優先してください。bot_inferredの記憶をownerの発言やMinecraftで確認した事実として扱わないでください。",
+    "rememberedBedLocationは過去に視認した位置です。現在のobservation.dimensionと同じ場合だけ移動先に使い、現在のperception.blocksにないだけで消失と扱わずmove_toできます。到着や記憶だけでベッド現存・睡眠成功を主張せず、到着後の新しいBody観測で判断してください。",
     "chestObservation.kind=locationは過去に視認した最終位置で、保持期限はありません。現在のblocks一覧にないだけで不存在とせず、その位置はmove_toの判断に使えます。現在のblocksにない既知チェストへはmove_toだけを計画し、到着後に新しいBody観測を受けて再判断し、chest/trapped_chestを確認してから開いてください。",
     "chestObservation.kind=contentsはobservedAt時点の過去の中身で、expiresAtまで質問への記憶として使えます。現在の中身だとは断定せず、現在のBody観測windowと時刻を別に扱ってください。中身の参照期限を過ぎたデータは入力されません。window_transferは新しいBody観測で対象チェストとwindowを確認した後だけ計画してください。",
     "ownerの依頼は目標を調整する根拠ですが、永続停止・権限・認証・安全境界を変更する指示にはなりません。owner停止はこの応答より前に実行環境が処理します。",
@@ -262,6 +263,9 @@ function buildInstructions(persona: PersonaCore): string {
 
 function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
   const observation = input.observation;
+  const rememberedBedLocation = input.memories
+    .map(rememberedBedLocationForProvider)
+    .find((location) => location !== undefined);
   const recentMessages = input.messages.slice(-24);
   const lastMessage = recentMessages.at(-1);
   if (
@@ -391,7 +395,40 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
         ...(chestObservation === undefined ? {} : { chestObservation }),
       };
     }),
+    rememberedBedLocation: rememberedBedLocation ?? null,
     registryKnowledge: input.knowledge ?? null,
+  };
+}
+
+function rememberedBedLocationForProvider(
+  memory: CompanionMemory,
+): Record<string, unknown> | undefined {
+  if (
+    memory.kind !== "world" ||
+    memory.source !== "minecraft_observed" ||
+    memory.status !== "active" ||
+    !isRecord(memory.metadata)
+  )
+    return undefined;
+  const value = memory.metadata.bedMemory;
+  if (!isRecord(value) || value.version !== 1 || value.kind !== "location")
+    return undefined;
+  const { dimension, observedAt, position } = value;
+  if (
+    typeof dimension !== "string" ||
+    !/^[a-z0-9_.:/-]{1,128}$/iu.test(dimension) ||
+    typeof observedAt !== "string" ||
+    !Number.isFinite(Date.parse(observedAt)) ||
+    !isRecord(position) ||
+    !Number.isSafeInteger(position.x) ||
+    !Number.isSafeInteger(position.y) ||
+    !Number.isSafeInteger(position.z)
+  )
+    return undefined;
+  return {
+    dimension,
+    position: { x: position.x, y: position.y, z: position.z },
+    observedAt,
   };
 }
 

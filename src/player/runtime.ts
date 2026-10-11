@@ -491,6 +491,7 @@ export class CompanionRuntime {
       });
       if (!this.#isCurrent(generation)) return;
       this.#rememberVisibleChests(observation);
+      this.#rememberVisibleBeds(observation);
       const nearbyDroppedItems =
         observation.perception.nearbyDroppedItems?.entities ??
         observation.perception.entities.filter(
@@ -619,13 +620,20 @@ export class CompanionRuntime {
           this.#memoryContextLimit,
         );
         const latestChestLocation = this.#store.latestObservedChestLocation();
+        const latestBedLocation = this.#store.latestObservedBedLocation();
+        const latestLocations = [latestChestLocation, latestBedLocation].filter(
+          (memory): memory is NonNullable<typeof memory> => memory !== null,
+        );
+        const latestLocationIds = new Set(
+          latestLocations.map((memory) => memory.id),
+        );
         const memories =
-          latestChestLocation === null
+          latestLocations.length === 0
             ? recalledMemories
             : [
-                latestChestLocation,
+                ...latestLocations,
                 ...recalledMemories.filter(
-                  (memory) => memory.id !== latestChestLocation.id,
+                  (memory) => !latestLocationIds.has(memory.id),
                 ),
               ].slice(0, this.#memoryContextLimit);
         const messages = this.#store.recentMessages(24);
@@ -812,6 +820,7 @@ export class CompanionRuntime {
     }
     if (!this.#isCurrent(generation) || this.#isStopped()) return;
     this.#rememberVisibleChests(observation);
+    this.#rememberVisibleBeds(observation);
     if (!isSafeForEquipmentUpkeep(observation)) {
       this.#equipmentUpkeepQueued = false;
       await this.#speakControlMessage(
@@ -1602,6 +1611,7 @@ export class CompanionRuntime {
         return;
       this.#rememberChestObservations(result);
       this.#rememberChestContents(operation, result);
+      this.#rememberBedObservations(result);
       if (updated.activeOperation !== null) {
         this.#scheduleRetry({
           reason: "Body outcome did not match the persisted active operation",
@@ -1626,6 +1636,7 @@ export class CompanionRuntime {
         return;
       }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
+      this.#rememberVisibleBeds(freshObservation);
       const nextStep = updated.plan?.steps[0];
       const damageReflexAttackTargetId =
         damageReflex &&
@@ -1951,6 +1962,34 @@ export class CompanionRuntime {
     }
   }
 
+  #rememberVisibleBeds(
+    observation: PlayerBodyObservation | null | undefined,
+  ): void {
+    if (!observation) return;
+    const recorded = new Set<string>();
+    for (const block of observation.perception.blocks) {
+      if (!isBedBlockName(block.name)) continue;
+      const position = {
+        x: Math.floor(block.position.x),
+        y: Math.floor(block.position.y),
+        z: Math.floor(block.position.z),
+      };
+      const key = JSON.stringify([
+        observation.dimension,
+        position.x,
+        position.y,
+        position.z,
+      ]);
+      if (recorded.has(key)) continue;
+      recorded.add(key);
+      this.#rememberBed({
+        dimension: observation.dimension,
+        position,
+        observedAt: observation.observedAt,
+      });
+    }
+  }
+
   #rememberChestObservations(result: PlayerOperationResult): void {
     this.#rememberVisibleChests(result.before);
     this.#rememberVisibleChests(result.after);
@@ -1960,6 +1999,27 @@ export class CompanionRuntime {
       for (const block of view.visibleBlocks) {
         if (!isChestBlockName(block.name)) continue;
         this.#rememberChest({
+          dimension: view.dimension,
+          position: {
+            x: Math.floor(block.position.x),
+            y: Math.floor(block.position.y),
+            z: Math.floor(block.position.z),
+          },
+          observedAt: result.completedAt,
+        });
+      }
+    }
+  }
+
+  #rememberBedObservations(result: PlayerOperationResult): void {
+    this.#rememberVisibleBeds(result.before);
+    this.#rememberVisibleBeds(result.after);
+    const sweep = result.lookSweep;
+    if (sweep === undefined) return;
+    for (const view of [sweep.current, ...sweep.directions]) {
+      for (const block of view.visibleBlocks) {
+        if (!isBedBlockName(block.name)) continue;
+        this.#rememberBed({
           dimension: view.dimension,
           position: {
             x: Math.floor(block.position.x),
@@ -2039,6 +2099,22 @@ export class CompanionRuntime {
       this.#store.rememberObservedChest(input);
     } catch (error) {
       this.#logError(error, "Observed chest memory could not be saved");
+    }
+  }
+
+  #rememberBed(input: {
+    readonly dimension: string;
+    readonly position: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+    readonly observedAt: string;
+  }): void {
+    try {
+      this.#store.rememberObservedBedLocation(input);
+    } catch (error) {
+      this.#logError(error, "Observed bed location could not be saved");
     }
   }
 
@@ -2128,6 +2204,10 @@ function visibleEquipmentChests(
 
 function isChestBlockName(name: string): boolean {
   return /(?:^|:)(?:trapped_)?chest$/u.test(name);
+}
+
+function isBedBlockName(name: string): boolean {
+  return /(?:^|:)[a-z0-9_]+_bed$/iu.test(name);
 }
 
 function sameBlockAtPosition(

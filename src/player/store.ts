@@ -78,6 +78,13 @@ const chestMemoryObservationSchema = z
       new Set(contents.map(({ slot }) => slot)).size === contents.length,
     "Chest content slots must be unique.",
   );
+const bedMemoryObservationSchema = z
+  .object({
+    dimension: chestDimensionSchema,
+    position: chestPositionSchema,
+    observedAt: z.iso.datetime(),
+  })
+  .strict();
 const SECRET_LABEL =
   /(?:^|[\s_:=,."'`])(api[_ -]?key|authorization|bearer|password|private[_ -]?key|secret)(?:$|[\s_:=,."'`])/iu;
 const SECRET_VALUE =
@@ -616,6 +623,65 @@ export class CompanionStore {
          FROM companion_memories
          WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
            AND json_extract(metadata_json, '$.chestMemory.kind') = 'location'
+         ORDER BY updated_at DESC, memory_id DESC
+         LIMIT 1`,
+      )
+      .get();
+    return row === undefined ? null : memoryFromRow(row);
+  }
+
+  /** Saves a Body-observed bed location without recording inferred bed state. */
+  public rememberObservedBedLocation(input: {
+    readonly dimension: string;
+    readonly position: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+    readonly observedAt: string;
+  }): CompanionMemory {
+    const parsed = bedMemoryObservationSchema.safeParse(input);
+    if (!parsed.success) throw invalidInput("Invalid observed bed location.");
+    const { dimension, position, observedAt } = parsed.data;
+    const locationKey = JSON.stringify([
+      dimension,
+      position.x,
+      position.y,
+      position.z,
+    ]);
+    return this.#database
+      .transaction(() =>
+        this.insertMemory({
+          kind: "world",
+          content: `確認済みベッドの場所: ${dimension} (${position.x}, ${position.y}, ${position.z})`,
+          source: "minecraft_observed",
+          status: "active",
+          importance: 5,
+          metadata: {
+            bedMemory: {
+              version: 1,
+              kind: "location",
+              locationKey,
+              dimension,
+              position,
+              observedAt,
+            },
+          },
+          createdAt: observedAt,
+          updatedAt: observedAt,
+        }),
+      )
+      .immediate();
+  }
+
+  /** Returns the latest last-seen bed location for autonomous goal context. */
+  public latestObservedBedLocation(): CompanionMemory | null {
+    const row = this.#database
+      .prepare<[], MemoryRow>(
+        `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+         FROM companion_memories
+         WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
+           AND json_extract(metadata_json, '$.bedMemory.kind') = 'location'
          ORDER BY updated_at DESC, memory_id DESC
          LIMIT 1`,
       )
