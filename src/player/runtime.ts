@@ -30,7 +30,6 @@ import type {
 } from "./agent.js";
 import type { CompanionStore } from "./store.js";
 import {
-  type ChestEquipmentWithdrawalCandidate,
   type EquipmentUpgradeCandidate,
   findChestEquipmentWithdrawal,
   findInventoryEquipmentUpgrade,
@@ -45,6 +44,7 @@ const minimumWaitMs = 10_000;
 const maximumRetryMs = 5 * 60_000;
 const defaultRetryMs = 5_000;
 const worldChangeCoalesceMs = 1_500;
+const maintenanceCheckIntervalMs = 5_000;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
 const automaticPickupSuppressionLimit = 32;
@@ -76,6 +76,10 @@ interface ActiveBodyRun {
 interface EquipmentStepResult {
   readonly observation: PlayerBodyObservation | null;
   readonly confirmed: boolean;
+}
+
+interface FoodUpkeepResult extends EquipmentStepResult {
+  readonly handled: boolean;
 }
 
 interface DamageReflexContext {
@@ -161,6 +165,10 @@ export class CompanionRuntime {
   #drainPromise: Promise<void> | undefined;
   #waitTimer: NodeJS.Timeout | undefined;
   #worldChangeTimer: NodeJS.Timeout | undefined;
+  #maintenanceTimer: NodeJS.Timeout | undefined;
+  #maintenanceObservationInFlight = false;
+  #maintenanceActionInFlight = false;
+  #maintenanceActionFinished: Promise<void> | undefined;
   #failureCount = 0;
   #worldChangedDuringDecision = false;
   #ownerFollowRequested = false;
@@ -169,8 +177,13 @@ export class CompanionRuntime {
   #damageReflexContext: DamageReflexContext | undefined;
   #equipmentUpkeepQueued = false;
   #automaticPickupSuppressed = new Map<string, true>();
+  #foodPickupSuppressed = new Set<string>();
+  #foodPickupSuppressedAtFood: number | undefined;
   #equipmentChestSuppressed = new Set<string>();
+  #foodChestSuppressed = new Set<string>();
   #failedEquipmentCandidateFingerprint: string | undefined;
+  #failedFoodAttemptFingerprint: string | undefined;
+  #foodUseSuppressedFingerprint: string | undefined;
   #cachedKnowledge: PlayerKnowledge | undefined;
   #wakeAt: string | null = null;
   #wakeReason: string | null = null;
@@ -235,6 +248,7 @@ export class CompanionRuntime {
   public async start(): Promise<void> {
     if (!this.#activate()) return;
     if (this.#isStopped()) return;
+    this.#armMaintenanceTimer();
     this.#fireWake({ reason: "startup; re-observe before continuing" });
   }
 
@@ -266,6 +280,7 @@ export class CompanionRuntime {
     }
 
     if (!this.#started) this.#activate();
+    if (!this.#isStopped()) this.#armMaintenanceTimer();
     if (this.#isStopped()) {
       if (isExplicitResumeCommand(message)) {
         this.#store.recordMessage("owner", message);
@@ -332,6 +347,7 @@ export class CompanionRuntime {
     this.#equipmentUpkeepQueued = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
+    this.#clearMaintenanceTimer();
     this.#clearTimers();
     this.#activeDecision?.abort(new Error("Owner stopped companion"));
     this.#activeBody?.controller.abort(new Error("Owner stopped companion"));
@@ -351,6 +367,7 @@ export class CompanionRuntime {
     } catch {
       this.#logger?.warn({ errorType: "BodyStopError" }, "Body stop failed");
     }
+    await this.#maintenanceActionFinished;
     await this.#drainPromise;
     return true;
   }
@@ -369,6 +386,7 @@ export class CompanionRuntime {
     this.#store.resume(snapshot.stopGeneration);
     this.#runtimeStopLatched = false;
     this.#stopPersistenceFailed = false;
+    this.#armMaintenanceTimer();
     await this.#requestWake({
       reason: "owner explicitly resumed autonomy",
       ...(ownerMessage === undefined
@@ -387,15 +405,19 @@ export class CompanionRuntime {
     this.#equipmentUpkeepQueued = false;
     this.#generation += 1;
     this.#pendingWake = undefined;
+    this.#clearMaintenanceTimer();
     this.#clearTimers();
     this.#unsubscribeBody?.();
     this.#unsubscribeBody = undefined;
     this.#activeDecision?.abort(new Error("Companion runtime shutdown"));
     this.#activeBody?.controller.abort(new Error("Companion runtime shutdown"));
+    await this.#maintenanceActionFinished;
     await this.#drainPromise;
   }
 
   async #requestWake(wake: PendingWake): Promise<void> {
+    const maintenanceAction = this.#maintenanceActionFinished;
+    if (maintenanceAction !== undefined) await maintenanceAction;
     if (this.#disposed || this.#isStopped()) return;
     if (wake.mode !== "damage_reflex") {
       this.#damageReflexPending = false;
@@ -434,7 +456,122 @@ export class CompanionRuntime {
     this.#unsubscribeBody = this.#body.onEvent((event) =>
       this.#onBodyEvent(event),
     );
+    if (!this.#isStopped()) this.#armMaintenanceTimer();
     return true;
+  }
+
+  #armMaintenanceTimer(): void {
+    if (
+      this.#maintenanceTimer !== undefined ||
+      !this.#started ||
+      this.#disposed ||
+      this.#isStopped()
+    )
+      return;
+    this.#maintenanceTimer = setInterval(() => {
+      void this.#checkMaintenance();
+    }, maintenanceCheckIntervalMs);
+    this.#maintenanceTimer.unref();
+  }
+
+  #clearMaintenanceTimer(): void {
+    if (this.#maintenanceTimer !== undefined)
+      clearInterval(this.#maintenanceTimer);
+    this.#maintenanceTimer = undefined;
+  }
+
+  #refreshAutomaticPickupSuppressions(
+    observation: PlayerBodyObservation,
+  ): void {
+    const automaticPickupRange =
+      observation.perception.nearbyDroppedItems?.maxDistance ??
+      observation.perception.maxDistance;
+    const observedTargets = new Set<string>();
+    for (const entity of visibleDroppedItems(observation)) {
+      const item = entity.droppedItem;
+      if (
+        item !== undefined &&
+        Number.isFinite(entity.distance) &&
+        entity.distance <= automaticPickupRange
+      )
+        observedTargets.add(
+          automaticPickupFingerprint(
+            observation.dimension,
+            entity.id,
+            item.name,
+            item.count,
+          ),
+        );
+    }
+    for (const fingerprint of this.#automaticPickupSuppressed.keys()) {
+      if (!observedTargets.has(fingerprint))
+        this.#automaticPickupSuppressed.delete(fingerprint);
+    }
+  }
+
+  async #checkMaintenance(): Promise<void> {
+    if (
+      this.#maintenanceObservationInFlight ||
+      !this.#started ||
+      this.#disposed ||
+      this.#isStopped()
+    )
+      return;
+    this.#maintenanceObservationInFlight = true;
+    const generation = this.#generation;
+    let observation: PlayerBodyObservation;
+    try {
+      observation = await this.#body.observe({
+        ownerPositionException: true,
+      });
+    } catch (error) {
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        this.#logError(error, "Periodic upkeep observation failed");
+      return;
+    } finally {
+      this.#maintenanceObservationInFlight = false;
+    }
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
+    try {
+      this.#rememberVisibleChests(observation);
+      this.#rememberVisibleBeds(observation);
+      this.#refreshAutomaticPickupSuppressions(observation);
+
+      const snapshot = this.#store.snapshot();
+      if (
+        !isSafeForEquipmentUpkeep(observation) ||
+        observation.window !== null ||
+        this.#maintenanceActionInFlight ||
+        this.#activeDecision !== undefined ||
+        this.#activeBody !== undefined ||
+        this.#drainPromise !== undefined ||
+        this.#pendingWake !== undefined ||
+        snapshot.plan !== null ||
+        snapshot.activeOperation !== null
+      )
+        return;
+
+      this.#maintenanceActionInFlight = true;
+      let finishMaintenanceAction!: () => void;
+      this.#maintenanceActionFinished = new Promise<void>((resolve) => {
+        finishMaintenanceAction = resolve;
+      });
+      try {
+        const food = await this.#runFoodUpkeep(observation, generation);
+        if (!this.#isCurrent(generation) || this.#isStopped()) return;
+        observation = food.observation ?? observation;
+        if (this.#hasActiveBodyRun() || this.#store.snapshot().plan !== null)
+          return;
+        await this.#runEquipmentUpkeep(observation, generation, false, false);
+      } finally {
+        this.#maintenanceActionInFlight = false;
+        this.#maintenanceActionFinished = undefined;
+        finishMaintenanceAction();
+      }
+    } catch (error) {
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        this.#logError(error, "Periodic upkeep check failed");
+    }
   }
 
   #fireWake(wake: PendingWake): void {
@@ -492,43 +629,36 @@ export class CompanionRuntime {
       if (!this.#isCurrent(generation)) return;
       this.#rememberVisibleChests(observation);
       this.#rememberVisibleBeds(observation);
-      const nearbyDroppedItems =
-        observation.perception.nearbyDroppedItems?.entities ??
-        observation.perception.entities.filter(
-          (entity) => entity.droppedItem !== undefined,
-        );
+      this.#refreshAutomaticPickupSuppressions(observation);
+      const nearbyDroppedItems = visibleDroppedItems(observation);
       const automaticPickupRange =
         observation.perception.nearbyDroppedItems?.maxDistance ??
         observation.perception.maxDistance;
-      const observedAutomaticPickupTargets = new Set<string>();
-      for (const entity of nearbyDroppedItems) {
-        const item = entity.droppedItem;
-        if (
-          item !== undefined &&
-          Number.isFinite(entity.distance) &&
-          entity.distance <= automaticPickupRange
-        )
-          observedAutomaticPickupTargets.add(
-            automaticPickupFingerprint(
-              observation.dimension,
-              entity.id,
-              item.name,
-              item.count,
-            ),
-          );
-      }
-      for (const fingerprint of this.#automaticPickupSuppressed.keys()) {
-        if (!observedAutomaticPickupTargets.has(fingerprint))
-          this.#automaticPickupSuppressed.delete(fingerprint);
-      }
       const automaticEquipmentEligible =
         wake.mode === undefined &&
         wake.ownerMessage === undefined &&
         snapshot.plan === null &&
         snapshot.activeOperation === null &&
+        !this.#maintenanceActionInFlight &&
         observation.self.health !== null &&
         observation.self.health > 0 &&
         isSafeForEquipmentUpkeep(observation);
+      if (
+        wake.mode === undefined &&
+        wake.ownerMessage === undefined &&
+        snapshot.plan === null &&
+        snapshot.activeOperation === null &&
+        !this.#maintenanceActionInFlight &&
+        isSafeForEquipmentUpkeep(observation)
+      ) {
+        const food = await this.#runFoodUpkeep(observation, generation);
+        if (food.handled) {
+          this.#setWakeTimer(this.#minWaitMs, {
+            reason: "food upkeep completed; continue after a fresh observation",
+          });
+          return;
+        }
+      }
       if (
         automaticEquipmentEligible &&
         (await this.#runEquipmentUpkeep(observation, generation, false))
@@ -839,16 +969,431 @@ export class CompanionRuntime {
     }
   }
 
+  async #runFoodUpkeep(
+    initialObservation: PlayerBodyObservation,
+    generation: number,
+  ): Promise<FoodUpkeepResult> {
+    let observation = initialObservation;
+    const food = observation.self.food;
+    if (
+      !this.#isCurrent(generation) ||
+      this.#isStopped() ||
+      !isSafeForEquipmentUpkeep(observation) ||
+      observation.window !== null ||
+      food === null ||
+      food >= 20
+    )
+      return {
+        observation,
+        confirmed: false,
+        handled: false,
+      };
+
+    if (
+      this.#foodPickupSuppressedAtFood !== undefined &&
+      this.#foodPickupSuppressedAtFood !== food
+    ) {
+      this.#foodPickupSuppressed.clear();
+      this.#foodChestSuppressed.clear();
+    }
+    this.#foodPickupSuppressedAtFood = food;
+
+    const edibleInventory = (current: PlayerBodyObservation): BodyItemStack[] =>
+      current.self.inventory.filter(
+        (item) =>
+          item.slot >= 9 &&
+          item.slot < 45 &&
+          item.count > 0 &&
+          this.#isKnownFood(item.name),
+      );
+    let edibleItems = edibleInventory(observation);
+    let fingerprint = foodAttemptFingerprint(observation, edibleItems);
+    if (this.#foodUseSuppressedFingerprint === fingerprint) {
+      return {
+        observation,
+        confirmed: false,
+        handled: false,
+      };
+    }
+    if (this.#foodUseSuppressedFingerprint !== undefined)
+      this.#foodUseSuppressedFingerprint = undefined;
+    if (this.#failedFoodAttemptFingerprint === fingerprint)
+      return {
+        observation,
+        confirmed: false,
+        handled: false,
+      };
+
+    if (edibleItems.length === 0) {
+      const maxDistance =
+        observation.perception.nearbyDroppedItems?.maxDistance ??
+        observation.perception.maxDistance;
+      const foodDrops = (nearby: boolean): BodyVisibleEntity[] =>
+        visibleDroppedItems(observation)
+          .filter(
+            (entity) =>
+              entity.droppedItem !== undefined &&
+              entity.droppedItem.count > 0 &&
+              this.#isKnownFood(entity.droppedItem.name) &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= maxDistance &&
+              (nearby
+                ? entity.distance <= equipmentSearchRange
+                : entity.distance > equipmentSearchRange),
+          )
+          .sort((left, right) => left.distance - right.distance)
+          .slice(0, equipmentUpkeepStepLimit);
+      const collectFoodDrop = async (nearby: boolean): Promise<void> => {
+        for (const candidate of foodDrops(nearby)) {
+          const collected = await this.#collectObservedDrop(
+            observation,
+            candidate,
+            generation,
+            food,
+          );
+          if (collected.observation !== null)
+            observation = collected.observation;
+          if (collected.confirmed) return;
+        }
+      };
+      await collectFoodDrop(true);
+      if (edibleInventory(observation).length === 0) {
+        for (const block of visibleEquipmentChests(observation)) {
+          const chestKey = JSON.stringify([
+            food,
+            equipmentChestFingerprint(observation.dimension, block),
+          ]);
+          if (
+            this.#foodChestSuppressed.has(chestKey) ||
+            this.#foodChestSuppressed.size >= equipmentChestSuppressionLimit
+          )
+            continue;
+          this.#foodChestSuppressed.add(chestKey);
+          const chest = await this.#withdrawFromVisibleChest(
+            observation,
+            block,
+            generation,
+            1,
+            (fresh) => {
+              if (!isChestEquipmentWindow(fresh.window)) return null;
+              const item = fresh.window.slots
+                .slice(0, fresh.window.inventoryStart)
+                .find(
+                  (candidate) =>
+                    candidate !== null &&
+                    candidate.count > 0 &&
+                    this.#isKnownFood(candidate.name),
+                );
+              return item === undefined || item === null ? null : { item };
+            },
+            (before, after, candidate) =>
+              inventoryCount(after, candidate.item.name) >
+              inventoryCount(before, candidate.item.name),
+          );
+          observation = chest.observation;
+          if (!chest.confirmed) break;
+          if (chest.withdrawn.length > 0) break;
+        }
+      }
+      if (edibleInventory(observation).length === 0)
+        await collectFoodDrop(false);
+      edibleItems = edibleInventory(observation);
+      fingerprint = foodAttemptFingerprint(observation, edibleItems);
+      if (edibleItems.length === 0) {
+        this.#failedFoodAttemptFingerprint = fingerprint;
+        return { observation, confirmed: false, handled: false };
+      }
+    }
+
+    const step = await this.#executeUpkeepAction(
+      { kind: "consume" },
+      "Consume one known edible inventory item while hunger is below full, then verify the Body result and fresh observation.",
+      generation,
+    );
+    let after = step.observation;
+    if (after === null) {
+      try {
+        after = await this.#body.observe({ ownerPositionException: true });
+      } catch (error) {
+        this.#logError(error, "Food result could not be observed");
+        this.#failedFoodAttemptFingerprint = fingerprint;
+        return {
+          observation,
+          confirmed: false,
+          handled: false,
+        };
+      }
+    }
+    const inventoryChanged = edibleItems.some(
+      (item) =>
+        inventoryCount(after, item.name) <
+        inventoryCount(observation, item.name),
+    );
+    const foodIncreased = after.self.food !== null && after.self.food > food;
+    if (
+      !step.confirmed ||
+      !inventoryChanged ||
+      !foodIncreased ||
+      !this.#isCurrent(generation) ||
+      this.#isStopped()
+    ) {
+      if (
+        step.confirmed &&
+        inventoryChanged &&
+        !foodIncreased &&
+        after.self.food !== null
+      )
+        this.#foodUseSuppressedFingerprint = foodAttemptFingerprint(
+          after,
+          edibleInventory(after),
+        );
+      this.#failedFoodAttemptFingerprint = foodAttemptFingerprint(
+        after,
+        after.self.inventory.filter(
+          (item) =>
+            item.slot >= 9 &&
+            item.slot < 45 &&
+            item.count > 0 &&
+            this.#isKnownFood(item.name),
+        ),
+      );
+      return { observation: after, confirmed: false, handled: false };
+    }
+    this.#failedFoodAttemptFingerprint = undefined;
+    this.#foodUseSuppressedFingerprint = undefined;
+    return { observation: after, confirmed: true, handled: true };
+  }
+
+  #isKnownFood(name: string): boolean {
+    return this.#body
+      .knowledge(name)
+      .facts.some(
+        (fact) =>
+          fact.kind === "item" &&
+          fact.name === name &&
+          fact.food !== null &&
+          fact.food.foodPoints > 0,
+      );
+  }
+
+  async #collectObservedDrop(
+    observation: PlayerBodyObservation,
+    candidate: BodyVisibleEntity,
+    generation: number,
+    foodState?: number,
+  ): Promise<EquipmentStepResult> {
+    const item = candidate.droppedItem;
+    if (item === undefined) return { observation: null, confirmed: false };
+    const targetKey = automaticPickupFingerprint(
+      observation.dimension,
+      candidate.id,
+      item.name,
+      item.count,
+    );
+    const key =
+      foodState === undefined
+        ? targetKey
+        : JSON.stringify([foodState, targetKey]);
+    const suppressed =
+      foodState === undefined
+        ? this.#automaticPickupSuppressed.has(key)
+        : this.#foodPickupSuppressed.has(key);
+    const suppressionCount =
+      foodState === undefined
+        ? this.#automaticPickupSuppressed.size
+        : this.#foodPickupSuppressed.size;
+    if (suppressed || suppressionCount >= automaticPickupSuppressionLimit)
+      return { observation: null, confirmed: false };
+    const current = visibleDroppedItems(observation).find(
+      (entity) =>
+        entity.id === candidate.id &&
+        entity.droppedItem?.name === item.name &&
+        entity.droppedItem.count === item.count &&
+        Number.isFinite(entity.distance) &&
+        entity.distance <=
+          (observation.perception.nearbyDroppedItems?.maxDistance ??
+            observation.perception.maxDistance),
+    );
+    if (current === undefined) return { observation: null, confirmed: false };
+    if (foodState === undefined) this.#automaticPickupSuppressed.set(key, true);
+    else this.#foodPickupSuppressed.add(key);
+    const beforeCount = inventoryCount(observation, item.name);
+    const step = await this.#executeUpkeepAction(
+      { kind: "collect_item", entityId: current.id },
+      "Collect one observed item and confirm its inventory count increased.",
+      generation,
+    );
+    if (
+      !step.confirmed ||
+      step.observation === null ||
+      inventoryCount(step.observation, item.name) <= beforeCount ||
+      !canContinuePlan(observation, step.observation, undefined)
+    )
+      return { observation: step.observation, confirmed: false };
+    return step;
+  }
+
+  async #withdrawFromVisibleChest<T extends { readonly item: BodyItemStack }>(
+    initialObservation: PlayerBodyObservation,
+    block: BodyVisibleBlock,
+    generation: number,
+    limit: number,
+    findCandidate: (observation: PlayerBodyObservation) => T | null,
+    verifyTransfer: (
+      before: PlayerBodyObservation,
+      after: PlayerBodyObservation,
+      candidate: T,
+    ) => boolean,
+  ): Promise<{
+    readonly observation: PlayerBodyObservation;
+    readonly withdrawn: readonly T[];
+    readonly confirmed: boolean;
+    readonly cleanupConfirmed: boolean;
+  }> {
+    let observation = initialObservation;
+    const withdrawn: T[] = [];
+    let confirmed = true;
+    let cleanupConfirmed = true;
+    const targetBlock = block;
+
+    if (block.distance > equipmentChestReach) {
+      const moved = await this.#executeUpkeepAction(
+        {
+          kind: "move_to",
+          position: {
+            x: block.position.x,
+            y: block.position.y,
+            z: block.position.z,
+          },
+          range: equipmentChestMoveRange,
+        },
+        "Move within reach of the observed chest, then verify the same chest before opening it.",
+        generation,
+      );
+      if (
+        !moved.confirmed ||
+        moved.observation === null ||
+        !canContinuePlan(observation, moved.observation, undefined) ||
+        !isSafeForEquipmentUpkeep(moved.observation)
+      )
+        return {
+          observation,
+          withdrawn,
+          confirmed: false,
+          cleanupConfirmed,
+        };
+      observation = moved.observation;
+      const reachable = visibleEquipmentChests(observation).find(
+        (candidate) =>
+          sameBlockPosition(candidate, targetBlock) &&
+          candidate.distance <= equipmentChestReach,
+      );
+      if (reachable === undefined)
+        return {
+          observation,
+          withdrawn,
+          confirmed: false,
+          cleanupConfirmed,
+        };
+      block = reachable;
+    }
+
+    if (
+      !this.#isCurrent(generation) ||
+      this.#isStopped() ||
+      !isSafeForEquipmentUpkeep(observation)
+    )
+      return {
+        observation,
+        withdrawn,
+        confirmed: false,
+        cleanupConfirmed,
+      };
+
+    try {
+      const opened = await this.#executeUpkeepAction(
+        {
+          kind: "open_window",
+          target: {
+            kind: "block",
+            position: {
+              x: block.position.x,
+              y: block.position.y,
+              z: block.position.z,
+            },
+          },
+        },
+        "Open the freshly observed reachable chest to inspect its contents.",
+        generation,
+      );
+      if (
+        !opened.confirmed ||
+        opened.observation === null ||
+        !isChestEquipmentWindow(opened.observation.window)
+      ) {
+        confirmed = false;
+      } else {
+        observation = opened.observation;
+        while (
+          withdrawn.length < limit &&
+          this.#isCurrent(generation) &&
+          !this.#isStopped() &&
+          isSafeForEquipmentUpkeep(observation)
+        ) {
+          const candidate = findCandidate(observation);
+          if (candidate === null) break;
+          const before = observation;
+          const transfer = await this.#executeUpkeepAction(
+            {
+              kind: "window_transfer",
+              item: candidate.item.name,
+              count: 1,
+              direction: "window_to_inventory",
+            },
+            "Withdraw exactly one freshly observed item from the open chest.",
+            generation,
+          );
+          if (
+            !transfer.confirmed ||
+            transfer.observation === null ||
+            !sameEquipmentChestWindow(
+              before.window,
+              transfer.observation.window,
+            ) ||
+            !verifyTransfer(before, transfer.observation, candidate)
+          ) {
+            confirmed = false;
+            break;
+          }
+          withdrawn.push(candidate);
+          observation = transfer.observation;
+        }
+      }
+    } catch (error) {
+      this.#logError(error, "Chest inspection failed");
+      confirmed = false;
+    } finally {
+      const closed = await this.#closeEquipmentWindow(generation);
+      if (!closed.confirmed || closed.observation === null) {
+        confirmed = false;
+        cleanupConfirmed = false;
+      } else {
+        observation = closed.observation;
+      }
+    }
+    return { observation, withdrawn, confirmed, cleanupConfirmed };
+  }
+
   async #runEquipmentUpkeep(
     initialObservation: PlayerBodyObservation,
     generation: number,
     explicit: boolean,
+    scheduleWake = true,
   ): Promise<boolean> {
     let observation = initialObservation;
     let attemptedGearWork = false;
     let uncertain = false;
     let cleanupConfirmed = true;
-    let windowMayBeOpen = false;
     let swept = false;
     let equipmentChanges = 0;
     let equipmentDropsCollected = 0;
@@ -884,7 +1429,7 @@ export class CompanionRuntime {
             }
             attemptedGearWork = true;
             const before = observation;
-            const step = await this.#executeEquipmentAction(
+            const step = await this.#executeUpkeepAction(
               {
                 kind: "equip",
                 item: upgrade.item.name,
@@ -936,42 +1481,23 @@ export class CompanionRuntime {
               automaticPickupSuppressionLimit
           )
             return false;
-          const currentDrops = visibleDroppedItems(observation);
           for (const candidate of candidates) {
             const item = candidate.droppedItem;
             if (item === undefined) continue;
-            const target = currentDrops.find(
-              (current) =>
-                current.id === candidate.id &&
-                current.droppedItem?.name === item.name &&
-                current.droppedItem.count === item.count &&
-                Number.isFinite(current.distance) &&
-                current.distance <=
-                  (observation.perception.nearbyDroppedItems?.maxDistance ??
-                    observation.perception.maxDistance),
-            );
-            if (target === undefined) continue;
             const targetKey = automaticPickupFingerprint(
               observation.dimension,
-              target.id,
+              candidate.id,
               item.name,
               item.count,
             );
             if (this.#automaticPickupSuppressed.has(targetKey)) continue;
-            this.#automaticPickupSuppressed.set(targetKey, true);
             attemptedGearWork = true;
-            const before = observation;
-            const step = await this.#executeEquipmentAction(
-              { kind: "collect_item", entityId: target.id },
-              "Collect one observed equipment item, then confirm it in inventory before equipping.",
+            const step = await this.#collectObservedDrop(
+              observation,
+              candidate,
               generation,
             );
-            if (
-              !step.confirmed ||
-              step.observation === null ||
-              !hasInventoryItemName(step.observation, item.name) ||
-              !canContinuePlan(before, step.observation, undefined)
-            ) {
+            if (!step.confirmed || step.observation === null) {
               uncertain = true;
               return false;
             }
@@ -1003,7 +1529,7 @@ export class CompanionRuntime {
           !this.#isStopped()
         ) {
           swept = true;
-          const sweep = await this.#executeEquipmentAction(
+          const sweep = await this.#executeUpkeepAction(
             { kind: "look_sweep" },
             "Complete one bounded look sweep before searching the received visible subset for chests.",
             generation,
@@ -1038,8 +1564,7 @@ export class CompanionRuntime {
               if (!(await equipInventoryUpgrades())) break;
               continue;
             }
-            if (uncertain) break;
-            let block = visibleEquipmentChests(observation).find(
+            const block = visibleEquipmentChests(observation).find(
               (candidate) =>
                 !this.#equipmentChestSuppressed.has(
                   equipmentChestFingerprint(observation.dimension, candidate),
@@ -1058,137 +1583,22 @@ export class CompanionRuntime {
               break;
             // Suppress before travel so a failed or interrupted approach is bounded.
             this.#equipmentChestSuppressed.add(chestKey);
-            const withdrawn: ChestEquipmentWithdrawalCandidate[] = [];
-            let chestFailed = false;
             attemptedGearWork = true;
-            try {
-              if (block.distance > equipmentChestReach) {
-                const targetBlock = block;
-                const moved = await this.#executeEquipmentAction(
-                  {
-                    kind: "move_to",
-                    position: {
-                      x: block.position.x,
-                      y: block.position.y,
-                      z: block.position.z,
-                    },
-                    range: equipmentChestMoveRange,
-                  },
-                  "Move within reach of the observed chest, then verify the same chest before opening it.",
-                  generation,
-                );
-                if (
-                  !moved.confirmed ||
-                  moved.observation === null ||
-                  !canContinuePlan(observation, moved.observation, undefined) ||
-                  !isSafeForEquipmentUpkeep(moved.observation)
-                ) {
-                  chestFailed = true;
-                } else {
-                  observation = moved.observation;
-                  const reachable = visibleEquipmentChests(observation).find(
-                    (candidate) =>
-                      sameBlockPosition(candidate, targetBlock) &&
-                      candidate.distance <= equipmentChestReach,
-                  );
-                  if (reachable === undefined) chestFailed = true;
-                  else block = reachable;
-                }
-              }
-              if (chestFailed) {
-                uncertain = true;
-                break;
-              }
-              if (
-                !this.#isCurrent(generation) ||
-                this.#isStopped() ||
-                !isSafeForEquipmentUpkeep(observation)
-              ) {
-                uncertain = true;
-                break;
-              }
-              windowMayBeOpen = true;
-              const opened = await this.#executeEquipmentAction(
-                {
-                  kind: "open_window",
-                  target: {
-                    kind: "block",
-                    position: {
-                      x: block.position.x,
-                      y: block.position.y,
-                      z: block.position.z,
-                    },
-                  },
-                },
-                "Open the freshly observed reachable chest to inspect its contents.",
-                generation,
-              );
-              if (
-                !opened.confirmed ||
-                opened.observation === null ||
-                !isChestEquipmentWindow(opened.observation.window)
-              ) {
-                chestFailed = true;
-              } else {
-                observation = opened.observation;
-                let transfers = 0;
-                while (
-                  transfers + equipmentDropsCollected <
-                    equipmentUpkeepStepLimit &&
-                  equipmentChanges + transfers + equipmentDropsCollected <
-                    equipmentUpkeepStepLimit &&
-                  this.#isCurrent(generation) &&
-                  !this.#isStopped() &&
-                  isSafeForEquipmentUpkeep(observation)
-                ) {
-                  const candidate = findChestEquipmentWithdrawal(observation);
-                  if (candidate === null) break;
-                  attemptedGearWork = true;
-                  const transfer = await this.#executeEquipmentAction(
-                    {
-                      kind: "window_transfer",
-                      item: candidate.item.name,
-                      count: 1,
-                      direction: "window_to_inventory",
-                    },
-                    "Withdraw exactly one observed strictly better equipment item.",
-                    generation,
-                  );
-                  if (
-                    !transfer.confirmed ||
-                    transfer.observation === null ||
-                    !sameEquipmentChestWindow(
-                      observation.window,
-                      transfer.observation.window,
-                    ) ||
-                    !hasMatchingInventoryItem(
-                      transfer.observation,
-                      candidate.item,
-                    )
-                  ) {
-                    chestFailed = true;
-                    break;
-                  }
-                  withdrawn.push(candidate);
-                  observation = transfer.observation;
-                  transfers += 1;
-                }
-              }
-            } catch (error) {
-              this.#logError(error, "Equipment chest inspection failed");
-              chestFailed = true;
-            } finally {
-              if (windowMayBeOpen) {
-                const closed = await this.#closeEquipmentWindow(generation);
-                windowMayBeOpen = false;
-                if (!closed.confirmed || closed.observation === null) {
-                  cleanupConfirmed = false;
-                  chestFailed = true;
-                } else {
-                  observation = closed.observation;
-                }
-              }
-            }
+            const chest = await this.#withdrawFromVisibleChest(
+              observation,
+              block,
+              generation,
+              equipmentUpkeepStepLimit -
+                equipmentChanges -
+                equipmentDropsCollected,
+              (fresh) => findChestEquipmentWithdrawal(fresh),
+              (_before, after, candidate) =>
+                hasMatchingInventoryItem(after, candidate.item),
+            );
+            observation = chest.observation;
+            const withdrawn = chest.withdrawn;
+            if (!chest.cleanupConfirmed) cleanupConfirmed = false;
+            const chestFailed = !chest.confirmed;
 
             if (!cleanupConfirmed || !this.#isCurrent(generation)) break;
             if (chestFailed) {
@@ -1233,7 +1643,7 @@ export class CompanionRuntime {
                 break;
               }
               const before = observation;
-              const step = await this.#executeEquipmentAction(
+              const step = await this.#executeUpkeepAction(
                 {
                   kind: "equip",
                   item: upgrade.item.name,
@@ -1289,13 +1699,6 @@ export class CompanionRuntime {
     } catch (error) {
       this.#logError(error, "Equipment upkeep failed");
       uncertain = true;
-    } finally {
-      if (windowMayBeOpen) {
-        const closed = await this.#closeEquipmentWindow(generation);
-        if (!closed.confirmed || closed.observation === null)
-          cleanupConfirmed = false;
-        else observation = closed.observation;
-      }
     }
 
     if (explicit && this.#isCurrent(generation) && !this.#isStopped()) {
@@ -1321,14 +1724,19 @@ export class CompanionRuntime {
     if (swept && confirmedItems.length === 0 && !uncertain)
       attemptedGearWork = false;
     const handled = explicit || attemptedGearWork || confirmedItems.length > 0;
-    if (handled && this.#isCurrent(generation) && !this.#isStopped())
+    if (
+      scheduleWake &&
+      handled &&
+      this.#isCurrent(generation) &&
+      !this.#isStopped()
+    )
       this.#setWakeTimer(this.#minWaitMs, {
         reason: "equipment upkeep completed; wait for a fresh observation",
       });
     return handled;
   }
 
-  async #executeEquipmentAction(
+  async #executeUpkeepAction(
     operationInput: PlayerOperation,
     expectedOutcome: string,
     generation: number,
@@ -1343,7 +1751,7 @@ export class CompanionRuntime {
       return { observation: null, confirmed: false };
     const plan = {
       purpose:
-        "Perform one deterministic equipment upkeep step from fresh Body observations.",
+        "Perform one deterministic food or equipment upkeep step from fresh Body observations.",
       steps: [{ operation, expectedOutcome }],
     };
     try {
@@ -1361,7 +1769,8 @@ export class CompanionRuntime {
       waitMs: this.#minWaitMs,
       knowledgeQuery: null,
     };
-    this.#clearTimers();
+    const preserveWakeTimer = this.#maintenanceActionInFlight;
+    this.#clearTimers(preserveWakeTimer);
     const result: { observation: PlayerBodyObservation | null } = {
       observation: null,
     };
@@ -1372,7 +1781,7 @@ export class CompanionRuntime {
     } catch (error) {
       this.#logError(error, "Equipment upkeep step failed");
     } finally {
-      this.#clearTimers();
+      this.#clearTimers(preserveWakeTimer);
     }
     return {
       observation: result.observation,
@@ -1399,7 +1808,7 @@ export class CompanionRuntime {
     }
     if (observation.window === null) return { observation, confirmed: true };
     if (this.#isCurrent(generation) && !this.#isStopped()) {
-      const closed = await this.#executeEquipmentAction(
+      const closed = await this.#executeUpkeepAction(
         { kind: "window_close" },
         "Close the chest after equipment inspection and verify the window is gone.",
         generation,
@@ -1670,9 +2079,10 @@ export class CompanionRuntime {
       }
       const next = updated.plan?.steps[0];
       if (next === undefined) {
-        this.#setWakeTimer(this.#waitFromSnapshot(updated), {
-          reason: "current companion plan completed with observed outcomes",
-        });
+        if (!this.#maintenanceActionInFlight)
+          this.#setWakeTimer(this.#waitFromSnapshot(updated), {
+            reason: "current companion plan completed with observed outcomes",
+          });
         onPlanConfirmed?.(freshObservation);
         return;
       }
@@ -1854,6 +2264,7 @@ export class CompanionRuntime {
   }
 
   #scheduleRetry(wake: PendingWake): void {
+    if (this.#maintenanceActionInFlight) return;
     this.#failureCount += 1;
     const delay = Math.min(
       maximumRetryMs,
@@ -1898,6 +2309,10 @@ export class CompanionRuntime {
 
   #isCurrent(generation: number): boolean {
     return !this.#disposed && generation === this.#generation;
+  }
+
+  #hasActiveBodyRun(): boolean {
+    return this.#activeBody !== undefined;
   }
 
   #isStopped(): boolean {
@@ -2118,14 +2533,17 @@ export class CompanionRuntime {
     }
   }
 
-  #clearTimers(): void {
-    if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
+  #clearTimers(preserveWaitTimer = false): void {
+    if (!preserveWaitTimer && this.#waitTimer !== undefined)
+      clearTimeout(this.#waitTimer);
     if (this.#worldChangeTimer !== undefined)
       clearTimeout(this.#worldChangeTimer);
-    this.#waitTimer = undefined;
+    if (!preserveWaitTimer) this.#waitTimer = undefined;
     this.#worldChangeTimer = undefined;
-    this.#wakeAt = null;
-    this.#wakeReason = null;
+    if (!preserveWaitTimer) {
+      this.#wakeAt = null;
+      this.#wakeReason = null;
+    }
   }
 }
 
@@ -2260,13 +2678,37 @@ function sameBlockPosition(
   );
 }
 
-function hasInventoryItemName(
+function inventoryCount(
   observation: PlayerBodyObservation,
   name: string,
-): boolean {
-  return observation.self.inventory.some(
-    (item) => item.slot >= 9 && item.slot < 45 && item.name === name,
+): number {
+  return observation.self.inventory
+    .filter((item) => item.slot >= 9 && item.slot < 45 && item.name === name)
+    .reduce((total, item) => total + item.count, 0);
+}
+
+function foodAttemptFingerprint(
+  observation: PlayerBodyObservation,
+  items: readonly BodyItemStack[],
+): string {
+  const visibleFoods = visibleDroppedItems(observation)
+    .flatMap((entity) =>
+      entity.droppedItem === undefined
+        ? []
+        : [[entity.id, entity.droppedItem.name, entity.droppedItem.count]],
+    )
+    .sort(([leftId], [rightId]) => Number(leftId) - Number(rightId));
+  const visibleChests = visibleEquipmentChests(observation).map((block) =>
+    equipmentChestFingerprint(observation.dimension, block),
   );
+  return JSON.stringify([
+    observation.self.food,
+    items
+      .map((item) => [item.name, inventoryCount(observation, item.name)])
+      .sort(([left], [right]) => String(left).localeCompare(String(right))),
+    visibleFoods,
+    visibleChests,
+  ]);
 }
 
 function equipmentChestFingerprint(

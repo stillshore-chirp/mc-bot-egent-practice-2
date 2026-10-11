@@ -66,6 +66,7 @@ function failStopPersistence(store: CompanionStore): void {
 function makeObservation(
   options: {
     readonly health?: number | null;
+    readonly food?: number | null;
     readonly inLava?: boolean | null;
     readonly onFire?: boolean | null;
     readonly suffocating?: boolean | null;
@@ -93,7 +94,7 @@ function makeObservation(
       pitch: 0,
       velocity: { x: 0, y: 0, z: 0 },
       health,
-      food: 20,
+      food: options.food === undefined ? 20 : options.food,
       foodSaturation: 5,
       oxygen: 20,
       inWater: false,
@@ -153,6 +154,20 @@ function gearItem(name: string, slot: number, durability = 100): BodyItemStack {
     metadata: 0,
     durability,
     maxDurability: 100,
+    customName: null,
+    enchantments: [],
+  };
+}
+
+function foodItem(name: string, slot: number, count = 1): BodyItemStack {
+  return {
+    slot,
+    itemId: 2,
+    name,
+    count,
+    metadata: 0,
+    durability: null,
+    maxDurability: null,
     customName: null,
     enchantments: [],
   };
@@ -393,17 +408,20 @@ class FakeBody implements PlayerBody {
   readonly runtimeMarkerIds: string[] = [];
   readonly listeners = new Set<(event: PlayerBodyEvent) => void>();
   readonly observeOptions: (PlayerBodyObservationOptions | undefined)[] = [];
+  observeCalls = 0;
   observation = makeObservation();
   executeHandler: ExecuteHandler | undefined;
   observeHandler: ((body: FakeBody) => Promise<void> | void) | undefined;
   stopActiveCalls = 0;
   knowledgeCalls: string[] = [];
+  readonly foodNames = new Set<string>();
 
   public constructor(private readonly store: CompanionStore) {}
 
   public async observe(
     options?: PlayerBodyObservationOptions,
   ): Promise<PlayerBodyObservation> {
+    this.observeCalls += 1;
     this.observeOptions.push(options);
     await this.observeHandler?.(this);
     return this.observation;
@@ -439,7 +457,20 @@ class FakeBody implements PlayerBody {
       registryVersion: "test",
       observedAt: new Date().toISOString(),
       query,
-      facts: [],
+      facts: this.foodNames.has(query)
+        ? [
+            {
+              kind: "item",
+              id: 2,
+              name: query,
+              displayName: query,
+              stackSize: 64,
+              maxDurability: null,
+              enchantCategories: [],
+              food: { foodPoints: 4, saturation: 1.2 },
+            },
+          ]
+        : [],
       inferences: [],
       truncated: false,
     };
@@ -483,6 +514,7 @@ function createRuntime(
   body: FakeBody,
   agent: FakeAgent,
   say: (text: string) => Promise<void> = async () => undefined,
+  minWaitMs = 1_000,
 ): CompanionRuntime {
   const runtime = new CompanionRuntime({
     ownerUsername: "Builder",
@@ -490,7 +522,7 @@ function createRuntime(
     store,
     agent,
     say,
-    minWaitMs: 1_000,
+    minWaitMs,
     memoryContextLimit: 7,
   });
   runtimes.push(runtime);
@@ -904,6 +936,502 @@ describe("CompanionRuntime", () => {
     await eventually(() => agent.inputs.length === 1);
 
     expect(body.executed).toHaveLength(0);
+  });
+
+  it("samples Body every five seconds during an active operation and stops polling on owner stop", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const pending = deferred<PlayerOperationResult>();
+    body.executeHandler = async () => pending.promise;
+    const agent = new FakeAgent([
+      { ...emptyDecision(), plan: makeDecision([look]).plan, waitMs: 60_000 },
+      { ...emptyDecision(), waitMs: 60_000 },
+    ]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(() => body.executed.length === 1);
+    const observationsBeforeTick = body.observeCalls;
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(body.observeCalls).toBeGreaterThan(observationsBeforeTick);
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(1);
+    expect(agent.signals[0]?.aborted).toBe(false);
+
+    const operation = body.executed[0];
+    if (operation === undefined) throw new Error("Expected active operation");
+    pending.resolve(
+      body.result(operation, "active-look", "successful", body.observation),
+    );
+    await eventuallyWithFakeTimers(
+      () => runtime.status().currentOperation === null,
+    );
+    await runtime.stop("Builder");
+    const observationsAfterStop = body.observeCalls;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(body.observeCalls).toBe(observationsAfterStop);
+    expect(await runtime.resume("Impostor")).toBe(false);
+    expect(await runtime.resume("Builder")).toBe(true);
+    const observationsAfterResume = body.observeCalls;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(body.observeCalls).toBeGreaterThan(observationsAfterResume);
+    expect(agent.inputs).toHaveLength(2);
+  });
+
+  it("consumes known inventory food below full hunger and avoids model judgment", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [foodItem("bread", 9, 2)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      if (operation.kind !== "consume")
+        throw new Error("Expected one food consume operation");
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          food: 16,
+          inventory: [foodItem("bread", 9, 1)],
+        },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "food-consume",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.results.length === 1);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "consume",
+    ]);
+    expect(body.observation.self.food).toBe(16);
+    expect(body.observation.self.inventory[0]?.count).toBe(1);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("collects a nearby known food drop before consuming it", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const apple = droppedItemEntity(98, 2, "apple", 1);
+    body.foodNames.add("apple");
+    body.observation = makeObservation({
+      food: 12,
+      entities: [apple],
+      nearbyDroppedItems: makeNearbyDroppedItems([apple]),
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after =
+        operation.kind === "collect_item"
+          ? {
+              ...before,
+              self: {
+                ...before.self,
+                inventory: [foodItem("apple", 9)],
+              },
+              perception: {
+                ...before.perception,
+                entities: [],
+                nearbyDroppedItems: makeNearbyDroppedItems([]),
+              },
+            }
+          : operation.kind === "consume"
+            ? {
+                ...before,
+                self: {
+                  ...before.self,
+                  food: 16,
+                  inventory: [],
+                },
+              }
+            : undefined;
+      if (after === undefined)
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `food-drop-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 2);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "collect_item",
+      "consume",
+    ]);
+    expect(body.observation.self.food).toBe(16);
+    expect(agent.inputs).toHaveLength(0);
+    await runtime.stop("Builder");
+  });
+
+  it("uses the shared reachable-chest path to acquire and consume food", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const apple = foodItem("apple", 0);
+    body.foodNames.add("apple");
+    body.observation = makeObservation({
+      food: 12,
+      blocks: [equipmentChestBlock(1)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after: PlayerBodyObservation;
+      switch (operation.kind) {
+        case "open_window":
+          after = { ...before, window: chestWindow(apple) };
+          break;
+        case "window_transfer": {
+          const owned = foodItem("apple", 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          after = { ...before, window: null };
+          break;
+        case "consume":
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              food: 16,
+              inventory: [],
+            },
+          };
+          break;
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `food-chest-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 4);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "consume",
+    ]);
+    expect(body.observation.window).toBeNull();
+    expect(body.observation.self.food).toBe(16);
+    expect(agent.inputs).toHaveLength(0);
+    await runtime.stop("Builder");
+  });
+
+  it("schedules the normal wake after startup food upkeep without model polling", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [foodItem("bread", 9)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: { ...before.self, food: 16, inventory: [] },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "food-wake",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 20_000 }]);
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    for (let attempt = 0; attempt < 100 && body.results.length === 0; attempt++)
+      await Promise.resolve();
+    expect(body.results).toHaveLength(1);
+    expect(runtime.status().wakeReason).toBe(
+      "food upkeep completed; continue after a fresh observation",
+    );
+    expect(agent.inputs).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(agent.inputs).toHaveLength(0);
+    expect(body.executed).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 1);
+
+    expect(agent.inputs).toHaveLength(1);
+    await runtime.stop("Builder");
+  });
+
+  it("preserves the pending normal wake across periodic food maintenance", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.observation = makeObservation({
+      food: 20,
+      inventory: [foodItem("bread", 9)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: { ...before.self, food: 16, inventory: [] },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "periodic-food-wake",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([
+      { ...emptyDecision(), waitMs: 20_000 },
+      emptyDecision(),
+    ]);
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () =>
+        agent.inputs.length === 1 &&
+        !runtime.status().thinking &&
+        runtime.status().nextWakeAt !== null,
+    );
+    const originalWakeAt = runtime.status().nextWakeAt;
+    if (originalWakeAt === null) throw new Error("Expected scheduled wake");
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [foodItem("bread", 9)],
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    for (let attempt = 0; attempt < 100 && body.results.length === 0; attempt++)
+      await Promise.resolve();
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "consume",
+    ]);
+    expect(agent.inputs).toHaveLength(1);
+    expect(runtime.status().nextWakeAt).toBe(originalWakeAt);
+
+    const remainingWait = Date.parse(originalWakeAt) - Date.now();
+    await vi.advanceTimersByTimeAsync(Math.max(0, remainingWait - 1));
+    expect(agent.inputs).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 2);
+    expect(agent.inputs).toHaveLength(2);
+    await runtime.stop("Builder");
+  });
+
+  it("preserves the pending normal wake across periodic equipment maintenance", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const current = gearItem("iron_helmet", 5, 60);
+    const upgrade = gearItem("diamond_helmet", 9);
+    body.observation = makeObservation({
+      food: 20,
+      equipment: { ...body.observation.self.equipment, head: current },
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind !== "equip")
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          inventory: [],
+          equipment: {
+            ...before.self.equipment,
+            head: { ...upgrade, slot: 5 },
+          },
+        },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "periodic-equipment-wake",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([
+      { ...emptyDecision(), waitMs: 20_000 },
+      emptyDecision(),
+    ]);
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () =>
+        agent.inputs.length === 1 &&
+        !runtime.status().thinking &&
+        runtime.status().nextWakeAt !== null,
+    );
+    const originalWakeAt = runtime.status().nextWakeAt;
+    if (originalWakeAt === null) throw new Error("Expected scheduled wake");
+    body.observation = makeObservation({
+      food: 20,
+      inventory: [upgrade],
+      equipment: { ...body.observation.self.equipment, head: current },
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    for (let attempt = 0; attempt < 100 && body.results.length === 0; attempt++)
+      await Promise.resolve();
+    expect(body.executed.map((operation) => operation.kind)).toEqual(["equip"]);
+    expect(agent.inputs).toHaveLength(1);
+    expect(runtime.status().nextWakeAt).toBe(originalWakeAt);
+
+    const remainingWait = Date.parse(originalWakeAt) - Date.now();
+    await vi.advanceTimersByTimeAsync(Math.max(0, remainingWait - 1));
+    expect(agent.inputs).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 2);
+    expect(agent.inputs).toHaveLength(2);
+    await runtime.stop("Builder");
+  });
+
+  it("keeps one periodic food action fenced across ticks and requires fresh hunger increase", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.observation = makeObservation();
+    const pending = deferred<PlayerOperationResult>();
+    body.executeHandler = async () => pending.promise;
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 60_000 }]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () => agent.inputs.length === 1 && !runtime.status().thinking,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [foodItem("bread", 9, 2)],
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await eventuallyWithFakeTimers(() => body.executed.length === 1);
+    const observationCount = body.observeCalls;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(body.observeCalls).toBeGreaterThan(observationCount);
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(1);
+
+    const operation = body.executed[0];
+    if (operation === undefined) throw new Error("Expected food action");
+    const before = body.observation;
+    const after = {
+      ...before,
+      self: {
+        ...before.self,
+        inventory: [foodItem("bread", 9, 1)],
+      },
+    };
+    body.observation = after;
+    pending.resolve(
+      body.result(
+        operation,
+        "food-no-hunger-change",
+        "successful",
+        after,
+        before,
+      ),
+    );
+    await eventuallyWithFakeTimers(
+      () => runtime.status().currentOperation === null,
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("does not consume at full hunger and suppresses an unchanged failed food attempt", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.observation = makeObservation({
+      food: 20,
+      inventory: [foodItem("bread", 9)],
+    });
+    const agent = new FakeAgent([
+      { ...emptyDecision(), waitMs: 60_000 },
+      { ...emptyDecision(), waitMs: 60_000 },
+    ]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 1);
+    expect(body.executed).toHaveLength(0);
+
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [foodItem("bread", 9)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) =>
+      fakeBody.result(
+        operation,
+        "failed-food-consume",
+        "failed",
+        fakeBody.observation,
+      );
+    const chat = runtime.receiveChat("Builder", "check once");
+    await eventuallyWithFakeTimers(() => agent.inputs.length === 2);
+    await chat;
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "consume",
+    ]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(body.executed).toHaveLength(1);
+    expect(agent.inputs).toHaveLength(2);
   });
 
   it("suppresses an unconfirmed gear candidate until equipment state changes", async () => {
@@ -1868,16 +2396,13 @@ describe("CompanionRuntime", () => {
     const runtime = createRuntime(store, body, agent);
 
     await runtime.start();
-    await eventuallyWithFakeTimers(
-      () =>
-        body.executed.length === 32 &&
-        agent.inputs.length >= 32 &&
-        !runtime.status().thinking,
-    );
+    await eventuallyWithFakeTimers(() => body.results.length === 32, 2_500);
+    for (let attempt = 0; attempt < 100; attempt++) await Promise.resolve();
     const attemptedItemIds = body.executed.flatMap((operation) =>
       operation.kind === "collect_item" ? [operation.entityId] : [],
     );
     expect(attemptedItemIds).toHaveLength(32);
+    expect(agent.inputs).toHaveLength(0);
     expect(new Set(attemptedItemIds).size).toBe(32);
 
     const newDrop = droppedItemEntity(133, 0.1, "apple", 1);
@@ -1896,7 +2421,7 @@ describe("CompanionRuntime", () => {
       status: "successful",
       operation: { kind: "collect_item", entityId: 133 },
     });
-    expect(agent.inputs).toHaveLength(32);
+    expect(agent.inputs).toHaveLength(0);
   });
 
   it("lets authenticated owner input supersede an automatic pickup", async () => {
