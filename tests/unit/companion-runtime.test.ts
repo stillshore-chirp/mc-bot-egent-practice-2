@@ -29,6 +29,7 @@ import type {
   BodyItemStack,
   BodyVisibleBlock,
   BodyWindowSnapshot,
+  PlayerBodyLookSweep,
 } from "../../src/minecraft/player-body-observation.js";
 import { CompanionStore } from "../../src/player/store.js";
 import { isImmediateStopCommand } from "../../src/player/stop-command.js";
@@ -107,13 +108,14 @@ function makeObservation(
       gameMode: "survival",
       experience: { level: 0, points: 0, progress: 0 },
       inventory: options.inventory ?? [],
-      equipment: options.equipment ?? {
-        hand: null,
+      equipment: {
+        hand: gearItem("wooden_sword", 0),
         "off-hand": null,
-        head: null,
-        torso: null,
-        legs: null,
-        feet: null,
+        head: gearItem("leather_helmet", 5),
+        torso: gearItem("leather_chestplate", 6),
+        legs: gearItem("leather_leggings", 7),
+        feet: gearItem("leather_boots", 8),
+        ...options.equipment,
       },
     },
     perception: {
@@ -253,6 +255,31 @@ function equipmentChestBlock(
     position: { x, y: 64, z: 0, dimension: "overworld" },
     distance,
     properties: {},
+  };
+}
+
+function emptyLookSweep(): PlayerBodyLookSweep {
+  const view: PlayerBodyLookSweep["current"] = {
+    directionIndex: null,
+    yawDegrees: 0,
+    pitchDegrees: -25,
+    dimension: "overworld",
+    visibleBlocks: [],
+    visibleEntities: [],
+    omittedBlockCandidates: 0,
+    omittedEntityCandidates: 0,
+    candidateSearchMayBeTruncated: false,
+  };
+  return {
+    current: view,
+    directions: Array.from({ length: 8 }, (_, directionIndex) => ({
+      ...view,
+      directionIndex,
+    })),
+    plannedDirectionCount: 8,
+    complete: true,
+    candidateSearchMayBeTruncated: false,
+    worldAbsenceEstablished: false,
   };
 }
 
@@ -947,6 +974,390 @@ describe("CompanionRuntime", () => {
       "diamond_chestplate",
     );
     expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("uses all directions from one automatic sweep to acquire and equip a chest upgrade", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    const candidate = gearItem("diamond_helmet", 0);
+    const chest = equipmentChestBlock(3);
+    const emptySweep = emptyLookSweep();
+    const lookSweep: PlayerBodyLookSweep = {
+      ...emptySweep,
+      directions: emptySweep.directions.map((view, directionIndex) => ({
+        ...view,
+        visibleBlocks:
+          directionIndex === 0
+            ? [
+                {
+                  name: chest.name,
+                  position: {
+                    x: chest.position.x,
+                    y: chest.position.y,
+                    z: chest.position.z,
+                  },
+                  distance: chest.distance,
+                },
+              ]
+            : [],
+      })),
+    };
+    body.observation = makeObservation({
+      equipment: { head: null },
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after = before;
+      switch (operation.kind) {
+        case "look_sweep":
+          return {
+            ...fakeBody.result(
+              operation,
+              `automatic-equipment-sweep-${fakeBody.executed.length}`,
+              "successful",
+              after,
+              before,
+            ),
+            lookSweep,
+          };
+        case "look":
+          after = {
+            ...before,
+            perception: { ...before.perception, blocks: [chest] },
+          };
+          break;
+        case "open_window":
+          after = { ...before, window: chestWindow(candidate) };
+          break;
+        case "window_transfer": {
+          const owned = gearItem(candidate.name, 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          after = { ...before, window: null };
+          break;
+        case "equip": {
+          const owned = before.self.inventory.find(
+            (item) => item.name === operation.item,
+          );
+          if (owned === undefined)
+            throw new Error("Expected chest helmet in inventory");
+          after = {
+            ...before,
+            self: {
+              ...before.self,
+              inventory: before.self.inventory.filter(
+                (item) => item.name !== operation.item,
+              ),
+              equipment: {
+                ...before.self.equipment,
+                head: { ...owned, slot: 5 },
+              },
+            },
+          };
+          break;
+        }
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `automatic-equipment-operation-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length > 0 || agent.inputs.length > 0);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "look_sweep",
+      "look",
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "equip",
+    ]);
+    expect(body.executed[1]).toEqual({
+      kind: "look",
+      target: { x: 3.5, y: 64.5, z: 0.5 },
+    });
+    expect(body.observation.window).toBeNull();
+    expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it.each([
+    ["empty hand", null],
+    ["broken known weapon", gearItem("wooden_sword", 0, 0)],
+  ] as const)(
+    "starts a bounded sweep for an unowned weapon with complete armor (%s)",
+    async (_gap, hand) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const agent = new FakeAgent([]);
+      const runtime = createRuntime(store, body, agent);
+      body.observation = makeObservation({ equipment: { hand } });
+      body.executeHandler = async (operation, _signal, fakeBody) => {
+        if (operation.kind !== "look_sweep")
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+        return {
+          ...fakeBody.result(
+            operation,
+            "unowned-weapon-equipment-sweep",
+            "successful",
+            fakeBody.observation,
+            fakeBody.observation,
+          ),
+          lookSweep: emptyLookSweep(),
+        };
+      };
+
+      await runtime.start();
+      await eventually(() => body.executed.length > 0);
+
+      expect(body.executed).toEqual([{ kind: "look_sweep" }]);
+      expect(agent.inputs).toHaveLength(1);
+    },
+  );
+
+  it("keeps a held tool out of the automatic equipment-gap sweep", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({
+      equipment: { hand: gearItem("diamond_pickaxe", 0) },
+    });
+    body.executeHandler = async (operation) => {
+      throw new Error(`Unexpected operation: ${operation.kind}`);
+    };
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length > 0);
+
+    expect(body.executed).toEqual([]);
+  });
+
+  it("fences repeated automatic miss sweeps but processes a newly visible gear drop immediately", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 60_000 }]);
+    const runtime = createRuntime(store, body, agent);
+    const candidate = gearItem("diamond_helmet", 9);
+    body.observation = makeObservation({ equipment: { head: null } });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after = before;
+      if (operation.kind === "look_sweep") {
+        return {
+          ...fakeBody.result(
+            operation,
+            `equipment-miss-sweep-${fakeBody.executed.length}`,
+            "successful",
+            after,
+            before,
+          ),
+          lookSweep: emptyLookSweep(),
+        };
+      }
+      if (operation.kind === "collect_item") {
+        after = {
+          ...before,
+          self: { ...before.self, inventory: [candidate] },
+          perception: {
+            ...before.perception,
+            entities: [],
+            nearbyDroppedItems: makeNearbyDroppedItems([]),
+          },
+        };
+      } else if (operation.kind === "equip") {
+        after = {
+          ...before,
+          self: {
+            ...before.self,
+            inventory: before.self.inventory.filter(
+              (item) => item.name !== operation.item,
+            ),
+            equipment: {
+              ...before.self.equipment,
+              head: { ...candidate, slot: 5 },
+            },
+          },
+        };
+      } else {
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `equipment-miss-operation-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () => body.executed.length === 1 && agent.inputs.length === 1,
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(body.executed).toEqual([{ kind: "look_sweep" }]);
+
+    const drop = droppedItemEntity(91, 2, "diamond_helmet");
+    body.observation = makeObservation({
+      equipment: { head: null },
+      entities: [drop],
+      nearbyDroppedItems: makeNearbyDroppedItems([drop]),
+    });
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await vi.advanceTimersByTimeAsync(1_500);
+    await eventuallyWithFakeTimers(() => body.executed.length === 3);
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "look_sweep",
+      "collect_item",
+      "equip",
+    ]);
+    expect(body.observation.self.equipment.head?.name).toBe("diamond_helmet");
+    expect(agent.inputs).toHaveLength(1);
+  });
+
+  it("aborts an automatic equipment sweep immediately on owner stop", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({ equipment: { head: null } });
+    let sweepSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind !== "look_sweep")
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      sweepSignal = signal;
+      return await new Promise((resolve) => {
+        const finish = (): void =>
+          resolve(
+            fakeBody.result(
+              operation,
+              "stopped-equipment-sweep",
+              "failed",
+              fakeBody.observation,
+            ),
+          );
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    await runtime.stop("Builder");
+
+    expect(sweepSignal?.aborted).toBe(true);
+    expect(body.executed).toEqual([{ kind: "look_sweep" }]);
+    expect(store.snapshot().stopped).toBe(true);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("lets owner follow supersede a periodic equipment sweep before a found chest is rechecked", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 60_000 }]);
+    const runtime = createRuntime(store, body, agent, undefined, 60_000);
+    const pendingSweep = deferred<PlayerOperationResult>();
+    let sweepSignal: AbortSignal | undefined;
+    let sweepReleased = false;
+    const emptySweep = emptyLookSweep();
+    const candidateSweep: PlayerBodyLookSweep = {
+      ...emptySweep,
+      directions: emptySweep.directions.map((view, index) =>
+        index === 2
+          ? { ...view, visibleBlocks: [equipmentChestBlock(3, 3)] }
+          : view,
+      ),
+    };
+    const releaseSweep = (): void => {
+      if (sweepReleased) return;
+      sweepReleased = true;
+      pendingSweep.resolve({
+        ...body.result(
+          { kind: "look_sweep" },
+          "periodic-owner-race-sweep",
+          "successful",
+          body.observation,
+        ),
+        lookSweep: candidateSweep,
+      });
+    };
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "look_sweep") {
+        sweepSignal = signal;
+        return pendingSweep.promise;
+      }
+      if (operation.kind === "follow_owner")
+        return fakeBody.result(
+          operation,
+          "periodic-owner-race-follow",
+          "successful",
+          fakeBody.observation,
+        );
+      return fakeBody.result(
+        operation,
+        `unexpected-periodic-owner-race-${fakeBody.executed.length}`,
+        "failed",
+        null,
+      );
+    };
+
+    try {
+      await runtime.start();
+      await eventuallyWithFakeTimers(
+        () => agent.inputs.length === 1 && !runtime.status().thinking,
+      );
+      body.observation = makeObservation({ equipment: { head: null } });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await eventuallyWithFakeTimers(
+        () => body.executed[0]?.kind === "look_sweep",
+      );
+
+      const ownerTurn = runtime.receiveChat("Builder", "こっち来て");
+      expect(sweepSignal?.aborted).toBe(true);
+      releaseSweep();
+      await ownerTurn;
+      await eventuallyWithFakeTimers(() =>
+        body.executed.some((operation) => operation.kind === "follow_owner"),
+      );
+
+      expect(body.executed.map((operation) => operation.kind)).toEqual([
+        "look_sweep",
+        "follow_owner",
+      ]);
+      expect(
+        body.executed.some((operation) =>
+          ["open_window", "window_transfer", "equip"].includes(operation.kind),
+        ),
+      ).toBe(false);
+      expect(agent.inputs).toHaveLength(1);
+    } finally {
+      releaseSweep();
+    }
   });
 
   it("does not start autonomous equipment upkeep when self health is unknown", async () => {
@@ -1721,7 +2132,6 @@ describe("CompanionRuntime", () => {
     body.observation = makeObservation({
       inventory: [firstCandidate],
       equipment: {
-        hand: null,
         "off-hand": null,
         head: gearItem("iron_helmet", 5),
         torso: null,
@@ -2148,12 +2558,8 @@ describe("CompanionRuntime", () => {
     const body = new FakeBody(store);
     body.observation = makeObservation({
       equipment: {
-        hand: null,
         "off-hand": null,
         head: current,
-        torso: null,
-        legs: null,
-        feet: null,
       },
       entities: [],
       nearbyDroppedItems: makeNearbyDroppedItems([
@@ -4501,7 +4907,11 @@ describe("CompanionRuntime", () => {
         () => store.snapshot().lastOutcome?.operation.kind === "attack",
       );
 
-      expect(body.executed).toEqual([{ kind: "attack", entityId: target.id }]);
+      expect(body.executed).toEqual(
+        inventoryCase === "best-held"
+          ? [{ kind: "attack", entityId: target.id }]
+          : [{ kind: "look_sweep" }, { kind: "attack", entityId: target.id }],
+      );
       expect(agent.inputs).toHaveLength(1);
     }
   });
