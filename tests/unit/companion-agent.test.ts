@@ -417,6 +417,27 @@ describe("CompanionAgent", () => {
           },
         },
       },
+      {
+        id: "bed-location",
+        kind: "world",
+        content: "確認済みベッドの場所: the_nether (12, 64, -3)",
+        source: "minecraft_observed",
+        status: "active",
+        importance: 5,
+        createdAt: "2026-10-10T00:00:00.000Z",
+        updatedAt: "2026-10-10T00:00:00.000Z",
+        metadata: {
+          bedMemory: {
+            version: 1,
+            kind: "location",
+            locationKey: "the_nether:12:64:-3",
+            dimension: "the_nether",
+            position: { x: 12, y: 64, z: -3 },
+            observedAt: "2026-10-10T00:00:00.000Z",
+            privateInternalField: "not-forwarded",
+          },
+        },
+      },
     ];
 
     await agent.decide({
@@ -439,9 +460,17 @@ describe("CompanionAgent", () => {
         perception: { blocks: unknown[] };
         window: unknown;
       };
+      rememberedBedLocation: {
+        dimension: string;
+        position: { x: number; y: number; z: number };
+        observedAt: string;
+      } | null;
       memories: { chestObservation?: Record<string, unknown> }[];
     };
     expect(request.instructions).toContain("過去に視認した最終位置");
+    expect(request.instructions).toContain(
+      "rememberedBedLocationは過去に視認した位置です。現在のobservation.dimensionと同じ場合だけ移動先に使い、現在のperception.blocksにないだけで消失と扱わずmove_toできます。到着や記憶だけでベッド現存・睡眠成功を主張せず、到着後の新しいBody観測で判断してください。",
+    );
     expect(request.instructions).toContain(
       "現在のblocks一覧にないだけで不存在とせず",
     );
@@ -458,7 +487,9 @@ describe("CompanionAgent", () => {
       window: null,
     });
     expect(
-      providerInput.memories.map(({ chestObservation }) => chestObservation),
+      providerInput.memories
+        .map(({ chestObservation }) => chestObservation)
+        .filter((value) => value !== undefined),
     ).toEqual([
       {
         kind: "location",
@@ -475,6 +506,12 @@ describe("CompanionAgent", () => {
         contents: [{ slot: 0, name: "diamond", count: 3 }],
       },
     ]);
+    expect(providerInput.observation).toMatchObject({ dimension: "overworld" });
+    expect(providerInput.rememberedBedLocation).toEqual({
+      dimension: "the_nether",
+      position: { x: 12, y: 64, z: -3 },
+      observedAt: "2026-10-10T00:00:00.000Z",
+    });
     expect(request.input).not.toContain("privateInternalField");
   });
 

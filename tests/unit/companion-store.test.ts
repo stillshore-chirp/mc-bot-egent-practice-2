@@ -322,6 +322,54 @@ describe("CompanionStore", () => {
     }
   });
 
+  it("persists and refreshes a body-observed bed location across reopen", () => {
+    const { path } = freshDatabase();
+    let now = "2026-10-10T00:00:00.000Z";
+    let store = CompanionStore.open(path, { now: () => now });
+    const first = store.rememberObservedBedLocation({
+      dimension: "overworld",
+      position: { x: 12, y: 64, z: -3 },
+      observedAt: now,
+    });
+    expect(first).toMatchObject({
+      kind: "world",
+      source: "minecraft_observed",
+      status: "active",
+      metadata: {
+        bedMemory: {
+          version: 1,
+          kind: "location",
+          dimension: "overworld",
+          position: { x: 12, y: 64, z: -3 },
+          observedAt: now,
+        },
+      },
+    });
+    store.close();
+
+    now = "2026-10-12T00:00:00.000Z";
+    store = CompanionStore.open(path, { now: () => now });
+    const refreshed = store.rememberObservedBedLocation({
+      dimension: "overworld",
+      position: { x: 12, y: 64, z: -3 },
+      observedAt: now,
+    });
+    expect(refreshed.id).toBe(first.id);
+    expect(refreshed.updatedAt).toBe(now);
+    expect(refreshed.metadata).toMatchObject({
+      bedMemory: { observedAt: now, position: { x: 12, y: 64, z: -3 } },
+    });
+    store.close();
+
+    now = "2030-10-12T00:00:00.000Z";
+    store = CompanionStore.open(path, { now: () => now });
+    expect(store.latestObservedBedLocation()?.id).toBe(first.id);
+    expect(store.latestObservedBedLocation()?.metadata).toMatchObject({
+      bedMemory: { observedAt: "2026-10-12T00:00:00.000Z" },
+    });
+    store.close();
+  });
+
   it("finds a rare old memory among a large recent set with a bounded recall pool", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });

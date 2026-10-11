@@ -615,6 +615,102 @@ describe("CompanionRuntime", () => {
     expect(body.executed[0]).toEqual(move);
   });
 
+  it("records bed locations only from the current visible Body block subset", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const observedAt = "2026-10-10T00:00:00.000Z";
+    const ordinaryBlock: BodyVisibleBlock = {
+      name: "minecraft:stone",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const visibleBed: BodyVisibleBlock = {
+      name: "minecraft:white_bed",
+      stateId: 2,
+      position: { x: 2, y: 64, z: 0, dimension: "overworld" },
+      distance: 2,
+      properties: {},
+    };
+    body.observation = {
+      ...makeObservation({ blocks: [ordinaryBlock, visibleBed] }),
+      observedAt,
+    };
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+
+    expect(store.latestObservedBedLocation()).toMatchObject({
+      kind: "world",
+      source: "minecraft_observed",
+      metadata: {
+        bedMemory: {
+          kind: "location",
+          dimension: "overworld",
+          position: { x: 2, y: 64, z: 0 },
+          observedAt,
+        },
+      },
+    });
+  });
+
+  it("uses a remembered bed location for an out-of-sight move input", async () => {
+    const { store } = freshStore();
+    const position = { x: 12, y: 64, z: -3 };
+    store.rememberObservedBedLocation({
+      dimension: "overworld",
+      position,
+      observedAt: "2026-10-10T00:00:00.000Z",
+    });
+    const move = playerOperationSchema.parse({
+      kind: "move_to",
+      position,
+      range: 1,
+    });
+    const body = new FakeBody(store);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: {
+          ...before.self,
+          position: {
+            ...before.self.position,
+            ...position,
+          },
+        },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "bed-move",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([makeDecision([move])]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+
+    expect(agent.inputs[0]?.observation.perception.blocks).toEqual([]);
+    expect(agent.inputs[0]?.observation.dimension).toBe("overworld");
+    expect(
+      agent.inputs[0]?.memories.find(
+        (memory) => memory.id === store.latestObservedBedLocation()?.id,
+      )?.metadata,
+    ).toMatchObject({
+      bedMemory: { kind: "location", dimension: "overworld", position },
+    });
+    expect(body.observation.self.position).toMatchObject(position);
+    expect(body.executed[0]).toEqual(move);
+  });
+
   it("passes the latest 24 chronological owner and companion messages to judgment", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
