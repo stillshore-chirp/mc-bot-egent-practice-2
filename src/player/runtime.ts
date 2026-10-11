@@ -55,7 +55,7 @@ const ownerReplyFailed =
 const ownerPlanAccepted = "依頼を受け取ったよ。結果を確認してから伝えるね。";
 const ownerPlanUnconfirmed =
   "行動結果を確認できなかったので、完了とは言えないよ。";
-const ownerPlanConfirmed = "頼まれた行動を終えて、結果を確認できたよ。";
+const ownerPlanConfirmed = "いま実行した操作の結果を確認できたよ。";
 const equipmentChestReach = 4.5;
 const equipmentSearchRange = 32;
 const equipmentChestMoveRange = 2.5;

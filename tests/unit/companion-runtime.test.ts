@@ -3013,6 +3013,38 @@ describe("CompanionRuntime", () => {
     expect(runtime.status().recentErrors).toHaveLength(1);
   });
 
+  it("describes an observed plan step without claiming its larger goal was achieved", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const planDecision = makeDecision([look]);
+    const decision = companionDecisionSchema.parse({
+      ...planDecision,
+      speech: null,
+      goal: {
+        title: "Gather 64 oak logs",
+        successCondition: "The inventory contains 64 oak logs.",
+        source: "owner",
+      },
+    });
+    const runtime = createRuntime(store, body, new FakeAgent([decision]), say);
+
+    await runtime.receiveChat("Builder", "Gather 64 oak logs");
+
+    expect(body.executed).toEqual([{ kind: "look_sweep" }]);
+    expect(body.observation.self.inventory).toEqual([]);
+    expect(store.snapshot().goal?.title).toBe("Gather 64 oak logs");
+    expect(say).toHaveBeenNthCalledWith(
+      1,
+      "依頼を受け取ったよ。結果を確認してから伝えるね。",
+    );
+    expect(say).toHaveBeenNthCalledWith(
+      2,
+      "いま実行した操作の結果を確認できたよ。",
+    );
+    expect(say).not.toHaveBeenCalledWith("64本集められたよ。");
+  });
+
   it("speaks planned owner replies only after confirmation and falls back when results are unconfirmed", async () => {
     for (const outcome of [
       "successful",
