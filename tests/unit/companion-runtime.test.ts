@@ -1333,6 +1333,74 @@ describe("CompanionRuntime", () => {
     await runtime.stop("Builder");
   });
 
+  it("defers periodic actions while a coalesced world-change wake is pending", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: { ...before.self, food: 20, inventory: [] },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "coalesced-world-food",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 30_000 }]);
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () =>
+        agent.inputs.length === 1 &&
+        !runtime.status().thinking &&
+        runtime.status().nextWakeAt !== null,
+    );
+    const normalWakeAt = runtime.status().nextWakeAt;
+    if (normalWakeAt === null) throw new Error("Expected scheduled wake");
+    const observationsBeforeRace = body.observeCalls;
+
+    await vi.advanceTimersByTimeAsync(4_900);
+    body.observation = makeObservation({
+      food: 5,
+      inventory: [foodItem("bread", 10)],
+    });
+    const worldChangeObservedAt = Date.now();
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    for (let attempt = 0; attempt < 100; attempt++) await Promise.resolve();
+
+    expect(body.observeCalls).toBeGreaterThan(observationsBeforeRace);
+    expect(body.executed).toHaveLength(0);
+    expect(agent.inputs).toHaveLength(1);
+    expect(runtime.status().nextWakeAt).toBe(normalWakeAt);
+
+    await vi.advanceTimersByTimeAsync(1_399);
+    expect(agent.inputs).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    for (let attempt = 0; attempt < 100; attempt++) await Promise.resolve();
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "consume",
+    ]);
+    expect(body.observation.self.food).toBeGreaterThan(5);
+    expect(body.observation.self.inventory).toHaveLength(0);
+    expect(Date.now() - worldChangeObservedAt).toBeLessThanOrEqual(1_500);
+    expect(Date.now()).toBeLessThan(Date.parse(normalWakeAt));
+    expect(agent.inputs).toHaveLength(1);
+    await runtime.stop("Builder");
+  });
+
   it("keeps one periodic food action fenced across ticks and requires fresh hunger increase", async () => {
     vi.useFakeTimers();
     const { store } = freshStore();

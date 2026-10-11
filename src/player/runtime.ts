@@ -546,6 +546,7 @@ export class CompanionRuntime {
         this.#activeBody !== undefined ||
         this.#drainPromise !== undefined ||
         this.#pendingWake !== undefined ||
+        this.#worldChangeTimer !== undefined ||
         snapshot.plan !== null ||
         snapshot.activeOperation !== null
       )
