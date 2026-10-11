@@ -259,14 +259,12 @@ export class CompanionRuntime {
   ): Promise<void> {
     if (!sameMinecraftIdentity(username, this.#ownerUsername)) return;
     if (this.#disposed) return;
-    const message = rawMessage.trim().slice(0, messageLimit);
-    if (message.length === 0) return;
 
-    if (isImmediateStopCommand(message)) {
+    if (isImmediateStopCommand(rawMessage)) {
       const stopped = await this.stop(username);
       if (stopped) {
         try {
-          this.#store.recordMessage("owner", message);
+          this.#store.recordMessage("owner", rawMessage);
         } catch (error) {
           this.#logError(error, "Owner stop message could not be recorded");
         }
@@ -279,11 +277,14 @@ export class CompanionRuntime {
       return;
     }
 
+    const message = rawMessage.trim().slice(0, messageLimit);
+    if (message.length === 0) return;
+
     if (!this.#started) this.#activate();
     if (!this.#isStopped()) this.#armMaintenanceTimer();
     if (this.#isStopped()) {
+      this.#store.recordMessage("owner", message);
       if (isExplicitResumeCommand(message)) {
-        this.#store.recordMessage("owner", message);
         await this.resume(username, message);
       }
       return;
@@ -2990,7 +2991,7 @@ function nextOperationTargetIsAvailable(
 }
 
 function isExplicitResumeCommand(message: string): boolean {
-  return /^(?:再開|再開して|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
+  return /^(?:再開|再開して|再開しろ|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
     message.trim(),
   );
 }

@@ -269,7 +269,7 @@ describe("companion acceptance without paid services", () => {
         "周囲の危険が分からないので、ここで待つね。",
       );
 
-      await runtime.receiveChat(ownerUsername, "自律行動を止めて");
+      await runtime.receiveChat(ownerUsername, "緊急停止命令");
       await ownerTurn;
 
       expect(store.snapshot().stopped).toBe(true);

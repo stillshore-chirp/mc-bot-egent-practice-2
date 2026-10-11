@@ -2903,9 +2903,9 @@ describe("CompanionRuntime", () => {
 
     await runtime.receiveChat("Builder", "ついてきて");
     await eventually(() => body.executed.length === 2);
-    await runtime.receiveChat("Impostor", "止まって");
+    await runtime.receiveChat("Impostor", "緊急停止命令");
     expect(followSignals[1]?.aborted).toBe(false);
-    await runtime.receiveChat("Builder", "止まって");
+    await runtime.receiveChat("Builder", "緊急停止命令");
 
     expect(followSignals[1]?.aborted).toBe(true);
     expect(store.snapshot().stopped).toBe(true);
@@ -3228,10 +3228,10 @@ describe("CompanionRuntime", () => {
 
     await runtime.start();
     await eventually(() => agent.inputs.length === 1);
-    await runtime.receiveChat("Impostor", "止まって");
+    await runtime.receiveChat("Impostor", "緊急停止命令");
     expect(runtime.status().stopped).toBe(false);
 
-    const stopping = runtime.receiveChat("Builder", "止まって");
+    const stopping = runtime.receiveChat("Builder", "緊急停止命令");
     await eventually(() => agent.signals[0]?.aborted === true);
     expect(runtime.status()).toMatchObject({ stopped: true, running: false });
     expect(store.snapshot().stopped).toBe(false);
@@ -3276,7 +3276,7 @@ describe("CompanionRuntime", () => {
 
     await runtime.start();
     await eventually(() => body.executed.length === 1);
-    await runtime.receiveChat("Builder", "自律行動を止めて");
+    await runtime.receiveChat("Builder", "緊急停止命令");
 
     expect(bodySignal?.aborted).toBe(true);
     expect(body.stopActiveCalls).toBe(1);
@@ -4305,12 +4305,99 @@ describe("CompanionRuntime", () => {
 });
 
 describe("owner stop command", () => {
-  it("detects direct commands without treating quotes, negation, questions, or future conditions as stops", () => {
-    expect(isImmediateStopCommand("今どうなってる、止まって")).toBe(true);
-    expect(isImmediateStopCommand("自律行動を止めてください")).toBe(true);
-    expect(isImmediateStopCommand("止まらないで")).toBe(false);
-    expect(isImmediateStopCommand("『止めて』って言ったよ")).toBe(false);
-    expect(isImmediateStopCommand("止めていい？")).toBe(false);
-    expect(isImmediateStopCommand("明日停止して")).toBe(false);
+  it("matches only the complete unmodified stop token", () => {
+    expect(isImmediateStopCommand("緊急停止命令")).toBe(true);
+    expect(isImmediateStopCommand(" 緊急停止命令 ")).toBe(false);
+    expect(isImmediateStopCommand("『緊急停止命令』")).toBe(false);
+    expect(isImmediateStopCommand("緊急停止命令！")).toBe(false);
+    expect(isImmediateStopCommand("緊急停止命令の意味は？")).toBe(false);
+    expect(isImmediateStopCommand("通常会話のあとに止まって")).toBe(false);
+  });
+
+  it("checks raw owner input before trimming or truncation", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    const stopToken = "緊急停止命令";
+    const longPrefix = `${stopToken}${" ".repeat(2_000 - stopToken.length)}x`;
+    const ordinaryMessages = [
+      ` ${stopToken} `,
+      `『${stopToken}』`,
+      `${stopToken}！`,
+      `${stopToken}の意味は？`,
+      longPrefix,
+    ];
+
+    await runtime.receiveChat("Impostor", stopToken);
+    expect(runtime.status().stopped).toBe(false);
+    expect(agent.inputs).toHaveLength(0);
+
+    for (const message of ordinaryMessages) {
+      await runtime.receiveChat("Builder", message);
+      expect(runtime.status().stopped).toBe(false);
+      expect(body.executed).toHaveLength(0);
+      expect(agent.inputs.at(-1)?.ownerMessage).toBe(
+        message.trim().slice(0, 2_000),
+      );
+    }
+    expect(agent.inputs).toHaveLength(ordinaryMessages.length);
+
+    await runtime.receiveChat("Builder", stopToken);
+    expect(runtime.status().stopped).toBe(true);
+    expect(agent.inputs).toHaveLength(ordinaryMessages.length);
+    expect(
+      store
+        .recentMessages(100)
+        .filter((entry) => entry.role === "owner")
+        .at(-1)?.text,
+    ).toBe(stopToken);
+  });
+
+  it("stores ordinary owner chat while stopped and wakes only for authenticated resume forms", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({
+        ...emptyDecision(),
+        speech: "自律を再開したよ。",
+      }),
+      companionDecisionSchema.parse({
+        ...emptyDecision(),
+        speech: "自律を再開したよ。",
+      }),
+    ]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.receiveChat("Builder", "緊急停止命令");
+    expect(runtime.status().stopped).toBe(true);
+    expect(agent.inputs).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "停止中に保存する通常メッセージ");
+    expect(store.recentMessages(100).at(-1)).toMatchObject({
+      role: "owner",
+      text: "停止中に保存する通常メッセージ",
+    });
+    expect(agent.inputs).toHaveLength(0);
+    expect(body.executed).toHaveLength(0);
+
+    await runtime.receiveChat("Impostor", "再開しろ");
+    expect(runtime.status().stopped).toBe(true);
+    expect(agent.inputs).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "再開しろ");
+    expect(runtime.status().running).toBe(true);
+    expect(agent.inputs[0]?.ownerMessage).toBe("再開しろ");
+    expect(say).toHaveBeenCalledWith("自律を再開したよ。");
+    expect(body.executed).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "緊急停止命令");
+    expect(runtime.status().stopped).toBe(true);
+    await runtime.receiveChat("Builder", "再開して");
+    expect(runtime.status().running).toBe(true);
+    expect(agent.inputs[1]?.ownerMessage).toBe("再開して");
+    expect(say).toHaveBeenCalledTimes(4);
+    expect(body.executed).toHaveLength(0);
   });
 });
