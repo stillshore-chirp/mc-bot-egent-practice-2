@@ -2972,6 +2972,160 @@ describe("CompanionRuntime", () => {
     }
   });
 
+  it("gives an empty owner decision one fallback and does not repeat it on a timer wake", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({ ...emptyDecision(), waitMs: 5_000 }),
+      emptyDecision(),
+    ]);
+    const runtime = createRuntime(store, body, agent, say, 1_000);
+
+    await runtime.receiveChat("Builder", "今の様子を教えて");
+
+    expect(say).toHaveBeenCalledExactlyOnceWith(
+      "今は返事をまとめられなかったよ。必要ならもう一度聞いてね。",
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.ownerMessage).toBeUndefined();
+    expect(say).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives an owner a fixed reply when the Agent fails", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([
+      async () => {
+        throw new Error("synthetic decision failure");
+      },
+    ]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.receiveChat("Builder", "いま何をしているの？");
+
+    expect(say).toHaveBeenCalledExactlyOnceWith(
+      "今は返事を作れなかったよ。少し待ってからもう一度聞いてね。",
+    );
+    expect(runtime.status().recentErrors).toHaveLength(1);
+  });
+
+  it("speaks planned owner replies only after confirmation and falls back when results are unconfirmed", async () => {
+    for (const outcome of [
+      "successful",
+      "failed",
+      "fresh-observation-failed",
+    ] as const) {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const say = vi.fn(async () => undefined);
+      const decision = companionDecisionSchema.parse({
+        ...makeDecision([look]),
+        speech: "もう完了したよ。",
+      });
+      const agent = new FakeAgent([decision]);
+      const runtime = createRuntime(store, body, agent, say);
+      let observations = 0;
+      if (outcome === "fresh-observation-failed") {
+        body.observeHandler = async () => {
+          observations += 1;
+          if (observations === 2)
+            throw new Error("synthetic observation failure");
+        };
+      }
+      const result = deferred<PlayerOperationResult>();
+      body.executeHandler = async () => result.promise;
+
+      const ownerTurn = runtime.receiveChat("Builder", "周囲を確認して");
+      await eventually(() => body.executed.length === 1);
+      expect(say).toHaveBeenCalledExactlyOnceWith(
+        "依頼を受け取ったよ。結果を確認してから伝えるね。",
+      );
+      expect(say).not.toHaveBeenCalledWith("もう完了したよ。");
+
+      const operation = body.executed[0];
+      if (operation === undefined) throw new Error("Expected a Body operation");
+      result.resolve(
+        body.result(
+          operation,
+          `synthetic-${outcome}`,
+          outcome === "failed" ? "failed" : "successful",
+          outcome === "failed" ? null : body.observation,
+        ),
+      );
+      await ownerTurn;
+
+      if (outcome === "successful") {
+        expect(say).toHaveBeenCalledTimes(2);
+        expect(say).toHaveBeenNthCalledWith(
+          1,
+          "依頼を受け取ったよ。結果を確認してから伝えるね。",
+        );
+        expect(say).toHaveBeenNthCalledWith(2, "もう完了したよ。");
+      } else {
+        expect(say).toHaveBeenCalledTimes(2);
+        expect(say).toHaveBeenNthCalledWith(
+          1,
+          "依頼を受け取ったよ。結果を確認してから伝えるね。",
+        );
+        expect(say).toHaveBeenNthCalledWith(
+          2,
+          "行動結果を確認できなかったので、完了とは言えないよ。",
+        );
+        expect(say).not.toHaveBeenCalledWith("もう完了したよ。");
+      }
+    }
+  });
+
+  it("lets the latest owner message replace a pending plan without replying for the stale turn", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({
+        ...makeDecision([look]),
+        speech: "前の依頼は完了したよ。",
+      }),
+      companionDecisionSchema.parse({
+        ...emptyDecision(),
+        speech: "今の状況を確認したよ。",
+      }),
+    ]);
+    const runtime = createRuntime(store, body, agent, say);
+    body.executeHandler = async (operation, signal, fakeBody) =>
+      await new Promise<PlayerOperationResult>((resolve) => {
+        const interrupted = (): void =>
+          resolve(
+            fakeBody.result(
+              operation,
+              "synthetic-superseded-operation",
+              "interrupted",
+              null,
+            ),
+          );
+        if (signal?.aborted) interrupted();
+        else signal?.addEventListener("abort", interrupted, { once: true });
+      });
+
+    const earlierTurn = runtime.receiveChat("Builder", "周囲を確認して");
+    await eventually(() => body.executed.length === 1);
+    await runtime.receiveChat("Builder", "いま何が見える？");
+    await earlierTurn;
+
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.ownerMessage).toBe("いま何が見える？");
+    expect(say).toHaveBeenCalledTimes(2);
+    expect(say).toHaveBeenNthCalledWith(
+      1,
+      "依頼を受け取ったよ。結果を確認してから伝えるね。",
+    );
+    expect(say).toHaveBeenNthCalledWith(2, "今の状況を確認したよ。");
+    expect(say).not.toHaveBeenCalledWith("前の依頼は完了したよ。");
+  });
+
   it("keeps idle nudges, new goals, and quoted questions in the owner-message path", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

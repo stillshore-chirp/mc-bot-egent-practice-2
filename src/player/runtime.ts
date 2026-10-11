@@ -48,6 +48,14 @@ const maintenanceCheckIntervalMs = 5_000;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
 const automaticPickupSuppressionLimit = 32;
+const ownerReplyUnavailable =
+  "今は返事をまとめられなかったよ。必要ならもう一度聞いてね。";
+const ownerReplyFailed =
+  "今は返事を作れなかったよ。少し待ってからもう一度聞いてね。";
+const ownerPlanAccepted = "依頼を受け取ったよ。結果を確認してから伝えるね。";
+const ownerPlanUnconfirmed =
+  "行動結果を確認できなかったので、完了とは言えないよ。";
+const ownerPlanConfirmed = "頼まれた行動を終えて、結果を確認できたよ。";
 const equipmentChestReach = 4.5;
 const equipmentSearchRange = 32;
 const equipmentChestMoveRange = 2.5;
@@ -879,12 +887,21 @@ export class CompanionRuntime {
       // The model request is complete; later world events are handled after
       // the Body result rather than invalidating an already validated action.
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
-      if (
-        wake.ownerMessage !== undefined &&
-        decision.speech !== null &&
-        decision.speech.length > 0
-      )
-        await this.#speakDecision(decision.speech, generation);
+      if (wake.ownerMessage !== undefined) {
+        if (refreshAfterDecision) {
+          await this.#speakDecision(ownerPlanUnconfirmed, generation);
+        } else if (decision.plan === null) {
+          const reply = decision.speech?.trim();
+          await this.#speakDecision(
+            reply === undefined || reply.length === 0
+              ? ownerReplyUnavailable
+              : reply,
+            generation,
+          );
+        } else {
+          await this.#speakDecision(ownerPlanAccepted, generation);
+        }
+      }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
 
       if (refreshAfterDecision) {
@@ -904,9 +921,6 @@ export class CompanionRuntime {
         this.#setWakeTimer(waitMs, {
           reason:
             "registry knowledge request was repeated; wait for a new wake",
-          ...(wake.ownerMessage === undefined
-            ? {}
-            : { ownerMessage: wake.ownerMessage }),
         });
         return;
       }
@@ -919,13 +933,30 @@ export class CompanionRuntime {
       await this.#executePlan(
         decision,
         generation,
-        undefined,
+        wake.ownerMessage === undefined
+          ? undefined
+          : async () => {
+              const reply = decision.speech?.trim();
+              await this.#speakDecision(
+                reply === undefined || reply.length === 0
+                  ? ownerPlanConfirmed
+                  : reply,
+                generation,
+              );
+            },
         wake.mode === "damage_reflex",
+        wake.ownerMessage === undefined
+          ? undefined
+          : async () => {
+              await this.#speakDecision(ownerPlanUnconfirmed, generation);
+            },
       );
     } catch (error) {
       if (!controller.signal.aborted && this.#isCurrent(generation)) {
         this.#logError(error, "Companion judgment failed");
-        this.#scheduleRetry(wake);
+        if (wake.ownerMessage !== undefined)
+          await this.#speakDecision(ownerReplyFailed, generation);
+        this.#scheduleRetry({ reason: "Companion judgment failed" });
       }
     } finally {
       if (wake.mode === "damage_reflex" && this.#isCurrent(generation)) {
@@ -1981,10 +2012,17 @@ export class CompanionRuntime {
   async #executePlan(
     decision: CompanionDecision,
     generation: number,
-    onPlanConfirmed?: (observation: PlayerBodyObservation) => void,
+    onPlanConfirmed?: (
+      observation: PlayerBodyObservation,
+    ) => void | Promise<void>,
     damageReflex = false,
+    onPlanNotConfirmed?: () => void | Promise<void>,
   ): Promise<void> {
     const plannedSteps = decision.plan?.steps ?? [];
+    const reportPlanNotConfirmed = async (): Promise<void> => {
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        await onPlanNotConfirmed?.();
+    };
     for (const plannedStep of plannedSteps) {
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
       const snapshot = this.#store.snapshot();
@@ -1994,6 +2032,7 @@ export class CompanionRuntime {
         !sameOperation(step.operation, plannedStep.operation) ||
         step.expectedOutcome !== plannedStep.expectedOutcome
       ) {
+        await reportPlanNotConfirmed();
         this.#requestReplan(
           "persisted plan no longer matches next action",
           generation,
@@ -2002,6 +2041,7 @@ export class CompanionRuntime {
       }
       const operation = playerOperationSchema.parse(step.operation);
       if (operation.kind === "follow_owner") {
+        await reportPlanNotConfirmed();
         this.#requestReplan(
           "Agent cannot issue the internal owner-follow operation",
           generation,
@@ -2043,6 +2083,7 @@ export class CompanionRuntime {
         updated = this.#store.recordOutcome(outcome);
       } catch (error) {
         this.#logError(error, "Body outcome could not be persisted");
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({ reason: "Body outcome persistence failed" });
         return;
       }
@@ -2056,12 +2097,14 @@ export class CompanionRuntime {
       this.#rememberChestContents(operation, result);
       this.#rememberBedObservations(result);
       if (updated.activeOperation !== null) {
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "Body outcome did not match the persisted active operation",
         });
         return;
       }
       if (result.status !== "successful") {
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({ reason: "Body outcome was not confirmed" });
         return;
       }
@@ -2073,6 +2116,7 @@ export class CompanionRuntime {
         });
       } catch (error) {
         this.#logError(error, "Fresh Body observation failed");
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "fresh observation after Body action failed",
         });
@@ -2106,6 +2150,7 @@ export class CompanionRuntime {
             ));
       if (result.after === null || result.sameLife !== true || !canContinue) {
         this.#store.save({ plan: null });
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "Body result or next-step prerequisites changed",
         });
@@ -2117,7 +2162,7 @@ export class CompanionRuntime {
           this.#setWakeTimer(this.#waitFromSnapshot(updated), {
             reason: "current companion plan completed with observed outcomes",
           });
-        onPlanConfirmed?.(freshObservation);
+        await onPlanConfirmed?.(freshObservation);
         return;
       }
     }
