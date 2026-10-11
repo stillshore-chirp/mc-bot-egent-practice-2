@@ -48,6 +48,18 @@ const maintenanceCheckIntervalMs = 5_000;
 const messageLimit = 2_000;
 const defaultMemoryContextLimit = 12;
 const automaticPickupSuppressionLimit = 32;
+const ownerReplyUnavailable =
+  "現在の状況は確認したけれど、返答を確定できなかったよ。詳しい理由はまだ分からないよ。";
+const ownerReplyFailed =
+  "依頼は受け取ったけれど、現在の状態と返答は確認できていないよ。詳しい原因はまだ分からないよ。";
+const ownerPlanAccepted = "依頼を受け取ったよ。結果を確認してから伝えるね。";
+const ownerPlanUnconfirmed =
+  "行動結果はまだ確認できず、完了とは言えないよ。詳しい原因はまだ分からないよ。";
+const ownerPlanConfirmed = "いま実行した操作の結果を確認できたよ。";
+const ownerDamageInterruption =
+  "ダメージ対応を優先して、元の返答を中断したよ。元の返答はまだ届けられておらず、実行中の操作があれば結果も未確認だよ。";
+const ownerDamageObservationFailed =
+  "ダメージ対応を優先して元の返答を中断したよ。現在の状態と返答はまだ確認できていないよ。詳しい原因はまだ分からないよ。";
 const equipmentChestReach = 4.5;
 const equipmentSearchRange = 32;
 const equipmentChestMoveRange = 2.5;
@@ -171,6 +183,8 @@ export class CompanionRuntime {
   #maintenanceActionFinished: Promise<void> | undefined;
   #failureCount = 0;
   #worldChangedDuringDecision = false;
+  #activeOwnerReplyGeneration: number | undefined;
+  #ownerReplyInterruptedByDamage = false;
   #ownerFollowRequested = false;
   #damageReflexPending = false;
   #waterRecoveryActive = false;
@@ -259,14 +273,12 @@ export class CompanionRuntime {
   ): Promise<void> {
     if (!sameMinecraftIdentity(username, this.#ownerUsername)) return;
     if (this.#disposed) return;
-    const message = rawMessage.trim().slice(0, messageLimit);
-    if (message.length === 0) return;
 
-    if (isImmediateStopCommand(message)) {
+    if (isImmediateStopCommand(rawMessage)) {
       const stopped = await this.stop(username);
       if (stopped) {
         try {
-          this.#store.recordMessage("owner", message);
+          this.#store.recordMessage("owner", rawMessage);
         } catch (error) {
           this.#logError(error, "Owner stop message could not be recorded");
         }
@@ -279,11 +291,14 @@ export class CompanionRuntime {
       return;
     }
 
+    const message = rawMessage.trim().slice(0, messageLimit);
+    if (message.length === 0) return;
+
     if (!this.#started) this.#activate();
     if (!this.#isStopped()) this.#armMaintenanceTimer();
     if (this.#isStopped()) {
+      this.#store.recordMessage("owner", message);
       if (isExplicitResumeCommand(message)) {
-        this.#store.recordMessage("owner", message);
         await this.resume(username, message);
       }
       return;
@@ -343,6 +358,8 @@ export class CompanionRuntime {
       this.#logError(error, "Owner stop state could not be read");
     }
     this.#runtimeStopLatched = true;
+    this.#activeOwnerReplyGeneration = undefined;
+    this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
     this.#waterRecoveryActive = false;
@@ -403,6 +420,8 @@ export class CompanionRuntime {
   public async shutdown(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#activeOwnerReplyGeneration = undefined;
+    this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
     this.#equipmentUpkeepQueued = false;
@@ -423,6 +442,8 @@ export class CompanionRuntime {
     if (maintenanceAction !== undefined) await maintenanceAction;
     if (this.#disposed || this.#isStopped()) return;
     if (wake.mode !== "damage_reflex") {
+      this.#activeOwnerReplyGeneration = undefined;
+      this.#ownerReplyInterruptedByDamage = false;
       this.#damageReflexPending = false;
       this.#waterRecoveryActive = false;
       this.#damageReflexContext = undefined;
@@ -623,6 +644,12 @@ export class CompanionRuntime {
   async #think(wake: PendingWake, generation: number): Promise<void> {
     const controller = new AbortController();
     this.#activeDecision = controller;
+    if (wake.ownerMessage !== undefined)
+      this.#activeOwnerReplyGeneration = generation;
+    const ownerReplyInterruptedByDamage =
+      wake.mode === "damage_reflex" && this.#ownerReplyInterruptedByDamage;
+    if (ownerReplyInterruptedByDamage)
+      this.#ownerReplyInterruptedByDamage = false;
     this.#worldChangedDuringDecision = false;
     try {
       const snapshot = this.#store.snapshot();
@@ -631,6 +658,8 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
+      if (ownerReplyInterruptedByDamage)
+        void this.#speakDecision(ownerDamageInterruption, generation);
       this.#rememberVisibleChests(observation);
       this.#rememberVisibleBeds(observation);
       this.#refreshAutomaticPickupSuppressions(observation);
@@ -878,12 +907,23 @@ export class CompanionRuntime {
       // The model request is complete; later world events are handled after
       // the Body result rather than invalidating an already validated action.
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
-      if (
-        wake.ownerMessage !== undefined &&
-        decision.speech !== null &&
-        decision.speech.length > 0
-      )
-        await this.#speakDecision(decision.speech, generation);
+      if (wake.ownerMessage !== undefined) {
+        if (refreshAfterDecision) {
+          this.#finishOwnerReply(generation);
+          await this.#speakDecision(ownerPlanUnconfirmed, generation);
+        } else if (decision.plan === null) {
+          this.#finishOwnerReply(generation);
+          const reply = decision.speech?.trim();
+          await this.#speakDecision(
+            reply === undefined || reply.length === 0
+              ? ownerReplyUnavailable
+              : reply,
+            generation,
+          );
+        } else {
+          await this.#speakDecision(ownerPlanAccepted, generation);
+        }
+      }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
 
       if (refreshAfterDecision) {
@@ -903,9 +943,6 @@ export class CompanionRuntime {
         this.#setWakeTimer(waitMs, {
           reason:
             "registry knowledge request was repeated; wait for a new wake",
-          ...(wake.ownerMessage === undefined
-            ? {}
-            : { ownerMessage: wake.ownerMessage }),
         });
         return;
       }
@@ -918,13 +955,35 @@ export class CompanionRuntime {
       await this.#executePlan(
         decision,
         generation,
-        undefined,
+        wake.ownerMessage === undefined
+          ? undefined
+          : async () => {
+              this.#finishOwnerReply(generation);
+              const reply = decision.speech?.trim();
+              await this.#speakDecision(
+                reply === undefined || reply.length === 0
+                  ? ownerPlanConfirmed
+                  : reply,
+                generation,
+              );
+            },
         wake.mode === "damage_reflex",
+        wake.ownerMessage === undefined
+          ? undefined
+          : async () => {
+              this.#finishOwnerReply(generation);
+              await this.#speakDecision(ownerPlanUnconfirmed, generation);
+            },
       );
     } catch (error) {
       if (!controller.signal.aborted && this.#isCurrent(generation)) {
         this.#logError(error, "Companion judgment failed");
-        this.#scheduleRetry(wake);
+        if (ownerReplyInterruptedByDamage)
+          void this.#speakDecision(ownerDamageObservationFailed, generation);
+        if (wake.ownerMessage !== undefined) this.#finishOwnerReply(generation);
+        if (wake.ownerMessage !== undefined)
+          await this.#speakDecision(ownerReplyFailed, generation);
+        this.#scheduleRetry({ reason: "Companion judgment failed" });
       }
     } finally {
       if (wake.mode === "damage_reflex" && this.#isCurrent(generation)) {
@@ -933,6 +992,7 @@ export class CompanionRuntime {
         this.#damageReflexContext = undefined;
       }
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
+      this.#finishOwnerReply(generation);
     }
   }
 
@@ -1980,10 +2040,17 @@ export class CompanionRuntime {
   async #executePlan(
     decision: CompanionDecision,
     generation: number,
-    onPlanConfirmed?: (observation: PlayerBodyObservation) => void,
+    onPlanConfirmed?: (
+      observation: PlayerBodyObservation,
+    ) => void | Promise<void>,
     damageReflex = false,
+    onPlanNotConfirmed?: () => void | Promise<void>,
   ): Promise<void> {
     const plannedSteps = decision.plan?.steps ?? [];
+    const reportPlanNotConfirmed = async (): Promise<void> => {
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        await onPlanNotConfirmed?.();
+    };
     for (const plannedStep of plannedSteps) {
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
       const snapshot = this.#store.snapshot();
@@ -1993,6 +2060,7 @@ export class CompanionRuntime {
         !sameOperation(step.operation, plannedStep.operation) ||
         step.expectedOutcome !== plannedStep.expectedOutcome
       ) {
+        await reportPlanNotConfirmed();
         this.#requestReplan(
           "persisted plan no longer matches next action",
           generation,
@@ -2001,6 +2069,7 @@ export class CompanionRuntime {
       }
       const operation = playerOperationSchema.parse(step.operation);
       if (operation.kind === "follow_owner") {
+        await reportPlanNotConfirmed();
         this.#requestReplan(
           "Agent cannot issue the internal owner-follow operation",
           generation,
@@ -2042,6 +2111,7 @@ export class CompanionRuntime {
         updated = this.#store.recordOutcome(outcome);
       } catch (error) {
         this.#logError(error, "Body outcome could not be persisted");
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({ reason: "Body outcome persistence failed" });
         return;
       }
@@ -2055,12 +2125,14 @@ export class CompanionRuntime {
       this.#rememberChestContents(operation, result);
       this.#rememberBedObservations(result);
       if (updated.activeOperation !== null) {
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "Body outcome did not match the persisted active operation",
         });
         return;
       }
       if (result.status !== "successful") {
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({ reason: "Body outcome was not confirmed" });
         return;
       }
@@ -2072,6 +2144,7 @@ export class CompanionRuntime {
         });
       } catch (error) {
         this.#logError(error, "Fresh Body observation failed");
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "fresh observation after Body action failed",
         });
@@ -2105,6 +2178,7 @@ export class CompanionRuntime {
             ));
       if (result.after === null || result.sameLife !== true || !canContinue) {
         this.#store.save({ plan: null });
+        await reportPlanNotConfirmed();
         this.#scheduleRetry({
           reason: "Body result or next-step prerequisites changed",
         });
@@ -2116,7 +2190,7 @@ export class CompanionRuntime {
           this.#setWakeTimer(this.#waitFromSnapshot(updated), {
             reason: "current companion plan completed with observed outcomes",
           });
-        onPlanConfirmed?.(freshObservation);
+        await onPlanConfirmed?.(freshObservation);
         return;
       }
     }
@@ -2134,6 +2208,8 @@ export class CompanionRuntime {
         this.#isStopped()
       )
         return;
+      if (this.#activeOwnerReplyGeneration === this.#generation)
+        this.#ownerReplyInterruptedByDamage = true;
       try {
         const snapshot = this.#store.snapshot();
         this.#damageReflexContext = {
@@ -2342,6 +2418,11 @@ export class CompanionRuntime {
 
   #isCurrent(generation: number): boolean {
     return !this.#disposed && generation === this.#generation;
+  }
+
+  #finishOwnerReply(generation: number): void {
+    if (this.#activeOwnerReplyGeneration === generation)
+      this.#activeOwnerReplyGeneration = undefined;
   }
 
   #hasActiveBodyRun(): boolean {
@@ -2990,7 +3071,7 @@ function nextOperationTargetIsAvailable(
 }
 
 function isExplicitResumeCommand(message: string): boolean {
-  return /^(?:再開|再開して|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
+  return /^(?:再開|再開して|再開しろ|自律再開|自律を再開|自律を再開して|続行|続行して|resume|resume autonomy)[。！!]?$/iu.test(
     message.trim(),
   );
 }
