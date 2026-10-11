@@ -85,6 +85,11 @@ interface ActiveBodyRun {
   readonly promise: Promise<PlayerOperationResult>;
 }
 
+interface InterleavedOwnerReplyRun {
+  readonly generation: number;
+  readonly controller: AbortController;
+}
+
 interface EquipmentStepResult {
   readonly observation: PlayerBodyObservation | null;
   readonly confirmed: boolean;
@@ -151,9 +156,10 @@ export interface CompanionDecisionPort {
 }
 
 /**
- * Serializes all model judgments and Body operations. Durable stop is written
- * before cancellation; successful multi-step plans continue only after Body
- * confirms the operation and a fresh observation still matches its result.
+ * Serializes all state-writing judgments and Body operations. Read-only owner
+ * replies may run alongside one active goal turn. Durable stop is written
+ * before cancellation; successful plans continue only after Body confirms the
+ * operation and a fresh observation still matches its result.
  */
 export class CompanionRuntime {
   readonly #ownerUsername: string;
@@ -173,6 +179,9 @@ export class CompanionRuntime {
   #generation = 0;
   #activeDecision: AbortController | undefined;
   #activeBody: ActiveBodyRun | undefined;
+  #pendingOwnerRequest: string | undefined;
+  #ownerReplyGeneration = 0;
+  #activeInterleavedOwnerReply: InterleavedOwnerReplyRun | undefined;
   #pendingWake: PendingWake | undefined;
   #drainPromise: Promise<void> | undefined;
   #waitTimer: NodeJS.Timeout | undefined;
@@ -339,6 +348,10 @@ export class CompanionRuntime {
     }
 
     this.#store.recordMessage("owner", message);
+    if (this.#hasActiveOwnerTurnContext()) {
+      await this.#replyDuringGoalTurn(message);
+      return;
+    }
     await this.#requestWake({
       reason: "owner message",
       ownerMessage: message,
@@ -358,6 +371,8 @@ export class CompanionRuntime {
       this.#logError(error, "Owner stop state could not be read");
     }
     this.#runtimeStopLatched = true;
+    this.#cancelInterleavedOwnerReply("Owner stopped companion");
+    this.#pendingOwnerRequest = undefined;
     this.#activeOwnerReplyGeneration = undefined;
     this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
@@ -416,10 +431,165 @@ export class CompanionRuntime {
     return true;
   }
 
+  #hasActiveOwnerTurnContext(): boolean {
+    const snapshot = this.#store.snapshot();
+    return (
+      this.#pendingOwnerRequest !== undefined ||
+      this.#activeInterleavedOwnerReply !== undefined ||
+      this.#activeDecision !== undefined ||
+      this.#activeBody !== undefined ||
+      this.#drainPromise !== undefined ||
+      snapshot.activeOperation !== null
+    );
+  }
+
+  async #replyDuringGoalTurn(ownerMessage: string): Promise<void> {
+    this.#cancelInterleavedOwnerReply("A newer owner message superseded reply");
+    const run: InterleavedOwnerReplyRun = {
+      generation: ++this.#ownerReplyGeneration,
+      controller: new AbortController(),
+    };
+    this.#activeInterleavedOwnerReply = run;
+    try {
+      if (this.#isStopped() || !this.#isCurrentInterleavedOwnerReply(run))
+        return;
+      const observation = await this.#body.observe({
+        ownerPositionException: true,
+      });
+      if (this.#isStopped() || !this.#isCurrentInterleavedOwnerReply(run))
+        return;
+      const snapshot = this.#store.snapshot();
+      if (snapshot.stopped || this.#isStopped()) return;
+      const input = this.#createDecisionInput(
+        snapshot,
+        observation,
+        "owner asked a separate question during an active goal turn",
+        ownerMessage,
+        undefined,
+        { pendingOwnerRequest: this.#pendingOwnerRequest ?? null },
+      );
+      const decision = await this.#agent.decide(input, run.controller.signal);
+      if (this.#isStopped() || !this.#isCurrentInterleavedOwnerReply(run))
+        return;
+      if (decision.ownerMessageDisposition === "update_goal") {
+        await this.#requestWake({
+          reason: "owner explicitly changed the active goal",
+          ownerMessage,
+        });
+        return;
+      }
+      if (decision.ownerMessageDisposition !== "answer_only") {
+        await this.#speakInterleavedOwnerReply(ownerReplyFailed, run);
+        return;
+      }
+      const reply = decision.speech?.trim();
+      await this.#speakInterleavedOwnerReply(
+        reply === undefined || reply.length === 0
+          ? ownerReplyUnavailable
+          : reply,
+        run,
+      );
+    } catch (error) {
+      if (
+        !run.controller.signal.aborted &&
+        this.#isCurrentInterleavedOwnerReply(run) &&
+        !this.#isStopped()
+      ) {
+        this.#logError(error, "Interleaved owner reply failed");
+        await this.#speakInterleavedOwnerReply(ownerReplyFailed, run);
+      }
+    } finally {
+      if (this.#activeInterleavedOwnerReply === run)
+        this.#activeInterleavedOwnerReply = undefined;
+    }
+  }
+
+  #createDecisionInput(
+    snapshot: CompanionSnapshot,
+    observation: PlayerBodyObservation,
+    wakeReason: string,
+    ownerMessage?: string,
+    pendingOwnerRequest?: string,
+    ownerReplyContext?: CompanionDecisionInput["ownerReplyContext"],
+  ): CompanionDecisionInput {
+    const query =
+      ownerMessage ??
+      pendingOwnerRequest ??
+      ownerReplyContext?.pendingOwnerRequest ??
+      snapshot.goal?.title ??
+      snapshot.interests[0] ??
+      "Minecraftで共有した経験と現在の状況";
+    const recalledMemories = this.#store.recall(
+      query,
+      this.#memoryContextLimit,
+    );
+    const latestChestLocation = this.#store.latestObservedChestLocation();
+    const latestBedLocation = this.#store.latestObservedBedLocation();
+    const latestLocations = [latestChestLocation, latestBedLocation].filter(
+      (memory): memory is NonNullable<typeof memory> => memory !== null,
+    );
+    const latestLocationIds = new Set(
+      latestLocations.map((memory) => memory.id),
+    );
+    const memories =
+      latestLocations.length === 0
+        ? recalledMemories
+        : [
+            ...latestLocations,
+            ...recalledMemories.filter(
+              (memory) => !latestLocationIds.has(memory.id),
+            ),
+          ].slice(0, this.#memoryContextLimit);
+    return {
+      snapshot,
+      observation,
+      wakeReason,
+      messages: this.#store.recentMessages(24),
+      memories,
+      ...(ownerMessage === undefined ? {} : { ownerMessage }),
+      ...(pendingOwnerRequest === undefined ? {} : { pendingOwnerRequest }),
+      ...(ownerReplyContext === undefined ? {} : { ownerReplyContext }),
+      ...(this.#cachedKnowledge === undefined
+        ? {}
+        : { knowledge: this.#cachedKnowledge }),
+    };
+  }
+
+  #isCurrentInterleavedOwnerReply(run: InterleavedOwnerReplyRun): boolean {
+    return (
+      this.#activeInterleavedOwnerReply === run &&
+      run.generation === this.#ownerReplyGeneration &&
+      !run.controller.signal.aborted
+    );
+  }
+
+  #cancelInterleavedOwnerReply(reason: string): void {
+    this.#ownerReplyGeneration += 1;
+    const active = this.#activeInterleavedOwnerReply;
+    this.#activeInterleavedOwnerReply = undefined;
+    active?.controller.abort(new Error(reason));
+  }
+
+  async #speakInterleavedOwnerReply(
+    text: string,
+    run: InterleavedOwnerReplyRun,
+  ): Promise<void> {
+    if (!this.#isCurrentInterleavedOwnerReply(run) || this.#isStopped()) return;
+    try {
+      await this.#say(text);
+      if (this.#isCurrentInterleavedOwnerReply(run) && !this.#isStopped())
+        this.#store.recordMessage("companion", text);
+    } catch (error) {
+      this.#logError(error, "Interleaved owner reply delivery failed");
+    }
+  }
+
   /** Stop local work while preserving the durable owner stop state as-is. */
   public async shutdown(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#cancelInterleavedOwnerReply("Companion runtime shutdown");
+    this.#pendingOwnerRequest = undefined;
     this.#activeOwnerReplyGeneration = undefined;
     this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
@@ -438,6 +608,14 @@ export class CompanionRuntime {
   }
 
   async #requestWake(wake: PendingWake): Promise<void> {
+    if (wake.mode !== undefined || wake.ownerMessage !== undefined)
+      this.#cancelInterleavedOwnerReply(
+        "A newer owner action superseded reply",
+      );
+    if (wake.mode === "follow_owner" || wake.mode === "equipment_upkeep")
+      this.#pendingOwnerRequest = undefined;
+    else if (wake.ownerMessage !== undefined)
+      this.#pendingOwnerRequest = wake.ownerMessage;
     const maintenanceAction = this.#maintenanceActionFinished;
     if (maintenanceAction !== undefined) await maintenanceAction;
     if (this.#disposed || this.#isStopped()) return;
@@ -648,6 +826,7 @@ export class CompanionRuntime {
       this.#activeOwnerReplyGeneration = generation;
     const ownerReplyInterruptedByDamage =
       wake.mode === "damage_reflex" && this.#ownerReplyInterruptedByDamage;
+    const ownerReplyGeneration = this.#ownerReplyGeneration;
     if (ownerReplyInterruptedByDamage)
       this.#ownerReplyInterruptedByDamage = false;
     this.#worldChangedDuringDecision = false;
@@ -658,7 +837,10 @@ export class CompanionRuntime {
         ownerPositionException: true,
       });
       if (!this.#isCurrent(generation)) return;
-      if (ownerReplyInterruptedByDamage)
+      if (
+        ownerReplyInterruptedByDamage &&
+        ownerReplyGeneration === this.#ownerReplyGeneration
+      )
         void this.#speakDecision(ownerDamageInterruption, generation);
       this.#rememberVisibleChests(observation);
       this.#rememberVisibleBeds(observation);
@@ -773,46 +955,17 @@ export class CompanionRuntime {
       if (wake.mode === "damage_reflex") {
         decision = this.#damageReflexDecision(snapshot, observation);
       } else {
-        const query =
-          wake.ownerMessage ??
-          snapshot.goal?.title ??
-          snapshot.interests[0] ??
-          "Minecraftで共有した経験と現在の状況";
-        const recalledMemories = this.#store.recall(
-          query,
-          this.#memoryContextLimit,
-        );
-        const latestChestLocation = this.#store.latestObservedChestLocation();
-        const latestBedLocation = this.#store.latestObservedBedLocation();
-        const latestLocations = [latestChestLocation, latestBedLocation].filter(
-          (memory): memory is NonNullable<typeof memory> => memory !== null,
-        );
-        const latestLocationIds = new Set(
-          latestLocations.map((memory) => memory.id),
-        );
-        const memories =
-          latestLocations.length === 0
-            ? recalledMemories
-            : [
-                ...latestLocations,
-                ...recalledMemories.filter(
-                  (memory) => !latestLocationIds.has(memory.id),
-                ),
-              ].slice(0, this.#memoryContextLimit);
-        const messages = this.#store.recentMessages(24);
-        const input = {
+        const pendingOwnerRequest =
+          this.#pendingOwnerRequest === wake.ownerMessage
+            ? undefined
+            : this.#pendingOwnerRequest;
+        const input = this.#createDecisionInput(
           snapshot,
           observation,
-          wakeReason: wake.reason,
-          messages,
-          memories,
-          ...(wake.ownerMessage === undefined
-            ? {}
-            : { ownerMessage: wake.ownerMessage }),
-          ...(this.#cachedKnowledge === undefined
-            ? {}
-            : { knowledge: this.#cachedKnowledge }),
-        };
+          wake.reason,
+          wake.ownerMessage,
+          pendingOwnerRequest,
+        );
 
         decision = await this.#agent.decide(input, controller.signal);
         if (!this.#isCurrent(generation)) return;
@@ -902,6 +1055,13 @@ export class CompanionRuntime {
           : { relationshipSummary: decision.relationshipSummary }),
       };
       this.#store.save(patch);
+      if (
+        wake.mode !== "damage_reflex" &&
+        this.#pendingOwnerRequest !== undefined &&
+        (wake.ownerMessage === undefined ||
+          wake.ownerMessage === this.#pendingOwnerRequest)
+      )
+        this.#pendingOwnerRequest = undefined;
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
 
       // The model request is complete; later world events are handled after
