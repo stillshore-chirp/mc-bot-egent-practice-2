@@ -62,6 +62,7 @@ const ownerDamageObservationFailed =
   "ダメージ対応を優先して元の返答を中断したよ。現在の状態と返答はまだ確認できていないよ。詳しい原因はまだ分からないよ。";
 const equipmentChestReach = 4.5;
 const equipmentSearchRange = 32;
+const equipmentSweepMissCooldownMs = 30_000;
 const equipmentChestMoveRange = 2.5;
 const equipmentChestSearchLimit = 4;
 const equipmentChestSuppressionLimit = 64;
@@ -93,6 +94,13 @@ interface InterleavedOwnerReplyRun {
 interface EquipmentStepResult {
   readonly observation: PlayerBodyObservation | null;
   readonly confirmed: boolean;
+  readonly lookSweep?: PlayerOperationResult["lookSweep"] | undefined;
+}
+
+interface EquipmentSweepChestCandidate {
+  readonly name: string;
+  readonly position: BodyVisibleBlock["position"];
+  readonly distance: number;
 }
 
 interface FoodUpkeepResult extends EquipmentStepResult {
@@ -203,6 +211,8 @@ export class CompanionRuntime {
   #foodPickupSuppressed = new Set<string>();
   #foodPickupSuppressedAtFood: number | undefined;
   #equipmentChestSuppressed = new Set<string>();
+  #equipmentSweepCooldown:
+    { readonly fingerprint: string; readonly expiresAt: number } | undefined;
   #foodChestSuppressed = new Set<string>();
   #failedEquipmentCandidateFingerprint: string | undefined;
   #failedFoodAttemptFingerprint: string | undefined;
@@ -380,6 +390,7 @@ export class CompanionRuntime {
     this.#waterRecoveryActive = false;
     this.#damageReflexContext = undefined;
     this.#equipmentUpkeepQueued = false;
+    this.#equipmentSweepCooldown = undefined;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearMaintenanceTimer();
@@ -421,6 +432,7 @@ export class CompanionRuntime {
     this.#store.resume(snapshot.stopGeneration);
     this.#runtimeStopLatched = false;
     this.#stopPersistenceFailed = false;
+    this.#equipmentSweepCooldown = undefined;
     this.#armMaintenanceTimer();
     await this.#requestWake({
       reason: "owner explicitly resumed autonomy",
@@ -595,6 +607,7 @@ export class CompanionRuntime {
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
     this.#equipmentUpkeepQueued = false;
+    this.#equipmentSweepCooldown = undefined;
     this.#generation += 1;
     this.#pendingWake = undefined;
     this.#clearMaintenanceTimer();
@@ -1648,6 +1661,11 @@ export class CompanionRuntime {
     let uncertain = false;
     let cleanupConfirmed = true;
     let swept = false;
+    let sweepAttempted = false;
+    let sweepChestCandidates: EquipmentSweepChestCandidate[] = [];
+    let automaticSweepFingerprint: string | undefined;
+    const attemptedSweepChestCandidates = new Set<string>();
+    let sweepChestCandidateChecks = 0;
     let equipmentChanges = 0;
     let equipmentDropsCollected = 0;
     const confirmedItems: string[] = [];
@@ -1782,15 +1800,20 @@ export class CompanionRuntime {
           !this.#isStopped()
         ) {
           swept = true;
+          sweepAttempted = true;
           const sweep = await this.#executeUpkeepAction(
             { kind: "look_sweep" },
-            "Complete one bounded look sweep before searching the received visible subset for chests.",
+            "Complete one bounded look sweep before searching its received views for nearby chests.",
             generation,
           );
           if (!sweep.confirmed || sweep.observation === null) {
             uncertain = true;
           } else {
             observation = sweep.observation;
+            sweepChestCandidates = equipmentSweepChestCandidates(
+              sweep.lookSweep,
+              observation.dimension,
+            );
           }
         }
 
@@ -1823,7 +1846,81 @@ export class CompanionRuntime {
                   equipmentChestFingerprint(observation.dimension, candidate),
                 ),
             );
-            if (block === undefined) break;
+            if (block === undefined) {
+              if (!explicit && !sweepAttempted) {
+                const fingerprint = equipmentSearchGapFingerprint(observation);
+                const cooldown = this.#equipmentSweepCooldown;
+                if (
+                  fingerprint !== null &&
+                  (cooldown?.fingerprint !== fingerprint ||
+                    cooldown.expiresAt <= Date.now())
+                ) {
+                  sweepAttempted = true;
+                  swept = true;
+                  const sweep = await this.#executeUpkeepAction(
+                    { kind: "look_sweep" },
+                    "Complete one bounded look sweep for nearby gear while equipment is missing.",
+                    generation,
+                  );
+                  if (!sweep.confirmed || sweep.observation === null) {
+                    attemptedGearWork = true;
+                    uncertain = true;
+                    break;
+                  }
+                  observation = sweep.observation;
+                  sweepChestCandidates = equipmentSweepChestCandidates(
+                    sweep.lookSweep,
+                    observation.dimension,
+                  );
+                  if (sweep.lookSweep?.complete === true)
+                    automaticSweepFingerprint = fingerprint;
+                  continue;
+                }
+              }
+
+              const candidate = sweepChestCandidates.find((sweepCandidate) => {
+                if (sweepCandidate.position.dimension !== observation.dimension)
+                  return false;
+                const key = equipmentChestFingerprint(
+                  observation.dimension,
+                  sweepCandidate,
+                );
+                return (
+                  !attemptedSweepChestCandidates.has(key) &&
+                  !this.#equipmentChestSuppressed.has(key)
+                );
+              });
+              if (
+                candidate === undefined ||
+                sweepChestCandidateChecks >= equipmentChestSearchLimit
+              )
+                break;
+
+              const candidateKey = equipmentChestFingerprint(
+                observation.dimension,
+                candidate,
+              );
+              attemptedSweepChestCandidates.add(candidateKey);
+              sweepChestCandidateChecks += 1;
+              const looked = await this.#executeUpkeepAction(
+                {
+                  kind: "look",
+                  target: {
+                    x: candidate.position.x + 0.5,
+                    y: candidate.position.y + 0.5,
+                    z: candidate.position.z + 0.5,
+                  },
+                },
+                "Face a chest candidate from the current bounded sweep, then confirm it in a fresh Body view.",
+                generation,
+              );
+              if (!looked.confirmed || looked.observation === null) {
+                uncertain = true;
+                break;
+              }
+              observation = looked.observation;
+              continue;
+            }
             inspected += 1;
             const chestKey = equipmentChestFingerprint(
               observation.dimension,
@@ -1948,6 +2045,16 @@ export class CompanionRuntime {
           if (await collectEquipmentDrop(distantEquipmentDrops))
             await equipInventoryUpgrades();
         }
+
+        if (
+          automaticSweepFingerprint !== undefined &&
+          equipmentSearchGapFingerprint(observation) ===
+            automaticSweepFingerprint
+        )
+          this.#equipmentSweepCooldown = {
+            fingerprint: automaticSweepFingerprint,
+            expiresAt: Date.now() + equipmentSweepMissCooldownMs,
+          };
       }
     } catch (error) {
       this.#logError(error, "Equipment upkeep failed");
@@ -2024,12 +2131,16 @@ export class CompanionRuntime {
     };
     const preserveWakeTimer = this.#maintenanceActionInFlight;
     this.#clearTimers(preserveWakeTimer);
-    const result: { observation: PlayerBodyObservation | null } = {
+    const result: {
+      observation: PlayerBodyObservation | null;
+      bodyResult?: PlayerOperationResult | undefined;
+    } = {
       observation: null,
     };
     try {
-      await this.#executePlan(decision, generation, (fresh) => {
+      await this.#executePlan(decision, generation, (fresh, bodyResult) => {
         result.observation = fresh;
+        result.bodyResult = bodyResult;
       });
     } catch (error) {
       this.#logError(error, "Equipment upkeep step failed");
@@ -2044,6 +2155,9 @@ export class CompanionRuntime {
         result.observation !== null &&
         this.#isCurrent(generation) &&
         !this.#isStopped(),
+      ...(result.bodyResult?.lookSweep === undefined
+        ? {}
+        : { lookSweep: result.bodyResult.lookSweep }),
     };
   }
 
@@ -2202,6 +2316,7 @@ export class CompanionRuntime {
     generation: number,
     onPlanConfirmed?: (
       observation: PlayerBodyObservation,
+      result: PlayerOperationResult,
     ) => void | Promise<void>,
     damageReflex = false,
     onPlanNotConfirmed?: () => void | Promise<void>,
@@ -2350,7 +2465,7 @@ export class CompanionRuntime {
           this.#setWakeTimer(this.#waitFromSnapshot(updated), {
             reason: "current companion plan completed with observed outcomes",
           });
-        await onPlanConfirmed?.(freshObservation);
+        await onPlanConfirmed?.(freshObservation, result);
         return;
       }
     }
@@ -2391,10 +2506,12 @@ export class CompanionRuntime {
       event.type === "bot_death" ||
       event.type === "bot_death_cause_updated"
     ) {
+      this.#equipmentSweepCooldown = undefined;
       this.#fireWake({ reason: `urgent Body event: ${event.type}` });
       return;
     }
     if (event.type === "disconnected") {
+      this.#equipmentSweepCooldown = undefined;
       if (this.#activeBody?.operation.kind === "follow_owner") {
         this.#ownerFollowRequested = false;
         this.#activeBody.controller.abort(
@@ -2406,6 +2523,7 @@ export class CompanionRuntime {
       return;
     }
     if (event.type === "reconnected") {
+      this.#equipmentSweepCooldown = undefined;
       this.#fireWake({ reason: "Body reconnected; observe before acting" });
       return;
     }
@@ -2894,6 +3012,65 @@ function visibleEquipmentChests(
     .sort((left, right) => left.distance - right.distance);
 }
 
+function equipmentSweepChestCandidates(
+  sweep: PlayerOperationResult["lookSweep"],
+  dimension: string,
+): EquipmentSweepChestCandidate[] {
+  if (sweep?.complete !== true) return [];
+  const candidates = new Map<string, EquipmentSweepChestCandidate>();
+  for (const view of [sweep.current, ...sweep.directions]) {
+    if (view.dimension !== dimension) continue;
+    for (const block of view.visibleBlocks) {
+      if (
+        !isChestBlockName(block.name) ||
+        !Number.isFinite(block.distance) ||
+        block.distance > equipmentSearchRange
+      )
+        continue;
+      const candidate: EquipmentSweepChestCandidate = {
+        name: block.name,
+        position: { ...block.position, dimension: view.dimension },
+        distance: block.distance,
+      };
+      const key = equipmentChestFingerprint(dimension, candidate);
+      const previous = candidates.get(key);
+      if (previous === undefined || candidate.distance < previous.distance)
+        candidates.set(key, candidate);
+    }
+  }
+  return [...candidates.values()].sort(
+    (left, right) => left.distance - right.distance,
+  );
+}
+
+function equipmentSearchGapFingerprint(
+  observation: PlayerBodyObservation,
+): string | null {
+  const armorGaps = (["head", "torso", "legs", "feet"] as const).filter(
+    (destination) => {
+      const item = observation.self.equipment[destination];
+      return item === null || item?.durability === 0;
+    },
+  );
+  const hand = observation.self.equipment.hand;
+  const handNeedsWeapon =
+    (hand === null ||
+      hand === undefined ||
+      (hand.durability === 0 &&
+        equipmentDestinationForName(hand.name) === "hand")) &&
+    findRetaliationWeaponUpgrade(observation) === null;
+  const gaps = [...armorGaps, ...(handNeedsWeapon ? ["hand"] : [])];
+  if (gaps.length === 0) return null;
+  const position = observation.self.position;
+  return JSON.stringify([
+    observation.dimension,
+    Math.floor(position.x),
+    Math.floor(position.y),
+    Math.floor(position.z),
+    gaps,
+  ]);
+}
+
 function isChestBlockName(name: string): boolean {
   return /(?:^|:)(?:trapped_)?chest$/u.test(name);
 }
@@ -2942,8 +3119,8 @@ function equipmentDropCandidates(
 }
 
 function sameBlockPosition(
-  left: BodyVisibleBlock,
-  right: BodyVisibleBlock,
+  left: Pick<BodyVisibleBlock, "position">,
+  right: Pick<BodyVisibleBlock, "position">,
 ): boolean {
   return (
     Math.floor(left.position.x) === Math.floor(right.position.x) &&
@@ -2987,7 +3164,7 @@ function foodAttemptFingerprint(
 
 function equipmentChestFingerprint(
   dimension: string,
-  block: BodyVisibleBlock,
+  block: Pick<BodyVisibleBlock, "position">,
 ): string {
   return JSON.stringify([
     dimension,
