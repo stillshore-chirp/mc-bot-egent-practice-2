@@ -932,6 +932,7 @@ export class CompanionRuntime {
           .filter(
             (entity) =>
               entity.droppedItem !== undefined &&
+              entity.droppedItem.name !== "rotten_flesh" &&
               Number.isFinite(entity.distance) &&
               entity.distance <= automaticPickupRange,
           )

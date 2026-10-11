@@ -2626,7 +2626,7 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(0);
   });
 
-  it("collects one nearby visible drop without a fresh owner instruction", async () => {
+  it("skips nearby rotten flesh and collects a normal visible drop autonomously", async () => {
     const { store } = freshStore();
     store.save({
       goal: {
@@ -2636,8 +2636,9 @@ describe("CompanionRuntime", () => {
       },
     });
     const body = new FakeBody(store);
+    const rotten = droppedItemEntity(30, 1, "rotten_flesh", 1);
     const item = droppedItemEntity(31, 2, "oak_log", 1);
-    body.observation = makeObservation({ entities: [item] });
+    body.observation = makeObservation({ entities: [rotten, item] });
     const agent = new FakeAgent([emptyDecision()]);
     body.executeHandler = async (operation, _signal, fakeBody) => {
       const before = fakeBody.observation;
