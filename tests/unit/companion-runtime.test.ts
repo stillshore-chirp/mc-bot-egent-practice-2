@@ -1153,6 +1153,183 @@ describe("CompanionRuntime", () => {
     await runtime.stop("Builder");
   });
 
+  it("stops food upkeep when chest cleanup is unconfirmed, then retries after a fresh closed-window observation", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const apple = foodItem("apple", 0);
+    body.foodNames.add("apple");
+    body.observation = makeObservation({
+      food: 12,
+      blocks: [equipmentChestBlock(1)],
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after = before;
+      let status: "successful" | "failed" = "successful";
+      switch (operation.kind) {
+        case "open_window":
+          after = { ...before, window: chestWindow(apple) };
+          break;
+        case "window_transfer": {
+          const owned = foodItem("apple", 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          status = "failed";
+          break;
+        case "consume":
+          after = {
+            ...before,
+            self: { ...before.self, food: 16, inventory: [] },
+            window: null,
+          };
+          break;
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `food-cleanup-${fakeBody.executed.length}`,
+        status,
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(
+      () => body.executed.length >= 4 && !runtime.status().thinking,
+    );
+
+    expect(
+      body.executed.filter(
+        (operation) =>
+          operation.kind === "collect_item" || operation.kind === "consume",
+      ),
+    ).toEqual([]);
+    expect(body.observation.window).not.toBeNull();
+    expect(body.observation.self.inventory).toContainEqual(
+      foodItem("apple", 9),
+    );
+
+    body.observation = { ...body.observation, window: null };
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "inventory",
+    });
+    await eventually(
+      () => body.executed.some((operation) => operation.kind === "consume"),
+      5_000,
+    );
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+      "window_close",
+      "consume",
+    ]);
+    expect(body.observation.self.food).toBe(16);
+    expect(body.observation.window).toBeNull();
+    await runtime.stop("Builder");
+  });
+
+  it("tries the sixth food drop after five visible targets fail once", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const drops = Array.from({ length: 6 }, (_, index) =>
+      droppedItemEntity(301 + index, index + 1, "apple"),
+    );
+    const visibleDrops = [...drops, droppedItemEntity(399, 0.25, "stone")];
+    body.foodNames.add("apple");
+    body.observation = makeObservation({
+      food: 12,
+      entities: visibleDrops,
+      nearbyDroppedItems: makeNearbyDroppedItems(visibleDrops),
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind === "collect_item" && operation.entityId !== 306)
+        return fakeBody.result(
+          operation,
+          `food-drop-failed-${operation.entityId}`,
+          "failed",
+          before,
+          before,
+        );
+      let after: PlayerBodyObservation;
+      if (operation.kind === "collect_item") {
+        const remaining = drops.filter(
+          (drop) => drop.id !== operation.entityId,
+        );
+        after = {
+          ...before,
+          self: { ...before.self, inventory: [foodItem("apple", 9)] },
+          perception: {
+            ...before.perception,
+            entities: remaining,
+            nearbyDroppedItems: makeNearbyDroppedItems(remaining),
+          },
+        };
+      } else if (operation.kind === "consume") {
+        after = {
+          ...before,
+          self: { ...before.self, food: 16, inventory: [] },
+        };
+      } else {
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `food-drop-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    const collectedIds = () =>
+      body.executed
+        .filter((operation) => operation.kind === "collect_item")
+        .map((operation) => operation.entityId);
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (collectedIds().length >= 6 && !runtime.status().thinking) break;
+      await Promise.resolve();
+    }
+    expect(collectedIds()).toEqual([301, 302, 303, 304, 305, 399]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await eventuallyWithFakeTimers(() => collectedIds().includes(306));
+
+    expect(collectedIds()).toEqual([301, 302, 303, 304, 305, 399, 306]);
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "collect_item",
+      "collect_item",
+      "collect_item",
+      "collect_item",
+      "collect_item",
+      "collect_item",
+      "collect_item",
+      "consume",
+    ]);
+    expect(body.observation.self.food).toBe(16);
+    await runtime.stop("Builder");
+  });
+
   it("schedules the normal wake after startup food upkeep without model polling", async () => {
     vi.useFakeTimers();
     const { store } = freshStore();

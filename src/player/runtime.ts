@@ -1029,15 +1029,31 @@ export class CompanionRuntime {
       const maxDistance =
         observation.perception.nearbyDroppedItems?.maxDistance ??
         observation.perception.maxDistance;
+      const eligibleFoodDrop = (entity: BodyVisibleEntity): boolean =>
+        entity.droppedItem !== undefined &&
+        entity.droppedItem.count > 0 &&
+        this.#isKnownFood(entity.droppedItem.name) &&
+        Number.isFinite(entity.distance) &&
+        entity.distance <= maxDistance;
+      const foodDropKey = (entity: BodyVisibleEntity): string | undefined => {
+        const item = entity.droppedItem;
+        if (item === undefined) return undefined;
+        return JSON.stringify([
+          food,
+          automaticPickupFingerprint(
+            observation.dimension,
+            entity.id,
+            item.name,
+            item.count,
+          ),
+        ]);
+      };
       const foodDrops = (nearby: boolean): BodyVisibleEntity[] =>
         visibleDroppedItems(observation)
           .filter(
             (entity) =>
-              entity.droppedItem !== undefined &&
-              entity.droppedItem.count > 0 &&
-              this.#isKnownFood(entity.droppedItem.name) &&
-              Number.isFinite(entity.distance) &&
-              entity.distance <= maxDistance &&
+              eligibleFoodDrop(entity) &&
+              !this.#foodPickupSuppressed.has(foodDropKey(entity) ?? "") &&
               (nearby
                 ? entity.distance <= equipmentSearchRange
                 : entity.distance > equipmentSearchRange),
@@ -1092,6 +1108,10 @@ export class CompanionRuntime {
               inventoryCount(before, candidate.item.name),
           );
           observation = chest.observation;
+          if (!chest.cleanupConfirmed || observation.window !== null) {
+            this.#failedFoodAttemptFingerprint = undefined;
+            return { observation, confirmed: false, handled: true };
+          }
           if (!chest.confirmed) break;
           if (chest.withdrawn.length > 0) break;
         }
@@ -1101,7 +1121,16 @@ export class CompanionRuntime {
       edibleItems = edibleInventory(observation);
       fingerprint = foodAttemptFingerprint(observation, edibleItems);
       if (edibleItems.length === 0) {
-        this.#failedFoodAttemptFingerprint = fingerprint;
+        const hasUntriedFoodDrop =
+          this.#foodPickupSuppressed.size < automaticPickupSuppressionLimit &&
+          visibleDroppedItems(observation).some(
+            (entity) =>
+              eligibleFoodDrop(entity) &&
+              !this.#foodPickupSuppressed.has(foodDropKey(entity) ?? ""),
+          );
+        this.#failedFoodAttemptFingerprint = hasUntriedFoodDrop
+          ? undefined
+          : fingerprint;
         return { observation, confirmed: false, handled: false };
       }
     }
