@@ -2916,6 +2916,83 @@ describe("CompanionRuntime", () => {
     ]);
   });
 
+  it("accepts kana approach wording and active same-purpose follow nudges", async () => {
+    for (const command of ["こっちきて", "こっち来て！"]) {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const say = vi.fn(async () => undefined);
+      const agent = new FakeAgent([]);
+      const followSignals: AbortSignal[] = [];
+      body.executeHandler = async (operation, signal, fakeBody) => {
+        if (operation.kind !== "follow_owner")
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+        if (signal !== undefined) followSignals.push(signal);
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          const finish = (): void =>
+            resolve(
+              fakeBody.result(
+                operation,
+                `follow-${fakeBody.executed.length}`,
+                "interrupted",
+                null,
+              ),
+            );
+          if (signal?.aborted) finish();
+          else signal?.addEventListener("abort", finish, { once: true });
+        });
+      };
+      const runtime = createRuntime(store, body, agent, say);
+
+      await runtime.receiveChat("Builder", command);
+      await eventually(() => body.executed.length === 1);
+      expect(body.executed[0]).toEqual({ kind: "follow_owner" });
+      expect(agent.inputs).toHaveLength(0);
+
+      for (const reminder of [
+        "こっちきて。",
+        "早く来て！",
+        "はやくきて",
+        "早く",
+        "急いで。",
+      ]) {
+        await runtime.receiveChat("Builder", reminder);
+        expect(body.executed).toHaveLength(1);
+        expect(followSignals[0]?.aborted).toBe(false);
+        expect(agent.inputs).toHaveLength(0);
+      }
+      expect(say).toHaveBeenCalledTimes(1);
+
+      await runtime.receiveChat("Builder", "早く石を集めて");
+      expect(followSignals[0]?.aborted).toBe(true);
+      expect(agent.inputs).toHaveLength(1);
+      expect(agent.inputs[0]?.ownerMessage).toBe("早く石を集めて");
+      expect(body.executed).toHaveLength(1);
+
+      await runtime.shutdown();
+    }
+  });
+
+  it("keeps idle nudges, new goals, and quoted questions in the owner-message path", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+
+    for (const message of [
+      "早く",
+      "急いで",
+      "早く石を集めて",
+      "『こっちきて』の意味は？",
+    ]) {
+      await runtime.receiveChat("Builder", message);
+      expect(agent.inputs.at(-1)?.ownerMessage).toBe(message);
+      expect(body.executed).toHaveLength(0);
+    }
+    expect(agent.inputs).toHaveLength(4);
+
+    await runtime.shutdown();
+  });
+
   it("keeps an internal follow operation from a nonconforming Agent port out of Body", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);

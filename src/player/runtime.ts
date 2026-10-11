@@ -289,7 +289,10 @@ export class CompanionRuntime {
       return;
     }
 
-    if (isOwnerFollowCommand(message)) {
+    if (
+      isOwnerFollowCommand(message) ||
+      (this.#ownerFollowRequested && isOwnerFollowReminder(message))
+    ) {
       if (this.#ownerFollowRequested) return;
       this.#store.recordMessage("owner", message);
       this.#ownerFollowRequested = true;
@@ -2993,9 +2996,19 @@ function isExplicitResumeCommand(message: string): boolean {
 }
 
 function isOwnerFollowCommand(message: string): boolean {
-  return /^(?:こっち(?:に)?来て|ついてきて|ついて来て)[。！!]*$/u.test(
-    message.trim(),
+  return /^(?:こっち(?:に)?(?:きて|来て)|ついてきて|ついて来て)$/u.test(
+    normalizeOwnerFollowMessage(message),
   );
+}
+
+function isOwnerFollowReminder(message: string): boolean {
+  return /^(?:早く(?:来て)?|はやくきて|急いで)$/u.test(
+    normalizeOwnerFollowMessage(message),
+  );
+}
+
+function normalizeOwnerFollowMessage(message: string): string {
+  return message.trim().replace(/[。.!！?？、，,]+$/u, "");
 }
 
 function normalizeKnowledgeQuery(query: string): string {
