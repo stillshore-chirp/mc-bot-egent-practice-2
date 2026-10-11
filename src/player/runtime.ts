@@ -630,8 +630,34 @@ export class CompanionRuntime {
     else if (wake.ownerMessage !== undefined)
       this.#pendingOwnerRequest = wake.ownerMessage;
     const maintenanceAction = this.#maintenanceActionFinished;
+    const activeBody = this.#activeBody;
+    const ownerWake =
+      wake.mode === "follow_owner" ||
+      wake.mode === "equipment_upkeep" ||
+      wake.ownerMessage !== undefined;
+    let maintenanceInterruptGeneration: number | undefined;
+    if (
+      ownerWake &&
+      maintenanceAction !== undefined &&
+      this.#maintenanceActionInFlight &&
+      activeBody?.operation.kind === "look_sweep"
+    ) {
+      // A look sweep has no open window to clean up; let the newer owner wake
+      // stop this search before it can inspect a chest candidate.
+      this.#generation += 1;
+      maintenanceInterruptGeneration = this.#generation;
+      this.#pendingWake = wake;
+      activeBody.controller.abort(
+        new Error("Owner action superseded the automatic equipment sweep"),
+      );
+    }
     if (maintenanceAction !== undefined) await maintenanceAction;
     if (this.#disposed || this.#isStopped()) return;
+    if (
+      maintenanceInterruptGeneration !== undefined &&
+      !this.#isCurrent(maintenanceInterruptGeneration)
+    )
+      return;
     if (wake.mode !== "damage_reflex") {
       this.#activeOwnerReplyGeneration = undefined;
       this.#ownerReplyInterruptedByDamage = false;
@@ -649,7 +675,7 @@ export class CompanionRuntime {
     this.#worldChangeTimer = undefined;
     this.#wakeAt = null;
     this.#wakeReason = wake.reason;
-    this.#generation += 1;
+    if (maintenanceInterruptGeneration === undefined) this.#generation += 1;
     this.#activeDecision?.abort(new Error("Companion judgment superseded"));
     this.#pendingWake = wake;
     if (this.#activeBody !== undefined) {

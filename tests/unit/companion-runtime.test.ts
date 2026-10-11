@@ -1275,6 +1275,91 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(0);
   });
 
+  it("lets owner follow supersede a periodic equipment sweep before a found chest is rechecked", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 60_000 }]);
+    const runtime = createRuntime(store, body, agent, undefined, 60_000);
+    const pendingSweep = deferred<PlayerOperationResult>();
+    let sweepSignal: AbortSignal | undefined;
+    let sweepReleased = false;
+    const emptySweep = emptyLookSweep();
+    const candidateSweep: PlayerBodyLookSweep = {
+      ...emptySweep,
+      directions: emptySweep.directions.map((view, index) =>
+        index === 2
+          ? { ...view, visibleBlocks: [equipmentChestBlock(3, 3)] }
+          : view,
+      ),
+    };
+    const releaseSweep = (): void => {
+      if (sweepReleased) return;
+      sweepReleased = true;
+      pendingSweep.resolve({
+        ...body.result(
+          { kind: "look_sweep" },
+          "periodic-owner-race-sweep",
+          "successful",
+          body.observation,
+        ),
+        lookSweep: candidateSweep,
+      });
+    };
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "look_sweep") {
+        sweepSignal = signal;
+        return pendingSweep.promise;
+      }
+      if (operation.kind === "follow_owner")
+        return fakeBody.result(
+          operation,
+          "periodic-owner-race-follow",
+          "successful",
+          fakeBody.observation,
+        );
+      return fakeBody.result(
+        operation,
+        `unexpected-periodic-owner-race-${fakeBody.executed.length}`,
+        "failed",
+        null,
+      );
+    };
+
+    try {
+      await runtime.start();
+      await eventuallyWithFakeTimers(
+        () => agent.inputs.length === 1 && !runtime.status().thinking,
+      );
+      body.observation = makeObservation({ equipment: { head: null } });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await eventuallyWithFakeTimers(
+        () => body.executed[0]?.kind === "look_sweep",
+      );
+
+      const ownerTurn = runtime.receiveChat("Builder", "こっち来て");
+      expect(sweepSignal?.aborted).toBe(true);
+      releaseSweep();
+      await ownerTurn;
+      await eventuallyWithFakeTimers(() =>
+        body.executed.some((operation) => operation.kind === "follow_owner"),
+      );
+
+      expect(body.executed.map((operation) => operation.kind)).toEqual([
+        "look_sweep",
+        "follow_owner",
+      ]);
+      expect(
+        body.executed.some((operation) =>
+          ["open_window", "window_transfer", "equip"].includes(operation.kind),
+        ),
+      ).toBe(false);
+      expect(agent.inputs).toHaveLength(1);
+    } finally {
+      releaseSweep();
+    }
+  });
+
   it("does not start autonomous equipment upkeep when self health is unknown", async () => {
     const { store } = freshStore();
     const block: BodyVisibleBlock = {
