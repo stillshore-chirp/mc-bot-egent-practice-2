@@ -303,6 +303,7 @@ function makeDecision(
 ): CompanionDecision {
   return companionDecisionSchema.parse({
     speech: null,
+    ownerMessageDisposition: null,
     goal: {
       title: "Look around the nearby forest",
       successCondition: "Check the surrounding area safely.",
@@ -327,6 +328,36 @@ function makeDecision(
 
 function emptyDecision(): CompanionDecision {
   return makeDecision();
+}
+
+function ownerGoalDecision(
+  operations: readonly PlayerOperation[],
+  title: string,
+): CompanionDecision {
+  return companionDecisionSchema.parse({
+    ...makeDecision(operations),
+    goal: {
+      title,
+      successCondition: "The requested observation is confirmed by Body.",
+      source: "owner",
+    },
+  });
+}
+
+function interleavedReplyDecision(
+  speech: string | null,
+  disposition: "answer_only" | "update_goal",
+): CompanionDecision {
+  return companionDecisionSchema.parse({
+    ...emptyDecision(),
+    speech,
+    ownerMessageDisposition: disposition,
+    goal: null,
+    plan: null,
+    memoryUpdates: [],
+    relationshipSummary: null,
+    knowledgeQuery: null,
+  });
 }
 
 interface Deferred<T> {
@@ -1201,7 +1232,7 @@ describe("CompanionRuntime", () => {
         before,
       );
     };
-    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const agent = new FakeAgent([emptyDecision()]);
     const runtime = createRuntime(store, body, agent);
 
     await runtime.start();
@@ -2675,7 +2706,10 @@ describe("CompanionRuntime", () => {
     body.observation = makeObservation({
       entities: [droppedItemEntity(35, 2, "apple", 1)],
     });
-    const agent = new FakeAgent([emptyDecision()]);
+    const agent = new FakeAgent([
+      interleavedReplyDecision(null, "update_goal"),
+      emptyDecision(),
+    ]);
     let pickupSignal: AbortSignal | undefined;
     body.executeHandler = async (operation, signal, fakeBody) => {
       pickupSignal = signal;
@@ -2701,8 +2735,12 @@ describe("CompanionRuntime", () => {
 
     expect(pickupSignal?.aborted).toBe(true);
     expect(body.executed).toHaveLength(1);
-    expect(agent.inputs).toHaveLength(1);
-    expect(agent.inputs[0]?.ownerMessage).toBe("少し待って");
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[0]).toMatchObject({
+      ownerMessage: "少し待って",
+      ownerReplyContext: { pendingOwnerRequest: null },
+    });
+    expect(agent.inputs[1]?.ownerMessage).toBe("少し待って");
     expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
   });
 
@@ -2833,7 +2871,9 @@ describe("CompanionRuntime", () => {
     const runtime = createRuntime(store, body, agent, say);
 
     await runtime.start();
-    await eventually(() => store.snapshot().waitUntil !== null);
+    await eventually(
+      () => !runtime.status().thinking && runtime.status().nextWakeAt !== null,
+    );
     expect(say).not.toHaveBeenCalled();
 
     await runtime.receiveChat("Builder", "状況を教えて");
@@ -2852,7 +2892,9 @@ describe("CompanionRuntime", () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const say = vi.fn(async () => undefined);
-    const agent = new FakeAgent([emptyDecision()]);
+    const agent = new FakeAgent([
+      interleavedReplyDecision("今の状態を確認しているよ。", "answer_only"),
+    ]);
     const runtime = createRuntime(store, body, agent, say);
     const followSignals: AbortSignal[] = [];
     body.executeHandler = async (operation, signal, fakeBody) => {
@@ -2898,22 +2940,19 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(0);
 
     await runtime.receiveChat("Builder", "状況を教えて");
-    expect(followSignals[0]?.aborted).toBe(true);
+    expect(followSignals[0]?.aborted).toBe(false);
     expect(agent.inputs).toHaveLength(1);
+    expect(say).toHaveBeenCalledWith("今の状態を確認しているよ。");
 
     await runtime.receiveChat("Builder", "ついてきて");
-    await eventually(() => body.executed.length === 2);
     await runtime.receiveChat("Impostor", "緊急停止命令");
-    expect(followSignals[1]?.aborted).toBe(false);
+    expect(followSignals[0]?.aborted).toBe(false);
     await runtime.receiveChat("Builder", "緊急停止命令");
 
-    expect(followSignals[1]?.aborted).toBe(true);
+    expect(followSignals[0]?.aborted).toBe(true);
     expect(store.snapshot().stopped).toBe(true);
     expect(agent.inputs).toHaveLength(1);
-    expect(body.executed.map(({ kind }) => kind)).toEqual([
-      "follow_owner",
-      "follow_owner",
-    ]);
+    expect(body.executed.map(({ kind }) => kind)).toEqual(["follow_owner"]);
   });
 
   it("accepts kana approach wording and active same-purpose follow nudges", async () => {
@@ -2921,7 +2960,10 @@ describe("CompanionRuntime", () => {
       const { store } = freshStore();
       const body = new FakeBody(store);
       const say = vi.fn(async () => undefined);
-      const agent = new FakeAgent([]);
+      const agent = new FakeAgent([
+        interleavedReplyDecision(null, "update_goal"),
+        ownerGoalDecision([], "石を集める"),
+      ]);
       const followSignals: AbortSignal[] = [];
       body.executeHandler = async (operation, signal, fakeBody) => {
         if (operation.kind !== "follow_owner")
@@ -2964,9 +3006,14 @@ describe("CompanionRuntime", () => {
 
       await runtime.receiveChat("Builder", "早く石を集めて");
       expect(followSignals[0]?.aborted).toBe(true);
-      expect(agent.inputs).toHaveLength(1);
+      expect(agent.inputs).toHaveLength(2);
       expect(agent.inputs[0]?.ownerMessage).toBe("早く石を集めて");
+      expect(agent.inputs[0]?.ownerReplyContext).toEqual({
+        pendingOwnerRequest: null,
+      });
+      expect(agent.inputs[1]?.ownerMessage).toBe("早く石を集めて");
       expect(body.executed).toHaveLength(1);
+      expect(store.snapshot().goal?.title).toBe("石を集める");
 
       await runtime.shutdown();
     }
@@ -3112,28 +3159,146 @@ describe("CompanionRuntime", () => {
     }
   });
 
-  it("lets the latest owner message replace a pending plan without replying for the stale turn", async () => {
+  it("answers side questions while the original owner goal judgment is still pending", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const say = vi.fn(async () => undefined);
+    const originalDecision = deferred<CompanionDecision>();
     const agent = new FakeAgent([
-      companionDecisionSchema.parse({
-        ...makeDecision([look]),
-        speech: "前の依頼は完了したよ。",
-      }),
-      companionDecisionSchema.parse({
-        ...emptyDecision(),
-        speech: "今の状況を確認したよ。",
-      }),
+      () => originalDecision.promise,
+      async () =>
+        interleavedReplyDecision("いまの周囲を確認しているよ。", "answer_only"),
+      async () =>
+        interleavedReplyDecision("依頼を続けているよ。", "answer_only"),
     ]);
     const runtime = createRuntime(store, body, agent, say);
+
+    const originalTurn = runtime.receiveChat("Builder", "周囲を確認して");
+    await eventually(() => agent.inputs.length === 1);
+    expect(agent.inputs[0]?.ownerMessage).toBe("周囲を確認して");
+    expect(agent.signals[0]?.aborted).toBe(false);
+
+    await runtime.receiveChat("Builder", "いま何が見える？");
+    await runtime.receiveChat("Builder", "元の依頼は進んでいる？");
+
+    expect(agent.inputs).toHaveLength(3);
+    expect(agent.inputs[1]).toMatchObject({
+      ownerMessage: "いま何が見える？",
+      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+    });
+    expect(agent.inputs[2]).toMatchObject({
+      ownerMessage: "元の依頼は進んでいる？",
+      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+    });
+    expect(agent.signals[0]?.aborted).toBe(false);
+    expect(body.executed).toHaveLength(0);
+    expect(store.snapshot().goal).toBeNull();
+    expect(say).toHaveBeenNthCalledWith(1, "いまの周囲を確認しているよ。");
+    expect(say).toHaveBeenNthCalledWith(2, "依頼を続けているよ。");
+
+    originalDecision.resolve(ownerGoalDecision([look], "周囲を確認する"));
+    await originalTurn;
+
+    expect(agent.inputs).toHaveLength(3);
+    expect(agent.signals[0]?.aborted).toBe(false);
+    expect(body.executed).toEqual([look]);
+    expect(store.snapshot().goal?.title).toBe("周囲を確認する");
+    expect(say).toHaveBeenCalledWith(
+      "依頼を受け取ったよ。結果を確認してから伝えるね。",
+    );
+  });
+
+  it("keeps active work for answer-only replies and replaces it only for an explicit new goal", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const move = playerOperationSchema.parse({
+      kind: "move_to",
+      position: { x: 8, y: 64, z: 8 },
+      range: 2,
+    });
+    const agent = new FakeAgent([
+      ownerGoalDecision([look], "周囲を確認する"),
+      interleavedReplyDecision("いま確認中だよ。", "answer_only"),
+      interleavedReplyDecision(null, "update_goal"),
+      ownerGoalDecision([move], "木を集める"),
+    ]);
+    let originalBodySignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) =>
+      fakeBody.executed.length > 1
+        ? fakeBody.result(
+            operation,
+            "synthetic-new-goal-operation",
+            "successful",
+            fakeBody.observation,
+          )
+        : await new Promise<PlayerOperationResult>((resolve) => {
+            originalBodySignal = signal;
+            const interrupted = (): void =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "synthetic-replaced-operation",
+                  "interrupted",
+                  null,
+                ),
+              );
+            if (signal?.aborted) interrupted();
+            else signal?.addEventListener("abort", interrupted, { once: true });
+          });
+    const runtime = createRuntime(store, body, agent, say);
+
+    const originalTurn = runtime.receiveChat("Builder", "周囲を確認して");
+    await eventually(() => body.executed.length === 1);
+    const originalGoal = store.snapshot().goal;
+    const originalOperation = store.snapshot().activeOperation;
+    expect(originalGoal?.title).toBe("周囲を確認する");
+    expect(originalOperation).not.toBeNull();
+
+    await runtime.receiveChat("Builder", "いまはどこを見ている？");
+    expect(originalBodySignal?.aborted).toBe(false);
+    expect(store.snapshot().goal).toEqual(originalGoal);
+    expect(store.snapshot().activeOperation).toEqual(originalOperation);
+    expect(body.executed).toHaveLength(1);
+
+    await runtime.receiveChat("Builder", "木を集めて");
+    await originalTurn;
+
+    expect(originalBodySignal?.aborted).toBe(true);
+    expect(agent.inputs[1]).toMatchObject({
+      ownerMessage: "いまはどこを見ている？",
+      ownerReplyContext: { pendingOwnerRequest: null },
+    });
+    expect(agent.inputs[2]).toMatchObject({
+      ownerMessage: "木を集めて",
+      ownerReplyContext: { pendingOwnerRequest: null },
+    });
+    expect(agent.inputs[3]?.ownerMessage).toBe("木を集めて");
+    expect(agent.inputs).toHaveLength(4);
+    expect(body.executed).toEqual([look, move]);
+    expect(store.snapshot().goal?.title).toBe("木を集める");
+    expect(say).toHaveBeenCalledWith("いま確認中だよ。");
+  });
+
+  it("suppresses a superseded or stopped interleaved reply", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async () => undefined);
+    const supersededReply = deferred<CompanionDecision>();
+    const stoppedReply = deferred<CompanionDecision>();
+    const agent = new FakeAgent([
+      ownerGoalDecision([look], "周囲を確認する"),
+      () => supersededReply.promise,
+      interleavedReplyDecision("最新の質問に答えたよ。", "answer_only"),
+      () => stoppedReply.promise,
+    ]);
     body.executeHandler = async (operation, signal, fakeBody) =>
       await new Promise<PlayerOperationResult>((resolve) => {
         const interrupted = (): void =>
           resolve(
             fakeBody.result(
               operation,
-              "synthetic-superseded-operation",
+              "synthetic-stopped-operation",
               "interrupted",
               null,
             ),
@@ -3141,22 +3306,91 @@ describe("CompanionRuntime", () => {
         if (signal?.aborted) interrupted();
         else signal?.addEventListener("abort", interrupted, { once: true });
       });
-
-    const earlierTurn = runtime.receiveChat("Builder", "周囲を確認して");
+    const runtime = createRuntime(store, body, agent, say);
+    const originalTurn = runtime.receiveChat("Builder", "周囲を確認して");
     await eventually(() => body.executed.length === 1);
-    await runtime.receiveChat("Builder", "いま何が見える？");
-    await earlierTurn;
 
-    expect(agent.inputs).toHaveLength(2);
-    expect(agent.inputs[1]?.ownerMessage).toBe("いま何が見える？");
-    expect(say).toHaveBeenCalledTimes(2);
-    expect(say).toHaveBeenNthCalledWith(
-      1,
-      "依頼を受け取ったよ。結果を確認してから伝えるね。",
+    const staleTurn = runtime.receiveChat("Builder", "古い質問");
+    await eventually(() => agent.inputs.length === 2);
+    const staleSignal = agent.signals[1];
+    await runtime.receiveChat("Builder", "新しい質問");
+    expect(staleSignal?.aborted).toBe(true);
+    expect(say).toHaveBeenCalledWith("最新の質問に答えたよ。");
+    supersededReply.resolve(
+      interleavedReplyDecision("古い返事を出さないで", "answer_only"),
     );
-    expect(say).toHaveBeenNthCalledWith(2, "今の状況を確認したよ。");
-    expect(say).not.toHaveBeenCalledWith("前の依頼は完了したよ。");
+    await staleTurn;
+    expect(say).not.toHaveBeenCalledWith("古い返事を出さないで");
+
+    const stoppedTurn = runtime.receiveChat("Builder", "停止前の質問");
+    await eventually(() => agent.inputs.length === 4);
+    const stoppedSignal = agent.signals[3];
+    await runtime.stop("Builder");
+    expect(stoppedSignal?.aborted).toBe(true);
+    stoppedReply.resolve(
+      interleavedReplyDecision("停止後の古い返事", "answer_only"),
+    );
+    await stoppedTurn;
+    await originalTurn;
+    expect(say).not.toHaveBeenCalledWith("古い返事を出さないで");
+    expect(say).not.toHaveBeenCalledWith("停止後の古い返事");
+    expect(runtime.status().stopped).toBe(true);
   });
+
+  it.each([
+    ["missing", undefined],
+    ["null", null],
+    ["invalid", "unexpected"],
+  ] as const)(
+    "keeps active work and uses an unknown fallback for a %s reply disposition",
+    async (_caseName, disposition) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const say = vi.fn(async () => undefined);
+      const undecidedReply = {
+        ...interleavedReplyDecision("誤って確定した返答", "answer_only"),
+        ownerMessageDisposition: disposition,
+      } as unknown as CompanionDecision;
+      const agent = new FakeAgent([
+        ownerGoalDecision([look], "周囲を確認する"),
+        undecidedReply,
+      ]);
+      let originalBodySignal: AbortSignal | undefined;
+      body.executeHandler = async (operation, signal, fakeBody) =>
+        await new Promise<PlayerOperationResult>((resolve) => {
+          originalBodySignal = signal;
+          const interrupted = (): void =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "synthetic-unknown-reply-interruption",
+                "interrupted",
+                null,
+              ),
+            );
+          if (signal?.aborted) interrupted();
+          else signal?.addEventListener("abort", interrupted, { once: true });
+        });
+      const runtime = createRuntime(store, body, agent, say);
+      const originalTurn = runtime.receiveChat("Builder", "周囲を確認して");
+      await eventually(() => body.executed.length === 1);
+      const originalGoal = store.snapshot().goal;
+      const originalOperation = store.snapshot().activeOperation;
+
+      await runtime.receiveChat("Builder", "いま何が見える？");
+
+      expect(originalBodySignal?.aborted).toBe(false);
+      expect(store.snapshot().goal).toEqual(originalGoal);
+      expect(store.snapshot().activeOperation).toEqual(originalOperation);
+      expect(body.executed).toHaveLength(1);
+      expect(say).toHaveBeenCalledWith(
+        "依頼は受け取ったけれど、現在の状態と返答は確認できていないよ。詳しい原因はまだ分からないよ。",
+      );
+
+      await runtime.shutdown();
+      await originalTurn;
+    },
+  );
 
   it("keeps idle nudges, new goals, and quoted questions in the owner-message path", async () => {
     const { store } = freshStore();
@@ -3320,7 +3554,9 @@ describe("CompanionRuntime", () => {
     const runtime = createRuntime(store, body, agent);
 
     await runtime.start();
-    await eventually(() => store.snapshot().waitUntil !== null);
+    await eventually(
+      () => !runtime.status().thinking && runtime.status().nextWakeAt !== null,
+    );
     expect(store.snapshot().relationshipSummary).toBe(
       "以前から一緒に探索している。",
     );
@@ -3477,7 +3713,8 @@ describe("CompanionRuntime", () => {
     const body = new FakeBody(store);
     const agent = new FakeAgent([
       makeDecision([look, look]),
-      makeDecision([look]),
+      interleavedReplyDecision(null, "update_goal"),
+      ownerGoalDecision([look], "安全な場所へ戻る"),
     ]);
     body.executeHandler = async (operation, signal, fakeBody) => {
       if (fakeBody.executed.length > 1)
@@ -3510,7 +3747,12 @@ describe("CompanionRuntime", () => {
     expect(runtime.status().currentOperation?.kind).toBe("look_sweep");
     await runtime.receiveChat("Builder", "今は戻ろう");
 
-    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs).toHaveLength(3);
+    expect(agent.inputs[1]).toMatchObject({
+      ownerMessage: "今は戻ろう",
+      ownerReplyContext: { pendingOwnerRequest: null },
+    });
+    expect(agent.inputs[2]?.ownerMessage).toBe("今は戻ろう");
     expect(body.executed).toHaveLength(2);
     expect(store.snapshot().lastOutcome?.status).toBe("successful");
     expect(store.snapshot().plan).toBeNull();
@@ -3703,17 +3945,21 @@ describe("CompanionRuntime", () => {
           ...makeDecision([look]),
           speech: "前の依頼は完了したよ。",
         }),
-        companionDecisionSchema.parse({
-          ...emptyDecision(),
-          speech: "最新の質問へ返答したよ。",
-        }),
+        interleavedReplyDecision("最新の質問へ返答したよ。", "answer_only"),
       ]);
       const pendingDamageObservation = deferred<undefined>();
       body.observeHandler = async (fakeBody) => {
         if (fakeBody.observeCalls === 2) await pendingDamageObservation.promise;
       };
-      body.executeHandler = async (operation, signal, fakeBody) =>
-        await new Promise<PlayerOperationResult>((resolve) => {
+      body.executeHandler = async (operation, signal, fakeBody) => {
+        if (fakeBody.executed.length > 1)
+          return fakeBody.result(
+            operation,
+            "synthetic-damage-reflex",
+            "successful",
+            fakeBody.observation,
+          );
+        return await new Promise<PlayerOperationResult>((resolve) => {
           const interrupted = (): void =>
             resolve(
               fakeBody.result(
@@ -3726,6 +3972,7 @@ describe("CompanionRuntime", () => {
           if (signal?.aborted) interrupted();
           else signal?.addEventListener("abort", interrupted, { once: true });
         });
+      };
       const runtime = createRuntime(store, body, agent, say);
 
       const ownerTurn = runtime.receiveChat("Builder", "周囲を確認して");
@@ -3753,7 +4000,8 @@ describe("CompanionRuntime", () => {
       if (supersedingAction === "new owner message") {
         expect(agent.inputs.at(-1)?.ownerMessage).toBe("いま何が見える？");
         expect(say).toHaveBeenCalledWith("最新の質問へ返答したよ。");
-        expect(body.executed).toHaveLength(1);
+        expect(body.executed).toHaveLength(2);
+        expect(store.snapshot().lastOutcome?.status).toBe("successful");
       } else {
         expect(runtime.status().stopped).toBe(true);
         expect(agent.inputs).toHaveLength(1);
@@ -4515,7 +4763,11 @@ describe("CompanionRuntime", () => {
       entities: [attackTarget],
       nearbyHostiles: makeNearbyHostiles([attackTarget]),
     });
-    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const agent = new FakeAgent([
+      emptyDecision(),
+      interleavedReplyDecision(null, "update_goal"),
+      ownerGoalDecision([], "敵から離れる"),
+    ]);
     const runtime = createRuntime(store, body, agent);
     let attackSignal: AbortSignal | undefined;
     body.executeHandler = async (operation, signal, fakeBody) => {
@@ -4546,10 +4798,12 @@ describe("CompanionRuntime", () => {
       confidence: "unknown",
     });
     await eventually(() => body.executed.length === 1);
-    await runtime.receiveChat("Builder", "状況を教えて");
+    await runtime.receiveChat("Builder", "この敵から離れて");
 
     expect(attackSignal?.aborted).toBe(true);
-    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs).toHaveLength(3);
+    expect(agent.inputs[1]?.ownerMessage).toBe("この敵から離れて");
+    expect(agent.inputs[2]?.ownerMessage).toBe("この敵から離れて");
     expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
   });
 
@@ -4607,7 +4861,11 @@ describe("CompanionRuntime", () => {
   it("preserves queued owner chat when a damage burst arrives as a reflex is cancelled", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
-    const agent = new FakeAgent([emptyDecision()]);
+    const agent = new FakeAgent([
+      emptyDecision(),
+      interleavedReplyDecision(null, "update_goal"),
+      ownerGoalDecision([], "危険から離れる"),
+    ]);
     const runtime = createRuntime(store, body, agent);
     let reflexSignal: AbortSignal | undefined;
     body.executeHandler = async (operation, signal, fakeBody) => {
@@ -4641,11 +4899,12 @@ describe("CompanionRuntime", () => {
       confidence: "unknown",
     });
     await eventually(() => body.executed.length === 1);
-    await runtime.receiveChat("Builder", "状況を教えて");
+    await runtime.receiveChat("Builder", "危険から離れて");
 
     expect(reflexSignal?.aborted).toBe(true);
-    expect(agent.inputs).toHaveLength(2);
-    expect(agent.inputs[1]?.ownerMessage).toBe("状況を教えて");
+    expect(agent.inputs).toHaveLength(3);
+    expect(agent.inputs[1]?.ownerMessage).toBe("危険から離れて");
+    expect(agent.inputs[2]?.ownerMessage).toBe("危険から離れて");
     expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
     expect(body.executed).toHaveLength(1);
   });

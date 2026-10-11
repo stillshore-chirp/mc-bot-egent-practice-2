@@ -190,6 +190,7 @@ describe("CompanionAgent", () => {
   it("accepts speech up to 2000 characters and rejects longer speech", () => {
     const validOutput = {
       speech: "a".repeat(2_000),
+      ownerMessageDisposition: null,
       goal: null,
       plan: null,
       memoryUpdates: [],
@@ -304,6 +305,62 @@ describe("CompanionAgent", () => {
       outputTokens: 17,
       cachedInputTokens: 8,
     });
+  });
+
+  it("encodes the pending goal context and answer-only disposition contract", async () => {
+    const output = {
+      speech: "いま確認しているよ。",
+      ownerMessageDisposition: "answer_only",
+      goal: null,
+      plan: null,
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 10_000,
+      knowledgeQuery: null,
+    };
+    const create = vi.fn().mockResolvedValue(response(output));
+    const agent = new CompanionAgent({
+      client: {
+        responses: { create },
+      } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+
+    const decision = await agent.decide({
+      ...createInput(),
+      ownerMessage: "いま何を確認しているの？",
+      pendingOwnerRequest: "周囲を確認して",
+      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+    });
+
+    const [request] = create.mock.calls[0] as unknown as [
+      {
+        input: string;
+        instructions: string;
+        text: { format: { schema: unknown } };
+      },
+    ];
+    const parsedInput = JSON.parse(request.input) as {
+      ownerMessage: string;
+      pendingOwnerRequest: string;
+      ownerReplyContext: { pendingOwnerRequest: string | null };
+    };
+    expect(parsedInput).toMatchObject({
+      ownerMessage: "いま何を確認しているの？",
+      pendingOwnerRequest: "周囲を確認して",
+      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+    });
+    expect(request.instructions).toContain(
+      "ownerReplyContextがある独立返信ではownerMessageDispositionを必ず選んでください。",
+    );
+    expect(
+      hasRequiredNullableProperty(
+        request.text.format.schema,
+        "ownerMessageDisposition",
+      ),
+    ).toBe(true);
+    expect(decision.ownerMessageDisposition).toBe("answer_only");
   });
 
   it("sends exactly the newest 24 mixed-role messages to the provider", async () => {
