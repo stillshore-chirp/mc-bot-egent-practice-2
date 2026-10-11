@@ -1527,13 +1527,148 @@ describe("CompanionRuntime", () => {
     await runtime.stop("Builder");
   });
 
+  it("searches ordinary food before consuming held rotten flesh", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const rotten = foodItem("rotten_flesh", 9);
+    const appleDrop = droppedItemEntity(98, 2, "apple", 1);
+    body.foodNames.add("rotten_flesh");
+    body.foodNames.add("apple");
+    body.observation = makeObservation({
+      food: 12,
+      inventory: [rotten],
+      entities: [appleDrop],
+      nearbyDroppedItems: makeNearbyDroppedItems([appleDrop]),
+    });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after: PlayerBodyObservation;
+      if (operation.kind === "collect_item") {
+        after = {
+          ...before,
+          self: {
+            ...before.self,
+            inventory: [rotten, foodItem("apple", 10)],
+          },
+          perception: {
+            ...before.perception,
+            entities: [],
+            nearbyDroppedItems: makeNearbyDroppedItems([]),
+          },
+        };
+      } else if (operation.kind === "consume") {
+        after = {
+          ...before,
+          self: { ...before.self, food: 16, inventory: [rotten] },
+        };
+      } else {
+        throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `food-rotten-drop-${fakeBody.executed.length}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+    const runtime = createRuntime(store, body, new FakeAgent([]));
+
+    await runtime.start();
+    await eventually(() => body.results.length === 2);
+
+    expect(body.executed).toEqual([
+      { kind: "collect_item", entityId: 98 },
+      { kind: "consume" },
+    ]);
+    expect(body.observation.self.food).toBe(16);
+    expect(body.observation.self.inventory).toContainEqual(rotten);
+    await runtime.stop("Builder");
+  });
+
+  it("uses held rotten flesh only after a bounded low-hunger search and records why", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const rotten = foodItem("rotten_flesh", 9);
+    body.foodNames.add("rotten_flesh");
+    body.observation = makeObservation({ food: 6, inventory: [rotten] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: { ...before.self, food: 10, inventory: [] },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "rotten-last-resort",
+        "successful",
+        after,
+        before,
+      );
+    };
+    const runtime = createRuntime(store, body, new FakeAgent([]));
+
+    await runtime.start();
+    await eventually(() => body.results.length === 1);
+
+    expect(body.executed).toEqual([{ kind: "consume", item: "rotten_flesh" }]);
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+      "bounded ordinary-food search",
+    );
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain("food=6");
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+      "health=20",
+    );
+    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+      "truncated=false",
+    );
+    await runtime.stop("Builder");
+  });
+
+  it.each(["water", "low oxygen", "above threshold"] as const)(
+    "does not use held rotten flesh with %s",
+    async (condition) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      body.foodNames.add("rotten_flesh");
+      const base = makeObservation({
+        food: condition === "above threshold" ? 7 : 6,
+        inventory: [foodItem("rotten_flesh", 9)],
+      });
+      body.observation = {
+        ...base,
+        self: {
+          ...base.self,
+          ...(condition === "water"
+            ? { inWater: true }
+            : condition === "low oxygen"
+              ? { oxygen: 5 }
+              : {}),
+        },
+      };
+      const agent = new FakeAgent([emptyDecision()]);
+      const runtime = createRuntime(store, body, agent);
+
+      await runtime.start();
+      await eventually(() => agent.inputs.length === 1);
+
+      expect(body.executed).toEqual([]);
+      await runtime.stop("Builder");
+    },
+  );
+
   it("uses the shared reachable-chest path to acquire and consume food", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const apple = foodItem("apple", 0);
+    const rotten = foodItem("rotten_flesh", 9);
     body.foodNames.add("apple");
+    body.foodNames.add("rotten_flesh");
     body.observation = makeObservation({
       food: 12,
+      inventory: [rotten],
       blocks: [equipmentChestBlock(1)],
     });
     body.executeHandler = async (operation, _signal, fakeBody) => {
@@ -1547,7 +1682,7 @@ describe("CompanionRuntime", () => {
           const owned = foodItem("apple", 9);
           after = {
             ...before,
-            self: { ...before.self, inventory: [owned] },
+            self: { ...before.self, inventory: [rotten, owned] },
             window: chestWindow(null, owned),
           };
           break;
@@ -1561,7 +1696,7 @@ describe("CompanionRuntime", () => {
             self: {
               ...before.self,
               food: 16,
-              inventory: [],
+              inventory: [rotten],
             },
           };
           break;
@@ -1591,6 +1726,7 @@ describe("CompanionRuntime", () => {
     ]);
     expect(body.observation.window).toBeNull();
     expect(body.observation.self.food).toBe(16);
+    expect(body.observation.self.inventory).toContainEqual(rotten);
     expect(agent.inputs).toHaveLength(0);
     await runtime.stop("Builder");
   });

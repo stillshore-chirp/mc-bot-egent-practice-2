@@ -3803,7 +3803,9 @@ function chooseFood(bot: Bot, requested?: string): Item {
     .filter(
       (item) =>
         bot.registry.foodsByName[item.name] !== undefined &&
-        (requested === undefined || item.name === requested),
+        (requested === undefined
+          ? item.name !== "rotten_flesh"
+          : item.name === requested),
     );
   const food = candidates.sort(
     (left, right) =>

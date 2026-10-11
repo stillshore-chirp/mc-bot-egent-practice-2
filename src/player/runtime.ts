@@ -1261,7 +1261,9 @@ export class CompanionRuntime {
     }
     this.#foodPickupSuppressedAtFood = food;
 
-    const edibleInventory = (current: PlayerBodyObservation): BodyItemStack[] =>
+    const knownFoodInventory = (
+      current: PlayerBodyObservation,
+    ): BodyItemStack[] =>
       current.self.inventory.filter(
         (item) =>
           item.slot >= 9 &&
@@ -1269,8 +1271,15 @@ export class CompanionRuntime {
           item.count > 0 &&
           this.#isKnownFood(item.name),
       );
-    let edibleItems = edibleInventory(observation);
-    let fingerprint = foodAttemptFingerprint(observation, edibleItems);
+    const ordinaryFoodInventory = (
+      current: PlayerBodyObservation,
+    ): BodyItemStack[] =>
+      knownFoodInventory(current).filter((item) =>
+        this.#isRoutineFood(item.name),
+      );
+    let edibleItems = ordinaryFoodInventory(observation);
+    let foodInventory = knownFoodInventory(observation);
+    let fingerprint = foodAttemptFingerprint(observation, foodInventory);
     if (this.#foodUseSuppressedFingerprint === fingerprint) {
       return {
         observation,
@@ -1294,7 +1303,7 @@ export class CompanionRuntime {
       const eligibleFoodDrop = (entity: BodyVisibleEntity): boolean =>
         entity.droppedItem !== undefined &&
         entity.droppedItem.count > 0 &&
-        this.#isKnownFood(entity.droppedItem.name) &&
+        this.#isRoutineFood(entity.droppedItem.name) &&
         Number.isFinite(entity.distance) &&
         entity.distance <= maxDistance;
       const foodDropKey = (entity: BodyVisibleEntity): string | undefined => {
@@ -1336,7 +1345,7 @@ export class CompanionRuntime {
         }
       };
       await collectFoodDrop(true);
-      if (edibleInventory(observation).length === 0) {
+      if (ordinaryFoodInventory(observation).length === 0) {
         for (const block of visibleEquipmentChests(observation)) {
           const chestKey = JSON.stringify([
             food,
@@ -1361,7 +1370,7 @@ export class CompanionRuntime {
                   (candidate) =>
                     candidate !== null &&
                     candidate.count > 0 &&
-                    this.#isKnownFood(candidate.name),
+                    this.#isRoutineFood(candidate.name),
                 );
               return item === undefined || item === null ? null : { item };
             },
@@ -1378,28 +1387,87 @@ export class CompanionRuntime {
           if (chest.withdrawn.length > 0) break;
         }
       }
-      if (edibleInventory(observation).length === 0)
+      if (ordinaryFoodInventory(observation).length === 0)
         await collectFoodDrop(false);
-      edibleItems = edibleInventory(observation);
-      fingerprint = foodAttemptFingerprint(observation, edibleItems);
+      edibleItems = ordinaryFoodInventory(observation);
+      foodInventory = knownFoodInventory(observation);
+      fingerprint = foodAttemptFingerprint(observation, foodInventory);
       if (edibleItems.length === 0) {
-        const hasUntriedFoodDrop =
-          this.#foodPickupSuppressed.size < automaticPickupSuppressionLimit &&
-          visibleDroppedItems(observation).some(
-            (entity) =>
-              eligibleFoodDrop(entity) &&
-              !this.#foodPickupSuppressed.has(foodDropKey(entity) ?? ""),
-          );
-        this.#failedFoodAttemptFingerprint = hasUntriedFoodDrop
-          ? undefined
-          : fingerprint;
-        return { observation, confirmed: false, handled: false };
+        const hasUntriedFoodDrop = visibleDroppedItems(observation).some(
+          (entity) =>
+            eligibleFoodDrop(entity) &&
+            !this.#foodPickupSuppressed.has(foodDropKey(entity) ?? ""),
+        );
+        const hasUntriedFoodChest = visibleEquipmentChests(observation).some(
+          (block) =>
+            !this.#foodChestSuppressed.has(
+              JSON.stringify([
+                food,
+                equipmentChestFingerprint(observation.dimension, block),
+              ]),
+            ),
+        );
+        if (
+          (hasUntriedFoodDrop &&
+            this.#foodPickupSuppressed.size <
+              automaticPickupSuppressionLimit) ||
+          (hasUntriedFoodChest &&
+            this.#foodChestSuppressed.size < equipmentChestSuppressionLimit)
+        ) {
+          this.#failedFoodAttemptFingerprint = undefined;
+          return { observation, confirmed: false, handled: false };
+        }
+        if (hasUntriedFoodDrop || hasUntriedFoodChest) {
+          this.#failedFoodAttemptFingerprint = fingerprint;
+          return { observation, confirmed: false, handled: false };
+        }
+
+        const heldRottenFlesh = foodInventory.filter(
+          (item) => item.name === "rotten_flesh",
+        );
+        if (
+          heldRottenFlesh.length === 0 ||
+          !canUseRottenFleshLastResort(observation) ||
+          !this.#isCurrent(generation) ||
+          this.#isStopped()
+        ) {
+          this.#failedFoodAttemptFingerprint = fingerprint;
+          return { observation, confirmed: false, handled: false };
+        }
+        edibleItems = heldRottenFlesh;
       }
     }
 
+    const useRottenFleshLastResort =
+      edibleItems.length > 0 &&
+      edibleItems.every((item) => item.name === "rotten_flesh");
+    const operation: PlayerOperation = useRottenFleshLastResort
+      ? { kind: "consume", item: "rotten_flesh" }
+      : { kind: "consume" };
+    const expectedOutcome = useRottenFleshLastResort
+      ? rottenFleshLastResortReason(
+          observation,
+          visibleDroppedItems(observation).filter((entity) => {
+            const item = entity.droppedItem;
+            const maxDistance =
+              observation.perception.nearbyDroppedItems?.maxDistance ??
+              observation.perception.maxDistance;
+            return (
+              item !== undefined &&
+              item.count > 0 &&
+              this.#isRoutineFood(item.name) &&
+              Number.isFinite(entity.distance) &&
+              entity.distance <= maxDistance
+            );
+          }).length,
+          visibleEquipmentChests(observation).length,
+          this.#foodPickupSuppressed.size,
+          this.#foodChestSuppressed.size,
+        )
+      : "Consume one ordinary known food item while hunger is below full, then verify the Body result and fresh observation.";
     const step = await this.#executeUpkeepAction(
-      { kind: "consume" },
-      "Consume one known edible inventory item while hunger is below full, then verify the Body result and fresh observation.",
+      operation,
+      expectedOutcome,
       generation,
     );
     let after = step.observation;
@@ -1437,17 +1505,11 @@ export class CompanionRuntime {
       )
         this.#foodUseSuppressedFingerprint = foodAttemptFingerprint(
           after,
-          edibleInventory(after),
+          knownFoodInventory(after),
         );
       this.#failedFoodAttemptFingerprint = foodAttemptFingerprint(
         after,
-        after.self.inventory.filter(
-          (item) =>
-            item.slot >= 9 &&
-            item.slot < 45 &&
-            item.count > 0 &&
-            this.#isKnownFood(item.name),
-        ),
+        knownFoodInventory(after),
       );
       return { observation: after, confirmed: false, handled: false };
     }
@@ -1466,6 +1528,10 @@ export class CompanionRuntime {
           fact.food !== null &&
           fact.food.foodPoints > 0,
       );
+  }
+
+  #isRoutineFood(name: string): boolean {
+    return name !== "rotten_flesh" && this.#isKnownFood(name);
   }
 
   async #collectObservedDrop(
@@ -3023,6 +3089,39 @@ function isSafeForEquipmentUpkeep(observation: PlayerBodyObservation): boolean {
     observation.self.suffocating !== true &&
     !observation.self.sleeping
   );
+}
+
+function canUseRottenFleshLastResort(
+  observation: PlayerBodyObservation,
+): boolean {
+  return (
+    observation.self.food !== null &&
+    observation.self.food <= 6 &&
+    isSafeForEquipmentUpkeep(observation) &&
+    observation.window === null &&
+    observation.self.inWater !== true &&
+    !(observation.self.oxygen !== null && observation.self.oxygen <= 5)
+  );
+}
+
+function rottenFleshLastResortReason(
+  observation: PlayerBodyObservation,
+  ordinaryDropCandidates: number,
+  visibleChestCandidates: number,
+  attemptedDropCandidates: number,
+  attemptedChestCandidates: number,
+): string {
+  const truncated =
+    observation.perception.candidateSearchMayBeTruncated ||
+    observation.perception.nearbyDroppedItems?.candidateSearchMayBeTruncated ===
+      true;
+  return [
+    "Use only held rotten_flesh as a bounded ordinary-food search last resort",
+    `food=${observation.self.food}; health=${observation.self.health}`,
+    `inWater=${observation.self.inWater}; oxygen=${observation.self.oxygen}; inLava=${observation.self.inLava}; onFire=${observation.self.onFire}; suffocating=${observation.self.suffocating}`,
+    `visibleOrdinaryDrops=${ordinaryDropCandidates}; visibleChests=${visibleChestCandidates}; attemptedDrops=${attemptedDropCandidates}; attemptedChests=${attemptedChestCandidates}; truncated=${truncated}`,
+    "This bounded visible observation does not establish world-wide ordinary-food absence.",
+  ].join("; ");
 }
 
 function visibleEquipmentChests(
