@@ -2986,7 +2986,7 @@ describe("CompanionRuntime", () => {
     await runtime.receiveChat("Builder", "今の様子を教えて");
 
     expect(say).toHaveBeenCalledExactlyOnceWith(
-      "今は返事をまとめられなかったよ。必要ならもう一度聞いてね。",
+      "現在の状況は確認したけれど、返答を確定できなかったよ。詳しい理由はまだ分からないよ。",
     );
     await vi.advanceTimersByTimeAsync(5_000);
     expect(agent.inputs).toHaveLength(2);
@@ -3008,7 +3008,7 @@ describe("CompanionRuntime", () => {
     await runtime.receiveChat("Builder", "いま何をしているの？");
 
     expect(say).toHaveBeenCalledExactlyOnceWith(
-      "今は返事を作れなかったよ。少し待ってからもう一度聞いてね。",
+      "依頼は受け取ったけれど、現在の状態と返答は確認できていないよ。詳しい原因はまだ分からないよ。",
     );
     expect(runtime.status().recentErrors).toHaveLength(1);
   });
@@ -3105,7 +3105,7 @@ describe("CompanionRuntime", () => {
         );
         expect(say).toHaveBeenNthCalledWith(
           2,
-          "行動結果を確認できなかったので、完了とは言えないよ。",
+          "行動結果はまだ確認できず、完了とは言えないよ。詳しい原因はまだ分からないよ。",
         );
         expect(say).not.toHaveBeenCalledWith("もう完了したよ。");
       }
@@ -3602,6 +3602,167 @@ describe("CompanionRuntime", () => {
     expect(body.executed[0]).toEqual({ kind: "look_sweep" });
     expect(store.snapshot().lastOutcome?.status).toBe("successful");
   });
+
+  it("explains a damage interruption once without blocking the reflex action", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const interruptionReply =
+      "ダメージ対応を優先して、元の返答を中断したよ。元の返答はまだ届けられておらず、実行中の操作があれば結果も未確認だよ。";
+    const pendingSpeech = deferred<undefined>();
+    const damageAction = deferred<PlayerOperationResult>();
+    const say = vi.fn(async (text: string) => {
+      if (text === interruptionReply) await pendingSpeech.promise;
+    });
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({
+        ...makeDecision([look]),
+        speech: "依頼は完了したよ。",
+      }),
+    ]);
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (fakeBody.executed.length === 1)
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          const interrupted = (): void =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "synthetic-owner-action-interrupted",
+                "interrupted",
+                null,
+              ),
+            );
+          if (signal?.aborted) interrupted();
+          else signal?.addEventListener("abort", interrupted, { once: true });
+        });
+      return damageAction.promise;
+    };
+    const runtime = createRuntime(store, body, agent, say);
+
+    const ownerTurn = runtime.receiveChat("Builder", "周囲を確認して");
+    await eventually(() => body.executed.length === 1);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(() => body.executed.length === 2);
+
+    expect(say).toHaveBeenCalledWith(
+      "依頼を受け取ったよ。結果を確認してから伝えるね。",
+    );
+    expect(say).toHaveBeenCalledWith(interruptionReply);
+    expect(say).toHaveBeenCalledTimes(2);
+    expect(say).not.toHaveBeenCalledWith("依頼は完了したよ。");
+
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    expect(body.executed).toHaveLength(2);
+    expect(say).toHaveBeenCalledTimes(2);
+
+    pendingSpeech.resolve(undefined);
+    await eventually(() =>
+      store
+        .recentMessages(24)
+        .some((message) => message.text === interruptionReply),
+    );
+    const damageOperation = body.executed[1];
+    if (damageOperation === undefined)
+      throw new Error("Expected a damage-reflex operation");
+    damageAction.resolve(
+      body.result(
+        damageOperation,
+        "synthetic-damage-action",
+        "successful",
+        body.observation,
+      ),
+    );
+    await ownerTurn;
+
+    expect(say).toHaveBeenCalledTimes(2);
+    expect(
+      store
+        .recentMessages(24)
+        .filter((message) => message.text === interruptionReply),
+    ).toHaveLength(1);
+    await runtime.shutdown();
+  });
+
+  it.each(["new owner message", "owner stop"] as const)(
+    "suppresses a pending damage interruption explanation after %s supersedes it",
+    async (supersedingAction) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const say = vi.fn(async () => undefined);
+      const agent = new FakeAgent([
+        companionDecisionSchema.parse({
+          ...makeDecision([look]),
+          speech: "前の依頼は完了したよ。",
+        }),
+        companionDecisionSchema.parse({
+          ...emptyDecision(),
+          speech: "最新の質問へ返答したよ。",
+        }),
+      ]);
+      const pendingDamageObservation = deferred<undefined>();
+      body.observeHandler = async (fakeBody) => {
+        if (fakeBody.observeCalls === 2) await pendingDamageObservation.promise;
+      };
+      body.executeHandler = async (operation, signal, fakeBody) =>
+        await new Promise<PlayerOperationResult>((resolve) => {
+          const interrupted = (): void =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "synthetic-superseded-owner-action",
+                "interrupted",
+                null,
+              ),
+            );
+          if (signal?.aborted) interrupted();
+          else signal?.addEventListener("abort", interrupted, { once: true });
+        });
+      const runtime = createRuntime(store, body, agent, say);
+
+      const ownerTurn = runtime.receiveChat("Builder", "周囲を確認して");
+      await eventually(() => body.executed.length === 1);
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+      await eventually(() => body.observeCalls === 2);
+
+      const supersedingTurn =
+        supersedingAction === "new owner message"
+          ? runtime.receiveChat("Builder", "いま何が見える？")
+          : runtime.receiveChat("Builder", "緊急停止命令");
+      if (supersedingAction === "owner stop")
+        await eventually(() => runtime.status().stopped);
+      pendingDamageObservation.resolve(undefined);
+      await Promise.all([ownerTurn, supersedingTurn]);
+
+      expect(say).not.toHaveBeenCalledWith(
+        "ダメージ対応を優先して、元の返答を中断したよ。元の返答はまだ届けられておらず、実行中の操作があれば結果も未確認だよ。",
+      );
+      if (supersedingAction === "new owner message") {
+        expect(agent.inputs.at(-1)?.ownerMessage).toBe("いま何が見える？");
+        expect(say).toHaveBeenCalledWith("最新の質問へ返答したよ。");
+        expect(body.executed).toHaveLength(1);
+      } else {
+        expect(runtime.status().stopped).toBe(true);
+        expect(agent.inputs).toHaveLength(1);
+        expect(body.executed).toHaveLength(1);
+      }
+
+      await runtime.shutdown();
+    },
+  );
 
   it("uses bounded jump recovery after low-oxygen damage and remembers the interrupted goal", async () => {
     const { store } = freshStore();
