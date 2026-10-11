@@ -125,7 +125,7 @@ describe("companion acceptance without paid services", () => {
       expect(store.snapshot().stopped).toBe(false);
       expect(calls).toHaveLength(1);
 
-      await runtime.receiveChat(ownerUsername, "止めて");
+      await runtime.receiveChat(ownerUsername, "緊急停止命令");
       expect(store.snapshot().stopped).toBe(true);
       expect(store.snapshot().plan).toBeNull();
       expect(calls).toHaveLength(1);
@@ -156,7 +156,7 @@ describe("companion acceptance without paid services", () => {
         expect.objectContaining({ role: "owner", text: ownerMessage }),
       );
       expect(resumedInput.recentMessages).toContainEqual(
-        expect.objectContaining({ role: "owner", text: "止めて" }),
+        expect.objectContaining({ role: "owner", text: "緊急停止命令" }),
       );
       expect(resumedCall.instructions).toContain("コンパニオン「ミナ");
       expect(body.operations).toHaveLength(3);
