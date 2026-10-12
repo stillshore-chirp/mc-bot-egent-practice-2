@@ -62,6 +62,79 @@ export interface CompanionActiveOperation {
   readonly operationId: string;
   readonly operation: PlayerOperation;
   readonly expectedOutcome: string;
+  /** Runtime timestamp persisted before Body dispatch for stop/restart recovery. */
+  readonly bodyStartedAt?: string | undefined;
+}
+
+export const companionOutcomeEvidenceSources = [
+  "body_result",
+  "runtime_exception",
+  "owner_stop",
+  "process_restart",
+  "unknown",
+] as const;
+export type CompanionOutcomeEvidenceSource =
+  (typeof companionOutcomeEvidenceSources)[number];
+
+export const companionOutcomeReasonCodes = [
+  "operation_mismatch",
+  "recovery_required",
+  "body_result_unavailable",
+  "owner_stop_before_verification",
+  "process_restart_before_verification",
+  "unknown_registry_item",
+  "item_not_in_inventory",
+  "no_recipe_for_current_inventory_and_surface",
+  "no_path",
+  "path_timeout",
+  "goto_rejected",
+  "collected",
+  "entity_removed",
+  "target_unobservable",
+  "invalid_target",
+  "path_failed",
+  "pickup_out_of_range",
+  "deadline_expired",
+  "failed",
+  "interrupted",
+  "unverified",
+  "cancelled",
+  "unknown",
+] as const;
+export type CompanionOutcomeReasonCode =
+  (typeof companionOutcomeReasonCodes)[number];
+
+/** Compact private evidence; arbitrary observation fields are intentionally excluded. */
+export interface CompanionBodyObservationEvidence {
+  readonly source: "minecraft" | "unknown";
+  readonly observedAt: string | null;
+  readonly dimension: string | null;
+  readonly position: {
+    readonly x: number;
+    readonly y: number;
+    readonly z: number;
+  } | null;
+  readonly yaw: number | null;
+  readonly pitch: number | null;
+  readonly health: number | null;
+  readonly food: number | null;
+  readonly oxygen: number | null;
+  readonly inWater: boolean | null;
+  readonly inLava: boolean | null;
+  readonly onFire: boolean | null;
+  readonly suffocating: boolean | null;
+  readonly sleeping: boolean | null;
+}
+
+export interface CompanionOutcomeBodyEvidence {
+  readonly source: CompanionOutcomeEvidenceSource;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  readonly sameLife: boolean | null;
+  readonly recoveryRequired: boolean | null;
+  readonly reasonCode: CompanionOutcomeReasonCode | null;
+  readonly before: CompanionBodyObservationEvidence;
+  readonly after: CompanionBodyObservationEvidence;
 }
 
 export const companionOutcomeStatuses = [
@@ -80,6 +153,10 @@ export interface CompanionOutcome {
   readonly summary: string;
   readonly expectedOutcome?: string | undefined;
   readonly observedAt: string;
+  /** Missing on older records; readback converts it to explicit unknown. */
+  readonly purpose?: string | null | undefined;
+  /** Missing on older records; readback converts it to explicit unknown. */
+  readonly bodyEvidence?: CompanionOutcomeBodyEvidence | undefined;
 }
 
 export type CompanionOutcomeInput = Omit<CompanionOutcome, "observedAt"> & {
@@ -134,8 +211,47 @@ export interface CompanionSnapshot {
   readonly activeOperation: CompanionActiveOperation | null;
   readonly lastOutcome: CompanionOutcome | null;
   readonly replyLifecycle: readonly CompanionReplyLifecycle[];
+  readonly outcomeRetention?: CompanionOutcomeRetention | undefined;
   readonly relationshipSummary: string;
   readonly interests: readonly string[];
+}
+
+export interface CompanionOutcomeRetention {
+  /** Earlier history predates the current guaranteed-retention policy. */
+  readonly coverageFrom: string;
+  readonly evictedCount: number;
+  readonly evictedThrough: string | null;
+}
+
+export interface CompanionOutcomeHistoryRequest {
+  readonly from: string;
+  readonly to: string;
+  readonly limit: number;
+}
+
+export interface CompanionOutcomeHistoryEntry extends CompanionOutcome {
+  readonly purpose: string | null;
+  readonly bodyEvidence: CompanionOutcomeBodyEvidence;
+  readonly recordedAt: string;
+}
+
+export interface CompanionOutcomeHistory {
+  readonly from: string;
+  readonly to: string;
+  readonly limit: number;
+  readonly records: readonly CompanionOutcomeHistoryEntry[];
+  readonly matchedCount: number;
+  readonly retained: {
+    readonly coverageFrom: string;
+    readonly oldestAt: string | null;
+    readonly newestAt: string | null;
+    readonly count: number;
+    readonly evictedCount: number;
+    readonly evictedThrough: string | null;
+  };
+  readonly unavailableBefore: boolean;
+  readonly truncatedByLimit: boolean;
+  readonly complete: boolean;
 }
 
 export interface CompanionStatePatch {
@@ -183,5 +299,6 @@ export interface CompanionMessage {
 export interface CompanionStoreOptions {
   readonly ownerUsername?: string | undefined;
   readonly now?: (() => string) | undefined;
+  /** Entry cap applied independently to message and outcome journal rows. */
   readonly maxJournalEntries?: number | undefined;
 }

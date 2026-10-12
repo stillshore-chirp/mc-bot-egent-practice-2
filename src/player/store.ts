@@ -7,11 +7,14 @@ import {
   companionMemoryKinds,
   companionMemorySources,
   companionMemoryStatuses,
+  companionOutcomeEvidenceSources,
+  companionOutcomeReasonCodes,
   companionOutcomeStatuses,
   companionPlanStepLimit,
   companionReplyLifecycleReasonCodes,
   companionReplyLifecycleStates,
   type CompanionActiveOperation,
+  type CompanionBodyObservationEvidence,
   type CompanionGoal,
   type CompanionMemory,
   type CompanionMemoryKind,
@@ -19,7 +22,13 @@ import {
   type CompanionMemoryStatus,
   type CompanionMessage,
   type CompanionOutcome,
+  type CompanionOutcomeBodyEvidence,
+  type CompanionOutcomeEvidenceSource,
+  type CompanionOutcomeHistory,
+  type CompanionOutcomeHistoryEntry,
+  type CompanionOutcomeHistoryRequest,
   type CompanionOutcomeInput,
+  type CompanionOutcomeReasonCode,
   type CompanionOutcomeStatus,
   type CompanionPlan,
   type CompanionReplyLifecycle,
@@ -37,6 +46,7 @@ import { playerOperationSchema } from "../minecraft/player-body-schema.js";
 const STORE_SCHEMA_VERSION = 1;
 const DEFAULT_JOURNAL_LIMIT = 256;
 const MAX_JOURNAL_LIMIT = 2_000;
+const MAX_OUTCOME_READ_LIMIT = 200;
 const MAX_RECALL_LIMIT = 20;
 const MAX_RECALL_TERMS = 32;
 const MAX_RECALL_CANDIDATES = 256;
@@ -195,8 +205,62 @@ const activeOperationSchema = z
     operationId: z.string().trim().min(1).max(120),
     operation: playerOperationSchema,
     expectedOutcome: z.string().trim().min(1).max(400),
+    bodyStartedAt: z.iso.datetime().optional(),
   })
   .strict();
+
+const outcomeObservationEvidenceSchema = z
+  .object({
+    source: z.enum(["minecraft", "unknown"]),
+    observedAt: z.iso.datetime().nullable(),
+    dimension: z.string().trim().min(1).max(128).nullable(),
+    position: z
+      .object({
+        x: z.number(),
+        y: z.number(),
+        z: z.number(),
+      })
+      .strict()
+      .nullable(),
+    yaw: z.number().nullable(),
+    pitch: z.number().nullable(),
+    health: z.number().nullable(),
+    food: z.number().nullable(),
+    oxygen: z.number().nullable(),
+    inWater: z.boolean().nullable(),
+    inLava: z.boolean().nullable(),
+    onFire: z.boolean().nullable(),
+    suffocating: z.boolean().nullable(),
+    sleeping: z.boolean().nullable(),
+  })
+  .strict();
+
+const outcomeBodyEvidenceSchema = z
+  .object({
+    source: z.enum(companionOutcomeEvidenceSources),
+    startedAt: z.iso.datetime().nullable(),
+    completedAt: z.iso.datetime().nullable(),
+    sameLife: z.boolean().nullable(),
+    recoveryRequired: z.boolean().nullable(),
+    reasonCode: z.enum(companionOutcomeReasonCodes).nullable(),
+    before: outcomeObservationEvidenceSchema,
+    after: outcomeObservationEvidenceSchema,
+  })
+  .strict();
+
+const outcomeRetentionSchema = z
+  .object({
+    coverageFrom: z.iso.datetime(),
+    evictedCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    evictedThrough: z.iso.datetime().nullable(),
+  })
+  .strict();
+
+const utcHistoryTimestampSchema = z.iso
+  .datetime()
+  .refine((value) =>
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value),
+  );
 
 const outcomeSchema = z
   .object({
@@ -206,8 +270,19 @@ const outcomeSchema = z
     summary: z.string().trim().min(1).max(MAX_TEXT_LENGTH),
     expectedOutcome: z.string().trim().min(1).max(400).optional(),
     observedAt: z.iso.datetime(),
+    purpose: z.string().trim().min(1).max(400).nullable().optional(),
+    bodyEvidence: outcomeBodyEvidenceSchema.optional(),
   })
   .strict();
+
+const outcomeHistoryRequestSchema = z
+  .object({
+    from: utcHistoryTimestampSchema,
+    to: utcHistoryTimestampSchema,
+    limit: z.number().int().min(1).max(MAX_OUTCOME_READ_LIMIT),
+  })
+  .strict()
+  .refine(({ from, to }) => Date.parse(from) < Date.parse(to));
 
 const replyLifecycleEventSchema = z
   .object({
@@ -240,6 +315,7 @@ const snapshotSchema = z
     waitUntil: z.iso.datetime().nullable(),
     activeOperation: activeOperationSchema.nullable(),
     lastOutcome: outcomeSchema.nullable(),
+    outcomeRetention: outcomeRetentionSchema.optional(),
     replyLifecycle: z
       .array(replyLifecycleSchema)
       .max(MAX_REPLY_LIFECYCLE_RECORDS)
@@ -427,7 +503,14 @@ export class CompanionStore {
             summary:
               "Owner stop requested before the operation result was verified.",
             expectedOutcome: current.activeOperation.expectedOutcome,
-            observedAt: this.#now(),
+            observedAt: stoppedAt,
+            purpose: current.plan?.purpose ?? null,
+            bodyEvidence: unknownOutcomeBodyEvidence(
+              "owner_stop",
+              current.activeOperation.bodyStartedAt ?? null,
+              stoppedAt,
+              "owner_stop_before_verification",
+            ),
           };
           this.insertJournalOutcome(
             interrupted,
@@ -1003,6 +1086,70 @@ export class CompanionStore {
     }));
   }
 
+  /** Reads a bounded period of retained Body outcomes without changing state. */
+  public readOutcomeHistory(
+    request: CompanionOutcomeHistoryRequest,
+  ): CompanionOutcomeHistory {
+    const parsedRequest = outcomeHistoryRequestSchema.safeParse(request);
+    if (!parsedRequest.success)
+      throw invalidInput("Invalid operation outcome history request.");
+    const { from, to, limit } = parsedRequest.data;
+    const matches = this.#database
+      .prepare<[string, string], { readonly count: number }>(
+        "SELECT COUNT(*) AS count FROM companion_journal WHERE kind = 'outcome' AND recorded_at >= ? AND recorded_at < ?",
+      )
+      .get(from, to);
+    const matchedCount = matches?.count ?? 0;
+    const rows = this.#database
+      .prepare<[string, string, number], JournalRow>(
+        "SELECT journal_id, kind, role, operation_id, content, payload_json, recorded_at FROM companion_journal WHERE kind = 'outcome' AND recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at, journal_id LIMIT ?",
+      )
+      .all(from, to, limit + 1);
+    const retainedRow = this.#database
+      .prepare<
+        [],
+        {
+          readonly count: number;
+          readonly oldest_at: string | null;
+          readonly newest_at: string | null;
+        }
+      >(
+        "SELECT COUNT(*) AS count, MIN(recorded_at) AS oldest_at, MAX(recorded_at) AS newest_at FROM companion_journal WHERE kind = 'outcome'",
+      )
+      .get();
+    const snapshot = this.readSnapshot();
+    const retention = snapshot.outcomeRetention ?? {
+      coverageFrom: this.#now(),
+      evictedCount: 0,
+      evictedThrough: null,
+    };
+    const truncatedByLimit = matchedCount > limit || rows.length > limit;
+    const unavailableBefore =
+      from < retention.coverageFrom ||
+      (retention.evictedThrough !== null && from <= retention.evictedThrough);
+    const records = rows
+      .slice(0, limit)
+      .map((row) => outcomeHistoryEntryFromRow(row));
+    return {
+      from,
+      to,
+      limit,
+      records,
+      matchedCount,
+      retained: {
+        coverageFrom: retention.coverageFrom,
+        oldestAt: retainedRow?.oldest_at ?? null,
+        newestAt: retainedRow?.newest_at ?? null,
+        count: retainedRow?.count ?? 0,
+        evictedCount: retention.evictedCount,
+        evictedThrough: retention.evictedThrough,
+      },
+      unavailableBefore,
+      truncatedByLimit,
+      complete: !unavailableBefore && !truncatedByLimit,
+    };
+  }
+
   /**
    * Stores a Body result and settles only the matching active plan step. A
    * stale or mismatched result is retained as history but cannot advance or
@@ -1253,13 +1400,52 @@ export class CompanionStore {
   }
 
   private trimJournal(): void {
-    this.#database
-      .prepare(
-        `DELETE FROM companion_journal WHERE journal_id NOT IN (
-          SELECT journal_id FROM companion_journal ORDER BY journal_id DESC LIMIT ?
-        )`,
+    const evictedOutcomes = this.#database
+      .prepare<
+        [number],
+        { readonly count: number; readonly newest_at: string | null }
+      >(
+        `SELECT COUNT(*) AS count, MAX(recorded_at) AS newest_at
+         FROM companion_journal
+         WHERE kind = 'outcome' AND journal_id NOT IN (
+           SELECT journal_id FROM companion_journal
+           WHERE kind = 'outcome' ORDER BY journal_id DESC LIMIT ?
+         )`,
       )
-      .run(this.#journalLimit);
+      .get(this.#journalLimit);
+    if (evictedOutcomes !== undefined && evictedOutcomes.count > 0) {
+      const current = this.readSnapshot();
+      const existing = current.outcomeRetention ?? {
+        coverageFrom: this.#now(),
+        evictedCount: 0,
+        evictedThrough: null,
+      };
+      this.writeSnapshot(
+        {
+          ...current,
+          outcomeRetention: {
+            ...existing,
+            evictedCount: Math.min(
+              Number.MAX_SAFE_INTEGER,
+              existing.evictedCount + evictedOutcomes.count,
+            ),
+            evictedThrough: laterTimestamp(
+              existing.evictedThrough,
+              evictedOutcomes.newest_at,
+            ),
+          },
+        },
+        this.#now(),
+      );
+    }
+    const trimKind = this.#database.prepare<[string, string, number]>(
+      `DELETE FROM companion_journal WHERE kind = ? AND journal_id NOT IN (
+        SELECT journal_id FROM companion_journal
+        WHERE kind = ? ORDER BY journal_id DESC LIMIT ?
+      )`,
+    );
+    trimKind.run("message", "message", this.#journalLimit);
+    trimKind.run("outcome", "outcome", this.#journalLimit);
   }
 
   private migrateAndImportLegacyState(): void {
@@ -1275,25 +1461,46 @@ export class CompanionStore {
             "SELECT version FROM companion_store_migrations WHERE version = ?",
           )
           .get(STORE_SCHEMA_VERSION);
-        if (applied !== undefined) return;
-
-        const ownerPlayerId = this.resolveLegacyOwnerId();
-        const legacyState = this.readLegacyRuntimeState();
-        const initial =
-          legacyState === null
-            ? this.readLegacyMemorySnapshot(ownerPlayerId)
-            : this.migrateLegacyRuntimeState(legacyState, ownerPlayerId);
-        this.writeSnapshot(sanitizeLegacySnapshot(initial), this.#now());
-        if (legacyState !== null) this.importLegacyRuntimeHistory(legacyState);
-        this.importLegacyMemories(ownerPlayerId);
-        this.#database
-          .prepare(
-            "INSERT INTO companion_store_migrations(version, applied_at) VALUES(?, ?)",
-          )
-          .run(STORE_SCHEMA_VERSION, this.#now());
+        if (applied === undefined) {
+          const ownerPlayerId = this.resolveLegacyOwnerId();
+          const legacyState = this.readLegacyRuntimeState();
+          const initial =
+            legacyState === null
+              ? this.readLegacyMemorySnapshot(ownerPlayerId)
+              : this.migrateLegacyRuntimeState(legacyState, ownerPlayerId);
+          this.writeSnapshot(sanitizeLegacySnapshot(initial), this.#now());
+          if (legacyState !== null)
+            this.importLegacyRuntimeHistory(legacyState);
+          this.importLegacyMemories(ownerPlayerId);
+          this.#database
+            .prepare(
+              "INSERT INTO companion_store_migrations(version, applied_at) VALUES(?, ?)",
+            )
+            .run(STORE_SCHEMA_VERSION, this.#now());
+        }
+        this.ensureOutcomeRetention();
         this.trimJournal();
       })
       .immediate();
+  }
+
+  private ensureOutcomeRetention(): void {
+    const current = this.readSnapshot();
+    if (current.outcomeRetention !== undefined) return;
+    const at = this.#now();
+    this.writeSnapshot(
+      {
+        ...current,
+        outcomeRetention: {
+          // History predating this policy remains readable but is not claimed
+          // complete because earlier combined journal eviction was untracked.
+          coverageFrom: at,
+          evictedCount: 0,
+          evictedThrough: null,
+        },
+      },
+      at,
+    );
   }
 
   /**
@@ -1306,13 +1513,21 @@ export class CompanionStore {
         const current = this.readSnapshot();
         const active = current.activeOperation;
         if (active === null) return;
+        const recoveredAt = this.#now();
         const outcome: CompanionOutcome = {
           operationId: active.operationId,
           operation: active.operation,
           status: "unverified",
           summary:
             "The process restarted before the operation result was verified; it was not replayed.",
-          observedAt: this.#now(),
+          purpose: current.plan?.purpose ?? null,
+          bodyEvidence: unknownOutcomeBodyEvidence(
+            "process_restart",
+            active.bodyStartedAt ?? null,
+            recoveredAt,
+            "process_restart_before_verification",
+          ),
+          observedAt: recoveredAt,
         };
         const eventKey = `restart-recovery:${createHash("sha256")
           .update(`${current.stopGeneration}:${active.operationId}`)
@@ -1335,7 +1550,7 @@ export class CompanionStore {
             activeOperation: null,
             lastOutcome: outcome,
           },
-          this.#now(),
+          recoveredAt,
         );
         this.trimJournal();
       })
@@ -2355,7 +2570,86 @@ function outcomeToJson(outcome: CompanionOutcome): JsonObject {
       ? {}
       : { expectedOutcome: outcome.expectedOutcome }),
     observedAt: outcome.observedAt,
+    ...(outcome.purpose === undefined ? {} : { purpose: outcome.purpose }),
+    ...(outcome.bodyEvidence === undefined
+      ? {}
+      : { bodyEvidence: recordToJson({ ...outcome.bodyEvidence }) }),
   };
+}
+
+function unknownObservationEvidence(): CompanionBodyObservationEvidence {
+  return {
+    source: "unknown",
+    observedAt: null,
+    dimension: null,
+    position: null,
+    yaw: null,
+    pitch: null,
+    health: null,
+    food: null,
+    oxygen: null,
+    inWater: null,
+    inLava: null,
+    onFire: null,
+    suffocating: null,
+    sleeping: null,
+  };
+}
+
+function unknownOutcomeBodyEvidence(
+  source: CompanionOutcomeEvidenceSource,
+  startedAt: string | null,
+  completedAt: string | null,
+  reasonCode: CompanionOutcomeReasonCode | null,
+): CompanionOutcomeBodyEvidence {
+  return {
+    source,
+    startedAt,
+    completedAt,
+    sameLife: null,
+    recoveryRequired: null,
+    reasonCode,
+    before: unknownObservationEvidence(),
+    after: unknownObservationEvidence(),
+  };
+}
+
+function outcomeHistoryEntryFromRow(
+  row: JournalRow,
+): CompanionOutcomeHistoryEntry {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json) as unknown;
+  } catch {
+    throw new CompanionStoreError(
+      "INVALID_STATE",
+      "Stored operation history is corrupt.",
+    );
+  }
+  const parsed = outcomeSchema.safeParse(payload);
+  if (!parsed.success) {
+    throw new CompanionStoreError(
+      "INVALID_STATE",
+      "Stored operation history is invalid.",
+    );
+  }
+  return {
+    ...parsed.data,
+    purpose: parsed.data.purpose ?? null,
+    bodyEvidence:
+      parsed.data.bodyEvidence ??
+      unknownOutcomeBodyEvidence("unknown", null, null, "unknown"),
+    recordedAt: row.recorded_at,
+  };
+}
+
+function laterTimestamp(
+  current: string | null,
+  candidate: string | null,
+): string | null {
+  if (candidate === null) return current;
+  if (current === null || candidate > current) return candidate;
+  return current;
 }
 
 function tableExists(database: Database.Database, name: string): boolean {

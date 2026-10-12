@@ -258,6 +258,72 @@ describe("CompanionStore", () => {
     store.close();
   });
 
+  it("retains message and outcome rows independently and reports history gaps", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, {
+      now: fixedNow,
+      maxJournalEntries: 2,
+    });
+    for (const message of ["first", "second", "third"])
+      store.recordMessage("owner", message);
+    for (const hour of [1, 2, 3]) {
+      store.recordOutcome(
+        outcome({
+          operationId: `history-${hour}`,
+          observedAt: `2026-10-10T0${hour}:00:00.000Z`,
+        }),
+      );
+    }
+
+    const history = store.readOutcomeHistory({
+      from: "2026-10-10T00:00:00.000Z",
+      to: "2026-10-11T00:00:00.000Z",
+      limit: 10,
+    });
+    expect(store.recentMessages(100)).toHaveLength(2);
+    expect(history.records.map(({ operationId }) => operationId)).toEqual([
+      "history-2",
+      "history-3",
+    ]);
+    expect(history.records[0]).toMatchObject({
+      purpose: null,
+      bodyEvidence: {
+        source: "unknown",
+        reasonCode: "unknown",
+        before: { source: "unknown", position: null, health: null },
+        after: { source: "unknown", position: null, health: null },
+      },
+    });
+    expect(history).toMatchObject({
+      matchedCount: 2,
+      truncatedByLimit: false,
+      unavailableBefore: true,
+      complete: false,
+      retained: {
+        count: 2,
+        evictedCount: 1,
+        evictedThrough: "2026-10-10T01:00:00.000Z",
+        oldestAt: "2026-10-10T02:00:00.000Z",
+        newestAt: "2026-10-10T03:00:00.000Z",
+      },
+    });
+    expect(
+      store.readOutcomeHistory({
+        from: "2026-10-10T00:00:00.000Z",
+        to: "2026-10-11T00:00:00.000Z",
+        limit: 1,
+      }).truncatedByLimit,
+    ).toBe(true);
+    expect(() =>
+      store.readOutcomeHistory({
+        from: "2026-10-10T00:00:00Z",
+        to: "2026-10-11T00:00:00.000Z",
+        limit: 1,
+      }),
+    ).toThrow(expect.objectContaining({ code: "INVALID_INPUT" }));
+    store.close();
+  });
+
   it("advances only the successful matching plan head and clears a failed plan", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });
