@@ -45,6 +45,7 @@ const persona: PersonaCore = {
 const snapshot: CompanionSnapshot = {
   stopped: false, stopGeneration: 0, goal: null, plan: null, waitUntil: null,
   activeOperation: null, lastOutcome: null, relationshipSummary: "Synthetic acceptance scenario.",
+  replyLifecycle: [],
   interests: ["小さな花壇を眺めること"],
 };
 

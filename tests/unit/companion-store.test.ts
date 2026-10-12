@@ -104,6 +104,160 @@ describe("CompanionStore", () => {
     store.close();
   });
 
+  it("recovers interrupted replies as evidence without replay and keeps durable stop", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    const sendingSequence = store.recordMessage(
+      "owner",
+      "synthetic first request",
+    );
+    store.recordReplyLifecycleEvent(sendingSequence, "received");
+    store.recordReplyLifecycleEvent(sendingSequence, "generation_started");
+    store.recordReplyLifecycleEvent(sendingSequence, "generated");
+    store.recordReplyLifecycleEvent(sendingSequence, "send_started");
+
+    const generatingSequence = store.recordMessage(
+      "owner",
+      "synthetic second request",
+    );
+    store.recordReplyLifecycleEvent(generatingSequence, "received");
+    store.recordReplyLifecycleEvent(generatingSequence, "generation_started");
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    expect(
+      store.replyLifecycleFor(sendingSequence)?.events.at(-1),
+    ).toMatchObject({
+      state: "send_unknown",
+      reasonCode: "process_restart_during_send",
+    });
+    expect(
+      store.replyLifecycleFor(generatingSequence)?.events.at(-1),
+    ).toMatchObject({
+      state: "interrupted",
+      reasonCode: "process_restart_with_generation_unresolved",
+    });
+    expect(store.messageBySequence(sendingSequence)?.text).toBe(
+      "synthetic first request",
+    );
+
+    const stoppedSequence = store.recordMessage(
+      "owner",
+      "synthetic stop target",
+    );
+    store.recordReplyLifecycleEvent(stoppedSequence, "received");
+    store.stop();
+    expect(store.replyLifecycleFor(stoppedSequence)?.events.at(-1)?.state).toBe(
+      "durable_stop",
+    );
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    expect(store.snapshot().stopped).toBe(true);
+    expect(store.replyLifecycleFor(stoppedSequence)?.events.at(-1)?.state).toBe(
+      "durable_stop",
+    );
+    expect(store.replyLifecycleFor(sendingSequence)?.events.at(-1)?.state).toBe(
+      "send_unknown",
+    );
+    store.close();
+  });
+
+  it("keeps question order when an evicted older send completes late", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, { now: fixedNow });
+    const olderSequence = store.recordMessage("owner", "synthetic request 1");
+    store.recordReplyLifecycleEvent(olderSequence, "received");
+    store.recordReplyLifecycleEvent(olderSequence, "generation_started");
+    store.recordReplyLifecycleEvent(olderSequence, "generated");
+    store.recordReplyLifecycleEvent(olderSequence, "send_started");
+
+    for (let index = 2; index <= 13; index += 1) {
+      const sequence = store.recordMessage(
+        "owner",
+        `synthetic request ${index}`,
+      );
+      store.recordReplyLifecycleEvent(sequence, "received");
+    }
+
+    const newestSequence = store.recordMessage("owner", "synthetic request 14");
+    store.recordReplyLifecycleEvent(newestSequence, "received");
+    store.recordReplyLifecycleEvent(newestSequence, "generation_started");
+    store.recordReplyLifecycleEvent(newestSequence, "generated");
+    store.recordReplyLifecycleEvent(
+      newestSequence,
+      "send_unknown",
+      "say_call_rejected",
+    );
+
+    store.recordReplyLifecycleEvent(olderSequence, "send_call_resolved");
+
+    expect(
+      store
+        .snapshot()
+        .replyLifecycle.map(({ ownerMessageSequence }) => ownerMessageSequence),
+    ).toEqual(Array.from({ length: 12 }, (_, index) => index + 3));
+    expect(store.latestReplyLifecycle()?.ownerMessageSequence).toBe(
+      newestSequence,
+    );
+    expect(store.latestReplyLifecycle()?.events.at(-1)).toMatchObject({
+      state: "send_unknown",
+      reasonCode: "say_call_rejected",
+    });
+    store.close();
+  });
+
+  it("retains a generated event when recovery marks a generation as interrupted", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    const sequence = store.recordMessage(
+      "owner",
+      "synthetic generated request",
+    );
+    store.recordReplyLifecycleEvent(sequence, "received");
+    store.recordReplyLifecycleEvent(sequence, "generation_started");
+    store.recordReplyLifecycleEvent(sequence, "generated");
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    expect(store.replyLifecycleFor(sequence)?.events).toMatchObject([
+      { state: "received" },
+      { state: "generation_started" },
+      { state: "generated" },
+      {
+        state: "interrupted",
+        reasonCode: "process_restart_with_generation_unresolved",
+      },
+    ]);
+    store.close();
+  });
+
+  it("reads a pre-lifecycle runtime snapshot with an empty evidence list", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    store.close();
+
+    const database = new Database(path);
+    const row = database
+      .prepare<[], { readonly payload_json: string }>(
+        "SELECT payload_json FROM companion_runtime_state WHERE singleton_id = 1",
+      )
+      .get();
+    if (row === undefined) throw new Error("Runtime state row missing.");
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    delete payload.replyLifecycle;
+    database
+      .prepare(
+        "UPDATE companion_runtime_state SET payload_json = ? WHERE singleton_id = 1",
+      )
+      .run(JSON.stringify(payload));
+    database.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    expect(store.snapshot().replyLifecycle).toEqual([]);
+    store.close();
+  });
+
   it("advances only the successful matching plan head and clears a failed plan", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });

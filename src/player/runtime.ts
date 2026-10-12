@@ -20,6 +20,10 @@ import type {
 import { playerOperationSchema } from "../minecraft/player-body-schema.js";
 import type {
   CompanionOutcomeInput,
+  CompanionMessage,
+  CompanionReplyLifecycle,
+  CompanionReplyLifecycleReasonCode,
+  CompanionReplyLifecycleState,
   CompanionSnapshot,
   CompanionStatePatch,
 } from "./contracts.js";
@@ -81,6 +85,7 @@ interface PendingWake {
   readonly mode?:
     "follow_owner" | "damage_reflex" | "equipment_upkeep" | undefined;
   readonly ownerMessage?: string | undefined;
+  readonly ownerMessageSequence?: number | undefined;
 }
 
 interface ActiveBodyRun {
@@ -94,6 +99,7 @@ interface ActiveBodyRun {
 interface InterleavedOwnerReplyRun {
   readonly generation: number;
   readonly controller: AbortController;
+  readonly ownerMessageSequence: number;
 }
 
 interface EquipmentStepResult {
@@ -215,6 +221,8 @@ export class CompanionRuntime {
   #activeDecision: AbortController | undefined;
   #activeBody: ActiveBodyRun | undefined;
   #pendingOwnerRequest: string | undefined;
+  #pendingOwnerRequestSequence: number | undefined;
+  #activeOwnerReplySequence: number | undefined;
   #ownerReplyGeneration = 0;
   #activeInterleavedOwnerReply: InterleavedOwnerReplyRun | undefined;
   #pendingWake: PendingWake | undefined;
@@ -317,6 +325,17 @@ export class CompanionRuntime {
     if (!this.#activate()) return;
     if (this.#isStopped()) return;
     this.#armMaintenanceTimer();
+    const recoveredReply = this.#recoverableReplyAfterRestart();
+    if (recoveredReply !== null) {
+      this.#pendingOwnerRequest = recoveredReply.message.text;
+      this.#pendingOwnerRequestSequence = recoveredReply.message.sequence;
+      this.#fireWake({
+        reason: "resume an owner request without a completed send",
+        ownerMessage: recoveredReply.message.text,
+        ownerMessageSequence: recoveredReply.message.sequence,
+      });
+      return;
+    }
     this.#fireWake({ reason: "startup; re-observe before continuing" });
   }
 
@@ -351,9 +370,9 @@ export class CompanionRuntime {
     if (!this.#started) this.#activate();
     if (!this.#isStopped()) this.#armMaintenanceTimer();
     if (this.#isStopped()) {
-      this.#store.recordMessage("owner", message);
+      const ownerMessageSequence = this.#store.recordMessage("owner", message);
       if (isExplicitResumeCommand(message)) {
-        await this.resume(username, message);
+        await this.resume(username, message, ownerMessageSequence);
       }
       return;
     }
@@ -392,14 +411,28 @@ export class CompanionRuntime {
       return;
     }
 
-    this.#store.recordMessage("owner", message);
+    const ownerMessageSequence = this.#store.recordMessage("owner", message);
+    if (isReplyStatusQuestion(message)) {
+      const target = this.#latestMeaningfulReplyStatusTarget();
+      await this.#speakReplyStatus(
+        replyStatusAnswer(
+          target?.lifecycle ?? null,
+          target?.originalMessage ?? null,
+        ),
+        this.#generation,
+      );
+      return;
+    }
+    if (!this.#tryRecordReplyLifecycleEvent(ownerMessageSequence, "received"))
+      return;
     if (this.#hasActiveOwnerTurnContext()) {
-      await this.#replyDuringGoalTurn(message);
+      await this.#replyDuringGoalTurn(message, ownerMessageSequence);
       return;
     }
     await this.#requestWake({
       reason: "owner message",
       ownerMessage: message,
+      ownerMessageSequence,
     });
   }
 
@@ -418,6 +451,8 @@ export class CompanionRuntime {
     this.#runtimeStopLatched = true;
     this.#cancelInterleavedOwnerReply("Owner stopped companion");
     this.#pendingOwnerRequest = undefined;
+    this.#pendingOwnerRequestSequence = undefined;
+    this.#activeOwnerReplySequence = undefined;
     this.#activeOwnerReplyGeneration = undefined;
     this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
@@ -462,6 +497,7 @@ export class CompanionRuntime {
   public async resume(
     actorUsername: string,
     ownerMessage?: string,
+    ownerMessageSequence?: number,
   ): Promise<boolean> {
     if (!sameMinecraftIdentity(actorUsername, this.#ownerUsername))
       return false;
@@ -474,19 +510,48 @@ export class CompanionRuntime {
     this.#stopPersistenceFailed = false;
     this.#equipmentSweepCooldown = undefined;
     this.#armMaintenanceTimer();
+    if (
+      ownerMessageSequence !== undefined &&
+      !this.#tryRecordReplyLifecycleEvent(ownerMessageSequence, "received")
+    )
+      return true;
     await this.#requestWake({
       reason: "owner explicitly resumed autonomy",
       ...(ownerMessage === undefined
         ? {}
         : { ownerMessage: ownerMessage.slice(0, messageLimit) }),
+      ...(ownerMessageSequence === undefined ? {} : { ownerMessageSequence }),
     });
     return true;
+  }
+
+  #latestMeaningfulReplyStatusTarget(): {
+    readonly lifecycle: CompanionReplyLifecycle;
+    readonly originalMessage: CompanionMessage | null;
+  } | null {
+    const records = [...this.#store.snapshot().replyLifecycle].sort(
+      (left, right) => right.ownerMessageSequence - left.ownerMessageSequence,
+    );
+    for (const lifecycle of records) {
+      const originalMessage = this.#store.messageBySequence(
+        lifecycle.ownerMessageSequence,
+      );
+      if (
+        originalMessage !== null &&
+        (isImmediateStopCommand(originalMessage.text) ||
+          isExplicitResumeCommand(originalMessage.text) ||
+          isReplyStatusQuestion(originalMessage.text))
+      )
+        continue;
+      return { lifecycle, originalMessage };
+    }
+    return null;
   }
 
   #hasActiveOwnerTurnContext(): boolean {
     const snapshot = this.#store.snapshot();
     return (
-      this.#pendingOwnerRequest !== undefined ||
+      this.#runnablePendingOwnerRequest() !== undefined ||
       this.#activeInterleavedOwnerReply !== undefined ||
       this.#activeDecision !== undefined ||
       this.#activeBody !== undefined ||
@@ -495,11 +560,94 @@ export class CompanionRuntime {
     );
   }
 
-  async #replyDuringGoalTurn(ownerMessage: string): Promise<void> {
-    this.#cancelInterleavedOwnerReply("A newer owner message superseded reply");
+  #runnablePendingOwnerRequest(): string | undefined {
+    if (this.#pendingOwnerRequest === undefined) return undefined;
+    if (this.#pendingOwnerRequestSequence === undefined)
+      return this.#pendingOwnerRequest;
+    const latest = this.#store
+      .replyLifecycleFor(this.#pendingOwnerRequestSequence)
+      ?.events.at(-1)?.state;
+    return latest === "received" ||
+      latest === "generation_started" ||
+      latest === "generated"
+      ? this.#pendingOwnerRequest
+      : undefined;
+  }
+
+  #recoverableReplyAfterRestart(): {
+    readonly message: CompanionMessage;
+  } | null {
+    const record = this.#store.latestReplyLifecycle();
+    const latest = record?.events.at(-1);
+    if (
+      record === null ||
+      (latest?.state !== "received" &&
+        !(
+          latest?.state === "interrupted" &&
+          latest.reasonCode === "process_restart_with_generation_unresolved"
+        ))
+    )
+      return null;
+    const message = this.#store.messageBySequence(record.ownerMessageSequence);
+    if (message?.role === "owner") return { message };
+    this.#tryRecordReplyLifecycleEvent(
+      record.ownerMessageSequence,
+      "interrupted",
+      "owner_message_unavailable",
+    );
+    return null;
+  }
+
+  #tryRecordReplyLifecycleEvent(
+    ownerMessageSequence: number,
+    state: CompanionReplyLifecycleState,
+    reasonCode?: CompanionReplyLifecycleReasonCode,
+  ): boolean {
+    try {
+      this.#store.recordReplyLifecycleEvent(
+        ownerMessageSequence,
+        state,
+        reasonCode,
+      );
+      return true;
+    } catch (error) {
+      this.#logError(error, "Reply lifecycle could not be persisted");
+      return false;
+    }
+  }
+
+  #recordReplyInterruption(
+    ownerMessageSequence: number,
+    reasonCode: CompanionReplyLifecycleReasonCode,
+  ): void {
+    const latest = this.#store
+      .replyLifecycleFor(ownerMessageSequence)
+      ?.events.at(-1)?.state;
+    if (
+      latest === "send_unknown" ||
+      latest === "send_call_resolved" ||
+      latest === "durable_stop"
+    )
+      return;
+    this.#tryRecordReplyLifecycleEvent(
+      ownerMessageSequence,
+      latest === "send_started" ? "send_unknown" : "interrupted",
+      reasonCode,
+    );
+  }
+
+  async #replyDuringGoalTurn(
+    ownerMessage: string,
+    ownerMessageSequence: number,
+  ): Promise<void> {
+    this.#cancelInterleavedOwnerReply(
+      "A newer owner message superseded reply",
+      "newer_owner_input",
+    );
     const run: InterleavedOwnerReplyRun = {
       generation: ++this.#ownerReplyGeneration,
       controller: new AbortController(),
+      ownerMessageSequence,
     };
     this.#activeInterleavedOwnerReply = run;
     try {
@@ -517,21 +665,40 @@ export class CompanionRuntime {
         observation,
         "owner asked a separate question during an active goal turn",
         ownerMessage,
-        undefined,
-        { pendingOwnerRequest: this.#pendingOwnerRequest ?? null },
+        this.#runnablePendingOwnerRequest(),
+        {
+          pendingOwnerRequest: this.#runnablePendingOwnerRequest() ?? null,
+        },
+        ownerMessageSequence,
       );
+      if (
+        !this.#tryRecordReplyLifecycleEvent(
+          ownerMessageSequence,
+          "generation_started",
+        )
+      )
+        return;
       const decision = await this.#agent.decide(input, run.controller.signal);
       if (this.#isStopped() || !this.#isCurrentInterleavedOwnerReply(run))
+        return;
+      if (
+        !this.#tryRecordReplyLifecycleEvent(ownerMessageSequence, "generated")
+      )
         return;
       if (decision.ownerMessageDisposition === "update_goal") {
         await this.#requestWake({
           reason: "owner explicitly changed the active goal",
           ownerMessage,
+          ownerMessageSequence,
         });
         return;
       }
       if (decision.ownerMessageDisposition !== "answer_only") {
-        await this.#speakInterleavedOwnerReply(ownerReplyFailed, run);
+        await this.#speakInterleavedOwnerReply(
+          ownerReplyFailed,
+          run,
+          ownerMessageSequence,
+        );
         return;
       }
       const reply = decision.speech?.trim();
@@ -540,6 +707,7 @@ export class CompanionRuntime {
           ? ownerReplyUnavailable
           : reply,
         run,
+        ownerMessageSequence,
       );
     } catch (error) {
       if (
@@ -548,7 +716,16 @@ export class CompanionRuntime {
         !this.#isStopped()
       ) {
         this.#logError(error, "Interleaved owner reply failed");
-        await this.#speakInterleavedOwnerReply(ownerReplyFailed, run);
+        this.#tryRecordReplyLifecycleEvent(
+          ownerMessageSequence,
+          "generation_failed",
+          "judgment_failed",
+        );
+        await this.#speakInterleavedOwnerReply(
+          ownerReplyFailed,
+          run,
+          ownerMessageSequence,
+        );
       }
     } finally {
       if (this.#activeInterleavedOwnerReply === run)
@@ -563,6 +740,7 @@ export class CompanionRuntime {
     ownerMessage?: string,
     pendingOwnerRequest?: string,
     ownerReplyContext?: CompanionDecisionInput["ownerReplyContext"],
+    ownerMessageSequence?: number,
   ): CompanionDecisionInput {
     const query =
       ownerMessage ??
@@ -601,6 +779,7 @@ export class CompanionRuntime {
       ...(ownerMessage === undefined ? {} : { ownerMessage }),
       ...(pendingOwnerRequest === undefined ? {} : { pendingOwnerRequest }),
       ...(ownerReplyContext === undefined ? {} : { ownerReplyContext }),
+      ...(ownerMessageSequence === undefined ? {} : { ownerMessageSequence }),
       ...(this.#cachedKnowledge === undefined
         ? {}
         : { knowledge: this.#cachedKnowledge }),
@@ -615,25 +794,29 @@ export class CompanionRuntime {
     );
   }
 
-  #cancelInterleavedOwnerReply(reason: string): void {
+  #cancelInterleavedOwnerReply(
+    reason: string,
+    lifecycleReasonCode?: CompanionReplyLifecycleReasonCode,
+  ): void {
     this.#ownerReplyGeneration += 1;
     const active = this.#activeInterleavedOwnerReply;
     this.#activeInterleavedOwnerReply = undefined;
+    if (active !== undefined && lifecycleReasonCode !== undefined)
+      this.#recordReplyInterruption(
+        active.ownerMessageSequence,
+        lifecycleReasonCode,
+      );
     active?.controller.abort(new Error(reason));
   }
 
   async #speakInterleavedOwnerReply(
     text: string,
     run: InterleavedOwnerReplyRun,
+    ownerMessageSequence: number,
   ): Promise<void> {
-    if (!this.#isCurrentInterleavedOwnerReply(run) || this.#isStopped()) return;
-    try {
-      await this.#say(text);
-      if (this.#isCurrentInterleavedOwnerReply(run) && !this.#isStopped())
-        this.#store.recordMessage("companion", text);
-    } catch (error) {
-      this.#logError(error, "Interleaved owner reply delivery failed");
-    }
+    await this.#speakOwnerReply(text, ownerMessageSequence, () =>
+      this.#isCurrentInterleavedOwnerReply(run),
+    );
   }
 
   /** Stop local work while preserving the durable owner stop state as-is. */
@@ -642,6 +825,8 @@ export class CompanionRuntime {
     this.#disposed = true;
     this.#cancelInterleavedOwnerReply("Companion runtime shutdown");
     this.#pendingOwnerRequest = undefined;
+    this.#pendingOwnerRequestSequence = undefined;
+    this.#activeOwnerReplySequence = undefined;
     this.#activeOwnerReplyGeneration = undefined;
     this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
@@ -670,11 +855,28 @@ export class CompanionRuntime {
     if (wake.mode !== undefined || wake.ownerMessage !== undefined)
       this.#cancelInterleavedOwnerReply(
         "A newer owner action superseded reply",
+        "newer_owner_input",
       );
-    if (wake.mode === "follow_owner" || wake.mode === "equipment_upkeep")
+    const ownerActionWake =
+      wake.ownerMessage !== undefined ||
+      wake.mode === "follow_owner" ||
+      wake.mode === "equipment_upkeep";
+    if (
+      ownerActionWake &&
+      this.#activeOwnerReplySequence !== undefined &&
+      this.#activeOwnerReplySequence !== wake.ownerMessageSequence
+    )
+      this.#recordReplyInterruption(
+        this.#activeOwnerReplySequence,
+        "newer_owner_input",
+      );
+    if (wake.mode === "follow_owner" || wake.mode === "equipment_upkeep") {
       this.#pendingOwnerRequest = undefined;
-    else if (wake.ownerMessage !== undefined)
+      this.#pendingOwnerRequestSequence = undefined;
+    } else if (wake.ownerMessage !== undefined) {
       this.#pendingOwnerRequest = wake.ownerMessage;
+      this.#pendingOwnerRequestSequence = wake.ownerMessageSequence;
+    }
     const maintenanceAction = this.#maintenanceActionFinished;
     const activeBody = this.#activeBody;
     const ownerWake =
@@ -1004,8 +1206,10 @@ export class CompanionRuntime {
   async #think(wake: PendingWake, generation: number): Promise<void> {
     const controller = new AbortController();
     this.#activeDecision = controller;
-    if (wake.ownerMessage !== undefined)
+    if (wake.ownerMessage !== undefined) {
       this.#activeOwnerReplyGeneration = generation;
+      this.#activeOwnerReplySequence = wake.ownerMessageSequence;
+    }
     const ownerReplyInterruptedByDamage =
       wake.mode === "damage_reflex" && this.#ownerReplyInterruptedByDamage;
     const ownerReplyGeneration = this.#ownerReplyGeneration;
@@ -1146,15 +1350,28 @@ export class CompanionRuntime {
         const pendingOwnerRequest =
           this.#pendingOwnerRequest === wake.ownerMessage
             ? undefined
-            : this.#pendingOwnerRequest;
+            : this.#runnablePendingOwnerRequest();
         const input = this.#createDecisionInput(
           snapshot,
           observation,
           wake.reason,
           wake.ownerMessage,
           pendingOwnerRequest,
+          undefined,
+          wake.ownerMessageSequence ??
+            (pendingOwnerRequest === undefined
+              ? undefined
+              : this.#pendingOwnerRequestSequence),
         );
 
+        if (
+          wake.ownerMessageSequence !== undefined &&
+          !this.#tryRecordReplyLifecycleEvent(
+            wake.ownerMessageSequence,
+            "generation_started",
+          )
+        )
+          return;
         decision = await this.#agent.decide(input, controller.signal);
         if (!this.#isCurrent(generation)) return;
         if (decision.knowledgeQuery !== null) {
@@ -1187,6 +1404,15 @@ export class CompanionRuntime {
           }
         }
       }
+
+      if (
+        wake.ownerMessageSequence !== undefined &&
+        !this.#tryRecordReplyLifecycleEvent(
+          wake.ownerMessageSequence,
+          "generated",
+        )
+      )
+        return;
 
       let refreshAfterDecision = false;
       if (
@@ -1256,13 +1482,6 @@ export class CompanionRuntime {
           : { relationshipSummary: decision.relationshipSummary }),
       };
       this.#store.save(patch);
-      if (
-        wake.mode !== "damage_reflex" &&
-        this.#pendingOwnerRequest !== undefined &&
-        (wake.ownerMessage === undefined ||
-          wake.ownerMessage === this.#pendingOwnerRequest)
-      )
-        this.#pendingOwnerRequest = undefined;
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
 
       // The model request is complete; later world events are handled after
@@ -1271,7 +1490,11 @@ export class CompanionRuntime {
       if (wake.ownerMessage !== undefined) {
         if (refreshAfterDecision) {
           this.#finishOwnerReply(generation);
-          await this.#speakDecision(ownerPlanUnconfirmed, generation);
+          await this.#speakDecision(
+            ownerPlanUnconfirmed,
+            generation,
+            wake.ownerMessageSequence,
+          );
         } else if (decision.plan === null) {
           this.#finishOwnerReply(generation);
           const reply = decision.speech?.trim();
@@ -1280,9 +1503,14 @@ export class CompanionRuntime {
               ? ownerReplyUnavailable
               : reply,
             generation,
+            wake.ownerMessageSequence,
           );
         } else {
-          await this.#speakDecision(ownerPlanAccepted, generation);
+          await this.#speakDecision(
+            ownerPlanAccepted,
+            generation,
+            wake.ownerMessageSequence,
+          );
         }
       }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
@@ -1326,6 +1554,8 @@ export class CompanionRuntime {
                   ? ownerPlanConfirmed
                   : reply,
                 generation,
+                wake.ownerMessageSequence,
+                true,
               );
             },
         wake.mode === "damage_reflex",
@@ -1333,17 +1563,32 @@ export class CompanionRuntime {
           ? undefined
           : async () => {
               this.#finishOwnerReply(generation);
-              await this.#speakDecision(ownerPlanUnconfirmed, generation);
+              await this.#speakDecision(
+                ownerPlanUnconfirmed,
+                generation,
+                wake.ownerMessageSequence,
+                true,
+              );
             },
       );
     } catch (error) {
       if (!controller.signal.aborted && this.#isCurrent(generation)) {
         this.#logError(error, "Companion judgment failed");
+        if (wake.ownerMessageSequence !== undefined)
+          this.#tryRecordReplyLifecycleEvent(
+            wake.ownerMessageSequence,
+            "generation_failed",
+            "judgment_failed",
+          );
         if (ownerReplyInterruptedByDamage)
           void this.#speakDecision(ownerDamageObservationFailed, generation);
         if (wake.ownerMessage !== undefined) this.#finishOwnerReply(generation);
         if (wake.ownerMessage !== undefined)
-          await this.#speakDecision(ownerReplyFailed, generation);
+          await this.#speakDecision(
+            ownerReplyFailed,
+            generation,
+            wake.ownerMessageSequence,
+          );
         this.#scheduleRetry({ reason: "Companion judgment failed" });
       }
     } finally {
@@ -1354,6 +1599,8 @@ export class CompanionRuntime {
       }
       if (this.#activeDecision === controller) this.#activeDecision = undefined;
       this.#finishOwnerReply(generation);
+      if (this.#activeOwnerReplySequence === wake.ownerMessageSequence)
+        this.#activeOwnerReplySequence = undefined;
     }
   }
 
@@ -2776,8 +3023,14 @@ export class CompanionRuntime {
       )
         return;
       this.#damagedCollectionCandidate = undefined;
-      if (this.#activeOwnerReplyGeneration === this.#generation)
+      if (this.#activeOwnerReplyGeneration === this.#generation) {
         this.#ownerReplyInterruptedByDamage = true;
+        if (this.#activeOwnerReplySequence !== undefined)
+          this.#recordReplyInterruption(
+            this.#activeOwnerReplySequence,
+            "damage_response",
+          );
+      }
       try {
         const snapshot = this.#store.snapshot();
         const activeBody = this.#activeBody;
@@ -2913,8 +3166,14 @@ export class CompanionRuntime {
         planPurpose: snapshot.plan?.purpose ?? null,
       };
       this.#damagedCollectionCandidate = undefined;
-      if (this.#activeOwnerReplyGeneration === generation)
+      if (this.#activeOwnerReplyGeneration === generation) {
         this.#ownerReplyInterruptedByDamage = true;
+        if (this.#activeOwnerReplySequence !== undefined)
+          this.#recordReplyInterruption(
+            this.#activeOwnerReplySequence,
+            "damage_response",
+          );
+      }
       this.#damageReflexPending = true;
       this.#fireWake({
         reason:
@@ -3126,7 +3385,21 @@ export class CompanionRuntime {
     return this.#runtimeStopLatched || this.#store.snapshot().stopped;
   }
 
-  async #speakDecision(text: string, generation: number): Promise<void> {
+  async #speakDecision(
+    text: string,
+    generation: number,
+    ownerMessageSequence?: number,
+    allowAfterResolved = false,
+  ): Promise<void> {
+    if (ownerMessageSequence !== undefined) {
+      await this.#speakOwnerReply(
+        text,
+        ownerMessageSequence,
+        () => this.#isCurrent(generation),
+        allowAfterResolved,
+      );
+      return;
+    }
     if (!this.#isCurrent(generation) || this.#isStopped()) return;
     try {
       await this.#say(text);
@@ -3134,6 +3407,67 @@ export class CompanionRuntime {
         this.#store.recordMessage("companion", text);
     } catch (error) {
       this.#logError(error, "Companion speech delivery failed");
+    }
+  }
+
+  async #speakOwnerReply(
+    text: string,
+    ownerMessageSequence: number,
+    isCurrent: () => boolean,
+    allowAfterResolved = false,
+  ): Promise<void> {
+    if (!isCurrent() || this.#isStopped()) return;
+    const latest = this.#store
+      .replyLifecycleFor(ownerMessageSequence)
+      ?.events.at(-1)?.state;
+    if (
+      latest === "send_started" ||
+      latest === "send_unknown" ||
+      latest === "durable_stop" ||
+      (latest === "send_call_resolved" && !allowAfterResolved)
+    )
+      return;
+    if (
+      !this.#tryRecordReplyLifecycleEvent(ownerMessageSequence, "send_started")
+    )
+      return;
+    try {
+      await this.#say(text);
+    } catch (error) {
+      this.#logError(error, "Companion speech delivery failed");
+      if (!this.#isStopped())
+        this.#tryRecordReplyLifecycleEvent(
+          ownerMessageSequence,
+          "send_unknown",
+          "say_call_rejected",
+        );
+      return;
+    }
+    // say resolving confirms only that the call returned. It does not prove
+    // that the owner saw the message in the Minecraft client.
+    if (this.#isStopped()) return;
+    if (
+      !this.#tryRecordReplyLifecycleEvent(
+        ownerMessageSequence,
+        "send_call_resolved",
+      )
+    )
+      return;
+    try {
+      this.#store.recordMessage("companion", text);
+    } catch (error) {
+      this.#logError(error, "Companion reply could not be journaled");
+    }
+  }
+
+  async #speakReplyStatus(text: string, generation: number): Promise<void> {
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
+    try {
+      await this.#say(text);
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        this.#store.recordMessage("companion", text);
+    } catch (error) {
+      this.#logError(error, "Reply status speech delivery failed");
     }
   }
 
@@ -3892,6 +4226,73 @@ function nextOperationTargetIsAvailable(
       return observation.self.sleeping;
     default:
       return true;
+  }
+}
+
+function isReplyStatusQuestion(message: string): boolean {
+  const hasReplyTopic = /返事|返答|返信|回答|メッセージ|返して/u.test(message);
+  const asksAboutAbsence =
+    /(?:来な|こな|届かな|届いていな|返ってこな|返ってきていな|途切れ|未返信|なかった|返事がない|返答がない|返信がない|回答がない|もらえない|くれない)/u.test(
+      message,
+    );
+  const asksAboutDelay = /遅(?:い|かった|れて|れた|れています|れました)/u.test(
+    message,
+  );
+  const asksForReason =
+    /[?？]|なぜ|どうして|なんで|理由|原因|教えて|説明して|分かる|わかる/u.test(
+      message,
+    );
+  return hasReplyTopic && (asksAboutAbsence || asksAboutDelay) && asksForReason;
+}
+
+function replyStatusAnswer(
+  lifecycle: CompanionReplyLifecycle | null,
+  originalMessage: CompanionMessage | null,
+): string {
+  if (lifecycle === null)
+    return "返答の記録が見つからず、元の質問の扱いも確認できないよ。理由はまだ分からないよ。返答が必要ならもう一度依頼してね。";
+  const questionStatus =
+    originalMessage?.role === "owner"
+      ? "元の質問は履歴に残っているよ。"
+      : "元の質問本文は履歴から見つからず、内容は確認できないよ。";
+  const latest = lifecycle.events.at(-1);
+  if (latest === undefined)
+    return `${questionStatus} 返答処理の記録がなく、理由はまだ分からないよ。`;
+
+  switch (latest.state) {
+    case "received":
+      return `${questionStatus} 受け取った記録だけがあり、生成開始と送信は確認できないよ。返答が必要ならもう一度依頼してね。`;
+    case "generation_started":
+      return `${questionStatus} 生成開始の記録はあるけれど、結果と送信は確認できないよ。返答が必要ならもう一度依頼してね。`;
+    case "generated":
+      return `${questionStatus} 返答生成の完了は記録されているよ。送信開始は確認できず、自動送信はしないよ。返答が必要ならもう一度依頼してね。`;
+    case "generation_failed":
+      return `${questionStatus} 返答生成の失敗が記録されているよ。詳しい例外は保存しておらず、送信も確認できないよ。自動再生成はせず、返答が必要ならもう一度依頼してね。`;
+    case "interrupted":
+      switch (latest.reasonCode) {
+        case "damage_response":
+          return `${questionStatus} ダメージ対応を優先して元の返答を中断した記録があるよ。送信は確認できず、自動再開もしないよ。返答が必要ならもう一度依頼してね。`;
+        case "newer_owner_input":
+          return `${questionStatus} あなたの新しい呼びかけで元の返答を中断した記録があるよ。送信は確認できず、古い返答を自動再開しないよ。必要ならもう一度依頼してね。`;
+        case "process_restart_with_generation_unresolved":
+          if (lifecycle.events.at(-2)?.state === "generated")
+            return `${questionStatus} 再起動前に返答生成の完了を記録しているよ。送信開始とゲーム内表示は未確認で、再起動の原因も分からないよ。再起動後の状態を確認して、元の質問を考え直すよ。`;
+          return `${questionStatus} 生成完了を記録した証跡は残っていないよ。再起動前に完了していたかは未確認で、送信開始とゲーム内表示も確認できないよ。再起動の原因は分からないよ。再起動後の状態を確認して、元の質問を考え直すよ。`;
+        default:
+          return `${questionStatus} 返答処理を中断した記録があるよ。理由の詳細と送信は確認できず、自動再開もしないよ。必要ならもう一度依頼してね。`;
+      }
+    case "send_started":
+      return `${questionStatus} 送信呼び出しを始めた記録はあるけれど、結果とゲーム内表示は不明だよ。自動再送はしないので、返答が必要ならもう一度依頼してね。`;
+    case "send_unknown":
+      if (latest.reasonCode === "say_call_rejected")
+        return `${questionStatus} say呼び出しの失敗が記録されているよ。ゲーム内表示は確認できず、自動再送もしないよ。返答が必要ならもう一度依頼してね。`;
+      if (latest.reasonCode === "process_restart_during_send")
+        return `${questionStatus} 再起動時に送信結果が不明だった記録があるよ。ゲーム内表示は確認できず、自動再送もしないよ。返答が必要ならもう一度依頼してね。`;
+      return `${questionStatus} 送信結果が不明だよ。ゲーム内表示は確認できず、自動再送もしないよ。返答が必要ならもう一度依頼してね。`;
+    case "send_call_resolved":
+      return `${questionStatus} say呼び出しが戻った記録はあるよ。ただし、ゲーム内画面に表示されたことは確認できないよ。重複を避けて自動再送しないので、見えていなければもう一度依頼してね。`;
+    case "durable_stop":
+      return `${questionStatus} 永続停止で元の返答処理を止めた記録があるよ。明示再開でも停止前の質問は自動再生しないので、必要なら再開後にもう一度依頼してね。`;
   }
 }
 
