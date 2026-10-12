@@ -19,7 +19,10 @@ import type {
 } from "../minecraft/player-body.js";
 import { playerOperationSchema } from "../minecraft/player-body-schema.js";
 import type {
+  CompanionBodyObservationEvidence,
+  CompanionOutcomeEvidenceSource,
   CompanionOutcomeInput,
+  CompanionOutcomeReasonCode,
   CompanionMessage,
   CompanionReplyLifecycle,
   CompanionReplyLifecycleReasonCode,
@@ -27,6 +30,7 @@ import type {
   CompanionSnapshot,
   CompanionStatePatch,
 } from "./contracts.js";
+import { companionOutcomeReasonCodes } from "./contracts.js";
 import type {
   CompanionDecision,
   CompanionDecisionInput,
@@ -71,6 +75,9 @@ const equipmentChestMoveRange = 2.5;
 const equipmentChestSearchLimit = 4;
 const equipmentChestSuppressionLimit = 64;
 const equipmentUpkeepStepLimit = 5;
+const outcomeReasonCodeSet: ReadonlySet<string> = new Set(
+  companionOutcomeReasonCodes,
+);
 const damageReflexAttackRange = 3.2;
 const waterRiskObservationCooldownMs = 1_000;
 const waterRecoveryDryMinimumIntervalMs = 2_000;
@@ -216,6 +223,7 @@ export class CompanionRuntime {
   #disposed = false;
   #runtimeStopLatched = false;
   #stopPersistenceFailed = false;
+  #outcomePersistenceBlocked = false;
   #unsubscribeBody: (() => void) | undefined;
   #generation = 0;
   #activeDecision: AbortController | undefined;
@@ -364,6 +372,13 @@ export class CompanionRuntime {
       return;
     }
 
+    if (this.#outcomePersistenceBlocked) {
+      await this.#speakControlMessage(
+        "操作結果の記録状態を確認できないため、自律行動を保留中だよ。停止してからBotを再起動してね。",
+      );
+      return;
+    }
+
     const message = rawMessage.trim().slice(0, messageLimit);
     if (message.length === 0) return;
 
@@ -483,6 +498,7 @@ export class CompanionRuntime {
     } else {
       this.#stopPersistenceFailed = false;
     }
+    if (!this.#stopPersistenceFailed) this.#outcomePersistenceBlocked = false;
     try {
       await this.#body.stopActiveOperation?.();
     } catch {
@@ -1096,6 +1112,7 @@ export class CompanionRuntime {
 
   async #checkMaintenance(): Promise<void> {
     if (
+      this.#outcomePersistenceBlocked ||
       this.#maintenanceObservationInFlight ||
       !this.#started ||
       this.#disposed ||
@@ -1204,6 +1221,7 @@ export class CompanionRuntime {
   }
 
   async #think(wake: PendingWake, generation: number): Promise<void> {
+    if (this.#outcomePersistenceBlocked) return;
     const controller = new AbortController();
     this.#activeDecision = controller;
     if (wake.ownerMessage !== undefined) {
@@ -2612,8 +2630,9 @@ export class CompanionRuntime {
     operationInput: PlayerOperation,
     expectedOutcome: string,
     generation: number,
+    purpose = "Perform one deterministic food or equipment upkeep step from fresh Body observations.",
   ): Promise<EquipmentStepResult> {
-    if (!this.#isCurrent(generation) || this.#isStopped())
+    if (!this.#isBodyDispatchAllowed(generation))
       return { observation: null, confirmed: false };
     const operation = playerOperationSchema.parse(operationInput);
     if (operation.kind === "follow_owner")
@@ -2621,11 +2640,7 @@ export class CompanionRuntime {
     const snapshot = this.#store.snapshot();
     if (snapshot.activeOperation !== null)
       return { observation: null, confirmed: false };
-    const plan = {
-      purpose:
-        "Perform one deterministic food or equipment upkeep step from fresh Body observations.",
-      steps: [{ operation, expectedOutcome }],
-    };
+    const plan = { purpose, steps: [{ operation, expectedOutcome }] };
     try {
       this.#store.save({ plan });
     } catch (error) {
@@ -2695,68 +2710,49 @@ export class CompanionRuntime {
       if (closed.confirmed && closed.observation?.window === null)
         return closed;
     }
-    return this.#forceCloseEquipmentWindow();
+    return this.#forceCloseEquipmentWindow(generation);
   }
 
-  async #forceCloseEquipmentWindow(): Promise<EquipmentStepResult> {
+  async #forceCloseEquipmentWindow(
+    generation: number,
+  ): Promise<EquipmentStepResult> {
+    if (!this.#isBodyDispatchAllowed(generation))
+      return { observation: null, confirmed: false };
+
     let observation: PlayerBodyObservation;
     try {
       observation = await this.#body.observe({
         ownerPositionException: true,
       });
     } catch (error) {
-      this.#logError(error, "Equipment cleanup observation failed");
+      if (this.#isBodyDispatchAllowed(generation))
+        this.#logError(error, "Equipment cleanup observation failed");
       return { observation: null, confirmed: false };
     }
+    if (!this.#isBodyDispatchAllowed(generation))
+      return { observation: null, confirmed: false };
     if (observation.window === null) return { observation, confirmed: true };
-
-    const operation = playerOperationSchema.parse({ kind: "window_close" });
-    const controller = new AbortController();
-    const operationId = randomUUID();
-    const run: ActiveBodyRun = {
-      operationId,
-      operation,
-      startedAt: new Date().toISOString(),
-      controller,
-      promise: Promise.resolve().then(() =>
-        this.#body.execute(operation, controller.signal),
-      ),
-    };
-    this.#activeBody = run;
-    let result: PlayerOperationResult | null = null;
-    try {
-      result = await run.promise;
-    } catch {
-      // The fresh observation below decides whether cleanup completed.
-    } finally {
-      if (this.#activeBody === run) this.#activeBody = undefined;
-    }
-    try {
-      const fresh = await this.#body.observe({ ownerPositionException: true });
-      return {
-        observation: fresh,
-        confirmed:
-          result !== null &&
-          sameOperation(result.operation, operation) &&
-          result.status === "successful" &&
-          result.after?.window === null &&
-          fresh.window === null,
-      };
-    } catch (error) {
-      this.#logError(error, "Equipment cleanup result could not be observed");
-      return { observation: null, confirmed: false };
-    }
+    return this.#executeUpkeepAction(
+      { kind: "window_close" },
+      "Close the equipment window after inspection and verify it is gone.",
+      generation,
+      "Close the equipment window after inspection and record the cleanup Body result.",
+    );
   }
 
   async #followOwner(generation: number): Promise<void> {
+    if (this.#outcomePersistenceBlocked) return;
     const operation = playerOperationSchema.parse({ kind: "follow_owner" });
     const operationId = randomUUID();
     const expectedOutcome =
       "The configured owner remains nearby until following is interrupted.";
+    const purpose = "明示された指示に従ってオーナーの近くまで移動する。";
+    const startedAt = new Date().toISOString();
     const activeOperation = {
       operationId,
       operation,
       expectedOutcome,
+      bodyStartedAt: startedAt,
     } as const;
 
     try {
@@ -2767,7 +2763,7 @@ export class CompanionRuntime {
           source: "owner",
         },
         plan: {
-          purpose: "明示された指示に従ってオーナーの近くまで移動する。",
+          purpose,
           steps: [{ operation, expectedOutcome }],
         },
         waitUntil: null,
@@ -2788,17 +2784,19 @@ export class CompanionRuntime {
     const run: ActiveBodyRun = {
       operationId,
       operation,
-      startedAt: new Date().toISOString(),
+      startedAt,
       controller,
       promise,
     };
     this.#activeBody = run;
 
     let result: PlayerOperationResult;
+    let evidenceSource: CompanionOutcomeEvidenceSource = "body_result";
     try {
       result = await promise;
     } catch {
       result = failedBodyResult(operation, operationId);
+      evidenceSource = "runtime_exception";
     } finally {
       if (this.#activeBody === run) this.#activeBody = undefined;
     }
@@ -2806,9 +2804,17 @@ export class CompanionRuntime {
     let updated: CompanionSnapshot;
     try {
       updated = this.#store.recordOutcome(
-        outcomeFromResult(result, operation, operationId, expectedOutcome),
+        outcomeFromResult(
+          result,
+          operation,
+          operationId,
+          expectedOutcome,
+          purpose,
+          evidenceSource,
+        ),
       );
     } catch (error) {
+      this.#outcomePersistenceBlocked = true;
       if (this.#isCurrent(generation)) this.#ownerFollowRequested = false;
       this.#logError(error, "Body outcome could not be persisted");
       return;
@@ -2833,6 +2839,7 @@ export class CompanionRuntime {
     damageReflex = false,
     onPlanNotConfirmed?: () => void | Promise<void>,
   ): Promise<void> {
+    if (this.#outcomePersistenceBlocked) return;
     const plannedSteps = decision.plan?.steps ?? [];
     const reportPlanNotConfirmed = async (): Promise<void> => {
       if (this.#isCurrent(generation) && !this.#isStopped())
@@ -2863,27 +2870,31 @@ export class CompanionRuntime {
         );
         return;
       }
+      const startedAt = new Date().toISOString();
       const operationId = randomUUID();
       const activeOperation = {
         operationId,
         operation,
         expectedOutcome: step.expectedOutcome,
+        bodyStartedAt: startedAt,
       } as const;
       this.#store.save({ activeOperation });
       const controller = new AbortController();
       const run: ActiveBodyRun = {
         operationId,
         operation,
-        startedAt: new Date().toISOString(),
+        startedAt,
         controller,
         promise: this.#body.execute(operation, controller.signal),
       };
       this.#activeBody = run;
       let result: PlayerOperationResult;
+      let evidenceSource: CompanionOutcomeEvidenceSource = "body_result";
       try {
         result = await run.promise;
       } catch {
         result = failedBodyResult(operation, operationId);
+        evidenceSource = "runtime_exception";
       } finally {
         if (this.#activeBody === run) this.#activeBody = undefined;
       }
@@ -2892,6 +2903,8 @@ export class CompanionRuntime {
         step.operation,
         operationId,
         step.expectedOutcome,
+        snapshot.plan?.purpose ?? decision.plan?.purpose ?? null,
+        evidenceSource,
       );
       const waterTrigger = this.#waterRecoveryTrigger;
       const interruptedCollection =
@@ -2921,9 +2934,11 @@ export class CompanionRuntime {
       try {
         updated = this.#store.recordOutcome(outcome);
       } catch (error) {
+        // recordOutcome may report failure after its transaction committed.
+        // Do not retry the current plan until stop/restart resolves that state.
+        this.#outcomePersistenceBlocked = true;
         this.#logError(error, "Body outcome could not be persisted");
         await reportPlanNotConfirmed();
-        this.#scheduleRetry({ reason: "Body outcome persistence failed" });
         return;
       }
       if (waterRecoveryControl && this.#waterRecoveryTrigger === waterTrigger)
@@ -3372,6 +3387,14 @@ export class CompanionRuntime {
     return !this.#disposed && generation === this.#generation;
   }
 
+  #isBodyDispatchAllowed(generation: number): boolean {
+    return (
+      !this.#outcomePersistenceBlocked &&
+      this.#isCurrent(generation) &&
+      !this.#isStopped()
+    );
+  }
+
   #finishOwnerReply(generation: number): void {
     if (this.#activeOwnerReplyGeneration === generation)
       this.#activeOwnerReplyGeneration = undefined;
@@ -3704,8 +3727,22 @@ function outcomeFromResult(
   plannedOperation: PlayerOperation,
   operationId: string,
   expectedOutcome: string,
+  purpose: string | null,
+  evidenceSource: CompanionOutcomeEvidenceSource,
 ): CompanionOutcomeInput {
   const operationMatches = sameOperation(result.operation, plannedOperation);
+  const candidateReason =
+    result.failureReason?.code ??
+    result.itemCollectionPathFailureReason ??
+    result.itemCollectionOutcome ??
+    result.status;
+  const reasonCode: CompanionOutcomeReasonCode | null = !operationMatches
+    ? "operation_mismatch"
+    : result.recoveryRequired
+      ? "recovery_required"
+      : outcomeReasonCodeSet.has(candidateReason)
+        ? (candidateReason as CompanionOutcomeReasonCode)
+        : null;
   return {
     // Body has an internal UUID; the runtime marker is the durable correlation ID.
     operationId,
@@ -3719,6 +3756,74 @@ function outcomeFromResult(
           : "Body returned a result for a different operation.",
     expectedOutcome,
     observedAt: result.completedAt,
+    purpose,
+    bodyEvidence: {
+      source: evidenceSource,
+      startedAt: result.startedAt,
+      completedAt: result.completedAt,
+      sameLife: result.sameLife ?? null,
+      recoveryRequired: result.recoveryRequired,
+      reasonCode,
+      before: bodyObservationEvidence(result.before),
+      after: bodyObservationEvidence(result.after),
+    },
+  };
+}
+
+function bodyObservationEvidence(
+  observation: PlayerBodyObservation | null,
+): CompanionBodyObservationEvidence {
+  if (observation === null) return unknownBodyObservationEvidence();
+  const boundedNumber = (value: number): number | null =>
+    Number.isFinite(value) ? value : null;
+  const x = boundedNumber(observation.self.position.x);
+  const y = boundedNumber(observation.self.position.y);
+  const z = boundedNumber(observation.self.position.z);
+  const dimension = observation.dimension.trim();
+  return {
+    source: observation.source,
+    observedAt: observation.observedAt,
+    dimension:
+      dimension.length > 0 && dimension.length <= 128 ? dimension : null,
+    position: x === null || y === null || z === null ? null : { x, y, z },
+    yaw: boundedNumber(observation.self.yaw),
+    pitch: boundedNumber(observation.self.pitch),
+    health:
+      observation.self.health === null
+        ? null
+        : boundedNumber(observation.self.health),
+    food:
+      observation.self.food === null
+        ? null
+        : boundedNumber(observation.self.food),
+    oxygen:
+      observation.self.oxygen === null
+        ? null
+        : boundedNumber(observation.self.oxygen),
+    inWater: observation.self.inWater,
+    inLava: observation.self.inLava,
+    onFire: observation.self.onFire,
+    suffocating: observation.self.suffocating,
+    sleeping: observation.self.sleeping,
+  };
+}
+
+function unknownBodyObservationEvidence(): CompanionBodyObservationEvidence {
+  return {
+    source: "unknown",
+    observedAt: null,
+    dimension: null,
+    position: null,
+    yaw: null,
+    pitch: null,
+    health: null,
+    food: null,
+    oxygen: null,
+    inWater: null,
+    inLava: null,
+    onFire: null,
+    suffocating: null,
+    sleeping: null,
   };
 }
 

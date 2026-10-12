@@ -8,4 +8,105 @@
 
 Agentへ渡す記憶と会話は検索と件数で制限されます。ownerが明示した発言の証拠だけをowner発の記憶として扱い、モデルの推測を観測済み事実へ変換しません。journalは上限を持ち、生の会話を無制限に保管しません。
 
+## 操作結果の履歴
+
+`companion_journal` は `message` と `outcome` を別々に保持します。既定256件、設定上限は種類ごとに最大2,000件です。outcomeには目的、選択操作、Body開始・完了時刻と出所、前後の限定観測、状態・成否・失敗理由を記録し、未観測値はunknownとして扱います。前後観測は位置・dimension・yaw/pitch・health/food/oxygen・水中等の状態だけです。任意NBT、全inventory、owner会話やcredentialを複製しません。
+
+すでに開いている `CompanionStore` では `readOutcomeHistory({ from, to, limit })` を使い、ミリ秒付きUTC形式 `YYYY-MM-DDTHH:mm:ss.sssZ` の半開区間 `[from, to)` と1〜200件の上限を指定します。戻り値の `matchedCount` / `truncatedByLimit` は件数不足を、`retained` の `coverageFrom` / `evictedThrough` / `evictedCount` と `unavailableBefore` は保証範囲を示します。`truncatedByLimit=true` は照会上限で結果が切り詰められたこと、`unavailableBefore=true` は保持境界より前やevictionと重なるため過去期間を確認できないことを示し、どちらかがtrueなら `complete=false` です。後者は実際に欠落した証明ではありません。`complete=true` が示すのは保持されたoutcomeの範囲だけで、待機中・未記録の操作がなかった証明にはなりません。`recorded_at` は `outcome.observedAt` 由来で、通常のBody結果では `completedAt`、stop/restartではその判定時刻です。期間検索の基準であり、DBへの実書込時刻やBody開始時刻と同一視しません。古いoutcomeに `purpose` や `bodyEvidence` がなければ、その項目はunknownです。
+
+停止済みの既存DBを調査する場合は `CompanionStore.open()` を使いません。起動時の作業directoryからDBの絶対pathを確定し、SQLite URIの `mode=ro` と `PRAGMA query_only=ON` で、期間・上限を指定して読むだけにします。下の例は件数・保持境界を集計し、outcome本体はローカル変数に留めます。pathと時刻は確認済みの値に置き換えます。調査時は標準出力・標準エラーをprivateなローカルartifactへ捕捉し、会話や公開先へ出すのは集計項目だけにします。失敗時は例外本文を表示せず、固定メッセージだけを返します。
+
+```python
+import json
+import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+database_path = Path("/absolute/path/to/companion.sqlite")
+from_utc = "2026-10-10T00:00:00.000Z"
+to_utc = "2026-10-11T00:00:00.000Z"  # exclusive
+limit = 20
+timestamp_format = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\Z")
+
+
+def parse_utc_millis(value):
+    if not isinstance(value, str) or timestamp_format.fullmatch(value) is None:
+        raise ValueError
+    parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    if parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z") != value:
+        raise ValueError
+    return parsed
+
+
+connection = None
+try:
+    from_time = parse_utc_millis(from_utc)
+    to_time = parse_utc_millis(to_utc)
+    if (
+        not database_path.is_absolute()
+        or not 1 <= limit <= 200
+        or from_time >= to_time
+    ):
+        raise ValueError
+
+    uri = "file:" + quote(str(database_path.resolve()), safe="/") + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=1)
+    connection.execute("PRAGMA query_only = ON")
+    connection.execute("BEGIN")
+    state_row = connection.execute(
+        "SELECT payload_json FROM companion_runtime_state WHERE singleton_id = 1"
+    ).fetchone()
+    retention = (
+        None if state_row is None else json.loads(state_row[0]).get("outcomeRetention")
+    )
+    matched = connection.execute(
+        "SELECT COUNT(*) FROM companion_journal WHERE kind='outcome' AND recorded_at >= ? AND recorded_at < ?",
+        (from_utc, to_utc),
+    ).fetchone()[0]
+    rows = connection.execute(
+        "SELECT payload_json, recorded_at FROM companion_journal WHERE kind='outcome' AND recorded_at >= ? AND recorded_at < ? ORDER BY recorded_at, journal_id LIMIT ?",
+        (from_utc, to_utc, limit + 1),
+    ).fetchall()
+    retained = connection.execute(
+        "SELECT COUNT(*), MIN(recorded_at), MAX(recorded_at) FROM companion_journal WHERE kind='outcome'"
+    ).fetchone()
+    selected_outcomes = [json.loads(payload) for payload, _ in rows[:limit]]
+    truncated = matched > limit or len(rows) > limit
+    coverage = None if retention is None else retention.get("coverageFrom")
+    evicted_through = None if retention is None else retention.get("evictedThrough")
+    unavailable_before = (
+        coverage is None
+        or from_utc < coverage
+        or (evicted_through is not None and from_utc <= evicted_through)
+    )
+    complete = not unavailable_before and not truncated
+    summary = {
+        "matched": matched,
+        "shown": len(selected_outcomes),
+        "truncated": truncated,
+        "complete": complete,
+        "retained": retained,
+        "coverageFrom": coverage,
+        "evictedCount": None if retention is None else retention.get("evictedCount"),
+        "evictedThrough": evicted_through,
+        "unavailableBefore": unavailable_before,
+        "legacyUnknownShown": sum(
+            "purpose" not in entry or "bodyEvidence" not in entry
+            for entry in selected_outcomes
+        ),
+    }
+except Exception:
+    raise RuntimeError("Read-only history inspection failed.") from None
+finally:
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            raise RuntimeError("Read-only history inspection failed.") from None
+```
+
+この手順はread-only照会です。`selected_outcomes` には位置などのprivate観測が含まれ得るため、必要な行をprivate環境内で確認し、raw行・会話・座標をIssue、PR、ログへ貼りません。metadataがない、期間が保持境界より古い、evictionと重なる、または `truncated` の場合は履歴の不足または確認不能を明記します。`complete` は保持されたoutcomeの範囲に限られ、Botが待機していた時間や未記録操作の不存在は示しません。
+
 管理画面は現在の目標、記憶、履歴から安全な表示項目だけを読み出します。tokenやcredentialを記憶・画面へ出しません。運用手順は [operations](operations.md)、画面の認証は [dashboard](dashboard.md) を参照してください。

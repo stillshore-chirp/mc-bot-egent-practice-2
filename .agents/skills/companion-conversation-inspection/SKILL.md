@@ -31,9 +31,9 @@ description: "ユーザーやBotの発話を、Minecraftコンパニオンの保
 - 送信前のsanitizeは改行を空白へまとめ、空白を正規化し、slash command guardを加え、本文を最大2,000文字に切り詰めます。
   送信処理はprotocol/configに応じてpacketを分割します。journalにはsanitize前のruntime本文がstore上限内で記録されるため、表示文はjournal本文と異なることがあります。
   根拠は[application wiring](../../../src/app/application.ts)と[Mineflayer transport](../../../src/minecraft/mineflayer-client.ts)です。
-- journalはmessageとoperation outcomeを合わせた上限付きです。
-  既定256件、最大2,000件で、追加時に古い行から削除されます。
-  履歴が見つからないことは発話がなかった証拠になりません。
+- journalはmessageとoperation outcomeを種類ごとに保持します。
+  既定256件、最大2,000件ずつで、追加時は同じ種類の古い行だけが削除されます。
+  outcome履歴の欠落は保持境界・eviction・照会上限とlegacy unknownを確認し、発話や操作がなかった証拠にしません。
 
 実装根拠: [config](../../../src/config/schema.ts)、[journal](../../../src/player/store.ts)、
 [runtime](../../../src/player/runtime.ts)、[Mineflayer](../../../src/minecraft/mineflayer-client.ts)、[application](../../../src/app/application.ts)。

@@ -706,6 +706,79 @@ describe("CompanionRuntime", () => {
     expect(body.executed[0]).toEqual(move);
   });
 
+  it("blocks the next plan wake after outcome persistence reports a post-commit failure and keeps owner stop available", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([
+      makeDecision([look, jump]),
+      makeDecision([jump]),
+    ]);
+    const runtime = createRuntime(store, body, agent);
+    const recordOutcome = store.recordOutcome.bind(store);
+    let failAfterCommit = true;
+    store.recordOutcome = (input) => {
+      const committed = recordOutcome(input);
+      if (failAfterCommit) {
+        failAfterCommit = false;
+        throw new Error("Synthetic post-commit store response failure");
+      }
+      return committed;
+    };
+
+    await runtime.start();
+    await eventually(
+      () =>
+        body.executed.length === 1 &&
+        store.snapshot().activeOperation === null &&
+        store.snapshot().plan?.steps[0]?.operation.kind === "control" &&
+        !runtime.status().thinking,
+    );
+    const committedHistory = store.readOutcomeHistory({
+      from: "2000-01-01T00:00:00.000Z",
+      to: "2100-01-01T00:00:00.000Z",
+      limit: 10,
+    });
+    expect(committedHistory.records[0]).toMatchObject({
+      purpose: "Inspect the area and continue from observed results.",
+      bodyEvidence: {
+        source: "body_result",
+        reasonCode: null,
+        before: {
+          source: "minecraft",
+          position: { x: 0, y: 64, z: 0 },
+          health: 20,
+          food: 20,
+          oxygen: 20,
+        },
+        after: { source: "minecraft", position: { x: 0, y: 64, z: 0 } },
+      },
+    });
+    expect(JSON.stringify(committedHistory.records[0])).not.toContain(
+      '"username"',
+    );
+    expect(JSON.stringify(committedHistory.records[0])).not.toContain(
+      '"inventory"',
+    );
+
+    body.emit({ type: "reconnected", at: new Date().toISOString() });
+    await eventually(
+      () =>
+        runtime.status().wakeReason ===
+        "Body reconnected; observe before acting",
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed).toHaveLength(1);
+    expect(store.snapshot().plan?.steps[0]?.operation.kind).toBe("control");
+
+    expect(await runtime.stop("Builder")).toBe(true);
+    expect(store.snapshot()).toMatchObject({
+      stopped: true,
+      plan: null,
+      activeOperation: null,
+    });
+  });
+
   it("records bed locations only from the current visible Body block subset", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
@@ -2530,7 +2603,7 @@ describe("CompanionRuntime", () => {
     expect(agent.inputs).toHaveLength(2);
   });
 
-  it("closes a chest after an owner stop changes the generation without writing a new plan", async () => {
+  it("does not dispatch chest cleanup after an owner stop changes the generation", async () => {
     const { store } = freshStore();
     const block: BodyVisibleBlock = {
       name: "minecraft:chest",
@@ -2575,9 +2648,8 @@ describe("CompanionRuntime", () => {
 
     expect(body.executed.map((operation) => operation.kind)).toEqual([
       "open_window",
-      "window_close",
     ]);
-    expect(body.observation.window).toBeNull();
+    expect(body.observation.window).not.toBeNull();
     expect(store.snapshot().stopped).toBe(true);
     expect(store.snapshot().plan).toBeNull();
     expect(
@@ -2681,6 +2753,21 @@ describe("CompanionRuntime", () => {
       "window_close",
       "window_close",
     ]);
+    const history = store.readOutcomeHistory({
+      from: "2000-01-01T00:00:00.000Z",
+      to: "2100-01-01T00:00:00.000Z",
+      limit: 10,
+    });
+    const closeOutcomes = history.records.filter(
+      (record) => record.operation.kind === "window_close",
+    );
+    expect(closeOutcomes).toHaveLength(2);
+    expect(closeOutcomes[1]).toMatchObject({
+      purpose:
+        "Close the equipment window after inspection and record the cleanup Body result.",
+      status: "failed",
+      bodyEvidence: { source: "body_result" },
+    });
     expect(body.observation.window).not.toBeNull();
     expect(
       messages.some((message) => message.includes("成功とは言えない")),
@@ -2691,6 +2778,85 @@ describe("CompanionRuntime", () => {
     expect(
       messages.some((message) => message.startsWith("装備を更新したよ")),
     ).toBe(false);
+    expect(agent.inputs).toHaveLength(0);
+  });
+
+  it("does not retry fallback cleanup after a post-commit close outcome failure", async () => {
+    const { store } = freshStore();
+    const block: BodyVisibleBlock = {
+      name: "minecraft:chest",
+      stateId: 1,
+      position: { x: 1, y: 64, z: 0, dimension: "overworld" },
+      distance: 1,
+      properties: {},
+    };
+    const candidate = gearItem("diamond_helmet", 0);
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = makeObservation({ blocks: [block] });
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      let after = before;
+      let status: PlayerOperationResult["status"] = "successful";
+      switch (operation.kind) {
+        case "open_window":
+          after = { ...before, window: chestWindow(candidate) };
+          break;
+        case "window_transfer": {
+          const owned = gearItem(candidate.name, 9);
+          after = {
+            ...before,
+            self: { ...before.self, inventory: [owned] },
+            window: chestWindow(null, owned),
+          };
+          break;
+        }
+        case "window_close":
+          status = "failed";
+          break;
+        default:
+          throw new Error(`Unexpected operation: ${operation.kind}`);
+      }
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `post-commit-cleanup-${fakeBody.executed.length}`,
+        status,
+        after,
+        before,
+      );
+    };
+    const recordOutcome = store.recordOutcome.bind(store);
+    let failCloseAfterCommit = true;
+    store.recordOutcome = (input) => {
+      const committed = recordOutcome(input);
+      if (input.operation.kind === "window_close" && failCloseAfterCommit) {
+        failCloseAfterCommit = false;
+        throw new Error("Synthetic post-commit cleanup response failure");
+      }
+      return committed;
+    };
+
+    await runtime.receiveChat("Builder", "装備を自分で探して");
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "open_window",
+      "window_transfer",
+      "window_close",
+    ]);
+    expect(body.runtimeMarkerIds).toHaveLength(3);
+    expect(store.snapshot().activeOperation).toBeNull();
+    const history = store.readOutcomeHistory({
+      from: "2000-01-01T00:00:00.000Z",
+      to: "2100-01-01T00:00:00.000Z",
+      limit: 10,
+    });
+    expect(
+      history.records.filter(
+        (record) => record.operation.kind === "window_close",
+      ),
+    ).toHaveLength(1);
     expect(agent.inputs).toHaveLength(0);
   });
 
