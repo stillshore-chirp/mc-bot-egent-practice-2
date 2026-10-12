@@ -68,8 +68,13 @@ const equipmentChestSearchLimit = 4;
 const equipmentChestSuppressionLimit = 64;
 const equipmentUpkeepStepLimit = 5;
 const damageReflexAttackRange = 3.2;
+const waterRiskObservationCooldownMs = 1_000;
+const waterRecoveryDryMinimumIntervalMs = 2_000;
+const waterRecoveryDryMaximumAgeMs = 10_000;
 const damageReflexPlanPurpose =
   "React once to damage using fresh Body-visible information.";
+const waterRecoveryPlanPurpose =
+  "Rise toward the surface after damage with low oxygen.";
 
 interface PendingWake {
   readonly reason: string;
@@ -111,6 +116,28 @@ interface DamageReflexContext {
   readonly goalTitle: string | null;
   readonly goalSuccessCondition: string | null;
   readonly planPurpose: string | null;
+}
+
+interface WaterRecoveryTrigger {
+  readonly oxygen: number;
+  readonly interruptedOperationId?: string | undefined;
+}
+
+interface WaterRecoveryTargetBlock {
+  readonly entityId: number;
+  readonly dimension: string;
+}
+
+interface WaterRecoveryDryCandidate {
+  readonly observedAtMs: number;
+  readonly dimension: string;
+  readonly lifeEpoch: number;
+  readonly y: number;
+}
+
+interface DamagedCollectionCandidate {
+  readonly operationId: string;
+  readonly entityId: number;
 }
 
 type DamageReflexPlanStep = NonNullable<
@@ -205,6 +232,14 @@ export class CompanionRuntime {
   #ownerFollowRequested = false;
   #damageReflexPending = false;
   #waterRecoveryActive = false;
+  #waterRecoveryAttempted = false;
+  #waterRecoveryLifeEpoch = 0;
+  #waterRecoveryDryCandidate: WaterRecoveryDryCandidate | undefined;
+  #waterRiskObservationInFlight = false;
+  #lastWaterRiskObservedAt = 0;
+  #waterRecoveryTrigger: WaterRecoveryTrigger | undefined;
+  #waterRecoveryTargetBlock: WaterRecoveryTargetBlock | undefined;
+  #damagedCollectionCandidate: DamagedCollectionCandidate | undefined;
   #damageReflexContext: DamageReflexContext | undefined;
   #equipmentUpkeepQueued = false;
   #automaticPickupSuppressed = new Map<string, true>();
@@ -388,6 +423,11 @@ export class CompanionRuntime {
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
     this.#waterRecoveryActive = false;
+    this.#waterRecoveryAttempted = false;
+    this.#waterRecoveryDryCandidate = undefined;
+    this.#waterRecoveryTrigger = undefined;
+    this.#waterRecoveryTargetBlock = undefined;
+    this.#damagedCollectionCandidate = undefined;
     this.#damageReflexContext = undefined;
     this.#equipmentUpkeepQueued = false;
     this.#equipmentSweepCooldown = undefined;
@@ -606,6 +646,12 @@ export class CompanionRuntime {
     this.#ownerReplyInterruptedByDamage = false;
     this.#ownerFollowRequested = false;
     this.#damageReflexPending = false;
+    this.#waterRecoveryActive = false;
+    this.#waterRecoveryAttempted = false;
+    this.#waterRecoveryDryCandidate = undefined;
+    this.#waterRecoveryTrigger = undefined;
+    this.#waterRecoveryTargetBlock = undefined;
+    this.#damagedCollectionCandidate = undefined;
     this.#equipmentUpkeepQueued = false;
     this.#equipmentSweepCooldown = undefined;
     this.#generation += 1;
@@ -635,20 +681,37 @@ export class CompanionRuntime {
       wake.mode === "follow_owner" ||
       wake.mode === "equipment_upkeep" ||
       wake.ownerMessage !== undefined;
+    const collectionDamageInterrupt =
+      wake.mode === "damage_reflex" &&
+      activeBody?.operation.kind === "collect_item" &&
+      (this.#waterRecoveryTrigger?.interruptedOperationId ===
+        activeBody.operationId ||
+        this.#damagedCollectionCandidate?.operationId ===
+          activeBody.operationId);
+    const ownerMaintenanceInterrupt =
+      ownerWake &&
+      (activeBody?.operation.kind === "look_sweep" ||
+        activeBody?.operation.kind === "collect_item");
     let maintenanceInterruptGeneration: number | undefined;
     if (
-      ownerWake &&
+      activeBody !== undefined &&
       maintenanceAction !== undefined &&
       this.#maintenanceActionInFlight &&
-      activeBody?.operation.kind === "look_sweep"
+      (ownerMaintenanceInterrupt || collectionDamageInterrupt)
     ) {
-      // A look sweep has no open window to clean up; let the newer owner wake
-      // stop this search before it can inspect a chest candidate.
+      // These operations have no open window to clean up; let the newer wake
+      // stop them before maintenance can continue to another candidate.
       this.#generation += 1;
       maintenanceInterruptGeneration = this.#generation;
       this.#pendingWake = wake;
       activeBody.controller.abort(
-        new Error("Owner action superseded the automatic equipment sweep"),
+        new Error(
+          collectionDamageInterrupt
+            ? "Damage response interrupted automatic item collection"
+            : activeBody.operation.kind === "collect_item"
+              ? "Owner action superseded automatic item collection"
+              : "Owner action superseded the automatic equipment sweep",
+        ),
       );
     }
     if (maintenanceAction !== undefined) await maintenanceAction;
@@ -663,6 +726,7 @@ export class CompanionRuntime {
       this.#ownerReplyInterruptedByDamage = false;
       this.#damageReflexPending = false;
       this.#waterRecoveryActive = false;
+      this.#damagedCollectionCandidate = undefined;
       this.#damageReflexContext = undefined;
     }
     if (wake.mode !== "damage_reflex" && wake.mode !== "equipment_upkeep")
@@ -750,6 +814,84 @@ export class CompanionRuntime {
     }
   }
 
+  #refreshWaterRecoveryLatch(observation: PlayerBodyObservation): void {
+    const { self } = observation;
+    if (self.inWater === false) this.#damagedCollectionCandidate = undefined;
+
+    const observedAtMs = Date.parse(observation.observedAt);
+    const now = Date.now();
+    const y = self.position.y;
+    if (
+      self.inWater !== false ||
+      self.health === null ||
+      !Number.isFinite(self.health) ||
+      self.health <= 0 ||
+      self.oxygen === null ||
+      !Number.isFinite(self.oxygen) ||
+      self.oxygen <= 5 ||
+      !Number.isFinite(self.velocity.y) ||
+      Math.abs(self.velocity.y) > 0.05 ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(observedAtMs) ||
+      observedAtMs > now ||
+      now - observedAtMs > waterRecoveryDryMaximumAgeMs
+    ) {
+      this.#waterRecoveryDryCandidate = undefined;
+      return;
+    }
+
+    const candidate = this.#waterRecoveryDryCandidate;
+    if (candidate === undefined) {
+      this.#waterRecoveryDryCandidate = {
+        observedAtMs,
+        dimension: observation.dimension,
+        lifeEpoch: this.#waterRecoveryLifeEpoch,
+        y,
+      };
+      return;
+    }
+
+    const intervalMs = observedAtMs - candidate.observedAtMs;
+    if (
+      candidate.dimension !== observation.dimension ||
+      candidate.lifeEpoch !== this.#waterRecoveryLifeEpoch ||
+      now - candidate.observedAtMs < 0 ||
+      now - candidate.observedAtMs > waterRecoveryDryMaximumAgeMs ||
+      intervalMs <= 0 ||
+      intervalMs > waterRecoveryDryMaximumAgeMs ||
+      Math.abs(y - candidate.y) > 0.1
+    ) {
+      this.#waterRecoveryDryCandidate = {
+        observedAtMs,
+        dimension: observation.dimension,
+        lifeEpoch: this.#waterRecoveryLifeEpoch,
+        y,
+      };
+      return;
+    }
+    if (intervalMs < waterRecoveryDryMinimumIntervalMs) return;
+
+    this.#waterRecoveryAttempted = false;
+    this.#waterRecoveryTrigger = undefined;
+    this.#waterRecoveryDryCandidate = undefined;
+  }
+
+  #isWaterRecoveryTargetBlocked(
+    entityId: number,
+    dimension: string,
+    ownerAuthorized = false,
+  ): boolean {
+    const block = this.#waterRecoveryTargetBlock;
+    if (
+      block === undefined ||
+      ownerAuthorized ||
+      this.#pendingOwnerRequest !== undefined ||
+      this.#ownerFollowRequested
+    )
+      return false;
+    return block.dimension === dimension && block.entityId === entityId;
+  }
+
   async #checkMaintenance(): Promise<void> {
     if (
       this.#maintenanceObservationInFlight ||
@@ -779,6 +921,7 @@ export class CompanionRuntime {
       this.#refreshAutomaticPickupSuppressions(observation);
 
       const snapshot = this.#store.snapshot();
+      this.#refreshWaterRecoveryLatch(observation);
       if (
         !isSafeForEquipmentUpkeep(observation) ||
         observation.window !== null ||
@@ -884,6 +1027,7 @@ export class CompanionRuntime {
       this.#rememberVisibleChests(observation);
       this.#rememberVisibleBeds(observation);
       this.#refreshAutomaticPickupSuppressions(observation);
+      this.#refreshWaterRecoveryLatch(observation);
       const nearbyDroppedItems = visibleDroppedItems(observation);
       const automaticPickupRange =
         observation.perception.nearbyDroppedItems?.maxDistance ??
@@ -941,6 +1085,10 @@ export class CompanionRuntime {
             const item = entity.droppedItem;
             return (
               item !== undefined &&
+              !this.#isWaterRecoveryTargetBlocked(
+                entity.id,
+                observation.dimension,
+              ) &&
               !this.#automaticPickupSuppressed.has(
                 automaticPickupFingerprint(
                   observation.dimension,
@@ -1067,6 +1215,19 @@ export class CompanionRuntime {
           refreshAfterDecision = true;
         }
       }
+
+      if (
+        wake.ownerMessage === undefined &&
+        decision.plan?.steps.some(
+          (step) =>
+            step.operation.kind === "collect_item" &&
+            this.#isWaterRecoveryTargetBlocked(
+              step.operation.entityId,
+              observation.dimension,
+            ),
+        )
+      )
+        decision = { ...decision, plan: null };
 
       const currentSnapshot = this.#store.snapshot();
       if (
@@ -1540,9 +1701,18 @@ export class CompanionRuntime {
     candidate: BodyVisibleEntity,
     generation: number,
     foodState?: number,
+    ownerAuthorized = false,
   ): Promise<EquipmentStepResult> {
     const item = candidate.droppedItem;
     if (item === undefined) return { observation: null, confirmed: false };
+    if (
+      this.#isWaterRecoveryTargetBlocked(
+        candidate.id,
+        observation.dimension,
+        ownerAuthorized,
+      )
+    )
+      return { observation: null, confirmed: false };
     const targetKey = automaticPickupFingerprint(
       observation.dimension,
       candidate.id,
@@ -1860,6 +2030,8 @@ export class CompanionRuntime {
               observation,
               candidate,
               generation,
+              undefined,
+              explicit,
             );
             if (!step.confirmed || step.observation === null) {
               uncertain = true;
@@ -2468,12 +2640,36 @@ export class CompanionRuntime {
       } finally {
         if (this.#activeBody === run) this.#activeBody = undefined;
       }
-      const outcome = outcomeFromResult(
+      let outcome = outcomeFromResult(
         result,
         step.operation,
         operationId,
         step.expectedOutcome,
       );
+      const waterTrigger = this.#waterRecoveryTrigger;
+      const interruptedCollection =
+        operation.kind === "collect_item" &&
+        waterTrigger?.interruptedOperationId === operationId;
+      const waterRecoveryControl =
+        damageReflex &&
+        this.#waterRecoveryAttempted &&
+        operation.kind === "control" &&
+        operation.controls.jump === true &&
+        sameOperation(result.operation, operation);
+      if (interruptedCollection) {
+        outcome = {
+          ...outcome,
+          summary: `water_recovery:acquisition_interrupted; trigger=inWater:true,oxygen:${waterTrigger.oxygen}; requested collection remains unmet.`,
+        };
+      } else if (waterRecoveryControl && waterTrigger !== undefined) {
+        const category = classifyWaterRecoveryResult(result);
+        outcome = {
+          ...outcome,
+          status:
+            result.status === "interrupted" ? result.status : "unverified",
+          summary: waterRecoverySummary(category, waterTrigger.oxygen),
+        };
+      }
       let updated: CompanionSnapshot;
       try {
         updated = this.#store.recordOutcome(outcome);
@@ -2483,6 +2679,8 @@ export class CompanionRuntime {
         this.#scheduleRetry({ reason: "Body outcome persistence failed" });
         return;
       }
+      if (waterRecoveryControl && this.#waterRecoveryTrigger === waterTrigger)
+        this.#waterRecoveryTrigger = undefined;
       if (
         !this.#isCurrent(generation) ||
         updated.stopped ||
@@ -2499,7 +2697,7 @@ export class CompanionRuntime {
         });
         return;
       }
-      if (result.status !== "successful") {
+      if (outcome.status !== "successful") {
         await reportPlanNotConfirmed();
         this.#scheduleRetry({ reason: "Body outcome was not confirmed" });
         return;
@@ -2519,6 +2717,7 @@ export class CompanionRuntime {
         return;
       }
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
+      this.#refreshWaterRecoveryLatch(freshObservation);
       this.#rememberVisibleBeds(freshObservation);
       const nextStep = updated.plan?.steps[0];
       const damageReflexAttackTargetId =
@@ -2576,10 +2775,17 @@ export class CompanionRuntime {
         this.#isStopped()
       )
         return;
+      this.#damagedCollectionCandidate = undefined;
       if (this.#activeOwnerReplyGeneration === this.#generation)
         this.#ownerReplyInterruptedByDamage = true;
       try {
         const snapshot = this.#store.snapshot();
+        const activeBody = this.#activeBody;
+        if (activeBody?.operation.kind === "collect_item")
+          this.#damagedCollectionCandidate = {
+            operationId: activeBody.operationId,
+            entityId: activeBody.operation.entityId,
+          };
         this.#damageReflexContext = {
           goalTitle: snapshot.goal?.title ?? null,
           goalSuccessCondition: snapshot.goal?.successCondition ?? null,
@@ -2596,6 +2802,18 @@ export class CompanionRuntime {
       return;
     }
     if (
+      event.type === "state_changed" &&
+      event.reason === "vitals" &&
+      this.#activeBody?.operation.kind === "collect_item"
+    ) {
+      void this.#inspectWaterRecoveryDuringCollection(this.#activeBody);
+      return;
+    }
+    if (event.type === "bot_death") {
+      this.#waterRecoveryLifeEpoch += 1;
+      this.#waterRecoveryDryCandidate = undefined;
+    }
+    if (
       event.type === "bot_death" ||
       event.type === "bot_death_cause_updated"
     ) {
@@ -2604,6 +2822,7 @@ export class CompanionRuntime {
       return;
     }
     if (event.type === "disconnected") {
+      this.#waterRecoveryDryCandidate = undefined;
       this.#equipmentSweepCooldown = undefined;
       if (this.#activeBody?.operation.kind === "follow_owner") {
         this.#ownerFollowRequested = false;
@@ -2638,6 +2857,77 @@ export class CompanionRuntime {
     this.#worldChangeTimer.unref();
   }
 
+  async #inspectWaterRecoveryDuringCollection(
+    run: ActiveBodyRun,
+  ): Promise<void> {
+    const now = Date.now();
+    const ownerWakePending = (): boolean =>
+      this.#pendingOwnerRequest !== undefined ||
+      this.#pendingWake?.ownerMessage !== undefined ||
+      this.#pendingWake?.mode === "follow_owner" ||
+      this.#pendingWake?.mode === "equipment_upkeep" ||
+      this.#ownerFollowRequested;
+    if (
+      run.operation.kind !== "collect_item" ||
+      this.#waterRiskObservationInFlight ||
+      now - this.#lastWaterRiskObservedAt < waterRiskObservationCooldownMs ||
+      this.#waterRecoveryActive ||
+      this.#waterRecoveryAttempted ||
+      this.#damageReflexPending ||
+      ownerWakePending() ||
+      this.#isStopped()
+    )
+      return;
+
+    this.#lastWaterRiskObservedAt = now;
+    this.#waterRiskObservationInFlight = true;
+    const generation = this.#generation;
+    try {
+      const observation = await this.#body.observe({
+        ownerPositionException: true,
+      });
+      if (
+        !this.#isCurrent(generation) ||
+        this.#activeBody !== run ||
+        this.#isStopped()
+      )
+        return;
+      if (ownerWakePending()) return;
+      const snapshot = this.#store.snapshot();
+      this.#refreshWaterRecoveryLatch(observation);
+      const oxygen = observation.self.oxygen;
+      if (observation.self.inWater !== true || oxygen === null || oxygen > 5)
+        return;
+
+      this.#waterRecoveryTrigger = {
+        oxygen,
+        interruptedOperationId: run.operationId,
+      };
+      this.#waterRecoveryTargetBlock = {
+        entityId: run.operation.entityId,
+        dimension: observation.dimension,
+      };
+      this.#damageReflexContext = {
+        goalTitle: snapshot.goal?.title ?? null,
+        goalSuccessCondition: snapshot.goal?.successCondition ?? null,
+        planPurpose: snapshot.plan?.purpose ?? null,
+      };
+      this.#damagedCollectionCandidate = undefined;
+      if (this.#activeOwnerReplyGeneration === generation)
+        this.#ownerReplyInterruptedByDamage = true;
+      this.#damageReflexPending = true;
+      this.#fireWake({
+        reason:
+          "known low oxygen in water interrupted item collection; recover from fresh Body observation",
+        mode: "damage_reflex",
+      });
+    } catch {
+      // Unknown observations never interrupt an active collection.
+    } finally {
+      this.#waterRiskObservationInFlight = false;
+    }
+  }
+
   #requestReplan(reason: string, generation: number): void {
     if (!this.#isCurrent(generation)) return;
     this.#store.save({ plan: null });
@@ -2648,12 +2938,38 @@ export class CompanionRuntime {
     snapshot: CompanionSnapshot,
     observation: PlayerBodyObservation,
   ): CompanionDecision {
+    const oxygen = observation.self.oxygen;
     const lowOxygenWater =
-      observation.self.inWater === true &&
-      observation.self.oxygen !== null &&
-      observation.self.oxygen <= 5;
+      observation.self.inWater === true && oxygen !== null && oxygen <= 5;
     if (lowOxygenWater) {
+      if (this.#waterRecoveryAttempted) {
+        this.#damagedCollectionCandidate = undefined;
+        return {
+          speech: null,
+          goal: snapshot.goal,
+          plan: null,
+          memoryUpdates: [],
+          relationshipSummary: null,
+          waitMs: Math.max(minimumWaitMs, this.#minWaitMs),
+          knowledgeQuery: null,
+        };
+      }
       this.#waterRecoveryActive = true;
+      this.#waterRecoveryAttempted = true;
+      const damagedCollection = this.#damagedCollectionCandidate;
+      this.#damagedCollectionCandidate = undefined;
+      if (damagedCollection !== undefined) {
+        this.#waterRecoveryTrigger = {
+          oxygen,
+          interruptedOperationId: damagedCollection.operationId,
+        };
+        this.#waterRecoveryTargetBlock = {
+          entityId: damagedCollection.entityId,
+          dimension: observation.dimension,
+        };
+      } else if (this.#waterRecoveryTrigger === undefined) {
+        this.#waterRecoveryTrigger = { oxygen };
+      }
       const context = this.#damageReflexContext;
       const memoryContent = context
         ? waterRecoveryMemoryContent(context)
@@ -2662,7 +2978,7 @@ export class CompanionRuntime {
         speech: null,
         goal: snapshot.goal,
         plan: {
-          purpose: "Rise toward the surface after damage with low oxygen.",
+          purpose: waterRecoveryPlanPurpose,
           steps: [
             {
               operation: {
@@ -2691,6 +3007,12 @@ export class CompanionRuntime {
         knowledgeQuery: null,
       };
     }
+    this.#damagedCollectionCandidate = undefined;
+    if (
+      !this.#waterRecoveryAttempted &&
+      this.#waterRecoveryTrigger?.interruptedOperationId !== undefined
+    )
+      this.#waterRecoveryTrigger = undefined;
     const target = (observation.perception.nearbyHostiles?.entities ?? [])
       .filter(
         (entity) =>
@@ -3039,7 +3361,7 @@ function waterRecoveryMemoryContent(
     if (value === null) return "未記録";
     return value.trim().slice(0, maximum) || "未記録";
   };
-  const content = `水の中で酸素5以下の被ダメージ反応。中断直前の保存goal title=${bounded(context.goalTitle, 56)}; success=${bounded(context.goalSuccessCondition, 44)}; plan.purpose=${bounded(context.planPurpose, 92)}。回復判断は40tickのjump入力。水に入った当初の理由は未記録。`;
+  const content = `Body観測で水中・酸素5以下を確認し、40tickのjump入力を試行。surface達成は再観測まで未確認。中断直前の保存goal title=${bounded(context.goalTitle, 56)}; success=${bounded(context.goalSuccessCondition, 44)}; plan.purpose=${bounded(context.planPurpose, 92)}。水に入った当初の理由は未記録。`;
   return content.length <= 320 ? content : content.slice(0, 320);
 }
 
@@ -3387,6 +3709,46 @@ function failedBodyResult(
 
 function sameOperation(left: PlayerOperation, right: PlayerOperation): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+type WaterRecoveryCategory =
+  "dry_observed" | "progress_observed" | "unresolved";
+
+function classifyWaterRecoveryResult(
+  result: PlayerOperationResult,
+): WaterRecoveryCategory {
+  if (result.sameLife !== true) return "unresolved";
+  const before = result.before;
+  const after = result.after;
+  if (after?.self.inWater === false) return "dry_observed";
+  if (before?.self.inWater !== true || after?.self.inWater !== true)
+    return "unresolved";
+  const beforeY = before.self.position.y;
+  const afterY = after.self.position.y;
+  const verticalProgress =
+    Number.isFinite(beforeY) &&
+    Number.isFinite(afterY) &&
+    afterY > beforeY + 0.15;
+  const oxygenProgress =
+    before.self.oxygen !== null &&
+    after.self.oxygen !== null &&
+    after.self.oxygen > before.self.oxygen;
+  return verticalProgress || oxygenProgress
+    ? "progress_observed"
+    : "unresolved";
+}
+
+function waterRecoverySummary(
+  category: WaterRecoveryCategory,
+  triggerOxygen: number,
+): string {
+  const detail =
+    category === "dry_observed"
+      ? "Body observed one dry frame; stable escape remains unconfirmed."
+      : category === "progress_observed"
+        ? "Body observed partial progress while still in water; surfacing remains unconfirmed."
+        : "Body did not confirm surfacing or partial progress; recovery remains unresolved.";
+  return `water_recovery:${category}; trigger=inWater:true,oxygen:${triggerOxygen}; ${detail}`;
 }
 
 function canContinuePlan(
