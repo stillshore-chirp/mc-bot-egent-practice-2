@@ -9,6 +9,8 @@ import {
   companionMemoryStatuses,
   companionOutcomeStatuses,
   companionPlanStepLimit,
+  companionReplyLifecycleReasonCodes,
+  companionReplyLifecycleStates,
   type CompanionActiveOperation,
   type CompanionGoal,
   type CompanionMemory,
@@ -20,6 +22,9 @@ import {
   type CompanionOutcomeInput,
   type CompanionOutcomeStatus,
   type CompanionPlan,
+  type CompanionReplyLifecycle,
+  type CompanionReplyLifecycleReasonCode,
+  type CompanionReplyLifecycleState,
   type CompanionSnapshot,
   type CompanionStatePatch,
   type CompanionStoreOptions,
@@ -39,6 +44,8 @@ const MAX_RECALL_FALLBACKS = 128;
 const MAX_OWNER_QUOTE_LENGTH = 400;
 const MAX_TEXT_LENGTH = 2_000;
 const MAX_MEMORY_UPDATE_LENGTH = 1_000;
+const MAX_REPLY_LIFECYCLE_RECORDS = 12;
+const MAX_REPLY_LIFECYCLE_EVENTS = 12;
 const CHEST_CONTENT_TTL_MS = 60 * 60 * 1_000;
 const chestDimensionSchema = z
   .string()
@@ -202,6 +209,28 @@ const outcomeSchema = z
   })
   .strict();
 
+const replyLifecycleEventSchema = z
+  .object({
+    state: z.enum(companionReplyLifecycleStates),
+    at: z.iso.datetime(),
+    reasonCode: z.enum(companionReplyLifecycleReasonCodes).optional(),
+  })
+  .strict();
+
+const replyLifecycleSchema = z
+  .object({
+    ownerMessageSequence: z
+      .number()
+      .int()
+      .positive()
+      .max(Number.MAX_SAFE_INTEGER),
+    events: z
+      .array(replyLifecycleEventSchema)
+      .min(1)
+      .max(MAX_REPLY_LIFECYCLE_EVENTS),
+  })
+  .strict();
+
 const snapshotSchema = z
   .object({
     stopped: z.boolean(),
@@ -211,6 +240,10 @@ const snapshotSchema = z
     waitUntil: z.iso.datetime().nullable(),
     activeOperation: activeOperationSchema.nullable(),
     lastOutcome: outcomeSchema.nullable(),
+    replyLifecycle: z
+      .array(replyLifecycleSchema)
+      .max(MAX_REPLY_LIFECYCLE_RECORDS)
+      .default([]),
     relationshipSummary: z.string().max(MAX_TEXT_LENGTH),
     interests: z.array(z.string().trim().min(1).max(240)).max(40),
   })
@@ -287,6 +320,7 @@ const emptySnapshot: CompanionSnapshot = {
   waitUntil: null,
   activeOperation: null,
   lastOutcome: null,
+  replyLifecycle: [],
   relationshipSummary: "",
   interests: [],
 };
@@ -328,6 +362,7 @@ export class CompanionStore {
       const store = new CompanionStore(database, options);
       store.migrateAndImportLegacyState();
       store.recoverInterruptedOperation();
+      store.recoverInterruptedReplies();
       store.readSnapshot();
       return store;
     } catch (error) {
@@ -380,6 +415,9 @@ export class CompanionStore {
       .transaction(() => {
         const current = this.readSnapshot();
         const nextGeneration = nextStopGeneration(current.stopGeneration);
+        const stoppedAt = this.#now();
+        const stopCancelsPendingWork =
+          current.plan !== null || current.activeOperation !== null;
         let lastOutcome = current.lastOutcome;
         if (current.activeOperation !== null) {
           const interrupted: CompanionOutcome = {
@@ -414,8 +452,18 @@ export class CompanionStore {
           waitUntil: null,
           activeOperation: null,
           lastOutcome,
+          replyLifecycle: current.replyLifecycle.map((record) =>
+            replyLifecycleNeedsStopEvent(record, stopCancelsPendingWork)
+              ? appendReplyLifecycleEvent(
+                  record,
+                  "durable_stop",
+                  stoppedAt,
+                  "owner_stop",
+                )
+              : record,
+          ),
         };
-        this.writeSnapshot(next, this.#now());
+        this.writeSnapshot(next, stoppedAt);
         this.trimJournal();
         return next;
       })
@@ -821,23 +869,121 @@ export class CompanionStore {
       );
   }
 
-  public recordMessage(role: string, text: string): void {
+  public recordMessage(role: string, text: string): number {
     if (role !== "owner" && role !== "companion") {
       throw invalidInput("Message role must be owner or companion.");
     }
     const content = boundedText(text, "message", MAX_TEXT_LENGTH);
     assertNoCredentialLikeContent(content);
-    this.#database
+    return this.#database
       .transaction(() => {
         const now = this.#now();
-        this.#database
+        const inserted = this.#database
           .prepare(
             "INSERT INTO companion_journal(kind, role, operation_id, event_key, content, payload_json, recorded_at) VALUES('message', ?, NULL, NULL, ?, ?, ?)",
           )
           .run(role, content, JSON.stringify({ role, text: content }), now);
         this.trimJournal();
+        const sequence = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(sequence) || sequence < 1)
+          throw invalidInput(
+            "Message sequence is outside the supported range.",
+          );
+        return sequence;
       })
       .immediate();
+  }
+
+  /** Records only bounded lifecycle metadata; the owner message stays in the journal. */
+  public recordReplyLifecycleEvent(
+    ownerMessageSequence: number,
+    state: CompanionReplyLifecycleState,
+    reasonCode?: CompanionReplyLifecycleReasonCode,
+  ): CompanionReplyLifecycle {
+    if (!Number.isSafeInteger(ownerMessageSequence) || ownerMessageSequence < 1)
+      throw invalidInput("Reply message sequence is invalid.");
+    const parsedEvent = replyLifecycleEventSchema.safeParse({
+      state,
+      at: this.#now(),
+      ...(reasonCode === undefined ? {} : { reasonCode }),
+    });
+    if (!parsedEvent.success)
+      throw invalidInput("Reply lifecycle event is invalid.");
+    return this.#database
+      .transaction(() => {
+        const current = this.readSnapshot();
+        if (current.stopped && state !== "durable_stop")
+          throw new CompanionStoreError(
+            "STOPPED",
+            "Owner stop is active; reply state changes are rejected.",
+          );
+        const message = this.messageBySequence(ownerMessageSequence);
+        if (message?.role !== "owner")
+          throw invalidInput(
+            "Reply lifecycle must reference an owner message.",
+          );
+        const existing = current.replyLifecycle.find(
+          (record) => record.ownerMessageSequence === ownerMessageSequence,
+        );
+        const updated: CompanionReplyLifecycle = {
+          ownerMessageSequence,
+          events: [...(existing?.events ?? []), parsedEvent.data].slice(
+            -MAX_REPLY_LIFECYCLE_EVENTS,
+          ),
+        };
+        const records = [
+          ...current.replyLifecycle.filter(
+            (record) => record.ownerMessageSequence !== ownerMessageSequence,
+          ),
+          updated,
+        ]
+          .sort(
+            (left, right) =>
+              left.ownerMessageSequence - right.ownerMessageSequence,
+          )
+          .slice(-MAX_REPLY_LIFECYCLE_RECORDS);
+        const next = { ...current, replyLifecycle: records };
+        this.writeSnapshot(next, parsedEvent.data.at);
+        return updated;
+      })
+      .immediate();
+  }
+
+  public replyLifecycleFor(
+    ownerMessageSequence: number,
+  ): CompanionReplyLifecycle | null {
+    return (
+      this.readSnapshot().replyLifecycle.find(
+        (record) => record.ownerMessageSequence === ownerMessageSequence,
+      ) ?? null
+    );
+  }
+
+  public latestReplyLifecycle(): CompanionReplyLifecycle | null {
+    return this.readSnapshot().replyLifecycle.reduce<CompanionReplyLifecycle | null>(
+      (latest, record) =>
+        latest === null ||
+        record.ownerMessageSequence > latest.ownerMessageSequence
+          ? record
+          : latest,
+      null,
+    );
+  }
+
+  public messageBySequence(sequence: number): CompanionMessage | null {
+    if (!Number.isSafeInteger(sequence) || sequence < 1) return null;
+    const row = this.#database
+      .prepare<[number], JournalRow>(
+        "SELECT journal_id, kind, role, operation_id, content, payload_json, recorded_at FROM companion_journal WHERE kind = 'message' AND journal_id = ?",
+      )
+      .get(sequence);
+    if (row === undefined) return null;
+    return {
+      sequence: row.journal_id,
+      role: row.role === "companion" ? "companion" : "owner",
+      text: row.content,
+      recordedAt: row.recorded_at,
+    };
   }
 
   public recentMessages(limit = 24): CompanionMessage[] {
@@ -1196,6 +1342,50 @@ export class CompanionStore {
       .immediate();
   }
 
+  /** A process restart never replays an uncertain outgoing chat call. */
+  private recoverInterruptedReplies(): void {
+    this.#database
+      .transaction(() => {
+        const current = this.readSnapshot();
+        if (current.stopped) return;
+        const at = this.#now();
+        const hasUnresolvedReply = current.replyLifecycle.some((record) => {
+          const state = record.events.at(-1)?.state;
+          return (
+            state === "send_started" ||
+            state === "generation_started" ||
+            state === "generated"
+          );
+        });
+        if (!hasUnresolvedReply) return;
+        const replyLifecycle = current.replyLifecycle.map((record) => {
+          const latest = record.events.at(-1);
+          if (latest?.state === "send_started") {
+            return appendReplyLifecycleEvent(
+              record,
+              "send_unknown",
+              at,
+              "process_restart_during_send",
+            );
+          }
+          if (
+            latest?.state === "generation_started" ||
+            latest?.state === "generated"
+          ) {
+            return appendReplyLifecycleEvent(
+              record,
+              "interrupted",
+              at,
+              "process_restart_with_generation_unresolved",
+            );
+          }
+          return record;
+        });
+        this.writeSnapshot({ ...current, replyLifecycle }, at);
+      })
+      .immediate();
+  }
+
   private resolveLegacyOwnerId(): string | null {
     if (!tableExists(this.#database, "players")) return null;
     const players = this.#database
@@ -1354,6 +1544,7 @@ export class CompanionStore {
       waitUntil: null,
       activeOperation: null,
       lastOutcome,
+      replyLifecycle: [],
       relationshipSummary,
       interests,
     };
@@ -2376,6 +2567,37 @@ function withLegacyRedactionFlag(value: JsonValue): JsonObject {
     ? recordToJson(value)
     : { legacyMetadata: value };
   return { ...safe, legacyCredentialRedacted: true };
+}
+
+function appendReplyLifecycleEvent(
+  record: CompanionReplyLifecycle,
+  state: CompanionReplyLifecycleState,
+  at: string,
+  reasonCode: CompanionReplyLifecycleReasonCode,
+): CompanionReplyLifecycle {
+  return {
+    ...record,
+    events: [...record.events, { state, at, reasonCode }].slice(
+      -MAX_REPLY_LIFECYCLE_EVENTS,
+    ),
+  };
+}
+
+function replyLifecycleNeedsStopEvent(
+  record: CompanionReplyLifecycle,
+  stopCancelsPendingWork: boolean,
+): boolean {
+  const state = record.events.at(-1)?.state;
+  return (
+    state === "received" ||
+    state === "generation_started" ||
+    state === "generated" ||
+    state === "generation_failed" ||
+    state === "interrupted" ||
+    state === "send_started" ||
+    (stopCancelsPendingWork &&
+      (state === "send_unknown" || state === "send_call_resolved"))
+  );
 }
 
 function sanitizeLegacySnapshot(

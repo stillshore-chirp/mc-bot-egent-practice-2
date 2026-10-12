@@ -86,6 +86,45 @@ export type CompanionOutcomeInput = Omit<CompanionOutcome, "observedAt"> & {
   readonly observedAt?: string | undefined;
 };
 
+export const companionReplyLifecycleStates = [
+  "received",
+  "generation_started",
+  "generated",
+  "generation_failed",
+  "interrupted",
+  "send_started",
+  "send_call_resolved",
+  "send_unknown",
+  "durable_stop",
+] as const;
+export type CompanionReplyLifecycleState =
+  (typeof companionReplyLifecycleStates)[number];
+
+export const companionReplyLifecycleReasonCodes = [
+  "judgment_failed",
+  "damage_response",
+  "newer_owner_input",
+  "owner_stop",
+  "process_restart_with_generation_unresolved",
+  "process_restart_during_send",
+  "say_call_rejected",
+  "owner_message_unavailable",
+] as const;
+export type CompanionReplyLifecycleReasonCode =
+  (typeof companionReplyLifecycleReasonCodes)[number];
+
+export interface CompanionReplyLifecycleEvent {
+  readonly state: CompanionReplyLifecycleState;
+  readonly at: string;
+  readonly reasonCode?: CompanionReplyLifecycleReasonCode | undefined;
+}
+
+/** Bounded reply evidence points back to the owner journal row; it stores no chat copy. */
+export interface CompanionReplyLifecycle {
+  readonly ownerMessageSequence: number;
+  readonly events: readonly CompanionReplyLifecycleEvent[];
+}
+
 export interface CompanionSnapshot {
   readonly stopped: boolean;
   readonly stopGeneration: number;
@@ -94,6 +133,7 @@ export interface CompanionSnapshot {
   readonly waitUntil: string | null;
   readonly activeOperation: CompanionActiveOperation | null;
   readonly lastOutcome: CompanionOutcome | null;
+  readonly replyLifecycle: readonly CompanionReplyLifecycle[];
   readonly relationshipSummary: string;
   readonly interests: readonly string[];
 }

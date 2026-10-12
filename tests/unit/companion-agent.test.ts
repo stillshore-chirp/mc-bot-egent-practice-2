@@ -31,6 +31,7 @@ const snapshot: CompanionSnapshot = {
   waitUntil: null,
   activeOperation: null,
   lastOutcome: null,
+  replyLifecycle: [],
   relationshipSummary: "一緒に探索した経験を重ねている。",
   interests: ["森の探索"],
 };
@@ -361,6 +362,79 @@ describe("CompanionAgent", () => {
       ),
     ).toBe(true);
     expect(decision.ownerMessageDisposition).toBe("answer_only");
+  });
+
+  it("sends only the current owner's bounded reply evidence to the Agent", async () => {
+    const create = vi.fn().mockResolvedValue(
+      response({
+        speech: "送信結果は分からないよ。",
+        goal: null,
+        plan: null,
+        memoryUpdates: [],
+        relationshipSummary: null,
+        waitMs: 10_000,
+        knowledgeQuery: null,
+      }),
+    );
+    const agent = new CompanionAgent({
+      client: {
+        responses: { create },
+      } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+
+    await agent.decide({
+      ...createInput(),
+      ownerMessage: "返事が来なかった理由を教えて。",
+      ownerMessageSequence: 2,
+      snapshot: {
+        ...snapshot,
+        replyLifecycle: [
+          {
+            ownerMessageSequence: 1,
+            events: [{ state: "send_unknown", at: "2026-10-10T00:00:00.000Z" }],
+          },
+          {
+            ownerMessageSequence: 2,
+            events: [
+              {
+                state: "interrupted",
+                at: "2026-10-10T00:01:00.000Z",
+                reasonCode: "damage_response",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const [request] = create.mock.calls[0] as unknown as [
+      { input: string; instructions: string },
+    ];
+    const parsedInput = JSON.parse(request.input) as {
+      ownerMessageSequence: number;
+      companion: {
+        replyLifecycle: {
+          ownerMessageSequence: number;
+          latestEvent: { state: string; reasonCode?: string } | null;
+          eventCount: number;
+        } | null;
+      };
+    };
+    expect(parsedInput.ownerMessageSequence).toBe(2);
+    expect(parsedInput.companion.replyLifecycle).toMatchObject({
+      ownerMessageSequence: 2,
+      latestEvent: { state: "interrupted", reasonCode: "damage_response" },
+      eventCount: 1,
+    });
+    expect(JSON.stringify(parsedInput)).not.toContain("send_unknown");
+    expect(request.instructions).toContain(
+      "send_call_resolvedはsay呼び出しが戻ったことだけを示し、ゲーム内画面への表示確認ではありません。",
+    );
+    expect(request.instructions).toContain(
+      "明示再開でも停止前の返答は復活しません。",
+    );
   });
 
   it("sends exactly the newest 24 mixed-role messages to the provider", async () => {

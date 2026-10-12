@@ -3652,10 +3652,319 @@ describe("CompanionRuntime", () => {
     expect(say).toHaveBeenCalledTimes(1);
   });
 
-  it("gives an owner a fixed reply when the Agent fails", async () => {
+  it("keeps an unknown send attached to its original question and never auto-retries it", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    let sayCalls = 0;
+    const say = vi.fn(async (_text: string) => {
+      sayCalls += 1;
+      if (sayCalls === 1) throw new Error("synthetic say rejection");
+    });
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent, say, 1_000);
+
+    await runtime.receiveChat("Builder", "周囲を確認して");
+
+    const originalSequence = store
+      .snapshot()
+      .replyLifecycle.at(-1)?.ownerMessageSequence;
+    expect(originalSequence).toBeDefined();
+    expect(store.messageBySequence(originalSequence ?? -1)?.text).toBe(
+      "周囲を確認して",
+    );
+    expect(
+      store.replyLifecycleFor(originalSequence ?? -1)?.events.at(-1),
+    ).toMatchObject({
+      state: "send_unknown",
+      reasonCode: "say_call_rejected",
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.ownerMessage).toBeUndefined();
+    expect(agent.inputs[1]?.pendingOwnerRequest).toBeUndefined();
+    expect(say).toHaveBeenCalledTimes(1);
+
+    await runtime.receiveChat("Builder", "返事が来なかった理由を教えて。");
+    expect(agent.inputs).toHaveLength(2);
+    expect(say).toHaveBeenCalledTimes(2);
+    expect(say.mock.calls[1]?.[0]).toContain("もう一度依頼して");
+    expect(store.messageBySequence(originalSequence ?? -1)?.text).toBe(
+      "周囲を確認して",
+    );
+  });
+
+  it("does not feed an unknown prior reply into a later goal-turn answer", async () => {
+    const { store } = freshStore();
+    store.save({
+      goal: {
+        title: "Continue the synthetic task",
+        successCondition: "Observe the current area.",
+        source: "owner",
+      },
+      plan: {
+        purpose: "Keep the active task context for a separate owner question.",
+        steps: [{ operation: look, expectedOutcome: "The area is observed." }],
+      },
+      activeOperation: {
+        operationId: "synthetic-active-operation",
+        operation: look,
+        expectedOutcome: "The area is observed.",
+      },
+    });
+    const body = new FakeBody(store);
+    let sayCalls = 0;
+    const say = vi.fn(async () => {
+      sayCalls += 1;
+      if (sayCalls === 1) throw new Error("synthetic say rejection");
+    });
+    const agent = new FakeAgent([
+      interleavedReplyDecision("最初の返信", "answer_only"),
+      interleavedReplyDecision("次の質問への返信", "answer_only"),
+    ]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.receiveChat("Builder", "最初の質問");
+    const originalSequence = store
+      .snapshot()
+      .replyLifecycle.at(-1)?.ownerMessageSequence;
+    expect(
+      store.replyLifecycleFor(originalSequence ?? -1)?.events.at(-1)?.state,
+    ).toBe("send_unknown");
+
+    await runtime.receiveChat("Builder", "次の質問");
+    expect(agent.inputs[1]?.ownerReplyContext).toEqual({
+      pendingOwnerRequest: null,
+    });
+    expect(agent.inputs[1]?.pendingOwnerRequest).toBeUndefined();
+    expect(say).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not repeat speech when persisting a resolved send fails", async () => {
+    vi.useFakeTimers();
     const { store } = freshStore();
     const body = new FakeBody(store);
     const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+    const recordLifecycleEvent = store.recordReplyLifecycleEvent.bind(store);
+    store.recordReplyLifecycleEvent = (sequence, state, reasonCode) => {
+      if (state === "send_call_resolved")
+        throw new Error("synthetic lifecycle persistence failure");
+      return recordLifecycleEvent(sequence, state, reasonCode);
+    };
+    const runtime = createRuntime(store, body, agent, say, 1_000);
+
+    await runtime.receiveChat("Builder", "合成の確認依頼");
+    expect(say).toHaveBeenCalledTimes(1);
+    expect(store.snapshot().replyLifecycle.at(-1)?.events.at(-1)?.state).toBe(
+      "send_started",
+    );
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(agent.inputs).toHaveLength(2);
+    expect(agent.inputs[1]?.pendingOwnerRequest).toBeUndefined();
+    expect(say).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat generic why, reply, or water-reason questions as reply-status requests", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async (_text: string) => undefined);
+    const agent = new FakeAgent([]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    for (const message of ["なぜ？", "返事", "水の中に行った理由は？"]) {
+      await runtime.receiveChat("Builder", message);
+    }
+    expect(agent.inputs.map(({ ownerMessage }) => ownerMessage)).toEqual([
+      "なぜ？",
+      "返事",
+      "水の中に行った理由は？",
+    ]);
+
+    const decisionsBeforeReplyStatus = agent.inputs.length;
+    await runtime.receiveChat("Builder", "返事が来なかった理由を教えて。");
+    expect(agent.inputs).toHaveLength(decisionsBeforeReplyStatus);
+    expect(say.mock.calls.at(-1)?.[0]).toContain("say呼び出しが戻った");
+
+    for (const message of [
+      "返事が遅い理由を教えて",
+      "返信が遅れたのはなぜ？",
+    ]) {
+      await runtime.receiveChat("Builder", message);
+      expect(agent.inputs).toHaveLength(decisionsBeforeReplyStatus);
+      expect(say.mock.calls.at(-1)?.[0]).toContain(
+        "元の質問は履歴に残っているよ",
+      );
+    }
+  });
+
+  it("diagnoses the newest owner question after an older send completes late", async () => {
+    const { store } = freshStore();
+    const olderSequence = store.recordMessage(
+      "owner",
+      "synthetic older request",
+    );
+    store.recordReplyLifecycleEvent(olderSequence, "received");
+    store.recordReplyLifecycleEvent(olderSequence, "generation_started");
+    store.recordReplyLifecycleEvent(olderSequence, "generated");
+    store.recordReplyLifecycleEvent(olderSequence, "send_started");
+
+    const newestSequence = store.recordMessage(
+      "owner",
+      "synthetic newer request",
+    );
+    store.recordReplyLifecycleEvent(newestSequence, "received");
+    store.recordReplyLifecycleEvent(newestSequence, "generation_started");
+    store.recordReplyLifecycleEvent(newestSequence, "generated");
+    store.recordReplyLifecycleEvent(
+      newestSequence,
+      "send_unknown",
+      "say_call_rejected",
+    );
+    store.recordReplyLifecycleEvent(olderSequence, "send_call_resolved");
+
+    const say = vi.fn(async (_text: string) => undefined);
+    const runtime = createRuntime(
+      store,
+      new FakeBody(store),
+      new FakeAgent([]),
+      say,
+    );
+
+    await runtime.receiveChat("Builder", "返信が遅れたのはなぜ？");
+
+    expect(store.latestReplyLifecycle()?.ownerMessageSequence).toBe(
+      newestSequence,
+    );
+    expect(say.mock.calls.at(-1)?.[0]).toContain(
+      "say呼び出しの失敗が記録されているよ",
+    );
+  });
+
+  it("explains a recorded generated result separately from an unresolved generation restart", async () => {
+    const { store, path } = freshStore();
+    const sequence = store.recordMessage(
+      "owner",
+      "synthetic generated request",
+    );
+    store.recordReplyLifecycleEvent(sequence, "received");
+    store.recordReplyLifecycleEvent(sequence, "generation_started");
+    store.recordReplyLifecycleEvent(sequence, "generated");
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const reopened = CompanionStore.open(path, { ownerUsername: "Builder" });
+    stores.push(reopened);
+    const say = vi.fn(async (_text: string) => undefined);
+    const runtime = createRuntime(
+      reopened,
+      new FakeBody(reopened),
+      new FakeAgent([]),
+      say,
+    );
+
+    await runtime.receiveChat("Builder", "返事が来なかった理由を教えて。");
+
+    expect(say.mock.calls.at(-1)?.[0]).toContain(
+      "再起動前に返答生成の完了を記録しているよ",
+    );
+    expect(say.mock.calls.at(-1)?.[0]).toContain(
+      "送信開始とゲーム内表示は未確認",
+    );
+    expect(say.mock.calls.at(-1)?.[0]).toContain("再起動の原因も分からないよ");
+    expect(say.mock.calls.at(-1)?.[0]).not.toContain("生成完了の記録がない");
+  });
+
+  it("does not speak a late owner reply after durable stop and resumes only on an explicit owner command", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const pending = deferred<CompanionDecision>();
+    const say = vi.fn(async () => undefined);
+    const agent = new FakeAgent([() => pending.promise, makeDecision([look])]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    const ownerTurn = runtime.receiveChat("Builder", "周囲を見て");
+    await eventually(() => runtime.status().thinking);
+    const sequence = store
+      .snapshot()
+      .replyLifecycle.at(-1)?.ownerMessageSequence;
+    const stopping = runtime.stop("Builder");
+    expect(store.snapshot().stopped).toBe(true);
+    pending.resolve(makeDecision([look]));
+    await stopping;
+    await ownerTurn;
+
+    expect(store.replyLifecycleFor(sequence ?? -1)?.events.at(-1)?.state).toBe(
+      "durable_stop",
+    );
+    expect(say).not.toHaveBeenCalled();
+    expect(body.executed).toHaveLength(0);
+
+    await runtime.receiveChat("Builder", "再開して");
+    expect(store.snapshot().stopped).toBe(false);
+    const resumedSequence = store
+      .snapshot()
+      .replyLifecycle.at(-1)?.ownerMessageSequence;
+    expect(store.messageBySequence(resumedSequence ?? -1)?.text).toBe(
+      "再開して",
+    );
+    expect(agent.inputs.at(-1)?.ownerMessage).toBe("再開して");
+    expect(body.executed).toEqual([look]);
+    expect(say).toHaveBeenCalled();
+    expect(
+      store.replyLifecycleFor(resumedSequence ?? -1)?.events.at(-1)?.state,
+    ).toBe("send_call_resolved");
+    expect(store.replyLifecycleFor(sequence ?? -1)?.events.at(-1)?.state).toBe(
+      "durable_stop",
+    );
+  });
+
+  it("explains the unfinished pre-stop question after quiet status inquiry and explicit resume", async () => {
+    const { store } = freshStore();
+    const originalSequence = store.recordMessage("owner", "元の未完了依頼");
+    store.recordReplyLifecycleEvent(originalSequence, "received");
+    store.recordReplyLifecycleEvent(originalSequence, "generation_started");
+    const body = new FakeBody(store);
+    const say = vi.fn(async (_text: string) => undefined);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.receiveChat("Builder", "緊急停止命令");
+    expect(
+      store.replyLifecycleFor(originalSequence)?.events.at(-1)?.state,
+    ).toBe("durable_stop");
+    const stoppedSpeechCount = say.mock.calls.length;
+
+    await runtime.receiveChat("Builder", "返事が来なかった理由を教えて。");
+    expect(agent.inputs).toHaveLength(0);
+    expect(body.executed).toHaveLength(0);
+    expect(say).toHaveBeenCalledTimes(stoppedSpeechCount);
+
+    await runtime.receiveChat("Builder", "再開して");
+    expect(runtime.status().stopped).toBe(false);
+    expect(agent.inputs).toHaveLength(1);
+    const resumeSequence = store
+      .snapshot()
+      .replyLifecycle.at(-1)?.ownerMessageSequence;
+    expect(store.messageBySequence(resumeSequence ?? -1)?.text).toBe(
+      "再開して",
+    );
+
+    await runtime.receiveChat("Builder", "返事が来なかった理由を教えて。");
+
+    expect(say.mock.calls.at(-1)?.[0]).toContain(
+      "永続停止で元の返答処理を止めた記録があるよ",
+    );
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed).toHaveLength(0);
+  });
+
+  it("gives an owner a fixed reply when the Agent fails", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const say = vi.fn(async (_text: string) => undefined);
     const agent = new FakeAgent([
       async () => {
         throw new Error("synthetic decision failure");
@@ -3669,6 +3978,13 @@ describe("CompanionRuntime", () => {
       "依頼は受け取ったけれど、現在の状態と返答は確認できていないよ。詳しい原因はまだ分からないよ。",
     );
     expect(runtime.status().recentErrors).toHaveLength(1);
+    expect(store.snapshot().replyLifecycle.at(-1)?.events).toMatchObject([
+      { state: "received" },
+      { state: "generation_started" },
+      { state: "generation_failed", reasonCode: "judgment_failed" },
+      { state: "send_started" },
+      { state: "send_call_resolved" },
+    ]);
   });
 
   it("describes an observed plan step without claiming its larger goal was achieved", async () => {
@@ -3785,38 +4101,43 @@ describe("CompanionRuntime", () => {
     const runtime = createRuntime(store, body, agent, say);
 
     const originalTurn = runtime.receiveChat("Builder", "周囲を確認して");
-    await eventually(() => agent.inputs.length === 1);
-    expect(agent.inputs[0]?.ownerMessage).toBe("周囲を確認して");
-    expect(agent.signals[0]?.aborted).toBe(false);
+    try {
+      await eventually(() => agent.inputs.length === 1);
+      expect(agent.inputs[0]?.ownerMessage).toBe("周囲を確認して");
+      expect(agent.signals[0]?.aborted).toBe(false);
 
-    await runtime.receiveChat("Builder", "いま何が見える？");
-    await runtime.receiveChat("Builder", "元の依頼は進んでいる？");
+      await runtime.receiveChat("Builder", "いま何が見える？");
+      await runtime.receiveChat("Builder", "元の依頼は進んでいる？");
 
-    expect(agent.inputs).toHaveLength(3);
-    expect(agent.inputs[1]).toMatchObject({
-      ownerMessage: "いま何が見える？",
-      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
-    });
-    expect(agent.inputs[2]).toMatchObject({
-      ownerMessage: "元の依頼は進んでいる？",
-      ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
-    });
-    expect(agent.signals[0]?.aborted).toBe(false);
-    expect(body.executed).toHaveLength(0);
-    expect(store.snapshot().goal).toBeNull();
-    expect(say).toHaveBeenNthCalledWith(1, "いまの周囲を確認しているよ。");
-    expect(say).toHaveBeenNthCalledWith(2, "依頼を続けているよ。");
+      expect(agent.inputs).toHaveLength(3);
+      expect(agent.inputs[1]).toMatchObject({
+        ownerMessage: "いま何が見える？",
+        ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+      });
+      expect(agent.inputs[2]).toMatchObject({
+        ownerMessage: "元の依頼は進んでいる？",
+        ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
+      });
+      expect(agent.signals[0]?.aborted).toBe(false);
+      expect(body.executed).toHaveLength(0);
+      expect(store.snapshot().goal).toBeNull();
+      expect(say).toHaveBeenNthCalledWith(1, "いまの周囲を確認しているよ。");
+      expect(say).toHaveBeenNthCalledWith(2, "依頼を続けているよ。");
 
-    originalDecision.resolve(ownerGoalDecision([look], "周囲を確認する"));
-    await originalTurn;
+      originalDecision.resolve(ownerGoalDecision([look], "周囲を確認する"));
+      await originalTurn;
 
-    expect(agent.inputs).toHaveLength(3);
-    expect(agent.signals[0]?.aborted).toBe(false);
-    expect(body.executed).toEqual([look]);
-    expect(store.snapshot().goal?.title).toBe("周囲を確認する");
-    expect(say).toHaveBeenCalledWith(
-      "依頼を受け取ったよ。結果を確認してから伝えるね。",
-    );
+      expect(agent.inputs).toHaveLength(3);
+      expect(agent.signals[0]?.aborted).toBe(false);
+      expect(body.executed).toEqual([look]);
+      expect(store.snapshot().goal?.title).toBe("周囲を確認する");
+      expect(say).toHaveBeenCalledWith(
+        "依頼を受け取ったよ。結果を確認してから伝えるね。",
+      );
+    } finally {
+      originalDecision.resolve(ownerGoalDecision([look], "周囲を確認する"));
+      await originalTurn;
+    }
   });
 
   it("keeps active work for answer-only replies and replaces it only for an explicit new goal", async () => {
