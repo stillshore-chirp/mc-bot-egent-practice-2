@@ -549,6 +549,7 @@ class FakeBody implements PlayerBody {
     status: PlayerOperationResult["status"],
     after: PlayerBodyObservation | null,
     before: PlayerBodyObservation = this.observation,
+    sameLife = true,
   ): PlayerOperationResult {
     const now = new Date().toISOString();
     const result = {
@@ -559,7 +560,7 @@ class FakeBody implements PlayerBody {
       completedAt: now,
       before,
       after,
-      sameLife: true,
+      sameLife,
       recoveryRequired: false,
     };
     this.results.push(result);
@@ -1358,6 +1359,73 @@ describe("CompanionRuntime", () => {
     } finally {
       releaseSweep();
     }
+  });
+
+  it("lets owner follow interrupt a periodic food drop collection", async () => {
+    vi.useFakeTimers();
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.foodNames.add("bread");
+    const agent = new FakeAgent([{ ...emptyDecision(), waitMs: 60_000 }]);
+    const runtime = createRuntime(store, body, agent, undefined, 60_000);
+    let collectSignal: AbortSignal | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      if (operation.kind === "collect_item") {
+        collectSignal = signal;
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          const interrupted = (): void =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "periodic-food-collection-interrupted",
+                "interrupted",
+                null,
+              ),
+            );
+          if (signal?.aborted) interrupted();
+          else signal?.addEventListener("abort", interrupted, { once: true });
+        });
+      }
+      if (operation.kind === "follow_owner")
+        return fakeBody.result(
+          operation,
+          "periodic-food-owner-follow",
+          "successful",
+          fakeBody.observation,
+        );
+      return fakeBody.result(
+        operation,
+        `unexpected-periodic-food-${fakeBody.executed.length}`,
+        "failed",
+        null,
+      );
+    };
+
+    await runtime.start();
+    await eventuallyWithFakeTimers(
+      () => agent.inputs.length === 1 && !runtime.status().thinking,
+    );
+    body.observation = makeObservation({
+      food: 12,
+      nearbyDroppedItems: makeNearbyDroppedItems([
+        droppedItemEntity(31, 1, "bread"),
+      ]),
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await eventuallyWithFakeTimers(() =>
+      body.executed.some((operation) => operation.kind === "collect_item"),
+    );
+
+    const ownerTurn = runtime.receiveChat("Builder", "こっち来て");
+    expect(collectSignal?.aborted).toBe(true);
+    await ownerTurn;
+
+    expect(body.executed.map((operation) => operation.kind)).toEqual([
+      "collect_item",
+      "follow_owner",
+    ]);
+    expect(agent.inputs).toHaveLength(1);
+    expect(store.snapshot().goal?.title).toBe("オーナーに追従する");
   });
 
   it("does not start autonomous equipment upkeep when self health is unknown", async () => {
@@ -4555,7 +4623,7 @@ describe("CompanionRuntime", () => {
     },
   );
 
-  it("uses bounded jump recovery after low-oxygen damage and remembers the interrupted goal", async () => {
+  it("records a single dry recovery frame as unverified and remembers the interrupted goal", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const move: Extract<PlayerOperation, { kind: "move_to" }> = {
@@ -4678,7 +4746,10 @@ describe("CompanionRuntime", () => {
     await eventually(
       () =>
         store.snapshot().lastOutcome?.operation.kind === "control" &&
-        store.snapshot().lastOutcome?.status === "successful",
+        store.snapshot().lastOutcome?.status === "unverified",
+    );
+    expect(store.snapshot().lastOutcome?.summary).toContain(
+      "water_recovery:dry_observed",
     );
 
     await runtime.receiveChat("Builder", "水の中に行った理由は？");
@@ -4695,6 +4766,229 @@ describe("CompanionRuntime", () => {
     ).toBe(true);
     expect(body.executed).toEqual([move, jump]);
   });
+
+  it("does not count post-respawn dry observation as same-life recovery", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after = {
+        ...before,
+        self: { ...before.self, inWater: false, oxygen: 20 },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        "synthetic-post-respawn-dry",
+        "successful",
+        after,
+        before,
+        false,
+      );
+    };
+    const runtime = createRuntime(
+      store,
+      body,
+      new FakeAgent([emptyDecision()]),
+    );
+
+    await runtime.start();
+    await eventually(() => runtime.status().nextWakeAt !== null);
+    body.emit({
+      type: "bot_damaged",
+      at: new Date().toISOString(),
+      source: null,
+      confidence: "unknown",
+    });
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "control",
+    );
+
+    expect(body.executed).toEqual([jump]);
+    expect(store.snapshot().lastOutcome?.status).toBe("unverified");
+    expect(store.snapshot().lastOutcome?.summary).toContain(
+      "water_recovery:unresolved",
+    );
+    expect(store.snapshot().lastOutcome?.summary).not.toContain(
+      "water_recovery:surface_reached",
+    );
+    await runtime.shutdown();
+  });
+
+  it.each(
+    [
+      "stale timestamp",
+      "unknown water state",
+      "different dimension",
+      "different life",
+      "vertical movement",
+      "nonpositive health",
+      "low oxygen",
+      "unstable height",
+    ].map((caseName) => ({ caseName })),
+  )(
+    "does not reset a water recovery attempt from a dry candidate with $caseName evidence",
+    async ({ caseName }) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      body.observation = {
+        ...body.observation,
+        self: { ...body.observation.self, inWater: true, oxygen: 4 },
+      };
+      body.executeHandler = async (operation, _signal, fakeBody) => {
+        if (operation.kind !== "control" || operation.controls.jump !== true)
+          return fakeBody.result(
+            operation,
+            `dry-candidate-${fakeBody.executed.length}`,
+            "successful",
+            fakeBody.observation,
+          );
+        const before = fakeBody.observation;
+        const after = {
+          ...before,
+          observedAt: new Date(Date.now() - 3_500).toISOString(),
+          self: { ...before.self, inWater: false, oxygen: 20 },
+        };
+        fakeBody.observation = after;
+        return fakeBody.result(
+          operation,
+          "dry-candidate-recovery",
+          "successful",
+          after,
+          before,
+        );
+      };
+      const runtime = createRuntime(
+        store,
+        body,
+        new FakeAgent([emptyDecision(), emptyDecision(), emptyDecision()]),
+      );
+      const emitAndWaitForObservation = async (event: PlayerBodyEvent) => {
+        const previousObserveCalls = body.observeCalls;
+        body.emit(event);
+        await eventually(() => body.observeCalls > previousObserveCalls);
+        await eventually(() => !runtime.status().thinking);
+      };
+
+      await runtime.start();
+      await eventually(() => runtime.status().nextWakeAt !== null);
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+      await eventually(
+        () => store.snapshot().lastOutcome?.operation.kind === "control",
+      );
+      await eventually(() => !runtime.status().thinking);
+
+      await emitAndWaitForObservation({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+
+      if (caseName === "stale timestamp") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date(Date.now() - 12_000).toISOString(),
+        };
+      } else if (caseName === "unknown water state") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          self: { ...body.observation.self, inWater: null, oxygen: 20 },
+        };
+      } else if (caseName === "different dimension") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          dimension: "nether",
+          self: {
+            ...body.observation.self,
+            position: {
+              ...body.observation.self.position,
+              dimension: "nether",
+            },
+          },
+        };
+      } else if (caseName === "vertical movement") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          self: {
+            ...body.observation.self,
+            velocity: { ...body.observation.self.velocity, y: 0.051 },
+          },
+        };
+      } else if (caseName === "nonpositive health") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          self: { ...body.observation.self, health: 0 },
+        };
+      } else if (caseName === "low oxygen") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          self: { ...body.observation.self, oxygen: 5 },
+        };
+      } else if (caseName === "unstable height") {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+          self: {
+            ...body.observation.self,
+            position: {
+              ...body.observation.self.position,
+              y: body.observation.self.position.y + 0.11,
+            },
+          },
+        };
+      } else {
+        body.observation = {
+          ...body.observation,
+          observedAt: new Date().toISOString(),
+        };
+      }
+      await emitAndWaitForObservation(
+        caseName === "different life"
+          ? { type: "bot_death", at: new Date().toISOString() }
+          : {
+              type: "bot_damaged",
+              at: new Date().toISOString(),
+              source: null,
+              confidence: "unknown",
+            },
+      );
+
+      body.observation = {
+        ...body.observation,
+        observedAt: new Date().toISOString(),
+        self: { ...body.observation.self, inWater: true, oxygen: 4 },
+      };
+      await emitAndWaitForObservation({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+
+      expect(
+        body.executed.filter(
+          (operation) =>
+            operation.kind === "control" && operation.controls.jump === true,
+        ),
+      ).toHaveLength(1);
+      await runtime.shutdown();
+    },
+  );
 
   it("keeps owner stop immediate during bounded water recovery", async () => {
     const { store } = freshStore();
@@ -4821,7 +5115,10 @@ describe("CompanionRuntime", () => {
     await eventually(
       () =>
         store.snapshot().lastOutcome?.operation.kind === "control" &&
-        store.snapshot().lastOutcome?.status === "successful",
+        store.snapshot().lastOutcome?.status === "unverified",
+    );
+    expect(store.snapshot().lastOutcome?.summary).toContain(
+      "water_recovery:unresolved",
     );
     const recalled = store.recall("水の中に行った理由は？", 7);
 
@@ -4864,18 +5161,292 @@ describe("CompanionRuntime", () => {
     },
   );
 
-  it("reobserves after bounded jump and does not claim surfacing or restart a sweep", async () => {
+  it.each([
+    { label: "unchanged water observation", afterWater: true },
+    { label: "unknown post-recovery water state", afterWater: null },
+  ] as const)(
+    "reobserves after bounded jump and leaves $label unresolved",
+    async ({ afterWater }) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      body.observation = {
+        ...body.observation,
+        self: { ...body.observation.self, inWater: true, oxygen: 4 },
+      };
+      body.executeHandler = async (operation, _signal, fakeBody) => {
+        const before = fakeBody.observation;
+        const after = {
+          ...before,
+          self: { ...before.self, inWater: afterWater },
+        };
+        return fakeBody.result(
+          operation,
+          "water-recovery-unresolved",
+          "successful",
+          after,
+          before,
+        );
+      };
+      const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
+      const runtime = createRuntime(store, body, agent);
+
+      await runtime.start();
+      await eventually(() => runtime.status().nextWakeAt !== null);
+      body.emit({
+        type: "bot_damaged",
+        at: new Date().toISOString(),
+        source: null,
+        confidence: "unknown",
+      });
+      await eventually(
+        () => store.snapshot().lastOutcome?.operation.kind === "control",
+      );
+      await runtime.receiveChat("Builder", "状況を教えて");
+
+      expect(agent.inputs).toHaveLength(2);
+      expect(agent.inputs[1]?.observation.self).toMatchObject({
+        inWater: true,
+        oxygen: 4,
+      });
+      expect(body.executed).toEqual([jump]);
+      expect(store.snapshot().lastOutcome?.status).toBe("unverified");
+      expect(store.snapshot().lastOutcome?.summary).toContain(
+        "water_recovery:unresolved",
+      );
+      expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+        "does not establish surfacing",
+      );
+      expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
+        "continued water or low oxygen as unresolved",
+      );
+    },
+  );
+
+  it("keeps the failed target blocked after a transient dry frame and stable escape", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
+    const target = 44;
+    const collect: PlayerOperation = { kind: "collect_item", entityId: target };
+    const otherTarget = 48;
+    const goal = {
+      title: "Collect the submerged item",
+      successCondition: "Bring the item to safety.",
+      source: "owner" as const,
+    };
+    const rewordedGoal = {
+      title: "Gather the oak log",
+      successCondition: "Add the oak log to inventory.",
+      source: "self" as const,
+    };
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 7 },
+    };
+    const initial = {
+      ...makeDecision([collect]),
+      goal,
+      plan: {
+        purpose: "Collect the requested item.",
+        steps: [
+          {
+            operation: collect,
+            expectedOutcome: "The observed item is collected.",
+          },
+        ],
+      },
+    };
+    const agent = new FakeAgent([
+      initial,
+      { ...makeDecision([collect]), goal: rewordedGoal },
+      { ...makeDecision([collect]), goal: rewordedGoal },
+      ownerGoalDecision([collect], "Collect the submerged item again"),
+    ]);
+    let finishRecovery: (() => void) | undefined;
+    body.executeHandler = async (operation, signal, fakeBody) => {
+      const before = fakeBody.observation;
+      if (operation.kind === "collect_item") {
+        const count = fakeBody.executed.filter(
+          (candidate) => candidate.kind === "collect_item",
+        ).length;
+        if (count > 1)
+          return fakeBody.result(
+            operation,
+            `later-${fakeBody.executed.length}`,
+            "successful",
+            fakeBody.observation,
+            before,
+          );
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "water-collection-interrupted",
+                  "interrupted",
+                  fakeBody.observation,
+                  before,
+                ),
+              ),
+            { once: true },
+          );
+        });
+      }
+      if (operation.kind === "control")
+        return await new Promise<PlayerOperationResult>((resolve) => {
+          finishRecovery = () => {
+            const after = {
+              ...fakeBody.observation,
+              observedAt: new Date().toISOString(),
+              self: {
+                ...fakeBody.observation.self,
+                oxygen: 20,
+                inWater: false,
+              },
+            };
+            fakeBody.observation = after;
+            resolve(
+              fakeBody.result(
+                operation,
+                "water-recovery-progress",
+                "successful",
+                after,
+                before,
+              ),
+            );
+          };
+        });
+      return fakeBody.result(
+        operation,
+        `later-${fakeBody.executed.length}`,
+        "successful",
+        fakeBody.observation,
+        fakeBody.observation,
+      );
+    };
+    const runtime = createRuntime(store, body, agent, undefined, 10_000);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
     body.observation = {
       ...body.observation,
       self: { ...body.observation.self, inWater: true, oxygen: 4 },
     };
-    const agent = new FakeAgent([emptyDecision(), emptyDecision()]);
-    const runtime = createRuntime(store, body, agent);
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "vitals",
+    });
+    await eventually(() => body.executed.length === 2);
+    await eventually(
+      () => store.snapshot().lastOutcome?.operation.kind === "collect_item",
+    );
+    expect(store.snapshot().lastOutcome?.status).toBe("interrupted");
+    expect(store.snapshot().lastOutcome?.summary).toContain(
+      "water_recovery:acquisition_interrupted; trigger=inWater:true,oxygen:4",
+    );
+    expect(body.executed[1]).toEqual(jump);
 
-    await runtime.start();
-    await eventually(() => runtime.status().nextWakeAt !== null);
+    finishRecovery?.();
+    await eventually(
+      () =>
+        store.snapshot().lastOutcome?.operation.kind === "control" &&
+        store
+          .snapshot()
+          .lastOutcome?.summary.includes("water_recovery:dry_observed") ===
+          true,
+    );
+    expect(store.snapshot().lastOutcome?.status).toBe("unverified");
+    expect(store.snapshot().lastOutcome?.summary).toContain(
+      "stable escape remains unconfirmed",
+    );
+
+    const sameTarget = droppedItemEntity(target, 1, "oak_log");
+    body.observation = {
+      ...body.observation,
+      observedAt: new Date().toISOString(),
+      self: { ...body.observation.self, inWater: true, oxygen: 20 },
+      perception: {
+        ...body.observation.perception,
+        entities: [sameTarget],
+        nearbyDroppedItems: makeNearbyDroppedItems([sameTarget]),
+      },
+    };
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    await eventually(() => agent.inputs.length >= 2);
+    expect(agent.inputs[1]?.observation.self).toMatchObject({
+      inWater: true,
+      oxygen: 20,
+    });
+    expect(store.snapshot().goal).toEqual(rewordedGoal);
+    expect(body.executed).toHaveLength(2);
+
+    body.observation = {
+      ...body.observation,
+      observedAt: new Date().toISOString(),
+      self: { ...body.observation.self, inWater: false, oxygen: 20 },
+    };
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "position",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    await eventually(() => agent.inputs.length >= 3);
+    expect(body.executed).toHaveLength(2);
+
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const safeOtherTarget = droppedItemEntity(otherTarget, 2, "birch_log");
+    body.observation = {
+      ...body.observation,
+      observedAt: new Date().toISOString(),
+      perception: {
+        ...body.observation.perception,
+        entities: [sameTarget, safeOtherTarget],
+        nearbyDroppedItems: makeNearbyDroppedItems([
+          sameTarget,
+          safeOtherTarget,
+        ]),
+      },
+    };
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "entities",
+    });
+    await eventually(() => body.executed.length === 3);
+    expect(body.executed[2]).toMatchObject({
+      kind: "collect_item",
+      entityId: otherTarget,
+    });
+
+    await eventually(() => !runtime.status().thinking);
+    await runtime.receiveChat("Builder", "同じアイテムも回収して");
+    await eventually(() => body.executed.length === 4);
+    expect(body.executed[3]).toMatchObject({
+      kind: "collect_item",
+      entityId: target,
+    });
+    await eventually(() => {
+      const outcome = store.snapshot().lastOutcome;
+      return (
+        outcome?.operation.kind === "collect_item" &&
+        outcome.operation.entityId === target &&
+        outcome.status === "successful"
+      );
+    });
+
+    body.observation = {
+      ...body.observation,
+      observedAt: new Date().toISOString(),
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
     body.emit({
       type: "bot_damaged",
       at: new Date().toISOString(),
@@ -4883,23 +5454,128 @@ describe("CompanionRuntime", () => {
       confidence: "unknown",
     });
     await eventually(
-      () => store.snapshot().lastOutcome?.operation.kind === "control",
+      () =>
+        body.executed.filter(
+          (operation) =>
+            operation.kind === "control" && operation.controls.jump === true,
+        ).length === 2,
     );
-    await runtime.receiveChat("Builder", "状況を教えて");
-
-    expect(agent.inputs).toHaveLength(2);
-    expect(agent.inputs[1]?.observation.self).toMatchObject({
-      inWater: true,
-      oxygen: 4,
+    finishRecovery?.();
+    await eventually(() => {
+      const outcome = store.snapshot().lastOutcome;
+      return (
+        outcome?.operation.kind === "control" &&
+        outcome.summary.includes("water_recovery:dry_observed")
+      );
     });
-    expect(body.executed).toEqual([jump]);
-    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
-      "does not establish surfacing",
-    );
-    expect(store.snapshot().lastOutcome?.expectedOutcome).toContain(
-      "continued water or low oxygen as unresolved",
-    );
+    await eventually(() => !runtime.status().thinking);
   });
+
+  it("lets owner stop supersede a pending low-oxygen collection observation", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const collect: PlayerOperation = { kind: "collect_item", entityId: 45 };
+    const agent = new FakeAgent([makeDecision([collect])]);
+    let holdObservation = false;
+    let releaseObservation: (() => void) | undefined;
+    body.observeHandler = async () => {
+      if (!holdObservation) return;
+      await new Promise<void>((resolve) => {
+        releaseObservation = resolve;
+      });
+    };
+    body.executeHandler = async (operation, signal, fakeBody) =>
+      await new Promise<PlayerOperationResult>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () =>
+            resolve(
+              fakeBody.result(
+                operation,
+                "owner-stopped-collection",
+                "interrupted",
+                null,
+              ),
+            ),
+          { once: true },
+        );
+      });
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => body.executed.length === 1);
+    holdObservation = true;
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, inWater: true, oxygen: 4 },
+    };
+    body.emit({
+      type: "state_changed",
+      at: new Date().toISOString(),
+      reason: "vitals",
+    });
+    await eventually(() => body.observeCalls >= 2);
+
+    await runtime.stop("Builder");
+    releaseObservation?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(runtime.status().stopped).toBe(true);
+    expect(body.executed).toHaveLength(1);
+    await runtime.shutdown();
+  });
+
+  it.each([
+    { label: "water state unknown", inWater: null, oxygen: 4 },
+    { label: "oxygen unknown", inWater: true, oxygen: null },
+  ] as const)(
+    "does not interrupt collection for incomplete water evidence ($label)",
+    async ({ inWater, oxygen }) => {
+      const { store } = freshStore();
+      const body = new FakeBody(store);
+      const agent = new FakeAgent([
+        makeDecision([{ kind: "collect_item", entityId: 46 }]),
+      ]);
+      let collectSignal: AbortSignal | undefined;
+      body.executeHandler = async (operation, signal, fakeBody) =>
+        await new Promise<PlayerOperationResult>((resolve) => {
+          collectSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () =>
+              resolve(
+                fakeBody.result(
+                  operation,
+                  "incomplete-water-evidence",
+                  "interrupted",
+                  null,
+                ),
+              ),
+            { once: true },
+          );
+        });
+      const runtime = createRuntime(store, body, agent);
+
+      await runtime.start();
+      await eventually(() => body.executed.length === 1);
+      body.observation = {
+        ...body.observation,
+        self: { ...body.observation.self, inWater, oxygen },
+      };
+      body.emit({
+        type: "state_changed",
+        at: new Date().toISOString(),
+        reason: "vitals",
+      });
+      await eventually(() => body.observeCalls >= 2);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(collectSignal?.aborted).toBe(false);
+      expect(body.executed).toHaveLength(1);
+      await runtime.stop("Builder");
+      expect(runtime.status().stopped).toBe(true);
+    },
+  );
 
   it("attacks one nearby unoccluded hostile from a fresh observation when damage source is unknown", async () => {
     const { store } = freshStore();
