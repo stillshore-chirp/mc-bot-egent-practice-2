@@ -18,6 +18,7 @@ describe("loadConfig", () => {
 
     expect(config.minecraft.version).toBe("1.21.11");
     expect(config.openai.model).toBe("gpt-6-luna");
+    expect(config.openai.reasoningEffort).toBe("medium");
     expect(config.memoryContextLimit).toBe(12);
     expect(config.connection).toEqual({
       timeoutMs: 60_000,
@@ -32,6 +33,22 @@ describe("loadConfig", () => {
       authToken: undefined,
     });
     expect(config.openai.apiKey).toBe("test-only-value");
+  });
+
+  it("accepts an explicit Luna reasoning effort and rejects unsupported values", () => {
+    const configured = loadConfig({
+      ...requiredEnvironment,
+      OPENAI_MODEL: "custom-model-override",
+      OPENAI_REASONING_EFFORT: "none",
+    });
+    expect(configured.openai.model).toBe("custom-model-override");
+    expect(configured.openai.reasoningEffort).toBe("none");
+    expect(() =>
+      loadConfig({
+        ...requiredEnvironment,
+        OPENAI_REASONING_EFFORT: "minimal",
+      }),
+    ).toThrow(ConfigurationError);
   });
 
   it("rejects a Bot identity that would replace the authorized player", () => {

@@ -4086,7 +4086,7 @@ describe("CompanionRuntime", () => {
     }
   });
 
-  it("answers side questions while the original owner goal judgment is still pending", async () => {
+  it("defers a dream while the original owner request is still pending", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const say = vi.fn(async () => undefined);
@@ -4094,7 +4094,10 @@ describe("CompanionRuntime", () => {
     const agent = new FakeAgent([
       () => originalDecision.promise,
       async () =>
-        interleavedReplyDecision("いまの周囲を確認しているよ。", "answer_only"),
+        interleavedReplyDecision(
+          "その夢は今の依頼の後に一緒に考えよう。まず周囲を確認するね。",
+          "answer_only",
+        ),
       async () =>
         interleavedReplyDecision("依頼を続けているよ。", "answer_only"),
     ]);
@@ -4106,12 +4109,15 @@ describe("CompanionRuntime", () => {
       expect(agent.inputs[0]?.ownerMessage).toBe("周囲を確認して");
       expect(agent.signals[0]?.aborted).toBe(false);
 
-      await runtime.receiveChat("Builder", "いま何が見える？");
+      await runtime.receiveChat(
+        "Builder",
+        "いつか海辺に灯台を作りたい。今の依頼の後に考えられる？",
+      );
       await runtime.receiveChat("Builder", "元の依頼は進んでいる？");
 
       expect(agent.inputs).toHaveLength(3);
       expect(agent.inputs[1]).toMatchObject({
-        ownerMessage: "いま何が見える？",
+        ownerMessage: "いつか海辺に灯台を作りたい。今の依頼の後に考えられる？",
         ownerReplyContext: { pendingOwnerRequest: "周囲を確認して" },
       });
       expect(agent.inputs[2]).toMatchObject({
@@ -4121,7 +4127,10 @@ describe("CompanionRuntime", () => {
       expect(agent.signals[0]?.aborted).toBe(false);
       expect(body.executed).toHaveLength(0);
       expect(store.snapshot().goal).toBeNull();
-      expect(say).toHaveBeenNthCalledWith(1, "いまの周囲を確認しているよ。");
+      expect(say).toHaveBeenNthCalledWith(
+        1,
+        "その夢は今の依頼の後に一緒に考えよう。まず周囲を確認するね。",
+      );
       expect(say).toHaveBeenNthCalledWith(2, "依頼を続けているよ。");
 
       originalDecision.resolve(ownerGoalDecision([look], "周囲を確認する"));
@@ -4140,7 +4149,7 @@ describe("CompanionRuntime", () => {
     }
   });
 
-  it("keeps active work for answer-only replies and replaces it only for an explicit new goal", async () => {
+  it("keeps an unfinished owner goal for factual and dream replies", async () => {
     const { store } = freshStore();
     const body = new FakeBody(store);
     const say = vi.fn(async () => undefined);
@@ -4152,6 +4161,10 @@ describe("CompanionRuntime", () => {
     const agent = new FakeAgent([
       ownerGoalDecision([look], "周囲を確認する"),
       interleavedReplyDecision("いま確認中だよ。", "answer_only"),
+      interleavedReplyDecision(
+        "その大きな目標は、周囲の確認が終わってから一緒に考えよう。",
+        "answer_only",
+      ),
       interleavedReplyDecision(null, "update_goal"),
       ownerGoalDecision([move], "木を集める"),
     ]);
@@ -4188,6 +4201,10 @@ describe("CompanionRuntime", () => {
     expect(originalOperation).not.toBeNull();
 
     await runtime.receiveChat("Builder", "いまはどこを見ている？");
+    await runtime.receiveChat(
+      "Builder",
+      "いつか大きな目標に挑戦したい。一緒に考えてくれる？",
+    );
     expect(originalBodySignal?.aborted).toBe(false);
     expect(store.snapshot().goal).toEqual(originalGoal);
     expect(store.snapshot().activeOperation).toEqual(originalOperation);
@@ -4202,14 +4219,119 @@ describe("CompanionRuntime", () => {
       ownerReplyContext: { pendingOwnerRequest: null },
     });
     expect(agent.inputs[2]).toMatchObject({
+      ownerMessage: "いつか大きな目標に挑戦したい。一緒に考えてくれる？",
+      ownerReplyContext: { pendingOwnerRequest: null },
+      snapshot: {
+        goal: originalGoal,
+        activeOperation: originalOperation,
+      },
+    });
+    expect(agent.inputs[3]).toMatchObject({
       ownerMessage: "木を集めて",
       ownerReplyContext: { pendingOwnerRequest: null },
     });
-    expect(agent.inputs[3]?.ownerMessage).toBe("木を集めて");
-    expect(agent.inputs).toHaveLength(4);
+    expect(agent.inputs[4]?.ownerMessage).toBe("木を集めて");
+    expect(agent.inputs).toHaveLength(5);
     expect(body.executed).toEqual([look, move]);
     expect(store.snapshot().goal?.title).toBe("木を集める");
     expect(say).toHaveBeenCalledWith("いま確認中だよ。");
+    expect(say).toHaveBeenCalledWith(
+      "その大きな目標は、周囲の確認が終わってから一緒に考えよう。",
+    );
+  });
+
+  it("promotes an unblocked dream through update-goal and a fresh normal judgment", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const title = "海辺に灯台を作る";
+    const successCondition = "灯台の完成をBody観測で確かめる";
+    const dreamDecision = (): CompanionDecision =>
+      companionDecisionSchema.parse({
+        ...ownerGoalDecision([look], title),
+        goal: { title, successCondition, source: "owner" },
+        plan: {
+          purpose:
+            "海辺の場所を確認し、資材を集めて灯台を建て、Body観測で完成を確かめる。まず現在の観測から候補地を調べ、結果を見て次の段階を決める。",
+          steps: [
+            {
+              operation: look,
+              expectedOutcome: "新しいBody観測で周囲の候補地を確認する",
+            },
+          ],
+        },
+        waitMs: 5_000,
+      });
+    const agent = new FakeAgent([
+      (_input, signal) =>
+        new Promise<CompanionDecision>((_resolve, reject) => {
+          const abort = (): void => reject(new Error("aborted"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        }),
+      interleavedReplyDecision(null, "update_goal"),
+      dreamDecision(),
+      dreamDecision(),
+    ]);
+    const runtime = createRuntime(store, body, agent);
+    let observationNumber = 0;
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      observationNumber += 1;
+      const after = {
+        ...before,
+        observedAt: `2026-10-12T00:00:0${observationNumber}.000Z`,
+        time: { ...before.time, timeOfDay: 7_000 + observationNumber * 1_000 },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `dream-flow-${observationNumber}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    expect(agent.inputs[0]?.ownerMessage).toBeUndefined();
+    expect(agent.inputs[0]?.snapshot.goal).toBeNull();
+
+    const dreamQuestion =
+      "いつか海辺に灯台を作りたい。大きな目標にできるかな？";
+    await runtime.receiveChat("Builder", dreamQuestion);
+
+    expect(agent.signals[0]?.aborted).toBe(true);
+    expect(agent.inputs[1]).toMatchObject({
+      ownerMessage: dreamQuestion,
+      ownerReplyContext: { pendingOwnerRequest: null },
+      snapshot: { goal: null, activeOperation: null },
+    });
+    expect(agent.inputs[2]?.ownerMessage).toBe(dreamQuestion);
+    expect(store.snapshot().goal).toMatchObject({
+      title,
+      successCondition,
+      source: "owner",
+    });
+    await eventually(() => body.executed.length === 1);
+    expect(body.executed).toEqual([look]);
+    expect(body.results[0]?.after?.time.timeOfDay).toBe(8_000);
+
+    body.emit({
+      type: "state_changed",
+      at: "2026-10-12T00:00:02.000Z",
+      reason: "position",
+    });
+    await eventually(() => agent.inputs.length === 4, 4_000);
+
+    expect(agent.inputs[3]?.snapshot.goal).toMatchObject({
+      title,
+      successCondition,
+      source: "owner",
+    });
+    expect(agent.inputs[3]?.observation.time.timeOfDay).toBe(8_000);
+    await eventually(() => body.executed.length === 2);
+    expect(store.snapshot().goal).toMatchObject({ title, successCondition });
   });
 
   it("suppresses a superseded or stopped interleaved reply", async () => {
@@ -4389,6 +4511,98 @@ describe("CompanionRuntime", () => {
       body.runtimeMarkerIds[1],
     );
     expect(runtime.status().lastOutcome?.status).toBe("successful");
+  });
+
+  it("continues a natural owner goal from a fresh Body observation", async () => {
+    const { store } = freshStore();
+    const title = "海辺に灯台を作る";
+    const successCondition =
+      "安全な海辺の場所を見つけ、灯台の完成をBody観測で確かめる";
+    const dreamDecision = (): CompanionDecision =>
+      companionDecisionSchema.parse({
+        ...ownerGoalDecision([look], title),
+        goal: { title, successCondition, source: "owner" },
+        plan: {
+          purpose: "まず周囲を確認し、観測後に同じ目標を続ける",
+          steps: [
+            {
+              operation: look,
+              expectedOutcome: "周囲の状態をBody観測で確認する",
+            },
+          ],
+        },
+        waitMs: 5_000,
+      });
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([dreamDecision(), dreamDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const observationNumber = fakeBody.executed.length;
+      if (observationNumber === 1) {
+        expect(store.snapshot().goal).toMatchObject({
+          title,
+          successCondition,
+          source: "owner",
+        });
+        expect(store.snapshot().plan).toMatchObject({
+          purpose: "まず周囲を確認し、観測後に同じ目標を続ける",
+          steps: [
+            {
+              operation: look,
+              expectedOutcome: "周囲の状態をBody観測で確認する",
+            },
+          ],
+        });
+      }
+      const timeOfDay = observationNumber === 1 ? 8_000 : 10_000;
+      const after = {
+        ...before,
+        observedAt:
+          observationNumber === 1
+            ? "2026-10-11T00:00:01.000Z"
+            : "2026-10-11T00:00:03.000Z",
+        time: { ...before.time, timeOfDay },
+      };
+      fakeBody.observation = after;
+      return fakeBody.result(
+        operation,
+        `dream-step-${observationNumber}`,
+        "successful",
+        after,
+        before,
+      );
+    };
+
+    const ownerMessage =
+      "いつか海辺に灯台を作りたい。安全な場所を見つけて、完成したか確かめたい。";
+    await runtime.receiveChat("Builder", ownerMessage);
+
+    expect(agent.inputs).toHaveLength(1);
+    expect(agent.inputs[0]?.ownerMessage).toBe(ownerMessage);
+    expect(store.snapshot().goal).toMatchObject({
+      title,
+      successCondition,
+      source: "owner",
+    });
+    expect(body.results[0]?.after?.time.timeOfDay).toBe(8_000);
+
+    body.emit({
+      type: "state_changed",
+      at: "2026-10-11T00:00:02.000Z",
+      reason: "position",
+    });
+    await eventually(() => agent.inputs.length === 2, 4_000);
+
+    expect(agent.inputs[1]?.snapshot.goal).toMatchObject({
+      title,
+      successCondition,
+      source: "owner",
+    });
+    expect(agent.inputs[1]?.observation.time.timeOfDay).toBe(8_000);
+    await eventually(() => body.executed.length === 2);
+    expect(body.results[1]?.after?.time.timeOfDay).toBe(10_000);
+    expect(store.snapshot().goal).toMatchObject({ title, successCondition });
   });
 
   it("continues a plan to collect a received drop outside the visible entity list", async () => {

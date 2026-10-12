@@ -188,6 +188,37 @@ function hasRequiredNullableProperty(
 }
 
 describe("CompanionAgent", () => {
+  it("keeps the explicit none effort for callers without an override", async () => {
+    const create = vi.fn().mockResolvedValue(
+      response({
+        speech: null,
+        ownerMessageDisposition: null,
+        goal: null,
+        plan: null,
+        memoryUpdates: [],
+        relationshipSummary: null,
+        waitMs: 10_000,
+        knowledgeQuery: null,
+      }),
+    );
+    const agent = new CompanionAgent({
+      client: { responses: { create } } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+
+    await agent.decide(createInput());
+
+    const [request] = create.mock.calls[0] as unknown as [
+      { reasoning: { effort: string } },
+    ];
+    expect(request.reasoning.effort).toBe("none");
+    expect(agent.status()).toMatchObject({
+      requestedModel: "gpt-6-luna",
+      requestedReasoningEffort: "none",
+    });
+  });
+
   it("accepts speech up to 2000 characters and rejects longer speech", () => {
     const validOutput = {
       speech: "a".repeat(2_000),
@@ -256,10 +287,12 @@ describe("CompanionAgent", () => {
         text: { format: { strict: boolean; schema: unknown } };
         store: boolean;
         model: string;
+        reasoning: { effort: string };
       },
       { maxRetries: number },
     ];
     expect(request.model).toBe("gpt-6-luna");
+    expect(request.reasoning.effort).toBe("medium");
     expect(request.instructions).toContain(
       "ownerMessageがある時は、その発言の意味・対象・直前の出来事を優先して自然に返答してください。話題が切り替わったら古い別件を代わりに説明せず、感情を決めつけずにペルソナと会話の流れに沿ってください。",
     );
@@ -298,6 +331,8 @@ describe("CompanionAgent", () => {
     expect(decision.plan?.steps[0]?.operation).toEqual({ kind: "consume" });
     expect(decision.relationshipSummary).toBeNull();
     expect(agent.status()).toMatchObject({
+      requestedModel: "gpt-6-luna",
+      requestedReasoningEffort: "medium",
       requests: 1,
       usageResponses: 1,
       missingUsageRequests: 0,
@@ -308,7 +343,7 @@ describe("CompanionAgent", () => {
     });
   });
 
-  it("encodes the pending goal context and answer-only disposition contract", async () => {
+  it("encodes pending work and conditional dream disposition rules", async () => {
     const output = {
       speech: "いま確認しているよ。",
       ownerMessageDisposition: "answer_only",
@@ -354,6 +389,24 @@ describe("CompanionAgent", () => {
     });
     expect(request.instructions).toContain(
       "ownerReplyContextがある独立返信ではownerMessageDispositionを必ず選んでください。",
+    );
+    expect(request.instructions).toContain(
+      "ownerが進行中の依頼の取消し・置換を明示する場合、または明示的な新しいゲーム内行動を要求する場合は、夢の話題を含んでもupdate_goalだけを選び",
+    );
+    expect(request.instructions).toContain(
+      "事実・状況・進捗の質問はanswer_onlyとし、speechだけで答え、goal/plan/memoryUpdates/relationshipSummary/knowledgeQueryを更新せず",
+    );
+    expect(request.instructions).toContain(
+      "夢・将来やりたいこと・大きな目標についての純粋な質問（ゲーム内行動の実行を明示依頼していない場合）だけは、runnableなpendingOwnerRequestがある、companion.activeOperationがある、またはcompanion.goal.source=ownerの成功条件が現在のBody観測で未達と分かる間、answer_only",
+    );
+    expect(request.instructions).toContain(
+      "companion.goal.source=ownerという保存値だけで未完了と決めつけず",
+    );
+    expect(request.instructions).toContain(
+      "interleaved返信でgoalやplanを作らず、そのowner発言を既存の通常判断へ渡してください。",
+    );
+    expect(request.instructions).toContain(
+      "plan.purposeに必要な複数段階の方針、stepsに現在の観測から着手可能な1〜3操作",
     );
     expect(
       hasRequiredNullableProperty(

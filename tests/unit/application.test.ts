@@ -52,7 +52,11 @@ describe("companion application setup", () => {
         version: "1.21.11",
       },
       ownerUsername: "owner",
-      openai: { apiKey: "test-key", model: "gpt-6-luna" },
+      openai: {
+        apiKey: "test-key",
+        model: "gpt-6-luna",
+        reasoningEffort: "medium",
+      },
       databasePath,
       personaPath: fileURLToPath(
         new URL("../../config/persona.example.json", import.meta.url),
