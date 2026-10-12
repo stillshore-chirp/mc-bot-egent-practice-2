@@ -15,6 +15,15 @@ const optionalTrimmedEnvironment = z.preprocess(
   z.string().trim().optional(),
 );
 
+const openAIReasoningEfforts = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 export const environmentSchema = z
   .object({
     MINECRAFT_HOST: z.string().trim().min(1),
@@ -25,6 +34,7 @@ export const environmentSchema = z
     OWNER_USERNAME: z.string().trim().min(1),
     OPENAI_API_KEY: z.string().trim().min(1),
     OPENAI_MODEL: z.string().trim().default("gpt-6-luna"),
+    OPENAI_REASONING_EFFORT: z.enum(openAIReasoningEfforts).default("medium"),
     DATABASE_PATH: z.string().trim().default("data/companion.sqlite"),
     PERSONA_PATH: z.string().trim().default("config/persona.example.json"),
     LOG_LEVEL: z
@@ -89,6 +99,7 @@ export interface AppConfig {
   readonly openai: {
     readonly apiKey: string;
     readonly model: string;
+    readonly reasoningEffort: Environment["OPENAI_REASONING_EFFORT"];
   };
   readonly databasePath: string;
   readonly personaPath: string;

@@ -36,6 +36,8 @@ function fixture(): DashboardSnapshot {
         { code: "request_failed", at: "2026-10-09T23:59:00.000Z" },
       ],
       usage: {
+        requestedModel: "gpt-6-luna",
+        requestedReasoningEffort: "medium",
         requests: 3,
         usageResponses: 2,
         missingUsageRequests: 1,
@@ -183,7 +185,14 @@ describe("DashboardHttpServer", () => {
     expect(authorized.status).toBe(200);
     const payload: unknown = await authorized.json();
     expect(payload).toMatchObject({
-      runtime: { usage: { inputTokens: null, requests: 3 } },
+      runtime: {
+        usage: {
+          inputTokens: null,
+          requests: 3,
+          requestedModel: "gpt-6-luna",
+          requestedReasoningEffort: "medium",
+        },
+      },
       memories: [
         {
           content: "<img src=x onerror=alert(1)>",

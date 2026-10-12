@@ -32,15 +32,16 @@ npm start
 
 開発時は `npm run dev` を使います。起動前のloopback・port・ゲームモード確認には、ローカルserverだけを対象にする `npm run preflight:local -- --server-dir <server-dir> --expected-mode survival --expected-difficulty normal` を使えます。この確認はserverやworldへ書き込みません。
 
-| 設定                                                     | 用途・既定値                                                        |
-| -------------------------------------------------------- | ------------------------------------------------------------------- |
-| `MINECRAFT_HOST`, `MINECRAFT_USERNAME`, `OWNER_USERNAME` | 必須。Botとownerは別のidentity                                      |
-| `MINECRAFT_PORT`, `MINECRAFT_AUTH`, `MINECRAFT_VERSION`  | `25565`, `microsoft`, `1.21.11`                                     |
-| `OPENAI_API_KEY`, `OPENAI_MODEL`                         | key必須、既定model `gpt-6-luna`                                     |
-| `DATABASE_PATH`, `PERSONA_PATH`                          | `data/companion.sqlite`, `config/persona.example.json`              |
-| `CONNECT_TIMEOUT_MS`, `RECONNECT_*`                      | 接続期限と切断後の再試行                                            |
-| `DASHBOARD_ENABLED`, `DASHBOARD_HOST`, `DASHBOARD_PORT`  | read-only管理画面。既定は `127.0.0.1:4310`                          |
-| `DASHBOARD_AUTH_TOKEN`                                   | loopback画面のBearer認証に任意。設定時は32文字以上。URLには含めない |
+| 設定                                                     | 用途・既定値                                                         |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| `MINECRAFT_HOST`, `MINECRAFT_USERNAME`, `OWNER_USERNAME` | 必須。Botとownerは別のidentity                                       |
+| `MINECRAFT_PORT`, `MINECRAFT_AUTH`, `MINECRAFT_VERSION`  | `25565`, `microsoft`, `1.21.11`                                      |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`                         | key必須、既定model `gpt-6-luna`                                      |
+| `OPENAI_REASONING_EFFORT`                                | 既定 `medium`。`/api/snapshot`に要求値表示。Provider実効値は示さない |
+| `DATABASE_PATH`, `PERSONA_PATH`                          | `data/companion.sqlite`, `config/persona.example.json`               |
+| `CONNECT_TIMEOUT_MS`, `RECONNECT_*`                      | 接続期限と切断後の再試行                                             |
+| `DASHBOARD_ENABLED`, `DASHBOARD_HOST`, `DASHBOARD_PORT`  | read-only管理画面。既定は `127.0.0.1:4310`                           |
+| `DASHBOARD_AUTH_TOKEN`                                   | loopback画面のBearer認証に任意。設定時は32文字以上。URLには含めない  |
 
 値は [.env.example](.env.example) と [設定schema](src/config/schema.ts) に記載しています。実値、会話、記憶、Minecraft worldの情報をGitへ含めないでください。
 

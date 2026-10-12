@@ -168,6 +168,7 @@ export function createApplication(config: AppConfig): CompanionApplication {
   const agent = new CompanionAgent({
     client: new OpenAI({ apiKey: config.openai.apiKey }),
     model: config.openai.model,
+    reasoningEffort: config.openai.reasoningEffort,
     persona,
   });
   const runtime = new CompanionRuntime({
@@ -213,6 +214,8 @@ function createDashboardSnapshot(
   const status = runtime.status();
   const snapshot = store.snapshot();
   const usage = status.usage ?? {
+    requestedModel: null,
+    requestedReasoningEffort: null,
     requests: 0,
     usageResponses: 0,
     missingUsageRequests: 0,

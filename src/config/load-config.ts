@@ -32,6 +32,7 @@ export function loadConfig(
     openai: {
       apiKey: env.OPENAI_API_KEY,
       model: env.OPENAI_MODEL,
+      reasoningEffort: env.OPENAI_REASONING_EFFORT,
     },
     databasePath: env.DATABASE_PATH,
     personaPath: env.PERSONA_PATH,

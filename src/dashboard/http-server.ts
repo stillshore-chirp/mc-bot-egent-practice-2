@@ -14,6 +14,8 @@ export type DashboardConnectionState =
   "idle" | "connecting" | "connected" | "reconnecting" | "failed" | "stopped";
 
 export interface DashboardUsageSnapshot {
+  readonly requestedModel?: string | null;
+  readonly requestedReasoningEffort?: string | null;
   readonly requests: number;
   readonly usageResponses: number;
   readonly missingUsageRequests: number;
@@ -103,6 +105,14 @@ const outcomeStatuses = new Set([
   "interrupted",
   "cancelled",
   "unverified",
+]);
+const reasoningEfforts = new Set([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
 ]);
 const maximumQueryLength = 2_000;
 const maximumMemoryCount = 30;
@@ -460,6 +470,12 @@ function sanitizeSnapshot(snapshot: DashboardSnapshot): DashboardSnapshot {
             : [{ code, at: safeText(error.at, 64) ?? "" }];
         }),
       usage: {
+        requestedModel: safeText(usage.requestedModel, 80),
+        requestedReasoningEffort:
+          typeof usage.requestedReasoningEffort === "string" &&
+          reasoningEfforts.has(usage.requestedReasoningEffort)
+            ? usage.requestedReasoningEffort
+            : null,
         requests: safeCount(usage.requests),
         usageResponses: safeCount(usage.usageResponses),
         missingUsageRequests: safeCount(usage.missingUsageRequests),
