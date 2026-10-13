@@ -42,9 +42,13 @@ import {
   type MemoryUpdate,
 } from "./contracts.js";
 import { playerOperationSchema } from "../minecraft/player-body-schema.js";
+import { playerHomePoiScanSchema } from "../minecraft/player-body-observation.js";
 import type {
   PlayerBodyDeathCause,
   PlayerBodyEvent,
+  PlayerHomePoi,
+  PlayerHomePoiDoor,
+  PlayerHomePoiScan,
 } from "../minecraft/player-body.js";
 
 const STORE_SCHEMA_VERSION = 1;
@@ -63,6 +67,7 @@ const MAX_REPLY_LIFECYCLE_RECORDS = 12;
 const MAX_REPLY_LIFECYCLE_EVENTS = 12;
 const CHEST_CONTENT_TTL_MS = 60 * 60 * 1_000;
 const OBSERVED_LIFE_EPISODE_LIMIT = 8;
+const OBSERVED_HOME_POI_LIMIT = 8;
 type ObservedLifeEvent = Extract<
   PlayerBodyEvent,
   {
@@ -194,6 +199,28 @@ const bedMemoryObservationSchema = z
     dimension: chestDimensionSchema,
     position: chestPositionSchema,
     observedAt: z.iso.datetime(),
+  })
+  .strict();
+const storedHomePoiScanSummarySchema = z
+  .object({
+    observedAt: z.iso.datetime(),
+    center: chestPositionSchema,
+    radius: z.literal(128),
+    coverage: z.literal("loaded_blocks_only"),
+    candidateLimit: z.literal(OBSERVED_HOME_POI_LIMIT),
+    omittedCandidatesAtLeast: z.number().int().min(0),
+    candidateSearchMayBeTruncated: z.boolean(),
+  })
+  .strict();
+const homePoiMemoryMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    kind: z.literal("bed_head"),
+    locationKey: z.string().min(1).max(256),
+    dimension: chestDimensionSchema,
+    bedName: z.string().regex(/^[a-z0-9_.:/-]{1,128}_bed$/iu),
+    scan: storedHomePoiScanSummarySchema,
+    home: z.unknown(),
   })
   .strict();
 const SECRET_LABEL =
@@ -933,6 +960,103 @@ export class CompanionStore {
       )
       .get();
     return row === undefined ? null : memoryFromRow(row);
+  }
+
+  /** Persists each observed bed-head HOME POI without claiming a building shape. */
+  public rememberObservedHomePoiScan(
+    input: PlayerHomePoiScan,
+  ): CompanionMemory[] {
+    const parsed = playerHomePoiScanSchema.safeParse(input);
+    if (!parsed.success) throw invalidInput("Invalid observed HOME POI scan.");
+    const scan = parsed.data;
+    const uniqueHomes = new Map<string, PlayerHomePoi>();
+    for (const home of scan.homes) {
+      const locationKey = homePoiLocationKey(
+        scan.dimension,
+        home.bedHead,
+      );
+      uniqueHomes.set(locationKey, home);
+    }
+    return this.#database
+      .transaction(() => {
+        const memories: CompanionMemory[] = [];
+        for (const [locationKey, home] of uniqueHomes) {
+          const existingRow = this.#database
+            .prepare<[string], MemoryRow>(
+              `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+               FROM companion_memories
+               WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
+                 AND json_extract(metadata_json, '$.homeMemory.locationKey') = ?
+               ORDER BY updated_at DESC, memory_id DESC
+               LIMIT 1`,
+            )
+            .get(locationKey);
+          const existing =
+            existingRow === undefined ? null : memoryFromRow(existingRow);
+          const previous =
+            existing === null ? undefined : homePoiMemoryFrom(existing);
+          const mergedHome = mergeObservedHomePoi(previous?.home, home);
+          const metadata = {
+            homeMemory: {
+              version: 1,
+              kind: "bed_head",
+              locationKey,
+              dimension: scan.dimension,
+              bedName: home.bedName,
+              scan: {
+                observedAt: scan.observedAt,
+                center: scan.center,
+                radius: scan.radius,
+                coverage: scan.coverage,
+                candidateLimit: scan.candidateLimit,
+                omittedCandidatesAtLeast: scan.omittedCandidatesAtLeast,
+                candidateSearchMayBeTruncated:
+                  scan.candidateSearchMayBeTruncated,
+              },
+              home: mergedHome,
+            },
+          };
+          this.#database
+            .prepare(
+              "UPDATE companion_memories SET status = 'superseded' WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active' AND json_extract(metadata_json, '$.homeMemory.locationKey') = ?",
+            )
+            .run(locationKey);
+          memories.push(
+            this.insertMemory({
+              kind: "world",
+              content: `Observed bed-head HOME POI: ${locationKey}`,
+              source: "minecraft_observed",
+              status: "active",
+              importance: 5,
+              metadata: recordToJson(metadata),
+              createdAt: existing?.createdAt ?? scan.observedAt,
+              updatedAt: scan.observedAt,
+            }),
+          );
+        }
+        return memories;
+      })
+      .immediate();
+  }
+
+  /** Returns at most eight newest observed HOME POIs for direct Agent context. */
+  public latestObservedHomePois(limit = OBSERVED_HOME_POI_LIMIT): CompanionMemory[] {
+    const boundedLimit = Math.max(
+      0,
+      Math.min(OBSERVED_HOME_POI_LIMIT, Math.trunc(limit)),
+    );
+    if (boundedLimit === 0) return [];
+    const rows = this.#database
+      .prepare<[number], MemoryRow>(
+        `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+         FROM companion_memories
+         WHERE kind = 'world' AND source = 'minecraft_observed' AND status = 'active'
+           AND json_extract(metadata_json, '$.homeMemory.kind') = 'bed_head'
+         ORDER BY updated_at DESC, memory_id DESC
+         LIMIT ?`,
+      )
+      .all(boundedLimit);
+    return rows.map(memoryFromRow);
   }
 
   /** Persists only Body-confirmed life events without touching the stop latch. */
@@ -3055,6 +3179,105 @@ function recordToJson(value: Record<string, unknown>): JsonObject {
 function mergeJsonMetadata(left: JsonValue, right: JsonValue): JsonValue {
   if (!isRecord(left) || !isRecord(right)) return right;
   return { ...recordToJson(left), ...recordToJson(right) };
+}
+
+function homePoiLocationKey(
+  dimension: string,
+  position: PlayerHomePoi["bedHead"],
+): string {
+  return JSON.stringify([dimension, position.x, position.y, position.z]);
+}
+
+function homePoiMemoryFrom(
+  memory: CompanionMemory,
+): { readonly home: PlayerHomePoi } | undefined {
+  if (
+    memory.kind !== "world" ||
+    memory.source !== "minecraft_observed" ||
+    memory.status !== "active" ||
+    !isRecord(memory.metadata)
+  )
+    return undefined;
+  const rawHomeMemory = memory.metadata.homeMemory;
+  const parsedMemory = homePoiMemoryMetadataSchema.safeParse(rawHomeMemory);
+  if (!parsedMemory.success) return undefined;
+  const value = parsedMemory.data;
+  const parsedScan = playerHomePoiScanSchema.safeParse({
+    source: "loaded_home_poi_scan",
+    observedAt: value.scan.observedAt,
+    dimension: value.dimension,
+    center: value.scan.center,
+    radius: value.scan.radius,
+    coverage: value.scan.coverage,
+    candidateLimit: value.scan.candidateLimit,
+    omittedCandidatesAtLeast: value.scan.omittedCandidatesAtLeast,
+    candidateSearchMayBeTruncated: value.scan.candidateSearchMayBeTruncated,
+    worldAbsenceEstablished: false,
+    homes: [value.home],
+  });
+  const home = parsedScan.success ? parsedScan.data.homes[0] : undefined;
+  if (
+    home === undefined ||
+    home.bedName !== value.bedName ||
+    homePoiLocationKey(value.dimension, home.bedHead) !== value.locationKey
+  )
+    return undefined;
+  return { home };
+}
+
+function mergeObservedHomePoi(
+  previous: PlayerHomePoi | undefined,
+  next: PlayerHomePoi,
+): PlayerHomePoi {
+  const doors = new Map<string, PlayerHomePoiDoor>();
+  for (const door of previous?.doors ?? [])
+    doors.set(blockCoordinateKey(door.position), door);
+  for (const door of next.doors) {
+    const key = blockCoordinateKey(door.position);
+    const prior = doors.get(key);
+    if (prior?.relation === "verified" && door.relation === "unknown") {
+      doors.set(key, {
+        ...prior,
+        observedState: door.observedState,
+        observedAt: door.observedAt,
+      });
+    } else {
+      doors.set(key, door);
+    }
+  }
+  const retainedDoors = [...doors.values()]
+    .sort((left, right) => {
+      if (left.relation !== right.relation)
+        return left.relation === "verified" ? -1 : 1;
+      return (
+        Date.parse(right.observedAt) - Date.parse(left.observedAt) ||
+        blockCoordinateKey(left.position).localeCompare(
+          blockCoordinateKey(right.position),
+        )
+      );
+    })
+    .slice(0, OBSERVED_HOME_POI_LIMIT);
+  const retainedVerifiedRelation = retainedDoors.some(
+    (door) => door.relation === "verified",
+  );
+  return {
+    ...next,
+    doorRelationStatus: retainedVerifiedRelation
+      ? "verified"
+      : next.doorRelationStatus,
+    doorRelationReason: retainedVerifiedRelation
+      ? "verified_flat_room_boundary"
+      : next.doorRelationReason,
+    doors: retainedDoors,
+  };
+}
+
+function blockCoordinateKey(position: {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}): string {
+  return JSON.stringify([position.x, position.y, position.z]);
 }
 
 function jsonText(value: unknown, limit: number): string {

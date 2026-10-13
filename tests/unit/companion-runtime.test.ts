@@ -25,6 +25,7 @@ import type {
   PlayerBodyObservationOptions,
   PlayerKnowledge,
   PlayerOperationResult,
+  PlayerHomePoiScan,
 } from "../../src/minecraft/player-body.js";
 import type {
   BodyItemStack,
@@ -590,6 +591,7 @@ function createRuntime(
 }
 
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
+const scanHome = playerOperationSchema.parse({ kind: "scan_home" });
 const jump = playerOperationSchema.parse({
   kind: "control",
   controls: { jump: true },
@@ -647,6 +649,67 @@ describe("CompanionRuntime", () => {
     expect(store.snapshot().lastOutcome?.bodyEvidence?.startedAt).toBe(
       body.results[0]?.startedAt,
     );
+  });
+
+  it("persists a successful HOME scan and supplies it to a later Agent decision", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([makeDecision([scanHome]), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const observedAt = "2026-10-10T00:00:00.000Z";
+    const scan: PlayerHomePoiScan = {
+      source: "loaded_home_poi_scan",
+      observedAt,
+      dimension: "overworld",
+      center: { x: 0, y: 64, z: 0 },
+      radius: 128,
+      coverage: "loaded_blocks_only",
+      candidateLimit: 8,
+      omittedCandidatesAtLeast: 0,
+      candidateSearchMayBeTruncated: false,
+      worldAbsenceEstablished: false,
+      homes: [
+        {
+          bedName: "minecraft:oak_bed",
+          bedHead: { x: 8, y: 64, z: 4 },
+          observedAt,
+          doorRelationStatus: "unknown",
+          doorRelationReason: "no_supported_closed_wood_door_boundary",
+          connectedRoomCellCount: 0,
+          roomSearchTruncated: false,
+          doorSearchMayBeTruncated: false,
+          doors: [],
+        },
+      ],
+    };
+    body.executeHandler = async (operation, _signal, fakeBody) => ({
+      ...fakeBody.result(
+        operation,
+        "synthetic-home-scan",
+        "successful",
+        fakeBody.observation,
+      ),
+      homePoiScan: scan,
+    });
+
+    await runtime.receiveChat("Builder", "近くのベッドを探して");
+
+    expect(body.executed).toEqual([{ kind: "scan_home" }]);
+    expect(store.latestObservedHomePois()).toHaveLength(1);
+    expect(agent.inputs[0]?.homePoiMemories).toEqual([]);
+
+    await runtime.receiveChat("Builder", "前に記録したベッドの場所を教えて");
+
+    expect(agent.inputs.at(-1)?.homePoiMemories).toHaveLength(1);
+    expect(agent.inputs.at(-1)?.homePoiMemories?.[0]?.metadata).toMatchObject({
+      homeMemory: {
+        dimension: "overworld",
+        home: {
+          bedName: "minecraft:oak_bed",
+          bedHead: { x: 8, y: 64, z: 4 },
+        },
+      },
+    });
   });
 
   it("provides declared purpose and post-action evidence to a later question after synthetic respawn", async () => {
