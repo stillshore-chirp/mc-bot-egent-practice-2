@@ -671,17 +671,14 @@ const homePoiDirections: readonly {
   { direction: "west", x: -1, z: 0 },
 ];
 
-function scanLoadedHomePois(
-  bot: Bot,
-  signal: AbortSignal,
-): PlayerHomePoiScan {
+function scanLoadedHomePois(bot: Bot, signal: AbortSignal): PlayerHomePoiScan {
   throwIfAborted(signal);
   const observedAt = new Date().toISOString();
   const origin = bot.entity.position.clone();
   const center = origin.floored();
   const rawCandidates = bot.findBlocks({
     matching: (block) => isBedHeadPoi(block),
-    point: center,
+    point: origin,
     maxDistance: homePoiSearchRadius,
     count: homePoiSearchSentinel,
   });
@@ -689,8 +686,9 @@ function scanLoadedHomePois(
     .filter((position) => origin.distanceTo(position) <= homePoiSearchRadius)
     .filter(
       (position, index, all) =>
-        all.findIndex((candidate) => blockKey(candidate) === blockKey(position)) ===
-        index,
+        all.findIndex(
+          (candidate) => blockKey(candidate) === blockKey(position),
+        ) === index,
     )
     .sort((left, right) => origin.distanceTo(left) - origin.distanceTo(right));
   const homes: PlayerHomePoi[] = [];
@@ -701,6 +699,7 @@ function scanLoadedHomePois(
     homes.push(analyzeHomePoi(bot, bed, observedAt, signal));
   }
   const candidateSearchMayBeTruncated =
+    rawCandidates.length >= homePoiSearchSentinel ||
     candidates.length >= homePoiSearchSentinel;
   return {
     source: "loaded_home_poi_scan",
@@ -768,7 +767,7 @@ function analyzeHomePoi(
     maxDistance: homePoiDoorSearchRadius,
     count: homePoiDoorSearchSentinel,
   });
-  const doorSearchMayBeTruncated =
+  let doorSearchMayBeTruncated =
     rawDoorPositions.length >= homePoiDoorSearchSentinel;
   const canonicalDoors = new Map<string, Block>();
   for (const position of rawDoorPositions) {
@@ -784,6 +783,7 @@ function analyzeHomePoi(
     if (lowerDoor === null || !isHandOperableDoor(lowerDoor.name)) continue;
     canonicalDoors.set(blockKey(lowerDoor.position), lowerDoor);
   }
+  doorSearchMayBeTruncated ||= canonicalDoors.size > playerHomePoiDoorLimit;
   const doors = [...canonicalDoors.values()]
     .sort(
       (left, right) =>
@@ -874,9 +874,7 @@ function classifyHomeDoor(
       : properties.open === false
         ? "closed"
         : "unknown";
-  const unknown = (
-    reason: PlayerHomePoiDoor["reason"],
-  ): PlayerHomePoiDoor => ({
+  const unknown = (reason: PlayerHomePoiDoor["reason"]): PlayerHomePoiDoor => ({
     position: blockCoordinates(position),
     facing,
     observedState,
@@ -889,13 +887,20 @@ function classifyHomeDoor(
   });
   if (observedState === "open") return unknown("door_open");
   if (observedState !== "closed") return unknown("door_state_unknown");
+  if (facing === null) return unknown("ambiguous_boundary");
   if (incompleteBoundary || roomSearchTruncated)
     return unknown("room_evidence_incomplete");
 
   const insideCells: Vec3[] = [];
   const outsideCells: Vec3[] = [];
-  for (const direction of homePoiDirections) {
-    const neighbor = position.offset(direction.x, 0, direction.z);
+  const facingAxis = homePoiDirections.find(
+    (direction) => direction.direction === facing,
+  );
+  if (facingAxis === undefined) return unknown("ambiguous_boundary");
+  for (const neighbor of [
+    position.offset(facingAxis.x, 0, facingAxis.z),
+    position.offset(-facingAxis.x, 0, -facingAxis.z),
+  ]) {
     const key = blockKey(neighbor);
     if (connected.has(key)) {
       insideCells.push(neighbor);
@@ -906,20 +911,23 @@ function classifyHomeDoor(
   }
   if (insideCells.length !== 1 || outsideCells.length !== 1)
     return unknown("ambiguous_boundary");
-  const insideRoofed = roofedAt(bot, insideCells[0]!);
-  const outsideRoofed = roofedAt(bot, outsideCells[0]!);
+  const insideCell = insideCells[0];
+  const outsideCell = outsideCells[0];
+  if (insideCell === undefined || outsideCell === undefined)
+    return unknown("ambiguous_boundary");
+  const insideRoofed = roofedAt(bot, insideCell);
+  const outsideRoofed = roofedAt(bot, outsideCell);
   if (insideRoofed === null || outsideRoofed === null)
     return unknown("room_evidence_incomplete");
-  if (!insideRoofed || outsideRoofed)
-    return unknown("ambiguous_boundary");
+  if (!insideRoofed || outsideRoofed) return unknown("ambiguous_boundary");
   return {
     position: blockCoordinates(position),
     facing,
     observedState,
     relation: "verified",
     reason: "closed_flat_room_boundary",
-    insideCell: blockCoordinates(insideCells[0]!),
-    outsideCell: blockCoordinates(outsideCells[0]!),
+    insideCell: blockCoordinates(insideCell),
+    outsideCell: blockCoordinates(outsideCell),
     relationObservedAt: observedAt,
     observedAt,
   };
@@ -945,7 +953,10 @@ function isBedHeadPoi(block: Block): boolean {
 }
 
 function homePoiDirection(value: unknown): PlayerHomePoiDirection | null {
-  return value === "north" || value === "south" || value === "east" || value === "west"
+  return value === "north" ||
+    value === "south" ||
+    value === "east" ||
+    value === "west"
     ? value
     : null;
 }

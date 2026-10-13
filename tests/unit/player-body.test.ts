@@ -1915,25 +1915,59 @@ describe("player body", () => {
           connectedRoomCellCount: 7,
           roomSearchTruncated: false,
           doorSearchMayBeTruncated: false,
-          doors: expect.arrayContaining([
-            expect.objectContaining({
-              position: { x: 2, y: 64, z: 0 },
-              observedState: "closed",
-              relation: "verified",
-              reason: "closed_flat_room_boundary",
-              insideCell: { x: 1, y: 64, z: 0 },
-              outsideCell: { x: 3, y: 64, z: 0 },
-            }),
-            expect.objectContaining({
-              position: { x: 0, y: 64, z: -2 },
-              observedState: "closed",
-              relation: "verified",
-              insideCell: { x: 0, y: 64, z: -1 },
-              outsideCell: { x: 0, y: 64, z: -3 },
-            }),
-          ]),
         },
       ],
+    });
+    const doors = result.homePoiScan?.homes[0]?.doors ?? [];
+    expect(
+      doors.some(
+        (door) =>
+          door.position.x === 2 &&
+          door.position.z === 0 &&
+          door.observedState === "closed" &&
+          door.relation === "verified" &&
+          door.reason === "closed_flat_room_boundary" &&
+          door.insideCell?.x === 1 &&
+          door.outsideCell?.x === 3,
+      ),
+    ).toBe(true);
+    expect(
+      doors.some(
+        (door) =>
+          door.position.x === 0 &&
+          door.position.z === -2 &&
+          door.observedState === "closed" &&
+          door.relation === "verified" &&
+          door.insideCell?.z === -1 &&
+          door.outsideCell?.z === -3,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not infer a door boundary from walkable cells perpendicular to its facing", async () => {
+    const fake = makeFakeBot();
+    addFlatHomeWithTwoWoodenDoors(fake);
+    const eastDoor = fake.blocks.get("2,64,0");
+    if (eastDoor === undefined) throw new Error("expected test door");
+    eastDoor.getProperties = () => ({
+      half: "lower",
+      open: false,
+      facing: "north",
+    });
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "scan_home",
+    });
+
+    const perpendicularDoor = result.homePoiScan?.homes[0]?.doors.find(
+      (door) => door.position.x === 2 && door.position.z === 0,
+    );
+    expect(perpendicularDoor).toMatchObject({
+      facing: "north",
+      relation: "unknown",
+      reason: "ambiguous_boundary",
+      insideCell: null,
+      outsideCell: null,
     });
   });
 
@@ -1976,6 +2010,71 @@ describe("player body", () => {
       worldAbsenceEstablished: false,
     });
     expect(cappedResult.homePoiScan?.homes).toHaveLength(8);
+
+    const sentinel = makeFakeBot();
+    addHomeBlock(sentinel, "oak_bed", new Vec3(0, 64, 0), {
+      part: "head",
+    });
+    sentinel.candidates.push(
+      ...Array.from({ length: 8 }, () => new Vec3(0, 64, 0)),
+    );
+    const sentinelResult = await new MineflayerPlayerBody(
+      () => sentinel.bot,
+    ).execute({ kind: "scan_home" });
+    expect(sentinel.findBlockSearches.find(({ count }) => count === 9)).toEqual(
+      {
+        count: 9,
+        resultCount: 9,
+      },
+    );
+    expect(sentinelResult.homePoiScan).toMatchObject({
+      candidateSearchMayBeTruncated: true,
+      homes: [{ bedHead: { x: 0, y: 64, z: 0 } }],
+    });
+
+    const fractional = makeFakeBot();
+    fractional.bot.entity.position = new Vec3(0.9, 64.9, 0);
+    addHomeBlock(fractional, "birch_bed", new Vec3(127, 64, 18), {
+      part: "head",
+    });
+    const fractionalResult = await new MineflayerPlayerBody(
+      () => fractional.bot,
+    ).execute({ kind: "scan_home" });
+    expect(fractionalResult.homePoiScan?.homes).toMatchObject([
+      { bedHead: { x: 127, y: 64, z: 18 } },
+    ]);
+  });
+
+  it("marks canonical door caps as incomplete even below the raw search sentinel", async () => {
+    const fake = makeFakeBot();
+    addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 0), { part: "head" });
+    for (let index = 1; index <= 9; index += 1) {
+      addHomeBlock(fake, "oak_door", new Vec3(index, 64, 0), {
+        half: "lower",
+        open: false,
+        facing: "east",
+      });
+      addHomeBlock(fake, "oak_door", new Vec3(index, 65, 0), {
+        half: "upper",
+        open: false,
+        facing: "east",
+      });
+    }
+
+    const result = await new MineflayerPlayerBody(() => fake.bot).execute({
+      kind: "scan_home",
+    });
+
+    expect(fake.findBlockSearches.find(({ count }) => count === 33)).toEqual({
+      count: 33,
+      resultCount: 18,
+    });
+    expect(result.homePoiScan?.homes[0]).toMatchObject({
+      doorSearchMayBeTruncated: true,
+      doorRelationStatus: "unknown",
+      doorRelationReason: "door_search_truncated",
+    });
+    expect(result.homePoiScan?.homes[0]?.doors).toHaveLength(8);
   });
 
   it("keeps unsupported or open-door relations unknown", async () => {
@@ -1994,14 +2093,14 @@ describe("player body", () => {
 
     expect(result.homePoiScan?.homes[0]).toMatchObject({
       doorRelationStatus: "verified",
-      doors: expect.arrayContaining([
-        expect.objectContaining({
-          position: { x: 2, y: 64, z: 0 },
-          observedState: "open",
-          relation: "unknown",
-          reason: "door_open",
-        }),
-      ]),
+    });
+    const observedOpenDoor = result.homePoiScan?.homes[0]?.doors.find(
+      (door) => door.position.x === 2 && door.position.z === 0,
+    );
+    expect(observedOpenDoor).toMatchObject({
+      observedState: "open",
+      relation: "unknown",
+      reason: "door_open",
     });
     expect(result.homePoiScan?.homes[0]?.doors.length).toBeGreaterThan(0);
   });
