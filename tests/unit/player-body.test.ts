@@ -4304,6 +4304,143 @@ describe("player body", () => {
     expect(result.observedEffect).toBeUndefined();
   });
 
+  it("confirms a block-use transition when result observations omit the target", async () => {
+    const fake = makeFakeBot();
+    const target = new Vec3(0, 64, -2);
+    const targetKey = "0,64,-2";
+    const closed = makeBlock("oak_door", 701, target);
+    closed.getProperties = () => ({ half: "lower", open: false });
+    fake.blocks.set(targetKey, closed);
+    fake.candidates.push(target);
+    Object.assign(fake.bot.registry.blocksByStateId, {
+      701: { name: "oak_door" },
+      702: { name: "oak_door" },
+    });
+
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const observation = observePlayerBody(fake.bot, "owner");
+    const resultObservation = {
+      ...observation,
+      perception: {
+        ...observation.perception,
+        blocks: observation.perception.blocks.filter(
+          (block) =>
+            block.position.x !== target.x ||
+            block.position.y !== target.y ||
+            block.position.z !== target.z,
+        ),
+      },
+    };
+    vi.spyOn(
+      body as unknown as {
+        safeObserve: (bot: Bot) => ReturnType<typeof observePlayerBody> | null;
+      },
+      "safeObserve",
+    ).mockReturnValue(resultObservation);
+
+    const client = (
+      fake.bot as Bot & {
+        _client: EventEmitter & {
+          write: (event: string, packet: unknown) => void;
+        };
+      }
+    )._client;
+    vi.spyOn(client, "write").mockImplementation((event) => {
+      if (event !== "block_place") return;
+      setTimeout(() => {
+        const opened = makeBlock("oak_door", 702, target);
+        opened.getProperties = () => ({ half: "lower", open: true });
+        fake.blocks.set(targetKey, opened);
+        client.emit("block_change", { location: target, type: 702 });
+      }, 10);
+    });
+
+    const result = await body.execute({
+      kind: "use",
+      target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+    });
+
+    expect(result.before?.perception.blocks).not.toContainEqual(
+      expect.objectContaining({ position: { x: 0, y: 64, z: -2 } }),
+    );
+    expect(result.after?.perception.blocks).not.toContainEqual(
+      expect.objectContaining({ position: { x: 0, y: 64, z: -2 } }),
+    );
+    expect(result.sameLife).toBe(true);
+    expect(result.status).toBe("successful");
+  });
+
+  it("requires a changed target state and the same life for block-use success", async () => {
+    const runDoorUse = async (
+      unknownInitialState: boolean,
+      opened: boolean,
+      crossLife = false,
+    ): Promise<PlayerOperationResult> => {
+      const fake = makeFakeBot();
+      const target = new Vec3(0, 64, -2);
+      const targetKey = "0,64,-2";
+      const stateId = 711;
+      const updatedStateId = opened ? 712 : stateId;
+      const door = makeBlock("oak_door", stateId, target);
+      door.getProperties = () => ({ half: "lower", open: false });
+      fake.blocks.set(targetKey, door);
+      fake.candidates.push(target);
+      Object.assign(fake.bot.registry.blocksByStateId, {
+        711: { name: "oak_door" },
+        712: { name: "oak_door" },
+      });
+      if (unknownInitialState) {
+        const readBlockAt = fake.bot.blockAt.bind(fake.bot);
+        let firstRead = true;
+        vi.spyOn(fake.bot, "blockAt").mockImplementation((position) => {
+          if (firstRead) {
+            firstRead = false;
+            return null;
+          }
+          return readBlockAt(position);
+        });
+      }
+
+      const client = (
+        fake.bot as Bot & {
+          _client: EventEmitter & {
+            write: (event: string, packet: unknown) => void;
+          };
+        }
+      )._client;
+      vi.spyOn(client, "write").mockImplementation((event) => {
+        if (event !== "block_place") return;
+        if (crossLife) {
+          fake.bot.health = 0;
+          fake.bot.emit("health");
+        }
+        if (opened) {
+          const openedDoor = makeBlock("oak_door", updatedStateId, target);
+          openedDoor.getProperties = () => ({ half: "lower", open: true });
+          fake.blocks.set(targetKey, openedDoor);
+        }
+        client.emit("block_change", {
+          location: target,
+          type: updatedStateId,
+        });
+      });
+
+      return new MineflayerPlayerBody(() => fake.bot).execute({
+        kind: "use",
+        target: { kind: "block", position: { x: 0, y: 64, z: -2 } },
+      });
+    };
+
+    const unchanged = await runDoorUse(false, false);
+    const unknown = await runDoorUse(true, true);
+    const crossedLife = await runDoorUse(false, true, true);
+
+    expect(unchanged.status).toBe("unverified");
+    expect(unknown.status).toBe("unverified");
+    expect(crossedLife.sameLife).toBe(false);
+    expect(crossedLife.status).toBe("unverified");
+  });
+
   it("defaults item use to four ticks and keeps unobserved effects unverified", async () => {
     vi.useFakeTimers();
     try {

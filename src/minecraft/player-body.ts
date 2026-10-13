@@ -85,6 +85,7 @@ const stallAfterMs = 20_000;
 const minimumDigTimeoutMs = 35_000;
 const digServerUpdateGraceMs = 5_000;
 const placeServerUpdateGraceMs = 5_000;
+const useBlockUpdateGraceMs = 250;
 const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
 const itemCollectionVisibilityGraceMs = 1_000;
@@ -476,6 +477,7 @@ interface ActiveOperation {
   readonly startedAt: string;
   readonly startedAtMs: number;
   readonly startedLifeGeneration: number;
+  targetBlockStateIdBefore?: number;
   resolvedMoveTarget?: Vec3;
   moveRelativeLeadInputAttempted: boolean;
   done: Promise<PlayerOperationResult>;
@@ -1393,6 +1395,17 @@ function blockAtObservation(
   );
 }
 
+function safeBlockStateId(
+  bot: Bot,
+  position: { readonly x: number; readonly y: number; readonly z: number },
+): number | undefined {
+  try {
+    return bot.blockAt(blockPosition(position))?.stateId;
+  } catch {
+    return undefined;
+  }
+}
+
 function captureAttackEvidence(
   bot: Bot,
   operation: PlayerOperation,
@@ -1725,12 +1738,12 @@ function operationEvidence(
       if (operation.target.kind === "block") {
         const key = blockKey(operation.target.position);
         const update = serverBlockUpdates.get(key);
-        const oldBlock = blockAtObservation(before, operation.target.position);
+        const oldStateId = active.targetBlockStateIdBefore;
         const observed = bot.blockAt(blockPosition(operation.target.position));
         const blockChanged =
           update !== undefined &&
-          oldBlock !== undefined &&
-          update.stateId !== oldBlock.stateId &&
+          oldStateId !== undefined &&
+          update.stateId !== oldStateId &&
           observed?.stateId === update.stateId;
         const openedWindow =
           after.window !== null && before.window?.id !== after.window.id;
@@ -1784,6 +1797,11 @@ function captureServerBlockUpdates(
     signal: AbortSignal,
     timeoutMs: number,
     expectedName: string,
+  ): Promise<boolean>;
+  waitForTargetStateChange(
+    previousStateId: number,
+    signal: AbortSignal,
+    timeoutMs: number,
   ): Promise<boolean>;
   dispose(): void;
 } {
@@ -1924,6 +1942,12 @@ function captureServerBlockUpdates(
         signal,
         timeoutMs,
         (update) => update.name === expectedName,
+      ),
+    waitForTargetStateChange: (previousStateId, signal, timeoutMs) =>
+      waitForMatchingTargetUpdate(
+        signal,
+        timeoutMs,
+        (update) => update.stateId !== previousStateId,
       ),
     dispose: () => {
       client.removeListener("block_change", single);
@@ -2186,6 +2210,10 @@ export class MineflayerPlayerBody implements PlayerBody {
     externalAbort?: () => void,
   ): ActiveOperation {
     const startedAt = new Date().toISOString();
+    const targetBlockStateIdBefore =
+      operation.kind === "use" && operation.target.kind === "block"
+        ? safeBlockStateId(bot, operation.target.position)
+        : undefined;
     return {
       id: randomUUID(),
       operation,
@@ -2194,6 +2222,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       startedAt,
       startedAtMs: Date.now(),
       startedLifeGeneration: this.lifeGeneration,
+      ...(targetBlockStateIdBefore === undefined
+        ? {}
+        : { targetBlockStateIdBefore }),
       moveRelativeLeadInputAttempted: false,
       done: Promise.resolve({
         operationId: "",
@@ -2317,6 +2348,17 @@ export class MineflayerPlayerBody implements PlayerBody {
             expectedBlockName,
           );
         }
+        if (
+          operation.kind === "use" &&
+          operation.target.kind === "block" &&
+          active.targetBlockStateIdBefore !== undefined &&
+          blockEvidence !== undefined
+        )
+          await blockEvidence.waitForTargetStateChange(
+            active.targetBlockStateIdBefore,
+            controller.signal,
+            useBlockUpdateGraceMs,
+          );
       }
     } catch (error) {
       commandError = error;
@@ -2359,6 +2401,9 @@ export class MineflayerPlayerBody implements PlayerBody {
     const confirmed =
       !travelCrossedLife &&
       !craftCrossedLife &&
+      (operation.kind !== "use" ||
+        operation.target.kind !== "block" ||
+        sameLife) &&
       operationEvidence(bot, operation, before, after, serverUpdates, active);
     const interrupted =
       (controller.signal.aborted && !active.timedOut) || travelCrossedLife;
