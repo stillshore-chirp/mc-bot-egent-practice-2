@@ -3721,14 +3721,14 @@ export class CompanionRuntime {
       result.status !== "successful" ||
       result.sameLife !== true ||
       scan === undefined ||
-      before === null ||
-      before === undefined ||
-      after === null ||
-      after === undefined ||
-      before.dimension !== after.dimension ||
-      before.dimension !== scan.dimension ||
       !this.#isCurrent(generation) ||
       this.#isStopped()
+    )
+      return;
+    if (before === null || after === null) return;
+    if (
+      before.dimension !== after.dimension ||
+      before.dimension !== scan.dimension
     )
       return;
     try {
