@@ -25,6 +25,7 @@ import type {
   PlayerBodyObservationOptions,
   PlayerKnowledge,
   PlayerOperationResult,
+  PlayerHomePoiScan,
 } from "../../src/minecraft/player-body.js";
 import type {
   BodyItemStack,
@@ -57,6 +58,35 @@ function freshStore(): {
   const store = CompanionStore.open(path, { ownerUsername: "Builder" });
   stores.push(store);
   return { store, path };
+}
+
+function makeHomePoiScan(dimension = "overworld"): PlayerHomePoiScan {
+  const observedAt = "2026-10-10T00:00:00.000Z";
+  return {
+    source: "loaded_home_poi_scan",
+    observedAt,
+    dimension,
+    center: { x: 0, y: 64, z: 0 },
+    radius: 128,
+    coverage: "loaded_blocks_only",
+    candidateLimit: 8,
+    omittedCandidatesAtLeast: 0,
+    candidateSearchMayBeTruncated: false,
+    worldAbsenceEstablished: false,
+    homes: [
+      {
+        bedName: "minecraft:white_bed",
+        bedHead: { x: 8, y: 64, z: 4 },
+        observedAt,
+        doorRelationStatus: "unknown",
+        doorRelationReason: "no_supported_closed_wood_door_boundary",
+        connectedRoomCellCount: 0,
+        roomSearchTruncated: false,
+        doorSearchMayBeTruncated: false,
+        doors: [],
+      },
+    ],
+  };
 }
 
 function failStopPersistence(store: CompanionStore): void {
@@ -590,6 +620,7 @@ function createRuntime(
 }
 
 const look = playerOperationSchema.parse({ kind: "look_sweep" });
+const scanHome = playerOperationSchema.parse({ kind: "scan_home" });
 const jump = playerOperationSchema.parse({
   kind: "control",
   controls: { jump: true },
@@ -647,6 +678,110 @@ describe("CompanionRuntime", () => {
     expect(store.snapshot().lastOutcome?.bodyEvidence?.startedAt).toBe(
       body.results[0]?.startedAt,
     );
+  });
+
+  it("persists a successful HOME scan and supplies it to a later Agent decision", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([makeDecision([scanHome]), emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+    const scan = makeHomePoiScan();
+    body.executeHandler = async (operation, _signal, fakeBody) => ({
+      ...fakeBody.result(
+        operation,
+        "synthetic-home-scan",
+        "successful",
+        fakeBody.observation,
+      ),
+      homePoiScan: scan,
+    });
+
+    await runtime.receiveChat("Builder", "近くのベッドを探して");
+
+    expect(body.executed).toEqual([{ kind: "scan_home" }]);
+    expect(store.latestObservedHomePois()).toHaveLength(1);
+    expect(agent.inputs[0]?.homePoiMemories).toEqual([]);
+
+    await runtime.receiveChat("Builder", "前に記録したベッドの場所を教えて");
+
+    expect(agent.inputs.at(-1)?.homePoiMemories).toHaveLength(1);
+    expect(agent.inputs.at(-1)?.homePoiMemories?.[0]?.metadata).toMatchObject({
+      homeMemory: {
+        dimension: "overworld",
+        home: {
+          bedName: "minecraft:white_bed",
+          bedHead: { x: 8, y: 64, z: 4 },
+        },
+      },
+    });
+  });
+
+  it("does not persist a late successful HOME scan after owner stop", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([makeDecision([scanHome]), emptyDecision()]);
+    const pendingResult = deferred<PlayerOperationResult>();
+    body.executeHandler = async () => pendingResult.promise;
+    const runtime = createRuntime(store, body, agent);
+
+    const ownerTurn = runtime.receiveChat("Builder", "近くのベッドを探して");
+    await eventually(() => body.executed.length === 1);
+    const stopping = runtime.stop("Builder");
+    await eventually(() => runtime.status().stopped);
+    expect(store.snapshot().stopped).toBe(true);
+
+    pendingResult.resolve({
+      ...body.result(
+        scanHome,
+        "late-owner-stopped-home-scan",
+        "successful",
+        body.observation,
+      ),
+      homePoiScan: makeHomePoiScan(),
+    });
+    await Promise.all([ownerTurn, stopping]);
+
+    expect(body.executed).toEqual([scanHome]);
+    expect(store.latestObservedHomePois()).toHaveLength(0);
+    expect(store.snapshot().stopped).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it("does not persist HOME evidence when the before and after dimensions differ", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      const before = fakeBody.observation;
+      const after: PlayerBodyObservation = {
+        ...before,
+        dimension: "nether",
+        self: {
+          ...before.self,
+          position: { ...before.self.position, dimension: "nether" },
+        },
+      };
+      return {
+        ...fakeBody.result(
+          operation,
+          "dimension-changed-home-scan",
+          "successful",
+          after,
+          before,
+        ),
+        homePoiScan: makeHomePoiScan(before.dimension),
+      };
+    };
+    const runtime = createRuntime(
+      store,
+      body,
+      new FakeAgent([makeDecision([scanHome]), emptyDecision()]),
+    );
+
+    await runtime.receiveChat("Builder", "近くのベッドを探して");
+
+    expect(body.executed).toEqual([scanHome]);
+    expect(store.latestObservedHomePois()).toHaveLength(0);
+    await runtime.shutdown();
   });
 
   it("provides declared purpose and post-action evidence to a later question after synthetic respawn", async () => {

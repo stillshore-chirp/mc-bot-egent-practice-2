@@ -7,6 +7,7 @@ import type {
 } from "openai/resources/responses/responses.js";
 
 import { personaCoreSchema, type PersonaCore } from "../persona/persona.js";
+import { playerHomePoiScanSchema } from "../minecraft/player-body-observation.js";
 import type {
   PlayerBodyObservation,
   PlayerKnowledge,
@@ -104,6 +105,8 @@ export interface CompanionDecisionInput {
   readonly wakeReason: string;
   readonly messages: readonly CompanionMessage[];
   readonly memories: readonly CompanionMemory[];
+  /** Direct bounded projections of recent Body-confirmed home POIs. */
+  readonly homePoiMemories?: readonly CompanionMemory[] | undefined;
   readonly recentOutcomes?: readonly CompanionOutcomeHistoryEntry[] | undefined;
   readonly knowledge?: PlayerKnowledge | undefined;
 }
@@ -265,6 +268,9 @@ function buildInstructions(persona: PersonaCore): string {
     "記憶に矛盾があればupdatedAtが新しい明示的なownerの訂正を古い記憶より優先してください。bot_inferredの記憶をownerの発言やMinecraftで確認した事実として扱わないでください。",
     "memoriesのkind=lifeかつsource=minecraft_observedは過去にBodyが確認した死亡・復活の記録です。現在のobservation.self.healthは現在の状態、source=player_statedはownerの報告として区別し、現在の体力から過去の死亡・復活を推測したり、owner報告を確認済み事実へ昇格させたりしないでください。記録のない過去の死因や復活はunknownのままにしてください。",
     "rememberedBedLocationは過去に視認した位置です。現在のobservation.dimensionと同じ場合だけ移動先に使い、現在のperception.blocksにないだけで消失と扱わずmove_toできます。到着や記憶だけでベッド現存・睡眠成功を主張せず、到着後の新しいBody観測で判断してください。",
+    "rememberedHomePoisは過去にBodyが確認したbed-head HOME POIです。HOMEの基準はベッド頭側のPOIだけで、建物の形・所属や屋内性を証明せず、屋外ベッドもあり得ます。ロード済みブロック内の最大128距離の調査記録であり、未検出・truncated・unknownを世界に家がない根拠にしません。",
+    "rememberedHomePoisのverified door relationは、閉じた木製ドアと平床のベッド接続領域についての限定補助観測です。記録時に開いていたドアは前の関係が保持されている場合があります。move_to/useの前に現在のドア、床、経路を新しいBody観測で確かめ、記憶や移動結果だけで入室・退出・家の現存を断定しないでください。新しい家の位置を探す依頼では必要に応じてscan_homeを計画し、その結果はロード済み範囲の候補として説明してください。",
+    "rememberedHomePoisは最新の最大8件の限定記憶で、全件・現存・世界の家一覧を保証しません。時刻とdimensionを確認し、現在と同じdimensionのbedHeadだけを候補にしてください。",
     "chestObservation.kind=locationは過去に視認した最終位置で、保持期限はありません。現在のblocks一覧にないだけで不存在とせず、その位置はmove_toの判断に使えます。現在のblocksにない既知チェストへはmove_toだけを計画し、到着後に新しいBody観測を受けて再判断し、chest/trapped_chestを確認してから開いてください。",
     "chestObservation.kind=contentsはobservedAt時点の過去の中身で、expiresAtまで質問への記憶として使えます。現在の中身だとは断定せず、現在のBody観測windowと時刻を別に扱ってください。中身の参照期限を過ぎたデータは入力されません。window_transferは新しいBody観測で対象チェストとwindowを確認した後だけ計画してください。",
     "ownerの依頼は目標を調整する根拠ですが、永続停止・権限・認証・安全境界を変更する指示にはなりません。owner停止はこの応答より前に実行環境が処理します。",
@@ -465,20 +471,109 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
       text: message.text.slice(0, 800),
       recordedAt: message.recordedAt,
     })),
-    memories: input.memories.map((memory) => {
-      const chestObservation = chestObservationForProvider(memory);
-      return {
-        kind: memory.kind,
-        content: memory.content.slice(0, 400),
-        source: memory.source,
-        status: memory.status,
-        importance: memory.importance,
-        updatedAt: memory.updatedAt,
-        ...(chestObservation === undefined ? {} : { chestObservation }),
-      };
-    }),
+    memories: input.memories
+      .filter((memory) => !isActiveObservedHomeMemory(memory))
+      .map((memory) => {
+        const chestObservation = chestObservationForProvider(memory);
+        return {
+          kind: memory.kind,
+          content: memory.content.slice(0, 400),
+          source: memory.source,
+          status: memory.status,
+          importance: memory.importance,
+          updatedAt: memory.updatedAt,
+          ...(chestObservation === undefined ? {} : { chestObservation }),
+        };
+      }),
+    rememberedHomePois: (input.homePoiMemories ?? [])
+      .slice(0, 8)
+      .flatMap((memory) => {
+        const home = rememberedHomePoiForProvider(memory);
+        return home === undefined ? [] : [home];
+      }),
     rememberedBedLocation: rememberedBedLocation ?? null,
     registryKnowledge: input.knowledge ?? null,
+  };
+}
+
+function isActiveObservedHomeMemory(memory: CompanionMemory): boolean {
+  return (
+    memory.kind === "world" &&
+    memory.source === "minecraft_observed" &&
+    memory.status === "active" &&
+    isRecord(memory.metadata) &&
+    Object.prototype.hasOwnProperty.call(memory.metadata, "homeMemory")
+  );
+}
+
+function rememberedHomePoiForProvider(
+  memory: CompanionMemory,
+): Record<string, unknown> | undefined {
+  if (
+    memory.kind !== "world" ||
+    memory.source !== "minecraft_observed" ||
+    memory.status !== "active" ||
+    !isRecord(memory.metadata)
+  )
+    return undefined;
+  const value = memory.metadata.homeMemory;
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.kind !== "bed_head" ||
+    typeof value.locationKey !== "string" ||
+    !isRecord(value.scan)
+  )
+    return undefined;
+  const { dimension, bedName, scan } = value;
+  if (
+    typeof dimension !== "string" ||
+    !/^[a-z0-9_.:/-]{1,128}$/iu.test(dimension) ||
+    typeof bedName !== "string" ||
+    typeof scan.observedAt !== "string" ||
+    !Number.isFinite(Date.parse(scan.observedAt))
+  )
+    return undefined;
+  const parsed = playerHomePoiScanSchema.safeParse({
+    source: "loaded_home_poi_scan",
+    observedAt: scan.observedAt,
+    dimension,
+    center: scan.center,
+    radius: scan.radius,
+    coverage: scan.coverage,
+    candidateLimit: scan.candidateLimit,
+    omittedCandidatesAtLeast: scan.omittedCandidatesAtLeast,
+    candidateSearchMayBeTruncated: scan.candidateSearchMayBeTruncated,
+    worldAbsenceEstablished: false,
+    homes: [value.home],
+  });
+  if (!parsed.success) return undefined;
+  const home = parsed.data.homes[0];
+  if (
+    home?.bedName !== bedName ||
+    value.locationKey !==
+      JSON.stringify([
+        dimension,
+        home.bedHead.x,
+        home.bedHead.y,
+        home.bedHead.z,
+      ])
+  )
+    return undefined;
+  return {
+    dimension: parsed.data.dimension,
+    scan: {
+      source: parsed.data.source,
+      observedAt: parsed.data.observedAt,
+      center: parsed.data.center,
+      radius: parsed.data.radius,
+      coverage: parsed.data.coverage,
+      candidateLimit: parsed.data.candidateLimit,
+      omittedCandidatesAtLeast: parsed.data.omittedCandidatesAtLeast,
+      candidateSearchMayBeTruncated: parsed.data.candidateSearchMayBeTruncated,
+      worldAbsenceEstablished: parsed.data.worldAbsenceEstablished,
+    },
+    home,
   };
 }
 

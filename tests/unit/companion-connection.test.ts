@@ -1,6 +1,14 @@
 import { EventEmitter } from "node:events";
-import mineflayer from "mineflayer";
+import { createRequire } from "node:module";
+import mineflayer, { type Bot } from "mineflayer";
+import type { Block } from "prismarine-block";
+import type {
+  Move,
+  Movements,
+  PartiallyComputedPath,
+} from "mineflayer-pathfinder";
 import { describe, expect, it, vi } from "vitest";
+import { Vec3 } from "vec3";
 import { AppError } from "../../src/domain/errors.js";
 import {
   ConnectionManager,
@@ -10,6 +18,22 @@ import {
   MineflayerClient,
   oxygenFromEntityMetadata,
 } from "../../src/minecraft/mineflayer-client.js";
+import { NavigationMovements } from "../../src/minecraft/navigation-movements.js";
+
+const require = createRequire(import.meta.url);
+const createRegistry = require("prismarine-registry") as (
+  version: string,
+) => Record<string, unknown>;
+const testRegistry = createRegistry("1.21.11");
+const createBlock = require("prismarine-block") as (
+  registry: Record<string, unknown>,
+) => {
+  fromProperties: (
+    type: string,
+    properties: Record<string, string | boolean>,
+    biomeId: number,
+  ) => Block;
+};
 
 function createFakeBot(
   options: {
@@ -30,8 +54,12 @@ function createFakeBot(
     _client: client,
     username: options.username ?? "Companion",
     version: options.version ?? "26.3",
-    entity: { id: 1, name: "player" },
-    registry: { entitiesByName: {} },
+    entity: { id: 1, name: "player", width: 0.6, height: 1.8 },
+    registry: { ...testRegistry, entitiesByName: {} },
+    pathfinder: {
+      goal: null as object | null,
+      setMovements: vi.fn<(movements: Movements) => void>(),
+    },
     inventory: new EventEmitter(),
     health: 20,
     loadPlugin: vi.fn(),
@@ -57,6 +85,92 @@ function createFakeBot(
     }),
   });
   return { bot, client };
+}
+
+function syntheticPathNode(point: Vec3): Move {
+  return {
+    x: point.x,
+    y: point.y,
+    z: point.z,
+    remainingBlocks: 0,
+    cost: 0,
+    toBreak: [],
+    toPlace: [],
+    parkour: false,
+    hash: "synthetic",
+  };
+}
+
+function pathfinderDoorTop(block: Block): Vec3 {
+  const point = new Vec3(0.5, 0, 0.5);
+  let count = 1;
+  for (const shape of block.shapes) {
+    const height = shape[4];
+    if (height === point.y) {
+      point.x += (shape[0] + shape[3]) / 2;
+      point.z += (shape[2] + shape[5]) / 2;
+      count += 1;
+    } else if (height > point.y) {
+      count = 2;
+      point.x = 0.5 + (shape[0] + shape[3]) / 2;
+      point.y = height;
+      point.z = 0.5 + (shape[2] + shape[5]) / 2;
+    }
+  }
+  point.x /= count;
+  point.z /= count;
+  return block.position.plus(point);
+}
+
+function makeOpenDoorPathFixture(
+  fakeBot: ReturnType<typeof createFakeBot>["bot"],
+): { readonly result: PartiallyComputedPath; readonly node: Move } {
+  const blockFactory = createBlock(testRegistry);
+  const lower = blockFactory.fromProperties(
+    "oak_door",
+    {
+      half: "lower",
+      open: true,
+      facing: "north",
+      hinge: "left",
+      powered: false,
+    },
+    0,
+  );
+  const upper = blockFactory.fromProperties(
+    "oak_door",
+    {
+      half: "upper",
+      open: true,
+      facing: "north",
+      hinge: "left",
+      powered: false,
+    },
+    0,
+  );
+  lower.position = new Vec3(4, 64, 7);
+  upper.position = lower.position.offset(0, 1, 0);
+  const key = (position: Vec3): string =>
+    `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
+  const blocks = new Map([
+    [key(lower.position), lower],
+    [key(upper.position), upper],
+  ]);
+  (fakeBot as unknown as Bot).blockAt = vi.fn(
+    (position: Vec3) => blocks.get(key(position)) ?? null,
+  );
+  const node = syntheticPathNode(pathfinderDoorTop(lower));
+  return {
+    node,
+    result: {
+      status: "success",
+      cost: 1,
+      time: 1,
+      visitedNodes: 1,
+      generatedNodes: 1,
+      path: [node],
+    },
+  };
 }
 
 function clientFor(
@@ -275,6 +389,7 @@ describe("Minecraft companion connection", () => {
       await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(1));
       first.bot.emit("spawn");
       await firstConnection;
+      expect(first.bot.pathfinder.setMovements).toHaveBeenCalledOnce();
       first.bot.emit("end", "temporary disconnect");
       first.bot.emit("chat", "visitor", "late after end");
 
@@ -284,6 +399,7 @@ describe("Minecraft companion connection", () => {
       expect(minecraft.isConnected).toBe(false);
       second.bot.emit("spawn");
       await secondConnection;
+      expect(second.bot.pathfinder.setMovements).toHaveBeenCalledOnce();
       second.bot.emit("chat", "visitor", "current connection");
       first.bot.emit("chat", "visitor", "late from old connection");
 
@@ -293,6 +409,113 @@ describe("Minecraft companion connection", () => {
         second.bot,
       ]);
       expect(chats).toEqual([["visitor", "current connection"]]);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("applies walk-only door-aware movements before each spawn is admitted", async () => {
+    const { bot, client: protocolClient } = createFakeBot();
+    const createBot = mockCreateBots(bot);
+    const minecraft = clientFor();
+
+    try {
+      const connecting = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      expect(bot.pathfinder.setMovements).not.toHaveBeenCalled();
+
+      bot.emit("spawn");
+      await connecting;
+
+      const firstMovements = bot.pathfinder.setMovements.mock.calls[0]?.[0];
+      expect(firstMovements).toBeInstanceOf(NavigationMovements);
+
+      protocolClient.emit("respawn");
+      expect(minecraft.isConnected).toBe(false);
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(bot.pathfinder.setMovements).toHaveBeenCalledTimes(2),
+      );
+      expect(bot.pathfinder.setMovements.mock.calls[1]?.[0]).toBeInstanceOf(
+        NavigationMovements,
+      );
+      expect(bot.pathfinder.setMovements.mock.calls[1]?.[0]).not.toBe(
+        firstMovements,
+      );
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("corrects an open-door path before observers with one listener per Bot", async () => {
+    const first = createFakeBot();
+    const second = createFakeBot();
+    const createBot = mockCreateBots(first.bot, second.bot);
+    const minecraft = clientFor();
+    const firstPath = makeOpenDoorPathFixture(first.bot);
+    const secondPath = makeOpenDoorPathFixture(second.bot);
+    const firstObservedY: number[] = [];
+    const secondObservedY: number[] = [];
+    const observeFirst = (result: PartiallyComputedPath): void => {
+      const node = result.path[0];
+      if (node !== undefined) firstObservedY.push(node.y);
+    };
+    const observeSecond = (result: PartiallyComputedPath): void => {
+      const node = result.path[0];
+      if (node !== undefined) secondObservedY.push(node.y);
+    };
+    first.bot.on("path_update", observeFirst);
+    second.bot.on("path_update", observeSecond);
+    const originalY = firstPath.node.y;
+    const feetY = originalY - 1;
+
+    try {
+      const firstConnection = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(1));
+      expect(first.bot.listenerCount("path_update")).toBe(2);
+      expect(first.bot.listeners("path_update")[0]).not.toBe(observeFirst);
+      first.bot.emit("spawn");
+      await firstConnection;
+
+      // No active pathfinder goal is the owner-stop/no-dispatch boundary.
+      first.bot.emit("path_update", firstPath.result);
+      expect(firstObservedY).toEqual([originalY]);
+      expect((first.bot as unknown as Bot).blockAt).not.toHaveBeenCalled();
+
+      first.bot.pathfinder.goal = {};
+      first.bot.emit("path_update", firstPath.result);
+      expect(firstObservedY).toEqual([originalY, feetY]);
+      expect((first.bot as unknown as Bot).blockAt).toHaveBeenCalledTimes(3);
+
+      first.client.emit("respawn");
+      first.bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(first.bot.pathfinder.setMovements).toHaveBeenCalledTimes(2),
+      );
+      expect(first.bot.listenerCount("path_update")).toBe(2);
+
+      const afterRespawn = makeOpenDoorPathFixture(first.bot);
+      first.bot.pathfinder.goal = {};
+      first.bot.emit("path_update", afterRespawn.result);
+      expect(firstObservedY.at(-1)).toBe(feetY);
+      expect((first.bot as unknown as Bot).blockAt).toHaveBeenCalledTimes(3);
+
+      first.bot.emit("end", "temporary disconnect");
+      expect(first.bot.listenerCount("path_update")).toBe(1);
+
+      const secondConnection = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(2));
+      expect(second.bot.listenerCount("path_update")).toBe(2);
+      second.bot.emit("spawn");
+      await secondConnection;
+      second.bot.pathfinder.goal = {};
+      const secondFeetY = secondPath.node.y - 1;
+      second.bot.emit("path_update", secondPath.result);
+      expect(secondObservedY).toEqual([secondFeetY]);
+      expect(second.bot.listenerCount("path_update")).toBe(2);
+
+      second.bot.emit("end", "shutdown");
+      expect(second.bot.listenerCount("path_update")).toBe(1);
     } finally {
       createBot.mockRestore();
     }

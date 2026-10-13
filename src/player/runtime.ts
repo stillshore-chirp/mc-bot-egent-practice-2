@@ -772,6 +772,7 @@ export class CompanionRuntime {
     const latestLifeMemory = this.#store.latestObservedLifeMemory();
     const latestChestLocation = this.#store.latestObservedChestLocation();
     const latestBedLocation = this.#store.latestObservedBedLocation();
+    const latestHomePois = this.#store.latestObservedHomePois(8);
     const latestPriorityMemories = [
       latestLifeMemory,
       latestChestLocation,
@@ -795,6 +796,7 @@ export class CompanionRuntime {
       wakeReason,
       messages: this.#store.recentMessages(24),
       memories,
+      homePoiMemories: latestHomePois,
       recentOutcomes: this.#store.readRecentOutcomes(),
       ...(ownerMessage === undefined ? {} : { ownerMessage }),
       ...(pendingOwnerRequest === undefined ? {} : { pendingOwnerRequest }),
@@ -3052,6 +3054,7 @@ export class CompanionRuntime {
       this.#rememberChestObservations(result);
       this.#rememberChestContents(operation, result);
       this.#rememberBedObservations(result);
+      this.#rememberHomePoiScan(operation, result, generation);
       if (updated.activeOperation !== null) {
         await reportPlanNotConfirmed();
         this.#scheduleRetry({
@@ -3701,6 +3704,38 @@ export class CompanionRuntime {
           observedAt: result.completedAt,
         });
       }
+    }
+  }
+
+  #rememberHomePoiScan(
+    operation: PlayerOperation,
+    result: PlayerOperationResult,
+    generation: number,
+  ): void {
+    const scan = result.homePoiScan;
+    const before = result.before;
+    const after = result.after;
+    if (
+      operation.kind !== "scan_home" ||
+      !sameOperation(operation, result.operation) ||
+      result.status !== "successful" ||
+      result.sameLife !== true ||
+      scan === undefined ||
+      !this.#isCurrent(generation) ||
+      this.#isStopped()
+    )
+      return;
+    if (before === null || after === null) return;
+    if (
+      before.dimension !== after.dimension ||
+      before.dimension !== scan.dimension
+    )
+      return;
+    try {
+      this.#store.rememberObservedHomePoiScan(scan);
+    } catch (error) {
+      // The Body outcome is already durable; a memory failure must not replay it.
+      this.#logError(error, "HOME POI observation could not be persisted");
     }
   }
 

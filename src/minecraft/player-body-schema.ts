@@ -41,6 +41,7 @@ export const playerOperationNames = [
   "move_relative",
   "look",
   "look_sweep",
+  "scan_home",
   "control",
   "equip",
   "use",
@@ -81,6 +82,8 @@ export const playerOperationDescriptions = {
   look: "Turn the player's view toward a world position.",
   look_sweep:
     "Physically look in eight directions at pitchDegrees from -60 (down) to 60 (up); omitted pitchDegrees defaults to -25. Each view reports its observed pitch and only the blocks and non-player entities visible from that view. The result is a bounded visible subset; a missing target is not proof of absence.",
+  scan_home:
+    "Search loaded Minecraft blocks within a 3D radius of 128 for bed-head HOME POIs and limited flat-room closed wooden-door boundary evidence. This is a loaded subset, not proof that other homes or buildings do not exist.",
   control:
     "Hold the selected movement, jump, sprint, or sneak controls for bounded ticks.",
   equip: "Equip an inventory item into a player equipment slot.",
@@ -145,6 +148,7 @@ const playerOperationBaseSchema = z.discriminatedUnion("kind", [
       pitchDegrees: z.number().min(-60).max(60).optional(),
     })
     .strict(),
+  z.object({ kind: z.literal("scan_home") }).strict(),
   z
     .object({
       kind: z.literal("control"),

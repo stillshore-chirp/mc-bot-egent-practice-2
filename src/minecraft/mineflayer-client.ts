@@ -1,8 +1,12 @@
 import mineflayer, { type Bot, type BotOptions } from "mineflayer";
 import { states } from "minecraft-protocol";
-import { pathfinder } from "mineflayer-pathfinder";
+import { pathfinder, type PartiallyComputedPath } from "mineflayer-pathfinder";
 import { AppError } from "../domain/errors.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import {
+  correctOpenWoodDoorPath,
+  NavigationMovements,
+} from "./navigation-movements.js";
 import { MineflayerPlayerBody, type PlayerBody } from "./player-body.js";
 
 export interface MineflayerClientOptions {
@@ -294,6 +298,18 @@ export class MineflayerClient {
       this.botInstance === bot &&
       this.connectionEpoch === connectionEpoch &&
       connectionOpen;
+    const onPathUpdate = (result: PartiallyComputedPath): void => {
+      if (
+        !isCurrentConnection() ||
+        !this.spawned ||
+        bot.pathfinder.goal == null
+      )
+        return;
+      correctOpenWoodDoorPath(bot, result);
+    };
+    // Move the correction ahead of observers already attached by instrumentation.
+    // Mineflayer-pathfinder assigns results.path only after path_update returns.
+    bot.prependListener("path_update", onPathUpdate);
     const invalidateSpawnWork = (): void => {
       spawnGeneration += 1;
     };
@@ -342,6 +358,7 @@ export class MineflayerClient {
 
     bot.on("end", (reason) => {
       bot.off("physicsTick", onPhysicsTick);
+      bot.off("path_update", onPathUpdate);
       if (this.botInstance !== bot || this.connectionEpoch !== connectionEpoch)
         return;
       connectionOpen = false;
@@ -423,6 +440,10 @@ export class MineflayerClient {
         void (async () => {
           if (sendsPlayerLoadedPacket) await bot.waitForChunksToLoad();
           if (!isCurrentSpawn(generation)) return;
+          // Pathfinder is injected after the bot registry is prepared. Apply
+          // the companion's safe walk policy before admitting body actions on
+          // every spawn, including respawns and newly connected Bot instances.
+          bot.pathfinder.setMovements(new NavigationMovements(bot));
           if (sendsPlayerLoadedPacket) bot._client.write("player_loaded", {});
           this.spawned = true;
           settleResolve();

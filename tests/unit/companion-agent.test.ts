@@ -16,7 +16,11 @@ import type {
   CompanionMemory,
   CompanionSnapshot,
 } from "../../src/player/contracts.js";
-import type { PlayerBodyObservation } from "../../src/minecraft/player-body.js";
+import type {
+  PlayerBodyObservation,
+  PlayerHomePoi,
+  PlayerHomePoiScan,
+} from "../../src/minecraft/player-body.js";
 import type { PersonaCore } from "../../src/persona/persona.js";
 import { CompanionStore } from "../../src/player/store.js";
 
@@ -297,6 +301,258 @@ describe("CompanionAgent", () => {
       expect(serializedLifeMemory?.content).toContain("死因: 未確認");
       expect(serializedLifeMemory?.content).toContain("復活: Minecraftで確認");
       expect(serializedLifeMemory?.content.length).toBeLessThanOrEqual(400);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes bounded stored HOME POIs through the real Agent request", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "companion-agent-home-poi-"));
+    const store = CompanionStore.open(join(directory, "memory.sqlite3"), {
+      now: () => "2026-10-13T00:00:00.000Z",
+    });
+    try {
+      const makeHome = (index: number, observedAt: string): PlayerHomePoi => {
+        const verified = index === 0 || index === 20;
+        return {
+          bedName: "minecraft:white_bed",
+          bedHead: { x: 20 + index, y: 64, z: 10 },
+          observedAt,
+          doorRelationStatus: verified ? "verified" : "unknown",
+          doorRelationReason: verified
+            ? "verified_flat_room_boundary"
+            : "no_supported_closed_wood_door_boundary",
+          connectedRoomCellCount: verified ? 7 : 0,
+          roomSearchTruncated: false,
+          doorSearchMayBeTruncated: false,
+          doors: verified
+            ? [
+                {
+                  position: { x: 22 + index, y: 64, z: 10 },
+                  facing: "east",
+                  observedState: "closed",
+                  relation: "verified",
+                  reason: "closed_flat_room_boundary",
+                  insideCell: { x: 21 + index, y: 64, z: 10 },
+                  outsideCell: { x: 23 + index, y: 64, z: 10 },
+                  relationObservedAt: observedAt,
+                  observedAt,
+                },
+              ]
+            : [],
+        };
+      };
+      const firstObservedAt = "2026-10-12T23:58:00.000Z";
+      const firstScan: PlayerHomePoiScan = {
+        source: "loaded_home_poi_scan",
+        observedAt: firstObservedAt,
+        dimension: "overworld",
+        center: { x: 20, y: 64, z: 10 },
+        radius: 128,
+        coverage: "loaded_blocks_only",
+        candidateLimit: 8,
+        omittedCandidatesAtLeast: 0,
+        candidateSearchMayBeTruncated: false,
+        worldAbsenceEstablished: false,
+        homes: Array.from({ length: 8 }, (_, index) =>
+          makeHome(index, firstObservedAt),
+        ),
+      };
+      const olderHomes = store.rememberObservedHomePoiScan(firstScan);
+      const newestObservedAt = "2026-10-12T23:59:00.000Z";
+      const newestHome = makeHome(20, newestObservedAt);
+      const newestHomes = store.rememberObservedHomePoiScan({
+        ...firstScan,
+        observedAt: newestObservedAt,
+        center: newestHome.bedHead,
+        homes: [newestHome],
+      });
+      const memories = [...newestHomes, ...olderHomes];
+      const unrelatedMemories: CompanionMemory[] = [
+        {
+          id: "unrelated-bed-memory",
+          kind: "world",
+          content: "Preserve the remembered bed location.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {
+            bedMemory: {
+              version: 1,
+              kind: "location",
+              locationKey: "overworld:5:64:6",
+              dimension: "overworld",
+              position: { x: 5, y: 64, z: 6 },
+              observedAt: firstObservedAt,
+            },
+          },
+        },
+        {
+          id: "unrelated-chest-memory",
+          kind: "world",
+          content: "Preserve the remembered chest observation.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {
+            chestMemory: {
+              version: 1,
+              kind: "location",
+              locationKey: "overworld:7:64:8",
+              dimension: "overworld",
+              position: { x: 7, y: 64, z: 8 },
+              observedAt: firstObservedAt,
+            },
+          },
+        },
+        {
+          id: "unrelated-life-memory",
+          kind: "life",
+          content: "Preserve the observed life memory.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {},
+        },
+        {
+          id: "unrelated-purpose-memory",
+          kind: "goal",
+          content: "Preserve the owner's declared purpose.",
+          source: "player_stated",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {},
+        },
+        {
+          id: "malformed-home-memory",
+          kind: "world",
+          content: "Malformed HOME metadata must not bypass projection.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: { homeMemory: { version: 1, kind: "invalid" } },
+        },
+      ];
+
+      const create = vi.fn().mockResolvedValue(
+        response({
+          speech: "記録したベッド位置を確認したよ。",
+          ownerMessageDisposition: "answer_only",
+          goal: null,
+          plan: null,
+          memoryUpdates: [],
+          relationshipSummary: null,
+          waitMs: 10_000,
+          knowledgeQuery: null,
+        }),
+      );
+      const agent = new CompanionAgent({
+        client: {
+          responses: { create },
+        } as unknown as CompanionResponsesClient,
+        model: "gpt-6-luna",
+        persona,
+      });
+
+      await agent.decide({
+        ...createInput(),
+        memories: [...memories, ...unrelatedMemories],
+        homePoiMemories: memories,
+      });
+
+      const [request] = create.mock.calls[0] as unknown as [
+        { readonly input: string; readonly instructions: string },
+      ];
+      const providerInput = JSON.parse(request.input) as {
+        rememberedHomePois: {
+          dimension: string;
+          scan: {
+            coverage: string;
+            candidateSearchMayBeTruncated: boolean;
+            worldAbsenceEstablished: boolean;
+          };
+          home: PlayerHomePoi;
+        }[];
+        memories: {
+          kind: string;
+          source: string;
+          content: string;
+          chestObservation?: Record<string, unknown>;
+        }[];
+        rememberedBedLocation: {
+          dimension: string;
+          position: { x: number; y: number; z: number };
+          observedAt: string;
+        } | null;
+      };
+      expect(providerInput.rememberedHomePois).toHaveLength(8);
+      expect(
+        providerInput.rememberedHomePois.some(
+          ({ dimension, home }) =>
+            dimension === "overworld" &&
+            home.bedHead.x === newestHome.bedHead.x &&
+            home.doors[0]?.relation === "verified",
+        ),
+      ).toBe(true);
+      expect(
+        providerInput.rememberedHomePois.every(
+          ({ scan }) =>
+            scan.coverage === "loaded_blocks_only" &&
+            !scan.worldAbsenceEstablished,
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(providerInput.rememberedHomePois)).not.toContain(
+        "memoryId",
+      );
+      expect(providerInput.memories).toHaveLength(4);
+      const genericMemoryContents = providerInput.memories.map(
+        ({ content }) => content,
+      );
+      for (const homeMemory of memories) {
+        if (homeMemory.content.length > 0)
+          expect(genericMemoryContents).not.toContain(
+            homeMemory.content.slice(0, 400),
+          );
+      }
+      expect(genericMemoryContents).not.toContain(
+        "Malformed HOME metadata must not bypass projection.",
+      );
+      expect(genericMemoryContents).toEqual(
+        expect.arrayContaining([
+          "Preserve the remembered bed location.",
+          "Preserve the remembered chest observation.",
+          "Preserve the observed life memory.",
+          "Preserve the owner's declared purpose.",
+        ]),
+      );
+      expect(
+        providerInput.memories.find(
+          ({ content }) =>
+            content === "Preserve the remembered chest observation.",
+        )?.chestObservation,
+      ).toMatchObject({
+        kind: "location",
+        dimension: "overworld",
+        position: { x: 7, y: 64, z: 8 },
+        observedAt: firstObservedAt,
+      });
+      expect(providerInput.rememberedBedLocation).toEqual({
+        dimension: "overworld",
+        position: { x: 5, y: 64, z: 6 },
+        observedAt: firstObservedAt,
+      });
+      expect(request.instructions).toContain("最新の最大8件の限定記憶");
     } finally {
       store.close();
       rmSync(directory, { recursive: true, force: true });

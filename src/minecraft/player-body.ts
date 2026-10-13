@@ -20,6 +20,14 @@ import {
   playerBodyLookSweepDirectionCount,
   playerBodyLookSweepSchema,
   summarizeLookSweepView,
+  playerHomePoiCandidateLimit,
+  playerHomePoiDoorLimit,
+  playerHomePoiRoomCellLimit,
+  type BodyBlockCoordinates,
+  type PlayerHomePoi,
+  type PlayerHomePoiDoor,
+  type PlayerHomePoiDirection,
+  type PlayerHomePoiScan,
   type BodyItemStack,
   type PlayerBodyLookSweep,
   type PlayerBodyObservation,
@@ -29,6 +37,7 @@ import {
   queryPlayerKnowledge,
   type PlayerKnowledge,
 } from "./player-body-knowledge.js";
+import { isHandOperableDoor } from "./navigation-movements.js";
 
 export {
   isPlayerOperationName,
@@ -44,6 +53,9 @@ export type {
   PlayerBodyLookSweep,
   PlayerBodyObservation,
   PlayerBodyObservationOptions,
+  PlayerHomePoi,
+  PlayerHomePoiDoor,
+  PlayerHomePoiScan,
 } from "./player-body-observation.js";
 export type {
   PlayerKnowledge,
@@ -73,6 +85,7 @@ const stallAfterMs = 20_000;
 const minimumDigTimeoutMs = 35_000;
 const digServerUpdateGraceMs = 5_000;
 const placeServerUpdateGraceMs = 5_000;
+const useBlockUpdateGraceMs = 250;
 const maximumDigTimeoutMs = 5 * 60_000;
 const itemCollectionPollMs = 250;
 const itemCollectionVisibilityGraceMs = 1_000;
@@ -88,6 +101,11 @@ const maximumItemCollectionTimeoutMs = 45_000;
 const consumeEffectObservationGraceMs = 1_000;
 const consumeEffectObservationPollTicks = 1;
 const deathEvidenceCorrelationMs = 1_000;
+const homePoiSearchRadius = 128;
+const homePoiDoorSearchRadius = 12;
+const homePoiSearchSentinel = playerHomePoiCandidateLimit + 1;
+const homePoiDoorSearchSentinel = 33;
+const homePoiRoofCheckHeight = 8;
 const spawnAdmissionWaitMs = 3_000;
 const spawnAdmissionPollMs = 50;
 
@@ -338,6 +356,7 @@ export interface PlayerOperationResult {
   readonly itemCollectionPathFailureReason?: PlayerItemCollectionPathFailureReason;
   readonly failureReason?: PlayerOperationFailureReason;
   readonly lookSweep?: PlayerBodyLookSweep | undefined;
+  readonly homePoiScan?: PlayerHomePoiScan | undefined;
   readonly detail?: string;
 }
 
@@ -458,6 +477,7 @@ interface ActiveOperation {
   readonly startedAt: string;
   readonly startedAtMs: number;
   readonly startedLifeGeneration: number;
+  targetBlockStateIdBefore?: number;
   resolvedMoveTarget?: Vec3;
   moveRelativeLeadInputAttempted: boolean;
   done: Promise<PlayerOperationResult>;
@@ -476,6 +496,7 @@ interface ActiveOperation {
   consumeStatusLifeGeneration?: number;
   consumeStatusCleanup?: () => void;
   lookSweep?: PlayerBodyLookSweep;
+  homePoiScan?: PlayerHomePoiScan;
   expectedTrade?: {
     readonly input1Name: string;
     readonly input1Count: number;
@@ -639,6 +660,317 @@ function timeoutFor(operation: PlayerOperation, bot: Bot): number {
     default:
       return 15_000;
   }
+}
+
+const homePoiDirections: readonly {
+  readonly direction: PlayerHomePoiDirection;
+  readonly x: number;
+  readonly z: number;
+}[] = [
+  { direction: "north", x: 0, z: -1 },
+  { direction: "south", x: 0, z: 1 },
+  { direction: "east", x: 1, z: 0 },
+  { direction: "west", x: -1, z: 0 },
+];
+
+function scanLoadedHomePois(bot: Bot, signal: AbortSignal): PlayerHomePoiScan {
+  throwIfAborted(signal);
+  const observedAt = new Date().toISOString();
+  const origin = bot.entity.position.clone();
+  const center = origin.floored();
+  const rawCandidates = bot.findBlocks({
+    matching: (block) => isBedHeadPoi(block),
+    point: origin,
+    // Mineflayer floors point internally; the live-origin filter below enforces the 128-block sphere.
+    maxDistance: homePoiSearchRadius + 2,
+    count: homePoiSearchSentinel,
+  });
+  const candidates = rawCandidates
+    .filter((position) => origin.distanceTo(position) <= homePoiSearchRadius)
+    .filter(
+      (position, index, all) =>
+        all.findIndex(
+          (candidate) => blockKey(candidate) === blockKey(position),
+        ) === index,
+    )
+    .sort((left, right) => origin.distanceTo(left) - origin.distanceTo(right));
+  const homes: PlayerHomePoi[] = [];
+  for (const candidate of candidates.slice(0, playerHomePoiCandidateLimit)) {
+    throwIfAborted(signal);
+    const bed = bot.blockAt(candidate);
+    if (bed === null || !isBedHeadPoi(bed)) continue;
+    homes.push(analyzeHomePoi(bot, bed, observedAt, signal));
+  }
+  const candidateSearchMayBeTruncated =
+    rawCandidates.length >= homePoiSearchSentinel ||
+    candidates.length >= homePoiSearchSentinel;
+  return {
+    source: "loaded_home_poi_scan",
+    observedAt,
+    dimension: bot.game.dimension,
+    center: blockCoordinates(center),
+    radius: homePoiSearchRadius,
+    coverage: "loaded_blocks_only",
+    candidateLimit: playerHomePoiCandidateLimit,
+    omittedCandidatesAtLeast: Math.max(
+      0,
+      candidates.length - playerHomePoiCandidateLimit,
+    ),
+    candidateSearchMayBeTruncated,
+    worldAbsenceEstablished: false,
+    homes,
+  };
+}
+
+function analyzeHomePoi(
+  bot: Bot,
+  bed: Block,
+  observedAt: string,
+  signal: AbortSignal,
+): PlayerHomePoi {
+  const bedHead = bed.position.floored();
+  const connected = new Map<string, Vec3>();
+  const checked = new Set<string>();
+  const queue: Vec3[] = [];
+  let incompleteBoundary = false;
+  let roomSearchTruncated = false;
+  for (const direction of homePoiDirections) {
+    const seed = bedHead.offset(direction.x, 0, direction.z);
+    const walkable = flatWalkableCell(bot, seed);
+    if (walkable === null) incompleteBoundary = true;
+    else if (walkable) addConnectedCell(seed, connected, queue, checked);
+  }
+  while (queue.length > 0) {
+    throwIfAborted(signal);
+    const current = queue.shift();
+    if (current === undefined) break;
+    for (const direction of homePoiDirections) {
+      const candidate = current.offset(direction.x, 0, direction.z);
+      const key = blockKey(candidate);
+      if (checked.has(key)) continue;
+      checked.add(key);
+      const walkable = flatWalkableCell(bot, candidate);
+      if (walkable === null) {
+        incompleteBoundary = true;
+        continue;
+      }
+      if (!walkable) continue;
+      if (connected.size >= playerHomePoiRoomCellLimit) {
+        roomSearchTruncated = true;
+        continue;
+      }
+      connected.set(key, candidate);
+      queue.push(candidate);
+    }
+  }
+
+  const rawDoorPositions = bot.findBlocks({
+    matching: (block) => isHandOperableDoor(block.name),
+    point: bedHead,
+    maxDistance: homePoiDoorSearchRadius,
+    count: homePoiDoorSearchSentinel,
+  });
+  let doorSearchMayBeTruncated =
+    rawDoorPositions.length >= homePoiDoorSearchSentinel;
+  const canonicalDoors = new Map<string, Block>();
+  for (const position of rawDoorPositions) {
+    throwIfAborted(signal);
+    const found = bot.blockAt(position);
+    if (found === null || !isHandOperableDoor(found.name)) continue;
+    const properties = found.getProperties();
+    const lowerPosition =
+      properties.half === "upper"
+        ? found.position.offset(0, -1, 0)
+        : found.position;
+    const lowerDoor = bot.blockAt(lowerPosition);
+    if (lowerDoor === null || !isHandOperableDoor(lowerDoor.name)) continue;
+    canonicalDoors.set(blockKey(lowerDoor.position), lowerDoor);
+  }
+  doorSearchMayBeTruncated ||= canonicalDoors.size > playerHomePoiDoorLimit;
+  const doors = [...canonicalDoors.values()]
+    .sort(
+      (left, right) =>
+        bedHead.distanceTo(left.position) - bedHead.distanceTo(right.position),
+    )
+    .slice(0, playerHomePoiDoorLimit)
+    .map((door) =>
+      classifyHomeDoor(
+        bot,
+        door,
+        connected,
+        incompleteBoundary,
+        roomSearchTruncated,
+        observedAt,
+      ),
+    );
+
+  const verifiedDoorCount = doors.filter(
+    (door) => door.relation === "verified",
+  ).length;
+  const doorRelationStatus = verifiedDoorCount > 0 ? "verified" : "unknown";
+  const doorRelationReason: PlayerHomePoi["doorRelationReason"] =
+    verifiedDoorCount > 0
+      ? "verified_flat_room_boundary"
+      : roomSearchTruncated
+        ? "room_region_limit_reached"
+        : incompleteBoundary
+          ? "unloaded_room_boundary"
+          : doorSearchMayBeTruncated
+            ? "door_search_truncated"
+            : connected.size === 0
+              ? "no_bed_adjacent_walkable_cells"
+              : doors.some((door) => door.reason === "ambiguous_boundary")
+                ? "ambiguous_boundary"
+                : "no_supported_closed_wood_door_boundary";
+  return {
+    bedName: bed.name,
+    bedHead: blockCoordinates(bedHead),
+    observedAt,
+    doorRelationStatus,
+    doorRelationReason,
+    connectedRoomCellCount: connected.size,
+    roomSearchTruncated,
+    doorSearchMayBeTruncated,
+    doors,
+  };
+}
+
+function addConnectedCell(
+  position: Vec3,
+  connected: Map<string, Vec3>,
+  queue: Vec3[],
+  checked: Set<string>,
+): void {
+  const key = blockKey(position);
+  if (connected.has(key)) return;
+  connected.set(key, position);
+  checked.add(key);
+  queue.push(position);
+}
+
+function flatWalkableCell(bot: Bot, feetPosition: Vec3): boolean | null {
+  const feet = bot.blockAt(feetPosition);
+  const head = bot.blockAt(feetPosition.offset(0, 1, 0));
+  const floor = bot.blockAt(feetPosition.offset(0, -1, 0));
+  if (feet === null || head === null || floor === null) return null;
+  return (
+    isAirBlock(feet.name) &&
+    isAirBlock(head.name) &&
+    floor.boundingBox === "block"
+  );
+}
+
+function classifyHomeDoor(
+  bot: Bot,
+  door: Block,
+  connected: ReadonlyMap<string, Vec3>,
+  incompleteBoundary: boolean,
+  roomSearchTruncated: boolean,
+  observedAt: string,
+): PlayerHomePoiDoor {
+  const position = door.position.floored();
+  const properties = door.getProperties();
+  const facing = homePoiDirection(properties.facing);
+  const observedState =
+    properties.open === true
+      ? "open"
+      : properties.open === false
+        ? "closed"
+        : "unknown";
+  const unknown = (reason: PlayerHomePoiDoor["reason"]): PlayerHomePoiDoor => ({
+    position: blockCoordinates(position),
+    facing,
+    observedState,
+    relation: "unknown",
+    reason,
+    insideCell: null,
+    outsideCell: null,
+    relationObservedAt: null,
+    observedAt,
+  });
+  if (observedState === "open") return unknown("door_open");
+  if (observedState !== "closed") return unknown("door_state_unknown");
+  if (facing === null) return unknown("ambiguous_boundary");
+  if (incompleteBoundary || roomSearchTruncated)
+    return unknown("room_evidence_incomplete");
+
+  const insideCells: Vec3[] = [];
+  const outsideCells: Vec3[] = [];
+  const facingAxis = homePoiDirections.find(
+    (direction) => direction.direction === facing,
+  );
+  if (facingAxis === undefined) return unknown("ambiguous_boundary");
+  for (const neighbor of [
+    position.offset(facingAxis.x, 0, facingAxis.z),
+    position.offset(-facingAxis.x, 0, -facingAxis.z),
+  ]) {
+    const key = blockKey(neighbor);
+    if (connected.has(key)) {
+      insideCells.push(neighbor);
+      continue;
+    }
+    const walkable = flatWalkableCell(bot, neighbor);
+    if (walkable) outsideCells.push(neighbor);
+  }
+  if (insideCells.length !== 1 || outsideCells.length !== 1)
+    return unknown("ambiguous_boundary");
+  const insideCell = insideCells[0];
+  const outsideCell = outsideCells[0];
+  if (insideCell === undefined || outsideCell === undefined)
+    return unknown("ambiguous_boundary");
+  const insideRoofed = roofedAt(bot, insideCell);
+  const outsideRoofed = roofedAt(bot, outsideCell);
+  if (insideRoofed === null || outsideRoofed === null)
+    return unknown("room_evidence_incomplete");
+  if (!insideRoofed || outsideRoofed) return unknown("ambiguous_boundary");
+  return {
+    position: blockCoordinates(position),
+    facing,
+    observedState,
+    relation: "verified",
+    reason: "closed_flat_room_boundary",
+    insideCell: blockCoordinates(insideCell),
+    outsideCell: blockCoordinates(outsideCell),
+    relationObservedAt: observedAt,
+    observedAt,
+  };
+}
+
+function roofedAt(bot: Bot, feetPosition: Vec3): boolean | null {
+  for (let offset = 2; offset <= homePoiRoofCheckHeight; offset += 1) {
+    const block = bot.blockAt(feetPosition.offset(0, offset, 0));
+    if (block === null) return null;
+    if (block.boundingBox === "block") return true;
+    if (!isAirBlock(block.name)) return null;
+  }
+  return false;
+}
+
+function isBedHeadPoi(block: Block): boolean {
+  if (!block.name.endsWith("_bed")) return false;
+  try {
+    return block.getProperties().part === "head";
+  } catch {
+    return false;
+  }
+}
+
+function homePoiDirection(value: unknown): PlayerHomePoiDirection | null {
+  return value === "north" ||
+    value === "south" ||
+    value === "east" ||
+    value === "west"
+    ? value
+    : null;
+}
+
+function isAirBlock(name: string): boolean {
+  return name === "air" || name === "cave_air" || name === "void_air";
+}
+
+function blockCoordinates(position: Vec3): BodyBlockCoordinates {
+  const block = position.floored();
+  return { x: block.x, y: block.y, z: block.z };
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -1063,6 +1395,17 @@ function blockAtObservation(
   );
 }
 
+function safeBlockStateId(
+  bot: Bot,
+  position: { readonly x: number; readonly y: number; readonly z: number },
+): number | undefined {
+  try {
+    return bot.blockAt(blockPosition(position))?.stateId;
+  } catch {
+    return undefined;
+  }
+}
+
 function captureAttackEvidence(
   bot: Bot,
   operation: PlayerOperation,
@@ -1177,6 +1520,8 @@ function operationEvidence(
     }
     case "look_sweep":
       return active.lookSweep?.complete === true;
+    case "scan_home":
+      return active.homePoiScan !== undefined;
     case "control":
     case "move_vehicle":
     case "elytra_fly":
@@ -1393,12 +1738,12 @@ function operationEvidence(
       if (operation.target.kind === "block") {
         const key = blockKey(operation.target.position);
         const update = serverBlockUpdates.get(key);
-        const oldBlock = blockAtObservation(before, operation.target.position);
+        const oldStateId = active.targetBlockStateIdBefore;
         const observed = bot.blockAt(blockPosition(operation.target.position));
         const blockChanged =
           update !== undefined &&
-          oldBlock !== undefined &&
-          update.stateId !== oldBlock.stateId &&
+          oldStateId !== undefined &&
+          update.stateId !== oldStateId &&
           observed?.stateId === update.stateId;
         const openedWindow =
           after.window !== null && before.window?.id !== after.window.id;
@@ -1452,6 +1797,11 @@ function captureServerBlockUpdates(
     signal: AbortSignal,
     timeoutMs: number,
     expectedName: string,
+  ): Promise<boolean>;
+  waitForTargetStateChange(
+    previousStateId: number,
+    signal: AbortSignal,
+    timeoutMs: number,
   ): Promise<boolean>;
   dispose(): void;
 } {
@@ -1592,6 +1942,12 @@ function captureServerBlockUpdates(
         signal,
         timeoutMs,
         (update) => update.name === expectedName,
+      ),
+    waitForTargetStateChange: (previousStateId, signal, timeoutMs) =>
+      waitForMatchingTargetUpdate(
+        signal,
+        timeoutMs,
+        (update) => update.stateId !== previousStateId,
       ),
     dispose: () => {
       client.removeListener("block_change", single);
@@ -1854,6 +2210,10 @@ export class MineflayerPlayerBody implements PlayerBody {
     externalAbort?: () => void,
   ): ActiveOperation {
     const startedAt = new Date().toISOString();
+    const targetBlockStateIdBefore =
+      operation.kind === "use" && operation.target.kind === "block"
+        ? safeBlockStateId(bot, operation.target.position)
+        : undefined;
     return {
       id: randomUUID(),
       operation,
@@ -1862,6 +2222,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       startedAt,
       startedAtMs: Date.now(),
       startedLifeGeneration: this.lifeGeneration,
+      ...(targetBlockStateIdBefore === undefined
+        ? {}
+        : { targetBlockStateIdBefore }),
       moveRelativeLeadInputAttempted: false,
       done: Promise.resolve({
         operationId: "",
@@ -1985,6 +2348,17 @@ export class MineflayerPlayerBody implements PlayerBody {
             expectedBlockName,
           );
         }
+        if (
+          operation.kind === "use" &&
+          operation.target.kind === "block" &&
+          active.targetBlockStateIdBefore !== undefined &&
+          blockEvidence !== undefined
+        )
+          await blockEvidence.waitForTargetStateChange(
+            active.targetBlockStateIdBefore,
+            controller.signal,
+            useBlockUpdateGraceMs,
+          );
       }
     } catch (error) {
       commandError = error;
@@ -2027,6 +2401,9 @@ export class MineflayerPlayerBody implements PlayerBody {
     const confirmed =
       !travelCrossedLife &&
       !craftCrossedLife &&
+      (operation.kind !== "use" ||
+        operation.target.kind !== "block" ||
+        sameLife) &&
       operationEvidence(bot, operation, before, after, serverUpdates, active);
     const interrupted =
       (controller.signal.aborted && !active.timedOut) || travelCrossedLife;
@@ -2131,6 +2508,9 @@ export class MineflayerPlayerBody implements PlayerBody {
       ...(active.lookSweep === undefined
         ? {}
         : { lookSweep: active.lookSweep }),
+      ...(active.homePoiScan === undefined
+        ? {}
+        : { homePoiScan: active.homePoiScan }),
       detail,
     };
     if (recoveryRequired) {
@@ -2678,6 +3058,9 @@ export class MineflayerPlayerBody implements PlayerBody {
         return;
       case "look_sweep":
         await this.runLookSweep(bot, operation, signal, active);
+        return;
+      case "scan_home":
+        active.homePoiScan = scanLoadedHomePois(bot, signal);
         return;
       case "control":
         for (const control of bodyControls)

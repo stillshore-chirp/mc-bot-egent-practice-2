@@ -11,6 +11,10 @@ import type {
   MemoryUpdate,
 } from "../../src/player/contracts.js";
 import { playerOperationSchema } from "../../src/minecraft/player-body-schema.js";
+import type {
+  PlayerHomePoi,
+  PlayerHomePoiScan,
+} from "../../src/minecraft/player-body.js";
 
 const directories: string[] = [];
 const fixedNow = () => "2026-10-10T00:00:00.000Z";
@@ -101,6 +105,146 @@ describe("CompanionStore", () => {
     expect(
       store.recentMessages().map(({ role, text }) => ({ role, text })),
     ).toEqual(messages.slice(6));
+    store.close();
+  });
+
+  it("persists HOME POIs across reopen and retains a verified relation while a door is open", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    const firstObservedAt = "2026-10-10T00:00:00.000Z";
+    const firstHome: PlayerHomePoi = {
+      bedName: "minecraft:white_bed",
+      bedHead: { x: 20, y: 64, z: 10 },
+      observedAt: firstObservedAt,
+      doorRelationStatus: "verified",
+      doorRelationReason: "verified_flat_room_boundary",
+      connectedRoomCellCount: 7,
+      roomSearchTruncated: false,
+      doorSearchMayBeTruncated: false,
+      doors: [
+        {
+          position: { x: 22, y: 64, z: 10 },
+          facing: "east",
+          observedState: "closed",
+          relation: "verified",
+          reason: "closed_flat_room_boundary",
+          insideCell: { x: 21, y: 64, z: 10 },
+          outsideCell: { x: 23, y: 64, z: 10 },
+          relationObservedAt: firstObservedAt,
+          observedAt: firstObservedAt,
+        },
+      ],
+    };
+    const firstScan: PlayerHomePoiScan = {
+      source: "loaded_home_poi_scan",
+      observedAt: firstObservedAt,
+      dimension: "overworld",
+      center: { x: 20, y: 64, z: 10 },
+      radius: 128,
+      coverage: "loaded_blocks_only",
+      candidateLimit: 8,
+      omittedCandidatesAtLeast: 0,
+      candidateSearchMayBeTruncated: false,
+      worldAbsenceEstablished: false,
+      homes: [firstHome],
+    };
+    const initial = store.rememberObservedHomePoiScan(firstScan);
+    expect(initial).toHaveLength(1);
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    expect(store.latestObservedHomePois()).toHaveLength(1);
+    const secondObservedAt = "2026-10-10T00:05:00.000Z";
+    const firstDoor = firstHome.doors[0];
+    if (firstDoor === undefined)
+      throw new Error("Expected a home door fixture");
+    const currentOpenHome: PlayerHomePoi = {
+      ...firstHome,
+      observedAt: secondObservedAt,
+      doorRelationStatus: "unknown",
+      doorRelationReason: "no_supported_closed_wood_door_boundary",
+      doors: [
+        {
+          ...firstDoor,
+          observedState: "open",
+          relation: "unknown",
+          reason: "door_open",
+          insideCell: null,
+          outsideCell: null,
+          relationObservedAt: null,
+          observedAt: secondObservedAt,
+        },
+      ],
+    };
+    store.rememberObservedHomePoiScan({
+      ...firstScan,
+      observedAt: secondObservedAt,
+      homes: [currentOpenHome],
+    });
+
+    const current = store.latestObservedHomePois();
+    expect(current).toHaveLength(1);
+    expect(current[0]?.metadata).toMatchObject({
+      homeMemory: {
+        scan: { observedAt: secondObservedAt },
+        home: {
+          doorRelationStatus: "verified",
+          doors: [
+            {
+              observedState: "open",
+              relation: "verified",
+              relationObservedAt: firstObservedAt,
+              observedAt: secondObservedAt,
+            },
+          ],
+        },
+      },
+    });
+    store.close();
+  });
+
+  it("retains multiple HOME POIs while bounding readback to eight newest rows", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, { now: fixedNow });
+    const makeHome = (index: number, observedAt: string): PlayerHomePoi => ({
+      bedName: "minecraft:white_bed",
+      bedHead: { x: 30 + index, y: 64, z: 10 },
+      observedAt,
+      doorRelationStatus: "unknown",
+      doorRelationReason: "no_supported_closed_wood_door_boundary",
+      connectedRoomCellCount: 0,
+      roomSearchTruncated: false,
+      doorSearchMayBeTruncated: false,
+      doors: [],
+    });
+    const makeScan = (
+      index: number,
+      observedAt: string,
+    ): PlayerHomePoiScan => ({
+      source: "loaded_home_poi_scan",
+      observedAt,
+      dimension: "overworld",
+      center: { x: 30 + index, y: 64, z: 10 },
+      radius: 128,
+      coverage: "loaded_blocks_only",
+      candidateLimit: 8,
+      omittedCandidatesAtLeast: 0,
+      candidateSearchMayBeTruncated: false,
+      worldAbsenceEstablished: false,
+      homes: [makeHome(index, observedAt)],
+    });
+    const firstScanAt = "2026-10-10T00:00:00.000Z";
+    const firstEight: PlayerHomePoiScan = {
+      ...makeScan(0, firstScanAt),
+      homes: Array.from({ length: 8 }, (_, index) =>
+        makeHome(index, firstScanAt),
+      ),
+    };
+    store.rememberObservedHomePoiScan(firstEight);
+    store.rememberObservedHomePoiScan(makeScan(8, "2026-10-10T00:01:00.000Z"));
+
+    expect(store.latestObservedHomePois(20)).toHaveLength(8);
+    expect(store.latestObservedHomePois(3)).toHaveLength(3);
     store.close();
   });
 
