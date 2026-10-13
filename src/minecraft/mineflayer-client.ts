@@ -3,6 +3,7 @@ import { states } from "minecraft-protocol";
 import { pathfinder } from "mineflayer-pathfinder";
 import { AppError } from "../domain/errors.js";
 import { sameMinecraftIdentity } from "../domain/minecraft-identity.js";
+import { NavigationMovements } from "./navigation-movements.js";
 import { MineflayerPlayerBody, type PlayerBody } from "./player-body.js";
 
 export interface MineflayerClientOptions {
@@ -423,6 +424,10 @@ export class MineflayerClient {
         void (async () => {
           if (sendsPlayerLoadedPacket) await bot.waitForChunksToLoad();
           if (!isCurrentSpawn(generation)) return;
+          // Pathfinder is injected after the bot registry is prepared. Apply
+          // the companion's safe walk policy before admitting body actions on
+          // every spawn, including respawns and newly connected Bot instances.
+          bot.pathfinder.setMovements(new NavigationMovements(bot));
           if (sendsPlayerLoadedPacket) bot._client.write("player_loaded", {});
           this.spawned = true;
           settleResolve();

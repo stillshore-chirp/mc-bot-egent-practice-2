@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import mineflayer from "mineflayer";
+import type { Movements } from "mineflayer-pathfinder";
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../../src/domain/errors.js";
 import {
@@ -10,6 +12,13 @@ import {
   MineflayerClient,
   oxygenFromEntityMetadata,
 } from "../../src/minecraft/mineflayer-client.js";
+import { NavigationMovements } from "../../src/minecraft/navigation-movements.js";
+
+const require = createRequire(import.meta.url);
+const createRegistry = require("prismarine-registry") as (
+  version: string,
+) => Record<string, unknown>;
+const testRegistry = createRegistry("1.21.11");
 
 function createFakeBot(
   options: {
@@ -31,7 +40,8 @@ function createFakeBot(
     username: options.username ?? "Companion",
     version: options.version ?? "26.3",
     entity: { id: 1, name: "player" },
-    registry: { entitiesByName: {} },
+    registry: { ...testRegistry, entitiesByName: {} },
+    pathfinder: { setMovements: vi.fn<(movements: Movements) => void>() },
     inventory: new EventEmitter(),
     health: 20,
     loadPlugin: vi.fn(),
@@ -275,6 +285,7 @@ describe("Minecraft companion connection", () => {
       await vi.waitFor(() => expect(createBot).toHaveBeenCalledTimes(1));
       first.bot.emit("spawn");
       await firstConnection;
+      expect(first.bot.pathfinder.setMovements).toHaveBeenCalledOnce();
       first.bot.emit("end", "temporary disconnect");
       first.bot.emit("chat", "visitor", "late after end");
 
@@ -284,6 +295,7 @@ describe("Minecraft companion connection", () => {
       expect(minecraft.isConnected).toBe(false);
       second.bot.emit("spawn");
       await secondConnection;
+      expect(second.bot.pathfinder.setMovements).toHaveBeenCalledOnce();
       second.bot.emit("chat", "visitor", "current connection");
       first.bot.emit("chat", "visitor", "late from old connection");
 
@@ -293,6 +305,39 @@ describe("Minecraft companion connection", () => {
         second.bot,
       ]);
       expect(chats).toEqual([["visitor", "current connection"]]);
+    } finally {
+      createBot.mockRestore();
+    }
+  });
+
+  it("applies walk-only door-aware movements before each spawn is admitted", async () => {
+    const { bot, client: protocolClient } = createFakeBot();
+    const createBot = mockCreateBots(bot);
+    const minecraft = clientFor();
+
+    try {
+      const connecting = minecraft.connect();
+      await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
+      expect(bot.pathfinder.setMovements).not.toHaveBeenCalled();
+
+      bot.emit("spawn");
+      await connecting;
+
+      const firstMovements = bot.pathfinder.setMovements.mock.calls[0]?.[0];
+      expect(firstMovements).toBeInstanceOf(NavigationMovements);
+
+      protocolClient.emit("respawn");
+      expect(minecraft.isConnected).toBe(false);
+      bot.emit("spawn");
+      await vi.waitFor(() =>
+        expect(bot.pathfinder.setMovements).toHaveBeenCalledTimes(2),
+      );
+      expect(bot.pathfinder.setMovements.mock.calls[1]?.[0]).toBeInstanceOf(
+        NavigationMovements,
+      );
+      expect(bot.pathfinder.setMovements.mock.calls[1]?.[0]).not.toBe(
+        firstMovements,
+      );
     } finally {
       createBot.mockRestore();
     }
