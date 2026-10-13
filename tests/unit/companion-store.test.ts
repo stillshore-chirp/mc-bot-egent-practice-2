@@ -11,7 +11,10 @@ import type {
   MemoryUpdate,
 } from "../../src/player/contracts.js";
 import { playerOperationSchema } from "../../src/minecraft/player-body-schema.js";
-import type { PlayerHomePoi, PlayerHomePoiScan } from "../../src/minecraft/player-body.js";
+import type {
+  PlayerHomePoi,
+  PlayerHomePoiScan,
+} from "../../src/minecraft/player-body.js";
 
 const directories: string[] = [];
 const fixedNow = () => "2026-10-10T00:00:00.000Z";
@@ -110,7 +113,7 @@ describe("CompanionStore", () => {
     let store = CompanionStore.open(path, { now: fixedNow });
     const firstObservedAt = "2026-10-10T00:00:00.000Z";
     const firstHome: PlayerHomePoi = {
-      bedName: "minecraft:oak_bed",
+      bedName: "minecraft:white_bed",
       bedHead: { x: 20, y: 64, z: 10 },
       observedAt: firstObservedAt,
       doorRelationStatus: "verified",
@@ -152,6 +155,9 @@ describe("CompanionStore", () => {
     store = CompanionStore.open(path, { now: fixedNow });
     expect(store.latestObservedHomePois()).toHaveLength(1);
     const secondObservedAt = "2026-10-10T00:05:00.000Z";
+    const firstDoor = firstHome.doors[0];
+    if (firstDoor === undefined)
+      throw new Error("Expected a home door fixture");
     const currentOpenHome: PlayerHomePoi = {
       ...firstHome,
       observedAt: secondObservedAt,
@@ -159,7 +165,7 @@ describe("CompanionStore", () => {
       doorRelationReason: "no_supported_closed_wood_door_boundary",
       doors: [
         {
-          ...firstHome.doors[0]!,
+          ...firstDoor,
           observedState: "open",
           relation: "unknown",
           reason: "door_open",
@@ -201,7 +207,7 @@ describe("CompanionStore", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });
     const makeHome = (index: number, observedAt: string): PlayerHomePoi => ({
-      bedName: "minecraft:oak_bed",
+      bedName: "minecraft:white_bed",
       bedHead: { x: 30 + index, y: 64, z: 10 },
       observedAt,
       doorRelationStatus: "unknown",
@@ -211,7 +217,10 @@ describe("CompanionStore", () => {
       doorSearchMayBeTruncated: false,
       doors: [],
     });
-    const makeScan = (index: number, observedAt: string): PlayerHomePoiScan => ({
+    const makeScan = (
+      index: number,
+      observedAt: string,
+    ): PlayerHomePoiScan => ({
       source: "loaded_home_poi_scan",
       observedAt,
       dimension: "overworld",
@@ -232,9 +241,7 @@ describe("CompanionStore", () => {
       ),
     };
     store.rememberObservedHomePoiScan(firstEight);
-    store.rememberObservedHomePoiScan(
-      makeScan(8, "2026-10-10T00:01:00.000Z"),
-    );
+    store.rememberObservedHomePoiScan(makeScan(8, "2026-10-10T00:01:00.000Z"));
 
     expect(store.latestObservedHomePois(20)).toHaveLength(8);
     expect(store.latestObservedHomePois(3)).toHaveLength(3);

@@ -538,10 +538,14 @@ function rememberedHomePoiForProvider(
   if (!parsed.success) return undefined;
   const home = parsed.data.homes[0];
   if (
-    home === undefined ||
-    home.bedName !== bedName ||
+    home?.bedName !== bedName ||
     value.locationKey !==
-      JSON.stringify([dimension, home.bedHead.x, home.bedHead.y, home.bedHead.z])
+      JSON.stringify([
+        dimension,
+        home.bedHead.x,
+        home.bedHead.y,
+        home.bedHead.z,
+      ])
   )
     return undefined;
   return {

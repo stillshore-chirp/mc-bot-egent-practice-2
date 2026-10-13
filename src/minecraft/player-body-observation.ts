@@ -101,13 +101,12 @@ const homePoiDoorSchema = z
     observedAt: z.iso.datetime(),
   })
   .strict()
-  .refine(
-    (door) =>
-      door.relation === "verified"
-        ? door.relationObservedAt !== null &&
-          door.insideCell !== null &&
-          door.outsideCell !== null
-        : door.relationObservedAt === null,
+  .refine((door) =>
+    door.relation === "verified"
+      ? door.relationObservedAt !== null &&
+        door.insideCell !== null &&
+        door.outsideCell !== null
+      : door.relationObservedAt === null,
   );
 const homePoiSchema = z
   .object({
@@ -124,7 +123,11 @@ const homePoiSchema = z
       "no_supported_closed_wood_door_boundary",
       "ambiguous_boundary",
     ]),
-    connectedRoomCellCount: z.number().int().min(0).max(playerHomePoiRoomCellLimit),
+    connectedRoomCellCount: z
+      .number()
+      .int()
+      .min(0)
+      .max(playerHomePoiRoomCellLimit),
     roomSearchTruncated: z.boolean(),
     doorSearchMayBeTruncated: z.boolean(),
     doors: z.array(homePoiDoorSchema).max(playerHomePoiDoorLimit),

@@ -16,7 +16,7 @@ Agentへ渡す記憶と会話は検索と件数で制限されます。ownerが�
 
 Agentには直近5件のoutcomeを毎回渡し、それより古い目的は宣言目的を含めた既存episode memoryのlexical recallで参照できます。記憶件数・会話入力上限と256件のoutcome保持境界を超える履歴の到達は保証しません。欠けた記録から目的や過去の理由を推測しません。
 
-家の記憶は、村人と同じHOME基準であるbedのhead位置をHOME POIとして扱い、Bodyが確認できるload済み範囲の128ブロック以内を調べ、最新8件まで保存します。これは建物形状や居住者の確定ではありません。平床と閉じた木製ドアの限定観測はHOMEとdoorの対応を示す補助証拠で、屋根はHOME成立基準ではありません。未ロード、上限到達、複雑な構造、曖昧な対応はunknownとし、固定TTLを設けません。保存したdoor関係は観測時点の記録です。利用時はfreshなBody観測で確かめ、既存の`move_to` / `use`操作を判断します。
+家の記憶は、村人と同じHOME基準であるbedのhead位置をHOME POIとして扱い、Bodyが確認できるload済み範囲の128ブロック以内を調べて保存します。Agent入力には最新8件までを参照として渡します。これは建物形状や居住者の確定ではありません。平床と閉じた木製ドアの限定観測はHOMEとdoorの対応を示す補助証拠で、屋根はHOME成立基準ではありません。未ロード、上限到達、複雑な構造、曖昧な対応はunknownとし、固定TTLを設けません。保存したdoor関係は観測時点の記録です。利用時はfreshなBody観測で確かめ、既存の`move_to` / `use`操作を判断します。
 
 すでに開いている `CompanionStore` では `readOutcomeHistory({ from, to, limit })` を使い、ミリ秒付きUTC形式 `YYYY-MM-DDTHH:mm:ss.sssZ` の半開区間 `[from, to)` と1〜200件の上限を指定します。戻り値の `matchedCount` / `truncatedByLimit` は件数不足を、`retained` の `coverageFrom` / `evictedThrough` / `evictedCount` と `unavailableBefore` は保証範囲を示します。`truncatedByLimit=true` は照会上限で結果が切り詰められたこと、`unavailableBefore=true` は保持境界より前やevictionと重なるため過去期間を確認できないことを示し、どちらかがtrueなら `complete=false` です。後者は実際に欠落した証明ではありません。`complete=true` が示すのは保持されたoutcomeの範囲だけで、待機中・未記録の操作がなかった証明にはなりません。`recorded_at` は `outcome.observedAt` 由来で、通常のBody結果では `completedAt`、stop/restartではその判定時刻です。期間検索の基準であり、DBへの実書込時刻やBody開始時刻と同一視しません。古いoutcomeに `purpose`、`preActionObservation`、`bodyEvidence` がなければ、欠けた項目はunknownです。`bodyEvidence.startedAt` がnullまたは未記録の場合、実際のBody開始時刻はunknownです。
 

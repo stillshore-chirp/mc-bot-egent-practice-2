@@ -971,10 +971,7 @@ export class CompanionStore {
     const scan = parsed.data;
     const uniqueHomes = new Map<string, PlayerHomePoi>();
     for (const home of scan.homes) {
-      const locationKey = homePoiLocationKey(
-        scan.dimension,
-        home.bedHead,
-      );
+      const locationKey = homePoiLocationKey(scan.dimension, home.bedHead);
       uniqueHomes.set(locationKey, home);
     }
     return this.#database
@@ -1040,7 +1037,9 @@ export class CompanionStore {
   }
 
   /** Returns at most eight newest observed HOME POIs for direct Agent context. */
-  public latestObservedHomePois(limit = OBSERVED_HOME_POI_LIMIT): CompanionMemory[] {
+  public latestObservedHomePois(
+    limit = OBSERVED_HOME_POI_LIMIT,
+  ): CompanionMemory[] {
     const boundedLimit = Math.max(
       0,
       Math.min(OBSERVED_HOME_POI_LIMIT, Math.trunc(limit)),
@@ -3217,8 +3216,7 @@ function homePoiMemoryFrom(
   });
   const home = parsedScan.success ? parsedScan.data.homes[0] : undefined;
   if (
-    home === undefined ||
-    home.bedName !== value.bedName ||
+    home?.bedName !== value.bedName ||
     homePoiLocationKey(value.dimension, home.bedHead) !== value.locationKey
   )
     return undefined;

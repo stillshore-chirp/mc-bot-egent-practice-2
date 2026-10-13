@@ -316,7 +316,7 @@ describe("CompanionAgent", () => {
       const makeHome = (index: number, observedAt: string): PlayerHomePoi => {
         const verified = index === 0 || index === 20;
         return {
-          bedName: "minecraft:oak_bed",
+          bedName: "minecraft:white_bed",
           bedHead: { x: 20 + index, y: 64, z: 10 },
           observedAt,
           doorRelationStatus: verified ? "verified" : "unknown",
@@ -383,7 +383,9 @@ describe("CompanionAgent", () => {
         }),
       );
       const agent = new CompanionAgent({
-        client: { responses: { create } } as unknown as CompanionResponsesClient,
+        client: {
+          responses: { create },
+        } as unknown as CompanionResponsesClient,
         model: "gpt-6-luna",
         persona,
       });
@@ -421,7 +423,7 @@ describe("CompanionAgent", () => {
         providerInput.rememberedHomePois.every(
           ({ scan }) =>
             scan.coverage === "loaded_blocks_only" &&
-            scan.worldAbsenceEstablished === false,
+            !scan.worldAbsenceEstablished,
         ),
       ).toBe(true);
       expect(JSON.stringify(providerInput.rememberedHomePois)).not.toContain(
