@@ -679,7 +679,8 @@ function scanLoadedHomePois(bot: Bot, signal: AbortSignal): PlayerHomePoiScan {
   const rawCandidates = bot.findBlocks({
     matching: (block) => isBedHeadPoi(block),
     point: origin,
-    maxDistance: homePoiSearchRadius,
+    // Mineflayer floors point internally; the live-origin filter below enforces the 128-block sphere.
+    maxDistance: homePoiSearchRadius + 2,
     count: homePoiSearchSentinel,
   });
   const candidates = rawCandidates

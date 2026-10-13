@@ -81,8 +81,8 @@ function addFlatHomeWithTwoWoodenDoors(
       }
     }
   }
-  addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 0), { part: "head" });
-  addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 1), { part: "foot" });
+  addHomeBlock(fake, "white_bed", new Vec3(0, 64, 0), { part: "head" });
+  addHomeBlock(fake, "white_bed", new Vec3(0, 64, 1), { part: "foot" });
   addHomeBlock(fake, "stone", new Vec3(3, 63, 0));
   addHomeBlock(fake, "stone", new Vec3(0, 63, -3));
   addHomeBlock(fake, "oak_door", new Vec3(2, 64, 0), {
@@ -394,10 +394,11 @@ function makeFakeBot(
       count?: number;
       point?: Vec3;
     }) => {
+      const searchPoint = point.floored();
       const results = candidates
         .filter(
           (candidate) =>
-            point.distanceTo(candidate) <= maxDistance &&
+            searchPoint.distanceTo(candidate) <= maxDistance &&
             matching(blocks.get(key(candidate)) ?? airAt(candidate)),
         )
         .slice(0, count);
@@ -1908,7 +1909,7 @@ describe("player body", () => {
       worldAbsenceEstablished: false,
       homes: [
         {
-          bedName: "oak_bed",
+          bedName: "white_bed",
           bedHead: { x: 0, y: 64, z: 0 },
           doorRelationStatus: "verified",
           doorRelationReason: "verified_flat_room_boundary",
@@ -1973,13 +1974,13 @@ describe("player body", () => {
 
   it("uses 3D radius 128, records bed heads rather than foot halves, and marks candidate caps", async () => {
     const boundary = makeFakeBot();
-    addHomeBlock(boundary, "oak_bed", new Vec3(0, 64, -128), {
+    addHomeBlock(boundary, "white_bed", new Vec3(0, 64, -128), {
       part: "head",
     });
-    addHomeBlock(boundary, "oak_bed", new Vec3(0, 64, -127), {
+    addHomeBlock(boundary, "white_bed", new Vec3(0, 64, -127), {
       part: "foot",
     });
-    addHomeBlock(boundary, "spruce_bed", new Vec3(129, 64, 0), {
+    addHomeBlock(boundary, "red_bed", new Vec3(129, 64, 0), {
       part: "head",
     });
     const boundaryResult = await new MineflayerPlayerBody(
@@ -1994,10 +1995,10 @@ describe("player body", () => {
 
     const capped = makeFakeBot();
     for (let index = 0; index < 9; index += 1)
-      addHomeBlock(capped, "oak_bed", new Vec3(index, 64, -8), {
+      addHomeBlock(capped, "white_bed", new Vec3(index, 64, -8), {
         part: "head",
       });
-    addHomeBlock(capped, "oak_bed", new Vec3(0, 64, -9), {
+    addHomeBlock(capped, "white_bed", new Vec3(0, 64, -9), {
       part: "foot",
     });
     const cappedResult = await new MineflayerPlayerBody(
@@ -2012,7 +2013,7 @@ describe("player body", () => {
     expect(cappedResult.homePoiScan?.homes).toHaveLength(8);
 
     const sentinel = makeFakeBot();
-    addHomeBlock(sentinel, "oak_bed", new Vec3(0, 64, 0), {
+    addHomeBlock(sentinel, "white_bed", new Vec3(0, 64, 0), {
       part: "head",
     });
     sentinel.candidates.push(
@@ -2034,7 +2035,7 @@ describe("player body", () => {
 
     const fractional = makeFakeBot();
     fractional.bot.entity.position = new Vec3(0.9, 64.9, 0);
-    addHomeBlock(fractional, "birch_bed", new Vec3(127, 64, 18), {
+    addHomeBlock(fractional, "red_bed", new Vec3(127, 64, 18), {
       part: "head",
     });
     const fractionalResult = await new MineflayerPlayerBody(
@@ -2047,7 +2048,7 @@ describe("player body", () => {
 
   it("marks canonical door caps as incomplete even below the raw search sentinel", async () => {
     const fake = makeFakeBot();
-    addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 0), { part: "head" });
+    addHomeBlock(fake, "white_bed", new Vec3(0, 64, 0), { part: "head" });
     for (let index = 1; index <= 9; index += 1) {
       addHomeBlock(fake, "oak_door", new Vec3(index, 64, 0), {
         half: "lower",
