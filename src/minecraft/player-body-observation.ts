@@ -18,6 +18,134 @@ export interface BodyPosition extends BodyBlockCoordinates {
   readonly dimension: string;
 }
 
+export type PlayerHomePoiDirection = "north" | "south" | "east" | "west";
+
+export interface PlayerHomePoiDoor {
+  readonly position: BodyBlockCoordinates;
+  readonly facing: PlayerHomePoiDirection | null;
+  readonly observedState: "open" | "closed" | "unknown";
+  readonly relation: "verified" | "unknown";
+  readonly reason:
+    | "closed_flat_room_boundary"
+    | "door_open"
+    | "door_state_unknown"
+    | "ambiguous_boundary"
+    | "room_evidence_incomplete";
+  readonly insideCell: BodyBlockCoordinates | null;
+  readonly outsideCell: BodyBlockCoordinates | null;
+  /** Time when the relation itself was last directly observed; null when unknown. */
+  readonly relationObservedAt: string | null;
+  readonly observedAt: string;
+}
+
+export interface PlayerHomePoi {
+  /** Minecraft bed registry name; the position is the bed's HOME head half. */
+  readonly bedName: string;
+  readonly bedHead: BodyBlockCoordinates;
+  readonly observedAt: string;
+  readonly doorRelationStatus: "verified" | "unknown";
+  readonly doorRelationReason:
+    | "verified_flat_room_boundary"
+    | "no_bed_adjacent_walkable_cells"
+    | "room_region_limit_reached"
+    | "unloaded_room_boundary"
+    | "door_search_truncated"
+    | "no_supported_closed_wood_door_boundary"
+    | "ambiguous_boundary";
+  readonly connectedRoomCellCount: number;
+  readonly roomSearchTruncated: boolean;
+  readonly doorSearchMayBeTruncated: boolean;
+  readonly doors: readonly PlayerHomePoiDoor[];
+}
+
+export interface PlayerHomePoiScan {
+  readonly source: "loaded_home_poi_scan";
+  readonly observedAt: string;
+  readonly dimension: string;
+  readonly center: BodyBlockCoordinates;
+  readonly radius: 128;
+  readonly coverage: "loaded_blocks_only";
+  readonly candidateLimit: 8;
+  readonly omittedCandidatesAtLeast: number;
+  readonly candidateSearchMayBeTruncated: boolean;
+  readonly worldAbsenceEstablished: false;
+  readonly homes: readonly PlayerHomePoi[];
+}
+
+export const playerHomePoiCandidateLimit = 8;
+export const playerHomePoiDoorLimit = 8;
+export const playerHomePoiRoomCellLimit = 128;
+const homePoiCoordinateSchema = z
+  .object({
+    x: z.number().int().refine(Number.isSafeInteger),
+    y: z.number().int().refine(Number.isSafeInteger),
+    z: z.number().int().refine(Number.isSafeInteger),
+  })
+  .strict();
+const homePoiDoorSchema = z
+  .object({
+    position: homePoiCoordinateSchema,
+    facing: z.enum(["north", "south", "east", "west"]).nullable(),
+    observedState: z.enum(["open", "closed", "unknown"]),
+    relation: z.enum(["verified", "unknown"]),
+    reason: z.enum([
+      "closed_flat_room_boundary",
+      "door_open",
+      "door_state_unknown",
+      "ambiguous_boundary",
+      "room_evidence_incomplete",
+    ]),
+    insideCell: homePoiCoordinateSchema.nullable(),
+    outsideCell: homePoiCoordinateSchema.nullable(),
+    relationObservedAt: z.iso.datetime().nullable(),
+    observedAt: z.iso.datetime(),
+  })
+  .strict()
+  .refine(
+    (door) =>
+      door.relation === "verified"
+        ? door.relationObservedAt !== null &&
+          door.insideCell !== null &&
+          door.outsideCell !== null
+        : door.relationObservedAt === null,
+  );
+const homePoiSchema = z
+  .object({
+    bedName: z.string().regex(/^[a-z0-9_.:/-]{1,128}_bed$/iu),
+    bedHead: homePoiCoordinateSchema,
+    observedAt: z.iso.datetime(),
+    doorRelationStatus: z.enum(["verified", "unknown"]),
+    doorRelationReason: z.enum([
+      "verified_flat_room_boundary",
+      "no_bed_adjacent_walkable_cells",
+      "room_region_limit_reached",
+      "unloaded_room_boundary",
+      "door_search_truncated",
+      "no_supported_closed_wood_door_boundary",
+      "ambiguous_boundary",
+    ]),
+    connectedRoomCellCount: z.number().int().min(0).max(playerHomePoiRoomCellLimit),
+    roomSearchTruncated: z.boolean(),
+    doorSearchMayBeTruncated: z.boolean(),
+    doors: z.array(homePoiDoorSchema).max(playerHomePoiDoorLimit),
+  })
+  .strict();
+export const playerHomePoiScanSchema = z
+  .object({
+    source: z.literal("loaded_home_poi_scan"),
+    observedAt: z.iso.datetime(),
+    dimension: z.string().regex(/^[a-z0-9_.:/-]{1,128}$/iu),
+    center: homePoiCoordinateSchema,
+    radius: z.literal(128),
+    coverage: z.literal("loaded_blocks_only"),
+    candidateLimit: z.literal(playerHomePoiCandidateLimit),
+    omittedCandidatesAtLeast: z.number().int().min(0),
+    candidateSearchMayBeTruncated: z.boolean(),
+    worldAbsenceEstablished: z.literal(false),
+    homes: z.array(homePoiSchema).max(playerHomePoiCandidateLimit),
+  })
+  .strict();
+
 export interface BodyItemStack {
   readonly slot: number;
   readonly itemId: number;

@@ -39,6 +39,74 @@ function makeBlock(name: string, stateId: number, position: Vec3): FakeBlock {
   };
 }
 
+function addHomeBlock(
+  fake: ReturnType<typeof makeFakeBot>,
+  name: string,
+  position: Vec3,
+  properties: Readonly<Record<string, unknown>> = {},
+): void {
+  const block = makeBlock(name, 900, position.floored());
+  block.getProperties = () => ({ ...properties });
+  fake.blocks.set(
+    `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`,
+    block,
+  );
+  if (
+    !fake.candidates.some(
+      (candidate) =>
+        Math.floor(candidate.x) === Math.floor(position.x) &&
+        Math.floor(candidate.y) === Math.floor(position.y) &&
+        Math.floor(candidate.z) === Math.floor(position.z),
+    )
+  )
+    fake.candidates.push(position.floored());
+}
+
+function addFlatHomeWithTwoWoodenDoors(
+  fake: ReturnType<typeof makeFakeBot>,
+): void {
+  for (let x = -1; x <= 1; x += 1) {
+    for (let z = -1; z <= 1; z += 1) {
+      addHomeBlock(fake, "stone", new Vec3(x, 63, z));
+      addHomeBlock(fake, "stone", new Vec3(x, 66, z));
+    }
+  }
+  for (let x = -2; x <= 2; x += 1) {
+    for (let z = -2; z <= 2; z += 1) {
+      if (Math.abs(x) !== 2 && Math.abs(z) !== 2) continue;
+      for (let y = 64; y <= 65; y += 1) {
+        if (x === 2 && z === 0) continue;
+        if (x === 0 && z === -2) continue;
+        addHomeBlock(fake, "oak_planks", new Vec3(x, y, z));
+      }
+    }
+  }
+  addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 0), { part: "head" });
+  addHomeBlock(fake, "oak_bed", new Vec3(0, 64, 1), { part: "foot" });
+  addHomeBlock(fake, "stone", new Vec3(3, 63, 0));
+  addHomeBlock(fake, "stone", new Vec3(0, 63, -3));
+  addHomeBlock(fake, "oak_door", new Vec3(2, 64, 0), {
+    half: "lower",
+    open: false,
+    facing: "east",
+  });
+  addHomeBlock(fake, "oak_door", new Vec3(2, 65, 0), {
+    half: "upper",
+    open: false,
+    facing: "east",
+  });
+  addHomeBlock(fake, "spruce_door", new Vec3(0, 64, -2), {
+    half: "lower",
+    open: false,
+    facing: "north",
+  });
+  addHomeBlock(fake, "spruce_door", new Vec3(0, 65, -2), {
+    half: "upper",
+    open: false,
+    facing: "north",
+  });
+}
+
 function pathUpdateListenerCount(bot: Bot): number {
   return (bot as unknown as EventEmitter).listenerCount("path_update");
 }
@@ -662,13 +730,14 @@ function emitEatingCompletion(
 
 describe("player body", () => {
   it("exports a single strict operation catalog and rejects malformed variants", () => {
-    expect(playerOperationNames).toHaveLength(32);
+    expect(playerOperationNames).toHaveLength(33);
     expect(Object.keys(playerOperationDescriptions).sort()).toEqual(
       [...playerOperationNames].sort(),
     );
     expect(playerOperationNames).toContain("move_to");
     expect(playerOperationNames).toContain("move_relative");
     expect(playerOperationNames).toContain("look_sweep");
+    expect(playerOperationNames).toContain("scan_home");
     expect(playerOperationNames).toContain("window_transfer");
     expect(playerOperationNames).toContain("elytra_fly");
     expect(playerOperationNames).toContain("collect_item");
@@ -678,6 +747,9 @@ describe("player body", () => {
     });
     expect(playerOperationSchema.parse({ kind: "look_sweep" })).toEqual({
       kind: "look_sweep",
+    });
+    expect(playerOperationSchema.parse({ kind: "scan_home" })).toEqual({
+      kind: "scan_home",
     });
     expect(
       playerOperationSchema.parse({ kind: "look_sweep", pitchDegrees: -60 }),
@@ -1816,6 +1888,122 @@ describe("player body", () => {
     expect(
       allViews.reduce((total, view) => total + view.visibleEntities.length, 0),
     ).toBeLessThanOrEqual(18);
+  });
+
+  it("scans loaded bed-head HOME POIs and verifies only flat wooden door boundaries", async () => {
+    const fake = makeFakeBot();
+    addFlatHomeWithTwoWoodenDoors(fake);
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({ kind: "scan_home" });
+
+    expect(result.status).toBe("successful");
+    expect(result.homePoiScan).toMatchObject({
+      source: "loaded_home_poi_scan",
+      dimension: "overworld",
+      radius: 128,
+      coverage: "loaded_blocks_only",
+      candidateLimit: 8,
+      candidateSearchMayBeTruncated: false,
+      worldAbsenceEstablished: false,
+      homes: [
+        {
+          bedName: "oak_bed",
+          bedHead: { x: 0, y: 64, z: 0 },
+          doorRelationStatus: "verified",
+          doorRelationReason: "verified_flat_room_boundary",
+          connectedRoomCellCount: 7,
+          roomSearchTruncated: false,
+          doorSearchMayBeTruncated: false,
+          doors: expect.arrayContaining([
+            expect.objectContaining({
+              position: { x: 2, y: 64, z: 0 },
+              observedState: "closed",
+              relation: "verified",
+              reason: "closed_flat_room_boundary",
+              insideCell: { x: 1, y: 64, z: 0 },
+              outsideCell: { x: 3, y: 64, z: 0 },
+            }),
+            expect.objectContaining({
+              position: { x: 0, y: 64, z: -2 },
+              observedState: "closed",
+              relation: "verified",
+              insideCell: { x: 0, y: 64, z: -1 },
+              outsideCell: { x: 0, y: 64, z: -3 },
+            }),
+          ]),
+        },
+      ],
+    });
+  });
+
+  it("uses 3D radius 128, records bed heads rather than foot halves, and marks candidate caps", async () => {
+    const boundary = makeFakeBot();
+    addHomeBlock(boundary, "oak_bed", new Vec3(0, 64, -128), {
+      part: "head",
+    });
+    addHomeBlock(boundary, "oak_bed", new Vec3(0, 64, -127), {
+      part: "foot",
+    });
+    addHomeBlock(boundary, "spruce_bed", new Vec3(129, 64, 0), {
+      part: "head",
+    });
+    const boundaryResult = await new MineflayerPlayerBody(
+      () => boundary.bot,
+    ).execute({ kind: "scan_home" });
+    expect(boundaryResult.homePoiScan?.homes).toHaveLength(1);
+    expect(boundaryResult.homePoiScan?.homes[0]?.bedHead).toEqual({
+      x: 0,
+      y: 64,
+      z: -128,
+    });
+
+    const capped = makeFakeBot();
+    for (let index = 0; index < 9; index += 1)
+      addHomeBlock(capped, "oak_bed", new Vec3(index, 64, -8), {
+        part: "head",
+      });
+    addHomeBlock(capped, "oak_bed", new Vec3(0, 64, -9), {
+      part: "foot",
+    });
+    const cappedResult = await new MineflayerPlayerBody(
+      () => capped.bot,
+    ).execute({ kind: "scan_home" });
+    expect(cappedResult.homePoiScan).toMatchObject({
+      candidateLimit: 8,
+      candidateSearchMayBeTruncated: true,
+      omittedCandidatesAtLeast: 1,
+      worldAbsenceEstablished: false,
+    });
+    expect(cappedResult.homePoiScan?.homes).toHaveLength(8);
+  });
+
+  it("keeps unsupported or open-door relations unknown", async () => {
+    const fake = makeFakeBot();
+    addFlatHomeWithTwoWoodenDoors(fake);
+    const openDoor = fake.blocks.get("2,64,0");
+    if (openDoor === undefined) throw new Error("expected test door");
+    openDoor.getProperties = () => ({
+      half: "lower",
+      open: true,
+      facing: "east",
+    });
+    const body = new MineflayerPlayerBody(() => fake.bot);
+
+    const result = await body.execute({ kind: "scan_home" });
+
+    expect(result.homePoiScan?.homes[0]).toMatchObject({
+      doorRelationStatus: "verified",
+      doors: expect.arrayContaining([
+        expect.objectContaining({
+          position: { x: 2, y: 64, z: 0 },
+          observedState: "open",
+          relation: "unknown",
+          reason: "door_open",
+        }),
+      ]),
+    });
+    expect(result.homePoiScan?.homes[0]?.doors.length).toBeGreaterThan(0);
   });
 
   it("sweeps at a requested upward pitch and reports observed pitch", async () => {
