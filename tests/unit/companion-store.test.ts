@@ -760,6 +760,105 @@ describe("CompanionStore", () => {
     store.close();
   });
 
+  it("keeps only eight confirmed life episodes and updates exact death anchors while stopped", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    const stopped = store.stop();
+    const deaths = Array.from({ length: 9 }, (_, index) =>
+      new Date(
+        Date.parse("2026-10-01T00:00:00.000Z") + index * 60_000,
+      ).toISOString(),
+    );
+
+    for (const at of deaths) {
+      store.recordObservedLifeEvent({ type: "bot_death", at });
+    }
+    const deathAt = deaths[8];
+    if (deathAt === undefined) throw new Error("expected synthetic death time");
+    store.recordObservedLifeEvent({
+      type: "bot_respawn",
+      at: "2026-10-01T00:09:30.000Z",
+      deathAt,
+    });
+    store.recordObservedLifeEvent({
+      type: "bot_respawn",
+      at: "2026-10-01T00:09:45.000Z",
+      deathAt,
+    });
+    store.recordObservedLifeEvent({
+      type: "bot_death_cause_updated",
+      at: "2026-10-01T00:09:20.000Z",
+      deathAt,
+      cause: {
+        source: { kind: "mob", name: "zombie", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "death_notification",
+        causeKey: "death.attack.mob",
+      },
+    });
+    store.recordObservedLifeEvent({
+      type: "bot_death_cause_updated",
+      at: "2026-10-01T00:09:21.000Z",
+      deathAt: deaths[0] ?? "2026-10-01T00:00:00.000Z",
+      cause: {
+        source: { kind: "mob", name: "skeleton", category: "Hostile mobs" },
+        confidence: "observed",
+        provenance: "death_notification",
+        causeKey: "death.attack.arrow",
+      },
+    });
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+    const memory = store.latestObservedLifeMemory();
+    expect(store.snapshot()).toMatchObject({
+      stopped: true,
+      stopGeneration: stopped.stopGeneration,
+      activeOperation: null,
+    });
+    expect(memory).toMatchObject({
+      kind: "life",
+      source: "minecraft_observed",
+      metadata: {
+        observedLifeEpisodes: {
+          version: 1,
+          episodes: [
+            { deathAt: deaths[1] },
+            { deathAt: deaths[2] },
+            { deathAt: deaths[3] },
+            { deathAt: deaths[4] },
+            { deathAt: deaths[5] },
+            { deathAt: deaths[6] },
+            { deathAt: deaths[7] },
+            {
+              deathAt,
+              deathSource: "minecraft_observed",
+              cause: {
+                source: {
+                  kind: "mob",
+                  name: "zombie",
+                  category: "Hostile mobs",
+                },
+                provenance: "death_notification",
+              },
+              causeObservedAt: "2026-10-01T00:09:20.000Z",
+              respawnAt: "2026-10-01T00:09:30.000Z",
+              respawnSource: "minecraft_observed",
+            },
+          ],
+        },
+      },
+    });
+    expect(memory?.content).toContain("死因: zombie");
+    expect(memory?.content).toContain("2026-10-01T00:09:30.000Z");
+    const content = memory?.content ?? "";
+    expect(content.indexOf(deathAt)).toBeLessThan(
+      content.indexOf(deaths[7] ?? ""),
+    );
+    expect(memory?.content).not.toContain("skeleton");
+    store.close();
+  });
+
   it("finds a rare old memory among a large recent set with a bounded recall pool", () => {
     const { path } = freshDatabase();
     const store = CompanionStore.open(path, { now: fixedNow });

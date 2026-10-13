@@ -372,6 +372,11 @@ export type PlayerBodyEvent =
       readonly cause: PlayerBodyDeathCause;
     }
   | {
+      readonly type: "bot_respawn";
+      readonly at: string;
+      readonly deathAt: string;
+    }
+  | {
       readonly type: "disconnected";
       readonly at: string;
       readonly reason: string;
@@ -1639,6 +1644,12 @@ export class MineflayerPlayerBody implements PlayerBody {
         cause: PlayerBodyDeathCause | undefined;
         causeUpdateEmitted: boolean;
         timer: ReturnType<typeof setTimeout>;
+      }
+    | undefined;
+  private deathAwaitingRespawn:
+    | {
+        readonly bot: Bot;
+        readonly at: string;
       }
     | undefined;
   private disconnectedSinceBind = false;
@@ -3494,6 +3505,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     if (this.pendingBotDeath !== undefined)
       clearTimeout(this.pendingBotDeath.timer);
     this.pendingBotDeath = undefined;
+    this.deathAwaitingRespawn = undefined;
     this.boundBot = bot;
     this.boundBotEnded = false;
     this.botLifeDead = !Number.isFinite(bot.health) || bot.health <= 0;
@@ -3641,6 +3653,7 @@ export class MineflayerPlayerBody implements PlayerBody {
         }, deathEvidenceCorrelationMs),
       };
       this.pendingBotDeath = pendingBotDeath;
+      this.deathAwaitingRespawn = { bot, at };
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
       this.emit({
@@ -3652,6 +3665,7 @@ export class MineflayerPlayerBody implements PlayerBody {
     listen("end", (reason: unknown) => {
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
+      this.deathAwaitingRespawn = undefined;
       this.boundBotEnded = true;
       if (this.pendingBotDeath?.bot === bot) {
         clearTimeout(this.pendingBotDeath.timer);
@@ -3676,6 +3690,7 @@ export class MineflayerPlayerBody implements PlayerBody {
       });
     });
     listen("spawn", () => {
+      const confirmedDeath = this.deathAwaitingRespawn;
       this.lastBotDamage = undefined;
       this.pendingDeathNotice = undefined;
       this.abortActiveTravelForLifecycleChange(
@@ -3684,6 +3699,14 @@ export class MineflayerPlayerBody implements PlayerBody {
       );
       this.lifeGeneration += 1;
       this.botLifeDead = false;
+      this.deathAwaitingRespawn = undefined;
+      if (confirmedDeath?.bot === bot && !this.boundBotEnded) {
+        this.emit({
+          type: "bot_respawn",
+          at: new Date().toISOString(),
+          deathAt: confirmedDeath.at,
+        });
+      }
       if (this.disconnectedSinceBind) {
         this.disconnectedSinceBind = false;
         this.emit({ type: "reconnected", at: new Date().toISOString() });

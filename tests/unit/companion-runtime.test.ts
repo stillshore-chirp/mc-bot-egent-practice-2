@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -727,6 +728,134 @@ describe("CompanionRuntime", () => {
     });
     expect(agent.inputs[2]?.observation.self.inWater).toBe(false);
     expect(say).toHaveBeenCalledWith(answer.speech);
+  });
+
+  it("prioritizes confirmed life history for a later question alongside current health and owner reports", async () => {
+    const { store, path } = freshStore();
+    const ownerReport = "前に洞窟で死亡したと報告した";
+    store.remember(
+      [
+        {
+          kind: "fact",
+          content: ownerReport,
+          importance: 4,
+          ownerQuote: ownerReport,
+        },
+      ],
+      { ownerMessage: ownerReport },
+    );
+    expect(store.latestObservedLifeMemory()).toBeNull();
+    const body = new FakeBody(store);
+    body.observation = {
+      ...body.observation,
+      self: { ...body.observation.self, health: 20 },
+    };
+    const answer = companionDecisionSchema.parse({
+      ...emptyDecision(),
+      speech:
+        "Minecraftで確認した過去の死亡と復活は記録にあるよ。今の体力は現在の観測だよ。洞窟での死亡はownerからの報告として分けているよ。",
+    });
+    const agent = new FakeAgent([emptyDecision(), emptyDecision(), answer]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    await eventually(() => !runtime.status().thinking);
+    body.emit({ type: "bot_death", at: "2026-10-10T00:00:03.000Z" });
+    await eventually(() => agent.inputs.length === 2);
+    await eventually(() => !runtime.status().thinking);
+    body.emit({
+      type: "bot_respawn",
+      at: "2026-10-10T00:00:04.000Z",
+      deathAt: "2026-10-10T00:00:03.000Z",
+    });
+
+    await runtime.shutdown();
+    store.close();
+    const reopened = CompanionStore.open(path, { ownerUsername: "Builder" });
+    stores.push(reopened);
+    const laterBody = new FakeBody(reopened);
+    laterBody.observation = {
+      ...laterBody.observation,
+      self: { ...laterBody.observation.self, health: 20 },
+    };
+    const laterAgent = new FakeAgent([answer]);
+    const laterRuntime = createRuntime(reopened, laterBody, laterAgent);
+
+    await laterRuntime.receiveChat("Builder", "前の死亡と復活について教えて");
+
+    const input = laterAgent.inputs[0];
+    const lifeMemory = input?.memories.find((memory) => memory.kind === "life");
+    const ownerMemory = input?.memories.find(
+      (memory) => memory.source === "player_stated",
+    );
+    expect(input?.observation.self.health).toBe(20);
+    expect(lifeMemory?.source).toBe("minecraft_observed");
+    expect(lifeMemory?.content).toContain("2026-10-10T00:00:03.000Z");
+    expect(lifeMemory?.content).toContain("2026-10-10T00:00:04.000Z");
+    expect(lifeMemory?.content).toContain("死因: 未確認");
+    expect(ownerMemory).toMatchObject({
+      source: "player_stated",
+      content: ownerReport,
+    });
+  });
+
+  it("records observed life events during durable owner stop without waking or dispatching", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    await eventually(() => !runtime.status().thinking);
+    await runtime.stop("Builder");
+    body.emit({ type: "bot_death", at: "2026-10-10T00:00:03.000Z" });
+    body.emit({
+      type: "bot_respawn",
+      at: "2026-10-10T00:00:04.000Z",
+      deathAt: "2026-10-10T00:00:03.000Z",
+    });
+
+    expect(store.snapshot()).toMatchObject({ stopped: true, plan: null });
+    expect(store.latestObservedLifeMemory()?.content).toContain(
+      "Minecraftで確認 (2026-10-10T00:00:04.000Z)",
+    );
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed).toEqual([]);
+  });
+
+  it("does not wake or dispatch when observed life-event persistence fails", async () => {
+    const { store, path } = freshStore();
+    const database = new Database(path);
+    try {
+      database.exec(`
+        CREATE TRIGGER reject_observed_life_memory
+        BEFORE INSERT ON companion_memories
+        WHEN NEW.kind = 'life' AND NEW.source = 'minecraft_observed'
+        BEGIN
+          SELECT RAISE(FAIL, 'synthetic life memory write failure');
+        END;
+      `);
+    } finally {
+      database.close();
+    }
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision()]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    await eventually(() => !runtime.status().thinking);
+    body.emit({ type: "bot_death", at: "2026-10-10T00:00:03.000Z" });
+
+    expect(agent.inputs).toHaveLength(1);
+    expect(body.executed).toEqual([]);
+    expect(store.snapshot()).toMatchObject({
+      stopped: false,
+      activeOperation: null,
+    });
+    expect(store.latestObservedLifeMemory()).toBeNull();
   });
 
   it("does not dispatch when active-marker save throws after committing; reopen records unknown completion without replay", async () => {

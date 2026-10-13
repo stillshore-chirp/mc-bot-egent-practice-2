@@ -769,21 +769,24 @@ export class CompanionRuntime {
       query,
       this.#memoryContextLimit,
     );
+    const latestLifeMemory = this.#store.latestObservedLifeMemory();
     const latestChestLocation = this.#store.latestObservedChestLocation();
     const latestBedLocation = this.#store.latestObservedBedLocation();
-    const latestLocations = [latestChestLocation, latestBedLocation].filter(
-      (memory): memory is NonNullable<typeof memory> => memory !== null,
-    );
-    const latestLocationIds = new Set(
-      latestLocations.map((memory) => memory.id),
+    const latestPriorityMemories = [
+      latestLifeMemory,
+      latestChestLocation,
+      latestBedLocation,
+    ].filter((memory): memory is NonNullable<typeof memory> => memory !== null);
+    const latestPriorityIds = new Set(
+      latestPriorityMemories.map((memory) => memory.id),
     );
     const memories =
-      latestLocations.length === 0
+      latestPriorityMemories.length === 0
         ? recalledMemories
         : [
-            ...latestLocations,
+            ...latestPriorityMemories,
             ...recalledMemories.filter(
-              (memory) => !latestLocationIds.has(memory.id),
+              (memory) => !latestPriorityIds.has(memory.id),
             ),
           ].slice(0, this.#memoryContextLimit);
     return {
@@ -3124,7 +3127,20 @@ export class CompanionRuntime {
   }
 
   #onBodyEvent(event: PlayerBodyEvent): void {
-    if (this.#disposed || !this.#started) return;
+    if (this.#disposed) return;
+    if (
+      event.type === "bot_death" ||
+      event.type === "bot_death_cause_updated" ||
+      event.type === "bot_respawn"
+    ) {
+      try {
+        this.#store.recordObservedLifeEvent(event);
+      } catch (error) {
+        this.#logError(error, "Observed life event could not be persisted");
+        return;
+      }
+    }
+    if (!this.#started || this.#isStopped()) return;
     if (event.type === "bot_damaged") {
       if (
         this.#waterRecoveryActive ||
