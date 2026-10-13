@@ -10,9 +10,11 @@ Agentへ渡す記憶と会話は検索と件数で制限されます。ownerが�
 
 ## 操作結果の履歴
 
-`companion_journal` は `message` と `outcome` を別々に保持します。既定256件、設定上限は種類ごとに最大2,000件です。outcomeには目的、選択操作、Body開始・完了時刻と出所、前後の限定観測、状態・成否・失敗理由を記録し、未観測値はunknownとして扱います。前後観測は位置・dimension・yaw/pitch・health/food/oxygen・水中等の状態だけです。任意NBT、全inventory、owner会話やcredentialを複製しません。
+`companion_journal` は `message` と `outcome` を別々に保持します。既定256件、設定上限は種類ごとに最大2,000件です。outcomeにはBody dispatch前に保存した宣言目的と限定観測、選択操作、Body開始・完了時刻と出所、前後の限定観測、状態・成否・失敗理由を記録し、未観測値はunknownとして扱います。active markerの `bodyStartedAt` はdispatch前にmarkerを保存した時刻であり、Bodyが実際に開始した証拠ではありません。通常の `bodyEvidence.startedAt` はBody結果に含まれる値を使い、stop/restartで結果を受け取っていない場合は `null` のままです。前後観測は位置・dimension・yaw/pitch・health/food/oxygen・水中等の状態だけです。任意NBT、全inventory、owner会話やcredentialを複製しません。
 
-すでに開いている `CompanionStore` では `readOutcomeHistory({ from, to, limit })` を使い、ミリ秒付きUTC形式 `YYYY-MM-DDTHH:mm:ss.sssZ` の半開区間 `[from, to)` と1〜200件の上限を指定します。戻り値の `matchedCount` / `truncatedByLimit` は件数不足を、`retained` の `coverageFrom` / `evictedThrough` / `evictedCount` と `unavailableBefore` は保証範囲を示します。`truncatedByLimit=true` は照会上限で結果が切り詰められたこと、`unavailableBefore=true` は保持境界より前やevictionと重なるため過去期間を確認できないことを示し、どちらかがtrueなら `complete=false` です。後者は実際に欠落した証明ではありません。`complete=true` が示すのは保持されたoutcomeの範囲だけで、待機中・未記録の操作がなかった証明にはなりません。`recorded_at` は `outcome.observedAt` 由来で、通常のBody結果では `completedAt`、stop/restartではその判定時刻です。期間検索の基準であり、DBへの実書込時刻やBody開始時刻と同一視しません。古いoutcomeに `purpose` や `bodyEvidence` がなければ、その項目はunknownです。
+Agentには直近5件のoutcomeを毎回渡し、それより古い目的は宣言目的を含めた既存episode memoryのlexical recallで参照できます。記憶件数・会話入力上限と256件のoutcome保持境界を超える履歴の到達は保証しません。欠けた記録から目的や過去の理由を推測しません。
+
+すでに開いている `CompanionStore` では `readOutcomeHistory({ from, to, limit })` を使い、ミリ秒付きUTC形式 `YYYY-MM-DDTHH:mm:ss.sssZ` の半開区間 `[from, to)` と1〜200件の上限を指定します。戻り値の `matchedCount` / `truncatedByLimit` は件数不足を、`retained` の `coverageFrom` / `evictedThrough` / `evictedCount` と `unavailableBefore` は保証範囲を示します。`truncatedByLimit=true` は照会上限で結果が切り詰められたこと、`unavailableBefore=true` は保持境界より前やevictionと重なるため過去期間を確認できないことを示し、どちらかがtrueなら `complete=false` です。後者は実際に欠落した証明ではありません。`complete=true` が示すのは保持されたoutcomeの範囲だけで、待機中・未記録の操作がなかった証明にはなりません。`recorded_at` は `outcome.observedAt` 由来で、通常のBody結果では `completedAt`、stop/restartではその判定時刻です。期間検索の基準であり、DBへの実書込時刻やBody開始時刻と同一視しません。古いoutcomeに `purpose`、`preActionObservation`、`bodyEvidence` がなければ、欠けた項目はunknownです。`bodyEvidence.startedAt` がnullまたは未記録の場合、実際のBody開始時刻はunknownです。
 
 停止済みの既存DBを調査する場合は `CompanionStore.open()` を使いません。起動時の作業directoryからDBの絶対pathを確定し、SQLite URIの `mode=ro` と `PRAGMA query_only=ON` で、期間・上限を指定して読むだけにします。下の例は件数・保持境界を集計し、outcome本体はローカル変数に留めます。pathと時刻は確認済みの値に置き換えます。調査時は標準出力・標準エラーをprivateなローカルartifactへ捕捉し、会話や公開先へ出すのは集計項目だけにします。失敗時は例外本文を表示せず、固定メッセージだけを返します。
 

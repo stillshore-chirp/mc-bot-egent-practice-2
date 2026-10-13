@@ -596,6 +596,177 @@ const jump = playerOperationSchema.parse({
 });
 
 describe("CompanionRuntime", () => {
+  it("persists declared purpose and allowlisted pre-action observation before Body dispatch", async () => {
+    const { store } = freshStore();
+    const body = new FakeBody(store);
+    const purpose =
+      "Find the shoreline and confirm whether the path is flooded.";
+    const base = makeDecision([look]);
+    const decision = companionDecisionSchema.parse({
+      ...base,
+      plan: { ...base.plan, purpose },
+    });
+    const agent = new FakeAgent([decision]);
+    const runtime = createRuntime(store, body, agent);
+    body.observation = {
+      ...makeObservation(),
+      observedAt: "2026-10-10T00:00:00.000Z",
+      self: { ...makeObservation().self, inWater: true, oxygen: 7 },
+    };
+    body.executeHandler = async (operation, _signal, fakeBody) => {
+      expect(store.snapshot().activeOperation).toMatchObject({
+        operation,
+        purpose,
+        preActionObservation: {
+          source: "minecraft",
+          observedAt: "2026-10-10T00:00:00.000Z",
+          inWater: true,
+          oxygen: 7,
+        },
+      });
+      return fakeBody.result(
+        operation,
+        "synthetic-purpose-result",
+        "successful",
+        fakeBody.observation,
+      );
+    };
+
+    await runtime.receiveChat("Builder", "周囲を確認して");
+
+    expect(store.snapshot().lastOutcome).toMatchObject({
+      purpose,
+      preActionObservation: {
+        observedAt: "2026-10-10T00:00:00.000Z",
+        inWater: true,
+        oxygen: 7,
+      },
+      bodyEvidence: { source: "body_result" },
+    });
+    expect(store.snapshot().lastOutcome?.bodyEvidence?.startedAt).toBe(
+      body.results[0]?.startedAt,
+    );
+  });
+
+  it("provides declared purpose and post-action evidence to a later question after synthetic respawn", async () => {
+    const { store } = freshStore();
+    const before = {
+      source: "minecraft" as const,
+      observedAt: "2026-10-10T00:00:00.000Z",
+      dimension: "overworld",
+      position: { x: 12, y: 64, z: 4 },
+      yaw: 0,
+      pitch: 0,
+      health: 20,
+      food: 20,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+    };
+    store.recordOutcome({
+      operationId: "synthetic-water-purpose",
+      operation: look,
+      status: "successful",
+      summary: "Body observed a water entry after the movement attempt.",
+      expectedOutcome: "Reach the shoreline and inspect the route.",
+      observedAt: "2026-10-10T00:00:02.000Z",
+      purpose: "Reach the shoreline to inspect the underwater entrance.",
+      preActionObservation: before,
+      bodyEvidence: {
+        source: "body_result",
+        startedAt: "2026-10-10T00:00:00.500Z",
+        completedAt: "2026-10-10T00:00:02.000Z",
+        sameLife: true,
+        recoveryRequired: false,
+        reasonCode: null,
+        before,
+        after: {
+          ...before,
+          observedAt: "2026-10-10T00:00:02.000Z",
+          inWater: true,
+        },
+      },
+    });
+    const answer = companionDecisionSchema.parse({
+      speech:
+        "記録された実行前の目的は水中の入口を調べることだったよ。実行前の観測では水中ではなく、Body結果では水中が観測されたよ。今は水中ではないよ。水へ入ったさらに前の理由は記録されていないよ。",
+      ownerMessageDisposition: null,
+      goal: null,
+      plan: null,
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 5_000,
+      knowledgeQuery: null,
+    });
+    const body = new FakeBody(store);
+    const agent = new FakeAgent([emptyDecision(), emptyDecision(), answer]);
+    const say = vi.fn(async () => undefined);
+    const runtime = createRuntime(store, body, agent, say);
+
+    await runtime.start();
+    await eventually(() => agent.inputs.length === 1);
+    await eventually(() => !runtime.status().thinking);
+    body.emit({ type: "bot_death", at: "2026-10-10T00:00:03.000Z" });
+    body.observation = {
+      ...body.observation,
+      observedAt: "2026-10-10T00:00:04.000Z",
+      self: { ...body.observation.self, inWater: false, oxygen: 20 },
+    };
+    await eventually(() => agent.inputs.length === 2);
+    await eventually(() => !runtime.status().thinking);
+
+    await runtime.receiveChat("Builder", "復活した今、なぜ水へ行ったの？");
+
+    expect(agent.inputs[2]?.recentOutcomes?.[0]).toMatchObject({
+      purpose: "Reach the shoreline to inspect the underwater entrance.",
+      preActionObservation: { inWater: false },
+      bodyEvidence: { after: { inWater: true } },
+    });
+    expect(agent.inputs[2]?.observation.self.inWater).toBe(false);
+    expect(say).toHaveBeenCalledWith(answer.speech);
+  });
+
+  it("does not dispatch when active-marker save throws after committing; reopen records unknown completion without replay", async () => {
+    const { store, path } = freshStore();
+    const originalSave = store.save.bind(store);
+    store.save = (patch) => {
+      const updated = originalSave(patch);
+      if (patch.activeOperation !== undefined && patch.activeOperation !== null)
+        throw new Error("Synthetic post-commit marker failure");
+      return updated;
+    };
+    const body = new FakeBody(store);
+    const base = makeDecision([look]);
+    const purpose = "Inspect the path before choosing a route.";
+    const agent = new FakeAgent([
+      companionDecisionSchema.parse({
+        ...base,
+        plan: { ...base.plan, purpose },
+      }),
+    ]);
+    const runtime = createRuntime(store, body, agent);
+
+    await runtime.receiveChat("Builder", "周囲を確認して");
+
+    expect(body.executed).toHaveLength(0);
+    expect(store.snapshot().activeOperation).toMatchObject({ purpose });
+    await runtime.shutdown();
+    store.close();
+    const reopened = CompanionStore.open(path, { ownerUsername: "Builder" });
+    stores.push(reopened);
+    expect(reopened.snapshot().activeOperation).toBeNull();
+    expect(reopened.snapshot().lastOutcome).toMatchObject({
+      purpose,
+      status: "unverified",
+      preActionObservation: { source: "minecraft" },
+      bodyEvidence: { source: "process_restart", startedAt: null },
+    });
+    expect(body.executed).toHaveLength(0);
+  });
+
   it("saves only a successful chest window's container slots as past observation", async () => {
     const { store } = freshStore();
     const chest: BodyVisibleBlock = {

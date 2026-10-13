@@ -47,6 +47,7 @@ const STORE_SCHEMA_VERSION = 1;
 const DEFAULT_JOURNAL_LIMIT = 256;
 const MAX_JOURNAL_LIMIT = 2_000;
 const MAX_OUTCOME_READ_LIMIT = 200;
+const RECENT_OUTCOME_CONTEXT_LIMIT = 5;
 const MAX_RECALL_LIMIT = 20;
 const MAX_RECALL_TERMS = 32;
 const MAX_RECALL_CANDIDATES = 256;
@@ -200,15 +201,6 @@ const planSchema = z
   })
   .strict();
 
-const activeOperationSchema = z
-  .object({
-    operationId: z.string().trim().min(1).max(120),
-    operation: playerOperationSchema,
-    expectedOutcome: z.string().trim().min(1).max(400),
-    bodyStartedAt: z.iso.datetime().optional(),
-  })
-  .strict();
-
 const outcomeObservationEvidenceSchema = z
   .object({
     source: z.enum(["minecraft", "unknown"]),
@@ -234,6 +226,23 @@ const outcomeObservationEvidenceSchema = z
     sleeping: z.boolean().nullable(),
   })
   .strict();
+
+const activeOperationSchema = z
+  .object({
+    operationId: z.string().trim().min(1).max(120),
+    operation: playerOperationSchema,
+    expectedOutcome: z.string().trim().min(1).max(400),
+    purpose: z.string().trim().min(1).max(400).nullable().optional(),
+    preActionObservation: outcomeObservationEvidenceSchema.optional(),
+    bodyStartedAt: z.iso.datetime().optional(),
+  })
+  .strict()
+  .transform((active) => ({
+    ...active,
+    purpose: active.purpose ?? null,
+    preActionObservation:
+      active.preActionObservation ?? unknownObservationEvidence(),
+  }));
 
 const outcomeBodyEvidenceSchema = z
   .object({
@@ -272,8 +281,18 @@ const outcomeSchema = z
     observedAt: z.iso.datetime(),
     purpose: z.string().trim().min(1).max(400).nullable().optional(),
     bodyEvidence: outcomeBodyEvidenceSchema.optional(),
+    preActionObservation: outcomeObservationEvidenceSchema.optional(),
   })
-  .strict();
+  .strict()
+  .transform((outcome) => ({
+    ...outcome,
+    purpose: outcome.purpose ?? null,
+    bodyEvidence:
+      outcome.bodyEvidence ??
+      unknownOutcomeBodyEvidence("unknown", null, null, "unknown"),
+    preActionObservation:
+      outcome.preActionObservation ?? unknownObservationEvidence(),
+  }));
 
 const outcomeHistoryRequestSchema = z
   .object({
@@ -504,10 +523,13 @@ export class CompanionStore {
               "Owner stop requested before the operation result was verified.",
             expectedOutcome: current.activeOperation.expectedOutcome,
             observedAt: stoppedAt,
-            purpose: current.plan?.purpose ?? null,
+            purpose: current.activeOperation.purpose ?? null,
+            preActionObservation:
+              current.activeOperation.preActionObservation ??
+              unknownObservationEvidence(),
             bodyEvidence: unknownOutcomeBodyEvidence(
               "owner_stop",
-              current.activeOperation.bodyStartedAt ?? null,
+              null,
               stoppedAt,
               "owner_stop_before_verification",
             ),
@@ -1150,6 +1172,16 @@ export class CompanionStore {
     };
   }
 
+  /** Reads the five most recently recorded outcomes for bounded Agent context. */
+  public readRecentOutcomes(): readonly CompanionOutcomeHistoryEntry[] {
+    const rows = this.#database
+      .prepare<[number], JournalRow>(
+        "SELECT journal_id, kind, role, operation_id, content, payload_json, recorded_at FROM companion_journal WHERE kind = 'outcome' ORDER BY journal_id DESC LIMIT ?",
+      )
+      .all(RECENT_OUTCOME_CONTEXT_LIMIT);
+    return rows.map((row) => outcomeHistoryEntryFromRow(row));
+  }
+
   /**
    * Stores a Body result and settles only the matching active plan step. A
    * stale or mismatched result is retained as history but cannot advance or
@@ -1520,10 +1552,12 @@ export class CompanionStore {
           status: "unverified",
           summary:
             "The process restarted before the operation result was verified; it was not replayed.",
-          purpose: current.plan?.purpose ?? null,
+          purpose: active.purpose ?? null,
+          preActionObservation:
+            active.preActionObservation ?? unknownObservationEvidence(),
           bodyEvidence: unknownOutcomeBodyEvidence(
             "process_restart",
-            active.bodyStartedAt ?? null,
+            null,
             recoveredAt,
             "process_restart_before_verification",
           ),
@@ -2557,7 +2591,7 @@ function sortJson(value: unknown): unknown {
 }
 
 function outcomeMemoryText(outcome: CompanionOutcome): string {
-  return `${outcome.status} ${outcome.operation.kind}: ${outcome.summary}${outcome.expectedOutcome === undefined ? "" : ` Expected: ${outcome.expectedOutcome}`}`;
+  return `${outcome.status} ${outcome.operation.kind}: ${outcome.summary}${outcome.expectedOutcome === undefined ? "" : ` Expected: ${outcome.expectedOutcome}`} Declared purpose: ${outcome.purpose ?? "unknown"}.`;
 }
 
 function outcomeToJson(outcome: CompanionOutcome): JsonObject {
@@ -2574,6 +2608,13 @@ function outcomeToJson(outcome: CompanionOutcome): JsonObject {
     ...(outcome.bodyEvidence === undefined
       ? {}
       : { bodyEvidence: recordToJson({ ...outcome.bodyEvidence }) }),
+    ...(outcome.preActionObservation === undefined
+      ? {}
+      : {
+          preActionObservation: recordToJson({
+            ...outcome.preActionObservation,
+          }),
+        }),
   };
 }
 
@@ -2636,9 +2677,8 @@ function outcomeHistoryEntryFromRow(
   return {
     ...parsed.data,
     purpose: parsed.data.purpose ?? null,
-    bodyEvidence:
-      parsed.data.bodyEvidence ??
-      unknownOutcomeBodyEvidence("unknown", null, null, "unknown"),
+    preActionObservation: parsed.data.preActionObservation,
+    bodyEvidence: parsed.data.bodyEvidence,
     recordedAt: row.recorded_at,
   };
 }

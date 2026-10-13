@@ -792,6 +792,7 @@ export class CompanionRuntime {
       wakeReason,
       messages: this.#store.recentMessages(24),
       memories,
+      recentOutcomes: this.#store.readRecentOutcomes(),
       ...(ownerMessage === undefined ? {} : { ownerMessage }),
       ...(pendingOwnerRequest === undefined ? {} : { pendingOwnerRequest }),
       ...(ownerReplyContext === undefined ? {} : { ownerReplyContext }),
@@ -1356,6 +1357,10 @@ export class CompanionRuntime {
               knowledgeQuery: null,
             },
             generation,
+            undefined,
+            false,
+            undefined,
+            observation,
           );
           return;
         }
@@ -1588,6 +1593,7 @@ export class CompanionRuntime {
                 true,
               );
             },
+        observation,
       );
     } catch (error) {
       if (!controller.signal.aborted && this.#isCurrent(generation)) {
@@ -1896,6 +1902,8 @@ export class CompanionRuntime {
       operation,
       expectedOutcome,
       generation,
+      undefined,
+      observation,
     );
     let after = step.observation;
     if (after === null) {
@@ -2016,6 +2024,8 @@ export class CompanionRuntime {
       { kind: "collect_item", entityId: current.id },
       "Collect one observed item and confirm its inventory count increased.",
       generation,
+      undefined,
+      observation,
     );
     if (
       !step.confirmed ||
@@ -2063,6 +2073,8 @@ export class CompanionRuntime {
         },
         "Move within reach of the observed chest, then verify the same chest before opening it.",
         generation,
+        undefined,
+        observation,
       );
       if (
         !moved.confirmed ||
@@ -2119,6 +2131,8 @@ export class CompanionRuntime {
         },
         "Open the freshly observed reachable chest to inspect its contents.",
         generation,
+        undefined,
+        observation,
       );
       if (
         !opened.confirmed ||
@@ -2146,6 +2160,8 @@ export class CompanionRuntime {
             },
             "Withdraw exactly one freshly observed item from the open chest.",
             generation,
+            undefined,
+            before,
           );
           if (
             !transfer.confirmed ||
@@ -2236,6 +2252,8 @@ export class CompanionRuntime {
               },
               "Equip a strictly better observed armor or combat weapon item.",
               generation,
+              undefined,
+              before,
             );
             if (
               !step.confirmed ||
@@ -2335,6 +2353,8 @@ export class CompanionRuntime {
             { kind: "look_sweep" },
             "Complete one bounded look sweep before searching its received views for nearby chests.",
             generation,
+            undefined,
+            observation,
           );
           if (!sweep.confirmed || sweep.observation === null) {
             uncertain = true;
@@ -2391,6 +2411,8 @@ export class CompanionRuntime {
                     { kind: "look_sweep" },
                     "Complete one bounded look sweep for nearby gear while equipment is missing.",
                     generation,
+                    undefined,
+                    observation,
                   );
                   if (!sweep.confirmed || sweep.observation === null) {
                     attemptedGearWork = true;
@@ -2443,6 +2465,8 @@ export class CompanionRuntime {
                 },
                 "Face a chest candidate from the current bounded sweep, then confirm it in a fresh Body view.",
                 generation,
+                undefined,
+                observation,
               );
               if (!looked.confirmed || looked.observation === null) {
                 uncertain = true;
@@ -2531,6 +2555,8 @@ export class CompanionRuntime {
                 },
                 "Equip the observed chest item only after the chest is closed and inventory transfer was confirmed.",
                 generation,
+                undefined,
+                before,
               );
               if (
                 !step.confirmed ||
@@ -2631,6 +2657,7 @@ export class CompanionRuntime {
     expectedOutcome: string,
     generation: number,
     purpose = "Perform one deterministic food or equipment upkeep step from fresh Body observations.",
+    beforeObservation?: PlayerBodyObservation,
   ): Promise<EquipmentStepResult> {
     if (!this.#isBodyDispatchAllowed(generation))
       return { observation: null, confirmed: false };
@@ -2665,10 +2692,17 @@ export class CompanionRuntime {
       observation: null,
     };
     try {
-      await this.#executePlan(decision, generation, (fresh, bodyResult) => {
-        result.observation = fresh;
-        result.bodyResult = bodyResult;
-      });
+      await this.#executePlan(
+        decision,
+        generation,
+        (fresh, bodyResult) => {
+          result.observation = fresh;
+          result.bodyResult = bodyResult;
+        },
+        false,
+        undefined,
+        beforeObservation,
+      );
     } catch (error) {
       this.#logError(error, "Equipment upkeep step failed");
     } finally {
@@ -2706,6 +2740,8 @@ export class CompanionRuntime {
         { kind: "window_close" },
         "Close the chest after equipment inspection and verify the window is gone.",
         generation,
+        undefined,
+        observation,
       );
       if (closed.confirmed && closed.observation?.window === null)
         return closed;
@@ -2737,11 +2773,25 @@ export class CompanionRuntime {
       "Close the equipment window after inspection and verify it is gone.",
       generation,
       "Close the equipment window after inspection and record the cleanup Body result.",
+      observation,
     );
   }
 
   async #followOwner(generation: number): Promise<void> {
     if (this.#outcomePersistenceBlocked) return;
+    const existing = this.#store.snapshot();
+    if (existing.activeOperation !== null) return;
+    let preActionObservation: PlayerBodyObservation;
+    try {
+      preActionObservation = await this.#body.observe({
+        ownerPositionException: true,
+      });
+    } catch (error) {
+      if (this.#isCurrent(generation) && !this.#isStopped())
+        this.#logError(error, "Owner-follow pre-action observation failed");
+      return;
+    }
+    if (!this.#isCurrent(generation) || this.#isStopped()) return;
     const operation = playerOperationSchema.parse({ kind: "follow_owner" });
     const operationId = randomUUID();
     const expectedOutcome =
@@ -2752,6 +2802,8 @@ export class CompanionRuntime {
       operationId,
       operation,
       expectedOutcome,
+      purpose,
+      preActionObservation: bodyObservationEvidence(preActionObservation),
       bodyStartedAt: startedAt,
     } as const;
 
@@ -2770,6 +2822,7 @@ export class CompanionRuntime {
         activeOperation,
       });
     } catch (error) {
+      this.#outcomePersistenceBlocked = true;
       this.#ownerFollowRequested = false;
       if (!this.#isStopped())
         this.#logError(error, "Owner-follow state could not be saved");
@@ -2811,6 +2864,7 @@ export class CompanionRuntime {
           expectedOutcome,
           purpose,
           evidenceSource,
+          activeOperation.preActionObservation,
         ),
       );
     } catch (error) {
@@ -2838,6 +2892,7 @@ export class CompanionRuntime {
     ) => void | Promise<void>,
     damageReflex = false,
     onPlanNotConfirmed?: () => void | Promise<void>,
+    initialObservation?: PlayerBodyObservation,
   ): Promise<void> {
     if (this.#outcomePersistenceBlocked) return;
     const plannedSteps = decision.plan?.steps ?? [];
@@ -2845,9 +2900,11 @@ export class CompanionRuntime {
       if (this.#isCurrent(generation) && !this.#isStopped())
         await onPlanNotConfirmed?.();
     };
+    let beforeObservation = initialObservation;
     for (const plannedStep of plannedSteps) {
       if (!this.#isCurrent(generation) || this.#isStopped()) return;
       const snapshot = this.#store.snapshot();
+      if (snapshot.activeOperation !== null) return;
       const step = snapshot.plan?.steps[0];
       if (
         step === undefined ||
@@ -2870,15 +2927,54 @@ export class CompanionRuntime {
         );
         return;
       }
+      if (beforeObservation === undefined) {
+        try {
+          beforeObservation = await this.#body.observe({
+            ownerPositionException: true,
+          });
+        } catch (error) {
+          this.#logError(error, "Pre-action Body observation failed");
+          await reportPlanNotConfirmed();
+          this.#scheduleRetry({ reason: "pre-action observation failed" });
+          return;
+        }
+      }
+      if (!this.#isCurrent(generation) || this.#isStopped()) return;
+      const latest = this.#store.snapshot();
+      const latestStep = latest.plan?.steps[0];
+      if (
+        latest.activeOperation !== null ||
+        latestStep === undefined ||
+        !sameOperation(latestStep.operation, operation) ||
+        latestStep.expectedOutcome !== step.expectedOutcome
+      ) {
+        await reportPlanNotConfirmed();
+        this.#requestReplan(
+          "persisted plan changed before operation dispatch",
+          generation,
+        );
+        return;
+      }
       const startedAt = new Date().toISOString();
       const operationId = randomUUID();
       const activeOperation = {
         operationId,
         operation,
         expectedOutcome: step.expectedOutcome,
+        purpose: latest.plan?.purpose ?? null,
+        preActionObservation: bodyObservationEvidence(beforeObservation),
         bodyStartedAt: startedAt,
       } as const;
-      this.#store.save({ activeOperation });
+      try {
+        this.#store.save({ activeOperation });
+      } catch (error) {
+        // A save may throw after committing. Never dispatch or retry until
+        // reopen/stop resolves the durable active marker.
+        this.#outcomePersistenceBlocked = true;
+        this.#logError(error, "Body operation marker could not be persisted");
+        await reportPlanNotConfirmed();
+        return;
+      }
       const controller = new AbortController();
       const run: ActiveBodyRun = {
         operationId,
@@ -2903,8 +2999,9 @@ export class CompanionRuntime {
         step.operation,
         operationId,
         step.expectedOutcome,
-        snapshot.plan?.purpose ?? decision.plan?.purpose ?? null,
+        activeOperation.purpose,
         evidenceSource,
+        activeOperation.preActionObservation,
       );
       const waterTrigger = this.#waterRecoveryTrigger;
       const interruptedCollection =
@@ -3022,6 +3119,7 @@ export class CompanionRuntime {
         await onPlanConfirmed?.(freshObservation, result);
         return;
       }
+      beforeObservation = freshObservation;
     }
   }
 
@@ -3729,6 +3827,7 @@ function outcomeFromResult(
   expectedOutcome: string,
   purpose: string | null,
   evidenceSource: CompanionOutcomeEvidenceSource,
+  preActionObservation: CompanionBodyObservationEvidence | null,
 ): CompanionOutcomeInput {
   const operationMatches = sameOperation(result.operation, plannedOperation);
   const candidateReason =
@@ -3757,6 +3856,8 @@ function outcomeFromResult(
     expectedOutcome,
     observedAt: result.completedAt,
     purpose,
+    preActionObservation:
+      preActionObservation ?? unknownBodyObservationEvidence(),
     bodyEvidence: {
       source: evidenceSource,
       startedAt: result.startedAt,

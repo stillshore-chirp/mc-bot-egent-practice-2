@@ -8,6 +8,7 @@ import {
   type CompanionResponsesClient,
 } from "../../src/player/agent.js";
 import type {
+  CompanionOutcomeHistoryEntry,
   CompanionMemory,
   CompanionSnapshot,
 } from "../../src/player/contracts.js";
@@ -120,6 +121,48 @@ function createInput(): CompanionDecisionInput {
       },
     ],
     memories,
+    recentOutcomes: [],
+  };
+}
+
+function syntheticOutcome(index: number): CompanionOutcomeHistoryEntry {
+  const observedAt = `2026-10-10T00:00:${String(index).padStart(2, "0")}.000Z`;
+  const evidence = {
+    source: "minecraft" as const,
+    observedAt,
+    dimension: "overworld",
+    position: { x: index, y: 64, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    health: 20,
+    food: 20,
+    oxygen: 20,
+    inWater: false,
+    inLava: false,
+    onFire: false,
+    suffocating: false,
+    sleeping: false,
+  };
+  return {
+    operationId: `private-correlation-${index}`,
+    operation: { kind: "look_sweep" },
+    status: "successful",
+    summary: `Synthetic Body result ${index}.`,
+    expectedOutcome: "The visible area is checked.",
+    observedAt,
+    purpose: `Declared purpose ${index}.`,
+    preActionObservation: evidence,
+    bodyEvidence: {
+      source: "body_result",
+      startedAt: observedAt,
+      completedAt: observedAt,
+      sameLife: true,
+      recoveryRequired: false,
+      reasonCode: null,
+      before: evidence,
+      after: { ...evidence, inWater: true },
+    },
+    recordedAt: observedAt,
   };
 }
 
@@ -341,6 +384,98 @@ describe("CompanionAgent", () => {
       outputTokens: 17,
       cachedInputTokens: 8,
     });
+  });
+
+  it("supplies bounded prior purpose separately from later Body state", async () => {
+    const output = {
+      speech:
+        "実行前に宣言した目的は記録上の採掘です。実行前は水中ではなく、Body結果では水中が観測されました。今は水中ではありません。過去に水へ入った理由は記録されていません。",
+      ownerMessageDisposition: "answer_only",
+      goal: null,
+      plan: null,
+      memoryUpdates: [],
+      relationshipSummary: null,
+      waitMs: 10_000,
+      knowledgeQuery: null,
+    };
+    const create = vi.fn().mockResolvedValue(response(output));
+    const agent = new CompanionAgent({
+      client: { responses: { create } } as unknown as CompanionResponsesClient,
+      model: "gpt-6-luna",
+      persona,
+    });
+    const outcomes = Array.from({ length: 7 }, (_, index) =>
+      syntheticOutcome(6 - index),
+    );
+    const currentObservation: PlayerBodyObservation = {
+      ...observation,
+      self: { ...observation.self, inWater: false, oxygen: 20 },
+    };
+    const latestOutcome = outcomes[0];
+    if (latestOutcome === undefined)
+      throw new Error("Missing synthetic outcome.");
+
+    const decision = await agent.decide({
+      ...createInput(),
+      snapshot: {
+        ...snapshot,
+        lastOutcome: latestOutcome,
+        activeOperation: {
+          operationId: "private-active-correlation",
+          operation: latestOutcome.operation,
+          expectedOutcome:
+            latestOutcome.expectedOutcome ?? "The area is checked.",
+          purpose: latestOutcome.purpose,
+          preActionObservation: latestOutcome.preActionObservation,
+          bodyStartedAt: latestOutcome.bodyEvidence.startedAt ?? undefined,
+        },
+      },
+      ownerMessage: "復活した今、さっき何を目指して水へ行ったの？",
+      ownerReplyContext: { pendingOwnerRequest: null },
+      observation: currentObservation,
+      recentOutcomes: outcomes,
+    });
+
+    const [request] = create.mock.calls[0] as unknown as [
+      { input: string; instructions: string },
+    ];
+    const parsed = JSON.parse(request.input) as {
+      observation: { self: { inWater: boolean } };
+      recentOutcomes: Record<string, unknown>[];
+      companion: {
+        lastOutcome: Record<string, unknown>;
+        activeOperation: Record<string, unknown>;
+      };
+    };
+    expect(parsed.recentOutcomes).toHaveLength(5);
+    expect(parsed.recentOutcomes[0]).toMatchObject({
+      purpose: "Declared purpose 6.",
+      preActionObservation: { inWater: false },
+      bodyEvidence: { after: { inWater: true } },
+    });
+    expect(parsed.recentOutcomes[4]?.purpose).toBe("Declared purpose 2.");
+    expect(parsed.companion.lastOutcome).toMatchObject({
+      operation: { kind: "look_sweep" },
+      status: "successful",
+      summary: "Synthetic Body result 6.",
+      expectedOutcome: "The visible area is checked.",
+      purpose: "Declared purpose 6.",
+      bodyEvidence: { after: { inWater: true } },
+    });
+    expect(parsed.companion.activeOperation).toMatchObject({
+      operation: { kind: "look_sweep" },
+      expectedOutcome: "The visible area is checked.",
+      purpose: "Declared purpose 6.",
+      preActionObservation: { inWater: false },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("operationId");
+    expect(JSON.stringify(parsed)).not.toContain("private-correlation");
+    expect(JSON.stringify(parsed)).not.toContain("private-active-correlation");
+    expect(parsed.observation.self.inWater).toBe(false);
+    expect(request.instructions).toContain(
+      "purposeや観測がunknown/nullなら後から推測で埋めず、実行理由・過去状態・死因を断定しないでください。",
+    );
+    expect(decision.speech).toContain("実行前に宣言した目的");
   });
 
   it("encodes pending work and conditional dream disposition rules", async () => {
