@@ -369,6 +369,81 @@ describe("CompanionAgent", () => {
         homes: [newestHome],
       });
       const memories = [...newestHomes, ...olderHomes];
+      const unrelatedMemories: CompanionMemory[] = [
+        {
+          id: "unrelated-bed-memory",
+          kind: "world",
+          content: "Preserve the remembered bed location.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {
+            bedMemory: {
+              version: 1,
+              kind: "location",
+              locationKey: "overworld:5:64:6",
+              dimension: "overworld",
+              position: { x: 5, y: 64, z: 6 },
+              observedAt: firstObservedAt,
+            },
+          },
+        },
+        {
+          id: "unrelated-chest-memory",
+          kind: "world",
+          content: "Preserve the remembered chest observation.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {
+            chestMemory: {
+              version: 1,
+              kind: "location",
+              locationKey: "overworld:7:64:8",
+              dimension: "overworld",
+              position: { x: 7, y: 64, z: 8 },
+              observedAt: firstObservedAt,
+            },
+          },
+        },
+        {
+          id: "unrelated-life-memory",
+          kind: "life",
+          content: "Preserve the observed life memory.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {},
+        },
+        {
+          id: "unrelated-purpose-memory",
+          kind: "goal",
+          content: "Preserve the owner's declared purpose.",
+          source: "player_stated",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: {},
+        },
+        {
+          id: "malformed-home-memory",
+          kind: "world",
+          content: "Malformed HOME metadata must not bypass projection.",
+          source: "minecraft_observed",
+          status: "active",
+          importance: 4,
+          createdAt: firstObservedAt,
+          updatedAt: firstObservedAt,
+          metadata: { homeMemory: { version: 1, kind: "invalid" } },
+        },
+      ];
 
       const create = vi.fn().mockResolvedValue(
         response({
@@ -392,7 +467,7 @@ describe("CompanionAgent", () => {
 
       await agent.decide({
         ...createInput(),
-        memories: [],
+        memories: [...memories, ...unrelatedMemories],
         homePoiMemories: memories,
       });
 
@@ -409,6 +484,17 @@ describe("CompanionAgent", () => {
           };
           home: PlayerHomePoi;
         }[];
+        memories: {
+          kind: string;
+          source: string;
+          content: string;
+          chestObservation?: Record<string, unknown>;
+        }[];
+        rememberedBedLocation: {
+          dimension: string;
+          position: { x: number; y: number; z: number };
+          observedAt: string;
+        } | null;
       };
       expect(providerInput.rememberedHomePois).toHaveLength(8);
       expect(
@@ -429,6 +515,43 @@ describe("CompanionAgent", () => {
       expect(JSON.stringify(providerInput.rememberedHomePois)).not.toContain(
         "memoryId",
       );
+      expect(providerInput.memories).toHaveLength(4);
+      const genericMemoryContents = providerInput.memories.map(
+        ({ content }) => content,
+      );
+      for (const homeMemory of memories) {
+        if (homeMemory.content.length > 0)
+          expect(genericMemoryContents).not.toContain(
+            homeMemory.content.slice(0, 400),
+          );
+      }
+      expect(genericMemoryContents).not.toContain(
+        "Malformed HOME metadata must not bypass projection.",
+      );
+      expect(genericMemoryContents).toEqual(
+        expect.arrayContaining([
+          "Preserve the remembered bed location.",
+          "Preserve the remembered chest observation.",
+          "Preserve the observed life memory.",
+          "Preserve the owner's declared purpose.",
+        ]),
+      );
+      expect(
+        providerInput.memories.find(
+          ({ content }) =>
+            content === "Preserve the remembered chest observation.",
+        )?.chestObservation,
+      ).toMatchObject({
+        kind: "location",
+        dimension: "overworld",
+        position: { x: 7, y: 64, z: 8 },
+        observedAt: firstObservedAt,
+      });
+      expect(providerInput.rememberedBedLocation).toEqual({
+        dimension: "overworld",
+        position: { x: 5, y: 64, z: 6 },
+        observedAt: firstObservedAt,
+      });
       expect(request.instructions).toContain("最新の最大8件の限定記憶");
     } finally {
       store.close();

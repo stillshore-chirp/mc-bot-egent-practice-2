@@ -471,18 +471,20 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
       text: message.text.slice(0, 800),
       recordedAt: message.recordedAt,
     })),
-    memories: input.memories.map((memory) => {
-      const chestObservation = chestObservationForProvider(memory);
-      return {
-        kind: memory.kind,
-        content: memory.content.slice(0, 400),
-        source: memory.source,
-        status: memory.status,
-        importance: memory.importance,
-        updatedAt: memory.updatedAt,
-        ...(chestObservation === undefined ? {} : { chestObservation }),
-      };
-    }),
+    memories: input.memories
+      .filter((memory) => !isActiveObservedHomeMemory(memory))
+      .map((memory) => {
+        const chestObservation = chestObservationForProvider(memory);
+        return {
+          kind: memory.kind,
+          content: memory.content.slice(0, 400),
+          source: memory.source,
+          status: memory.status,
+          importance: memory.importance,
+          updatedAt: memory.updatedAt,
+          ...(chestObservation === undefined ? {} : { chestObservation }),
+        };
+      }),
     rememberedHomePois: (input.homePoiMemories ?? [])
       .slice(0, 8)
       .flatMap((memory) => {
@@ -492,6 +494,16 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
     rememberedBedLocation: rememberedBedLocation ?? null,
     registryKnowledge: input.knowledge ?? null,
   };
+}
+
+function isActiveObservedHomeMemory(memory: CompanionMemory): boolean {
+  return (
+    memory.kind === "world" &&
+    memory.source === "minecraft_observed" &&
+    memory.status === "active" &&
+    isRecord(memory.metadata) &&
+    Object.prototype.hasOwnProperty.call(memory.metadata, "homeMemory")
+  );
 }
 
 function rememberedHomePoiForProvider(
