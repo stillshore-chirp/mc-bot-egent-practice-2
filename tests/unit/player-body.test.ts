@@ -2299,6 +2299,43 @@ describe("player body", () => {
     }
   });
 
+  it("emits one respawn only for a same-Bot spawn after confirmed death", async () => {
+    const fake = makeFakeBot();
+    const body = new MineflayerPlayerBody(() => fake.bot);
+    const events: PlayerBodyEvent[] = [];
+    body.onEvent((event) => events.push(event));
+    const botEvents = fake.bot as unknown as EventEmitter;
+
+    botEvents.emit("spawn");
+    expect(events.filter((event) => event.type === "bot_respawn")).toEqual([]);
+
+    fake.bot.health = 0;
+    botEvents.emit("death");
+    const death = events.find((event) => event.type === "bot_death");
+    expect(death?.type).toBe("bot_death");
+    if (death?.type !== "bot_death")
+      throw new Error("expected a confirmed bot death event");
+
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+    botEvents.emit("spawn");
+    fake.bot.health = 0;
+    botEvents.emit("death");
+    botEvents.emit("end", "synthetic disconnect");
+    fake.bot.health = 20;
+    botEvents.emit("spawn");
+
+    const respawns = events.filter((event) => event.type === "bot_respawn");
+    expect(respawns).toHaveLength(1);
+    const respawn = respawns[0];
+    expect(respawn?.type).toBe("bot_respawn");
+    if (respawn?.type !== "bot_respawn")
+      throw new Error("expected a confirmed bot respawn event");
+    expect(Date.parse(respawn.at)).not.toBeNaN();
+    expect(respawn.deathAt).toBe(death.at);
+    await body.stop();
+  });
+
   it("does not turn player-authored or another player's death text into self-cause", () => {
     const fake = makeFakeBot();
     const body = new MineflayerPlayerBody(() => fake.bot);

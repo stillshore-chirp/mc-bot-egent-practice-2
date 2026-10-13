@@ -42,6 +42,10 @@ import {
   type MemoryUpdate,
 } from "./contracts.js";
 import { playerOperationSchema } from "../minecraft/player-body-schema.js";
+import type {
+  PlayerBodyDeathCause,
+  PlayerBodyEvent,
+} from "../minecraft/player-body.js";
 
 const STORE_SCHEMA_VERSION = 1;
 const DEFAULT_JOURNAL_LIMIT = 256;
@@ -58,6 +62,95 @@ const MAX_MEMORY_UPDATE_LENGTH = 1_000;
 const MAX_REPLY_LIFECYCLE_RECORDS = 12;
 const MAX_REPLY_LIFECYCLE_EVENTS = 12;
 const CHEST_CONTENT_TTL_MS = 60 * 60 * 1_000;
+const OBSERVED_LIFE_EPISODE_LIMIT = 8;
+type ObservedLifeEvent = Extract<
+  PlayerBodyEvent,
+  {
+    readonly type: "bot_death" | "bot_death_cause_updated" | "bot_respawn";
+  }
+>;
+interface ObservedLifeEpisode {
+  readonly deathAt: string;
+  readonly deathSource: "minecraft_observed";
+  readonly cause: PlayerBodyDeathCause | null;
+  readonly causeObservedAt: string | null;
+  readonly respawnAt: string | null;
+  readonly respawnSource: "minecraft_observed" | null;
+}
+const utcMillisecondTimestampSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
+  .refine((value) => {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+  });
+const observedDeathCauseSchema = z
+  .object({
+    source: z
+      .object({
+        kind: z.string().regex(/^[a-z0-9_.:-]{1,48}$/iu),
+        name: z.string().regex(/^[a-z0-9_.:-]{1,128}$/iu),
+        category: z
+          .string()
+          .regex(/^[a-z0-9 _.:-]{1,128}$/iu)
+          .nullable(),
+      })
+      .strict()
+      .nullable(),
+    confidence: z.enum(["observed", "unknown"]),
+    provenance: z.enum(["damage_event", "death_notification"]),
+    causeKey: z
+      .string()
+      .regex(/^[a-z0-9_.:-]{1,96}$/iu)
+      .optional(),
+  })
+  .strict();
+const observedLifeEpisodeSchema = z
+  .object({
+    deathAt: utcMillisecondTimestampSchema,
+    deathSource: z.literal("minecraft_observed"),
+    cause: observedDeathCauseSchema.nullable(),
+    causeObservedAt: utcMillisecondTimestampSchema.nullable(),
+    respawnAt: utcMillisecondTimestampSchema.nullable(),
+    respawnSource: z.literal("minecraft_observed").nullable(),
+  })
+  .strict();
+const observedLifeMemoryMetadataSchema = z
+  .object({
+    observedLifeEpisodes: z
+      .object({
+        version: z.literal(1),
+        episodes: z
+          .array(observedLifeEpisodeSchema)
+          .max(OBSERVED_LIFE_EPISODE_LIMIT),
+      })
+      .strict(),
+  })
+  .strict();
+const observedLifeEventSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("bot_death"),
+      at: utcMillisecondTimestampSchema,
+      cause: observedDeathCauseSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("bot_death_cause_updated"),
+      at: utcMillisecondTimestampSchema,
+      deathAt: utcMillisecondTimestampSchema,
+      cause: observedDeathCauseSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("bot_respawn"),
+      at: utcMillisecondTimestampSchema,
+      deathAt: utcMillisecondTimestampSchema,
+    })
+    .strict(),
+]);
 const chestDimensionSchema = z
   .string()
   .trim()
@@ -840,6 +933,99 @@ export class CompanionStore {
       )
       .get();
     return row === undefined ? null : memoryFromRow(row);
+  }
+
+  /** Persists only Body-confirmed life events without touching the stop latch. */
+  public recordObservedLifeEvent(
+    input: ObservedLifeEvent,
+  ): CompanionMemory | null {
+    const parsed = observedLifeEventSchema.safeParse(input);
+    if (!parsed.success) throw invalidInput("Invalid observed life event.");
+    const event = parsed.data as ObservedLifeEvent;
+    return this.#database
+      .transaction(() => {
+        const existing = this.#database
+          .prepare<[], MemoryRow>(
+            `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+             FROM companion_memories
+             WHERE kind = 'life' AND source = 'minecraft_observed' AND status = 'active'
+               AND json_extract(metadata_json, '$.observedLifeEpisodes.version') = 1
+             ORDER BY updated_at DESC, memory_id DESC
+             LIMIT 1`,
+          )
+          .get();
+        const currentEpisodes =
+          existing === undefined
+            ? []
+            : observedLifeEpisodesFromMemory(existing);
+        const nextEpisodes = applyObservedLifeEvent(currentEpisodes, event);
+        if (nextEpisodes === null) {
+          return existing === undefined ? null : memoryFromRow(existing);
+        }
+        const metadata = JSON.parse(
+          JSON.stringify({
+            observedLifeEpisodes: {
+              version: 1,
+              episodes: nextEpisodes,
+            },
+          }),
+        ) as JsonObject;
+        const content = observedLifeMemoryText(nextEpisodes);
+        const now = this.#now();
+        if (existing === undefined) {
+          return this.insertMemory({
+            kind: "life",
+            content,
+            source: "minecraft_observed",
+            status: "active",
+            importance: 5,
+            metadata,
+            createdAt: event.at,
+            updatedAt: now,
+          });
+        }
+        const fingerprint = contentFingerprint("life", content);
+        const result = this.#database
+          .prepare(
+            `UPDATE companion_memories
+             SET content = ?, source = 'minecraft_observed', status = 'active',
+                 importance = 5, updated_at = ?, content_fingerprint = ?, metadata_json = ?
+             WHERE memory_id = ?`,
+          )
+          .run(
+            content,
+            now,
+            fingerprint,
+            JSON.stringify(metadata),
+            existing.memory_id,
+          );
+        if (result.changes !== 1) throw databaseInvariant();
+        const updated = this.#database
+          .prepare<[string], MemoryRow>(
+            "SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key FROM companion_memories WHERE memory_id = ?",
+          )
+          .get(existing.memory_id);
+        if (updated === undefined) throw databaseInvariant();
+        return memoryFromRow(updated);
+      })
+      .immediate();
+  }
+
+  /** Returns the bounded Body-confirmed life history for conversational context. */
+  public latestObservedLifeMemory(): CompanionMemory | null {
+    const row = this.#database
+      .prepare<[], MemoryRow>(
+        `SELECT memory_id, kind, content, source, status, importance, created_at, updated_at, metadata_json, legacy_source_key
+         FROM companion_memories
+         WHERE kind = 'life' AND source = 'minecraft_observed' AND status = 'active'
+           AND json_extract(metadata_json, '$.observedLifeEpisodes.version') = 1
+         ORDER BY updated_at DESC, memory_id DESC
+         LIMIT 1`,
+      )
+      .get();
+    if (row === undefined) return null;
+    observedLifeEpisodesFromMemory(row);
+    return memoryFromRow(row);
   }
 
   /** Deterministic lexical recall with salience and recency fallback. */
@@ -2471,6 +2657,111 @@ function memoryFromRow(row: MemoryRow): CompanionMemory {
     updatedAt: row.updated_at,
     metadata: parseJsonValue(row.metadata_json),
   };
+}
+
+function observedLifeEpisodesFromMemory(
+  row: MemoryRow,
+): readonly ObservedLifeEpisode[] {
+  const parsed = observedLifeMemoryMetadataSchema.safeParse(
+    parseJsonValue(row.metadata_json),
+  );
+  if (!parsed.success) throw databaseInvariant();
+  return parsed.data.observedLifeEpisodes.episodes.map((episode) => ({
+    ...episode,
+    cause: observedDeathCauseFromMemory(episode.cause),
+  }));
+}
+
+function observedDeathCauseFromMemory(
+  cause: z.output<typeof observedDeathCauseSchema> | null,
+): PlayerBodyDeathCause | null {
+  if (cause === null) return null;
+  return {
+    source: cause.source,
+    confidence: cause.confidence,
+    provenance: cause.provenance,
+    ...(cause.causeKey === undefined ? {} : { causeKey: cause.causeKey }),
+  };
+}
+
+function applyObservedLifeEvent(
+  episodes: readonly ObservedLifeEpisode[],
+  event: ObservedLifeEvent,
+): ObservedLifeEpisode[] | null {
+  const next = [...episodes];
+  const index =
+    event.type === "bot_death"
+      ? -1
+      : next.findIndex((episode) => episode.deathAt === event.deathAt);
+  if (event.type === "bot_death") {
+    const existingIndex = next.findIndex(
+      (episode) => episode.deathAt === event.at,
+    );
+    if (existingIndex >= 0) {
+      const existing = next[existingIndex];
+      if (existing === undefined) throw databaseInvariant();
+      if (event.cause === undefined) return null;
+      next[existingIndex] = {
+        ...existing,
+        cause: event.cause,
+        causeObservedAt: event.at,
+      };
+    } else {
+      next.push({
+        deathAt: event.at,
+        deathSource: "minecraft_observed",
+        cause: event.cause ?? null,
+        causeObservedAt: event.cause === undefined ? null : event.at,
+        respawnAt: null,
+        respawnSource: null,
+      });
+    }
+  } else if (event.type === "bot_death_cause_updated") {
+    if (index < 0) return null;
+    const existing = next[index];
+    if (existing === undefined) throw databaseInvariant();
+    next[index] = {
+      ...existing,
+      cause: event.cause,
+      causeObservedAt: event.at,
+    };
+  } else {
+    if (index < 0 || Date.parse(event.at) < Date.parse(event.deathAt))
+      return null;
+    const existing = next[index];
+    if (existing === undefined) throw databaseInvariant();
+    if (existing.respawnAt !== null) return null;
+    next[index] = {
+      ...existing,
+      respawnAt: event.at,
+      respawnSource: "minecraft_observed",
+    };
+  }
+  next.sort((left, right) => left.deathAt.localeCompare(right.deathAt));
+  const bounded = next.slice(-OBSERVED_LIFE_EPISODE_LIMIT);
+  if (JSON.stringify(bounded) === JSON.stringify(episodes)) return null;
+  return bounded;
+}
+
+function observedLifeMemoryText(
+  episodes: readonly ObservedLifeEpisode[],
+): string {
+  return [...episodes]
+    .reverse()
+    .map((episode) => {
+      const cause =
+        episode.cause?.confidence === "observed"
+          ? (episode.cause.source?.name ??
+            episode.cause.causeKey ??
+            "確認済みの要因")
+          : "未確認";
+      const respawn =
+        episode.respawnAt === null
+          ? "未記録（不明）"
+          : `Minecraftで確認 (${episode.respawnAt})`;
+      return `Minecraftで自分の死亡を確認 (${episode.deathAt})。死因: ${cause}。復活: ${respawn}。`;
+    })
+    .join("\n");
 }
 
 function memoryKind(value: string): CompanionMemoryKind {

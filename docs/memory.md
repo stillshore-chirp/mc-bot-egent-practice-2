@@ -8,6 +8,8 @@
 
 Agentへ渡す記憶と会話は検索と件数で制限されます。ownerが明示した発言の証拠だけをowner発の記憶として扱い、モデルの推測を観測済み事実へ変換しません。journalは上限を持ち、生の会話を無制限に保管しません。
 
+自分の死亡・復活は既存の `life` memoryに、Bodyが確認した時刻と `minecraft_observed` の出所を付けて最新8件まで保存します。時刻はBodyがイベントを受け取った時のUTC時刻で、Minecraft内の時刻ではありません。復活は同じBotの確認済み死亡後に届いたspawnだけを記録し、初回spawnやreconnect、現在の体力、ownerの報告から復活を補いません。遅れて届いた死因は元の `deathAt` と一致する保持中の記録だけへ結び付けます。停止中も事実の保存は行いますが、停止ラッチを変えたり判断やBody操作を起動したりしません。8件より古い記録や旧形式の記憶にない事実はunknownです。Agent入力では現在の体力、過去にBodyが確認した事実、ownerの報告を分けて渡します。
+
 ## 操作結果の履歴
 
 `companion_journal` は `message` と `outcome` を別々に保持します。既定256件、設定上限は種類ごとに最大2,000件です。outcomeにはBody dispatch前に保存した宣言目的と限定観測、選択操作、Body開始・完了時刻と出所、前後の限定観測、状態・成否・失敗理由を記録し、未観測値はunknownとして扱います。active markerの `bodyStartedAt` はdispatch前にmarkerを保存した時刻であり、Bodyが実際に開始した証拠ではありません。通常の `bodyEvidence.startedAt` はBody結果に含まれる値を使い、stop/restartで結果を受け取っていない場合は `null` のままです。前後観測は位置・dimension・yaw/pitch・health/food/oxygen・水中等の状態だけです。任意NBT、全inventory、owner会話やcredentialを複製しません。

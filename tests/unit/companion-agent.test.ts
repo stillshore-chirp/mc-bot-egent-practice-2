@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 import type { Response } from "openai/resources/responses/responses.js";
 
@@ -14,6 +18,7 @@ import type {
 } from "../../src/player/contracts.js";
 import type { PlayerBodyObservation } from "../../src/minecraft/player-body.js";
 import type { PersonaCore } from "../../src/persona/persona.js";
+import { CompanionStore } from "../../src/player/store.js";
 
 const persona: PersonaCore = {
   version: 1,
@@ -231,6 +236,73 @@ function hasRequiredNullableProperty(
 }
 
 describe("CompanionAgent", () => {
+  it("serializes the newest confirmed life episode before the 400-character memory cap", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "companion-agent-life-"));
+    const store = CompanionStore.open(join(directory, "memory.sqlite3"), {
+      now: () => "2026-10-10T00:00:00.000Z",
+    });
+    try {
+      const deathTimes = Array.from({ length: 8 }, (_, index) =>
+        new Date(
+          Date.parse("2026-10-01T00:00:00.000Z") + index * 60_000,
+        ).toISOString(),
+      );
+      for (const deathAt of deathTimes) {
+        store.recordObservedLifeEvent({ type: "bot_death", at: deathAt });
+        store.recordObservedLifeEvent({
+          type: "bot_respawn",
+          at: new Date(Date.parse(deathAt) + 30_000).toISOString(),
+          deathAt,
+        });
+      }
+      const lifeMemory = store.latestObservedLifeMemory();
+      if (lifeMemory === null) throw new Error("expected life memory");
+      const latestDeathAt = deathTimes.at(-1);
+      if (latestDeathAt === undefined) throw new Error("expected latest death");
+      const latestRespawnAt = new Date(
+        Date.parse(latestDeathAt) + 30_000,
+      ).toISOString();
+      const create = vi.fn().mockResolvedValue(
+        response({
+          speech: "記録を確認したよ。",
+          ownerMessageDisposition: "answer_only",
+          goal: null,
+          plan: null,
+          memoryUpdates: [],
+          relationshipSummary: null,
+          waitMs: 10_000,
+          knowledgeQuery: null,
+        }),
+      );
+      const agent = new CompanionAgent({
+        client: {
+          responses: { create },
+        } as unknown as CompanionResponsesClient,
+        model: "gpt-6-luna",
+        persona,
+      });
+
+      await agent.decide({ ...createInput(), memories: [lifeMemory] });
+
+      const [request] = create.mock.calls[0] as unknown as [{ input: string }];
+      const providerInput = JSON.parse(request.input) as {
+        memories: { kind: string; source: string; content: string }[];
+      };
+      const serializedLifeMemory = providerInput.memories.find(
+        (memory) => memory.kind === "life",
+      );
+      expect(serializedLifeMemory?.source).toBe("minecraft_observed");
+      expect(serializedLifeMemory?.content).toContain(latestDeathAt);
+      expect(serializedLifeMemory?.content).toContain(latestRespawnAt);
+      expect(serializedLifeMemory?.content).toContain("死因: 未確認");
+      expect(serializedLifeMemory?.content).toContain("復活: Minecraftで確認");
+      expect(serializedLifeMemory?.content.length).toBeLessThanOrEqual(400);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the explicit none effort for callers without an override", async () => {
     const create = vi.fn().mockResolvedValue(
       response({
