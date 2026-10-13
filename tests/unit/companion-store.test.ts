@@ -287,6 +287,12 @@ describe("CompanionStore", () => {
     ]);
     expect(history.records[0]).toMatchObject({
       purpose: null,
+      preActionObservation: {
+        source: "unknown",
+        observedAt: null,
+        position: null,
+        inWater: null,
+      },
       bodyEvidence: {
         source: "unknown",
         reasonCode: "unknown",
@@ -321,6 +327,170 @@ describe("CompanionStore", () => {
         limit: 1,
       }),
     ).toThrow(expect.objectContaining({ code: "INVALID_INPUT" }));
+    store.close();
+  });
+
+  it("exposes the newest five outcomes and recalls declared purpose beyond that window", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, { now: fixedNow });
+    const before = {
+      source: "minecraft" as const,
+      observedAt: fixedNow(),
+      dimension: "overworld",
+      position: { x: 1, y: 64, z: 2 },
+      yaw: 0,
+      pitch: 0,
+      health: 20,
+      food: 20,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+    };
+    for (let index = 0; index < 7; index += 1) {
+      store.recordOutcome(
+        outcome({
+          operationId: `recent-${index}`,
+          observedAt: `2026-10-10T00:00:0${index}.000Z`,
+          purpose:
+            index === 1
+              ? "Find the amber beetle archive beyond the newest window."
+              : `Inspect synthetic area ${index}.`,
+          preActionObservation: before,
+        }),
+      );
+    }
+
+    const recent = store.readRecentOutcomes();
+    expect(recent.map(({ operationId }) => operationId)).toEqual([
+      "recent-6",
+      "recent-5",
+      "recent-4",
+      "recent-3",
+      "recent-2",
+    ]);
+    expect(recent[0]).toMatchObject({
+      purpose: "Inspect synthetic area 6.",
+      preActionObservation: { source: "minecraft", inWater: false },
+    });
+    expect(
+      store
+        .recall("amber beetle archive", 8)
+        .some(({ content }) =>
+          content.includes(
+            "Declared purpose: Find the amber beetle archive beyond the newest window.",
+          ),
+        ),
+    ).toBe(true);
+    store.close();
+  });
+
+  it("uses the active marker purpose and pre-action observation when owner stop settles it", () => {
+    const { path } = freshDatabase();
+    const store = CompanionStore.open(path, { now: fixedNow });
+    const before = {
+      source: "minecraft" as const,
+      observedAt: fixedNow(),
+      dimension: "overworld",
+      position: { x: 3, y: 64, z: 4 },
+      yaw: 0,
+      pitch: 0,
+      health: 17,
+      food: 16,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+    };
+    store.save({
+      plan: {
+        purpose: "A later plan purpose must not replace the declared purpose.",
+        steps: [{ operation: look, expectedOutcome: "The area is observed." }],
+      },
+      activeOperation: {
+        operationId: "stop-purpose-test",
+        operation: look,
+        expectedOutcome: "The area is observed.",
+        purpose: "Declared before dispatch: check the shoreline.",
+        preActionObservation: before,
+        bodyStartedAt: fixedNow(),
+      },
+    });
+
+    const stopped = store.stop();
+
+    expect(stopped.lastOutcome).toMatchObject({
+      purpose: "Declared before dispatch: check the shoreline.",
+      preActionObservation: { source: "minecraft", inWater: false, food: 16 },
+      bodyEvidence: { source: "owner_stop", startedAt: null },
+    });
+    store.close();
+  });
+
+  it("uses the persisted purpose and pre-action observation during restart recovery", () => {
+    const { path } = freshDatabase();
+    let store = CompanionStore.open(path, { now: fixedNow });
+    const before = {
+      source: "minecraft" as const,
+      observedAt: fixedNow(),
+      dimension: "overworld",
+      position: { x: 2, y: 64, z: 6 },
+      yaw: 15,
+      pitch: 0,
+      health: 18,
+      food: 15,
+      oxygen: 20,
+      inWater: false,
+      inLava: false,
+      onFire: false,
+      suffocating: false,
+      sleeping: false,
+    };
+    store.save({
+      goal: {
+        title: "Reach the island garden.",
+        successCondition: "The garden path has been checked.",
+        source: "owner",
+      },
+      plan: {
+        purpose: "A later plan must not overwrite the active marker.",
+        steps: [{ operation: look, expectedOutcome: "The route is visible." }],
+      },
+      activeOperation: {
+        operationId: "restart-declared-purpose-test",
+        operation: look,
+        expectedOutcome: "The route is visible.",
+        purpose: "Declared before dispatch: inspect the island shoreline.",
+        preActionObservation: before,
+        bodyStartedAt: fixedNow(),
+      },
+    });
+    store.close();
+
+    store = CompanionStore.open(path, { now: fixedNow });
+
+    expect(store.snapshot()).toMatchObject({
+      goal: {
+        title: "Reach the island garden.",
+        source: "owner",
+      },
+      plan: null,
+      activeOperation: null,
+      lastOutcome: {
+        status: "unverified",
+        purpose: "Declared before dispatch: inspect the island shoreline.",
+        preActionObservation: {
+          source: "minecraft",
+          inWater: false,
+          food: 15,
+        },
+        bodyEvidence: { source: "process_restart", startedAt: null },
+      },
+    });
     store.close();
   });
 
@@ -925,6 +1095,8 @@ describe("CompanionStore", () => {
     expect(recovered.lastOutcome).toMatchObject({
       operationId: "restart-op-1",
       status: "unverified",
+      purpose: null,
+      preActionObservation: { source: "unknown", inWater: null },
     });
     store.close();
 

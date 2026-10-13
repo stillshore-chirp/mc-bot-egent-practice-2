@@ -16,6 +16,7 @@ import { playerDecisionOperationSchema } from "../minecraft/player-body-schema.j
 import type {
   CompanionMemory,
   CompanionMessage,
+  CompanionOutcomeHistoryEntry,
   CompanionSnapshot,
 } from "./contracts.js";
 
@@ -103,6 +104,7 @@ export interface CompanionDecisionInput {
   readonly wakeReason: string;
   readonly messages: readonly CompanionMessage[];
   readonly memories: readonly CompanionMemory[];
+  readonly recentOutcomes?: readonly CompanionOutcomeHistoryEntry[] | undefined;
   readonly knowledge?: PlayerKnowledge | undefined;
 }
 
@@ -259,6 +261,7 @@ function buildInstructions(persona: PersonaCore): string {
     "既定のゲームプレイ方針は、ゲーム内のリスクや失敗を引き受けて能動的に動くことを最優先にすることです。観測できる範囲で実行可能な移動、探索、作業を選び、危険の説明や安全確認だけを繰り返して行動を止めないでください。",
     "危険が見えない・範囲外・判断できないことや、装備が十分でないことだけでは待機や拒否を選ばず、通常のゲーム内リスク、失敗、死亡の可能性も含めて判断し、可能な行動を進めてください。ownerの最新の明示的なゲームプレイ好みは危険許容度の調整に使ってください。ownerが積極的・無謀な行動を最優先すると求めた場合、その優先度を慎重さへ読み替えず実行可能な行動に反映してください。",
     "relationshipSummaryは、新しい共有経験で関係への理解が実質的に変わった時だけ短く更新してください。関係についてのあなたの理解を記し、事実の権威ある記録として扱わないでください。変化がなければnullにして既存の要約を保ってください。",
+    "recentOutcomesは直近のBody操作記録です。purposeは実行前に宣言された目的、preActionObservationは実行前のallowlist観測、bodyEvidence.before/afterはBody結果内の観測、現在のobservationは現在状態として分けてください。purposeや観測がunknown/nullなら後から推測で埋めず、実行理由・過去状態・死因を断定しないでください。",
     "記憶に矛盾があればupdatedAtが新しい明示的なownerの訂正を古い記憶より優先してください。bot_inferredの記憶をownerの発言やMinecraftで確認した事実として扱わないでください。",
     "rememberedBedLocationは過去に視認した位置です。現在のobservation.dimensionと同じ場合だけ移動先に使い、現在のperception.blocksにないだけで消失と扱わずmove_toできます。到着や記憶だけでベッド現存・睡眠成功を主張せず、到着後の新しいBody観測で判断してください。",
     "chestObservation.kind=locationは過去に視認した最終位置で、保持期限はありません。現在のblocks一覧にないだけで不存在とせず、その位置はmove_toの判断に使えます。現在のblocksにない既知チェストへはmove_toだけを計画し、到着後に新しいBody観測を受けて再判断し、chest/trapped_chestを確認してから開いてください。",
@@ -306,6 +309,8 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
   ) {
     recentMessages.pop();
   }
+  const activeOperation = input.snapshot.activeOperation;
+  const lastOutcome = input.snapshot.lastOutcome;
   return {
     wakeReason: input.wakeReason.slice(0, 180),
     ownerMessage: input.ownerMessage?.slice(0, 2_000) ?? null,
@@ -317,8 +322,30 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
       goal: input.snapshot.goal,
       plan: input.snapshot.plan,
       waitUntil: input.snapshot.waitUntil,
-      activeOperation: input.snapshot.activeOperation,
-      lastOutcome: input.snapshot.lastOutcome,
+      activeOperation:
+        activeOperation === null
+          ? null
+          : {
+              operation: activeOperation.operation,
+              expectedOutcome: activeOperation.expectedOutcome,
+              purpose: activeOperation.purpose ?? null,
+              preActionObservation:
+                activeOperation.preActionObservation ?? null,
+              bodyStartedAt: activeOperation.bodyStartedAt ?? null,
+            },
+      lastOutcome:
+        lastOutcome === null
+          ? null
+          : {
+              operation: lastOutcome.operation,
+              status: lastOutcome.status,
+              summary: lastOutcome.summary,
+              expectedOutcome: lastOutcome.expectedOutcome ?? null,
+              observedAt: lastOutcome.observedAt,
+              purpose: lastOutcome.purpose ?? null,
+              preActionObservation: lastOutcome.preActionObservation ?? null,
+              bodyEvidence: lastOutcome.bodyEvidence ?? null,
+            },
       replyLifecycle:
         replyLifecycle === null
           ? null
@@ -330,6 +357,17 @@ function compactInput(input: CompanionDecisionInput): Record<string, unknown> {
       relationshipSummary: input.snapshot.relationshipSummary,
       interests: input.snapshot.interests.slice(0, 12),
     },
+    recentOutcomes: (input.recentOutcomes ?? []).slice(0, 5).map((outcome) => ({
+      operation: outcome.operation,
+      status: outcome.status,
+      summary: outcome.summary,
+      expectedOutcome: outcome.expectedOutcome ?? null,
+      purpose: outcome.purpose,
+      preActionObservation: outcome.preActionObservation,
+      bodyEvidence: outcome.bodyEvidence,
+      observedAt: outcome.observedAt,
+      recordedAt: outcome.recordedAt,
+    })),
     observation: {
       observedAt: observation.observedAt,
       gameVersion: observation.gameVersion,

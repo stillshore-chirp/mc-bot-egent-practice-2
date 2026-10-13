@@ -62,6 +62,10 @@ export interface CompanionActiveOperation {
   readonly operationId: string;
   readonly operation: PlayerOperation;
   readonly expectedOutcome: string;
+  /** Declared plan purpose captured before dispatch; absent legacy values are unknown. */
+  readonly purpose?: string | null | undefined;
+  /** Allowlisted Body observation captured before dispatch; legacy values are unknown. */
+  readonly preActionObservation?: CompanionBodyObservationEvidence | undefined;
   /** Runtime timestamp persisted before Body dispatch for stop/restart recovery. */
   readonly bodyStartedAt?: string | undefined;
 }
@@ -157,6 +161,8 @@ export interface CompanionOutcome {
   readonly purpose?: string | null | undefined;
   /** Missing on older records; readback converts it to explicit unknown. */
   readonly bodyEvidence?: CompanionOutcomeBodyEvidence | undefined;
+  /** Missing on older records; readback converts it to explicit unknown. */
+  readonly preActionObservation?: CompanionBodyObservationEvidence | undefined;
 }
 
 export type CompanionOutcomeInput = Omit<CompanionOutcome, "observedAt"> & {
@@ -232,6 +238,7 @@ export interface CompanionOutcomeHistoryRequest {
 export interface CompanionOutcomeHistoryEntry extends CompanionOutcome {
   readonly purpose: string | null;
   readonly bodyEvidence: CompanionOutcomeBodyEvidence;
+  readonly preActionObservation: CompanionBodyObservationEvidence;
   readonly recordedAt: string;
 }
 
