@@ -64,7 +64,7 @@ describe("Node.js runtime support", () => {
       new URL("../../src/index.ts", import.meta.url),
       "utf8",
     );
-    const firstImport = entry.match(/^\s*import\b[^\n]*/m)?.[0].trim();
+    const firstImport = /^\s*import\b[^\n]*/m.exec(entry)?.[0].trim();
 
     expect(firstImport).toBe('import "./runtime/node-version.js";');
   });
