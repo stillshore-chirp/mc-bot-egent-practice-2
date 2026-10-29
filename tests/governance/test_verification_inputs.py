@@ -34,8 +34,9 @@ def test_clean_build_script_selects_product_gate() -> None:
     assert result["workflow_contract"] is False
 
 
-def test_format_configuration_selects_product_gate() -> None:
-    result = MODULE.classify_paths([".prettierignore"])
+@pytest.mark.parametrize("path", (".prettierignore", ".npmrc", ".nvmrc"))
+def test_format_and_runtime_configuration_selects_product_gate(path: str) -> None:
+    result = MODULE.classify_paths([path])
 
     assert result["classification_ok"] is True
     assert result["product"] is True

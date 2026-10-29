@@ -2,7 +2,13 @@
 
 ## 設定と起動
 
-Node.js 22.13以上を使います。`.env.example` を `.env.local` にコピーし、Minecraft接続、owner、OpenAI API key、persona、database pathを設定してから起動します。
+Node.jsは安定版の22.23.4以上（22.x）、24.22.1以上（24.x）、26.12.1以上
+（26.x）を使います。既定の選択は `.nvmrc` の24.22.1です。nvmを使う場合は
+`nvm install && nvm use` を実行し、`node --version` で対応versionを確認してから
+`npm ci` を行います。`.npmrc` のengine-strictがinstall時に非対応versionを拒否し、
+起動時guardがBot起動時にも非対応versionを拒否します。
+`.env.example` を `.env.local` にコピーし、Minecraft接続、owner、OpenAI API key、
+persona、database pathを設定してから起動します。
 
 ```bash
 npm ci

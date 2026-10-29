@@ -62,6 +62,8 @@ RETIRED_DASHBOARD_PATTERNS = (
 )
 
 PRODUCT_PATTERNS = (
+    ".npmrc",
+    ".nvmrc",
     "src/**",
     "scripts/*.ts",
     "server/tree-guard/**",

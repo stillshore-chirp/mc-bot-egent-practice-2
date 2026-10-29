@@ -1,3 +1,5 @@
+import "../src/runtime/node-version.js";
+
 import { mkdir, writeFile } from "node:fs/promises";
 import { config as loadEnvironmentFile } from "dotenv";
 import OpenAI from "openai";

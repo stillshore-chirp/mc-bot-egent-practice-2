@@ -20,7 +20,11 @@ flowchart LR
 
 ## 起動
 
-Node.js 22.13.0以上とnpmが必要です。通常起動ではMinecraft server、別々のBot/owner identity、OpenAI Responses APIの利用資格、書込み可能なSQLite保存先を使います。
+Node.jsは安定版の22.23.4以上（22.x）、24.22.1以上（24.x）、26.12.1以上
+（26.x）に対応します。既定の選択は `.nvmrc` の24.22.1です。nvmを使う場合は
+`nvm install && nvm use` を実行し、`node --version` で対応versionを確認してから
+`npm ci` を行ってください。通常起動ではMinecraft server、別々のBot/owner
+identity、OpenAI Responses APIの利用資格、書込み可能なSQLite保存先を使います。
 
 ```bash
 npm ci
