@@ -34,7 +34,7 @@
     "pino": "10.3.1",
     "prismarine-nbt": "2.8.0",
     "vec3": "0.1.10",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
