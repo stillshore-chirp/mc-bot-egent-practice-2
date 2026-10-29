@@ -1,3 +1,5 @@
+import { writeSync } from "node:fs";
+
 export const SUPPORTED_NODE_VERSION_RANGE = "^22.23.4 || ^24.22.1 || ^26.12.1";
 
 const minimumVersions = new Map<number, readonly [number, number]>([
@@ -38,6 +40,9 @@ try {
     error instanceof Error
       ? error.message
       : "Unsupported Node.js version. Select a supported stable release.";
-  process.stderr.write(`${message}\n`);
-  process.exit(1);
+  try {
+    writeSync(2, `${message}\n`);
+  } finally {
+    process.exit(1);
+  }
 }
