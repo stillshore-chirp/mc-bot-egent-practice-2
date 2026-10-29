@@ -1,3 +1,5 @@
+import "../../src/runtime/node-version.js";
+
 import { randomBytes } from "node:crypto";
 import { createWriteStream, type WriteStream } from "node:fs";
 import {

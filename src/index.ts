@@ -1,3 +1,6 @@
+// Keep this first; its guard runs before startup dependencies load.
+import "./runtime/node-version.js";
+
 import { config as loadEnvironmentFile } from "dotenv";
 
 import type { CompanionApplication } from "./app/application.js";
